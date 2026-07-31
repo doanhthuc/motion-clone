@@ -4,8 +4,8 @@
 -- Email để chữ thường (route auth normalize lowercase). Chạy lại nhiều lần vẫn an toàn.
 
 INSERT INTO users (email, role, is_active) VALUES
-  ('user-mau-1@example\.com',  'user', true),
-  ('user-mau-2@example\.com',  'user', true)
+  ('user-mau-1@example.com',  'user', true),
+  ('user-mau-1@example.com',  'user', true)
 ON CONFLICT (email) DO UPDATE
   SET role = EXCLUDED.role,
       is_active = true;

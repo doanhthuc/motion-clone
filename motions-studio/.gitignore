@@ -29,6 +29,6 @@ data/
 # Model prebuilt node SS (quá lớn, user tự đặt vào)
 ltx-ss-prebuilt/*.safetensors
 
-# Fork: secrets + config runtime (KHONG commit)
+# Fork: secrets + config runtime (KHÔNG commit) — scrub-secrets.sh cưỡng chế
 setup/templates.json
 setup/pod.env

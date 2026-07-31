@@ -224,3 +224,60 @@ phần cài đặt.
 
 Thiếu `/opt/mtc-prebuilt/.ready` là setup `die` ngay — cố ý, để bạn không âm thầm rơi về đường
 cài-từ-đầu mà không biết.
+
+---
+
+## Kiểm chứng sau khi dựng: `make gpu-smoke`
+
+`make gpu-status` chỉ curl `/health`. Mà `/health` là một handler tĩnh
+(`api/src/server.js:55`) — nó trả 200 kể cả khi Postgres không nối được, ComfyUI chưa nạp custom
+node, hoặc `models/` là thư mục rỗng trên container disk. Lỗi đắt tiền nhất ở đây không ồn ào mà
+là **thành công giả**: mọi thứ xanh, và app lặng lẽ tải lại 33GB.
+
+`make gpu-smoke` kiểm sáu lớp, rẻ trước đắt sau, mỗi lớp in ra nó **chứng minh** điều gì:
+
+| Lớp | Kiểm | Chứng minh |
+|---|---|---|
+| 1 | `GET /health` | Cloudflare Tunnel sống + tiến trình api sống |
+| 2 | `GET /jobs?limit=1` | api + **Postgres** + API key — `/health` không chứng minh được DB, endpoint này có truy vấn thật |
+| 3 | `pm2 jlist` | mọi app online, không app nào crash-loop |
+| 4 | `/object_info/WanVideoModelLoader` | custom node đã nạp thật; thiếu là job motion chết với 400 *"node type not found"* |
+| 5 | `pod-volume.sh --check` | volume thật sự đang được dùng, số file model không giảm |
+| 6 | một job motion thật | năm lớp trên chứng minh từng mảnh đúng; chỉ job thật chứng minh chúng **ghép lại** đúng |
+
+Lớp 6 là opt-in vì repo không có sẵn video dẫn động:
+
+```bash
+SMOKE_REF=nhanvat.jpg SMOKE_DRIVER=dandong.mp4 make gpu-smoke
+```
+
+Nó gửi job nhỏ nhất mà vẫn đi hết đường ống (540p, 33 frame), poll tới khi `done`, rồi tải output
+về `/tmp/smoke-out.mp4` và kiểm dung lượng. Đường đi: Postgres → worker claim → ComfyUI nạp Wan
+Animate **từ volume** → DWPose → sampling → VAE decode → MinIO → API trả URL.
+
+Thiếu `GPU_SSH_HOST`/`GPU_SSH_PORT` trong `.env` thì lớp 3-5 tự bỏ qua kèm thông báo rõ, không
+im lặng báo pass.
+
+## Lấy bản mới từ upstream: `make sync-upstream`
+
+```bash
+make sync-upstream           # rsync + scrub + gate, rồi cho bạn xem diff
+make sync-upstream PULL=1    # git pull bản theo dõi trước
+make sync-upstream COMMIT=1  # commit nếu gate pass
+```
+
+Bản theo dõi upstream nằm ở `../motion-upstream-tracking/` (ngoài repo này, đã khóa push). Đổi chỗ
+bằng `UPSTREAM_DIR=`.
+
+**Vì sao phải là script:** `rsync` ghi đè các file `scrub-secrets.sh` đã dọn, nên mỗi lần sync là
+credentials của upstream quay lại — `DEFAULT_API_KEY` (key **chia sẻ** giữa mọi bản deploy của
+source này), admin key Motion Task Cloud, `setup/templates.json`, vài email cá nhân, **và các dòng
+`.gitignore` mà fork thêm vào**. Lần sync đầu tiên đã mất đúng 4 dòng `.gitignore` đó, nên
+`scrub-secrets.sh` giờ cưỡng chế luôn cả chúng.
+
+Script từ chối chạy khi working tree bẩn: nếu không thì trong diff kết quả bạn không phân biệt được
+hunk nào của upstream, hunk nào của mình — mà diff đó là lần review duy nhất bản import này có.
+Ghi đè bằng `FORCE=1`.
+
+Không dùng `--delete`: nó sẽ xoá mọi file fork thêm vào (`pod-volume.sh`, `scrub-secrets.sh`,
+specs). Đánh đổi: file bị xoá ở upstream thì còn sót lại đây. Đó là hướng sai an toàn hơn.

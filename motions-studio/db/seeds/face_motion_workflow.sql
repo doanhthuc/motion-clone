@@ -39,6 +39,6 @@ SELECT u.id,
 $json$::jsonb,
        true
 FROM users u
-WHERE lower(u.email) = lower('admin-mau@example\.com')
+WHERE lower(u.email) = lower('admin-mau@example.com')
 ON CONFLICT (user_id, slug) DO NOTHING;
 -- #endregion

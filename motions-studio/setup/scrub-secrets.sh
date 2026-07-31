@@ -154,6 +154,32 @@ _scrub_emails .env.example                     'doi-thanh-email-cua-ban@gmail.co
 _scrub_emails db/seed_users.sql                'user-mau-1@example.com'
 _scrub_emails db/seeds/face_motion_workflow.sql 'admin-mau@example.com'
 
+# ── 5b. Cưỡng chế .gitignore ────────────────────────────────────────────────
+# rsync trong sync-upstream.sh ghi đè .gitignore bằng bản của upstream → các dòng
+# fork thêm vào BIẾN MẤT, và lớp bảo vệ mất im lặng: lần sau ai vô tình tạo
+# setup/templates.json là nó lọt vào git. Đã xảy ra thật ở lần sync đầu tiên.
+# Nên coi đây là một mục scrub, không phải việc-làm-một-lần.
+GITIGNORE_MUST=(setup/templates.json setup/pod.env)
+GI="$ROOT/.gitignore"
+_missing_gi=""
+for _e in "${GITIGNORE_MUST[@]}"; do
+  grep -qxF "$_e" "$GI" 2>/dev/null || _missing_gi="${_missing_gi} $_e"
+done
+if [ -n "$_missing_gi" ]; then
+  if [ "$CHECK_ONLY" = 1 ]; then
+    bad ".gitignore THIẾU:${_missing_gi}"
+    FAIL=1
+  else
+    { printf '\n# Fork: secrets + config runtime (KHÔNG commit) — scrub-secrets.sh cưỡng chế\n'
+      for _e in $_missing_gi; do printf '%s\n' "$_e"; done
+    } >> "$GI"
+    act ".gitignore — thêm lại:${_missing_gi}"
+    CHANGED=1
+  fi
+else
+  ok ".gitignore — đủ mục bắt buộc"
+fi
+
 # ── 6. Cổng chặn cuối ───────────────────────────────────────────────────────
 # Mọi mục dưới đây là REGEX TỔNG QUÁT, không phải secret — nên file này tự pass
 # được cổng chặn của chính nó. Kiểm lại điều đó mỗi khi thêm pattern mới.

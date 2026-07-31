@@ -29,6 +29,12 @@ clean: down ## Remove FE node_modules/.nuxt/.output (keeps motions/.env)
 
 env = $(shell grep -E '^$(1)=' .env 2>/dev/null | cut -d= -f2- | sed -E 's/[[:space:]]*\#.*$$//' | tr -d '"')
 
+sync-upstream: ## Import upstream (ALD-Project) + re-scrub its secrets (PULL=1 to git pull, COMMIT=1 to commit)
+	@bash scripts/sync-upstream.sh
+
+scrub-check: ## Gate: fail if any third-party credential or personal email is tracked
+	@bash motions-studio/setup/scrub-secrets.sh --check
+
 gpu-preflight: ## Check root .env is complete BEFORE you spend money on a pod
 	@bash scripts/gpu-preflight.sh
 
@@ -86,6 +92,9 @@ gpu-volume-check: ## Prove the volume is really in use (catches "green but re-do
 	@ssh -o StrictHostKeyChecking=accept-new -p $(call env,GPU_SSH_PORT) root@$(call env,GPU_SSH_HOST) \
 		"cd ~/motion-backend && POD_VOLUME=$(call env,POD_VOLUME) \
 		 MODELS_MIN_GB=$(call env,MODELS_MIN_GB) ./setup/pod-volume.sh --check"
+
+gpu-smoke: ## Prove the pod really works end-to-end (SMOKE_REF=img SMOKE_DRIVER=vid for a real job)
+	@bash scripts/pod-smoke.sh
 
 gpu-status: ## Is the pod up, and is the backend answering?
 	@curl -sf https://$(call env,DOMAIN)/health >/dev/null 2>&1 \
