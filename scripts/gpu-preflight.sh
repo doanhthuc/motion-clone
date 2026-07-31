@@ -44,7 +44,7 @@ check() {
 
 echo "Pod rental"
 check GPU_PROVIDER required "vast | runpod — picks the CLI make gpu-provision/gpu-up/gpu-down use" 1
-check GPU          required "vast.ai card filter, e.g. RTX_4090 — motion-transfer needs >=24GB VRAM" 1
+check GPU          required "card filter — vast uses RTX_5090, RunPod uses 'NVIDIA GeForce RTX 5090'. Needs >=24GB VRAM" 1
 check DISK          required "GB — DEPLOY.md minimum for the motion-transfer box is 120" 1
 check MAX_DPH       required "\$/hour ceiling so a search never surprises you" 1
 
@@ -64,6 +64,12 @@ fi
 check GMAIL_USER    recommended "OTP login email — without it you must wire up SMTP another way"
 check GMAIL_APP_PASSWORD recommended "pairs with GMAIL_USER (App Password, not the Gmail password)"
 check CORS_ORIGINS  recommended "defaults to allow-all if unset — fine for a first deploy, not for prod" 1
+
+echo
+echo "Speed-ups (skip re-downloading 33GB of models / re-installing every pod)"
+check POD_VOLUME    recommended "RunPod Network Volume mount path, e.g. /workspace — without it every pod re-downloads ~33GB of models AND loses the database. docs/gpu-pod.md#network-volume" 1
+check MODELS_MIN_GB recommended "threshold below which pod-volume.sh assumes the symlink points at an empty dir" 1
+check MTC_PREBUILT  recommended "1 = pod image ships /opt/mtc-prebuilt, skips ~20-35 min of installing (needs worker-image/Dockerfile)" 1
 
 echo
 echo "After rent (make gpu-provision / gpu-wait fill these in for you)"
@@ -86,6 +92,21 @@ fi
 provider="$(get GPU_PROVIDER)"
 if [ "$provider" = "runpod" ]; then
   echo -e "${Y}! GPU_PROVIDER=runpod — this path is less tested than vast (see docs/gpu-pod.md#runpod).${X}"
+fi
+
+vol="$(get POD_VOLUME)"
+if [ -n "$vol" ] && [ "$provider" != "runpod" ]; then
+  blocking=$((blocking + 1))
+  echo -e "${R}✗ POD_VOLUME=$vol but GPU_PROVIDER=$provider — Network Volumes are RunPod-only.${X}"
+  echo -e "${D}   vast.ai storage dies with the instance, so models would still re-download every rent.${X}"
+  echo -e "${D}   Set GPU_PROVIDER=runpod, or clear POD_VOLUME.${X}"
+elif [ -z "$vol" ] && [ "$provider" = "runpod" ]; then
+  echo -e "${Y}! POD_VOLUME empty on RunPod — you are leaving the biggest win on the table${X}"
+  echo -e "${D}   (~33GB model re-download + database loss on every pod). docs/gpu-pod.md#network-volume${X}"
+fi
+if [ -n "$vol" ] && [ "$provider" = "runpod" ]; then
+  echo -e "${Y}! POD_VOLUME set: create the pod on the DASHBOARD, not 'make gpu-provision'${X}"
+  echo -e "${D}   runpodctl cannot attach a Network Volume, and it cannot be attached after creation.${X}"
 fi
 
 if [ "$blocking" -gt 0 ]; then

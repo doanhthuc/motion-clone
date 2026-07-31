@@ -36,12 +36,60 @@ die()  { printf '\033[31m ✗ \033[0m%s\n' "$*" >&2; exit 1; }
 # the detected driver, so the base image's own torch version doesn't matter much.
 IMAGE="${IMAGE:-pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel}"
 
+# Same precedence as every other knob here: environment overrides .env.
+POD_VOLUME="${POD_VOLUME:-$(env_get POD_VOLUME)}"
+
+# --- Network Volume is RunPod-only, and runpodctl cannot attach one --------------------------
+# vast.ai has no network volume that survives destroying the instance, so POD_VOLUME there is a
+# lie: the wiring would "work" and then vanish with the pod.
+if [ -n "$POD_VOLUME" ] && [ "$GPU_PROVIDER" != "runpod" ]; then
+  die "POD_VOLUME=$POD_VOLUME but GPU_PROVIDER=$GPU_PROVIDER.
+    Network Volumes are a RunPod feature. vast.ai storage dies with the instance, so models would
+    still be re-downloaded (~33GB) on every rent.
+    Either set GPU_PROVIDER=runpod, or clear POD_VOLUME to accept re-downloading."
+fi
+
 if [ "$GPU_PROVIDER" = "runpod" ]; then
   # --- RunPod branch — best-effort, LESS TESTED than the vast path below. -------------------
   # runpodctl's flags have moved across versions; verify with `runpodctl create pod --help`
   # before trusting this blindly. See docs/gpu-pod.md#runpod.
+  # NOTE: the Network Volume check comes BEFORE the runpodctl check on purpose — the dashboard
+  # path it prints needs no CLI at all, so demanding runpodctl first would block the very advice
+  # the user needs.
+  #
+  # STOP before spending money: runpodctl create pod has no flag for attaching a Network Volume.
+  # Renting here would give a pod with NO volume, bootstrap would refuse (mountpoint check) or —
+  # worse, if you forced it — you'd re-download 33GB onto a disk that dies with the pod. The
+  # silent-success failure this whole design exists to prevent. So: refuse, and hand over exact steps.
+  if [ -n "$POD_VOLUME" ]; then
+    warn "POD_VOLUME=$POD_VOLUME is set, and runpodctl CANNOT attach a Network Volume."
+    cat <<EOF
+
+  Create this pod on the dashboard instead — it is the only way to attach the volume:
+
+    1. runpod.io/console/pods → Deploy
+    2. GPU: $GPU        ← must be in the SAME REGION as your Network Volume
+    3. Network Volume: select yours, Mount Path: $POD_VOLUME
+    4. Container Disk: ${DISK}GB · Expose TCP Ports: 22
+    5. Template/Image: $IMAGE
+    6. Deploy, then copy pod id + SSH host/port into .env:
+         GPU_INSTANCE_ID=  GPU_SSH_HOST=  GPU_SSH_PORT=
+    7. make gpu-bootstrap
+
+  Why the dashboard: a volume attached at creation is the only supported path; there is no
+  runpodctl flag for it, and attaching after the fact is not possible either.
+
+  To rent WITHOUT a volume anyway (models will re-download every time):
+      POD_VOLUME= CONFIRM=yes GPU_PROVIDER=runpod bash scripts/pod-provision.sh
+
+EOF
+    exit 1
+  fi
+
   command -v runpodctl >/dev/null || die "runpodctl not found — https://github.com/runpod/runpodctl"
   warn "GPU_PROVIDER=runpod is best-effort — double check the command below against 'runpodctl create pod --help'."
+  warn "GPU='$GPU' must be a RunPod gpuType string (e.g. 'NVIDIA GeForce RTX 5090'), NOT vast.ai's"
+  warn "    underscore form (RTX_5090). Check: runpodctl get cloud"
 
   CREATE=(runpodctl create pod --name motion-transfer --gpuType "$GPU" --gpuCount 1 \
     --imageName "$IMAGE" --containerDiskInGb "$DISK" --ports "22/tcp")
