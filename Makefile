@@ -68,6 +68,25 @@ else
 endif
 	@echo "GPU pod destroyed"
 
+gpu-volume: ## Wire models/PGDATA/MinIO onto the Network Volume (idempotent; gpu-bootstrap does this too)
+	@test -n "$(call env,POD_VOLUME)" || { echo "set POD_VOLUME in .env first (see docs/gpu-pod.md#network-volume)"; exit 1; }
+	@ssh -o StrictHostKeyChecking=accept-new -p $(call env,GPU_SSH_PORT) root@$(call env,GPU_SSH_HOST) \
+		"cd ~/motion-backend && POD_VOLUME=$(call env,POD_VOLUME) MTC_PREBUILT=$(call env,MTC_PREBUILT) \
+		 MODELS_MIN_GB=$(call env,MODELS_MIN_GB) ./setup/pod-volume.sh"
+
+gpu-volume-adopt: ## ONE-TIME: move models/PGDATA/MinIO already on the pod ONTO the volume (keeps source as .bak)
+	@test -n "$(call env,POD_VOLUME)" || { echo "set POD_VOLUME in .env first"; exit 1; }
+	@echo "This stops nothing, copies data onto the volume, and renames the source to .bak-<timestamp>."
+	@ssh -o StrictHostKeyChecking=accept-new -p $(call env,GPU_SSH_PORT) root@$(call env,GPU_SSH_HOST) \
+		"cd ~/motion-backend && POD_VOLUME=$(call env,POD_VOLUME) MTC_PREBUILT=$(call env,MTC_PREBUILT) \
+		 MODELS_MIN_GB=$(call env,MODELS_MIN_GB) ./setup/pod-volume.sh --adopt"
+
+gpu-volume-check: ## Prove the volume is really in use (catches "green but re-downloading 33GB")
+	@test -n "$(call env,POD_VOLUME)" || { echo "set POD_VOLUME in .env first"; exit 1; }
+	@ssh -o StrictHostKeyChecking=accept-new -p $(call env,GPU_SSH_PORT) root@$(call env,GPU_SSH_HOST) \
+		"cd ~/motion-backend && POD_VOLUME=$(call env,POD_VOLUME) \
+		 MODELS_MIN_GB=$(call env,MODELS_MIN_GB) ./setup/pod-volume.sh --check"
+
 gpu-status: ## Is the pod up, and is the backend answering?
 	@curl -sf https://$(call env,DOMAIN)/health >/dev/null 2>&1 \
 		&& echo "up   → https://$(call env,DOMAIN)" \

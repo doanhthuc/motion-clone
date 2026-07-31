@@ -146,3 +146,81 @@ không chắc 100%.
 `__pycache__`, `.env*`, `.data`, `data`, `*.mp4`, `ltx-ss-prebuilt/*.safetensors` — đúng những gì
 `.gitignore` của `motions-studio` đã loại, cộng `.git` vì pod tự có bản riêng, không cần lịch sử.
 Model KHÔNG nằm trong repo — luôn tải qua Settings → Models AI sau khi bootstrap xong.
+
+---
+
+## Network Volume — hết tải lại model, hết mất database
+
+Hai chi phí lặp lại mỗi lần dựng pod, và cách xoá chúng:
+
+| Chi phí | Nguyên nhân | Cách xoá |
+|---|---|---|
+| ~33GB tải model **trong app** | `lib-feature.sh` cố ý không tải model; bạn tự bấm Settings → Models AI mỗi pod mới | `POD_VOLUME` |
+| ~20-35 phút cài phần mềm | `setup-motion-transfer.sh` cài ComfyUI + torch + custom node từ đầu | `MTC_PREBUILT=1` |
+| Mất users/jobs/workflows | Postgres nằm ở `/var/lib/postgresql` trên container disk, bị dựng lại mỗi Stop/Start | `POD_VOLUME` |
+
+### Tạo volume (một lần)
+
+RunPod → **Storage → Network Volume** → chọn **region còn stock GPU bạn hay thuê**, dung lượng
+~100GB (bộ Wan 2.2 Animate ~33GB + PGDATA + MinIO + chỗ thở). Ghi nhớ region.
+
+Khi tạo pod, **attach volume này và mount vào `/workspace`**. Bắt buộc cùng region với volume —
+RunPod không cho pod ở region khác gắn volume. `runpodctl create pod` chưa hỗ trợ network volume
+ổn định, nên tạo pod có volume thì làm qua dashboard hoặc RunPod API.
+
+Rồi trong `.env`:
+
+```bash
+POD_VOLUME=/workspace
+MODELS_MIN_GB=20          # ngưỡng cảnh báo "symlink trỏ thư mục rỗng"
+```
+
+Từ đó `make gpu-bootstrap` tự nối `models` + `PGDATA` + `MinIO` sang volume trước khi chạy setup.
+
+### Lần đầu trên pod ĐÃ tải model rồi
+
+`pod-volume.sh` **không bao giờ tự xoá dữ liệu**. Nếu `$COMFY_DIR/models` đang là thư mục thật có
+dữ liệu, nó dừng và yêu cầu bạn dời một lần:
+
+```bash
+make gpu-volume-adopt     # rsync sang volume, đổi tên nguồn thành .bak-<timestamp>
+```
+
+Nguồn được giữ lại dưới dạng `.bak-*` — tự xoá khi bạn đã yên tâm.
+
+### Kiểm chứng — đừng tin màu xanh
+
+Lỗi đáng sợ ở đây không ồn ào mà là **thành công giả**: pod lên, `/health` trả ok, login được,
+nhưng `models/` là thư mục rỗng trên container disk và app lặng lẽ tải lại 33GB.
+
+```bash
+make gpu-volume-check
+```
+
+Nó kiểm bằng con số, không bằng cảm giác: symlink có trỏ đúng volume, `data_directory` của Postgres
+có nằm trên volume, và **số file model có giảm so với manifest** hay không. Số file giảm là lỗi
+cứng (exit 1) — và manifest cố ý **không** bị ghi đè lúc đó, để bạn còn số cũ mà đối chiếu.
+
+`make gpu-bootstrap` cũng chạy bước check này ở cuối.
+
+### Ràng buộc phải biết
+
+- **PGDATA khoá theo major version Postgres.** Volume tạo bởi PG 16 thì pod có PG 17 không mở
+  được cluster. `pod-volume.sh` đọc `pgdata/PG_VERSION` và dừng sớm kèm thông báo rõ thay vì để
+  Postgres chết âm thầm. Cách tránh: luôn dùng cùng một base image.
+- **Volume khoá theo region.** Region hết GPU thì phải chờ, hoặc tạo volume thứ hai ở region khác.
+- **Volume tính tiền liên tục**, kể cả khi không có pod nào (~$0.07/GB/tháng → 100GB ≈ $7/tháng).
+  Vẫn rẻ hơn nhiều so với trả tiền pod trong lúc ngồi chờ tải 33GB mỗi lần.
+- **ComfyUI code + venv CỐ Ý không nằm trên volume.** Volume là network storage; `import torch`
+  đọc hàng nghìn file nhỏ, mà `run_enhance` gọi `comfy_recycle` giữa mỗi chunk RIFE nên ComfyUI
+  restart nhiều lần trong một job. Phần mềm để `MTC_PREBUILT=1` lo.
+
+### Image dựng sẵn (`MTC_PREBUILT=1`)
+
+`motions-studio/worker-image/Dockerfile` bake ComfyUI + custom node + `worker-venv` +
+`api-node_modules` vào `/opt/mtc-prebuilt`. Build, push, dùng làm image của pod, rồi đặt
+`MTC_PREBUILT=1` trong `.env`. `lib-feature.sh:475` sẽ symlink thẳng vào đó và bỏ qua toàn bộ
+phần cài đặt.
+
+Thiếu `/opt/mtc-prebuilt/.ready` là setup `die` ngay — cố ý, để bạn không âm thầm rơi về đường
+cài-từ-đầu mà không biết.

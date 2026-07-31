@@ -29,6 +29,17 @@ CF_TUNNEL_TOKEN="$(env_get CF_TUNNEL_TOKEN)"
 CORS_ORIGINS="$(env_get CORS_ORIGINS)"
 [ -n "$CF_API_TOKEN" ] || [ -n "$CF_TUNNEL_TOKEN" ] || die "CF_API_TOKEN or CF_TUNNEL_TOKEN missing from .env — run: make gpu-preflight"
 
+# ── Network Volume + prebuilt image (both optional, both big time savers) ──────
+# POD_VOLUME: mount path of a RunPod Network Volume on the pod. When set, models /
+#   PGDATA / MinIO get symlinked onto it, so re-creating a pod does NOT re-download
+#   the ~33GB model set and does NOT lose the database. See docs/gpu-pod.md#volume.
+# MTC_PREBUILT=1: the pod image already ships /opt/mtc-prebuilt (ComfyUI + venv +
+#   api node_modules). Skips ~20-35 min of installing. Requires the image built from
+#   motions-studio/worker-image/Dockerfile — the setup script dies if .ready is absent.
+POD_VOLUME="$(env_get POD_VOLUME)"
+MTC_PREBUILT="$(env_get MTC_PREBUILT)"
+MODELS_MIN_GB="$(env_get MODELS_MIN_GB)"
+
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -p "$PORT")
 REMOTE_DIR="motion-backend"
 
@@ -44,6 +55,28 @@ rsync -az --delete \
   motions-studio/ "root@$HOST:~/$REMOTE_DIR/" \
   || die "rsync failed"
 
+# ── Wire the Network Volume BEFORE setup runs ─────────────────────────────────
+# Order matters. pod-volume.sh installs Postgres and points data_directory at the
+# volume, so by the time setup-motion-transfer.sh reaches its Postgres phase its
+# own _pg_up() already returns true and it skips starting a second cluster on the
+# container disk. Same for models: the symlink must exist before setup creates
+# $COMFY_DIR/models/uploads, otherwise those land on the container disk.
+if [ -n "$POD_VOLUME" ]; then
+  log "wiring Network Volume $POD_VOLUME (models · PGDATA · MinIO) — no re-download, no DB loss"
+  ssh "${SSH_OPTS[@]}" "root@$HOST" "cd ~/$REMOTE_DIR && chmod +x setup/*.sh && \
+POD_VOLUME='$POD_VOLUME' MTC_PREBUILT='${MTC_PREBUILT:-0}' MODELS_MIN_GB='${MODELS_MIN_GB:-20}' \
+./setup/pod-volume.sh" < /dev/null || {
+    warn "pod-volume.sh exited non-zero."
+    warn "If it said a directory is a REAL dir with data (first run on a pod that already"
+    warn "downloaded models), adopt them onto the volume once:"
+    warn "  ssh -p $PORT root@$HOST 'cd ~/$REMOTE_DIR && POD_VOLUME=$POD_VOLUME ./setup/pod-volume.sh --adopt'"
+    die "aborting before setup — fix the volume first, nothing has been installed yet"
+  }
+else
+  warn "POD_VOLUME not set in .env → models re-download (~33GB, in-app) and the database is"
+  warn "lost every time the pod is re-created. See docs/gpu-pod.md#volume to set it up."
+fi
+
 log "running setup/setup-motion-transfer.sh on the pod — installs Postgres/MinIO/PM2, detects the"
 log "GPU/driver, installs ComfyUI + matching PyTorch/CUDA, and wires up the Cloudflare Tunnel. First"
 log "run takes a while (no models downloaded yet — that's a separate manual step, see below)."
@@ -58,9 +91,21 @@ ssh "${SSH_OPTS[@]}" "root@$HOST" "cd ~/$REMOTE_DIR && chmod +x setup/*.sh && \
 DOMAIN='$DOMAIN' SUPER_ADMIN='$SUPER_ADMIN' GMAIL_USER='$GMAIL_USER' \
 GMAIL_APP_PASSWORD='$GMAIL_APP_PASSWORD' CF_API_TOKEN='$CF_API_TOKEN' \
 CF_TUNNEL_TOKEN='$CF_TUNNEL_TOKEN' CORS_ORIGINS='$CORS_ORIGINS' HF_TOKEN='' \
+MTC_PREBUILT='${MTC_PREBUILT:-0}' \
 ./setup/setup-motion-transfer.sh" < /dev/null | tee "$LOG"
 STATUS=${PIPESTATUS[0]}
 [ "$STATUS" -eq 0 ] || die "setup-motion-transfer.sh exited $STATUS — full log: $LOG"
+
+# ── Gate: prove the volume is actually in use ─────────────────────────────────
+# The failure mode this catches is SILENT SUCCESS: the box comes up green, /health
+# answers, you log in fine — but models/ is a real empty dir on the container disk
+# and the app will happily re-download 33GB. Numbers, not vibes.
+if [ -n "$POD_VOLUME" ]; then
+  log "verifying the volume is really wired (models on volume · PGDATA on volume)…"
+  ssh "${SSH_OPTS[@]}" "root@$HOST" "cd ~/$REMOTE_DIR && \
+POD_VOLUME='$POD_VOLUME' MODELS_MIN_GB='${MODELS_MIN_GB:-20}' ./setup/pod-volume.sh --check" \
+    < /dev/null || warn "volume check failed — read the output above BEFORE downloading models again"
+fi
 
 log "checking the Cloudflare Tunnel actually came up…"
 if ! curl -sf "https://$DOMAIN/health" >/dev/null 2>&1; then
