@@ -1,0 +1,21 @@
+{
+  "name": "motion-backend-api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Motion Backend API — job queue + MinIO storage (S3) + presigned URLs",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "3.1068.0",
+    "@aws-sdk/s3-request-presigner": "3.1068.0",
+    "archiver": "^7.0.1",
+    "express": "^4.21.0",
+    "multer": "^1.4.5-lts.1",
+    "nodemailer": "^6.9.16",
+    "pg": "^8.13.0",
+    "unzipper": "^0.12.3"
+  },
+  "engines": { "node": ">=20" }
+}

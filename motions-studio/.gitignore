@@ -1,0 +1,34 @@
+# Secrets / config thực tế (chỉ commit .env.example)
+.env
+.env.*
+!.env.example
+
+# NodeJS
+node_modules/
+npm-debug.log*
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Output / data tạm
+*.mp4
+*.tmp
+data/
+
+# Bản chạy native bằng PM2 (setup-pm2.sh)
+# ALD 11/07/2026 - FIX: gitignore KHÔNG hỗ trợ comment cùng dòng → pattern ".data/  # ..." bị hỏng, .data KHÔNG
+# được ignore → MinIO data (bucket motion) có nguy cơ bị `git clean -fdx`/redeploy XOÁ. Tách comment ra dòng riêng.
+# MinIO data dir (ổ đơn native PM2)
+.data/
+# symlink api/db -> ../db (cho migrate.js đọc db/init)
+/api/db
+
+# Model prebuilt node SS (quá lớn, user tự đặt vào)
+ltx-ss-prebuilt/*.safetensors
+
+# Fork: secrets + config runtime (KHONG commit)
+setup/templates.json
+setup/pod.env

@@ -1,0 +1,35 @@
+{
+  "_note": [
+    "MẪU CẤU HÌNH — copy file này thành template THẬT của bạn rồi điền token CỦA BẠN.",
+    "",
+    "File thật KHÔNG bao giờ được commit. Đặt nó ở một trong hai chỗ:",
+    "  • /workspace/secrets/templates.json   (khuyến nghị — trên Network Volume, sống qua mọi lần dựng pod)",
+    "  • setup/templates.json                (đã có trong .gitignore)",
+    "",
+    "Rồi trỏ tới nó bằng env:  TEMPLATES_FILE=/workspace/secrets/templates.json",
+    "",
+    "CẢNH BÁO: fullstack-setup.sh mặc định gọi SETUP_API_URL để lấy mẫu từ Motion Task Cloud.",
+    "Nếu bạn không sở hữu server đó, hãy chặn bằng:  SETUP_API_URL=http://127.0.0.1:1",
+    "Lưu ý SETUP_API_KEY=\"\" KHÔNG chặn được, vì ${VAR:-default} coi chuỗi rỗng như chưa set.",
+    "",
+    "Chạy không-hỏi-gì:  TEMPLATE=<name> ./setup/fullstack-setup.sh"
+  ],
+  "templates": [
+    {
+      "name": "khach-mau",
+      "label": "Khách Mẫu — khach-mau.ten-mien-cua-ban.com",
+
+      "fe_domain": "app.ten-mien-cua-ban.com",
+      "be_domain": "api.ten-mien-cua-ban.com",
+
+      "cf_api_token": "",
+      "cf_tunnel_token": "",
+
+      "super_admin": "ban@gmail.com",
+      "gmail_user": "",
+      "gmail_app_password": "",
+
+      "hf_token": ""
+    }
+  ]
+}

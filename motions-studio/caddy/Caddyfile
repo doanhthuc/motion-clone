@@ -1,0 +1,22 @@
+# Caddy = reverse proxy + HTTPS TỰ ĐỘNG (Let's Encrypt). Set DOMAIN trong .env.
+# Cert tự xin + tự gia hạn, lưu ở volume caddydata → không cần certbot/sudo.
+# Yêu cầu: DNS của DOMAIN trỏ thẳng về IP VPS (Cloudflare để "DNS only"/grey-cloud khi xin cert),
+#          và port 80 + 443 mở (HTTP-01/TLS-ALPN challenge).
+
+{$DOMAIN} {
+	# Toàn bộ API (tạo/poll job, tải output) đi qua đây.
+	reverse_proxy api:8080
+
+	# ALD 14/06/2026 - Upload "Model AI (custom)" (LoRA/checkpoint/…) có thể tới hàng GB → /models cho body RẤT lớn.
+	# Hai matcher LOẠI TRỪ nhau (not path / path) để mỗi request chỉ qua đúng 1 giới hạn (tránh 250MB chặn /models).
+	@notmodels not path /models
+	request_body @notmodels {
+		max_size 250MB
+	}
+	@models path /models
+	request_body @models {
+		max_size 32GB
+	}
+
+	encode gzip
+}

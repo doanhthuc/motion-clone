@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+*.log
+
+# Python cache của scripts/ orchestration
+__pycache__/
+*.pyc
+
+# Bản theo dõi upstream nằm NGOÀI repo (~/Desktop/motion-upstream-tracking/)
+# — liệt kê ở đây để nếu ai đó copy vào trong thì cũng không lọt vào git.
+motions-studio-upstream/
+motions-upstream/

@@ -1,0 +1,1741 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Motion Transfer Pipeline — Full Plan v1.1</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,500;0,700;1,400&family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,800&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0a0e0c;
+    --bg-elevated: #11181420;
+    --bg-card: #0f1411;
+    --border: #1a2620;
+    --border-bright: #2a3d33;
+    --ink: #d4e8db;
+    --ink-dim: #6b8478;
+    --ink-faint: #3d524a;
+    --accent: #7fff9c;
+    --accent-dim: #3d8b50;
+    --warn: #ffb454;
+    --critical: #ff5f56;
+    --info: #5ac8fa;
+    --grid: rgba(127, 255, 156, 0.03);
+    
+    --font-display: 'Bricolage Grotesque', sans-serif;
+    --font-mono: 'JetBrains Mono', monospace;
+    --font-serif: 'Instrument Serif', serif;
+  }
+
+  * {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+  }
+
+  html {
+    scroll-behavior: smooth;
+    scroll-padding-top: 80px;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--font-mono);
+    font-size: 14px;
+    line-height: 1.65;
+    min-height: 100vh;
+    background-image:
+      linear-gradient(var(--grid) 1px, transparent 1px),
+      linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+    background-size: 32px 32px;
+    background-position: -1px -1px;
+  }
+
+  /* === LAYOUT === */
+  .layout {
+    display: grid;
+    grid-template-columns: 280px 1fr;
+    min-height: 100vh;
+  }
+
+  /* === SIDEBAR === */
+  .sidebar {
+    border-right: 1px solid var(--border);
+    background: var(--bg-card);
+    padding: 32px 0;
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    overflow-y: auto;
+    backdrop-filter: blur(20px);
+  }
+
+  .sidebar::-webkit-scrollbar { width: 4px; }
+  .sidebar::-webkit-scrollbar-track { background: transparent; }
+  .sidebar::-webkit-scrollbar-thumb { background: var(--border-bright); border-radius: 2px; }
+
+  .brand {
+    padding: 0 24px 24px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 24px;
+  }
+
+  .brand-mark {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--accent);
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    margin-bottom: 8px;
+  }
+
+  .brand-title {
+    font-family: var(--font-display);
+    font-size: 22px;
+    font-weight: 800;
+    line-height: 1.1;
+    color: var(--ink);
+    letter-spacing: -0.02em;
+  }
+
+  .brand-version {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--ink-dim);
+    margin-top: 8px;
+  }
+
+  .nav-section {
+    padding: 0 24px;
+    margin-bottom: 20px;
+  }
+
+  .nav-section-title {
+    font-size: 10px;
+    color: var(--ink-faint);
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    margin-bottom: 12px;
+  }
+
+  .nav-list {
+    list-style: none;
+  }
+
+  .nav-link {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 0;
+    color: var(--ink-dim);
+    text-decoration: none;
+    font-size: 13px;
+    transition: color 0.15s;
+    cursor: pointer;
+  }
+
+  .nav-link:hover {
+    color: var(--accent);
+  }
+
+  .nav-link.active {
+    color: var(--accent);
+  }
+
+  .nav-num {
+    display: inline-block;
+    width: 24px;
+    color: var(--ink-faint);
+    font-family: var(--font-mono);
+    font-size: 11px;
+  }
+
+  .nav-link.cp .nav-num {
+    color: var(--warn);
+  }
+
+  /* === MAIN === */
+  .main {
+    padding: 48px 64px 120px;
+    max-width: 1100px;
+  }
+
+  /* === HEADER === */
+  .header {
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 32px;
+    margin-bottom: 48px;
+    position: relative;
+  }
+
+  .header-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-bright);
+    padding: 6px 12px;
+    border-radius: 2px;
+    font-size: 11px;
+    color: var(--accent);
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    margin-bottom: 24px;
+  }
+
+  .header-tag::before {
+    content: '';
+    width: 6px;
+    height: 6px;
+    background: var(--accent);
+    border-radius: 50%;
+    animation: pulse 2s infinite;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+  }
+
+  h1 {
+    font-family: var(--font-display);
+    font-size: clamp(36px, 5vw, 56px);
+    font-weight: 800;
+    line-height: 1.05;
+    letter-spacing: -0.03em;
+    margin-bottom: 16px;
+    color: var(--ink);
+  }
+
+  h1 em {
+    font-family: var(--font-serif);
+    font-style: italic;
+    font-weight: 400;
+    color: var(--accent);
+  }
+
+  .subtitle {
+    font-size: 16px;
+    color: var(--ink-dim);
+    font-family: var(--font-mono);
+    max-width: 700px;
+  }
+
+  .meta-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 16px;
+    margin-top: 32px;
+    padding: 24px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 2px;
+  }
+
+  .meta-item {
+    border-left: 2px solid var(--accent);
+    padding-left: 12px;
+  }
+
+  .meta-label {
+    font-size: 10px;
+    color: var(--ink-faint);
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    margin-bottom: 4px;
+  }
+
+  .meta-value {
+    font-size: 13px;
+    color: var(--ink);
+  }
+
+  /* === SECTIONS === */
+  section {
+    margin-bottom: 64px;
+    scroll-margin-top: 32px;
+  }
+
+  h2 {
+    font-family: var(--font-display);
+    font-size: 32px;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+    margin-bottom: 24px;
+    color: var(--ink);
+    display: flex;
+    align-items: baseline;
+    gap: 16px;
+  }
+
+  h2 .section-num {
+    font-family: var(--font-mono);
+    font-size: 14px;
+    color: var(--accent);
+    font-weight: 500;
+  }
+
+  h3 {
+    font-family: var(--font-display);
+    font-size: 20px;
+    font-weight: 600;
+    color: var(--ink);
+    margin: 32px 0 16px;
+    letter-spacing: -0.01em;
+  }
+
+  h4 {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--accent);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    margin: 24px 0 12px;
+  }
+
+  p {
+    margin-bottom: 16px;
+    color: var(--ink);
+  }
+
+  /* === PHASES === */
+  .phase {
+    border: 1px solid var(--border);
+    background: var(--bg-card);
+    margin-bottom: 16px;
+    overflow: hidden;
+    transition: border-color 0.2s;
+  }
+
+  .phase:hover {
+    border-color: var(--border-bright);
+  }
+
+  .phase-header {
+    padding: 20px 24px;
+    cursor: pointer;
+    display: grid;
+    grid-template-columns: 60px 1fr auto auto;
+    align-items: center;
+    gap: 20px;
+    user-select: none;
+  }
+
+  .phase-num {
+    font-family: var(--font-display);
+    font-size: 36px;
+    font-weight: 800;
+    color: var(--accent);
+    line-height: 1;
+  }
+
+  .phase.cp .phase-num {
+    color: var(--warn);
+  }
+
+  .phase-info h3 {
+    margin: 0 0 4px;
+    font-size: 17px;
+  }
+
+  .phase-desc {
+    font-size: 12px;
+    color: var(--ink-dim);
+  }
+
+  .phase-time {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--ink-dim);
+    padding: 4px 10px;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    white-space: nowrap;
+  }
+
+  .phase-toggle {
+    width: 24px;
+    height: 24px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--ink-dim);
+    transition: transform 0.2s;
+  }
+
+  .phase.open .phase-toggle {
+    transform: rotate(180deg);
+  }
+
+  .phase-body {
+    padding: 0 24px;
+    max-height: 0;
+    overflow: hidden;
+    transition: max-height 0.3s ease, padding 0.3s ease;
+    border-top: 1px solid transparent;
+  }
+
+  .phase.open .phase-body {
+    padding: 24px;
+    max-height: 5000px;
+    border-top: 1px solid var(--border);
+  }
+
+  /* === CHECKPOINT BADGE === */
+  .cp-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    background: rgba(255, 180, 84, 0.1);
+    border: 1px solid var(--warn);
+    color: var(--warn);
+    font-size: 10px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    border-radius: 2px;
+  }
+
+  .cp-badge.done {
+    background: rgba(127, 255, 156, 0.1);
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  /* === CODE BLOCKS === */
+  pre {
+    background: #060906;
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    padding: 16px 20px;
+    margin: 16px 0;
+    overflow-x: auto;
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    line-height: 1.7;
+    color: var(--ink);
+    border-radius: 2px;
+    position: relative;
+  }
+
+  pre::before {
+    content: 'BASH';
+    position: absolute;
+    top: 8px;
+    right: 12px;
+    font-size: 9px;
+    color: var(--ink-faint);
+    letter-spacing: 0.15em;
+  }
+
+  pre.python::before { content: 'PYTHON'; }
+  pre.text::before { content: ''; }
+  pre.text { border-left-color: var(--ink-faint); }
+
+  code {
+    font-family: var(--font-mono);
+    background: var(--bg-elevated);
+    padding: 2px 6px;
+    font-size: 12.5px;
+    color: var(--accent);
+    border-radius: 2px;
+  }
+
+  pre code {
+    background: transparent;
+    padding: 0;
+    color: var(--ink);
+  }
+
+  /* Syntax highlighting */
+  .kw { color: #ff79c6; }
+  .str { color: #f1fa8c; }
+  .com { color: var(--ink-faint); font-style: italic; }
+  .num { color: #bd93f9; }
+  .fn { color: #50fa7b; }
+  .var { color: #8be9fd; }
+  .op { color: #ff79c6; }
+  .cmd { color: var(--accent); }
+  .flag { color: var(--warn); }
+  .path { color: var(--info); }
+
+  /* === TABLES === */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0;
+    font-size: 12.5px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+  }
+
+  th {
+    text-align: left;
+    padding: 12px 16px;
+    background: var(--bg-elevated);
+    border-bottom: 1px solid var(--border-bright);
+    color: var(--accent);
+    font-weight: 500;
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+  }
+
+  td {
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    color: var(--ink);
+    vertical-align: top;
+  }
+
+  td:first-child {
+    color: var(--ink-dim);
+    font-family: var(--font-mono);
+  }
+
+  tr:last-child td {
+    border-bottom: none;
+  }
+
+  tr:hover td {
+    background: rgba(127, 255, 156, 0.02);
+  }
+
+  /* === LISTS === */
+  ul, ol {
+    margin: 12px 0 16px 20px;
+    color: var(--ink);
+  }
+
+  li {
+    margin-bottom: 6px;
+  }
+
+  ul li::marker {
+    color: var(--accent);
+  }
+
+  /* === CALLOUTS === */
+  .callout {
+    padding: 20px 24px;
+    margin: 20px 0;
+    border-left: 3px solid var(--accent);
+    background: var(--bg-card);
+    border-radius: 2px;
+  }
+
+  .callout.warn { border-left-color: var(--warn); }
+  .callout.critical { border-left-color: var(--critical); background: rgba(255, 95, 86, 0.05); }
+  .callout.info { border-left-color: var(--info); }
+
+  .callout-title {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 8px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .callout.warn .callout-title { color: var(--warn); }
+  .callout.critical .callout-title { color: var(--critical); }
+  .callout.info .callout-title { color: var(--info); }
+
+  /* === STATS CARDS === */
+  .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 12px;
+    margin: 24px 0;
+  }
+
+  .stat-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    padding: 20px;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .stat-card::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 1px;
+    background: linear-gradient(90deg, var(--accent), transparent);
+  }
+
+  .stat-label {
+    font-size: 10px;
+    color: var(--ink-faint);
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    margin-bottom: 8px;
+  }
+
+  .stat-value {
+    font-family: var(--font-display);
+    font-size: 28px;
+    font-weight: 800;
+    color: var(--accent);
+    line-height: 1;
+    letter-spacing: -0.02em;
+  }
+
+  .stat-unit {
+    font-size: 12px;
+    color: var(--ink-dim);
+    margin-left: 4px;
+  }
+
+  /* === CHECKPOINT TIMELINE === */
+  .timeline {
+    margin: 32px 0;
+    padding: 24px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 2px;
+  }
+
+  .timeline-row {
+    display: grid;
+    grid-template-columns: 100px 1fr 2fr;
+    gap: 20px;
+    padding: 12px 0;
+    border-bottom: 1px dashed var(--border);
+    align-items: center;
+  }
+
+  .timeline-row:last-child { border-bottom: none; }
+
+  .timeline-id {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--warn);
+  }
+
+  .timeline-id.done {
+    color: var(--accent);
+  }
+
+  .timeline-when {
+    font-size: 12px;
+    color: var(--ink-dim);
+  }
+
+  .timeline-desc {
+    font-size: 13px;
+  }
+
+  /* === DIAGRAM === */
+  .ascii-diagram {
+    background: #060906;
+    border: 1px solid var(--border);
+    padding: 20px;
+    margin: 20px 0;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    line-height: 1.5;
+    overflow-x: auto;
+    color: var(--accent);
+    white-space: pre;
+    border-radius: 2px;
+  }
+
+  /* === STATUS DOTS === */
+  .status-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-right: 6px;
+  }
+
+  .status-dot.done { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+  .status-dot.pending { background: var(--warn); }
+  .status-dot.critical { background: var(--critical); }
+
+  /* === FOOTER === */
+  .footer {
+    margin-top: 80px;
+    padding-top: 32px;
+    border-top: 1px solid var(--border);
+    color: var(--ink-faint);
+    font-size: 12px;
+    display: flex;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 16px;
+  }
+
+  /* === SCROLLBAR === */
+  body::-webkit-scrollbar { width: 8px; }
+  body::-webkit-scrollbar-track { background: var(--bg); }
+  body::-webkit-scrollbar-thumb { background: var(--border-bright); border-radius: 4px; }
+
+  /* === MOBILE === */
+  @media (max-width: 1024px) {
+    .layout { grid-template-columns: 1fr; }
+    .sidebar { display: none; }
+    .main { padding: 24px; }
+  }
+
+  /* === DECORATIVE === */
+  .crosshair {
+    position: fixed;
+    pointer-events: none;
+    color: var(--accent);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    opacity: 0.3;
+  }
+  .crosshair.tl { top: 8px; left: 8px; }
+  .crosshair.tr { top: 8px; right: 8px; }
+  .crosshair.bl { bottom: 8px; left: 8px; }
+  .crosshair.br { bottom: 8px; right: 8px; }
+
+  .scan-line {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, var(--accent), transparent);
+    opacity: 0.3;
+    z-index: 1000;
+    animation: scan 8s linear infinite;
+  }
+
+  @keyframes scan {
+    0% { transform: translateY(0); }
+    100% { transform: translateY(-100vh); }
+  }
+</style>
+</head>
+<body>
+
+<div class="crosshair tl">+ N 21°1'42"</div>
+<div class="crosshair tr">+ E 105°51'15"</div>
+<div class="crosshair bl">+ BRIDGELLM-02</div>
+<div class="crosshair br">+ RTX 5090 / 32GB</div>
+
+<div class="layout">
+
+  <!-- ============ SIDEBAR ============ -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">/// Engineering Plan</div>
+      <div class="brand-title">Motion Transfer<br>Pipeline</div>
+      <div class="brand-version">v1.1 · 2026-05-23</div>
+    </div>
+
+    <div class="nav-section">
+      <div class="nav-section-title">Overview</div>
+      <ul class="nav-list">
+        <li><a href="#overview" class="nav-link"><span class="nav-num">001</span> Project Info</a></li>
+        <li><a href="#principles" class="nav-link"><span class="nav-num">002</span> Design Principles</a></li>
+        <li><a href="#rules" class="nav-link"><span class="nav-num">003</span> Critical Rules</a></li>
+        <li><a href="#architecture" class="nav-link"><span class="nav-num">004</span> Architecture</a></li>
+      </ul>
+    </div>
+
+    <div class="nav-section">
+      <div class="nav-section-title">Phases</div>
+      <ul class="nav-list">
+        <li><a href="#phase-0" class="nav-link"><span class="nav-num">P0</span> Pre-flight</a></li>
+        <li><a href="#phase-1" class="nav-link"><span class="nav-num">P1</span> System Deps</a></li>
+        <li><a href="#phase-2" class="nav-link"><span class="nav-num">P2</span> CUDA Setup</a></li>
+        <li><a href="#phase-3" class="nav-link"><span class="nav-num">P3</span> ComfyUI Install</a></li>
+        <li><a href="#phase-4" class="nav-link cp"><span class="nav-num">P4</span> PyTorch ★ CP2</a></li>
+        <li><a href="#phase-5" class="nav-link"><span class="nav-num">P5</span> Extensions</a></li>
+        <li><a href="#phase-6" class="nav-link"><span class="nav-num">P6</span> Helper Scripts</a></li>
+        <li><a href="#phase-7" class="nav-link cp"><span class="nav-num">P7</span> Models ★ CP3</a></li>
+        <li><a href="#phase-8" class="nav-link cp"><span class="nav-num">P8</span> Test/Prod ★ CP4</a></li>
+      </ul>
+    </div>
+
+    <div class="nav-section">
+      <div class="nav-section-title">Reference</div>
+      <ul class="nav-list">
+        <li><a href="#workflows" class="nav-link"><span class="nav-num">REF</span> Workflows</a></li>
+        <li><a href="#audio" class="nav-link"><span class="nav-num">REF</span> Audio Handling</a></li>
+        <li><a href="#risks" class="nav-link"><span class="nav-num">REF</span> Risk Register</a></li>
+        <li><a href="#checkpoints" class="nav-link"><span class="nav-num">REF</span> Checkpoints</a></li>
+        <li><a href="#daily" class="nav-link"><span class="nav-num">REF</span> Daily Ops</a></li>
+        <li><a href="#deliverables" class="nav-link"><span class="nav-num">REF</span> Deliverables</a></li>
+      </ul>
+    </div>
+  </aside>
+
+  <!-- ============ MAIN ============ -->
+  <main class="main">
+
+    <!-- ===== HEADER ===== -->
+    <header class="header" id="overview">
+      <div class="header-tag">System Online · Plan Approved</div>
+      <h1>Motion Transfer<br><em>Pipeline</em></h1>
+      <p class="subtitle">
+        Engineering plan for ComfyUI + Wan 2.2 Animate setup.<br>
+        Target: video 720p/1080p ≤ 30s with audio passthrough.
+      </p>
+
+      <div class="meta-grid">
+        <div class="meta-item">
+          <div class="meta-label">Hardware</div>
+          <div class="meta-value">RTX 5090 · 32GB VRAM</div>
+        </div>
+        <div class="meta-item">
+          <div class="meta-label">CPU / RAM</div>
+          <div class="meta-value">i7-14700K · 62GB</div>
+        </div>
+        <div class="meta-item">
+          <div class="meta-label">Operating System</div>
+          <div class="meta-value">Ubuntu 24.04.4 LTS</div>
+        </div>
+        <div class="meta-item">
+          <div class="meta-label">Co-Tenant</div>
+          <div class="meta-value">Ollama (manual unload)</div>
+        </div>
+        <div class="meta-item">
+          <div class="meta-label">Storage</div>
+          <div class="meta-value">1.6TB free · 3.4 GB/s</div>
+        </div>
+        <div class="meta-item">
+          <div class="meta-label">Total Time</div>
+          <div class="meta-value">2.5 – 5 hours</div>
+        </div>
+      </div>
+
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-label">Phases</div>
+          <div class="stat-value">8<span class="stat-unit">stages</span></div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Checkpoints</div>
+          <div class="stat-value">5<span class="stat-unit">gates</span></div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Workflows</div>
+          <div class="stat-value">8<span class="stat-unit">JSON files</span></div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Helper Scripts</div>
+          <div class="stat-value">5<span class="stat-unit">bash</span></div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Models</div>
+          <div class="stat-value">~22<span class="stat-unit">GB</span></div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Risks Tracked</div>
+          <div class="stat-value">14<span class="stat-unit">items</span></div>
+        </div>
+      </div>
+    </header>
+
+    <!-- ===== DESIGN PRINCIPLES ===== -->
+    <section id="principles">
+      <h2><span class="section-num">002</span> Design Principles</h2>
+
+      <table>
+        <tr>
+          <th width="40">#</th>
+          <th>Principle</th>
+          <th>Rationale</th>
+        </tr>
+        <tr>
+          <td>01</td>
+          <td><strong>Manual GPU Control</strong></td>
+          <td>User decides when to unload Ollama. No auto-orchestration.</td>
+        </tr>
+        <tr>
+          <td>02</td>
+          <td><strong>Isolation</strong></td>
+          <td>ComfyUI in own venv. No system Python pollution.</td>
+        </tr>
+        <tr>
+          <td>03</td>
+          <td><strong>Reproducibility</strong></td>
+          <td>All config in scripts. Can rebuild from scratch.</td>
+        </tr>
+        <tr>
+          <td>04</td>
+          <td><strong>Safety First</strong></td>
+          <td>Verify each phase before proceeding.</td>
+        </tr>
+        <tr>
+          <td>05</td>
+          <td><strong>Simplicity Bias</strong></td>
+          <td>No over-engineering. Web UI as primary interface.</td>
+        </tr>
+      </table>
+    </section>
+
+    <!-- ===== CRITICAL RULES ===== -->
+    <section id="rules">
+      <h2><span class="section-num">003</span> Critical Rules</h2>
+
+      <div class="callout critical">
+        <div class="callout-title">▲ Rule 01 · Ollama Unload (Manual)</div>
+        <p>BẮT BUỘC trước mỗi workflow:</p>
+        <pre class="text">1. Check VRAM với vram-check.sh
+2. Nếu &lt; 28GB free → ollama-free.sh
+3. Verify lại VRAM
+4. Mới start ComfyUI</pre>
+      </div>
+
+      <div class="callout critical">
+        <div class="callout-title">▲ Rule 02 · PyTorch Compute Capability</div>
+        <p>Sau mỗi lần install/update PyTorch hoặc custom nodes:</p>
+        <pre class="python"><span class="var">torch</span>.<span class="fn">cuda</span>.<span class="fn">get_device_capability</span>(<span class="num">0</span>) <span class="op">==</span> (<span class="num">12</span>, <span class="num">0</span>)</pre>
+        <p>Nếu không phải <code>(12, 0)</code> → PyTorch sai version, ComfyUI sẽ crash.</p>
+      </div>
+
+      <div class="callout critical">
+        <div class="callout-title">▲ Rule 03 · Audio Passthrough</div>
+        <p>Output video PHẢI có audio từ source:</p>
+        <ul>
+          <li>Test workflows (5s): ComfyUI native (VHS nodes)</li>
+          <li>Production workflows (30s): FFmpeg post-merge via <code>audio-merge.sh</code></li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- ===== ARCHITECTURE ===== -->
+    <section id="architecture">
+      <h2><span class="section-num">004</span> Architecture</h2>
+
+      <h3>Directory Structure</h3>
+      <pre class="text">~/ai/
+├── ComfyUI/                              # Main application
+│   ├── venv/                             # Python 3.12 isolated env
+│   ├── custom_nodes/                     # 6 extensions
+│   ├── models/                           # ~22GB models
+│   │   ├── diffusion_models/             # Wan 2.2 Animate (14GB)
+│   │   ├── text_encoders/                # UMT5 (6.7GB)
+│   │   ├── vae/                          # 250MB
+│   │   ├── clip_vision/                  # 1.2GB
+│   │   └── loras/                        # Relight + CausVid
+│   ├── input/                            # Source materials
+│   ├── output/                           # Generated videos
+│   └── main.py
+│
+├── scripts/                              # 5 helper bash scripts
+├── workflows/                            # 8 workflow JSON files
+│   └── variants/                         # 4 variants
+├── sources/                              # Input images & videos
+├── outputs/                              # Final processed videos
+├── logs/                                 # Runtime logs
+└── PLAN.md / PLAN.html                   # Documentation</pre>
+
+      <h3>Component Diagram</h3>
+      <div class="ascii-diagram">┌─────────────────────────────────────────────────────────────┐
+│                      RTX 5090 (32 GB VRAM)                   │
+│                                                              │
+│  ┌──────────────┐         ┌────────────────────────────┐   │
+│  │   Ollama     │         │   ComfyUI                  │   │
+│  │   (15 GB)    │  ←─→    │   (28 GB peak)             │   │
+│  │              │  MUTEX  │                            │   │
+│  └──────────────┘         │   ┌──────────────────────┐ │   │
+│                           │   │ Wan 2.2 Animate FP8  │ │   │
+│                           │   │  + UMT5 + VAE + CLIP │ │   │
+│                           │   └──────────────────────┘ │   │
+│                           └────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+        ↑                              ↑
+        │ Port 11434                   │ Port 8188
+        ↓                              ↓
+   ┌──────────┐                   ┌──────────────┐
+   │  Other   │                   │   Browser    │
+   │  apps    │                   │ (LAN access) │
+   └──────────┘                   └──────────────┘</div>
+
+      <h3>Pipeline Flow (with Audio)</h3>
+      <div class="ascii-diagram">INPUT
+─────
+📷 reference_image.jpg
+🎬 motion_video.mp4 ──┬──→ frames (video stream)
+                     └──→ audio (passthrough) ──┐
+                                                 │
+┌────────────────────────────────────────┐      │
+│  ComfyUI + Wan 2.2 Animate             │      │
+│                                        │      │
+│  frames + ref_image                    │      │
+│       ↓                                │      │
+│  [Wan 2.2 Animate]                     │      │
+│       ↓                                │      │
+│  generated_frames (silent)             │      │
+│       ↓                                │      │
+│  [RIFE 2x interpolation]               │      │
+│       ↓                                │      │
+│  output_silent.mp4 ──┐                 │      │
+└──────────────────────│─────────────────┘      │
+                       ↓                        ↓
+       ┌──────────────────────────────────────────┐
+       │      FFmpeg Audio Merger                  │
+       │      (audio-merge.sh)                     │
+       └──────────────────────────────────────────┘
+                       ↓
+OUTPUT
+──────
+🎬 output_final.mp4 (video + audio)</div>
+
+      <h3>Software Stack</h3>
+      <table>
+        <tr><th>Layer</th><th>Component</th><th>Version</th><th>Status</th></tr>
+        <tr><td>OS</td><td>Ubuntu</td><td>24.04.4 LTS</td><td><span class="status-dot done"></span>Đã có</td></tr>
+        <tr><td>Driver</td><td>NVIDIA</td><td>595.71.05</td><td><span class="status-dot done"></span>Đã có</td></tr>
+        <tr><td>CUDA System</td><td>CUDA Toolkit</td><td>13.2</td><td><span class="status-dot done"></span>Đã có</td></tr>
+        <tr><td>CUDA Runtime</td><td>(PyTorch built-in)</td><td>12.8</td><td><span class="status-dot pending"></span>Sẽ cài</td></tr>
+        <tr><td>Python</td><td>Python</td><td>3.12.3</td><td><span class="status-dot done"></span>Đã có</td></tr>
+        <tr><td>ML Framework</td><td>PyTorch nightly</td><td>2.7.0.dev+cu128</td><td><span class="status-dot pending"></span>Sẽ cài</td></tr>
+        <tr><td>Acceleration</td><td>Triton + SageAttention 2</td><td>Latest</td><td><span class="status-dot pending"></span>Sẽ cài</td></tr>
+        <tr><td>App</td><td>ComfyUI</td><td>Latest main</td><td><span class="status-dot pending"></span>Sẽ cài</td></tr>
+        <tr><td>Extensions</td><td>6 custom nodes</td><td>Latest</td><td><span class="status-dot pending"></span>Sẽ cài</td></tr>
+        <tr><td>Models</td><td>Wan 2.2 Animate FP8</td><td>14B</td><td><span class="status-dot pending"></span>Sẽ tải</td></tr>
+      </table>
+    </section>
+
+    <!-- ===== PHASES ===== -->
+    <section>
+      <h2><span class="section-num">005</span> Execution Phases</h2>
+
+      <!-- PHASE 0 -->
+      <div class="phase" id="phase-0">
+        <div class="phase-header" onclick="togglePhase(this)">
+          <div class="phase-num">00</div>
+          <div class="phase-info">
+            <h3>Pre-flight Check</h3>
+            <div class="phase-desc">Verify môi trường trước khi cài đặt</div>
+          </div>
+          <div class="phase-time">15 min</div>
+          <div class="phase-toggle">▼</div>
+        </div>
+        <div class="phase-body">
+          <h4>Objectives</h4>
+          <ul>
+            <li>Test internet speed từ 3 sources (Speedtest, HuggingFace, GitHub)</li>
+            <li>Verify CUDA 13.2 và nvcc</li>
+            <li>Verify Ollama API responsive</li>
+            <li>Tạo skeleton directory <code>~/ai/</code></li>
+            <li>Verify tmux installed</li>
+          </ul>
+
+          <h4>Acceptance</h4>
+          <ul>
+            <li>✅ Internet ≥ 1 MB/s từ ít nhất 1 source</li>
+            <li>✅ <code>nvcc --version</code> works</li>
+            <li>✅ Ollama API returns 200 OK</li>
+            <li>✅ Directory tree created</li>
+          </ul>
+
+          <h4>Commands (Internet Test)</h4>
+          <pre><span class="com"># Test 1: Speedtest 10MB</span>
+<span class="cmd">curl</span> -o /dev/null -w <span class="str">"Speed: %{speed_download} B/s\n"</span> \
+  --max-time <span class="num">60</span> http://speedtest.tele2.net/10MB.zip
+
+<span class="com"># Test 2: HuggingFace</span>
+<span class="cmd">curl</span> -o /tmp/test.bin -w <span class="str">"Speed: %{speed_download} B/s\n"</span> \
+  --max-time <span class="num">30</span> https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Wan2_1_VAE_bf16.safetensors
+
+<span class="com"># Test 3: GitHub</span>
+<span class="cmd">curl</span> -o /dev/null -w <span class="str">"Speed: %{speed_download} B/s\n"</span> \
+  https://github.com/comfyanonymous/ComfyUI/archive/refs/heads/master.zip</pre>
+
+          <h4>Commands (CUDA & Ollama)</h4>
+          <pre><span class="com"># CUDA</span>
+<span class="cmd">ls</span> -la /usr/local/cuda/bin/nvcc
+/usr/local/cuda/bin/nvcc --version
+
+<span class="com"># Ollama</span>
+<span class="cmd">curl</span> -s http://localhost:11434/api/version
+<span class="cmd">curl</span> -s http://localhost:11434/api/ps | python3 -m json.tool
+
+<span class="com"># Directory</span>
+<span class="cmd">mkdir</span> -p ~/ai/{scripts,workflows,workflows/variants,outputs,logs,sources}</pre>
+        </div>
+      </div>
+
+      <!-- PHASE 1 -->
+      <div class="phase" id="phase-1">
+        <div class="phase-header" onclick="togglePhase(this)">
+          <div class="phase-num">01</div>
+          <div class="phase-info">
+            <h3>System Dependencies</h3>
+            <div class="phase-desc">Cài packages OS cần thiết</div>
+          </div>
+          <div class="phase-time">5 min</div>
+          <div class="phase-toggle">▼</div>
+        </div>
+        <div class="phase-body">
+          <h4>Packages</h4>
+          <p><code>ffmpeg</code>, <code>cmake</code>, <code>build-essential</code>, <code>python3.12-venv</code>, <code>python3.12-dev</code>, <code>libgl1</code>, <code>libglib2.0-0</code>, <code>libsm6</code>, <code>libxext6</code>, <code>libxrender-dev</code>, <code>libgomp1</code>, <code>wget</code>, <code>curl</code>, <code>htop</code>, <code>nvtop</code>, <code>tmux</code>, <code>aria2</code>, <code>jq</code>, <code>bc</code></p>
+
+          <h4>Commands</h4>
+          <pre><span class="cmd">sudo</span> apt update
+<span class="cmd">sudo</span> apt install -y \
+  ffmpeg cmake build-essential \
+  python3.12-venv python3.12-dev python3-pip \
+  libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev libgomp1 \
+  wget curl htop nvtop tmux aria2 jq bc</pre>
+
+          <h4>Verify</h4>
+          <pre><span class="cmd">ffmpeg</span> -version | head -1
+<span class="cmd">cmake</span> --version | head -1
+<span class="cmd">nvtop</span> --version
+<span class="cmd">aria2c</span> --version | head -1</pre>
+        </div>
+      </div>
+
+      <!-- PHASE 2 -->
+      <div class="phase" id="phase-2">
+        <div class="phase-header" onclick="togglePhase(this)">
+          <div class="phase-num">02</div>
+          <div class="phase-info">
+            <h3>CUDA Environment Setup</h3>
+            <div class="phase-desc">Setup PATH cho CUDA 13.2 đã có sẵn</div>
+          </div>
+          <div class="phase-time">5 min</div>
+          <div class="phase-toggle">▼</div>
+        </div>
+        <div class="phase-body">
+          <div class="callout info">
+            <div class="callout-title">▲ Note</div>
+            <p>System CUDA 13.2 ≠ PyTorch CUDA 12.8 runtime. Hai cái không xung đột. System CUDA chỉ dùng cho compile native libs (SageAttention).</p>
+          </div>
+
+          <h4>Commands</h4>
+          <pre><span class="cmd">cat</span> &gt;&gt; ~/.bashrc &lt;&lt; <span class="str">'EOF'</span>
+
+<span class="com"># === CUDA 13.2 ===</span>
+<span class="kw">export</span> <span class="var">CUDA_HOME</span>=/usr/local/cuda
+<span class="kw">export</span> <span class="var">PATH</span>=<span class="var">$CUDA_HOME</span>/bin:<span class="var">$PATH</span>
+<span class="kw">export</span> <span class="var">LD_LIBRARY_PATH</span>=<span class="var">$CUDA_HOME</span>/lib64:<span class="var">$LD_LIBRARY_PATH</span>
+
+<span class="com"># === ComfyUI helpers ===</span>
+<span class="kw">export</span> <span class="var">HF_HUB_ENABLE_HF_TRANSFER</span>=<span class="num">1</span>
+<span class="kw">alias</span> comfy-vram=<span class="str">'~/ai/scripts/vram-check.sh'</span>
+<span class="kw">alias</span> comfy-free=<span class="str">'~/ai/scripts/ollama-free.sh'</span>
+<span class="kw">alias</span> comfy-start=<span class="str">'~/ai/scripts/comfy-start.sh'</span>
+<span class="kw">alias</span> comfy-stop=<span class="str">'~/ai/scripts/comfy-stop.sh'</span>
+<span class="str">EOF</span>
+
+<span class="cmd">source</span> ~/.bashrc
+<span class="cmd">nvcc</span> --version</pre>
+        </div>
+      </div>
+
+      <!-- PHASE 3 -->
+      <div class="phase" id="phase-3">
+        <div class="phase-header" onclick="togglePhase(this)">
+          <div class="phase-num">03</div>
+          <div class="phase-info">
+            <h3>ComfyUI Base Install</h3>
+            <div class="phase-desc">Clone ComfyUI + tạo Python virtual environment</div>
+          </div>
+          <div class="phase-time">5 min</div>
+          <div class="phase-toggle">▼</div>
+        </div>
+        <div class="phase-body">
+          <h4>Commands</h4>
+          <pre><span class="cmd">cd</span> ~/ai
+<span class="cmd">git</span> clone https://github.com/comfyanonymous/ComfyUI.git
+<span class="cmd">cd</span> ComfyUI
+
+<span class="com"># Tạo venv Python 3.12</span>
+python3.12 -m venv venv
+<span class="cmd">source</span> venv/bin/activate
+
+<span class="com"># Verify isolation</span>
+<span class="cmd">which</span> python  <span class="com"># → ~/ai/ComfyUI/venv/bin/python</span>
+python --version
+
+<span class="com"># Upgrade pip</span>
+pip install --upgrade pip wheel setuptools</pre>
+        </div>
+      </div>
+
+      <!-- PHASE 4 -->
+      <div class="phase cp" id="phase-4">
+        <div class="phase-header" onclick="togglePhase(this)">
+          <div class="phase-num">04</div>
+          <div class="phase-info">
+            <h3>PyTorch nightly cu128 <span class="cp-badge">★ CP2 · Critical</span></h3>
+            <div class="phase-desc">Cài PyTorch hỗ trợ Blackwell sm_120 — phase quan trọng nhất</div>
+          </div>
+          <div class="phase-time">10 min</div>
+          <div class="phase-toggle">▼</div>
+        </div>
+        <div class="phase-body">
+          <div class="callout critical">
+            <div class="callout-title">▲ Critical Checkpoint 2</div>
+            <p>Phase này có thể fail. Verify Phase 1-3 OK trước khi tiếp.</p>
+            <p>Output BẮT BUỘC: <code>Compute capability == (12, 0)</code></p>
+          </div>
+
+          <h4>Install</h4>
+          <pre><span class="cmd">cd</span> ~/ai/ComfyUI
+<span class="cmd">source</span> venv/bin/activate
+
+<span class="com"># Cài PyTorch nightly cu128</span>
+pip install --pre torch torchvision torchaudio \
+  --index-url https://download.pytorch.org/whl/nightly/cu128
+
+<span class="com"># Cài ComfyUI requirements</span>
+pip install -r requirements.txt</pre>
+
+          <h4>Verify (BẮT BUỘC)</h4>
+          <pre class="python">python &lt;&lt; <span class="str">'EOF'</span>
+<span class="kw">import</span> torch
+<span class="kw">print</span>(<span class="str">f'PyTorch:   {torch.__version__}'</span>)
+<span class="kw">print</span>(<span class="str">f'CUDA:      {torch.version.cuda}'</span>)
+<span class="kw">print</span>(<span class="str">f'Available: {torch.cuda.is_available()}'</span>)
+<span class="kw">print</span>(<span class="str">f'Device:    {torch.cuda.get_device_name(0)}'</span>)
+<span class="kw">print</span>(<span class="str">f'Compute:   {torch.cuda.get_device_capability(0)}'</span>)
+<span class="kw">print</span>(<span class="str">f'VRAM:      {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB'</span>)
+
+<span class="com"># Test compute</span>
+x = torch.randn(<span class="num">2000</span>, <span class="num">2000</span>, device=<span class="str">'cuda'</span>)
+y = torch.matmul(x, x)
+<span class="kw">print</span>(<span class="str">f'GPU compute: OK'</span>)
+<span class="str">EOF</span></pre>
+
+          <h4>Expected Output</h4>
+          <pre class="text">PyTorch:   2.7.0.dev...
+CUDA:      12.8
+Available: True
+Device:    NVIDIA GeForce RTX 5090
+Compute:   (12, 0)            ← BẮT BUỘC
+VRAM:      32.61 GB
+GPU compute: OK</pre>
+        </div>
+      </div>
+
+      <!-- PHASE 5 -->
+      <div class="phase" id="phase-5">
+        <div class="phase-header" onclick="togglePhase(this)">
+          <div class="phase-num">05</div>
+          <div class="phase-info">
+            <h3>Extensions (Custom Nodes)</h3>
+            <div class="phase-desc">6 custom nodes + Triton + SageAttention</div>
+          </div>
+          <div class="phase-time">20-30 min</div>
+          <div class="phase-toggle">▼</div>
+        </div>
+        <div class="phase-body">
+          <h4>Install Order</h4>
+          <table>
+            <tr><th>#</th><th>Extension</th><th>Vai trò</th></tr>
+            <tr><td>1</td><td>ComfyUI-Manager</td><td>Quản lý nodes</td></tr>
+            <tr><td>2</td><td>Triton</td><td>Compile attention kernels</td></tr>
+            <tr><td>3</td><td>SageAttention</td><td>Attention nhanh hơn 30-40%</td></tr>
+            <tr><td>4</td><td>ComfyUI-KJNodes</td><td>"Patch Sage Attention" node</td></tr>
+            <tr><td>5</td><td><strong>ComfyUI-WanVideoWrapper</strong></td><td>CORE — Wan model loader</td></tr>
+            <tr><td>6</td><td>ComfyUI-VideoHelperSuite</td><td>Load/save video + audio</td></tr>
+            <tr><td>7</td><td>ComfyUI-Frame-Interpolation</td><td>RIFE smoothing</td></tr>
+            <tr><td>8</td><td>ComfyUI_essentials</td><td>Image preprocessing</td></tr>
+          </table>
+
+          <div class="callout warn">
+            <div class="callout-title">▲ Important</div>
+            <p>Sau khi cài xong tất cả custom nodes, RESTORE PyTorch nightly cu128. Custom nodes thường pin torch version cũ và làm downgrade.</p>
+          </div>
+
+          <h4>Commands (sample)</h4>
+          <pre><span class="cmd">cd</span> ~/ai/ComfyUI/custom_nodes
+
+<span class="cmd">git</span> clone https://github.com/ltdrdata/ComfyUI-Manager.git
+<span class="cmd">git</span> clone https://github.com/kijai/ComfyUI-KJNodes.git
+<span class="cmd">git</span> clone https://github.com/kijai/ComfyUI-WanVideoWrapper.git
+<span class="cmd">git</span> clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git
+<span class="cmd">git</span> clone https://github.com/Fannovel16/ComfyUI-Frame-Interpolation.git
+<span class="cmd">git</span> clone https://github.com/cubiq/ComfyUI_essentials.git
+
+<span class="com"># Triton + SageAttention</span>
+<span class="cmd">cd</span> ~/ai/ComfyUI
+<span class="cmd">source</span> venv/bin/activate
+pip install triton sageattention
+
+<span class="com"># Install requirements cho từng node</span>
+<span class="kw">for</span> dir <span class="kw">in</span> custom_nodes/*/; <span class="kw">do</span>
+  <span class="kw">if</span> [ -f <span class="str">"$dir/requirements.txt"</span> ]; <span class="kw">then</span>
+    pip install -r <span class="str">"$dir/requirements.txt"</span>
+  <span class="kw">fi</span>
+<span class="kw">done</span>
+
+<span class="com"># ★ RESTORE PyTorch</span>
+pip install --pre --upgrade torch torchvision torchaudio \
+  --index-url https://download.pytorch.org/whl/nightly/cu128
+
+<span class="com"># Re-verify</span>
+python -c <span class="str">"import torch; print(torch.cuda.get_device_capability(0))"</span></pre>
+        </div>
+      </div>
+
+      <!-- PHASE 6 -->
+      <div class="phase" id="phase-6">
+        <div class="phase-header" onclick="togglePhase(this)">
+          <div class="phase-num">06</div>
+          <div class="phase-info">
+            <h3>Helper Scripts</h3>
+            <div class="phase-desc">5 scripts hỗ trợ daily workflow</div>
+          </div>
+          <div class="phase-time">15 min</div>
+          <div class="phase-toggle">▼</div>
+        </div>
+        <div class="phase-body">
+          <h4>Scripts</h4>
+          <table>
+            <tr><th>Script</th><th>Purpose</th></tr>
+            <tr><td><code>vram-check.sh</code></td><td>Check VRAM ≥ 28GB free</td></tr>
+            <tr><td><code>ollama-free.sh</code></td><td>Unload Ollama (3 fallback methods)</td></tr>
+            <tr><td><code>comfy-start.sh</code></td><td>Start ComfyUI với auto pre-check</td></tr>
+            <tr><td><code>comfy-stop.sh</code></td><td>Stop ComfyUI + optional Ollama restart</td></tr>
+            <tr><td><code>audio-merge.sh</code> ★</td><td>Merge audio source → silent video</td></tr>
+          </table>
+
+          <h4>Philosophy</h4>
+          <p>Scripts là <strong>tool support</strong>, không phải auto-orchestration. User vẫn kiểm soát quyết định.</p>
+
+          <h4>Audio Merge Script Spec</h4>
+          <pre><span class="cmd">audio-merge.sh</span> &lt;source_video&gt; &lt;silent_video&gt; &lt;output_video&gt;
+
+<span class="com"># Behavior:</span>
+<span class="com"># 1. Extract audio from source</span>
+<span class="com"># 2. If no audio → copy silent as output, log warning</span>
+<span class="com"># 3. Merge audio + silent video</span>
+<span class="com"># 4. Handle duration mismatch (-shortest)</span>
+<span class="com"># 5. Preserve audio quality (-c:a aac -b:a 192k)</span></pre>
+        </div>
+      </div>
+
+      <!-- PHASE 7 -->
+      <div class="phase cp" id="phase-7">
+        <div class="phase-header" onclick="togglePhase(this)">
+          <div class="phase-num">07</div>
+          <div class="phase-info">
+            <h3>Download Models <span class="cp-badge">★ CP3</span></h3>
+            <div class="phase-desc">~22GB models với resume capability</div>
+          </div>
+          <div class="phase-time">30 min — 3 hrs</div>
+          <div class="phase-toggle">▼</div>
+        </div>
+        <div class="phase-body">
+          <div class="callout warn">
+            <div class="callout-title">▲ Checkpoint 3</div>
+            <p>Verify internet speed adequate trước khi tải. Test cho thấy 706 B/s (suspicious). Cần test thật ở Phase 0 và confirm trước khi vào Phase 7.</p>
+          </div>
+
+          <h4>Required Models</h4>
+          <table>
+            <tr><th>File</th><th>Size</th><th>Folder</th></tr>
+            <tr><td>Wan2_2-Animate-14B_fp8_e4m3fn_scaled_KJ.safetensors</td><td>14 GB</td><td>diffusion_models/</td></tr>
+            <tr><td>umt5-xxl-enc-bf16.safetensors</td><td>6.7 GB</td><td>text_encoders/</td></tr>
+            <tr><td>Wan2_1_VAE_bf16.safetensors</td><td>250 MB</td><td>vae/</td></tr>
+            <tr><td>clip_vision_h.safetensors</td><td>1.2 GB</td><td>clip_vision/</td></tr>
+            <tr><td>Wan22Animate_relight_lora_fp16.safetensors</td><td>500 MB</td><td>loras/</td></tr>
+          </table>
+
+          <h4>Optional (cho fast mode)</h4>
+          <table>
+            <tr><th>File</th><th>Size</th><th>Folder</th></tr>
+            <tr><td>Wan21_CausVid_14B_T2V_lora_rank32.safetensors</td><td>600 MB</td><td>loras/</td></tr>
+          </table>
+
+          <h4>Strategy</h4>
+          <ul>
+            <li><code>hf_transfer</code> cho multi-thread download</li>
+            <li><code>tmux</code> để không mất khi disconnect SSH</li>
+            <li>Parallel download (5 files cùng lúc)</li>
+            <li>Auto-resume khi network drop</li>
+          </ul>
+
+          <h4>Commands</h4>
+          <pre><span class="cmd">tmux</span> new -s download
+
+<span class="com"># Inside tmux:</span>
+<span class="cmd">cd</span> ~/ai/ComfyUI/models
+<span class="cmd">source</span> ~/ai/ComfyUI/venv/bin/activate
+<span class="kw">export</span> <span class="var">HF_HUB_ENABLE_HF_TRANSFER</span>=<span class="num">1</span>
+
+<span class="cmd">huggingface-cli</span> download Kijai/WanVideo_comfy \
+  Wan2_2-Animate-14B_fp8_e4m3fn_scaled_KJ.safetensors \
+  --local-dir diffusion_models &amp;
+<span class="cmd">huggingface-cli</span> download Kijai/WanVideo_comfy \
+  umt5-xxl-enc-bf16.safetensors \
+  --local-dir text_encoders &amp;
+<span class="cmd">huggingface-cli</span> download Kijai/WanVideo_comfy \
+  Wan2_1_VAE_bf16.safetensors --local-dir vae &amp;
+<span class="cmd">huggingface-cli</span> download Kijai/WanVideo_comfy \
+  clip_vision_h.safetensors --local-dir clip_vision &amp;
+<span class="cmd">huggingface-cli</span> download Kijai/WanVideo_comfy \
+  Wan22Animate_relight_lora_fp16.safetensors --local-dir loras &amp;
+
+<span class="kw">wait</span>
+<span class="cmd">echo</span> <span class="str">"All downloads complete!"</span></pre>
+        </div>
+      </div>
+
+      <!-- PHASE 8 -->
+      <div class="phase cp" id="phase-8">
+        <div class="phase-header" onclick="togglePhase(this)">
+          <div class="phase-num">08</div>
+          <div class="phase-info">
+            <h3>Test & Production <span class="cp-badge">★ CP4 → CP5</span></h3>
+            <div class="phase-desc">Validate pipeline từ test 5s đến production 30s</div>
+          </div>
+          <div class="phase-time">1.5 — 2.5 hrs</div>
+          <div class="phase-toggle">▼</div>
+        </div>
+        <div class="phase-body">
+          <div class="callout warn">
+            <div class="callout-title">▲ Checkpoint 4</div>
+            <p>Confirm test 5s working OK trước khi run production 30s. Tránh waste compute nếu workflow có vấn đề.</p>
+          </div>
+
+          <h4>Sub-phases</h4>
+          <table>
+            <tr><th>#</th><th>Test</th><th>Purpose</th><th>Time</th></tr>
+            <tr><td>8.1</td><td>Prepare inputs</td><td>Setup ~/ai/sources/</td><td>5 min</td></tr>
+            <tr><td>8.2</td><td>Smoke test 5s/480p</td><td>End-to-end pipeline</td><td>1-2 min</td></tr>
+            <tr><td>8.3</td><td>Quality test 5s/720p</td><td>Visual quality check</td><td>3-5 min</td></tr>
+            <tr><td>8.4</td><td>Audio sync verify</td><td>Confirm audio passthrough</td><td>5 min</td></tr>
+            <tr><td>8.5</td><td>Production 30s/720p</td><td>Context windowing</td><td>15-25 min</td></tr>
+            <tr><td>8.6</td><td>Optional 30s/1080p</td><td>Full HD production</td><td>35-50 min</td></tr>
+            <tr><td>8.7</td><td>Test variants 05-08</td><td>All workflow types</td><td>30-60 min</td></tr>
+          </table>
+
+          <h4>Production Pipeline Example</h4>
+          <pre><span class="com"># 1. Start ComfyUI</span>
+~/ai/scripts/comfy-start.sh
+
+<span class="com"># 2. Trong browser: http://localhost:8188</span>
+<span class="com">#    → Load 03-prod-30s-720p.json</span>
+<span class="com">#    → Set inputs</span>
+<span class="com">#    → Queue Prompt</span>
+<span class="com">#    → Wait 15-25 min</span>
+
+<span class="com"># 3. Merge audio</span>
+~/ai/scripts/audio-merge.sh \
+  ~/ai/sources/videos/motion_30s.mp4 \
+  ~/ai/ComfyUI/output/wan_animate_silent.mp4 \
+  ~/ai/outputs/final_30s_720p.mp4</pre>
+
+          <div class="callout">
+            <div class="callout-title">▲ Checkpoint 5 · Final Review</div>
+            <p>After all tests pass: sign-off, document lessons learned, finalize maintenance plan.</p>
+          </div>
+        </div>
+      </div>
+
+    </section>
+
+    <!-- ===== WORKFLOWS ===== -->
+    <section id="workflows">
+      <h2><span class="section-num">006</span> Workflows Matrix</h2>
+
+      <h3>Core Workflows (4)</h3>
+      <table>
+        <tr><th>#</th><th>File</th><th>Duration</th><th>Resolution</th><th>Time</th></tr>
+        <tr><td>01</td><td>test-5s-480p.json</td><td>5s</td><td>832×480</td><td>1-2 min</td></tr>
+        <tr><td>02</td><td>test-5s-720p.json</td><td>5s</td><td>720×1280</td><td>3-5 min</td></tr>
+        <tr><td>03</td><td>prod-30s-720p.json</td><td>30s</td><td>720×1280</td><td>15-25 min</td></tr>
+        <tr><td>04</td><td>prod-30s-1080p.json</td><td>30s</td><td>1920×1080</td><td>35-50 min</td></tr>
+      </table>
+
+      <h3>Variants (4)</h3>
+      <table>
+        <tr><th>#</th><th>File</th><th>Special</th><th>Use Case</th></tr>
+        <tr><td>05</td><td>quick-5s-720p-causvid.json</td><td>TeaCache + CausVid, 8 steps</td><td>Test ý tưởng nhanh</td></tr>
+        <tr><td>06</td><td>quality-30s-720p-hq.json</td><td>40 steps, no accel</td><td>Demo, portfolio</td></tr>
+        <tr><td>07</td><td>portrait-vertical-30s.json</td><td>720×1280 portrait</td><td>TikTok, Reels</td></tr>
+        <tr><td>08</td><td>replace-mode-30s.json</td><td>Replace mode</td><td>Thay người trong video</td></tr>
+      </table>
+
+      <h3>Parameters Matrix</h3>
+      <table>
+        <tr><th>Param</th><th>01</th><th>02</th><th>03</th><th>04</th></tr>
+        <tr><td>Resolution</td><td>832×480</td><td>720×1280</td><td>720×1280</td><td>1920×1080</td></tr>
+        <tr><td>Frames</td><td>81</td><td>81</td><td>481</td><td>481</td></tr>
+        <tr><td>Steps</td><td>20</td><td>30</td><td>30</td><td>30</td></tr>
+        <tr><td>CFG</td><td>6.0</td><td>6.0</td><td>6.0</td><td>6.0</td></tr>
+        <tr><td>Context window</td><td>OFF</td><td>OFF</td><td>81/16</td><td>81/16</td></tr>
+        <tr><td>Block swap</td><td>OFF</td><td>OFF</td><td>OFF</td><td>ON (20)</td></tr>
+        <tr><td>RIFE</td><td>2x</td><td>2x</td><td>2x</td><td>2x</td></tr>
+        <tr><td>Audio method</td><td>VHS</td><td>VHS</td><td>FFmpeg</td><td>FFmpeg</td></tr>
+        <tr><td>VRAM peak</td><td>~18 GB</td><td>~22 GB</td><td>~26 GB</td><td>~28 GB</td></tr>
+      </table>
+    </section>
+
+    <!-- ===== AUDIO ===== -->
+    <section id="audio">
+      <h2><span class="section-num">007</span> Audio Handling</h2>
+
+      <p>Wan 2.2 Animate <strong>chỉ sinh video frames, không xử lý audio</strong>. Cần pipeline audio passthrough riêng.</p>
+
+      <h3>3 Approaches</h3>
+      <table>
+        <tr><th>Approach</th><th>Method</th><th>Pros</th><th>Cons</th></tr>
+        <tr><td>01 · ComfyUI Native</td><td>VHS_LoadVideo có audio output</td><td>Single workflow</td><td>Cần verify với 30s</td></tr>
+        <tr><td>02 · FFmpeg Post</td><td>audio-merge.sh sau khi gen</td><td>Reliable, full control</td><td>Cần 2 steps</td></tr>
+        <tr><td>03 · Hybrid</td><td>ComfyUI silent + auto merge</td><td>Best UX</td><td>Cần watcher script</td></tr>
+      </table>
+
+      <h3>Edge Cases</h3>
+      <table>
+        <tr><th>Case</th><th>Handling</th></tr>
+        <tr><td>Source no audio</td><td>Skip merge, output silent</td></tr>
+        <tr><td>Audio &gt; Video duration</td><td>Truncate với -shortest flag</td></tr>
+        <tr><td>Audio &lt; Video duration</td><td>Use -shortest flag</td></tr>
+        <tr><td>Multi-channel (5.1)</td><td>Preserve as-is hoặc downmix stereo</td></tr>
+        <tr><td>HEVC/AV1 codec</td><td>FFmpeg handles all codecs</td></tr>
+        <tr><td>FPS mismatch sau RIFE</td><td>Audio không bị stretch (RIFE chỉ đổi FPS)</td></tr>
+      </table>
+    </section>
+
+    <!-- ===== RISKS ===== -->
+    <section id="risks">
+      <h2><span class="section-num">008</span> Risk Register</h2>
+
+      <table>
+        <tr><th>ID</th><th>Risk</th><th>Prob</th><th>Impact</th><th>Mitigation</th></tr>
+        <tr><td>R1</td><td>PyTorch nightly bug</td><td>Med</td><td>High</td><td>Pin version; backup wheels</td></tr>
+        <tr><td>R2</td><td>Custom nodes downgrade torch</td><td>High</td><td>Med</td><td>Verify Compute (12,0) sau mỗi install</td></tr>
+        <tr><td>R3</td><td>Internet chậm (706 B/s test)</td><td>?</td><td>High</td><td>Test 3 sources; aria2 backup</td></tr>
+        <tr><td>R4</td><td>HuggingFace rate limit</td><td>Low</td><td>Med</td><td>Mirror hf-mirror.com</td></tr>
+        <tr><td>R5</td><td>OOM ở 30s/1080p</td><td>Med</td><td>Med</td><td>Block swap; fallback 720p+upscale</td></tr>
+        <tr><td>R6</td><td>Ollama không unload sạch</td><td>Low</td><td>Med</td><td>3 fallback methods</td></tr>
+        <tr><td>R7</td><td>SageAttention compile fail</td><td>Low</td><td>High</td><td>Skip, dùng PyTorch SDPA</td></tr>
+        <tr><td>R8</td><td>Disk cạn</td><td>Low</td><td>High</td><td>1.6TB free, OK</td></tr>
+        <tr><td>R9</td><td>Triton vs CUDA mismatch</td><td>Med</td><td>Med</td><td>Document versions</td></tr>
+        <tr><td>R10</td><td>Custom node breaking changes</td><td>Med</td><td>Low</td><td>Pin git commits</td></tr>
+        <tr><td>R11 ★</td><td>Audio drift sau 30s</td><td>Low</td><td>Med</td><td>Test với lip-sync video</td></tr>
+        <tr><td>R12 ★</td><td>VHS audio merge fail</td><td>Low</td><td>Low</td><td>Fallback FFmpeg</td></tr>
+        <tr><td>R13 ★</td><td>Source codec lạ</td><td>Low</td><td>Low</td><td>FFmpeg supports all</td></tr>
+        <tr><td>R14 ★</td><td>Audio bitrate giảm</td><td>Med</td><td>Low</td><td>-c:a copy</td></tr>
+      </table>
+    </section>
+
+    <!-- ===== CHECKPOINTS ===== -->
+    <section id="checkpoints">
+      <h2><span class="section-num">009</span> Checkpoints</h2>
+
+      <div class="timeline">
+        <div class="timeline-row">
+          <div class="timeline-id done">✓ CP1</div>
+          <div class="timeline-when">Before Phase 0</div>
+          <div class="timeline-desc">User approve plan · <span style="color: var(--accent);">DONE</span></div>
+        </div>
+        <div class="timeline-row">
+          <div class="timeline-id">○ CP2</div>
+          <div class="timeline-when">Before Phase 4</div>
+          <div class="timeline-desc">Critical phase — PyTorch nightly cu128, có thể break</div>
+        </div>
+        <div class="timeline-row">
+          <div class="timeline-id">○ CP3</div>
+          <div class="timeline-when">Before Phase 7</div>
+          <div class="timeline-desc">Verify internet adequate cho 22GB download</div>
+        </div>
+        <div class="timeline-row">
+          <div class="timeline-id">○ CP4</div>
+          <div class="timeline-when">Before Phase 8.5</div>
+          <div class="timeline-desc">Confirm test 5s OK trước khi run production 30s</div>
+        </div>
+        <div class="timeline-row">
+          <div class="timeline-id">○ CP5</div>
+          <div class="timeline-when">After completion</div>
+          <div class="timeline-desc">Final review, lessons learned, maintenance plan</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===== DAILY OPS ===== -->
+    <section id="daily">
+      <h2><span class="section-num">010</span> Daily Operations</h2>
+
+      <h3>Daily Workflow</h3>
+      <pre class="text">┌─ START ─────────────────────────────────────┐
+│                                              │
+│  1. Open terminal                            │
+│  2. vram-check.sh                            │
+│  3. (if needed) ollama-free.sh               │
+│  4. comfy-start.sh                           │
+│                                              │
+└──────────────┬───────────────────────────────┘
+               │
+               ↓
+┌─ GENERATE ──────────────────────────────────┐
+│                                              │
+│  5. Browser → http://localhost:8188          │
+│  6. Load workflow JSON                       │
+│  7. Set inputs (image + video)               │
+│  8. Queue Prompt                             │
+│  9. Wait (5-25 min)                          │
+│                                              │
+└──────────────┬───────────────────────────────┘
+               │
+               ↓
+┌─ POST-PROCESS ──────────────────────────────┐
+│                                              │
+│  10. Download from ~/ai/ComfyUI/output/      │
+│  11. (if 30s) audio-merge.sh                 │
+│  12. Verify output                           │
+│                                              │
+└──────────────┬───────────────────────────────┘
+               │
+               ↓
+┌─ CLEANUP ───────────────────────────────────┐
+│                                              │
+│  13. Ctrl+C to stop ComfyUI                  │
+│  14. (optional) Restart Ollama               │
+│                                              │
+└──────────────────────────────────────────────┘</pre>
+
+      <h3>Weekly Maintenance</h3>
+      <ul>
+        <li>Update ComfyUI: <code>git pull</code> in <code>~/ai/ComfyUI/</code></li>
+        <li>Update custom nodes via Manager UI</li>
+        <li>Verify Compute (12, 0) after updates</li>
+        <li>Clean old logs trong <code>~/ai/logs/</code></li>
+        <li>Clean old outputs nếu disk getting full</li>
+      </ul>
+
+      <h3>Monitoring</h3>
+      <pre><span class="cmd">nvtop</span>                          <span class="com"># Real-time GPU</span>
+<span class="cmd">du</span> -sh ~/ai/*                  <span class="com"># Disk usage</span>
+<span class="cmd">nvidia-smi</span>                     <span class="com"># Temperature, power</span></pre>
+    </section>
+
+    <!-- ===== DELIVERABLES ===== -->
+    <section id="deliverables">
+      <h2><span class="section-num">011</span> Deliverables</h2>
+
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-label">Scripts</div>
+          <div class="stat-value">5<span class="stat-unit">.sh</span></div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Workflows</div>
+          <div class="stat-value">8<span class="stat-unit">.json</span></div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Documentation</div>
+          <div class="stat-value">6<span class="stat-unit">.md</span></div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Total Models</div>
+          <div class="stat-value">~23<span class="stat-unit">GB</span></div>
+        </div>
+      </div>
+
+      <h3>Scripts (5)</h3>
+      <pre class="text">~/ai/scripts/
+├── vram-check.sh         · Check VRAM ≥ 28GB free
+├── ollama-free.sh        · Unload Ollama (3 methods)
+├── comfy-start.sh        · Start with pre-check
+├── comfy-stop.sh         · Stop + optional Ollama restart
+└── audio-merge.sh        · Merge audio source → output ★</pre>
+
+      <h3>Workflows (8)</h3>
+      <pre class="text">~/ai/workflows/
+├── 01-test-5s-480p.json
+├── 02-test-5s-720p.json
+├── 03-prod-30s-720p.json
+├── 04-prod-30s-1080p.json
+└── variants/
+    ├── 05-quick-5s-720p-causvid.json
+    ├── 06-quality-30s-720p-hq.json
+    ├── 07-portrait-vertical-30s.json
+    └── 08-replace-mode-30s.json</pre>
+
+      <h3>Documentation (6)</h3>
+      <pre class="text">~/ai/
+├── PLAN.md / PLAN.html      · This document
+├── README.md                · Quick start
+├── TROUBLESHOOTING.md       · Common errors & fixes
+├── VERSIONS.md              · Pinned versions
+├── AUDIO_HANDLING.md        · Audio pipeline guide
+└── WORKFLOWS.md             · When to use which workflow</pre>
+    </section>
+
+    <!-- ===== FOOTER ===== -->
+    <footer class="footer">
+      <div>
+        <strong>Motion Transfer Pipeline v1.1</strong><br>
+        Generated 2026-05-23
+      </div>
+      <div>
+        Status: <span style="color: var(--accent);">●</span> Plan Approved · CP1 Cleared<br>
+        Next: Phase 0 Execution
+      </div>
+      <div style="text-align: right;">
+        ubuntu@bridgellm-02<br>
+        RTX 5090 / 32GB · i7-14700K / 62GB
+      </div>
+    </footer>
+
+  </main>
+</div>
+
+<div class="scan-line"></div>
+
+<script>
+  function togglePhase(header) {
+    const phase = header.parentElement;
+    phase.classList.toggle('open');
+  }
+
+  // Auto-open phase on direct anchor link
+  if (window.location.hash) {
+    const target = document.querySelector(window.location.hash);
+    if (target && target.classList.contains('phase')) {
+      target.classList.add('open');
+    }
+  }
+
+  // Active nav link tracking
+  const sections = document.querySelectorAll('section, header, .phase');
+  const navLinks = document.querySelectorAll('.nav-link');
+  
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        const id = entry.target.id;
+        if (id) {
+          navLinks.forEach(link => {
+            link.classList.toggle('active', link.getAttribute('href') === '#' + id);
+          });
+        }
+      }
+    });
+  }, { rootMargin: '-30% 0px -60% 0px' });
+
+  sections.forEach(s => { if (s.id) observer.observe(s); });
+
+  // Open phase on nav click
+  document.querySelectorAll('.nav-link[href^="#phase-"]').forEach(link => {
+    link.addEventListener('click', () => {
+      const id = link.getAttribute('href').substring(1);
+      const phase = document.getElementById(id);
+      if (phase && phase.classList.contains('phase')) {
+        setTimeout(() => phase.classList.add('open'), 300);
+      }
+    });
+  });
+</script>
+
+</body>
+</html>

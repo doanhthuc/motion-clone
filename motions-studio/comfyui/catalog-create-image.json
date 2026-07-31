@@ -1,0 +1,13 @@
+{
+  "_note": "ALD 16/06/2026 - Catalog KHOÁ cho box chuyên create-image (Qwen-Image-Edit). Đây là ALLOW-LIST: Settings → Models AI CHỈ thấy & tải được các model dưới đây, không thể pull model/feature khác. setup-create-image.sh trỏ MODEL_CATALOG_PATH vào file này và KHÔNG tải model lúc cài (tải riêng qua Settings → Models AI → nhóm Qwen-Image-Edit → 'Cài cả nhóm'). url/type/filename/size lấy nguyên từ comfyui/catalog.json.",
+  "comfy": [
+    { "id": "qwen-edit-q8", "group": "Qwen-Image-Edit", "label": "Qwen-Image-Edit 2509 Q8_0", "type": "diffusion_models", "filename": "Qwen-Image-Edit-2509-Q8_0.gguf", "url": "https://huggingface.co/QuantStack/Qwen-Image-Edit-2509-GGUF/resolve/main/Qwen-Image-Edit-2509-Q8_0.gguf", "sizeBytes": 21764741857, "vram": "~20GB", "tier": "optional", "gated": false, "note": "UNet GGUF — nét, chi tiết tay tốt; vừa 5090 32GB. BẮT BUỘC cho create-image Linux/CUDA." },
+    { "id": "qwen-vl-7b", "group": "Qwen-Image-Edit", "label": "Qwen2.5-VL 7B fp8 (text encoder)", "type": "text_encoders", "filename": "qwen_2.5_vl_7b_fp8_scaled.safetensors", "url": "https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors", "sizeBytes": 9384497971, "vram": "", "tier": "optional", "gated": false, "note": "Text-encoder cho Qwen-Edit CUDA/Linux." },
+    { "id": "qwen-vae", "group": "Qwen-Image-Edit", "label": "Qwen Image VAE", "type": "vae", "filename": "qwen_image_vae.safetensors", "url": "https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/vae/qwen_image_vae.safetensors", "sizeBytes": 257698037, "vram": "", "tier": "optional", "gated": false, "note": "BẮT BUỘC." },
+    { "id": "flymy-realism", "group": "Qwen-Image-Edit", "label": "LoRA realism (flymy)", "type": "loras", "filename": "flymy_realism.safetensors", "url": "https://huggingface.co/flymy-ai/qwen-image-realism-lora/resolve/main/flymy_realism.safetensors", "sizeBytes": 96636764, "vram": "", "tier": "optional", "gated": false, "note": "Tăng độ thực cho ảnh Qwen (khuyến nghị)." }
+  ],
+  "ollama": [
+    { "id": "ollama-qwen25-7b", "group": "Ollama (dịch prompt)", "label": "qwen2.5:7b-instruct", "model": "qwen2.5:7b-instruct", "sizeBytes": 4700000000, "tier": "optional", "note": "Dịch prompt VN→EN trước khi dựng ảnh (Qwen hiểu tiếng Anh tốt hơn). KHUYẾN NGHỊ — thiếu thì prompt tiếng Việt dễ lệch." },
+    { "id": "ollama-qwen25vl-7b", "group": "Ollama (dịch prompt)", "label": "qwen2.5vl:7b", "model": "qwen2.5vl:7b", "sizeBytes": 6000000000, "tier": "optional", "note": "Vision refine (CREATE_IMAGE_REFINE) — tuỳ chọn, bỏ qua được." }
+  ]
+}

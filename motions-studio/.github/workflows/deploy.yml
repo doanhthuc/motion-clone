@@ -1,0 +1,90 @@
+# Push lên main → tự deploy lên VPS: rsync code + apply migration + docker compose up -d --build.
+# Cần GitHub Secrets (Settings → Secrets and variables → Actions):
+#   VPS_HOST      IP/hostname VPS            (vd 101.99.25.165 hoặc motion-server.datools.info)
+#   VPS_USER      user SSH                   (vd ubuntu)
+#   VPS_PATH      thư mục project trên VPS   (vd /home/ubuntu/motion-backend)
+#   VPS_SSH_KEY   private key SSH (toàn bộ nội dung, kể cả BEGIN/END)
+#   VPS_SSH_PORT  (tùy chọn) cổng SSH, mặc định 22
+#
+# Lần đầu trên VPS phải có sẵn .env (CI KHÔNG ghi đè .env). Profiles bật qua COMPOSE_PROFILES trong .env
+# (vd COMPOSE_PROFILES=gpu,proxy). .env + docker-compose.override.yml được giữ nguyên (không bị rsync xóa).
+name: Deploy to VPS
+
+on:
+  # ALD 16/06/2026 - ĐÃ TẮT auto-deploy khi push. Lý do: .165 chuyển sang NATIVE PM2 (setup-pm2.sh /
+  # fullstack-setup.sh), KHÔNG dùng Docker compose nữa. Mỗi push trước đây tự chạy `docker compose up -d` lên
+  # .165 → DỰNG LẠI stack Docker cũ → đụng cổng (minio 9000, api 8080, postgres 5432) với PM2 → crashloop.
+  # Giờ chỉ chạy TAY (workflow_dispatch) khi thật sự cần deploy Docker. Muốn bật lại auto-deploy thì thêm push
+  # trở lại VÀ trỏ VPS_HOST sang box Docker khác (KHÔNG phải .165 native).
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-vps
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Chuẩn bị SSH
+        env:
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_SSH_PORT: ${{ secrets.VPS_SSH_PORT }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -p "${VPS_SSH_PORT:-22}" -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Rsync code → VPS (giữ .env + override)
+        env:
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_PATH: ${{ secrets.VPS_PATH }}
+          VPS_SSH_PORT: ${{ secrets.VPS_SSH_PORT }}
+        run: |
+          rsync -az --delete -e "ssh -i ~/.ssh/id_deploy -p ${VPS_SSH_PORT:-22}" \
+            --exclude='.git' --exclude='.github' --exclude='node_modules' \
+            --exclude='.env' --exclude='docker-compose.override.yml' \
+            ./ "$VPS_USER@$VPS_HOST:$VPS_PATH/"
+
+      - name: Migrate + rebuild trên VPS
+        env:
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_PATH: ${{ secrets.VPS_PATH }}
+          VPS_SSH_PORT: ${{ secrets.VPS_SSH_PORT }}
+        run: |
+          ssh -i ~/.ssh/id_deploy -p "${VPS_SSH_PORT:-22}" "$VPS_USER@$VPS_HOST" "cd '$VPS_PATH' && bash -s" <<'EOSSH'
+          set -euo pipefail
+          if [ -f .env ]; then set -a; . ./.env; set +a; else echo "THIẾU .env trên VPS"; exit 1; fi
+          echo "── apply migrations (idempotent) ──"
+          for f in db/init/*.sql; do
+            echo "  $f"
+            docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f - < "$f" || echo "  (skip/err $f)"
+          done
+          echo "── docker compose up -d --build (COMPOSE_PROFILES=${COMPOSE_PROFILES:-none}) ──"
+          docker compose up -d --build
+          docker image prune -f || true
+          docker compose ps
+          # ALD 15/06/2026 - resource-helper (profile resource-admin, pid:host) bị `docker compose up` thường BỎ QUA
+          # → kẹt image cũ thiếu route /restart-comfy → nút Restart ComfyUI báo "Cannot POST /restart-comfy".
+          # Build + recreate TƯỜNG MINH để chuỗi FE→api→helper(kill pid host)→supervisor-restart hoạt động.
+          echo "── rebuild + recreate resource-helper (nút Restart ComfyUI) ──"
+          docker compose --profile resource-admin up -d --build resource-helper 2>&1 | tail -4 || true
+          # ALD 15/06/2026 - cài watchdog RAM ComfyUI (host cron mỗi phút) TỪ REPO qua deploy — KHÔNG scp/sửa tay VPS.
+          # rsync đã đưa scripts/ lên VPS; copy vào ~/ai/scripts + đảm bảo cron (idempotent). comfy-stop.sh có sẵn trên host.
+          echo "── comfy-ram-watchdog (host cron mỗi phút, recycle sau job) ──"
+          if [ -f scripts/comfy-ram-watchdog.sh ]; then
+            mkdir -p "$HOME/ai/scripts" "$HOME/ai/logs"
+            cp scripts/comfy-ram-watchdog.sh "$HOME/ai/scripts/comfy-ram-watchdog.sh"
+            chmod +x "$HOME/ai/scripts/comfy-ram-watchdog.sh"
+            { crontab -l 2>/dev/null | grep -v 'comfy-ram-watchdog.sh' || true; echo "* * * * * $HOME/ai/scripts/comfy-ram-watchdog.sh"; } | crontab - || true
+            echo "  cron: $(crontab -l 2>/dev/null | grep comfy-ram-watchdog || echo MISSING)"
+          else
+            echo "  (scripts/comfy-ram-watchdog.sh không có — bỏ qua)"
+          fi
+          EOSSH

@@ -1,0 +1,363 @@
+# ============================================================================
+# Motion Backend — stack độc lập (KHÔNG phụ thuộc Supabase).
+#   postgres    : job store (schema auto-load lúc init)
+#   minio       : object storage S3-compatible (giống Supabase Storage: bucket + presigned URL)
+#   createbuckets: tạo bucket tự động khi boot (chạy 1 lần rồi thoát)
+#   api         : NodeJS (Express) — REST tạo/poll/cancel job + upload/serve file qua MinIO
+#   comfyui     : GPU inference (tự tải models lúc entrypoint, skip nếu đã có) — profile "gpu"
+#   worker      : Python — poll API → chạy ComfyUI → upload kết quả
+#
+# Chạy trên VPS:  docker compose --profile gpu up -d --build
+#   (không GPU / dùng ComfyUI sẵn có ở ngoài: bỏ --profile gpu, set COMFY_URL=... trong .env)
+# ============================================================================
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-motion}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-motionpass}
+      POSTGRES_DB: ${POSTGRES_DB:-motion}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Auto-chạy schema lần đầu khởi tạo DB (chỉ chạy khi data dir trống)
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-motion} -d ${POSTGRES_DB:-motion}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-motionminio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-motionminiopass}
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Init container: tạo bucket + policy rồi thoát (giống Supabase Storage buckets).
+  createbuckets:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set m http://minio:9000 ${MINIO_ROOT_USER:-motionminio} ${MINIO_ROOT_PASSWORD:-motionminiopass} &&
+      mc mb -p m/${STORAGE_BUCKET:-motion} &&
+      echo 'bucket ${STORAGE_BUCKET:-motion} ready' &&
+      exit 0
+      "
+
+  # ALD 10/06/2026 - Xóa nền ảnh (rembg). Dùng cho: /model-refs upload (tách NGƯỜI) + tryon (crop sát SẢN PHẨM).
+  # Python/glibc riêng vì onnxruntime KHÔNG có wheel cho Alpine (image api). Chỉ nội bộ — không mở port.
+  bg-remover:
+    build: ./bg-remover
+    restart: unless-stopped
+    environment:
+      PORT: 8000
+
+  api:
+    build: ./api
+    restart: unless-stopped
+    volumes:
+      # ALD 04/06/2026 - migrate-on-boot (runMigrations) đọc db/init từ đây. Postgres chỉ chạy initdb.d khi
+      # volume TRỐNG → container chạy lại trên volume cũ sẽ tự áp migration idempotent từ mount này (docker
+      # up không còn lỗi thiếu cột). :ro vì chỉ đọc.
+      - ./db/init:/app/db/init:ro
+      # ALD 14/06/2026 - "Model AI (custom)": bind-mount thư mục uploads của ComfyUI (native trên host) vào api
+      # để route /models ghi/list/xoá file model THẲNG xuống đĩa trong search-path ComfyUI (gom 1 nơi, dễ dọn).
+      # Host path = ~/ai/ComfyUI/models/uploads (đã đăng ký trong extra_model_paths.yaml). RW.
+      - ${MODEL_UPLOADS_HOST_DIR:-/home/ubuntu/ai/ComfyUI/models/uploads}:/model-uploads
+      # ALD 15/06/2026 - Tab "Models AI" tải model on-demand: mount CẢ thư mục models của ComfyUI (native host)
+      # để api ghi/đọc/xoá model THẲNG vào search-path chuẩn (loras/checkpoints/unet/vae/...). api chạy root → ghi ok.
+      - ${COMFY_MODELS_HOST_DIR:-/home/ubuntu/ai/ComfyUI/models}:/comfy-models
+      # Catalog model curated (read-only) — sửa file + restart api là cập nhật, không cần rebuild image.
+      - ./comfyui/catalog.json:/app/catalog.json:ro
+      # ALD 13/07/2026 - Admin drawer đọc đúng file `pm2 logs comfyui` khi ComfyUI chạy native trên host.
+      # Box Docker thuần không có PM2 thì mount rỗng và drawer sẽ báo "chưa tìm thấy log".
+      - ${PM2_LOG_DIR_HOST:-/home/ubuntu/.pm2/logs}:/host-pm2-logs:ro
+    # api ở bridge network → tới host (Ollama 0.0.0.0:11434, ComfyUI…) qua host.docker.internal.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      PORT: 8080
+      DATABASE_URL: postgres://${POSTGRES_USER:-motion}:${POSTGRES_PASSWORD:-motionpass}@postgres:5432/${POSTGRES_DB:-motion}
+      S3_ENDPOINT: http://minio:9000
+      S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:-http://localhost:9000}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-motionminio}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-motionminiopass}
+      STORAGE_BUCKET: ${STORAGE_BUCKET:-motion}
+      # ALD 15/06/2026 - TẮT checksum mặc định của @aws-sdk/client-s3 ≥3.729 (kẹt GET/stream với MinIO → /media treo).
+      # Bắt buộc cho mọi service dùng S3 (api/wf-worker). KHÔNG có 2 dòng này = ảnh/video không xem được sau khi SDK lên đời.
+      AWS_REQUEST_CHECKSUM_CALCULATION: ${AWS_REQUEST_CHECKSUM_CALCULATION:-WHEN_REQUIRED}
+      AWS_RESPONSE_CHECKSUM_VALIDATION: ${AWS_RESPONSE_CHECKSUM_VALIDATION:-WHEN_REQUIRED}
+      API_KEY: ${API_KEY:-changeme-client-key}
+      WORKER_TOKEN: ${WORKER_TOKEN:-changeme-worker-token}
+      SIGNED_URL_TTL_SEC: ${SIGNED_URL_TTL_SEC:-604800}
+      # ALD 10/06/2026 - Xóa nền ảnh model mẫu khi upload /model-refs (gọi service bg-remover nội bộ).
+      BG_REMOVER_URL: ${BG_REMOVER_URL:-http://bg-remover:8000}
+      # ALD 14/06/2026 - Thư mục uploads model (= bind-mount ở trên) + giới hạn dung lượng 1 file (mặc định 30GB).
+      MODEL_UPLOADS_DIR: /model-uploads
+      MODEL_MAX_BYTES: ${MODEL_MAX_BYTES:-32212254720}
+      # ALD 15/06/2026 - Tab "Models AI": thư mục models ComfyUI (mount ở trên), catalog, token HF (model gated),
+      # số download song song tối đa. HF_TOKEN trống cũng OK (model trong catalog đều non-gated).
+      COMFY_MODELS_DIR: /comfy-models
+      MODEL_CATALOG_PATH: /app/catalog.json
+      HF_TOKEN: ${HF_TOKEN:-}
+      MODEL_DL_CONCURRENCY: ${MODEL_DL_CONCURRENCY:-2}
+      # Ẩn model Ollama dịch prompt khỏi Settings -> Models AI (tuỳ chọn).
+      HIDE_QWEN_TRANSLATE_MODELS: ${HIDE_QWEN_TRANSLATE_MODELS:-}
+      # Có giá trị (đứng sau Caddy/HTTPS) → output_url tải qua API trên 1 domain; trống → presigned MinIO.
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+      # Auth (login OTP standalone)
+      SESSION_JWT_SECRET: ${SESSION_JWT_SECRET:-}
+      ACCESS_TTL_SECONDS: ${ACCESS_TTL_SECONDS:-3600}
+      REFRESH_TTL_SECONDS: ${REFRESH_TTL_SECONDS:-2592000}
+      # Ollama cho endpoint list-models (picker model AI dàn cảnh). api ở bridge nên KHÔNG dùng được
+      # base_url 127.0.0.1 của wf-worker (host-net) → trỏ host.docker.internal. Ollama đã listen 0.0.0.0.
+      OLLAMA_URL: ${API_OLLAMA_URL:-http://host.docker.internal:11434}
+      # Admin VPS monitor: đọc ComfyUI /system_stats nếu URL tới được để hiển thị VRAM used.
+      COMFY_URL: ${COMFY_URL:-http://comfyui:8188}
+      # Tuỳ chọn: bật resource-helper privileged nội bộ để Admin VPS Monitor reset host swap/drop cache thật.
+      ADMIN_RESOURCE_HELPER_URL: ${ADMIN_RESOURCE_HELPER_URL:-}
+      ADMIN_RESOURCE_HELPER_TOKEN: ${ADMIN_RESOURCE_HELPER_TOKEN:-changeme-resource-helper-token}
+      COMFY_PM2_LOG_DIR: ${COMFY_PM2_LOG_DIR:-/host-pm2-logs}
+      APP_NAME: ${APP_NAME:-Motions}
+      # Admin gốc — API tự tạo/nâng email này thành admin lúc khởi động (tránh khoá ra ngoài).
+      SUPER_ADMIN: ${SUPER_ADMIN:-}
+      # Gửi OTP: IS_USED_GMAIL=true → Gmail (App Password) qua GMAIL_*; false → SMTP thường (OTP_SMTP_*).
+      IS_USED_GMAIL: ${IS_USED_GMAIL:-false}
+      GMAIL_USER: ${GMAIL_USER:-}
+      GMAIL_APP_PASSWORD: ${GMAIL_APP_PASSWORD:-}
+      OTP_SMTP_HOST: ${OTP_SMTP_HOST:-}
+      OTP_SMTP_PORT: ${OTP_SMTP_PORT:-587}
+      OTP_SMTP_USER: ${OTP_SMTP_USER:-}
+      OTP_SMTP_PASS: ${OTP_SMTP_PASS:-}
+      OTP_SMTP_FROM: ${OTP_SMTP_FROM:-}
+      OTP_SMTP_FROM_NAME: ${OTP_SMTP_FROM_NAME:-Motions}
+    ports:
+      - "${API_PORT:-8080}:8080"
+
+  # Optional host resource helper: chạy profile "resource-admin" khi muốn nút /admin/vps reset swap/drop cache thật.
+  # Service này privileged nhưng chỉ nằm trong Docker network nội bộ, API gọi qua token ADMIN_RESOURCE_HELPER_TOKEN.
+  resource-helper:
+    build:
+      context: ./api
+      dockerfile: Dockerfile.resource-helper
+    restart: unless-stopped
+    profiles: ["resource-admin"]
+    command: ["node", "src/admin-resource-helper.js"]
+    privileged: true
+    pid: "host"
+    environment:
+      PORT: 8099
+      COMFY_URL: ${COMFY_URL:-http://comfyui:8188}
+      ADMIN_RESOURCE_HELPER_TOKEN: ${ADMIN_RESOURCE_HELPER_TOKEN:-changeme-resource-helper-token}
+      ADMIN_RESOURCE_COMMAND_TIMEOUT_MS: ${ADMIN_RESOURCE_COMMAND_TIMEOUT_MS:-120000}
+      ADMIN_INSPECT_COMMAND_TIMEOUT_MS: ${ADMIN_INSPECT_COMMAND_TIMEOUT_MS:-3000}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # Reverse proxy + HTTPS tự động (Let's Encrypt). Chỉ chạy khi `--profile proxy` + set DOMAIN.
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    profiles: ["proxy"]
+    depends_on:
+      - api
+    environment:
+      DOMAIN: ${DOMAIN:-}        # bắt buộc set khi dùng --profile proxy (Caddy cần để xin cert)
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddydata:/data
+      - caddyconfig:/config
+
+  comfyui:
+    build: ./comfyui
+    restart: unless-stopped
+    profiles: ["gpu"]          # chỉ start khi `--profile gpu` (cần NVIDIA GPU)
+    environment:
+      # Manifest models (url|dest) + thư mục đích. Entrypoint tự tải, skip nếu file đã tồn tại.
+      HF_TOKEN: ${HF_TOKEN:-}
+      # RTX 5090: giảm phân mảnh allocator khi Wan 14B chạy sát 32GB; lazy CUDA bớt VRAM khởi động.
+      PYTORCH_ALLOC_CONF: ${PYTORCH_ALLOC_CONF:-${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}}
+      CUDA_MODULE_LOADING: ${CUDA_MODULE_LOADING:-LAZY}
+    ports:
+      - "${COMFY_PORT:-8188}:8188"
+    volumes:
+      - comfymodels:/app/ComfyUI/models      # cache models (mount sẵn nếu đã có → skip tải)
+      - comfyoutput:/app/ComfyUI/output
+      - comfyinput:/app/ComfyUI/input
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # Workflow worker: chạy engine workflow (node chat/ocr/image/http/...) — tái dùng image api.
+  wf-worker:
+    build: ./api
+    restart: unless-stopped
+    command: ["node", "src/wf-worker/worker.js"]
+    volumes:
+      # ALD 04/06/2026 - migrate-on-boot (runMigrations) đọc db/init từ đây (xem ghi chú ở service api).
+      - ./db/init:/app/db/init:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-motion}:${POSTGRES_PASSWORD:-motionpass}@postgres:5432/${POSTGRES_DB:-motion}
+      S3_ENDPOINT: http://minio:9000
+      # Fallback presigned (khi không có PUBLIC_BASE_URL) phải dùng IP server, KHÔNG 127.0.0.1.
+      S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:-}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-motionminio}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-motionminiopass}
+      STORAGE_BUCKET: ${STORAGE_BUCKET:-motion}
+      # ALD 15/06/2026 - TẮT checksum SDK S3 mới (kẹt MinIO) — xem ghi chú ở service api.
+      AWS_REQUEST_CHECKSUM_CALCULATION: ${AWS_REQUEST_CHECKSUM_CALCULATION:-WHEN_REQUIRED}
+      AWS_RESPONSE_CHECKSUM_VALIDATION: ${AWS_RESPONSE_CHECKSUM_VALIDATION:-WHEN_REQUIRED}
+      WF_POLL_INTERVAL_SEC: ${WF_POLL_INTERVAL_SEC:-2}
+      OLLAMA_URL: ${OLLAMA_URL:-http://172.17.0.1:11434}
+      MARKER_URL: ${MARKER_URL:-http://supabase-marker:8001}
+      COMFY_URL: ${COMFY_URL:-http://comfyui:8188}
+      # browserUrl (HMAC /media) — wf-worker phải dùng CÙNG secret + base với api
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+      SESSION_JWT_SECRET: ${SESSION_JWT_SECRET:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  worker:
+    build: ./worker
+    restart: unless-stopped
+    # ALD 04/06/2026 - Backstop RAM container worker. LƯU Ý: ComfyUI/Ollama chạy NATIVE (NGOÀI container này)
+    # nên mem_limit KHÔNG chặn RAM render — chỉ chặn worker.py tự rò. Chống OOM render thật = guard RAM trong
+    # worker.py (WORKER_MIN_AVAIL_GB) + giới hạn ComfyUI ở tầng systemd. Để generous: chỉ bắt rò bất thường.
+    mem_limit: ${WORKER_MEM_LIMIT:-24g}
+    depends_on:
+      api:
+        condition: service_started
+    environment:
+      # Chọn script worker: worker.py (Linux/CUDA, mặc định) hoặc subworkers/linux/{motion,image,video,talk}.py.
+      WORKER_SCRIPT: ${WORKER_SCRIPT:-worker.py}
+      API_URL: ${INTERNAL_API_URL:-http://api:8080}
+      WORKER_TOKEN: ${WORKER_TOKEN:-changeme-worker-token}
+      # ComfyUI: dùng service trong stack (--profile gpu) HOẶC external (set COMFY_URL ở .env)
+      COMFY_URL: ${COMFY_URL:-http://comfyui:8188}
+      WORKER_ID: ${WORKER_ID:-worker-1}
+      POLL_INTERVAL_SEC: ${POLL_INTERVAL_SEC:-3}
+      # ALD 04/06/2026 - Guard RAM: worker HOÃN nhận job khi RAM trống < N GB hoặc swap dùng > M% (chống OOM sập máy).
+      WORKER_MIN_AVAIL_GB: ${WORKER_MIN_AVAIL_GB:-12}
+      WORKER_MAX_SWAP_PCT: ${WORKER_MAX_SWAP_PCT:-70}
+      # ALD 13/07/2026 - Docker trước đây không forward các knob RTX 5090 nên worker luôn rơi về sdpa.
+      # SageAttention đã được verify trong image ComfyUI; torch.compile vẫn opt-in vì compile warmup + VRAM spike.
+      MOTION_ATTENTION: ${MOTION_ATTENTION:-sageattn}
+      MOTION_TORCH_COMPILE: ${MOTION_TORCH_COMPILE:-0}
+      MOTION_SHORT: ${MOTION_SHORT:-540}
+      MOTION_VRAM_MAX_EDGE: ${MOTION_VRAM_MAX_EDGE:-968}
+      MOTION_VRAM_MAX_FRAMES: ${MOTION_VRAM_MAX_FRAMES:-250}
+      # ALD 15/06/2026 - bổ sung ss, text-to-video, subtitle (LIVE box dùng .env JOB_TYPES riêng → phải sửa cả .env + recreate worker).
+      # ALD 29/06/2026 - thêm teen-flycam + trend-tiktok để worker full/default không bỏ sót social-video jobs mới.
+      JOB_TYPES: ${JOB_TYPES:-motion,bds,tryon,create-image,product-overlay,teaser,video,text-to-video,ss,talk,face-motion,concat,story-film,subtitle,voiceover,wan-i2v,teen-flycam,trend-tiktok,enhance,reveal}
+      # Vision auto-detect loại đồ cho Try-on (Auto). TRỐNG = tắt → dùng loại chọn tay / 'upper'.
+      OLLAMA_URL: ${OLLAMA_URL:-}
+      VISION_MODEL: ${VISION_MODEL:-qwen2.5vl:7b}
+      # Gemini (try-on Nano Banana Pro + TTS giọng tự nhiên). Key dùng CHUNG; có key → voiceover Gemini TTS,
+      # không có → fallback Piper (robotic). edge-tts bị MS chặn IP server này nên KHÔNG dùng được.
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_IMAGE_MODEL: ${GEMINI_IMAGE_MODEL:-gemini-3-pro-image-preview}
+      GEMINI_TTS_MODEL: ${GEMINI_TTS_MODEL:-gemini-2.5-flash-preview-tts}
+      GEMINI_TTS_VOICE: ${GEMINI_TTS_VOICE:-Kore}
+      # viXTTS clone giọng (service riêng trên host 127.0.0.1:8090; worker host-net). Service down → tự fallback Gemini.
+      VIXTTS_URL: ${VIXTTS_URL:-http://127.0.0.1:8090}
+      VIXTTS_REF: ${VIXTTS_REF:-}
+      # OmniVoice (Apache-2.0, bản VN) — engine TTS CHÍNH, ưu tiên trên viXTTS. Service riêng host :8091 (xem omnivoice/).
+      # Bỏ trống OMNIVOICE_URL = tắt, về dùng viXTTS như cũ. Đổi env phải RECREATE container worker.
+      OMNIVOICE_URL: ${OMNIVOICE_URL:-}
+      OMNIVOICE_REF: ${OMNIVOICE_REF:-}
+      OMNIVOICE_LANG: ${OMNIVOICE_LANG:-vietnamese}
+      # ALD 15/06/2026 - ASR model mặc định cho node "Phụ đề + Dịch" (OmniVoice /asr · faster-whisper). small|medium|large-v3.
+      OMNIVOICE_ASR_MODEL: ${OMNIVOICE_ASR_MODEL:-medium}
+      # ALD 15/06/2026 - model faster-whisper LOCAL (fallback ASR khi không có OmniVoice /asr) — small nhanh trên CPU.
+      WHISPER_MODEL: ${WHISPER_MODEL:-small}
+      # Thư mục ref clone giọng (lồng tiếng "clone") — phải khớp mount cùng đường dẫn ở trên.
+      TTS_REF_DIR: ${TTS_REF_DIR:-/home/ubuntu/ai/tts-refs}
+      # Giày/dép: render ở megapixel cao hơn cho rõ bàn chân (full-body) → áp được sản phẩm.
+      TRYON_SHOES_MP: ${TRYON_SHOES_MP:-2.0}
+      # ALD 10/06/2026 - tryon crop sát ảnh sản phẩm (bg-remover) → món đồ lấp đầy khung, hết lệch tỉ lệ "sản phẩm nhỏ".
+      BG_REMOVER_URL: ${BG_REMOVER_URL:-http://bg-remover:8000}
+      # Bật/tắt tiền xử lý crop sản phẩm tryon (1=bật mặc định).
+      TRYON_PRODUCT_AUTOCROP: ${TRYON_PRODUCT_AUTOCROP:-1}
+      # LTX-2.3 (Teaser motionMode='ltx' + type 'video'). Workflow CHƯA verify → BẮT BUỘC cấu hình
+      # LTX_WORKFLOW_JSON ('Save (API Format)' từ ComfyUI, dùng token __IMAGE__/__PROMPT__/__WIDTH__/…)
+      # thì LTX mới chạy; chưa set → teaser tự fallback Ken Burns. Tên model phải khớp models.txt.
+      # 🚨 LTX-2.3 22B official = bf16 ~46GB > 32GB RTX 5090 → cần bản FP8/GGUF (~24GB) hoặc offload. Text-enc=Gemma3.
+      LTX_WORKFLOW_JSON: ${LTX_WORKFLOW_JSON:-}
+      LTX_MODEL: ${LTX_MODEL:-LTX-2.3-22B-distilled-1.1-Q6_K.gguf}
+      LTX_VAE: ${LTX_VAE:-}
+      LTX_TEXT_ENCODER: ${LTX_TEXT_ENCODER:-}
+      LTX_FPS: ${LTX_FPS:-24}
+      LTX_STEPS: ${LTX_STEPS:-8}
+      LTX_TIMEOUT_SEC: ${LTX_TIMEOUT_SEC:-1800}
+      # ALD 14/06/2026 - node "SS" (Ảnh→Video LTX-2.3 + LoRA custom). SS_WORKFLOW_JSON = 'Save (API Format)' graph
+      # LTX-2.3 I2V đã-verify (token __IMAGE__/__PROMPT__/__LORA__/__LORA_STRENGTH__/…); chưa set → node SS báo lỗi rõ.
+      SS_MODEL: ${SS_MODEL:-LTX-2.3-22B-distilled-1.1-Q6_K.gguf}
+      SS_GEMMA: ${SS_GEMMA:-comfy_gemma_3_12B_it.safetensors}
+      SS_VAE: ${SS_VAE:-ltx-2.3-vae.safetensors}
+      SS_CKPT: ${SS_CKPT:-ltx-2.3-22b-distilled-1.1.safetensors}
+      SS_WORKFLOW_JSON: ${SS_WORKFLOW_JSON:-}
+      SS_FPS: ${SS_FPS:-24}
+      SS_STEPS: ${SS_STEPS:-8}
+      SS_TIMEOUT_SEC: ${SS_TIMEOUT_SEC:-1800}
+    # Cho phép reach ComfyUI chạy trên host (vd reuse ComfyUI sẵn có): COMFY_URL=http://host.docker.internal:8188
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - pipervoices:/app/piper-voice   # cache giọng Piper lazy-download (persist qua deploy)
+      # ALD 15/06/2026 - cache model faster-whisper (ASR node Phụ đề + Dịch) — persist qua deploy, khỏi tải lại.
+      - whispercache:/root/.cache/huggingface
+      # ALD 15/06/2026 - thư mục ref CLONE giọng (lồng tiếng "clone"): mount CÙNG đường dẫn host↔container để
+      # viXTTS (native host) đọc được file ref worker (container) ghi. host dir tự tạo khi mount.
+      - ${TTS_REF_DIR:-/home/ubuntu/ai/tts-refs}:${TTS_REF_DIR:-/home/ubuntu/ai/tts-refs}
+
+volumes:
+  pgdata:
+  miniodata:
+  comfymodels:
+  comfyoutput:
+  comfyinput:
+  caddydata:
+  caddyconfig:
+  pipervoices:
+  whispercache:

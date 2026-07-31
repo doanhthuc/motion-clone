@@ -1,0 +1,90 @@
+# ════════════════════════════════════════════════════════════════════════════
+# MODELS ĐÃ CHỌN MỨC CAO NHẤT CHẠY ĐƯỢC TRÊN RTX 5090 (32GB VRAM) — audit 13/06/2026:
+#   • Wan 2.2 Animate (motion): unet fp8_e4m3fn_scaled (bf16 14B + video frames → OOM 32GB) · VAE/text-enc bf16.
+#   • Qwen-Image-Edit (create-image/tryon): unet GGUF Q8_0 (~20GB, ĐÃ verify render OK + tay/chi tiết tốt;
+#     fp16=40GB → OOM) · text-encoder qwen2.5-VL fp8 (bf16 ~14GB + Q8 20GB > 32GB) · VAE full.
+#   • LTX-2.3 (teaser, optional): Q6_K 21GB (Q8 25.5GB sát ngưỡng).
+# Muốn nhẹ/nhanh hơn (vd GPU < 32GB): hạ Qwen unet xuống Q5_K_M/Q4_K_M (sửa QWEN_EDIT_GGUF trong .env + tên dòng dưới).
+# ════════════════════════════════════════════════════════════════════════════
+# Manifest models cho pipeline Wan 2.2 Animate. Format mỗi dòng:  dest_subdir | filename | url
+# Entrypoint tải vào ComfyUI/models/<dest>/<filename>, SKIP nếu file đã tồn tại.
+# Tất cả URL dưới đây ĐÃ VERIFY trả về HTTP 200 (HuggingFace, 2026-05-31).
+# Đã có models sẵn? Mount thư mục vào volume `comfymodels` → mọi dòng sẽ được SKIP.
+# Một số model là gated (cần login HF) → set HF_TOKEN trong .env để tải được.
+
+# --- 6 model chính của Wan 2.2 Animate ---
+diffusion_models | Wan2_2-Animate-14B_fp8_e4m3fn_scaled_KJ.safetensors          | https://huggingface.co/Kijai/WanVideo_comfy_fp8_scaled/resolve/main/Wan22Animate/Wan2_2-Animate-14B_fp8_e4m3fn_scaled_KJ.safetensors
+vae              | Wan2_1_VAE_bf16.safetensors                                    | https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Wan2_1_VAE_bf16.safetensors
+text_encoders    | umt5-xxl-enc-bf16.safetensors                                  | https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/umt5-xxl-enc-bf16.safetensors
+clip_vision      | clip_vision_h.safetensors                                      | https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/clip_vision/clip_vision_h.safetensors
+loras            | WanAnimate_relight_lora_fp16.safetensors                       | https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/LoRAs/Wan22_relight/WanAnimate_relight_lora_fp16.safetensors
+loras            | lightx2v_I2V_14B_480p_cfg_step_distill_rank32_bf16.safetensors | https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Lightx2v/lightx2v_I2V_14B_480p_cfg_step_distill_rank32_bf16.safetensors
+
+# --- Wan TEXT→VIDEO (node "Text → Video": CHỈ prompt, KHÔNG ảnh) — ALD 14/06/2026 ---
+# Graph text-only đã verify từ example WanVideoWrapper trên box (wanvideo_2_1_14B_T2V_example_03.json) +
+# /object_info :8188. Dùng CHUNG umt5-xxl-enc-bf16 (text_encoders) + Wan2_1_VAE_bf16 (vae) đã có ở trên → KHÔNG
+# cần thêm text-encoder/VAE. CHỈ cần model T2V (diffusion_models). 3 URL Kijai ĐÃ VERIFY 302→CDS (NON-GATED, 14/06).
+# MẶC ĐỊNH (WAN_T2V_MODEL): Wan2.1-T2V-14B 1 file fp8 — KHỚP đúng single-WanVideoModelLoader của example đã verify.
+diffusion_models | Wan2_1-T2V-14B_fp8_e4m3fn_scaled_KJ.safetensors                | https://huggingface.co/Kijai/WanVideo_comfy_fp8_scaled/resolve/main/T2V/Wan2_1-T2V-14B_fp8_e4m3fn_scaled_KJ.safetensors
+# Wan2.2 T2V-A14B = MoE 2-expert (HIGH+LOW). Worker hiện map 'wan2.2' về expert LOW (xấp xỉ single-loader; graph
+# 2-loader CHƯA verify trên box). Tải CẢ HAI để sau nâng lên graph 2-expert đầy đủ khi đã verify.
+diffusion_models | Wan2_2-T2V-A14B-LOW_fp8_e4m3fn_scaled_KJ.safetensors           | https://huggingface.co/Kijai/WanVideo_comfy_fp8_scaled/resolve/main/T2V/Wan2_2-T2V-A14B-LOW_fp8_e4m3fn_scaled_KJ.safetensors
+diffusion_models | Wan2_2-T2V-A14B_HIGH_fp8_e4m3fn_scaled_KJ.safetensors          | https://huggingface.co/Kijai/WanVideo_comfy_fp8_scaled/resolve/main/T2V/Wan2_2-T2V-A14B_HIGH_fp8_e4m3fn_scaled_KJ.safetensors
+
+# --- Qwen-Image-Edit 2509 cho create-image / tryon / compose (ĐÃ VERIFY 200, 2026-06-12) ---
+# Đường ảnh: UnetLoaderGGUF (unet) + CLIPLoader type qwen_image (text_encoders) + VAELoader (vae) + LoRA realism.
+# unet Q8_0 ~20GB (nét, vừa 5090 32GB; chi tiết tay/vật tốt hơn Q4). Nhẹ hơn thì Q5_K_M/Q4_K_M (sửa QWEN_EDIT_GGUF .env).
+unet             | Qwen-Image-Edit-2509-Q8_0.gguf       | https://huggingface.co/QuantStack/Qwen-Image-Edit-2509-GGUF/resolve/main/Qwen-Image-Edit-2509-Q8_0.gguf
+text_encoders    | qwen_2.5_vl_7b_fp8_scaled.safetensors  | https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors
+vae              | qwen_image_vae.safetensors             | https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/vae/qwen_image_vae.safetensors
+loras            | flymy_realism.safetensors              | https://huggingface.co/flymy-ai/qwen-image-realism-lora/resolve/main/flymy_realism.safetensors
+
+# --- Flux.1 + SD3.5 (FP8) cho create-image text→image (self-host, KHÔNG sửa/ghép ảnh — đó là việc của Qwen) ---
+# ALD 13/06/2026 - "Model (self-host)" ngoài Qwen-Edit. Dùng bản ALL-IN-ONE FP8 (1 file → CheckpointLoaderSimple,
+# gói sẵn CLIP/T5/VAE) → models/checkpoints. Vừa 5090 32GB. Tên file KHỚP env worker (FLUX_DEV_FP8/… linux.py).
+# URL Comfy-Org ĐÃ VERIFY HTTP 200 (2026-06-13), KHÔNG gated (không cần HF_TOKEN).
+checkpoints      | flux1-dev-fp8.safetensors                                | https://huggingface.co/Comfy-Org/flux1-dev/resolve/main/flux1-dev-fp8.safetensors
+checkpoints      | flux1-schnell-fp8.safetensors                            | https://huggingface.co/Comfy-Org/flux1-schnell/resolve/main/flux1-schnell-fp8.safetensors
+# ALD 14/06/2026 - ĐÃ BỎ HẲN SD3.5 (Large/Medium/Turbo) theo yêu cầu user — Flux đủ cho text→image. Turbo gated
+# (cần accept license + HF_TOKEN) hay lỗi nên bỏ luôn. Self-host text→image còn: Qwen-Edit + Flux Dev/Schnell.
+
+# --- DWPose (controlnet_aux/DWPreprocessor) — pre-pull vào thư mục ckpts của controlnet_aux ---
+# Nếu version controlnet_aux dùng path khác, nó sẽ tự tải lại lúc job đầu (vẫn tự động).
+../custom_nodes/comfyui_controlnet_aux/ckpts/hr16/DWPose-TorchScript-BatchSize5 | dw-ll_ucoco_384_bs5.torchscript.pt | https://huggingface.co/hr16/DWPose-TorchScript-BatchSize5/resolve/main/dw-ll_ucoco_384_bs5.torchscript.pt
+../custom_nodes/comfyui_controlnet_aux/ckpts/hr16/yolox-onnx                    | yolox_l.torchscript.pt             | https://huggingface.co/hr16/yolox-onnx/resolve/main/yolox_l.torchscript.pt
+
+# --- LTX-2.3 (Lightricks) cho Teaser — ảnh + prompt → video + audio ---
+# File chính thức ĐÃ VERIFY trên HuggingFace Lightricks/LTX-2.3 (checkpoints/LTX-Video):
+#   ltx-2.3-22b-dev.safetensors            46.1GB  (bf16, chất lượng tối đa, nhiều bước)
+#   ltx-2.3-22b-distilled-1.1.safetensors  46.1GB  (8 bước, cfg=1 — nhanh, "beginners")
+#   ltx-2.3-22b-distilled-lora-384-1.1.safetensors  7.61GB (LoRA, cần base)
+#
+# 🚨 VRAM: bf16 22B = **~46GB > 32GB RTX 5090** → KHÔNG dùng bản bf16 official. DÙNG BẢN GGUF (chạy qua
+#    node UnetLoaderGGUF của ComfyUI-GGUF/city96 — ĐÃ có trong Dockerfile, giống Qwen-Image-Edit).
+# ✅ KHUYÊN DÙNG (vừa 32GB): bản **distilled-1.1 Q8_0 (~24GB)** từ QuantStack/LTX-2.3-GGUF.
+#    Mở folder trên HF để lấy ĐÚNG tên file quant (vd Q8_0/Q6_K…) rồi sửa bên dưới + bỏ '#'. GGUF → models/unet.
+# 🚨 Text-encoder = **Gemma 3** (KHÔNG phải umt5/T5) — tải riêng (xem QuantStack/awesome-ltx2 → clip/text_encoders).
+# 🚨 LTX_MODEL ở docker-compose phải = tên file .gguf đã tải. cần HF_TOKEN nếu gated.
+# LƯU Ý: server prod chạy ComfyUI NATIVE ở /home/ubuntu/ai/ComfyUI (KHÔNG qua container này) → tải thẳng
+# vào /home/ubuntu/ai/ComfyUI/models/unet. Bản Q6_K (21GB) ĐÃ tải sẵn trên prod 02/06/2026. Quant 32GB:
+# Q6_K 21GB (khuyên) · Q5_K_M 19.4GB · Q4_K_M 17.8GB · Q8_0 25.5GB (sát ngưỡng). Tên file CÓ "22B".
+# unet | LTX-2.3-22B-distilled-1.1-Q6_K.gguf | https://huggingface.co/QuantStack/LTX-2.3-GGUF/resolve/main/LTX-2.3-distilled-1.1/LTX-2.3-22B-distilled-1.1-Q6_K.gguf
+# unet | LTX-2.3-22B-dev-Q6_K.gguf           | https://huggingface.co/QuantStack/LTX-2.3-GGUF/resolve/main/LTX-2.3-dev/LTX-2.3-22B-dev-Q6_K.gguf
+# (bf16 official, CHỈ nếu có >46GB VRAM/offload: https://huggingface.co/Lightricks/LTX-2.3 → ltx-2.3-22b-{dev,distilled-1.1}.safetensors → checkpoints/LTX-Video)
+
+# ════════════════════════════════════════════════════════════════════════════
+# --- node "SS" (Ảnh→Video / Text→Video, LTX-2.3 22B + LoRA custom) — ALD 14/06/2026, TỐI ƯU DISK ---
+# ĐÃ VERIFY render thật trên prod (I2V + T2V + 30s chia-đoạn). Tải 3 file rồi setup TỰ XỬ LÝ → đĩa cuối ~38GB
+# (KHÔNG giữ checkpoint 46GB). Đường I2V GGUF vừa 32GB VRAM (nạp tuần tự + offload):
+#   1) UNET GGUF Q6_K (~20GB)               → UnetLoaderGGUF (SS_MODEL)
+#   2) Gemma-3 fp8 text-encoder (~13GB)     → LTXAVTextEncoderLoader (SS_GEMMA)
+#   3) checkpoint cho audio-vae + video-vae + projection.
+#
+# Chỉ tải 2 file công khai dưới (GGUF + Gemma, ~33GB). 2 file CÒN LẠI (VAE + checkpoint-min) user TỰ ĐẶT vào
+# drop-zone `ltx-ss-prebuilt/` (setup tự copy vào — xem ltx-ss-prebuilt/README.md). → END-USER tải ~33GB + có sẵn
+# 2 file ~5.5GB = đĩa ~38GB (KHÔNG cần checkpoint 46GB, KHÔNG xử lý).
+unet          | LTX-2.3-22B-distilled-1.1-Q6_K.gguf   | https://huggingface.co/QuantStack/LTX-2.3-GGUF/resolve/main/LTX-2.3-distilled-1.1/LTX-2.3-22B-distilled-1.1-Q6_K.gguf
+text_encoders | comfy_gemma_3_12B_it.safetensors      | https://huggingface.co/GitMylo/LTX-2-comfy_gemma_fp8_e4m3fn/resolve/main/gemma_3_12B_it_fp8_e4m3fn.safetensors
+# FALLBACK (nếu KHÔNG có 2 file prebuilt ở drop-zone): bỏ '#' dòng dưới để tải checkpoint 46GB → setup tự cắt
+# transformer (comfyui/ltx-ss-postprocess.py) còn ~4GB. Tải ~79GB nhưng đĩa cuối vẫn ~38GB.
+# checkpoints | ltx-2.3-22b-distilled-1.1.safetensors | https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-22b-distilled-1.1.safetensors

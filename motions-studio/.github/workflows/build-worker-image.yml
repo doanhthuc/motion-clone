@@ -1,0 +1,80 @@
+name: Build worker image
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, development]
+    paths:
+      - worker-image/Dockerfile
+      - api/package.json
+      - worker/requirements.txt
+      - .github/workflows/build-worker-image.yml
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: worker-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # #region ALD 26/07/2026 - Dọn disk trước khi build.
+      # Runner tiêu chuẩn của GitHub chỉ còn ~14GB trống, trong khi RIÊNG base image
+      # vastai/comfy:v0.27.0-cuda-13.2-py312 đã 8GB nén / ~17.6GB sau giải nén — chưa tính các lớp
+      # mình thêm (7 custom node, torch/transformers/diffusers, compile sageattention, node_modules,
+      # minio, ollama). Không dọn thì build chết giữa chừng vì "no space left on device", và log lỗi
+      # đó nằm sâu trong bước build nên rất dễ tưởng Dockerfile sai.
+      # Xoá toolchain cài sẵn mà build này không dùng → lấy lại ~25-30GB.
+      - name: Free disk space
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /usr/local/share/powershell \
+                      /usr/share/swift /opt/hostedtoolcache 2>/dev/null || true
+          sudo docker image prune -af 2>/dev/null || true
+          echo "sau khi dọn:"; df -h / | tail -1
+      # #endregion
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ghcr.io/ald-project/motion-backend-worker
+          tags: |
+            type=raw,value=latest
+            type=raw,value=development,enable=${{ github.ref_name == 'development' }}
+            type=sha,prefix=sha-
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: worker-image/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # ALD 26/07/2026 - mode=min thay vì max: cache Actions giới hạn 10GB/repo, image này ~20GB
+          # nên mode=max chỉ tổ ghi rồi bị đuổi ngay, vừa vô ích vừa ăn thêm disk của runner.
+          cache-from: type=gha
+          cache-to: type=gha,mode=min
+
+      # #region ALD 26/07/2026 - ĐÃ GỠ bước tự đổi package sang public.
+      # Image có COPY api/package.json + worker/requirements.txt → phơi ra danh sách dependency và
+      # 7 custom node của sản phẩm. Không phải source code, nhưng đây là sản phẩm thương mại
+      # (bán Full Source) nên lộ stack cũng là mất giá trị → package GIỮ PRIVATE.
+      # Pod kéo image bằng tài khoản registry khai ở Admin → GPU → Cấu hình RunPod
+      # (classic PAT scope read:packages; GHCR KHÔNG nhận fine-grained token).
+      # Đừng thêm lại bước PATCH visibility=public: nó chỉ chờ ai đó cấp admin:packages là lật public.
+      # #endregion

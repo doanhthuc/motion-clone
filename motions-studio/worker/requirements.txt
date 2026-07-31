@@ -1,0 +1,10 @@
+requests==2.32.3
+websocket-client==1.8.0
+Pillow>=10.4.0
+# ALD 16/06/2026 - piper-tts chỉ dùng ở macos.py (giọng fallback dev); linux worker KHÔNG dùng. piper-phonemize~=1.1
+# KHÔNG có wheel cho Python ≥3.12 → pip báo ERROR đỏ (nhưng vô hại). Marker: chỉ cài khi py<3.12, py mới bỏ qua sạch.
+piper-tts==1.2.0; python_version < "3.12"
+edge-tts>=7.0.0
+# ALD 15/06/2026 - ASR fallback cho node "Phụ đề + Dịch" khi KHÔNG có OmniVoice /asr: faster-whisper chạy
+# thẳng trong worker (CPU, CTranslate2 — không kéo torch). Model tự tải lần đầu vào HF cache (volume persist).
+faster-whisper>=1.0.3

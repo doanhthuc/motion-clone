@@ -1,0 +1,11 @@
+# OmniVoice TTS service — deps cho service.py.
+# LƯU Ý: cài torch RIÊNG TRƯỚC bằng CUDA wheel (xem README.md), KHÔNG để pip kéo bản CPU:
+#   pip install torch==2.11.0+cu130 torchaudio==2.11.0+cu130 --extra-index-url https://download.pytorch.org/whl/cu130
+omnivoice
+fastapi
+uvicorn[standard]
+soundfile
+numpy
+python-multipart
+# ALD 15/06/2026 - ASR (/asr) cho node "Dịch phụ đề video": transcribe + timestamp (chạy GPU cùng venv).
+faster-whisper

@@ -1,0 +1,41 @@
+{
+  "name": "motions",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "nuxt build",
+    "dev": "nuxt dev --port 2030",
+    "generate": "nuxt generate",
+    "preview": "nuxt preview --port 2030",
+    "start": "node .output/server/index.mjs",
+    "postinstall": "nuxt prepare",
+    "typecheck": "nuxt typecheck"
+  },
+  "dependencies": {
+    "@nuxt/image": "^2.0.0",
+    "@nuxtjs/supabase": "^1.5.0",
+    "@pinia/nuxt": "^0.11.0",
+    "@tailwindcss/vite": "^4.3.0",
+    "@vscode/markdown-it-katex": "^1.1.1",
+    "@vue-flow/background": "^1.3.2",
+    "@vue-flow/controls": "^1.1.2",
+    "@vue-flow/core": "^1.42.5",
+    "@vue-flow/minimap": "^1.5.0",
+    "@vueuse/nuxt": "^13.0.0",
+    "bootstrap-icons": "^1.13.1",
+    "clsx": "^2.1.1",
+    "katex": "^0.16.11",
+    "lodash-es": "^4.17.21",
+    "markdown-it": "^14.1.1",
+    "nuxt": "^4.4.6",
+    "pinia": "^3.0.0",
+    "tailwind-merge": "^3.6.0",
+    "tailwindcss": "^4.3.0",
+    "vue": "^3.5.34",
+    "vue-router": "^5.0.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "vue-tsc": "^2.1.10"
+  }
+}

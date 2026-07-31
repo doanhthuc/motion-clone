@@ -1,0 +1,22 @@
+# ALD 15/06/2026 - Type-check gate (non-blocking). Hiện lỗi type để dọn dần, KHÔNG chặn build.
+# strict/typeCheck đang off trong nuxt.config → chạy lần đầu có thể nhiều lỗi tồn đọng → continue-on-error.
+name: typecheck
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Type check (non-blocking)
+        run: npm run typecheck
+        continue-on-error: true
