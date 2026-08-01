@@ -133,6 +133,10 @@ Lần dựng pod tiếp theo: quay lại **giai đoạn 1**, bỏ qua bước 7 
 | `pod create` báo hết máy | `MIN_CUDA_VERSION=13.0` lọc quá chặt | hạ xuống `12.8`, [CUDA 13](#cuda-13) |
 | Setup trên vast mất 1-2 tiếng | bốc trúng máy đĩa chậm | [Vì sao vast chậm](#vast-slow) |
 | `gpu-wait` hết giờ | pod chưa mở cổng 22, hoặc host chết | thông báo timeout in sẵn lệnh chẩn đoán |
+| Console lặp `start container ...: begin` | image không phải `runpod/*` → crash loop | [Ba cái bẫy của RunPod](#runpod-gotchas) §1 |
+| `pod-volume.sh` chết ở `rsync PGDATA` | MooseFS chặn `chown` | [§2](#runpod-gotchas) — `VOLUME_PGDATA=0` |
+| `minio` restart mãi, `pm2 ls` hiện `waiting` | MinIO từ chối symlink làm drive | [§3](#runpod-gotchas) |
+| DB trống sau khi dựng lại pod | PGDATA nằm trên container disk, không trên volume | [§2](#runpod-gotchas) — đánh đổi đã biết |
 | `https://$DOMAIN` không trả lời | cloudflared không chạy (pod không có systemd) | [systemd / cloudflared](#systemd-cloudflared) |
 | App load được, mọi API call chết CORS | `CORS_ORIGINS` thiếu `https://$FE_DOMAIN` | [Frontend on the pod](#frontend-on-the-pod) |
 | Pod mới lại tải 33GB model | volume không được mount thật | `make gpu-volume-check`, [Kiểm chứng](#volume-check) |
@@ -327,9 +331,18 @@ Nó cũng tự lo cái bẫy hay dính nhất: **pod phải cùng datacenter v�
 datacenter của volume rồi ghim `--data-center-ids` theo đúng đó. Chỉ có 1 volume thì tự lấy id và
 ghi vào `.env` là `POD_VOLUME_ID`; có nhiều hơn thì nó liệt kê ra và bắt bạn chọn.
 
-`make gpu-wait` giờ chạy được cả RunPod: nó poll `runpodctl pod get`, đọc SSH endpoint ở **cả hai
-dạng JSON** mà RunPod từng dùng (`portMappings` map và `runtime.ports` list) rồi tự điền
-`GPU_SSH_HOST`/`GPU_SSH_PORT`.
+`make gpu-wait` chạy được cả RunPod: nó poll `runpodctl ssh info` (nguồn đúng — `pod get` **không**
+mang endpoint SSH, trường `ports` của nó chỉ là `["22/tcp"]`), rồi tự điền `GPU_SSH_HOST` và
+`GPU_SSH_PORT`.
+
+Hai chi tiết đã trả giá mới biết:
+
+- **Điều kiện dừng không được dựa vào status.** Khi pod sẵn sàng, `ssh info` trả `id · ip · name ·
+  port · ssh_command · ssh_key` — **không có trường status nào**. Bản đầu bắt buộc
+  `status == running` nên chờ hết 25 phút trong khi đã cầm sẵn host và port. Giờ nó chỉ dựa vào
+  endpoint cộng một lần bắt tay SSH thật; status chỉ để hiển thị.
+- **`runpodctl pod get` thỉnh thoảng trả rỗng**, exit 0, không cảnh báo. Đo được 1 trên 3 lần.
+  Vòng lặp coi đó là "chưa sẵn sàng" và thử lại, không coi là lỗi.
 
 Lệnh vòng đời dùng cú pháp mới `runpodctl pod start|stop|delete` — dạng cũ (`runpodctl start pod`)
 vẫn chạy nhưng đã bị đánh dấu deprecated.
@@ -383,6 +396,71 @@ không chắc 100%.
 Model KHÔNG nằm trong repo — luôn tải qua Settings → Models AI sau khi bootstrap xong.
 
 ---
+
+<a id="runpod-gotchas"></a>
+## Ba cái bẫy của RunPod — đo trên pod thật 01/08/2026
+
+Cả ba đều thuộc loại "nhìn từ ngoài giống hệt boot chậm". Tốn $0.43 và vài vòng lặp sai hướng
+mới lần ra.
+
+### 1 · Image phải là `runpod/*`, nếu không container restart vô hạn
+
+| | Ai chạy sshd |
+|---|---|
+| vast.ai | `vastai create --ssh --direct` **tiêm sshd của vast** → image thường vẫn chạy |
+| RunPod | **không tiêm gì** — image phải tự chạy sshd và không được thoát |
+
+`pytorch/pytorch:*` (image chính thức của PyTorch) có `CMD=bash`, thoát ngay khi không có tty →
+RunPod khởi động lại → lặp mãi. Triệu chứng: console lặp `start container for <image>: begin`,
+`runpodctl ssh info` mãi trả `"pod not ready"`.
+
+`runpod/pytorch:*` có `/start.sh` chạy sshd rồi block. `pod-provision.sh` giờ chọn mặc định theo
+provider và cảnh báo nếu `POD_IMAGE` không phải `runpod/*` khi dùng RunPod.
+
+Tag CUDA của image **không** quyết định CUDA mà ComfyUI dùng — `--min-cuda-version` mới làm việc
+đó. Xem [CUDA 13](#cuda-13).
+
+### 2 · PGDATA không sống được trên Network Volume
+
+```
+mfs#euro-3.runpod.net:9421 on /workspace type fuse (rw,...,user_id=0,group_id=0)
+chown: 'Operation not permitted'      ← ngay cả khi là root
+```
+
+RunPod mount volume bằng MooseFS, ép `root:root` và chặn `chown`. Postgres **từ chối khởi động**
+nếu PGDATA không thuộc user `postgres` mode 0700. `rsync -a` chết ở lần `chown` đầu tiên và
+`pod-volume.sh` dừng trước khi cài gì.
+
+Phương án file ext4 loopback trên volume: **bất khả thi**, container không có `/dev/loop*`.
+
+Nên `VOLUME_PGDATA=0` là mặc định. Hệ quả:
+
+| | |
+|---|---|
+| DB sống qua `gpu-down` → `gpu-up` | ✅ container disk còn |
+| DB sống qua `gpu-destroy` | ❌ **mất** |
+| Model 33GB | ✅ vẫn trên volume, vẫn không phải tải lại |
+
+Muốn giữ DB qua `destroy` thì `pg_dump` định kỳ ra `/workspace` — chưa làm.
+
+*Sửa cho việc này nằm trong `motions-studio/setup/pod-volume.sh`, tức là sửa **cục bộ trên file
+upstream**. Phải làm lại sau mỗi `make sync-upstream`.*
+
+### 3 · MinIO từ chối symlink làm drive
+
+`pod-volume.sh` nối `.data/minio → $POD_VOLUME/minio` bằng symlink. Mọi thứ khác chấp nhận, riêng
+MinIO chết:
+
+```
+FATAL Unable to initialize backend: Unable to write to the backend
+HINT: Drives are not directories, MinIO erasure coding needs directories
+```
+
+rồi PM2 restart mãi — **37 lần** trước khi bị phát hiện, và `pm2 ls` chỉ hiện `waiting` chứ không
+`errored`, nên nhìn lướt tưởng đang khởi động.
+
+`mount --bind` bị container từ chối. `ecosystem.config.cjs:58` đọc `MINIO_DATA_DIR`, nên
+`pod-bootstrap.sh` trỏ MinIO thẳng vào `$POD_VOLUME/minio`, bỏ qua symlink.
 
 <a id="network-volume"></a>
 <a id="volume"></a>

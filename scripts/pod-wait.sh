@@ -132,7 +132,17 @@ while :; do
 
   probe
 
-  if [ "$STATUS" = "running" ] && [ -n "$HOST" ] && [ -n "$PORT" ]; then
+  # Gate on the endpoint and a real SSH handshake, NOT on the status string.
+  #
+  # Status used to be part of this condition and it deadlocked the RunPod path: once the pod is
+  # ready `runpodctl ssh info` returns {id, ip, name, port, ssh_command, ssh_key} and NO status
+  # field at all, so STATUS fell back to "?" and `[ "$STATUS" = running ]` was never true — the
+  # loop waited out its full timeout while holding a perfectly good host and port. Diagnosed on a
+  # live pod 2026-08-01 after four wrong guesses.
+  #
+  # Status is display-only now. The ssh probe below is the real test and cannot be fooled by a
+  # provider renaming a JSON field, which both of these CLIs have already done more than once.
+  if [ -n "$HOST" ] && [ -n "$PORT" ]; then
     if ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8 -p "$PORT" "root@$HOST" true 2>/dev/null; then
       env_set GPU_SSH_HOST "$HOST"
       env_set GPU_SSH_PORT "$PORT"
