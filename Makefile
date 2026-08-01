@@ -69,13 +69,27 @@ else
 endif
 	@echo "GPU pod stopped — note: storage still bills hourly while the pod EXISTS (see docs/gpu-pod.md#costs)"
 
+# `vastai destroy` asks "[y/N]" and answers itself with N on EOF — then exits 0. Piping y is not
+# skipping a safety check: typing `make gpu-destroy` IS the confirmation. What matters is the
+# verify below. Without it the target printed "GPU pod destroyed" over an aborted destroy, and you
+# only found out from the invoice.
 gpu-destroy: ## Permanently destroy the pod (frees the GPU, deletes its disk — irreversible)
+	@test -n "$(call env,GPU_INSTANCE_ID)" || { echo "GPU_INSTANCE_ID is empty in .env — nothing to destroy"; exit 1; }
 ifeq ($(shell grep -E '^GPU_PROVIDER=' .env 2>/dev/null | cut -d= -f2),runpod)
 	@runpodctl remove pod $(call env,GPU_INSTANCE_ID)
+	@echo "GPU pod destroyed — confirm on the RunPod dashboard (runpodctl has no list-and-verify)"
 else
-	@vastai destroy instance $(call env,GPU_INSTANCE_ID)
+	@printf 'y\n' | vastai destroy instance $(call env,GPU_INSTANCE_ID)
+	@sleep 3
+	@if vastai show instances 2>/dev/null | grep -q '\b$(call env,GPU_INSTANCE_ID)\b'; then \
+		echo "STILL ALIVE — instance $(call env,GPU_INSTANCE_ID) was NOT destroyed and is STILL BILLING."; \
+		echo "Destroy it by hand: vastai destroy instance $(call env,GPU_INSTANCE_ID)"; \
+		exit 1; \
+	else \
+		echo "destroyed — verified gone from 'vastai show instances'"; \
+		echo "now clear GPU_INSTANCE_ID / GPU_SSH_HOST / GPU_SSH_PORT in .env"; \
+	fi
 endif
-	@echo "GPU pod destroyed"
 
 gpu-volume: ## Wire models/PGDATA/MinIO onto the Network Volume (idempotent; gpu-bootstrap does this too)
 	@test -n "$(call env,POD_VOLUME)" || { echo "set POD_VOLUME in .env first (see docs/gpu-pod.md#network-volume)"; exit 1; }
