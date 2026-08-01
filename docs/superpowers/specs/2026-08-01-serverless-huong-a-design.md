@@ -28,23 +28,31 @@ Nên handler đó là tham chiếu tốt, không phải thứ để tái dùng.
 
 ## Kiến trúc
 
-Serverless là **nguồn worker thứ hai**, không thay pod:
+Serverless **thay** worker local. Đúng một nguồn worker tại một thời điểm.
 
 ```
-                    ┌──────────────────────────────────────────┐
-  FE tạo job ──────▶│ api + Postgres + MinIO   (luôn bật)      │
-                    │  jobs: queued → processing → done        │
-                    └────────┬────────────────────┬────────────┘
-                             │                    │
-              worker local (pod, PM2)    dispatcher → RunPod Serverless
-                    poll /worker/claim           POST /v2/<id>/run
-                             │                    │
-                             └──── cùng một giao thức ────┘
+   TRƯỚC (hôm nay)                      SAU
+   ┌──────────────────────┐             ┌──────────────────────┐
+   │ GPU pod              │             │ VPS (không GPU)      │
+   │  api · Postgres      │             │  api · Postgres      │
+   │  MinIO · FE          │             │  MinIO · FE          │
+   │  worker · comfyui    │             │  dispatcher          │
+   └──────────────────────┘             └──────────┬───────────┘
+    một máy làm tất cả                             │ POST /v2/<id>/run
+                                                   ▼
+                                        RunPod Serverless (0..N container)
+                                          poll /worker/claim ── cùng giao thức
 ```
 
-Muốn chuyển hẳn sang "không task = không tốn tiền" về sau: `pm2 stop worker` và dời
-api/Postgres/MinIO sang box không GPU. Không phải viết lại gì — đó là lý do thiết kế theo hình
-này thay vì thay thế thẳng.
+Chuyển đổi là `pm2 stop worker && pm2 stop comfyui` cộng việc dời api/Postgres/MinIO sang VPS.
+Vì hai bên dùng **cùng một giao thức** (§Quyết định 1), không có bước migrate dữ liệu hay đổi
+API nào.
+
+**Không chạy song song hai nguồn worker.** Cân nhắc ban đầu là để serverless gánh thêm cho pod
+trong giai đoạn chuyển tiếp, nhưng nó không có lợi ích thật: ở hình dạng giữ pod bạn đã trả tiền
+GPU 24/7 nên worker local là miễn phí, thêm serverless chỉ tốn thêm; ở hình dạng VPS thì không
+còn GPU nào để chạy worker local. Chỉ có ý nghĩa nếu mục tiêu là gánh tải cao điểm — bài toán
+khác, chưa có số liệu, xem §Cố tình KHÔNG làm.
 
 ## Quyết định 1 — tái dùng nguyên giao thức worker, không monkeypatch
 
@@ -276,6 +284,11 @@ RunPod Serverless với `max workers 3-5` rơi vào đúng kịch bản này nga
 song. Triệu chứng sẽ là job fail rải rác với thông báo "Worker khởi động lại giữa chừng" mà không
 có worker nào restart cả — cực khó lần ra nếu không biết trước.
 
+Lưu ý kẻo hiểu nhầm: lỗi này **không** sinh ra từ việc ghép worker local với serverless. Nó sinh
+ra từ **nhiều claimer dùng chung một `worker_id`**, mà serverless bản chất là nhiều container ngắn
+hạn. Tắt sạch worker local không chữa được — ba container serverless vẫn giết job của nhau.
+`max workers = 1` thì né được, nhưng đánh mất lý do dùng serverless.
+
 **Bắt buộc:** mỗi container đặt `WORKER_ID` riêng, sinh lúc khởi động (id worker của RunPod, hoặc
 `serverless-<uuid4>`). Đây là một dòng trong `entrypoint.sh`, nhưng thiếu nó thì hệ thống hỏng
 theo kiểu ngẫu nhiên và chỉ hỏng khi có tải.
@@ -283,6 +296,12 @@ theo kiểu ngẫu nhiên và chỉ hỏng khi có tải.
 Thêm vào §Kiểm chứng mục 6: hai job cùng lúc, không job nào bị chuyển `error` oan.
 
 ## Cố tình KHÔNG làm
+
+**Chạy song song worker local và serverless để gánh tải cao điểm.** Đây là bài toán khác với
+scale-to-zero và cần số liệu tải mà hiện chưa có. Nếu sau này cần, nó rẻ: bật lại `pm2 start
+worker` trên một máy có GPU là xong, giao thức đã chung. Nhưng lúc đó phải đọc lại
+[§Quyết định 5](#handler-shape) — thêm một claimer nữa thì ràng buộc `WORKER_ID` duy nhất càng
+chặt hơn.
 
 Ngân sách trần theo ngày · fallback tự động khi serverless lỗi · autoscale theo độ dài hàng đợi ·
 nhiều endpoint tách theo job type · concurrency > 1 trong một worker.
