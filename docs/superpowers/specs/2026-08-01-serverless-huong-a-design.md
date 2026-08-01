@@ -91,7 +91,20 @@ không mất tính đúng đắn. Đổi lại:
 Phương án thay thế (truyền `job_id` trong request) đòi thêm route claim-theo-id, và đẻ ra tình
 huống job bị gán cho một worker đã chết. Không đáng.
 
-## Quyết định 3 — presigned PUT cho output lớn
+## Quyết định 3 — presigned PUT cho output lớn · **HOÃN**
+
+> **Cập nhật 01/08/2026:** chủ dự án xác nhận output thật **dưới 100MB**. Giả định 1 ở §Ba giả
+> định coi như đã trả lời, và toàn bộ mục này **không cần làm cho lần triển khai đầu**.
+>
+> Ba hệ quả, đều theo hướng nhẹ đi:
+> - Không cần `presignPut`, không cần route `/worker/output-url`, không cần nhánh mới trong worker
+> - **Ràng buộc "phải là VPS" tan biến** — MinIO không cần cổng public, nên RunPod CPU pod dùng
+>   được cho scale-to-zero về sau
+> - Bảng hai hình dạng bên dưới không còn là giới hạn thực tế
+>
+> Giữ nguyên phần dưới đây làm tài liệu: nếu sau này có gói dài hơn hoặc độ phân giải cao hơn đẩy
+> output vượt 100MB, đây là thiết kế sẵn sàng dùng. Dấu hiệu để quay lại: job fail ở bước upload
+> với HTTP 413 từ Cloudflare.
 
 `api_upload_output` (`linux.py:718`) POST **nguyên file mp4 dạng multipart** qua api. Cloudflare
 Tunnel gói free chặn body 100MB, mà `auto-worker.js` đặt `MAX_OUTPUT_BYTES` mặc định 500MB. Đường
@@ -137,6 +150,25 @@ trước khi viết bất kỳ dòng code nào.
 
 ## Quyết định 4 — image và model
 
+`custom_nodes/` là thư mục extension của ComfyUI. Mỗi extension đăng ký thêm nhiều **node type**;
+workflow gọi node theo tên, thiếu extension thì ComfyUI trả 400 *node type not found*. Danh sách
+nền mà `setup-motion-transfer.sh` clone, và node type tương ứng mà `auto-worker.js` bắt buộc box
+phải có:
+
+| Extension | Node type |
+|---|---|
+| `kijai/ComfyUI-WanVideoWrapper` | `WanVideoModelLoader` `WanVideoVAELoader` `WanVideoTextEncodeCached` `WanVideoClipVisionEncode` `WanVideoAnimateEmbeds` `WanVideoSampler` `WanVideoDecode` `WanVideoBlockSwap` `WanVideoLoraSelectMulti` |
+| `kijai/ComfyUI-KJNodes` | `ImageResizeKJv2` `FaceMaskFromPoseKeypoints` `ImageCropByMaskAndResize` |
+| `Kosinkadink/ComfyUI-VideoHelperSuite` | `VHS_LoadVideo` `VHS_VideoCombine` |
+| `Fannovel16/comfyui_controlnet_aux` | `DWPreprocessor` (DWPose) |
+| `Fannovel16/ComfyUI-Frame-Interpolation` | `RIFE VFI` |
+| `naxci1/ComfyUI-FlashVSR_Stable` | FlashVSR |
+
+`CLIPVisionLoader` nằm trong ComfyUI lõi.
+
+Đây mới là danh sách **nền**. Giả định 2 tồn tại vì pod thật còn có node vá tay ngoài git, nên
+clone lại từ đầu chưa chắc ra cùng kết quả.
+
 - **Image**: ComfyUI + custom nodes nướng sẵn. Phải copy **y hệt** `custom_nodes/` của pod thật.
   README-runpod gọi đây là "nguyên nhân #1" gây lỗi 400 *node type not found*: pod thật có node
   vá tay ngoài git (`WanAnimatePreprocess` đã patch, DWPose, hai file onnx trong
@@ -162,8 +194,9 @@ Chưa có số liệu tải thật thì mọi thứ trên là đoán. Job lỗi 
 
 Đây là lý do spec này chưa chuyển thành plan. Cả ba chỉ đo được sau khi pod thật chạy một job thật.
 
-1. **Output thật nặng bao nhiêu.** Nếu đa số dưới 100MB thì §Quyết định 3 hoãn được, bỏ luôn ràng
-   buộc VPS — tiết kiệm hẳn một mảng việc. Đo: chạy vài job đại diện, xem kích thước mp4.
+1. ~~**Output thật nặng bao nhiêu.**~~ **ĐÃ TRẢ LỜI 01/08/2026: dưới 100MB.** Nguồn: chủ dự án
+   xác nhận, chưa phải số đo từ job chạy qua đường này. §Quyết định 3 hoãn, ràng buộc VPS bỏ.
+   Nếu về sau thấy job fail với HTTP 413 ở bước upload thì giả định này đã hết đúng.
 2. **`custom_nodes/` trên pod thật gồm những gì.** Quyết định nội dung image. Đo:
    `ssh pod 'ls ~/comfyui/custom_nodes && git -C ... rev-parse HEAD'` cho từng node, cộng
    `models/detection/*.onnx`.
@@ -191,21 +224,23 @@ Không có unit test cho phần này — nó là hạ tầng. Thứ chứng minh
 
 1. `custom_nodes/` trong image khớp pod thật, đối chiếu từng commit hash
 2. Một job `motion` chạy hết qua serverless, kết quả về đúng database và hiện trên FE
-3. Một job có output >100MB đi qua đường presigned PUT thành công — **chỉ kiểm được ở hình dạng
-   VPS**; ở hình dạng "giữ pod" thì thay bằng: job >100MB fail với thông báo rõ ràng, không im lặng
-   cắt file
+3. Kích thước output thật của vài job đại diện được ghi lại — xác nhận bằng số cái mà §Ba giả
+   định mục 1 đang tin theo lời kể. Vượt 100MB thì mở lại §Quyết định 3
 4. Tắt `pm2 stop worker` trên pod, job vẫn chạy — chứng minh serverless tự đứng được
 5. Không có job nào trong 10 phút → `runpodctl` báo 0 worker đang chạy, hoá đơn không tăng
 6. Hai job cùng lúc → hai worker, không job nào bị nhận hai lần
 
 ## Việc phải làm, theo thứ tự
 
-Chỉ bắt đầu sau khi §Ba giả định được đo.
+Giả định 1 đã trả lời. Còn giả định 2 và 3 phải đo trên pod thật trước khi bắt đầu.
 
-1. Đo ba giả định trên pod thật
-2. `presignPut` trong `storage.js` + route `GET /worker/output-url` + nhánh worker sau cờ
-   `MOTION_OUTPUT_PRESIGN`
+1. Đo giả định 2 (`custom_nodes/` thật) và 3 (worker code tách nhịp được không)
+2. ~~`presignPut` + route `/worker/output-url` + cờ `MOTION_OUTPUT_PRESIGN`~~ — **bỏ**, output
+   dưới 100MB nên đường multipart sẵn có là đủ
 3. Handler serverless + Dockerfile + job CI build image
 4. Network Volume cho model của endpoint, đổ model vào
 5. Dispatcher trong api
-6. Chạy hết 6 mục Kiểm chứng
+6. Chạy hết các mục Kiểm chứng
+
+Bỏ được mục 2 kéo theo: không đụng `storage.js`, không thêm route api, không sửa worker. Phần code
+mới thu về đúng ba thứ — handler, Dockerfile, dispatcher.
