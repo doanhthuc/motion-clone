@@ -134,6 +134,13 @@ STATUS=${PIPESTATUS[0]}
 # `mount --bind` would fix the symlink but the container denies it (permission denied).
 # ecosystem.config.cjs:58 reads MINIO_DATA_DIR, so pointing MinIO straight at the volume path
 # sidesteps the symlink entirely. Done after setup because setup rewrites .env.
+#
+# `pm2 delete` + `pm2 start`, NOT `pm2 restart --update-env`. --update-env refreshes environment
+# variables but leaves `args` frozen at whatever `pm2 start` computed the first time, and the data
+# directory is an ARGUMENT (`server <dir>`), not an env var. The first attempt used --update-env
+# and looked like it worked — pm2 said online, /minio/health/live said 200 — while MinIO quietly
+# kept writing to the container disk. Only `ls /workspace/minio` showed the truth: empty.
+# Verify by the presence of .minio.sys ON THE VOLUME, never by pm2 status.
 if [ -n "$POD_VOLUME" ]; then
   log "pointing MinIO at $POD_VOLUME/minio directly (it rejects symlinked drives)"
   remote "cd ~/$REMOTE_DIR && \
@@ -141,9 +148,16 @@ if [ -n "$POD_VOLUME" ]; then
     grep -q '^MINIO_DATA_DIR=' .env \
       && sed -i 's#^MINIO_DATA_DIR=.*#MINIO_DATA_DIR=$POD_VOLUME/minio#' .env \
       || echo 'MINIO_DATA_DIR=$POD_VOLUME/minio' >> .env ; \
-    pm2 restart minio --update-env >/dev/null 2>&1 ; sleep 6 ; \
-    pm2 jlist | python3 -c \"import sys,json;m=[p for p in json.load(sys.stdin) if p['name']=='minio'];print('minio', m[0]['pm2_env']['status'] if m else 'MISSING')\"" \
-    || warn "could not repoint MinIO — check 'pm2 logs minio'"
+    pm2 delete minio >/dev/null 2>&1 ; \
+    pm2 start ecosystem.config.cjs --only minio >/dev/null 2>&1 ; \
+    pm2 save >/dev/null 2>&1 ; sleep 8 ; \
+    if [ -d '$POD_VOLUME/minio/.minio.sys' ]; then \
+      echo 'MinIO backend on the volume: OK' ; \
+    else \
+      echo 'MinIO did NOT initialise on $POD_VOLUME/minio — it is writing somewhere else' ; \
+      pm2 describe minio | grep 'script args' ; exit 1 ; \
+    fi" \
+    || warn "MinIO is not using the volume — objects will be lost on gpu-destroy. Check 'pm2 logs minio'"
 fi
 
 # ── Gate: prove the volume is actually in use ─────────────────────────────────
