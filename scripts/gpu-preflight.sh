@@ -156,6 +156,17 @@ if [ "$provider" = "runpod" ]; then
       blocking=$((blocking + 1))
       echo -e "${R}✗ runpodctl has no API key${X}"
       echo -e "${D}   Get one at runpod.io/console/user/settings, then:  runpodctl doctor${X}"
+    elif [ -n "$vol" ] && [ -z "$(get POD_VOLUME_ID)" ]; then
+      # "ready" has to mean the next command works. POD_VOLUME set with no volume in the account
+      # means pod-provision.sh stops dead — better to say so here, for the price of one API call.
+      if [ "$(runpodctl network-volume list -o json 2>/dev/null | tr -d '[:space:]')" = "[]" ]; then
+        blocking=$((blocking + 1))
+        echo -e "${R}✗ POD_VOLUME=$vol but this account has no Network Volume yet${X}"
+        echo -e "${D}   Datacenter and size are both fixed at creation — pick a datacenter that stocks your GPU:${X}"
+        echo -e "${D}     runpodctl gpu list -o json | grep -A4 '\"$(get GPU)\"'${X}"
+        echo -e "${D}     runpodctl network-volume create --name motion --size 100 --data-center-id <DC>${X}"
+        echo -e "${D}   Or clear POD_VOLUME to rent without one (models re-download every pod, ~33GB).${X}"
+      fi
     fi
   fi
 fi
