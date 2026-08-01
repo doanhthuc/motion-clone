@@ -150,5 +150,20 @@ if [ "$blocking" -gt 0 ]; then
 fi
 echo -e "${G}✓ ready${X}$( [ "$pending" -gt 0 ] && echo " ${D}(${pending} field(s) still to fill in once the pod exists)${X}" )"
 echo
-echo "  next: $( [ "$pending" -gt 0 ] && echo "make gpu-provision" || echo "make gpu-up  →  make gpu-bootstrap" )"
+# RunPod + Network Volume has no CLI path: pod-provision.sh refuses on purpose because runpodctl
+# cannot attach a volume, and gpu-wait only knows how to ask vastai. Saying "make gpu-provision"
+# here would walk you into both dead ends.
+if [ "$pending" -le 0 ]; then
+  echo "  next: make gpu-up  →  make gpu-bootstrap"
+elif [ "$provider" = "runpod" ] && [ -n "$vol" ]; then
+  echo "  next: create the pod on runpod.io/console/pods with the volume mounted at $vol"
+  echo -e "${D}        (bash scripts/pod-provision.sh prints the exact settings)${X}"
+  echo "        then fill GPU_INSTANCE_ID / GPU_SSH_HOST / GPU_SSH_PORT by hand → make gpu-bootstrap"
+  echo -e "${D}        make gpu-wait does NOT work on RunPod — it only queries vastai.${X}"
+elif [ "$provider" = "runpod" ]; then
+  echo "  next: make gpu-provision  →  fill GPU_SSH_HOST/GPU_SSH_PORT by hand  →  make gpu-bootstrap"
+  echo -e "${D}        (make gpu-wait only queries vastai)${X}"
+else
+  echo "  next: make gpu-provision"
+fi
 echo
