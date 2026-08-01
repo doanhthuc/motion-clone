@@ -29,6 +29,21 @@ CF_TUNNEL_TOKEN="$(env_get CF_TUNNEL_TOKEN)"
 CORS_ORIGINS="$(env_get CORS_ORIGINS)"
 [ -n "$CF_API_TOKEN" ] || [ -n "$CF_TUNNEL_TOKEN" ] || die "CF_API_TOKEN or CF_TUNNEL_TOKEN missing from .env — run: make gpu-preflight"
 
+# ── Frontend on the pod (optional) ────────────────────────────────────────────
+# FE_DOMAIN set → setup-pm2.sh adds a SECOND public hostname to the same Cloudflare Tunnel
+# (CF_FE_DOMAIN → localhost:FE_PORT, plus its DNS record), and scripts/pod-fe.sh deploys the
+# Nuxt app behind it at the end. End-users then open one HTTPS link and your laptop can be off.
+# Leave it empty to keep the old shape: backend on the pod, frontend local via `make dev`.
+FE_DOMAIN="$(env_get FE_DOMAIN)"
+FE_PORT="$(env_get FE_PORT)"; FE_PORT="${FE_PORT:-2030}"
+if [ -n "$FE_DOMAIN" ]; then
+  [ -n "$CF_API_TOKEN" ] || warn "FE_DOMAIN set but only CF_TUNNEL_TOKEN available — an existing tunnel's second Public Hostname ($FE_DOMAIN → localhost:$FE_PORT) has to be added by hand on the Cloudflare dashboard."
+  case ",$CORS_ORIGINS," in
+    *",https://$FE_DOMAIN,"*) ;;
+    *) warn "CORS_ORIGINS does not list https://$FE_DOMAIN — the frontend will load and every API call will fail CORS. Fix .env, then re-run." ;;
+  esac
+fi
+
 # ── Network Volume + prebuilt image (both optional, both big time savers) ──────
 # POD_VOLUME: mount path of a RunPod Network Volume on the pod. When set, models /
 #   PGDATA / MinIO get symlinked onto it, so re-creating a pod does NOT re-download
@@ -87,10 +102,14 @@ LOG="/tmp/motion-clone-bootstrap-${TS}.log"
 # stdin redirected from /dev/null: every OPTIONAL prompt in setup-motion-transfer.sh is a single
 # `read` that returns empty on EOF and moves on. SUPER_ADMIN must be exported (it's a `while`
 # loop that would otherwise spin forever reading empty lines).
+# CF_FE_DOMAIN/CF_FE_PORT are what turn one tunnel into two public hostnames — setup-pm2.sh
+# already handles them (ingress rule, DNS CNAME, and its token preflight covers both zones).
+# FRONTEND_URL only changes the "it's ready" email into a single clickable link.
 ssh "${SSH_OPTS[@]}" "root@$HOST" "cd ~/$REMOTE_DIR && chmod +x setup/*.sh && \
 DOMAIN='$DOMAIN' SUPER_ADMIN='$SUPER_ADMIN' GMAIL_USER='$GMAIL_USER' \
 GMAIL_APP_PASSWORD='$GMAIL_APP_PASSWORD' CF_API_TOKEN='$CF_API_TOKEN' \
 CF_TUNNEL_TOKEN='$CF_TUNNEL_TOKEN' CORS_ORIGINS='$CORS_ORIGINS' HF_TOKEN='' \
+${FE_DOMAIN:+CF_FE_DOMAIN='$FE_DOMAIN' CF_FE_PORT='$FE_PORT' FRONTEND_URL='https://$FE_DOMAIN'} \
 MTC_PREBUILT='${MTC_PREBUILT:-0}' \
 ./setup/setup-motion-transfer.sh" < /dev/null | tee "$LOG"
 STATUS=${PIPESTATUS[0]}
@@ -153,7 +172,19 @@ if [ -n "$DASHBOARD_STEP" ]; then
   echo
 fi
 
-echo "  restart the FE dev server to pick it up:   make down && make dev"
+# ── Frontend on the pod ───────────────────────────────────────────────────────
+# Last, deliberately: the tunnel ingress it depends on was just created above, and it reads the
+# backend's API_KEY off the pod's own .env, which only exists once setup has finished.
+if [ -n "$FE_DOMAIN" ]; then
+  echo
+  log "deploying the frontend onto the pod (rsync + build + PM2)…"
+  bash scripts/pod-fe.sh || die "frontend deploy failed — the backend is up, re-run just the frontend with: make gpu-fe"
+  APP_URL="https://$FE_DOMAIN"
+else
+  APP_URL="http://localhost:2030"
+  echo "  restart the FE dev server to pick it up:   make down && make dev"
+fi
+
 echo "  then load the model group (NOT downloaded by setup, ~33GB):"
-echo "    http://localhost:2030 → login as $SUPER_ADMIN → Settings → Models AI → 'Wan 2.2 Animate' → Cài cả nhóm"
+echo "    $APP_URL → login as $SUPER_ADMIN → Settings → Models AI → 'Wan 2.2 Animate' → Cài cả nhóm"
 echo

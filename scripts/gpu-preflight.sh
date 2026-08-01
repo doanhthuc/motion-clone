@@ -66,6 +66,16 @@ check GMAIL_APP_PASSWORD recommended "pairs with GMAIL_USER (App Password, not t
 check CORS_ORIGINS  recommended "defaults to allow-all if unset — fine for a first deploy, not for prod" 1
 
 echo
+echo "Frontend on the pod (optional — leave FE_DOMAIN empty to keep running it locally)"
+fe_domain="$(get FE_DOMAIN)"
+if [ -n "$fe_domain" ]; then
+  printf "  ${G}✓${X} %-22s ${D}%s${X}\n" "FE_DOMAIN" "$fe_domain"
+  check FE_PORT recommended "port the Nuxt server listens on inside the pod — defaults to 2030" 1
+else
+  printf "  ${D}·${X} %-22s ${D}(empty — backend on the pod, frontend local via 'make dev')${X}\n" "FE_DOMAIN"
+fi
+
+echo
 echo "Speed-ups (skip re-downloading 33GB of models / re-installing every pod)"
 check POD_VOLUME    recommended "RunPod Network Volume mount path, e.g. /workspace — without it every pod re-downloads ~33GB of models AND loses the database. docs/gpu-pod.md#network-volume" 1
 check MODELS_MIN_GB recommended "threshold below which pod-volume.sh assumes the symlink points at an empty dir" 1
@@ -89,6 +99,29 @@ if [ "$admin" = "you@example.com" ]; then
   blocking=$((blocking + 1))
   echo -e "${R}✗ SUPER_ADMIN is still the .env.example placeholder — set your real email${X}"
 fi
+# FE on the pod: three ways to get a box that looks healthy and doesn't work. All free to catch here.
+if [ -n "$fe_domain" ]; then
+  cors="$(get CORS_ORIGINS)"
+  case ",$cors," in
+    *",https://$fe_domain,"*) ;;
+    *)
+      blocking=$((blocking + 1))
+      echo -e "${R}✗ CORS_ORIGINS is missing https://$fe_domain${X}"
+      echo -e "${D}   The frontend would load fine and every API call from the browser would fail CORS,${X}"
+      echo -e "${D}   which looks exactly like a broken backend. Set:${X}"
+      echo -e "${D}     CORS_ORIGINS=https://$fe_domain,http://localhost:2030${X}" ;;
+  esac
+  if [ "$fe_domain" = "$domain" ]; then
+    blocking=$((blocking + 1))
+    echo -e "${R}✗ FE_DOMAIN and DOMAIN are the same host — one tunnel cannot route one hostname to two ports.${X}"
+  fi
+  if [ -z "$cf_api" ]; then
+    echo -e "${Y}! FE_DOMAIN set but no CF_API_TOKEN — the CF_TUNNEL_TOKEN path cannot create the second${X}"
+    echo -e "${D}   Public Hostname. You would have to add $fe_domain → localhost:$( [ -n "$(get FE_PORT)" ] && get FE_PORT || echo 2030 ) on the Cloudflare${X}"
+    echo -e "${D}   dashboard by hand. docs/gpu-pod.md#frontend-on-the-pod${X}"
+  fi
+fi
+
 provider="$(get GPU_PROVIDER)"
 if [ "$provider" = "runpod" ]; then
   echo -e "${Y}! GPU_PROVIDER=runpod — this path is less tested than vast (see docs/gpu-pod.md#runpod).${X}"

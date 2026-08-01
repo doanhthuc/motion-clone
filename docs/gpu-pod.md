@@ -1,6 +1,7 @@
 # GPU pod cho backend motion-transfer (motions-studio)
 
-Frontend (`motions`) chạy local (`make dev`). Backend (`motions-studio`) cần GPU NVIDIA
+Frontend (`motions`) mặc định chạy local (`make dev`); muốn nó chạy luôn trên pod để người khác
+mở được thì xem [Frontend on the pod](#frontend-on-the-pod). Backend (`motions-studio`) cần GPU NVIDIA
 (≥24GB VRAM cho Wan 2.2 Animate) nên chạy trên máy thuê theo giờ — vast.ai hoặc RunPod — thay vì
 máy Mac của bạn. Toàn bộ flow dưới đây tự động hoá đúng những bước thủ công đã làm ở lần chạy
 trước (SSH vào máy thuê, chạy `motions-studio/setup/setup-motion-transfer.sh`, dán `.env` in ra
@@ -24,6 +25,51 @@ vào `motions/.env` — chỉ cần `make down && make dev` lại là FE local t
 Việc còn lại KHÔNG tự động (cố ý — xem "Vì sao không tự động" bên dưới): tải model. Mở
 `http://localhost:2030` → login bằng `SUPER_ADMIN` (OTP) → **Settings → Models AI** → nhóm
 **Wan 2.2 Animate** → **Cài cả nhóm** (~33GB).
+
+## Frontend on the pod
+
+Mặc định FE chạy local, nghĩa là **tắt máy bạn là không ai vào được app**. Muốn đưa cho người
+dùng thật thì cho FE chạy luôn trên pod: điền `FE_DOMAIN` (và `FE_PORT`, mặc định 2030) vào
+`.env`, thêm `https://<FE_DOMAIN>` vào `CORS_ORIGINS`, rồi `make gpu-bootstrap`.
+
+```
+                    ┌─ Cloudflare Tunnel (1 tunnel, 2 hostname)
+Browser end-user ───┤
+                    ├─ app.yourdomain.com  →  pod localhost:2030   PM2 "motions"
+                    └─ api.yourdomain.com  →  pod localhost:8080   PM2 "api"
+
+Máy bạn: make dev (localhost:2030) → https://api.yourdomain.com   [CORS đã whitelist]
+```
+
+Cả hai vẫn chạy song song: pod phục vụ người dùng, `make dev` để bạn code.
+
+| Lệnh | Làm gì | Mất bao lâu |
+|---|---|---|
+| `make gpu-bootstrap` | backend + tunnel 2 hostname + frontend | lần đầu ~30 phút |
+| `make gpu-fe` | CHỈ frontend: rsync + build + PM2 restart | ~2 phút |
+
+Sửa code FE xong thì `make gpu-fe`, không cần bootstrap lại.
+
+**`FE_DOMAIN` cần `CF_API_TOKEN`, không dùng được với `CF_TUNNEL_TOKEN`.** Đường tunnel-token
+không tạo được Public Hostname thứ hai qua API — phải tự thêm `FE_DOMAIN → localhost:2030` trên
+dashboard Cloudflare.
+
+Vài điểm dễ vấp:
+
+- **`CORS_ORIGINS` thiếu `https://<FE_DOMAIN>`** là lỗi tệ nhất: FE load bình thường, mọi API call
+  từ browser chết CORS, trông y hệt backend hỏng. `make gpu-preflight` chặn sẵn.
+- Trên pod, `motions/.env` dùng `NUXT_MOTION_API_URL=http://127.0.0.1:8080` (server-side proxy đi
+  loopback, cùng máy) nhưng `NUXT_PUBLIC_MOTION_BACKEND_URL=https://<DOMAIN>` (chạy trong browser
+  người dùng nên bắt buộc URL public). File này do `scripts/pod-fe.sh` sinh, **ghi đè mỗi lần
+  deploy** — đừng sửa tay. `API_KEY` được đọc từ `~/motion-backend/.env` ngay trên pod, không bao
+  giờ đi qua máy bạn.
+- **Build chạy trên pod, không build local rồi copy `.output/`.** `@nuxt/image` kéo `sharp`, và
+  `node_modules/@img/` trên máy Mac là `sharp-darwin-arm64` — copy sang pod Linux thì build xong
+  vẫn chết lúc chạy.
+- Đổi `DOMAIN` = tunnel mới. Tên tunnel là `motion-${DOMAIN//./-}`, nên đổi domain xong bootstrap
+  lại sẽ tạo tunnel khác và bỏ lại tunnel cũ trong account Cloudflare — xoá tay nếu muốn gọn.
+- `make gpu-fe` giả định ingress đã có sẵn. Nếu nó báo HTTP 404 thì đó là catch-all của tunnel,
+  nghĩa là chưa có ingress rule → chạy `make gpu-bootstrap` một lần.
 
 ## Cloudflare API Token
 

@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help setup dev down clean gpu-preflight gpu-provision gpu-wait gpu-bootstrap gpu-up gpu-down gpu-destroy gpu-status gpu-logs
+.PHONY: help setup dev down clean gpu-preflight gpu-provision gpu-wait gpu-bootstrap gpu-fe gpu-up gpu-down gpu-destroy gpu-status gpu-logs
 
 help: ## Show this help
 	@echo "motion-clone — make targets:"
@@ -44,8 +44,11 @@ gpu-provision: ## Find + rent a GPU pod (dry-run; CONFIRM=yes to actually rent)
 gpu-wait: ## Wait for a freshly rented pod's SSH to come up (TIMEOUT=25 min); saves host/port to .env
 	@bash scripts/pod-wait.sh
 
-gpu-bootstrap: ## rsync motions-studio + run setup-motion-transfer.sh on the pod (idempotent)
+gpu-bootstrap: ## rsync motions-studio + run setup-motion-transfer.sh on the pod (idempotent; also deploys FE if FE_DOMAIN is set)
 	@bash scripts/pod-bootstrap.sh
+
+gpu-fe: ## Re-deploy ONLY the frontend to the pod (rsync + build + PM2 restart, ~2 min)
+	@bash scripts/pod-fe.sh
 
 gpu-up: ## Start the pod and wait until the backend answers
 	@test -n "$(call env,GPU_INSTANCE_ID)" || { echo "set GPU_INSTANCE_ID in .env (see docs/gpu-pod.md)"; exit 1; }
