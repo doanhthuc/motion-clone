@@ -162,6 +162,23 @@ if [ -n "$POD_VOLUME" ]; then
     || warn "MinIO is not using the volume — objects will be lost on gpu-destroy. Check 'pm2 logs minio'"
 fi
 
+# ── Dispatcher serverless (tuỳ chọn) ──────────────────────────────────────────
+# Đăng ký bằng `pm2 start <script>` chứ không thêm vào ecosystem.config.cjs: file đó là upstream,
+# sửa vào là mất sau make sync-upstream.
+RUNPOD_ENDPOINT_ID="$(env_get RUNPOD_ENDPOINT_ID)"
+RUNPOD_API_KEY_ENV="$(env_get RUNPOD_API_KEY)"
+if [ -n "$RUNPOD_ENDPOINT_ID" ] && [ -n "$RUNPOD_API_KEY_ENV" ]; then
+  log "starting mc-dispatcher (serverless) — endpoint $RUNPOD_ENDPOINT_ID"
+  remote "cd ~/$REMOTE_DIR && pm2 delete mc-dispatcher >/dev/null 2>&1 ; \
+    RUNPOD_ENDPOINT_ID='$RUNPOD_ENDPOINT_ID' RUNPOD_API_KEY='$RUNPOD_API_KEY_ENV' \
+    pm2 start api/src/mc-dispatcher.js --name mc-dispatcher --update-env >/dev/null 2>&1 ; \
+    pm2 save >/dev/null 2>&1 ; sleep 4 ; \
+    pm2 jlist | python3 -c \"import sys,json;m=[p for p in json.load(sys.stdin) if p['name']=='mc-dispatcher'];print('mc-dispatcher', m[0]['pm2_env']['status'] if m else 'MISSING')\"" \
+    || warn "mc-dispatcher không start được — xem 'pm2 logs mc-dispatcher'"
+else
+  log "RUNPOD_ENDPOINT_ID/RUNPOD_API_KEY chưa đặt trong .env → bỏ qua dispatcher (worker local vẫn chạy)"
+fi
+
 # ── Gate: prove the volume is actually in use ─────────────────────────────────
 # The failure mode this catches is SILENT SUCCESS: the box comes up green, /health
 # answers, you log in fine — but models/ is a real empty dir on the container disk
