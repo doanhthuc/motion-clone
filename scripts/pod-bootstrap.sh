@@ -148,6 +148,8 @@ if [ -n "$POD_VOLUME" ]; then
     grep -q '^MINIO_DATA_DIR=' .env \
       && sed -i 's#^MINIO_DATA_DIR=.*#MINIO_DATA_DIR=$POD_VOLUME/minio#' .env \
       || echo 'MINIO_DATA_DIR=$POD_VOLUME/minio' >> .env ; \
+    grep -q '^VOLUME_PGDATA=' .env \
+      || echo 'VOLUME_PGDATA=$VOLUME_PGDATA' >> .env ; \
     pm2 delete minio >/dev/null 2>&1 ; \
     pm2 start ecosystem.config.cjs --only minio >/dev/null 2>&1 ; \
     pm2 save >/dev/null 2>&1 ; sleep 8 ; \

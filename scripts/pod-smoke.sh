@@ -148,7 +148,11 @@ elif [ -z "$POD_VOLUME" ]; then
       See docs/gpu-pod.md#network-volume"
 else
   if remote "cd ~/motion-backend && POD_VOLUME='$POD_VOLUME' MODELS_MIN_GB='${MODELS_MIN_GB:-20}' ./setup/pod-volume.sh --check" ; then
-    ok "volume wired: symlinks correct, PGDATA on volume, model count not regressed"
+    # Deliberately does not claim PGDATA is on the volume: on RunPod it cannot be (MooseFS blocks
+    # chown, Postgres refuses), so VOLUME_PGDATA=0 is the normal case. pod-volume.sh --check prints
+    # exactly where PGDATA lives; repeating a guess here would be the kind of confidently-wrong
+    # green line this whole script exists to replace.
+    ok "volume wired: models + caches on the volume, model count not regressed (PGDATA: see above)"
   else
     bad "pod-volume.sh --check failed — read its output above BEFORE re-downloading models"
   fi

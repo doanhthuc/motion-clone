@@ -146,7 +146,16 @@ LINK_FAIL=0
 mkdir -p "$COMFY_DIR" 2>/dev/null || true
 link_dir "$COMFY_DIR/models"   "$MODELS"  "ComfyUI models"  || LINK_FAIL=1
 link_dir "$COMFY_DIR/hf-cache" "$HFCACHE" "HF cache"        || LINK_FAIL=1
-link_dir "$ROOT/.data/minio"   "$MINIO"   "MinIO data"      || LINK_FAIL=1
+# ── ALD-local 01/08/2026 - MinIO có thể ở trên volume theo HAI cách hợp lệ ────────────────────
+# MinIO TỪ CHỐI symlink làm drive ("Drives are not directories") nên trên RunPod nó được trỏ
+# thẳng vào volume bằng MINIO_DATA_DIR trong .env, không qua .data/minio. Nếu chỉ kiểm symlink
+# thì cấu hình đúng lại bị báo đỏ — và đỏ-mà-không-hỏng cũng làm người ta mất niềm tin vào
+# --check y như xanh-mà-hỏng. Sửa CỤC BỘ trên file upstream: làm lại sau mỗi make sync-upstream.
+_MINIO_DD="$(get_kv MINIO_DATA_DIR)"
+case "${_MINIO_DD:-}" in
+  "$VOL"/*) ok "MinIO data → MINIO_DATA_DIR=$_MINIO_DD (trỏ thẳng volume, không cần symlink)" ;;
+  *)        link_dir "$ROOT/.data/minio" "$MINIO" "MinIO data" || LINK_FAIL=1 ;;
+esac
 # Ollama đọc OLLAMA_MODELS từ env; symlink là lớp dự phòng khi env không tới được
 # tiến trình (setup-pm2/lib-feature start bằng `nohup ollama serve`).
 link_dir "$HOME/.ollama/models" "$OLLAMA" "Ollama models"   || LINK_FAIL=1
@@ -175,6 +184,9 @@ fi
 # Đánh đổi: DB vẫn sống qua gpu-down/gpu-up (container disk còn), MẤT khi gpu-destroy. Models và
 # MinIO vẫn nằm trên volume nên vẫn không phải tải lại 33GB — đó mới là khoản tiết kiệm lớn.
 # Đây là sửa đổi CỤC BỘ trên file upstream: chạy lại sau mỗi `make sync-upstream`.
+# Đọc từ .env khi caller không truyền, để --check / --adopt / chạy tay đều thấy cùng quyết định
+# như lúc bootstrap. Không có dòng này thì `make gpu-smoke` báo đỏ một cấu hình cố ý.
+[ -z "${VOLUME_PGDATA:-}" ] && VOLUME_PGDATA="$(get_kv VOLUME_PGDATA)"
 if [ "${VOLUME_PGDATA:-1}" = "0" ]; then
   warn "VOLUME_PGDATA=0 → PGDATA ở lại container disk (volume MooseFS không cho chown)."
   warn "  DB sống qua gpu-down/gpu-up, MẤT khi gpu-destroy. Models + MinIO vẫn trên volume."
