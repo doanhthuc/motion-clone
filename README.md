@@ -34,7 +34,9 @@ make help                    # xem toàn bộ lệnh
 make gpu-preflight           # kiểm .env TRƯỚC khi tốn tiền thuê máy
 ```
 
-Đọc `docs/gpu-pod.md` trước lần thuê đầu tiên — đặc biệt phần chi phí: **pod dừng vẫn tính tiền ổ đĩa.**
+Toàn bộ quy trình theo thứ tự — dựng lần đầu, dùng hằng ngày, dọn, và dựng lại — nằm ở
+`docs/gpu-pod.md` mục **Runbook**. Đọc nó trước lần thuê đầu tiên, đặc biệt phần chi phí:
+**pod dừng vẫn tính tiền ổ đĩa**, và Network Volume tính tiền cả khi không có pod nào.
 
 ## Quan hệ với upstream
 

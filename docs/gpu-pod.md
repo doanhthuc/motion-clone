@@ -7,24 +7,136 @@ máy Mac của bạn. Toàn bộ flow dưới đây tự động hoá đúng nh�
 trước (SSH vào máy thuê, chạy `motions-studio/setup/setup-motion-transfer.sh`, dán `.env` in ra
 vào `motions/.env`).
 
-## Luồng nhanh
+## Runbook
+
+Bốn giai đoạn. Giai đoạn 0 làm một lần trong đời; giai đoạn 1 làm mỗi lần dựng pod mới; giai
+đoạn 2 là dùng hằng ngày; giai đoạn 3 là dọn.
+
+Chi tiết từng khái niệm nằm ở các mục sau trong file này — runbook chỉ nói làm gì, theo thứ tự nào.
+
+---
+
+### Giai đoạn 0 — một lần duy nhất
+
+Chỉ làm lại khi đổi máy dev, đổi tài khoản RunPod, hoặc đổi domain.
+
+**0.1 · CLI + API key**
 
 ```bash
-cp .env.example .env        # điền DOMAIN, SUPER_ADMIN, GMAIL_*, CF_API_TOKEN — xem bên dưới
-make gpu-preflight           # check .env đủ CHƯA, trước khi tốn tiền thuê máy
-make gpu-provision            # dry-run: tìm offer + in lệnh thuê (KHÔNG thuê)
-CONFIRM=yes make gpu-provision # thuê thật — điền GPU_INSTANCE_ID vào .env
-make gpu-wait                 # chờ SSH lên, tự lưu GPU_SSH_HOST/GPU_SSH_PORT vào .env
-make gpu-bootstrap            # rsync code + chạy setup-motion-transfer.sh trên pod (không tương tác)
-make gpu-status                # curl https://$DOMAIN/health
+brew install runpod/runpodctl/runpodctl    # cần >= 2.8, xem #runpod
+runpodctl doctor                            # hỏi API key, lấy ở runpod.io/console/user/settings
 ```
 
-`gpu-bootstrap` tự dán block `NUXT_MOTION_API_URL`/`NUXT_MOTION_API_KEY`/`NUXT_PUBLIC_MOTION_BACKEND_URL`
-vào `motions/.env` — chỉ cần `make down && make dev` lại là FE local trỏ đúng backend mới thuê.
+**0.2 · `.env`**
 
-Việc còn lại KHÔNG tự động (cố ý — xem "Vì sao không tự động" bên dưới): tải model. Mở
-`http://localhost:2030` → login bằng `SUPER_ADMIN` (OTP) → **Settings → Models AI** → nhóm
+```bash
+cp .env.example .env
+```
+
+Điền: `DOMAIN` (backend, vd `api.you.xyz`), `FE_DOMAIN` (frontend, vd `app.you.xyz`),
+`CORS_ORIGINS=https://$FE_DOMAIN,http://localhost:2030`, `SUPER_ADMIN`, `GMAIL_USER` +
+`GMAIL_APP_PASSWORD`, `CF_API_TOKEN`. Xem [Cloudflare API Token](#cloudflare-api-token) cho 3
+quyền bắt buộc.
+
+**0.3 · Network Volume** — [chi tiết](#network-volume)
+
+Datacenter và dung lượng **không sửa được sau khi tạo**. Chọn datacenter còn stock GPU bạn thuê:
+
+```bash
+runpodctl gpu list -o json | python3 -c 'import sys,json
+for g in json.load(sys.stdin):
+    if "5090" in g.get("gpuId",""):
+        print(g["gpuId"], "$%s/hr" % g.get("securePricePerHr"))
+        for d in g.get("dataCenterAvailability") or []: print("  ", d["dataCenterId"], d["stockStatus"])'
+
+runpodctl network-volume create --name motion --size 100 --data-center-id <DC>
+```
+
+Volume tính tiền **hàng tháng kể cả khi không có pod nào** — `make gpu-destroy` không tắt được
+đồng hồ đó, và không nên tắt: đó chính là thứ giữ 33GB model và database.
+
+---
+
+### Giai đoạn 1 — dựng pod mới
+
+Từ đây trở đi đồng hồ chạy. Toàn bộ giai đoạn này mất ~30-40 phút, phần lớn là chờ.
+
+```bash
+make gpu-preflight                          # 1. chặn mọi lỗi cấu hình TRƯỚC khi tốn tiền
+bash scripts/pod-provision.sh               # 2. dry-run — ĐỌC lệnh pod create nó in ra
+CONFIRM=yes bash scripts/pod-provision.sh   # 3. thuê thật; tự ghi GPU_INSTANCE_ID vào .env
+make gpu-wait                               # 4. chờ SSH; tự ghi GPU_SSH_HOST/PORT vào .env
+make gpu-bootstrap                          # 5. ~30 phút, xem bên dưới nó làm gì
+make gpu-volume-check                       # 6. chứng minh volume thật sự đang được dùng
+```
+
+Bước 5 làm, theo đúng thứ tự này (thứ tự có lý do — xem `scripts/pod-bootstrap.sh`):
+
+1. rsync `motions-studio/` lên pod
+2. symlink `models` + `PGDATA` + `MinIO` sang volume — **trước** khi setup chạy, nếu không
+   Postgres dựng cluster trên container disk rồi mất sạch khi destroy pod
+3. `setup-motion-transfer.sh`: Postgres, MinIO, ComfyUI, PyTorch khớp driver ([CUDA 13](#cuda-13)),
+   custom nodes, Cloudflare Tunnel với **2 hostname** (`DOMAIN`→:8080, `FE_DOMAIN`→:2030)
+4. ghi `motions/.env` **local** trỏ vào backend mới
+5. rsync + `npm install` + `npm run build` + PM2 cho frontend **trên pod**
+   ([chi tiết](#frontend-on-the-pod))
+
+**7 · Tải model** — không tự động, cố ý ([lý do](#no-auto-models)). Chỉ cần làm
+**một lần cho mỗi volume**, pod sau không phải tải lại:
+
+`https://$FE_DOMAIN` → login bằng `SUPER_ADMIN` (bấm gửi OTP) → **Settings → Models AI** → nhóm
 **Wan 2.2 Animate** → **Cài cả nhóm** (~33GB).
+
+**8 · Kiểm chứng thật** — [`make gpu-smoke`](#smoke). Đừng tin
+màu xanh, chạy một job thật.
+
+---
+
+### Giai đoạn 2 — dùng hằng ngày
+
+| Việc | Lệnh |
+|---|---|
+| Bật pod đã có | `make gpu-up` |
+| **Tắt pod khi xong** | `make gpu-down` |
+| Backend còn sống không | `make gpu-status` |
+| Xem log | `make gpu-logs` · `LOG=worker make gpu-logs` |
+| Sửa code FE → đẩy lên pod | `make gpu-fe` (~2 phút) |
+| Sửa code BE → đẩy lên pod | `make gpu-bootstrap` (idempotent, chạy lại an toàn) |
+| Code FE ở máy mình | `make dev` → `localhost:2030` |
+
+`make gpu-down` **không** xoá pod: container disk vẫn tính tiền theo giờ suốt thời gian pod tồn
+tại. Nghỉ vài ngày thì `make gpu-destroy` rẻ hơn — volume giữ lại model và database.
+
+---
+
+### Giai đoạn 3 — dọn
+
+```bash
+make gpu-destroy    # xoá pod, verify nó chết thật, rồi nhắc dọn .env
+```
+
+Rồi xoá tay 3 dòng trong `.env`: `GPU_INSTANCE_ID`, `GPU_SSH_HOST`, `GPU_SSH_PORT`.
+
+Cái **không** bị xoá, và không nên xoá: Network Volume (giữ model + database, vẫn tính tiền
+tháng), Cloudflare Tunnel + DNS (miễn phí, lần dựng sau tái dùng đúng tunnel đó vì tên tunnel
+suy ra từ `DOMAIN`).
+
+Lần dựng pod tiếp theo: quay lại **giai đoạn 1**, bỏ qua bước 7 (model đã nằm trên volume).
+
+---
+
+### Hỏng ở đâu thì đọc gì
+
+| Triệu chứng | Nguyên nhân thường gặp | Chỗ đọc |
+|---|---|---|
+| `gpu-preflight` báo đỏ | thiếu key/volume/CORS | thông báo tự nói cách sửa |
+| `pod create` báo hết máy | `MIN_CUDA_VERSION=13.0` lọc quá chặt | hạ xuống `12.8`, [CUDA 13](#cuda-13) |
+| `gpu-wait` hết giờ | pod chưa mở cổng 22, hoặc host chết | thông báo timeout in sẵn lệnh chẩn đoán |
+| `https://$DOMAIN` không trả lời | cloudflared không chạy (pod không có systemd) | [systemd / cloudflared](#systemd-cloudflared) |
+| App load được, mọi API call chết CORS | `CORS_ORIGINS` thiếu `https://$FE_DOMAIN` | [Frontend on the pod](#frontend-on-the-pod) |
+| Pod mới lại tải 33GB model | volume không được mount thật | `make gpu-volume-check`, [Kiểm chứng](#volume-check) |
+| Job chạy chậm bất thường | rơi xuống nhánh cu128 | [CUDA 13](#cuda-13) |
+| `https://$FE_DOMAIN` trả 404 | tunnel chưa có ingress cho FE | chạy `make gpu-bootstrap` một lần |
 
 ## Frontend on the pod
 
@@ -125,6 +237,7 @@ cho `setup-motion-transfer.sh`. Vì vậy `pod-provision.sh` chỉ cần image C
 (PyTorch của image gốc không quan trọng — script tự cài lại bản khớp driver phát hiện được), không
 cần lo image có hỗ trợ nested Docker hay không.
 
+<a id="costs"></a>
 ## Costs — pod dừng vẫn tính tiền
 
 Vast.ai tính tiền **ổ đĩa theo giờ SUỐT THỜI GIAN INSTANCE TỒN TẠI** — kể cả khi đã `stop`. Không
@@ -144,6 +257,7 @@ vastai show instances --raw | python3 -c "import json,sys;d=json.load(sys.stdin)
 vastai show user --raw | python3 -c "import json,sys;print('credit \$%s'%json.load(sys.stdin)['credit'])"
 ```
 
+<a id="reusing-an-existing-tunnel-token"></a>
 ## Reusing an existing tunnel token
 
 Nếu `.env` có `CF_TUNNEL_TOKEN` mà KHÔNG có `CF_API_TOKEN` (vd copy từ một project khác đã có
@@ -192,6 +306,7 @@ dạng JSON** mà RunPod từng dùng (`portMappings` map và `runtime.ports` li
 Lệnh vòng đời dùng cú pháp mới `runpodctl pod start|stop|delete` — dạng cũ (`runpodctl start pod`)
 vẫn chạy nhưng đã bị đánh dấu deprecated.
 
+<a id="no-auto-models"></a>
 ## Vì sao không tự động tải model
 
 Tải model là hành động qua UI đã login (OTP), tải ~33GB — không phải lệnh SSH đơn giản mà là
@@ -199,6 +314,7 @@ click trong FE sau khi đăng nhập; catalog model cũng có thể đổi theo 
 này rủi ro hơn lợi ích (tải nhầm/tải thiếu mà không ai để ý), nên để thủ công, chỉ 1 lần mỗi pod
 mới.
 
+<a id="systemd-cloudflared"></a>
 ## systemd / cloudflared
 
 Nhiều container vast.ai/RunPod KHÔNG có systemd. `setup-motion-transfer.sh` đã tự dò việc này cho
@@ -240,6 +356,8 @@ Model KHÔNG nằm trong repo — luôn tải qua Settings → Models AI sau khi
 
 ---
 
+<a id="network-volume"></a>
+<a id="volume"></a>
 ## Network Volume — hết tải lại model, hết mất database
 
 Hai chi phí lặp lại mỗi lần dựng pod, và cách xoá chúng:
@@ -286,6 +404,7 @@ make gpu-volume-adopt     # rsync sang volume, đổi tên nguồn thành .bak-<
 
 Nguồn được giữ lại dưới dạng `.bak-*` — tự xoá khi bạn đã yên tâm.
 
+<a id="volume-check"></a>
 ### Kiểm chứng — đừng tin màu xanh
 
 Lỗi đáng sợ ở đây không ồn ào mà là **thành công giả**: pod lên, `/health` trả ok, login được,
@@ -325,6 +444,7 @@ cài-từ-đầu mà không biết.
 
 ---
 
+<a id="smoke"></a>
 ## Kiểm chứng sau khi dựng: `make gpu-smoke`
 
 `make gpu-status` chỉ curl `/health`. Mà `/health` là một handler tĩnh
