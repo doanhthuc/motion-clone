@@ -23,6 +23,10 @@ GPU="${GPU:-$(env_get GPU)}"; GPU="${GPU:-RTX_4090}"
 DISK="${DISK:-$(env_get DISK)}"; DISK="${DISK:-120}"
 MAX_DPH="${MAX_DPH:-$(env_get MAX_DPH)}"; MAX_DPH="${MAX_DPH:-0.60}"
 RELIABILITY="${RELIABILITY:-$(env_get RELIABILITY)}"; RELIABILITY="${RELIABILITY:-0.95}"
+# Hardware floor for the vast marketplace — see the long note next to the filter below. Defaults
+# sit just under the measured median so a normal search still returns plenty of offers.
+MIN_DISK_BW="${MIN_DISK_BW:-$(env_get MIN_DISK_BW)}"; MIN_DISK_BW="${MIN_DISK_BW:-3000}"
+MIN_CPU_GHZ="${MIN_CPU_GHZ:-$(env_get MIN_CPU_GHZ)}"; MIN_CPU_GHZ="${MIN_CPU_GHZ:-2.5}"
 OFFER="${OFFER:-}"
 SKIP="${SKIP:-}"
 
@@ -45,7 +49,10 @@ die()  { printf '\033[31m ✗ \033[0m%s\n' "$*" >&2; exit 1; }
 IMAGE="${IMAGE:-$(env_get POD_IMAGE)}"; IMAGE="${IMAGE:-pytorch/pytorch:2.12.1-cuda13.0-cudnn9-devel}"
 
 # Same precedence as every other knob here: environment overrides .env.
-POD_VOLUME="${POD_VOLUME:-$(env_get POD_VOLUME)}"
+# ${VAR-default}, not ${VAR:-default}: POD_VOLUME= on the command line has to MEAN "no volume".
+# With the colon form an explicit empty value falls back to .env, so the documented escape hatch
+# `POD_VOLUME= bash scripts/pod-provision.sh` silently did the opposite of what it says.
+POD_VOLUME="${POD_VOLUME-$(env_get POD_VOLUME)}"
 POD_VOLUME_ID="${POD_VOLUME_ID:-$(env_get POD_VOLUME_ID)}"
 MIN_CUDA_VERSION="${MIN_CUDA_VERSION:-$(env_get MIN_CUDA_VERSION)}"; MIN_CUDA_VERSION="${MIN_CUDA_VERSION:-13.0}"
 
@@ -238,7 +245,7 @@ TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
 printf '%s' "$OFFERS" > "$TMP"
 
-BEST="$(OFFERS_FILE="$TMP" MAX_DPH="$MAX_DPH" SKIP="$SKIP" OFFER="$OFFER" python3 - <<'PY'
+BEST="$(OFFERS_FILE="$TMP" MAX_DPH="$MAX_DPH" SKIP="$SKIP" OFFER="$OFFER" MIN_DISK_BW="$MIN_DISK_BW" MIN_CPU_GHZ="$MIN_CPU_GHZ" python3 - <<'PY'
 import json, os, sys
 
 try:
@@ -258,21 +265,59 @@ if pinned:
 
 skip = {s.strip() for s in os.environ.get("SKIP", "").split(",") if s.strip()}
 cap = float(os.environ["MAX_DPH"])
-rows = sorted(
-    (o for o in offers if o.get("dph_total", 99) <= cap and str(o["id"]) not in skip),
-    key=lambda o: o["dph_total"],
-)
+min_bw = float(os.environ.get("MIN_DISK_BW") or 0)
+min_ghz = float(os.environ.get("MIN_CPU_GHZ") or 0)
 
-if not rows:
+# Filter on DISK BANDWIDTH and CPU CLOCK, not just price and reliability.
+#
+# NOTE: keep every quote in this heredoc balanced, apostrophes included. It sits inside $(...) and
+# bash 3.2 — the /bin/bash macOS still ships — counts quotes even in here, so a single unpaired one
+# breaks the whole file with an "unexpected EOF" that points at the last line and tells you nothing.
+#
+# vast is a marketplace of machines other people own, and the hardware spread is enormous: measured
+# across 64 RTX 5090 offers on 2026-08-01, disk_bw ran min 395 / median 3641 / max 12800 MB/s — a
+# 32x range at the same GPU. Sorting by dph and taking rows[0] therefore systematically picks the
+# SLOWEST disk, because cheap and slow correlate.
+#
+# setup-motion-transfer.sh is almost entirely disk and CPU work: apt Postgres, unpacking ~3-4GB of
+# torch wheels, cloning six custom nodes and installing their pip deps. On a 395 MB/s disk that is
+# a 1-2 hour job; on a fast one it is 10-20 minutes. Same script, same GPU, same price bracket.
+#
+# Filtered here rather than in the vast query string so a failure prints the actual distribution
+# instead of an empty result set, and so the grammar of `vastai search offers` cannot break it.
+def fast_enough(o):
+    return (o.get("disk_bw") or 0) >= min_bw and (o.get("cpu_ghz") or 0) >= min_ghz
+
+affordable = [o for o in offers if o.get("dph_total", 99) <= cap and str(o["id"]) not in skip]
+if not affordable:
     cheapest = min(o.get("dph_total", 99) for o in offers)
     sys.exit(f"nothing at or under ${cap:.2f}/hr (cheapest was ${cheapest:.2f}) — retry with MAX_DPH={cheapest + 0.05:.2f}")
 
-print(f"{len(rows)} offer(s) under the cap:\n", file=sys.stderr)
+rows = sorted((o for o in affordable if fast_enough(o)), key=lambda o: o["dph_total"])
+
+if not rows:
+    bws = sorted((o.get("disk_bw") or 0) for o in affordable)
+    best_bw = bws[-1] if bws else 0
+    print(
+        f"{len(affordable)} offer(s) under ${cap:.2f}/hr, but none meet "
+        f"disk_bw>={min_bw:.0f} MB/s and cpu_ghz>={min_ghz:.1f}.\n"
+        f"  disk_bw available here: min={bws[0]:.0f} median={bws[len(bws)//2]:.0f} max={best_bw:.0f} MB/s\n"
+        f"  Raise MAX_DPH to reach faster machines, or lower the bar with\n"
+        f"    MIN_DISK_BW={max(0, best_bw - 1):.0f} bash scripts/pod-provision.sh\n"
+        f"  Renting under the bar is allowed — it just means setup takes hours instead of minutes.",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+skipped = len(affordable) - len(rows)
+print(f"{len(rows)} offer(s) under the cap and fast enough"
+      f"{f' ({skipped} rejected as too slow)' if skipped else ''}:\n", file=sys.stderr)
 for o in rows[:5]:
     gb = o.get("gpu_ram", 0) / 1024
     print(
         f"  id={o['id']:<12} ${o['dph_total']:.3f}/hr  {o.get('gpu_name')}  "
-        f"{gb:.0f}GB  down={o.get('inet_down', 0):.0f}Mbps  "
+        f"{gb:.0f}GB  disk={o.get('disk_bw', 0):.0f}MB/s  cpu={o.get('cpu_ghz', 0):.1f}GHz  "
+        f"down={o.get('inet_down', 0):.0f}Mbps  "
         f"rel={o.get('reliability2', 0):.3f}  {o.get('geolocation', '?')}",
         file=sys.stderr,
     )

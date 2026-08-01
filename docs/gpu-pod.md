@@ -131,6 +131,7 @@ Lần dựng pod tiếp theo: quay lại **giai đoạn 1**, bỏ qua bước 7 
 |---|---|---|
 | `gpu-preflight` báo đỏ | thiếu key/volume/CORS | thông báo tự nói cách sửa |
 | `pod create` báo hết máy | `MIN_CUDA_VERSION=13.0` lọc quá chặt | hạ xuống `12.8`, [CUDA 13](#cuda-13) |
+| Setup trên vast mất 1-2 tiếng | bốc trúng máy đĩa chậm | [Vì sao vast chậm](#vast-slow) |
 | `gpu-wait` hết giờ | pod chưa mở cổng 22, hoặc host chết | thông báo timeout in sẵn lệnh chẩn đoán |
 | `https://$DOMAIN` không trả lời | cloudflared không chạy (pod không có systemd) | [systemd / cloudflared](#systemd-cloudflared) |
 | App load được, mọi API call chết CORS | `CORS_ORIGINS` thiếu `https://$FE_DOMAIN` | [Frontend on the pod](#frontend-on-the-pod) |
@@ -236,6 +237,33 @@ tiếp trên pod, y hệt ComfyUI/worker. Docker chỉ dùng ở **kiến trúc 
 cho `setup-motion-transfer.sh`. Vì vậy `pod-provision.sh` chỉ cần image CUDA có `apt`/`sudo`
 (PyTorch của image gốc không quan trọng — script tự cài lại bản khớp driver phát hiện được), không
 cần lo image có hỗ trợ nested Docker hay không.
+
+<a id="vast-slow"></a>
+## Vì sao setup trên vast lâu gấp 5 lần RunPod
+
+Không phải RunPod nhanh hơn. Là **bộ lọc offer trước đây chọn đúng máy chậm nhất**.
+
+vast là chợ máy của người khác. Đo ngày 01/08/2026 trên 64 offer RTX 5090:
+
+```
+disk_bw:   min 395   ·   median 3641   ·   max 12800 MB/s      → chênh 32 lần, cùng con GPU
+```
+
+`setup-motion-transfer.sh` gần như toàn I/O và CPU: apt Postgres, giải nén ~3-4GB torch wheel,
+clone 6 custom node kèm pip deps của chúng, ComfyUI requirements. Trên đĩa 395 MB/s đó là việc
+1-2 tiếng; trên đĩa nhanh là 10-20 phút. Cùng script, cùng GPU, cùng khoảng giá.
+
+Bộ lọc cũ chỉ nhìn `gpu_name`, `disk_space`, `reliability` rồi **sort theo giá rẻ nhất**. Rẻ và
+chậm đi đôi với nhau, nên nó chọn trúng máy tệ nhất một cách có hệ thống.
+
+Giờ có `MIN_DISK_BW` (mặc định 3000 MB/s) và `MIN_CPU_GHZ` (2.5). Lần đo gần nhất chúng loại 22
+trên 41 offer nằm dưới trần giá, và chọn máy $0.336/hr với đĩa 3487 MB/s thay vì máy rẻ hơn
+$0.02 mà chậm gấp mấy lần.
+
+Muốn thuê máy chậm vẫn được — script nói rõ phân bố `disk_bw` hiện có và in sẵn lệnh hạ ngưỡng.
+
+RunPod không cần hai biến này: secure cloud là phần cứng datacenter đồng đều, không có phương sai
+kiểu chợ.
 
 <a id="costs"></a>
 ## Costs — pod dừng vẫn tính tiền
