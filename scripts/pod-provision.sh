@@ -32,9 +32,17 @@ die()  { printf '\033[31m ✗ \033[0m%s\n' "$*" >&2; exit 1; }
 
 # setup-motion-transfer.sh installs EVERYTHING native (apt + PM2) — Postgres and MinIO are plain
 # binaries, not containers, so no Docker-in-Docker is needed inside the pod at all. Just needs a
-# CUDA-capable image with apt/sudo access; PyTorch itself gets reinstalled by the script to match
-# the detected driver, so the base image's own torch version doesn't matter much.
-IMAGE="${IMAGE:-pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel}"
+# CUDA-capable image with apt/sudo access.
+#
+# The image's own torch is never used: setup-pm2.sh builds ComfyUI a private venv with
+# `python3 -m venv` (no --system-site-packages), then lib-gpu.sh's motion_install_best_pytorch()
+# pip-installs a torch matching the DRIVER it finds via nvidia-smi:
+#     driver >= R580          → cu130 + torch 2.12.1   (CUDA 13.0, what we want)
+#     Blackwell, driver < 580 → cu128 + torch 2.11.0   (works, warns, slower)
+# So the tag below does not decide the CUDA version — the host's driver does. It is pinned to
+# cuda13.0/2.12.1 anyway so the declared CUDA matches what the setup targets, which is what keeps
+# you from being scheduled onto an R570 host and silently landing in the cu128 fallback.
+IMAGE="${IMAGE:-$(env_get POD_IMAGE)}"; IMAGE="${IMAGE:-pytorch/pytorch:2.12.1-cuda13.0-cudnn9-devel}"
 
 # Same precedence as every other knob here: environment overrides .env.
 POD_VOLUME="${POD_VOLUME:-$(env_get POD_VOLUME)}"

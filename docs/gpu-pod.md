@@ -89,6 +89,32 @@ Account Resources → tài khoản chứa domain. Zone Resources → Specific zo
 
 Token dùng lại được cho nhiều lần bootstrap/nhiều pod.
 
+## CUDA 13
+
+`lib-gpu.sh` → `motion_install_best_pytorch()` chọn wheel torch theo **driver mà `nvidia-smi` báo**,
+không theo image gốc của pod:
+
+| GPU / driver | Kết quả |
+|---|---|
+| compute cap ≥ 7.5 **và driver ≥ R580** | `cu130` + torch 2.12.1 — CUDA 13.0, đích nhắm |
+| Blackwell (RTX 50xx, cc ≥ 10) nhưng driver < R580 | `cu128` + torch 2.11.0, in warn bảo nâng driver rồi chạy lại setup |
+| còn lại (Maxwell/Pascal/Volta…) | `cu126` — CUDA 13 đã loại các đời này |
+
+Image gốc không quyết định vì ba lẽ: ComfyUI dùng venv riêng (`python3 -m venv`, KHÔNG
+`--system-site-packages`) nên torch của image không nhìn thấy được; torch wheel bundle sẵn CUDA
+runtime của nó; và `sageattention` cài từ PyPI dạng wheel chứ không compile `nvcc`.
+
+Điều image ảnh hưởng là **host bạn được xếp lên**. Vì vậy `POD_IMAGE` mặc định pin
+`pytorch/pytorch:2.12.1-cuda13.0-cudnn9-devel` — CUDA khai báo khớp với nhánh cu130. Trên trang
+deploy RunPod, đặt luôn filter **CUDA Version = 13.0** cho ăn khớp.
+
+Muốn ép khác đi: `MOTION_PYTORCH_CHANNEL=cu128 MOTION_PYTORCH_VERSION=2.11.0` (lib-gpu.sh tôn
+trọng pin có chủ đích). Kiểm sau khi dựng:
+
+```bash
+ssh pod '~/comfyui/venv/bin/python -c "import torch;print(torch.__version__, torch.version.cuda)"'
+```
+
 ## Kiến trúc thật trên pod — KHÔNG cần Docker
 
 `setup-motion-transfer.sh` cài mọi thứ NATIVE (apt + PM2), không qua `docker compose` — Postgres
