@@ -39,7 +39,15 @@ fi
 probe() {
   local raw
   if [ "$PROVIDER" = "runpod" ]; then
-    raw="$(runpodctl pod get "$ID" -o json 2>/dev/null)"
+    # `runpodctl ssh info` is the canonical source for the SSH endpoint — `pod get` does not carry
+    # one. While the pod is still pulling its image both return {"error": "pod not ready"}, which
+    # is normal, not a failure. Verified against a live pod 2026-08-01.
+    #
+    # Key names are searched permissively rather than pinned: this CLI renamed `get pod` to
+    # `pod get` and `ssh connect` to `ssh info` between releases, so pinning a key is how this
+    # breaks silently on the next upgrade.
+    raw="$(runpodctl ssh info "$ID" -o json 2>/dev/null)"
+    case "$raw" in *'"error"'*|"") raw="$(runpodctl pod get "$ID" -o json 2>/dev/null)";; esac
     read -r STATUS HOST PORT <<<"$(printf '%s' "$raw" | python3 -c '
 import sys, json
 def walk(node, want):
@@ -57,12 +65,20 @@ def walk(node, want):
     return None
 
 def ssh_endpoint(node):
-    # shape A: {"portMappings": {"22": 40123}, "publicIp": "1.2.3.4"}
+    # shape A — what `runpodctl ssh info` returns once the pod is up: a host and a port under
+    # some pair of these names. Tried first because it is the documented source.
+    host = walk(node, ["host", "hostname", "publicIp", "ip"])
+    port = walk(node, ["port", "sshPort", "publicPort"])
+    if host and port:
+        return host, port
+    # shape B: {"portMappings": {"22": 40123}, "publicIp": "1.2.3.4"}
     pm = walk(node, ["portMappings"])
-    ip = walk(node, ["publicIp", "ip"])
-    if isinstance(pm, dict) and pm.get("22") and ip:
-        return ip, pm["22"]
-    # shape B: {"runtime": {"ports": [{"privatePort":22,"publicPort":40123,"ip":"1.2.3.4"}]}}
+    if isinstance(pm, dict) and pm.get("22") and host:
+        return host, pm["22"]
+    # shape C: {"runtime": {"ports": [{"privatePort":22,"publicPort":40123,"ip":"1.2.3.4"}]}}
+    # NOT the same as the "ports" field of `pod get`, which is a list of STRINGS like ["22/tcp"] —
+    # hence the isinstance guard, without which this silently matches nothing.
+    # (No apostrophes in here: this block lives inside python3 -c with single quotes.)
     ports = walk(node, ["ports"])
     if isinstance(ports, list):
         for p in ports:

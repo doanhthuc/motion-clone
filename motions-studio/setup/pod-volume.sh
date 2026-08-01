@@ -167,7 +167,18 @@ if ! command -v pg_lsclusters >/dev/null 2>&1; then
   fi
 fi
 
-if command -v pg_lsclusters >/dev/null 2>&1; then
+# ── ALD-local 01/08/2026 - VOLUME_PGDATA=0 → để PGDATA trên container disk ────────────────────
+# Không phải tuỳ chọn phong cách: RunPod mount Network Volume bằng MooseFS với user_id=0,group_id=0
+# và CHẶN chown kể cả khi là root ("Operation not permitted"). Postgres từ chối khởi động nếu
+# PGDATA không thuộc user postgres mode 0700, nên PGDATA KHÔNG SỐNG ĐƯỢC trên volume đó — rsync
+# chết ở chown, script die, và không cài được gì. Đo trên pod thật 01/08/2026.
+# Đánh đổi: DB vẫn sống qua gpu-down/gpu-up (container disk còn), MẤT khi gpu-destroy. Models và
+# MinIO vẫn nằm trên volume nên vẫn không phải tải lại 33GB — đó mới là khoản tiết kiệm lớn.
+# Đây là sửa đổi CỤC BỘ trên file upstream: chạy lại sau mỗi `make sync-upstream`.
+if [ "${VOLUME_PGDATA:-1}" = "0" ]; then
+  warn "VOLUME_PGDATA=0 → PGDATA ở lại container disk (volume MooseFS không cho chown)."
+  warn "  DB sống qua gpu-down/gpu-up, MẤT khi gpu-destroy. Models + MinIO vẫn trên volume."
+elif command -v pg_lsclusters >/dev/null 2>&1; then
   PGVER="$(pg_lsclusters -h 2>/dev/null | awk 'NR==1{print $1}')"
   PGCLU="$(pg_lsclusters -h 2>/dev/null | awk 'NR==1{print $2}')"
   PGCONF="/etc/postgresql/$PGVER/${PGCLU:-main}/postgresql.conf"

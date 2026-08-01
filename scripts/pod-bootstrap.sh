@@ -77,9 +77,20 @@ rsync -az --delete \
 # container disk. Same for models: the symlink must exist before setup creates
 # $COMFY_DIR/models/uploads, otherwise those land on the container disk.
 if [ -n "$POD_VOLUME" ]; then
-  log "wiring Network Volume $POD_VOLUME (models · PGDATA · MinIO) — no re-download, no DB loss"
+  # VOLUME_PGDATA defaults to 0 because of how RunPod mounts a Network Volume: MooseFS with
+  # user_id=0,group_id=0 and chown blocked even for root. Postgres refuses to start unless PGDATA
+  # is owned by the postgres user at mode 0700, so putting PGDATA there does not merely degrade —
+  # rsync dies at the first chown and nothing gets installed at all. Measured on a live pod
+  # 2026-08-01. Models and MinIO are unaffected: both run as root and only need write access,
+  # so the ~33GB no-re-download win is kept. The cost is that the database now lives on the
+  # container disk: it survives gpu-down/gpu-up, and is lost on gpu-destroy.
+  # Set VOLUME_PGDATA=1 in .env on a provider whose volume honours chown.
+  VOLUME_PGDATA="$(env_get VOLUME_PGDATA)"; VOLUME_PGDATA="${VOLUME_PGDATA:-0}"
+  log "wiring Network Volume $POD_VOLUME (models · MinIO$([ "$VOLUME_PGDATA" = 1 ] && echo ' · PGDATA')) — no 33GB re-download"
+  [ "$VOLUME_PGDATA" = 1 ] || warn "PGDATA stays on the container disk — DB survives gpu-down/up, lost on gpu-destroy"
   ssh "${SSH_OPTS[@]}" "root@$HOST" "cd ~/$REMOTE_DIR && chmod +x setup/*.sh && \
 POD_VOLUME='$POD_VOLUME' MTC_PREBUILT='${MTC_PREBUILT:-0}' MODELS_MIN_GB='${MODELS_MIN_GB:-20}' \
+VOLUME_PGDATA='$VOLUME_PGDATA' \
 ./setup/pod-volume.sh" < /dev/null || {
     warn "pod-volume.sh exited non-zero."
     warn "If it said a directory is a REAL dir with data (first run on a pod that already"
@@ -114,6 +125,26 @@ MTC_PREBUILT='${MTC_PREBUILT:-0}' \
 ./setup/setup-motion-transfer.sh" < /dev/null | tee "$LOG"
 STATUS=${PIPESTATUS[0]}
 [ "$STATUS" -eq 0 ] || die "setup-motion-transfer.sh exited $STATUS — full log: $LOG"
+
+# ── MinIO must point AT the volume, not at a symlink to it ────────────────────
+# pod-volume.sh wires storage by symlinking .data/minio → $POD_VOLUME/minio, which works for every
+# other consumer and fails for exactly one: MinIO refuses a symlinked drive and dies on boot with
+#   FATAL Unable to initialize backend ... HINT: Drives are not directories
+# then PM2 restarts it forever. Seen on a live pod 2026-08-01 (37 restarts before it was noticed).
+# `mount --bind` would fix the symlink but the container denies it (permission denied).
+# ecosystem.config.cjs:58 reads MINIO_DATA_DIR, so pointing MinIO straight at the volume path
+# sidesteps the symlink entirely. Done after setup because setup rewrites .env.
+if [ -n "$POD_VOLUME" ]; then
+  log "pointing MinIO at $POD_VOLUME/minio directly (it rejects symlinked drives)"
+  remote "cd ~/$REMOTE_DIR && \
+    { rmdir .data/minio 2>/dev/null || rm -f .data/minio; } ; \
+    grep -q '^MINIO_DATA_DIR=' .env \
+      && sed -i 's#^MINIO_DATA_DIR=.*#MINIO_DATA_DIR=$POD_VOLUME/minio#' .env \
+      || echo 'MINIO_DATA_DIR=$POD_VOLUME/minio' >> .env ; \
+    pm2 restart minio --update-env >/dev/null 2>&1 ; sleep 6 ; \
+    pm2 jlist | python3 -c \"import sys,json;m=[p for p in json.load(sys.stdin) if p['name']=='minio'];print('minio', m[0]['pm2_env']['status'] if m else 'MISSING')\"" \
+    || warn "could not repoint MinIO — check 'pm2 logs minio'"
+fi
 
 # ── Gate: prove the volume is actually in use ─────────────────────────────────
 # The failure mode this catches is SILENT SUCCESS: the box comes up green, /health

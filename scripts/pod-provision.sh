@@ -43,10 +43,36 @@ die()  { printf '\033[31m ✗ \033[0m%s\n' "$*" >&2; exit 1; }
 # pip-installs a torch matching the DRIVER it finds via nvidia-smi:
 #     driver >= R580          → cu130 + torch 2.12.1   (CUDA 13.0, what we want)
 #     Blackwell, driver < 580 → cu128 + torch 2.11.0   (works, warns, slower)
-# So the tag below does not decide the CUDA version — the host's driver does. It is pinned to
-# cuda13.0/2.12.1 anyway so the declared CUDA matches what the setup targets, which is what keeps
-# you from being scheduled onto an R570 host and silently landing in the cu128 fallback.
-IMAGE="${IMAGE:-$(env_get POD_IMAGE)}"; IMAGE="${IMAGE:-pytorch/pytorch:2.12.1-cuda13.0-cudnn9-devel}"
+# So the tag does not decide the CUDA version — the host driver does, and --min-cuda-version
+# constrains that directly on RunPod.
+#
+# What the tag DOES decide is whether the container stays alive, and the two providers differ:
+#
+#   vast.ai — `vastai create --ssh --direct` injects vast's own sshd, so a plain upstream image
+#             like pytorch/pytorch works.
+#   RunPod  — nothing is injected. The image itself must run sshd and never exit. Upstream
+#             pytorch/pytorch has CMD=bash, which exits immediately without a tty, so RunPod
+#             restarts the container forever. Symptom (seen 2026-08-01, cost $0.43): the console
+#             log repeats "start container for <image>: begin" and `runpodctl ssh info` answers
+#             "pod not ready" until you give up. runpod/* images ship /start.sh, which starts sshd
+#             and blocks.
+IMAGE="${IMAGE:-$(env_get POD_IMAGE)}"
+if [ -z "$IMAGE" ]; then
+  if [ "$GPU_PROVIDER" = "runpod" ]; then
+    IMAGE="runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404"
+  else
+    IMAGE="pytorch/pytorch:2.12.1-cuda13.0-cudnn9-devel"
+  fi
+fi
+# Guard the exact mistake above: a non-runpod image on RunPod is a crash loop, not a slow boot.
+if [ "$GPU_PROVIDER" = "runpod" ]; then
+  case "$IMAGE" in
+    runpod/*) ;;
+    *) warn "POD_IMAGE='$IMAGE' is not a runpod/* image. RunPod injects no sshd, so unless this"
+       warn "image runs sshd and blocks, the container will restart forever and SSH never opens."
+       warn "Known-good: runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404 · list: runpodctl template search pytorch" ;;
+  esac
+fi
 
 # Same precedence as every other knob here: environment overrides .env.
 # ${VAR-default}, not ${VAR:-default}: POD_VOLUME= on the command line has to MEAN "no volume".
