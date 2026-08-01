@@ -148,6 +148,39 @@ Quyết định 3 hoãn được. Nếu output thường vượt 100MB thì **h�
 serverless cho job nặng được** — phải sang VPS sớm hơn dự định. Đây là lý do giả định 1 phải đo
 trước khi viết bất kỳ dòng code nào.
 
+<a id="always-on-box"></a>
+## Quyết định 3b — box luôn bật là VPS
+
+Chốt 01/08/2026: **VPS**, không phải RunPod CPU pod. Lý do là chi phí, không còn là ràng buộc kỹ
+thuật — §Quyết định 3 đã bỏ nên MinIO không cần cổng public nữa, cả hai lựa chọn đều khả thi về
+mặt kỹ thuật.
+
+VPS tính tiền cố định theo tháng và đã bao gồm đĩa. RunPod CPU pod tính theo giờ — chạy 24/7 là
+730 giờ mỗi tháng — **cộng** một Network Volume riêng, vì container disk chết theo pod nên PGDATA
+và MinIO không sống được nếu thiếu nó. Không lấy được đơn giá CPU của RunPod qua `runpodctl`
+(`gpu list` trả 0 entry cho CPU), nhưng cấu trúc tính tiền đủ để kết luận.
+
+Đã xác minh không có gì trên box đó cần GPU:
+
+| PM2 app | Cần ComfyUI? | Trên VPS |
+|---|---|---|
+| `api` · `minio` | không | chạy |
+| `wf-worker` | chỉ ở `freeGpuRam()` (`wf-worker/handlers.js:669`), bọc try/catch, hỏng thì `warn` | chạy |
+| `task-cloud-auto` | **có** — throw `"COMFY_URL chưa cấu hình"` (`task-cloud/auto-worker.js:100`) | tắt; stack tự chủ không dùng Task Cloud |
+| `worker` · `comfyui` | có | tắt; serverless gánh |
+
+Cài bằng script sẵn có, không viết mới — `fullstack-setup.sh` vốn được viết cho VPS, và
+`setup-pm2.sh:20` đã có cờ:
+
+```bash
+SKIP_COMFY=1 SKIP_MODELS=1 ./setup/fullstack-setup.sh
+```
+
+**Chi phí ẩn phải theo dõi:** trên pod, MinIO nằm trên Network Volume 100GB. Trên VPS nó nằm trên
+đĩa VPS — nhỏ hơn, đắt hơn mỗi GB, và video tích tụ dần. Cần hạn lưu output hoặc chuyển file cũ
+sang object storage rẻ. Đây là thứ duy nhất có thể làm VPS đắt hơn dự tính, và nó không lộ ra
+trong tháng đầu.
+
 ## Quyết định 4 — image và model
 
 `custom_nodes/` là thư mục extension của ComfyUI. Mỗi extension đăng ký thêm nhiều **node type**;
