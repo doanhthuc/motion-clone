@@ -441,7 +441,21 @@ Nên `VOLUME_PGDATA=0` là mặc định. Hệ quả:
 | DB sống qua `gpu-destroy` | ❌ **mất** |
 | Model 33GB | ✅ vẫn trên volume, vẫn không phải tải lại |
 
-Muốn giữ DB qua `destroy` thì `pg_dump` định kỳ ra `/workspace` — chưa làm.
+Muốn giữ DB qua `destroy` thì dump ra volume **trước khi destroy** (chưa tự động hoá):
+
+```bash
+# trên pod, TRƯỚC make gpu-destroy
+ssh -p $GPU_SSH_PORT root@$GPU_SSH_HOST \
+  'mkdir -p /workspace/pg-backup && sudo -u postgres pg_dump motion \
+   | gzip > /workspace/pg-backup/motion-$(date +%Y%m%d-%H%M).sql.gz'
+
+# trên pod MỚI, SAU make gpu-bootstrap
+ssh -p $GPU_SSH_PORT root@$GPU_SSH_HOST \
+  'zcat $(ls -t /workspace/pg-backup/*.sql.gz | head -1) | sudo -u postgres psql motion'
+```
+
+Kiểm dump có toàn vẹn không trước khi tin: `gzip -t <file>`. Một bản dump hỏng còn tệ hơn không
+có, vì nó khiến bạn yên tâm destroy.
 
 *Sửa cho việc này nằm trong `motions-studio/setup/pod-volume.sh`, tức là sửa **cục bộ trên file
 upstream**. Phải làm lại sau mỗi `make sync-upstream`.*
