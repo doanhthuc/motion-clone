@@ -167,11 +167,30 @@ CÓ SẴN** đó — nó KHÔNG tự tạo DNS/ingress mới (bước đó chỉ
 
 ## RunPod
 
-`GPU_PROVIDER=runpod` chạy được nhưng **kém kiểm chứng hơn** nhánh vast.ai — `runpodctl`'s CLI
-flags đổi qua từng bản, script chỉ đoán tốt nhất (`runpodctl create pod --name ... --gpuType ...`).
-Trước khi tin, chạy `runpodctl create pod --help` đối chiếu. `make gpu-wait` KHÔNG tự động cho
-RunPod (chỉ biết hỏi `vastai show instance`) — điền `GPU_SSH_HOST`/`GPU_SSH_PORT` thủ công từ
-`runpodctl get pod` hoặc dashboard rồi chạy thẳng `make gpu-bootstrap`.
+Cần `runpodctl` **≥ 2.8**: `brew install runpod/runpodctl/runpodctl`, rồi `runpodctl doctor` để
+nhập API key (lấy ở runpod.io/console/user/settings).
+
+Từ 2.8 CLI làm được cả hai thứ trước đây phải vào dashboard bấm tay:
+
+| Flag | Giải quyết |
+|---|---|
+| `--network-volume-id` + `--volume-mount-path` | attach Network Volume ngay lúc tạo pod |
+| `--min-cuda-version` | chỉ nhận host đủ driver — giữ đúng nhánh cu130, xem [CUDA 13](#cuda-13) |
+
+`pod-provision.sh` gate theo **flag** chứ không theo chuỗi version (`runpodctl version` đổi format
+qua các bản; thứ quan trọng là binary này có nhận flag ta sắp truyền hay không). Thiếu flag → nó
+chết kèm lệnh `brew upgrade`, không âm thầm thuê pod không có volume.
+
+Nó cũng tự lo cái bẫy hay dính nhất: **pod phải cùng datacenter với volume**. Script đọc
+datacenter của volume rồi ghim `--data-center-ids` theo đúng đó. Chỉ có 1 volume thì tự lấy id và
+ghi vào `.env` là `POD_VOLUME_ID`; có nhiều hơn thì nó liệt kê ra và bắt bạn chọn.
+
+`make gpu-wait` giờ chạy được cả RunPod: nó poll `runpodctl pod get`, đọc SSH endpoint ở **cả hai
+dạng JSON** mà RunPod từng dùng (`portMappings` map và `runtime.ports` list) rồi tự điền
+`GPU_SSH_HOST`/`GPU_SSH_PORT`.
+
+Lệnh vòng đời dùng cú pháp mới `runpodctl pod start|stop|delete` — dạng cũ (`runpodctl start pod`)
+vẫn chạy nhưng đã bị đánh dấu deprecated.
 
 ## Vì sao không tự động tải model
 
@@ -233,19 +252,26 @@ Hai chi phí lặp lại mỗi lần dựng pod, và cách xoá chúng:
 
 ### Tạo volume (một lần)
 
-RunPod → **Storage → Network Volume** → chọn **region còn stock GPU bạn hay thuê**, dung lượng
-~100GB (bộ Wan 2.2 Animate ~33GB + PGDATA + MinIO + chỗ thở). Ghi nhớ region.
+Qua CLI (runpodctl ≥ 2.8):
 
-Khi tạo pod, **attach volume này và mount vào `/workspace`**. Bắt buộc cùng region với volume —
-RunPod không cho pod ở region khác gắn volume. `runpodctl create pod` chưa hỗ trợ network volume
-ổn định, nên tạo pod có volume thì làm qua dashboard hoặc RunPod API.
+```bash
+runpodctl datacenter list                    # chọn dc còn stock GPU bạn thuê
+runpodctl network-volume create --name motion --size 100 --data-center-id <DC>
+```
+
+Hoặc dashboard: RunPod → **Storage → Network Volume**. ~100GB là đủ (Wan 2.2 Animate ~33GB +
+PGDATA + MinIO + chỗ thở). **Region quan trọng hơn dung lượng** — volume không di chuyển được, và
+pod khác region thì không mount được. Chọn region còn stock GPU bạn hay thuê.
 
 Rồi trong `.env`:
 
 ```bash
 POD_VOLUME=/workspace
 MODELS_MIN_GB=20          # ngưỡng cảnh báo "symlink trỏ thư mục rỗng"
+POD_VOLUME_ID=            # để trống nếu chỉ có 1 volume — pod-provision.sh tự điền
 ```
+
+`make gpu-provision` sẽ attach volume và ghim pod vào đúng datacenter của nó.
 
 Từ đó `make gpu-bootstrap` tự nối `models` + `PGDATA` + `MinIO` sang volume trước khi chạy setup.
 

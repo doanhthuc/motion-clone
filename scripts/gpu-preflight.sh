@@ -79,6 +79,8 @@ echo
 echo "Speed-ups (skip re-downloading 33GB of models / re-installing every pod)"
 check POD_VOLUME    recommended "RunPod Network Volume mount path, e.g. /workspace — without it every pod re-downloads ~33GB of models AND loses the database. docs/gpu-pod.md#network-volume" 1
 check MODELS_MIN_GB recommended "threshold below which pod-volume.sh assumes the symlink points at an empty dir" 1
+check POD_VOLUME_ID recommended "RunPod volume id to attach — pod-provision.sh fills this in for you if you own exactly one" 1
+check MIN_CUDA_VERSION recommended "passed to 'runpodctl pod create --min-cuda-version' — 13.0 keeps you off R570 hosts that fall back to cu128" 1
 check MTC_PREBUILT  recommended "1 = pod image ships /opt/mtc-prebuilt, skips ~20-35 min of installing (needs worker-image/Dockerfile)" 1
 
 echo
@@ -124,7 +126,8 @@ fi
 
 provider="$(get GPU_PROVIDER)"
 if [ "$provider" = "runpod" ]; then
-  echo -e "${Y}! GPU_PROVIDER=runpod — this path is less tested than vast (see docs/gpu-pod.md#runpod).${X}"
+  echo -e "${Y}! GPU_PROVIDER=runpod — rewritten for runpodctl 2.8 but not yet run against a live pod.${X}"
+  echo -e "${D}   Read the create command 'make gpu-provision' prints before you confirm it.${X}"
 fi
 
 vol="$(get POD_VOLUME)"
@@ -137,9 +140,24 @@ elif [ -z "$vol" ] && [ "$provider" = "runpod" ]; then
   echo -e "${Y}! POD_VOLUME empty on RunPod — you are leaving the biggest win on the table${X}"
   echo -e "${D}   (~33GB model re-download + database loss on every pod). docs/gpu-pod.md#network-volume${X}"
 fi
-if [ -n "$vol" ] && [ "$provider" = "runpod" ]; then
-  echo -e "${Y}! POD_VOLUME set: create the pod on the DASHBOARD, not 'make gpu-provision'${X}"
-  echo -e "${D}   runpodctl cannot attach a Network Volume, and it cannot be attached after creation.${X}"
+# runpodctl 2.8 attaches a volume at create time; older builds cannot, and would silently rent a
+# pod with no volume — the exact silent-success this design exists to prevent. Gate on the flag.
+if [ "$provider" = "runpod" ]; then
+  if ! command -v runpodctl >/dev/null 2>&1; then
+    blocking=$((blocking + 1))
+    echo -e "${R}✗ runpodctl not installed — brew install runpod/runpodctl/runpodctl${X}"
+  else
+    if [ -n "$vol" ] && ! runpodctl pod create --help 2>&1 | grep -q -- '--network-volume-id'; then
+      blocking=$((blocking + 1))
+      echo -e "${R}✗ this runpodctl cannot attach a Network Volume (no --network-volume-id)${X}"
+      echo -e "${D}   Upgrade:  brew upgrade runpodctl${X}"
+    fi
+    if ! runpodctl user -o json >/dev/null 2>&1; then
+      blocking=$((blocking + 1))
+      echo -e "${R}✗ runpodctl has no API key${X}"
+      echo -e "${D}   Get one at runpod.io/console/user/settings, then:  runpodctl doctor${X}"
+    fi
+  fi
 fi
 
 if [ "$blocking" -gt 0 ]; then
@@ -150,19 +168,8 @@ if [ "$blocking" -gt 0 ]; then
 fi
 echo -e "${G}✓ ready${X}$( [ "$pending" -gt 0 ] && echo " ${D}(${pending} field(s) still to fill in once the pod exists)${X}" )"
 echo
-# RunPod + Network Volume has no CLI path: pod-provision.sh refuses on purpose because runpodctl
-# cannot attach a volume, and gpu-wait only knows how to ask vastai. Saying "make gpu-provision"
-# here would walk you into both dead ends.
 if [ "$pending" -le 0 ]; then
   echo "  next: make gpu-up  →  make gpu-bootstrap"
-elif [ "$provider" = "runpod" ] && [ -n "$vol" ]; then
-  echo "  next: create the pod on runpod.io/console/pods with the volume mounted at $vol"
-  echo -e "${D}        (bash scripts/pod-provision.sh prints the exact settings)${X}"
-  echo "        then fill GPU_INSTANCE_ID / GPU_SSH_HOST / GPU_SSH_PORT by hand → make gpu-bootstrap"
-  echo -e "${D}        make gpu-wait does NOT work on RunPod — it only queries vastai.${X}"
-elif [ "$provider" = "runpod" ]; then
-  echo "  next: make gpu-provision  →  fill GPU_SSH_HOST/GPU_SSH_PORT by hand  →  make gpu-bootstrap"
-  echo -e "${D}        (make gpu-wait only queries vastai)${X}"
 else
   echo "  next: make gpu-provision"
 fi

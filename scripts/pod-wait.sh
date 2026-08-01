@@ -12,9 +12,7 @@
 # dead offer, not to rush a slow-but-working one — check `vastai logs <id>` before destroying
 # anything on a timeout.
 #
-# RunPod: this polling loop is vast-only (uses `vastai show instance`). If GPU_PROVIDER=runpod,
-# fill GPU_SSH_HOST/GPU_SSH_PORT into .env by hand from `runpodctl get pod` or the dashboard, then
-# skip straight to `make gpu-bootstrap`.
+# Works on both providers: vast via `vastai show instance`, RunPod via `runpodctl pod get`.
 set -uo pipefail
 
 env_get() { grep -E "^$1=" .env 2>/dev/null | cut -d= -f2- | tr -d '"' | sed 's/[[:space:]]*#.*//'; }
@@ -27,13 +25,79 @@ env_set() {
   fi
 }
 
-PROVIDER="$(env_get GPU_PROVIDER)"
+PROVIDER="$(env_get GPU_PROVIDER)"; PROVIDER="${PROVIDER:-vast}"
 if [ "$PROVIDER" = "runpod" ]; then
-  echo "GPU_PROVIDER=runpod — this script only knows how to poll vast.ai."
-  echo "Fill GPU_SSH_HOST / GPU_SSH_PORT into .env by hand (runpodctl get pod / RunPod dashboard),"
-  echo "then run: make gpu-bootstrap"
-  exit 1
+  command -v runpodctl >/dev/null || { echo "runpodctl not found — brew install runpod/runpodctl/runpodctl"; exit 1; }
 fi
+
+# probe — sets STATUS / HOST / PORT for the current pod. One function, two providers, so the
+# retry/timeout/billing logic below stays provider-agnostic.
+#
+# RunPod's JSON has moved around across releases (portMappings map vs runtime.ports list), and a
+# pod that is still starting has NO port block at all rather than an empty one. So: try both
+# shapes, treat "not there yet" as normal, and never guess a port number.
+probe() {
+  local raw
+  if [ "$PROVIDER" = "runpod" ]; then
+    raw="$(runpodctl pod get "$ID" -o json 2>/dev/null)"
+    read -r STATUS HOST PORT <<<"$(printf '%s' "$raw" | python3 -c '
+import sys, json
+def walk(node, want):
+    if isinstance(node, dict):
+        for k in want:
+            if node.get(k) not in (None, ""):
+                return node[k]
+        for v in node.values():
+            r = walk(v, want)
+            if r is not None: return r
+    elif isinstance(node, list):
+        for v in node:
+            r = walk(v, want)
+            if r is not None: return r
+    return None
+
+def ssh_endpoint(node):
+    # shape A: {"portMappings": {"22": 40123}, "publicIp": "1.2.3.4"}
+    pm = walk(node, ["portMappings"])
+    ip = walk(node, ["publicIp", "ip"])
+    if isinstance(pm, dict) and pm.get("22") and ip:
+        return ip, pm["22"]
+    # shape B: {"runtime": {"ports": [{"privatePort":22,"publicPort":40123,"ip":"1.2.3.4"}]}}
+    ports = walk(node, ["ports"])
+    if isinstance(ports, list):
+        for p in ports:
+            if isinstance(p, dict) and str(p.get("privatePort")) == "22":
+                if p.get("publicPort") and p.get("ip"):
+                    return p["ip"], p["publicPort"]
+    return None, None
+
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("? \x00 \x00"); raise SystemExit
+st = walk(d, ["desiredStatus", "status", "lastStatus"]) or "?"
+ip, port = ssh_endpoint(d)
+print(st, ip or "\x00", port or "\x00")
+' 2>/dev/null)"
+    [ "$HOST" = $'\x00' ] && HOST=""
+    [ "$PORT" = $'\x00' ] && PORT=""
+    # RunPod says RUNNING the moment the container is scheduled, well before sshd is listening.
+    # The ssh probe below is what actually decides, so normalise the word and let it do its job.
+    [ "$STATUS" = "RUNNING" ] && STATUS="running"
+    return
+  fi
+
+  raw="$(vastai show instance "$ID" --raw 2>/dev/null)"
+  STATUS="$(printf '%s' "$raw" | python3 -c 'import sys,json
+try: print(json.load(sys.stdin).get("actual_status") or "?")
+except Exception: print("?")' 2>/dev/null)"
+  HOST="$(printf '%s' "$raw" | python3 -c 'import sys,json
+try: print(json.load(sys.stdin).get("ssh_host") or "")
+except Exception: print("")' 2>/dev/null)"
+  PORT="$(printf '%s' "$raw" | python3 -c 'import sys,json
+try: print(json.load(sys.stdin).get("ssh_port") or "")
+except Exception: print("")' 2>/dev/null)"
+}
 
 TIMEOUT="${TIMEOUT:-25}"   # minutes
 
@@ -50,16 +114,7 @@ while :; do
   NOW=$(date +%s)
   MINS=$(( (NOW - START) / 60 ))
 
-  RAW="$(vastai show instance "$ID" --raw 2>/dev/null)"
-  STATUS="$(printf '%s' "$RAW" | python3 -c 'import sys,json
-try: print(json.load(sys.stdin).get("actual_status") or "?")
-except Exception: print("?")' 2>/dev/null)"
-  HOST="$(printf '%s' "$RAW" | python3 -c 'import sys,json
-try: print(json.load(sys.stdin).get("ssh_host") or "")
-except Exception: print("")' 2>/dev/null)"
-  PORT="$(printf '%s' "$RAW" | python3 -c 'import sys,json
-try: print(json.load(sys.stdin).get("ssh_port") or "")
-except Exception: print("")' 2>/dev/null)"
+  probe
 
   if [ "$STATUS" = "running" ] && [ -n "$HOST" ] && [ -n "$PORT" ]; then
     if ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8 -p "$PORT" "root@$HOST" true 2>/dev/null; then
@@ -73,11 +128,22 @@ except Exception: print("")' 2>/dev/null)"
 
   if [ "$NOW" -ge "$DEADLINE" ]; then
     SPENT="$(python3 -c "print(f'{($NOW - $START) / 3600 * $RATE:.2f}')")"
-    cat <<EOF
+    printf '\n✗ still "%s" after %s min ($%s burned).\n\n' "$STATUS" "$TIMEOUT" "$SPENT"
+    echo "  Check before destroying — a slow image pull and a dead host look identical from here:"
+    if [ "$PROVIDER" = "runpod" ]; then
+      cat <<EOF
+      runpodctl pod get $ID
+      runpodctl pod logs $ID     # if your runpodctl has it; otherwise read logs in the console
 
-✗ still "$STATUS" after ${TIMEOUT} min (\$${SPENT} burned).
+  Still pulling the image → it works, just slow. Wait, or TIMEOUT=40 make gpu-wait.
+  Wedged for many minutes → only then:
+      runpodctl pod delete $ID
+      CONFIRM=yes make gpu-provision
 
-  Check before destroying — a slow image pull and a dead host look identical from here:
+  A pod with no SSH port block usually means it was created without '--ports 22/tcp'.
+EOF
+    else
+      cat <<EOF
       vastai logs $ID
 
   "Pull complete" lines still advancing → it is working, just slow. Wait, or TIMEOUT=40 make gpu-wait.
@@ -85,6 +151,7 @@ except Exception: print("")' 2>/dev/null)"
       vastai destroy instance $ID -y
       SKIP=$ID CONFIRM=yes make gpu-provision
 EOF
+    fi
     exit 1
   fi
 

@@ -46,8 +46,19 @@ IMAGE="${IMAGE:-$(env_get POD_IMAGE)}"; IMAGE="${IMAGE:-pytorch/pytorch:2.12.1-c
 
 # Same precedence as every other knob here: environment overrides .env.
 POD_VOLUME="${POD_VOLUME:-$(env_get POD_VOLUME)}"
+POD_VOLUME_ID="${POD_VOLUME_ID:-$(env_get POD_VOLUME_ID)}"
+MIN_CUDA_VERSION="${MIN_CUDA_VERSION:-$(env_get MIN_CUDA_VERSION)}"; MIN_CUDA_VERSION="${MIN_CUDA_VERSION:-13.0}"
 
-# --- Network Volume is RunPod-only, and runpodctl cannot attach one --------------------------
+env_set() {
+  local key="$1" val="$2"
+  if grep -qE "^$key=" .env 2>/dev/null; then
+    sed -i.bak -E "s#^$key=.*#$key=$val#" .env && rm -f .env.bak
+  else
+    printf '%s=%s\n' "$key" "$val" >> .env
+  fi
+}
+
+# --- Network Volume is RunPod-only ------------------------------------------------------------
 # vast.ai has no network volume that survives destroying the instance, so POD_VOLUME there is a
 # lie: the wiring would "work" and then vanish with the pod.
 if [ -n "$POD_VOLUME" ] && [ "$GPU_PROVIDER" != "runpod" ]; then
@@ -58,73 +69,157 @@ if [ -n "$POD_VOLUME" ] && [ "$GPU_PROVIDER" != "runpod" ]; then
 fi
 
 if [ "$GPU_PROVIDER" = "runpod" ]; then
-  # --- RunPod branch — best-effort, LESS TESTED than the vast path below. -------------------
-  # runpodctl's flags have moved across versions; verify with `runpodctl create pod --help`
-  # before trusting this blindly. See docs/gpu-pod.md#runpod.
-  # NOTE: the Network Volume check comes BEFORE the runpodctl check on purpose — the dashboard
-  # path it prints needs no CLI at all, so demanding runpodctl first would block the very advice
-  # the user needs.
+  # --- RunPod branch ---------------------------------------------------------------------------
+  # runpodctl 2.8 attaches a Network Volume at create time (--network-volume-id) and can constrain
+  # the host's CUDA (--min-cuda-version), so the whole flow is one command. Older runpodctl could
+  # do neither, which is why this used to send you to the dashboard.
   #
-  # STOP before spending money: runpodctl create pod has no flag for attaching a Network Volume.
-  # Renting here would give a pod with NO volume, bootstrap would refuse (mountpoint check) or —
-  # worse, if you forced it — you'd re-download 33GB onto a disk that dies with the pod. The
-  # silent-success failure this whole design exists to prevent. So: refuse, and hand over exact steps.
+  # Gate on the FLAG, not on a version string: `runpodctl version` output has changed shape across
+  # releases, and what actually matters is whether this binary supports the flag we are about to pass.
+  command -v runpodctl >/dev/null \
+    || die "runpodctl not found —  brew install runpod/runpodctl/runpodctl"
+
+  RP_CREATE_HELP="$(runpodctl pod create --help 2>&1)"
+  case "$RP_CREATE_HELP" in
+    *--network-volume-id*) ;;
+    *) die "this runpodctl cannot attach a Network Volume ('runpodctl pod create' has no
+    --network-volume-id). Upgrade:  brew upgrade runpodctl
+    Or clear POD_VOLUME in .env to rent without one (models re-download every pod, ~33GB)." ;;
+  esac
+
+  runpodctl user -o json >/dev/null 2>&1 \
+    || die "runpodctl has no API key. Get one at runpod.io/console/user/settings, then:  runpodctl doctor"
+
+  # rp_pick FIELD — read one field out of runpodctl JSON without caring which envelope this
+  # release used. Different subcommands have wrapped their payload in {"pods":[…]}, {"data":{…}},
+  # or returned a bare array; walking the tree for the first object that has the key survives all
+  # three, and survives the next rename too.
+  rp_pick() {
+    RP_KEYS="$1" python3 -c '
+import sys, json, os
+keys = os.environ["RP_KEYS"].split(",")
+def walk(node):
+    if isinstance(node, dict):
+        for k in keys:
+            if node.get(k) not in (None, ""):
+                return node[k]
+        for v in node.values():
+            r = walk(v)
+            if r is not None:
+                return r
+    elif isinstance(node, list):
+        for v in node:
+            r = walk(v)
+            if r is not None:
+                return r
+    return None
+try:
+    r = walk(json.load(sys.stdin))
+except Exception:
+    r = None
+print(r if r is not None else "")
+' 2>/dev/null
+  }
+
+  DC_ARG=()
+  VOL_ARGS=()
   if [ -n "$POD_VOLUME" ]; then
-    warn "POD_VOLUME=$POD_VOLUME is set, and runpodctl CANNOT attach a Network Volume."
-    cat <<EOF
-
-  Create this pod on the dashboard instead — it is the only way to attach the volume:
-
-    1. runpod.io/console/pods → Deploy
-    2. GPU: $GPU        ← must be in the SAME REGION as your Network Volume
-    3. Network Volume: select yours, Mount Path: $POD_VOLUME
-    4. Container Disk: ${DISK}GB · Expose TCP Ports: 22
-    5. Template/Image: $IMAGE
-    6. Deploy, then copy pod id + SSH host/port into .env:
-         GPU_INSTANCE_ID=  GPU_SSH_HOST=  GPU_SSH_PORT=
-    7. make gpu-bootstrap
-
-  Why the dashboard: a volume attached at creation is the only supported path; there is no
-  runpodctl flag for it, and attaching after the fact is not possible either.
-
-  To rent WITHOUT a volume anyway (models will re-download every time):
-      POD_VOLUME= CONFIRM=yes GPU_PROVIDER=runpod bash scripts/pod-provision.sh
-
-EOF
-    exit 1
+    # A pod can only mount a volume in its OWN datacenter, and that is the single most common way
+    # this fails. So resolve the volume's datacenter and pin the pod to it rather than hoping.
+    if [ -z "$POD_VOLUME_ID" ]; then
+      VOL_JSON="$(runpodctl network-volume list -o json 2>/dev/null)"
+      VOL_COUNT="$(printf '%s' "$VOL_JSON" | python3 -c '
+import sys, json
+def vols(node, out):
+    if isinstance(node, dict):
+        if "id" in node and ("size" in node or "dataCenterId" in node or "datacenterId" in node):
+            out.append(node); return
+        for v in node.values(): vols(v, out)
+    elif isinstance(node, list):
+        for v in node: vols(v, out)
+out = []
+try: vols(json.load(sys.stdin), out)
+except Exception: pass
+for v in out:
+    print("%s\t%s\t%s\t%s" % (v.get("id",""), v.get("name",""),
+          v.get("dataCenterId") or v.get("datacenterId") or "?", v.get("size","?")))
+' 2>/dev/null)"
+      if [ -z "$VOL_COUNT" ]; then
+        die "POD_VOLUME=$POD_VOLUME is set but you have no Network Volume yet.
+    Create one (~100GB, in a datacenter that stocks your GPU):
+        runpodctl network-volume create --name motion --size 100 --data-center-id <DC>
+    Pick the datacenter with:  runpodctl datacenter list
+    Then re-run. Or clear POD_VOLUME to rent without one (models re-download every pod)."
+      fi
+      if [ "$(printf '%s\n' "$VOL_COUNT" | wc -l | tr -d ' ')" -gt 1 ]; then
+        warn "More than one Network Volume — pick one and put it in .env as POD_VOLUME_ID:"
+        printf '%s\n' "$VOL_COUNT" | while IFS=$'\t' read -r vid vname vdc vsize; do
+          printf '    %s  %-20s dc=%s  %sGB\n' "$vid" "$vname" "$vdc" "$vsize"
+        done
+        exit 1
+      fi
+      POD_VOLUME_ID="$(printf '%s' "$VOL_COUNT" | cut -f1)"
+      VOL_DC="$(printf '%s' "$VOL_COUNT" | cut -f3)"
+      log "using your only Network Volume: $POD_VOLUME_ID (dc=$VOL_DC)"
+      env_set POD_VOLUME_ID "$POD_VOLUME_ID"
+    else
+      VOL_DC="$(runpodctl network-volume get "$POD_VOLUME_ID" -o json 2>/dev/null | rp_pick dataCenterId,datacenterId)"
+      [ -n "$VOL_DC" ] || warn "could not read the datacenter of volume $POD_VOLUME_ID — the pod may land in a datacenter that cannot mount it."
+    fi
+    VOL_ARGS=(--network-volume-id "$POD_VOLUME_ID" --volume-mount-path "$POD_VOLUME")
+    [ -n "${VOL_DC:-}" ] && [ "$VOL_DC" != "?" ] && DC_ARG=(--data-center-ids "$VOL_DC")
+  else
+    warn "POD_VOLUME empty — this pod re-downloads ~33GB of models and loses its database when destroyed."
   fi
 
-  command -v runpodctl >/dev/null || die "runpodctl not found — https://github.com/runpod/runpodctl"
-  warn "GPU_PROVIDER=runpod is best-effort — double check the command below against 'runpodctl create pod --help'."
-  warn "GPU='$GPU' must be a RunPod gpuType string (e.g. 'NVIDIA GeForce RTX 5090'), NOT vast.ai's"
-  warn "    underscore form (RTX_5090). Check: runpodctl get cloud"
+  # --min-cuda-version is the real lever for the cu130 path in lib-gpu.sh: it keeps you off hosts
+  # whose driver is too old, instead of finding out from a warn line 30 minutes into setup.
+  CREATE=(runpodctl pod create
+    --name motion-transfer
+    --gpu-id "$GPU" --gpu-count 1
+    --image "$IMAGE"
+    --container-disk-in-gb "$DISK"
+    --ports "22/tcp"
+    --min-cuda-version "$MIN_CUDA_VERSION"
+    "${VOL_ARGS[@]}" "${DC_ARG[@]}")
 
-  CREATE=(runpodctl create pod --name motion-transfer --gpuType "$GPU" --gpuCount 1 \
-    --imageName "$IMAGE" --containerDiskInGb "$DISK" --ports "22/tcp")
-
+  # %q not [*]: the gpu id has spaces ("NVIDIA GeForce RTX 5090"), and this line is meant to be
+  # copy-pasteable. [*] would print it unquoted and the paste would be parsed as four arguments.
   echo
-  echo "  ${CREATE[*]}"
+  printf '  '; printf '%q ' "${CREATE[@]}"; printf '\n'
   echo
 
   if [ "${CONFIRM:-}" != "yes" ]; then
     cat <<EOF
 $(warn "Dry run — nothing rented.")
 
-  Read the command above, then:   CONFIRM=yes GPU_PROVIDER=runpod bash scripts/pod-provision.sh
+  GPU='$GPU' must be a RunPod gpu id — check it against:  runpodctl gpu list
+  Read the command above, then:   CONFIRM=yes bash scripts/pod-provision.sh
 
-  After it rents (get the pod id + SSH details from 'runpodctl get pod' or the RunPod dashboard):
-    1. put the pod id in .env as GPU_INSTANCE_ID
-    2. put the SSH host/port in .env as GPU_SSH_HOST / GPU_SSH_PORT (make gpu-wait's auto-detect
-       is vast-only — fill these by hand for RunPod)
-    3. make gpu-bootstrap     # rsyncs motions-studio + runs setup-motion-transfer.sh on the pod
-    4. make gpu-status        # confirm the backend answers at https://\$DOMAIN
+  After it rents (GPU_INSTANCE_ID is saved to .env for you automatically):
+    1. make gpu-wait          # polls runpodctl, writes GPU_SSH_HOST/GPU_SSH_PORT into .env
+    2. make gpu-bootstrap     # rsyncs motions-studio + runs setup-motion-transfer.sh on the pod
+    3. make gpu-status        # confirm the backend answers at https://\$DOMAIN
+
+  A RunPod Network Volume bills monthly whether or not a pod exists — 'make gpu-destroy' does not
+  stop that meter, and is not supposed to. See docs/gpu-pod.md#costs.
 EOF
     exit 0
   fi
 
   log "renting via runpodctl…"
-  "${CREATE[@]}" || die "runpodctl create pod failed — check the flags against your runpodctl version"
-  log "rented. Get the pod id + SSH host/port from 'runpodctl get pod', fill them into .env, then: make gpu-bootstrap"
+  RAW="$("${CREATE[@]}" 2>&1)" || die "runpodctl pod create failed:
+$RAW"
+  NEW_ID="$(printf '%s' "$RAW" | rp_pick id,podId)"
+  if [ -n "$NEW_ID" ]; then
+    env_set GPU_INSTANCE_ID "$NEW_ID"
+    log "rented — pod $NEW_ID (saved to .env as GPU_INSTANCE_ID). Next: make gpu-wait"
+  else
+    warn "rented, but could not parse the pod id out of the response — find it with 'runpodctl pod list'"
+    echo "$RAW"
+    echo
+    log "put the pod id in .env as GPU_INSTANCE_ID, then: make gpu-wait"
+  fi
   exit 0
 fi
 

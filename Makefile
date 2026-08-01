@@ -53,7 +53,7 @@ gpu-fe: ## Re-deploy ONLY the frontend to the pod (rsync + build + PM2 restart, 
 gpu-up: ## Start the pod and wait until the backend answers
 	@test -n "$(call env,GPU_INSTANCE_ID)" || { echo "set GPU_INSTANCE_ID in .env (see docs/gpu-pod.md)"; exit 1; }
 ifeq ($(shell grep -E '^GPU_PROVIDER=' .env 2>/dev/null | cut -d= -f2),runpod)
-	@runpodctl start pod $(call env,GPU_INSTANCE_ID)
+	@runpodctl pod start $(call env,GPU_INSTANCE_ID)
 else
 	@vastai start instance $(call env,GPU_INSTANCE_ID)
 endif
@@ -63,7 +63,7 @@ endif
 
 gpu-down: ## Stop the pod (DO NOT FORGET — an idle pod bills by the hour)
 ifeq ($(shell grep -E '^GPU_PROVIDER=' .env 2>/dev/null | cut -d= -f2),runpod)
-	@runpodctl stop pod $(call env,GPU_INSTANCE_ID)
+	@runpodctl pod stop $(call env,GPU_INSTANCE_ID)
 else
 	@vastai stop instance $(call env,GPU_INSTANCE_ID)
 endif
@@ -76,8 +76,17 @@ endif
 gpu-destroy: ## Permanently destroy the pod (frees the GPU, deletes its disk — irreversible)
 	@test -n "$(call env,GPU_INSTANCE_ID)" || { echo "GPU_INSTANCE_ID is empty in .env — nothing to destroy"; exit 1; }
 ifeq ($(shell grep -E '^GPU_PROVIDER=' .env 2>/dev/null | cut -d= -f2),runpod)
-	@runpodctl remove pod $(call env,GPU_INSTANCE_ID)
-	@echo "GPU pod destroyed — confirm on the RunPod dashboard (runpodctl has no list-and-verify)"
+	@runpodctl pod delete $(call env,GPU_INSTANCE_ID) || true
+	@sleep 3
+	@if runpodctl pod list -o json 2>/dev/null | grep -q '$(call env,GPU_INSTANCE_ID)'; then \
+		echo "STILL ALIVE — pod $(call env,GPU_INSTANCE_ID) was NOT deleted and is STILL BILLING."; \
+		echo "Delete it by hand: runpodctl pod delete $(call env,GPU_INSTANCE_ID)"; \
+		exit 1; \
+	else \
+		echo "destroyed — verified gone from 'runpodctl pod list'"; \
+		echo "now clear GPU_INSTANCE_ID / GPU_SSH_HOST / GPU_SSH_PORT in .env"; \
+		echo "NOTE: the Network Volume still exists and still bills monthly — that is deliberate."; \
+	fi
 else
 	@printf 'y\n' | vastai destroy instance $(call env,GPU_INSTANCE_ID)
 	@sleep 3
