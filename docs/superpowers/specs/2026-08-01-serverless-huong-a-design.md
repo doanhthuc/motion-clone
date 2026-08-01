@@ -214,6 +214,74 @@ clone lại từ đầu chưa chắc ra cùng kết quả.
 - Image dựng sẵn của upstream (`ghcr.io/ald-project/motion-backend-worker`) **không pull ẩn danh
   được** — đã thử, HTTP 403. Phải build vào registry riêng.
 
+<a id="handler-shape"></a>
+## Quyết định 5 — hình dạng handler, và WORKER_ID phải duy nhất
+
+Đọc code ngày 01/08/2026, cả hai điểm dưới đây đều là quan sát từ source chứ không phải phỏng đoán.
+
+### Handler tách sạch, khoảng 15 dòng
+
+`worker_runtime/runner.py` là **hàm thuần nhận callback**: `run_worker_loop(api_claim, api_patch,
+api_heartbeat, pipelines, startup, …)`. Việc chạy job thu về hai dòng — `fn = pipelines.get(jt)`
+rồi `fn(job)`. `PIPELINES` (`linux.py:9728`) là dict phẳng `job type → hàm`, có sẵn `motion`,
+`teen-flycam`, `trend-tiktok`, `enhance`. `_startup()` chỉ dọn queue ComfyUI mồ côi và đã bọc
+try/except nên vô hại khi queue rỗng.
+
+```python
+from worker_runtime.linux import PIPELINES, api_claim, api_patch, _startup
+
+def handler(event):
+    job = api_claim([])
+    if not job:
+        return {"ok": True, "claimed": False}      # hết job, thoát, tốn vài giây
+    fn = PIPELINES.get(job["type"])
+    if not fn:
+        api_patch(job["id"], status="error", error=f"unsupported {job['type']}")
+        return {"ok": False, "error": "unsupported"}
+    try:
+        fn(job)
+        return {"ok": True, "job": job["id"]}
+    except Exception as e:
+        api_patch(job["id"], status="error", error=str(e))
+        return {"ok": False, "error": str(e)}
+```
+
+Không monkeypatch gì. Cấu hình đọc từ env lúc import (`API_URL`, `WORKER_TOKEN`, `COMFY_URL`,
+`JOB_TYPES`) nên chỉ cần đặt env trước khi import.
+
+**Không cần heartbeat.** `runner.py` gửi mỗi 15 giây, nhưng chính comment trong đó nói
+`active_job_id` "chỉ là thông tin hiển thị badge FE". Reclaim không dựa vào heartbeat — xem dưới.
+
+### WORKER_ID phải duy nhất cho từng container — nếu không, worker giết job của nhau
+
+`api/src/routes/jobs.js:219-224`, chạy mỗi lần có ai gọi `/worker/claim`:
+
+```sql
+UPDATE jobs SET status='error', error='Worker khởi động lại giữa chừng — vui lòng chạy lại'
+ WHERE status='running' AND worker_id=$1 AND NOT (id::text = ANY($2::text[]))
+```
+
+Reclaim theo **`worker_id` + danh sách `active_job_ids` gửi kèm**, không theo thời gian chờ
+heartbeat. Với worker local chạy một tiến trình dài hạn thì đúng: claim lại nghĩa là nó vừa
+restart, nên job `running` cũ là tàn dư.
+
+Với serverless thì sai chết người. `linux.py:36` — `WORKER_ID = os.environ.get("WORKER_ID",
+"worker-1")`, **mặc định là hằng số**. Kịch bản:
+
+1. Worker A tỉnh, claim job J1 → `jobs.worker_id='worker-1'`, `status='running'`
+2. Worker B tỉnh vài giây sau, gọi `/worker/claim` với `active_job_ids=[]`
+3. Câu UPDATE trên khớp J1 → **J1 thành `error` trong lúc A vẫn đang render**
+
+RunPod Serverless với `max workers 3-5` rơi vào đúng kịch bản này ngay từ job thứ hai chạy song
+song. Triệu chứng sẽ là job fail rải rác với thông báo "Worker khởi động lại giữa chừng" mà không
+có worker nào restart cả — cực khó lần ra nếu không biết trước.
+
+**Bắt buộc:** mỗi container đặt `WORKER_ID` riêng, sinh lúc khởi động (id worker của RunPod, hoặc
+`serverless-<uuid4>`). Đây là một dòng trong `entrypoint.sh`, nhưng thiếu nó thì hệ thống hỏng
+theo kiểu ngẫu nhiên và chỉ hỏng khi có tải.
+
+Thêm vào §Kiểm chứng mục 6: hai job cùng lúc, không job nào bị chuyển `error` oan.
+
 ## Cố tình KHÔNG làm
 
 Ngân sách trần theo ngày · fallback tự động khi serverless lỗi · autoscale theo độ dài hàng đợi ·
@@ -233,12 +301,8 @@ Chưa có số liệu tải thật thì mọi thứ trên là đoán. Job lỗi 
 2. **`custom_nodes/` trên pod thật gồm những gì.** Quyết định nội dung image. Đo:
    `ssh pod 'ls ~/comfyui/custom_nodes && git -C ... rev-parse HEAD'` cho từng node, cộng
    `models/detection/*.onnx`.
-3. **Worker code có chạy được trong container serverless không.** Nó viết cho tiến trình dài hạn:
-   có vòng lặp, heartbeat, và trạng thái toàn cục. Cần đọc `worker_runtime/runner.py` xem tách ra
-   một nhịp claim-and-run có sạch không, hay phải bọc.
-
-Nếu giả định 3 sai — worker code không tách nhịp được — thiết kế phải quay lại kiểu monkeypatch
-như `rp_handler.py`, và §Quyết định 1 mất phần lớn giá trị. Đây là rủi ro lớn nhất của spec này.
+3. ~~**Worker code có chạy được trong container serverless không.**~~ **ĐÃ TRẢ LỜI 01/08/2026:
+   có, tách sạch.** Xem [§Quyết định 5](#handler-shape). Rủi ro lớn nhất của spec này đã gỡ.
 
 ## Xử lý lỗi
 
@@ -261,13 +325,16 @@ Không có unit test cho phần này — nó là hạ tầng. Thứ chứng minh
    định mục 1 đang tin theo lời kể. Vượt 100MB thì mở lại §Quyết định 3
 4. Tắt `pm2 stop worker` trên pod, job vẫn chạy — chứng minh serverless tự đứng được
 5. Không có job nào trong 10 phút → `runpodctl` báo 0 worker đang chạy, hoá đơn không tăng
-6. Hai job cùng lúc → hai worker, không job nào bị nhận hai lần
+6. Hai job cùng lúc → hai worker, không job nào bị nhận hai lần, và **không job nào bị chuyển
+   `error` oan** với thông báo "Worker khởi động lại giữa chừng" — đây là bài kiểm cho
+   [§Quyết định 5](#handler-shape), chạy với `max workers` ≥ 2 mới có ý nghĩa
 
 ## Việc phải làm, theo thứ tự
 
-Giả định 1 đã trả lời. Còn giả định 2 và 3 phải đo trên pod thật trước khi bắt đầu.
+Giả định 1 và 3 đã trả lời. Chỉ còn giả định 2, đo được bằng vài lệnh `ssh` khi pod sống.
 
-1. Đo giả định 2 (`custom_nodes/` thật) và 3 (worker code tách nhịp được không)
+1. Đo giả định 2: `custom_nodes/` thật trên pod, kèm commit hash từng repo và
+   `models/detection/*.onnx`
 2. ~~`presignPut` + route `/worker/output-url` + cờ `MOTION_OUTPUT_PRESIGN`~~ — **bỏ**, output
    dưới 100MB nên đường multipart sẵn có là đủ
 3. Handler serverless + Dockerfile + job CI build image
