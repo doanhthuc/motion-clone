@@ -1,7 +1,8 @@
 # RunPod Serverless cho stack tự chủ (hướng A) — thiết kế
 
 Ngày: 2026-08-01
-Trạng thái: **thiết kế, chưa triển khai.** Ba giả định ở §8 phải đo trên pod thật trước khi viết code.
+Trạng thái: **thiết kế, chưa triển khai.** Cả ba giả định đã đo xong trên pod thật 01/08/2026 —
+xem [§Đo thật](#measured). Spec sẵn sàng chuyển thành plan.
 
 ## Vấn đề
 
@@ -99,10 +100,12 @@ không mất tính đúng đắn. Đổi lại:
 Phương án thay thế (truyền `job_id` trong request) đòi thêm route claim-theo-id, và đẻ ra tình
 huống job bị gán cho một worker đã chết. Không đáng.
 
+<a id="quyet-dinh-3"></a>
 ## Quyết định 3 — presigned PUT cho output lớn · **HOÃN**
 
-> **Cập nhật 01/08/2026:** chủ dự án xác nhận output thật **dưới 100MB**. Giả định 1 ở §Ba giả
-> định coi như đã trả lời, và toàn bộ mục này **không cần làm cho lần triển khai đầu**.
+> **Cập nhật 01/08/2026 — ĐÃ ĐO, không còn là lời kể.** Sau một job motion thật: object lớn nhất
+> trong bucket **17.7 MB**, cả bucket 71 MB. Xem [§Đo thật](#measured). Toàn bộ mục này **không
+> cần làm cho lần triển khai đầu**.
 >
 > Ba hệ quả, đều theo hướng nhẹ đi:
 > - Không cần `presignPut`, không cần route `/worker/output-url`, không cần nhánh mới trong worker
@@ -317,11 +320,67 @@ Chưa có số liệu tải thật thì mọi thứ trên là đoán. Job lỗi 
 1. ~~**Output thật nặng bao nhiêu.**~~ **ĐÃ TRẢ LỜI 01/08/2026: dưới 100MB.** Nguồn: chủ dự án
    xác nhận, chưa phải số đo từ job chạy qua đường này. §Quyết định 3 hoãn, ràng buộc VPS bỏ.
    Nếu về sau thấy job fail với HTTP 413 ở bước upload thì giả định này đã hết đúng.
-2. **`custom_nodes/` trên pod thật gồm những gì.** Quyết định nội dung image. Đo:
+2. ~~**`custom_nodes/` trên pod thật gồm những gì.**~~ **ĐÃ ĐO 01/08/2026** trên pod
+   `ua9a220uubwfl9` sau khi một job motion chạy thành công. Xem [§Đo thật](#measured). Cách đo cũ
+   giữ lại bên dưới để lặp lại khi cần:
    `ssh pod 'ls ~/comfyui/custom_nodes && git -C ... rev-parse HEAD'` cho từng node, cộng
    `models/detection/*.onnx`.
 3. ~~**Worker code có chạy được trong container serverless không.**~~ **ĐÃ TRẢ LỜI 01/08/2026:
    có, tách sạch.** Xem [§Quyết định 5](#handler-shape). Rủi ro lớn nhất của spec này đã gỡ.
+
+<a id="measured"></a>
+## Đo thật trên pod — 01/08/2026
+
+Pod `ua9a220uubwfl9`, RTX 5090, driver 580.126.20, torch 2.12.1+cu130, sau một job motion chạy
+thành công end-to-end.
+
+### Kích thước output — giả định 1 xác nhận
+
+| Object lớn nhất trong bucket `motion` | 17.7 MB |
+|---|---|
+| Object thứ hai | 5.6 MB |
+| Cả bucket sau 1 job | 71 MB |
+
+Dưới 100MB rất xa, nên [§Quyết định 3](#quyet-dinh-3) (presigned PUT) đúng là hoãn được. Cảnh báo:
+đây là **một** job với clip ngắn. Gói dài hơn hoặc độ phân giải cao hơn có thể vượt — dấu hiệu để
+mở lại vẫn là HTTP 413 ở bước upload.
+
+### `custom_nodes/` thật — giả định 2 đóng
+
+Sáu node, đúng bằng danh sách `setup-motion-transfer.sh` clone. **Không có node vá tay ngoài git**
+như README-runpod cảnh báo — cảnh báo đó thuộc về box .165, không phải box dựng từ script này.
+
+| Node | Commit |
+|---|---|
+| `ComfyUI-WanVideoWrapper` | `088128b` |
+| `ComfyUI-KJNodes` | `4d46ac1` |
+| `ComfyUI-VideoHelperSuite` | `4ee72c0` |
+| `comfyui_controlnet_aux` | `e8b689a` |
+| `ComfyUI-Frame-Interpolation` | `26545cc` |
+| `ComfyUI-FlashVSR_Stable` | `f7f55ba` |
+
+### Weight DWPose nằm ngoài `models/` — phát hiện mới, ảnh hưởng image
+
+```
+comfyui_controlnet_aux/ckpts/hr16/yolox-onnx/yolox_l.torchscript.pt              207.6 MB
+comfyui_controlnet_aux/ckpts/hr16/DWPose-TorchScript-BatchSize5/dw-ll_..._bs5.pt 128.8 MB
+                                                                          tổng   337 MB
+```
+
+Ba hệ quả:
+
+1. Chúng **không** nằm trong `models/` nên **không** ở trên Network Volume — nằm trên container
+   disk, mất khi `gpu-destroy`, tải lại ở lần dùng DWPose đầu tiên. 337MB, không phải 33GB, nên
+   chấp nhận được với pod.
+2. Với **serverless thì không chấp nhận được**: mỗi worker cold-start sẽ tải lại 337MB. Phải nướng
+   `ckpts/` vào image, hoặc symlink nó sang volume.
+3. Định dạng là `.torchscript.pt`, **không phải `.onnx` trong `models/detection`** như
+   README-runpod mô tả. Đường dẫn trong README đó không áp dụng cho box dựng bằng script này.
+
+### Model trên volume
+
+13 file · 42 GB (nhóm Wan 2.2 Animate + FlashVSR Enhance). `pod-volume.sh --check` xác nhận
+không hồi quy.
 
 ## Xử lý lỗi
 
