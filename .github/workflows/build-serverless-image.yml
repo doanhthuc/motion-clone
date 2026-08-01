@@ -8,9 +8,10 @@ on:
   push:
     branches: [main]
     paths:
-      - motions-studio/worker/runpod/Dockerfile.selfhosted
-      - motions-studio/worker/runpod/entrypoint-selfhosted.sh
-      - motions-studio/worker/runpod/mc_handler.py
+      # Bao cả cây worker/, không chỉ ba file: Dockerfile làm `COPY worker /app/worker` nên
+      # requirements.txt hay worker_runtime/ đổi là image đổi. Chỉ theo dõi ba file thì tag
+      # trên GHCR lệch khỏi code mà không ai biết.
+      - motions-studio/worker/**
       - .github/workflows/build-serverless-image.yml
 
 permissions:
