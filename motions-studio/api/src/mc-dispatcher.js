@@ -17,7 +17,8 @@ const log = (...a) => console.log("[mc-dispatcher]", ...a)
 /** Số lần /run cần bắn. Hàm thuần để test được mà không cần DB lẫn mạng. */
 export function decideDispatch({ queued, running, maxInflight }) {
   const need = queued - running
-  if (need <= 0) return 0
+  // maxInflight <= 0 là input sai (config lỗi) — không bao giờ trả số âm.
+  if (need <= 0 || maxInflight <= 0) return 0
   return Math.min(need, maxInflight)
 }
 
@@ -59,6 +60,14 @@ async function tick() {
 async function main() {
   if (!ENDPOINT || !API_KEY) {
     log("thiếu RUNPOD_ENDPOINT_ID hoặc RUNPOD_API_KEY → không chạy")
+    process.exit(1)
+  }
+  // DATABASE_URL không có default: db.js gọi `new pg.Pool({ connectionString: process.env.DATABASE_URL })`
+  // không dotenv, không fallback — thiếu biến này thì pg rơi về default connection (localhost, user hệ
+  // điều hành, không mật khẩu), lỗi bị catch trong tick() nuốt, và pm2 status vẫn báo online mãi mãi
+  // trong khi dispatcher không bao giờ query được. Chết ngay lúc khởi động thay vì chạy mãi trong lỗi.
+  if (!process.env.DATABASE_URL) {
+    log("thiếu DATABASE_URL → không chạy (xem ecosystem.config.cjs cách nó dẫn xuất biến này từ .env)")
     process.exit(1)
   }
   log(`bắt đầu · endpoint=${ENDPOINT} · poll=${POLL_MS}ms · maxInflight=${MAX_INFLIGHT}`)

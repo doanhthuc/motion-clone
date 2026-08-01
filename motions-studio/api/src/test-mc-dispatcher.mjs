@@ -18,4 +18,7 @@ assert.equal(decideDispatch({ queued: 50, running: 0, maxInflight: 3 }), 3)
 // Đang chạy nhiều hơn queued (job vừa được nhận) → không âm.
 assert.equal(decideDispatch({ queued: 1, running: 4, maxInflight: 3 }), 0)
 
-console.log("mc-dispatcher: 5 assertions passed")
+// maxInflight âm (config lỗi) → không bao giờ trả số âm, kể cả khi need dương.
+assert.equal(decideDispatch({ queued: 5, running: 0, maxInflight: -1 }), 0)
+
+console.log("mc-dispatcher: 6 assertions passed")

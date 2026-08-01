@@ -165,16 +165,33 @@ fi
 # ── Dispatcher serverless (tuỳ chọn) ──────────────────────────────────────────
 # Đăng ký bằng `pm2 start <script>` chứ không thêm vào ecosystem.config.cjs: file đó là upstream,
 # sửa vào là mất sau make sync-upstream.
+#
+# DATABASE_URL: ecosystem.config.cjs:9 ghi rõ api/wf-worker chỉ đọc process.env (không dotenv), và
+# ecosystem.config.cjs:62 tự DẪN XUẤT DATABASE_URL từ POSTGRES_USER/PASSWORD/PORT/DB trong .env —
+# biến này KHÔNG có sẵn trong .env, chỉ tồn tại sau khi ecosystem.config.cjs tính ra. Thiếu nó thì
+# pg.Pool trong db.js rơi về default connection (localhost, user hệ điều hành, không mật khẩu), lỗi
+# liên tục nhưng bị catch trong tick() nuốt — trong khi `pm2 status` vẫn báo online mãi mãi. Lấy
+# đúng giá trị bằng cách require lại chính ecosystem.config.cjs TRÊN POD (nó tự đọc
+# ~/motion-backend/.env, khác .env gốc ở máy local) thay vì chép công thức ra đây lần hai — lệch
+# một chi tiết (thứ tự host/port, tên biến…) là lại thêm một lỗi im lặng khác.
 RUNPOD_ENDPOINT_ID="$(env_get RUNPOD_ENDPOINT_ID)"
 RUNPOD_API_KEY_ENV="$(env_get RUNPOD_API_KEY)"
 if [ -n "$RUNPOD_ENDPOINT_ID" ] && [ -n "$RUNPOD_API_KEY_ENV" ]; then
   log "starting mc-dispatcher (serverless) — endpoint $RUNPOD_ENDPOINT_ID"
-  remote "cd ~/$REMOTE_DIR && pm2 delete mc-dispatcher >/dev/null 2>&1 ; \
-    RUNPOD_ENDPOINT_ID='$RUNPOD_ENDPOINT_ID' RUNPOD_API_KEY='$RUNPOD_API_KEY_ENV' \
+  remote "cd ~/$REMOTE_DIR && \
+    DBURL=\$(node -e \"console.log(require('./ecosystem.config.cjs').apps.find(a=>a.name==='api').env.DATABASE_URL)\" 2>/dev/null) ; \
+    if [ -z \"\$DBURL\" ]; then echo 'mc-dispatcher: không tính được DATABASE_URL từ ecosystem.config.cjs — bỏ qua'; exit 1; fi ; \
+    pm2 delete mc-dispatcher >/dev/null 2>&1 ; \
+    DATABASE_URL=\"\$DBURL\" RUNPOD_ENDPOINT_ID='$RUNPOD_ENDPOINT_ID' RUNPOD_API_KEY='$RUNPOD_API_KEY_ENV' \
     pm2 start api/src/mc-dispatcher.js --name mc-dispatcher --update-env >/dev/null 2>&1 ; \
-    pm2 save >/dev/null 2>&1 ; sleep 4 ; \
+    pm2 save >/dev/null 2>&1 ; sleep 6 ; \
+    if pm2 logs mc-dispatcher --lines 100 --nostream 2>/dev/null | grep -q 'tick lỗi:'; then \
+      echo 'mc-dispatcher: log có \"tick lỗi:\" — DATABASE_URL sai hoặc Postgres không kết nối được. Log gần nhất:' ; \
+      pm2 logs mc-dispatcher --lines 100 --nostream ; \
+      exit 1 ; \
+    fi ; \
     pm2 jlist | python3 -c \"import sys,json;m=[p for p in json.load(sys.stdin) if p['name']=='mc-dispatcher'];print('mc-dispatcher', m[0]['pm2_env']['status'] if m else 'MISSING')\"" \
-    || warn "mc-dispatcher không start được — xem 'pm2 logs mc-dispatcher'"
+    || warn "mc-dispatcher không start được hoặc không kết nối được database — xem 'pm2 logs mc-dispatcher'"
 else
   log "RUNPOD_ENDPOINT_ID/RUNPOD_API_KEY chưa đặt trong .env → bỏ qua dispatcher (worker local vẫn chạy)"
 fi
