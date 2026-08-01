@@ -62,8 +62,11 @@ remote() { ssh "${SSH_OPTS[@]}" "root@$HOST" "$1"; }
 
 log "syncing motions-studio/ → root@$HOST:$PORT:~/$REMOTE_DIR (code only — models download later, in-app)"
 remote "mkdir -p ~/$REMOTE_DIR"
+# --exclude='venv' (bên cạnh '.venv'): worker/runpod/venv (~27MB, dùng để chạy test_mc_handler.py cục
+# bộ) không phải tên ẩn — thiếu exclude này thì mỗi `make gpu-bootstrap` lại đẩy nó lên pod dù pod tự
+# tạo venv riêng của nó (setup-motion-transfer.sh), tốn băng thông/ thời gian rsync vô ích mỗi lần.
 rsync -az --delete \
-  --exclude='.git' --exclude='node_modules' --exclude='.venv' --exclude='__pycache__' \
+  --exclude='.git' --exclude='node_modules' --exclude='.venv' --exclude='venv' --exclude='__pycache__' \
   --exclude='.env' --exclude='.env.*' --exclude='.data' --exclude='data' --exclude='*.mp4' \
   --exclude='ltx-ss-prebuilt/*.safetensors' \
   -e "ssh ${SSH_OPTS[*]}" \

@@ -48,7 +48,11 @@ jobs:
           # repository_owner, không gõ cứng: ai fork cũng build vào registry của mình.
           images: ghcr.io/${{ github.repository_owner }}/motion-serverless
           tags: |
-            type=raw,value=latest
+            # enable= guard: build đầu tiên gần như chắc chắn chạy bằng workflow_dispatch trên một
+            # nhánh (vd serverless-huong-a), không phải push vào main. Không có guard này thì lần
+            # chạy thử ĐÓ ghi đè tag `latest` — đúng cái endpoint RunPod pull — bằng image dựng từ
+            # code chưa merge, còn chưa chắc đã chạy được.
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
             type=sha,prefix=sha-
 
       - uses: docker/build-push-action@v6

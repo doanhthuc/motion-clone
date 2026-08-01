@@ -1,0 +1,14 @@
+# motions-studio/.dockerignore
+# `docker build` cho worker/runpod/Dockerfile.selfhosted (và Dockerfile Task Cloud cạnh nó) dùng
+# CONTEXT = motions-studio/ (xem .github/workflows/build-serverless-image.yml: context: motions-studio).
+# Không có file này, `COPY worker /app/worker` kéo theo bất cứ thứ gì nằm trong worker/ trên máy build,
+# kể cả venv cục bộ (worker/runpod/venv, ~27MB, dùng để chạy test_mc_handler.py) và node_modules/
+# __pycache__ nếu ai từng chạy thứ gì đó tại chỗ — phình image, đôi khi kéo theo binary sai kiến trúc
+# (venv build trên máy dev khác CPU/OS với base image CUDA của Dockerfile).
+venv
+.venv
+node_modules
+__pycache__
+*.pyc
+.env
+.env.*

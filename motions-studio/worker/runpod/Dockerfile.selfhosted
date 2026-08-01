@@ -31,7 +31,34 @@ RUN set -eux; \
       git clone --filter=blob:none "$url" "$d"; \
       git -C "$d" checkout "$sha"; \
     done
-RUN for d in */ ; do [ -f "$d/requirements.txt" ] && pip install --no-cache-dir -r "$d/requirements.txt" || true ; done
+# KHÔNG `|| true` ở đây nữa: lỗi pip PHẢI làm vỡ build — image thiếu deps mà build vẫn xanh còn tệ hơn
+# một build đỏ (đã dính đúng 2 node dưới đây, verify qua GitHub API commit đúng ghim ở trên 01/08/2026):
+#
+#   - ComfyUI-FlashVSR_Stable (f7f55ba): requirements.txt có dòng
+#       flash-attn --no-build-isolation; platform_system!="Windows"
+#     `--no-build-isolation` là option của lệnh `pip install`, không phải cú pháp hợp lệ TRONG một dòng
+#     requirements.txt → pip parse lỗi cả file trước khi cài bất cứ gì, nên TOÀN BỘ deps của node này
+#     (einops, safetensors, opencv-python, pyyaml, psutil, huggingface_hub, sageattention, triton...)
+#     bị bỏ sót, không một dòng log lỗi nào lộ ra nếu còn `|| true`. Bỏ qua thẳng file requirements.txt
+#     của riêng node này, cài đúng danh sách runtime tường minh bên dưới (KHÔNG cần flash-attn/triton —
+#     node fallback được, xem setup/lib-feature.sh:594-606, cùng cách upstream xử lý).
+#   - ComfyUI-Frame-Interpolation (26545cc): KHÔNG có requirements.txt (chỉ có requirements-no-cupy.txt
+#     và requirements-with-cupy.txt) → vòng lặp cũ tìm "requirements.txt" luôn bỏ qua ÂM THẦM, node
+#     RIFE VFI (dùng bởi job type "enhance") thiếu deps. Cài bản no-cupy — RIFE không cần cupy.
+RUN set -eux; \
+    for d in */ ; do \
+      d="${d%/}"; \
+      [ "$d" = "ComfyUI-FlashVSR_Stable" ] && continue; \
+      if [ -f "$d/requirements.txt" ]; then pip install --no-cache-dir -r "$d/requirements.txt"; fi; \
+      if [ -f "$d/requirements-no-cupy.txt" ]; then pip install --no-cache-dir -r "$d/requirements-no-cupy.txt"; fi; \
+    done
+# Danh sách runtime tường minh của FlashVSR (bỏ qua requirements.txt hỏng của chính nó ở trên).
+RUN pip install --no-cache-dir \
+      einops safetensors tqdm pillow huggingface_hub psutil "opencv-python>=4.8.1.78" pyyaml
+# SageAttention = đường attention chính cho Wan (đồng bộ Dockerfile Task Cloud dòng ~36-39);
+# assert ngay lúc build để torch/CUDA gãy lộ ra ở CI, không phải lúc container đã chạy job đầu tiên.
+RUN pip install --no-cache-dir sageattention \
+ && python -c "import torch, sageattention; assert torch.__version__.split('+')[0]=='2.12.1', torch.__version__"
 
 # Weight DWPose 337MB. Đo trên pod thật: chúng nằm TRONG thư mục node, không nằm trong models/,
 # nên KHÔNG có trên Network Volume. Không bake thì mỗi cold start tải lại 337MB.
@@ -44,6 +71,26 @@ RUN mkdir -p /app/ComfyUI/custom_nodes/comfyui_controlnet_aux/ckpts/hr16/yolox-o
 
 COPY worker /app/worker
 RUN pip install --no-cache-dir -r /app/worker/requirements.txt runpod
+
+# worker_runtime/linux.py:4025 mặc định MOTION_FRESH_COMFY=1, và linux.py:9780 mặc định
+# COMFY_RECYCLE_GB=22 (>0). CẢ HAI đường đều gọi comfy_recycle() (linux.py:1075), hàm
+# `pkill -9 -f "main.py.*8188"` rồi comfy_wait_ready() — docstring của nó ghi rõ nó CHỜ PM2
+# AUTORESTART dựng lại ComfyUI. Container serverless này khởi ComfyUI bằng
+# `python main.py &` thẳng trong entrypoint-selfhosted.sh, KHÔNG có PM2 nào theo dõi tiến
+# trình đó — job đầu tiên đủ lớn (RSS ComfyUI ≥ 22GB, chuyện thường với Wan) sẽ giết ComfyUI
+# vĩnh viễn và mọi job sau đó trên container ấm này fail liên tục cho tới khi RunPod tự huỷ
+# container. Tắt cả hai đường bằng cách đặt mặc định 0 ngay trong image (đồng bộ cách
+# Dockerfile Task Cloud cạnh nó đã làm với MOTION_FRESH_COMFY, dòng ~54).
+#
+# JOB_TYPES: linux.py:64-66 mặc định 19 type (tryon, talk, subtitle, voiceover, story-film...).
+# Image serverless này KHÔNG bake pipeline cho phần lớn trong số đó (không đủ custom node/model
+# trên Network Volume) — quên set JOB_TYPES lúc tạo RunPod Endpoint thì container vẫn claim được
+# job ngoài khả năng của nó rồi set 'error' (mc_handler.py: PIPELINES.get(job_type) → None →
+# api_patch error). Fail-safe phải nằm trong IMAGE, không chỉ trong một bảng hướng dẫn tạo
+# endpoint — endpoint vẫn override được bằng ENV riêng nếu cần mở rộng type.
+ENV MOTION_FRESH_COMFY=0 \
+    COMFY_RECYCLE_GB=0 \
+    JOB_TYPES=motion,teen-flycam,trend-tiktok,enhance
 
 ENV PYTHONPATH=/app/worker PYTHONUNBUFFERED=1
 COPY worker/runpod/entrypoint-selfhosted.sh /entrypoint.sh
