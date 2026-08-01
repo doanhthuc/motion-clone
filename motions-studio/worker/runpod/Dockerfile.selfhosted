@@ -1,0 +1,51 @@
+# motions-studio/worker/runpod/Dockerfile.selfhosted
+# Image RunPod Serverless cho stack TỰ CHỦ (khác Dockerfile cạnh nó, vốn cho Task Cloud).
+# Build từ thư mục motions-studio/:
+#   docker build -f worker/runpod/Dockerfile.selfhosted -t ghcr.io/<owner>/motion-serverless:latest .
+# Model KHÔNG bake — nằm trên Network Volume mount vào /app/ComfyUI/models.
+FROM pytorch/pytorch:2.12.1-cuda13.0-cudnn9-runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git wget aria2 ffmpeg libgl1 libglib2.0-0 ca-certificates build-essential pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git
+WORKDIR /app/ComfyUI
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Ghim commit ĐÚNG bản đã chạy được trên pod 01/08/2026. `--depth 1` không checkout commit cụ thể
+# được nên clone rồi fetch từng cái. Không ghim thì image trôi theo upstream và một ngày nào đó
+# ComfyUI trả 400 "node type not found" mà không ai đổi gì.
+WORKDIR /app/ComfyUI/custom_nodes
+RUN set -eux; \
+    for spec in \
+      "https://github.com/kijai/ComfyUI-WanVideoWrapper.git 088128b" \
+      "https://github.com/kijai/ComfyUI-KJNodes.git 4d46ac1" \
+      "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git 4ee72c0" \
+      "https://github.com/Fannovel16/comfyui_controlnet_aux.git e8b689a" \
+      "https://github.com/Fannovel16/ComfyUI-Frame-Interpolation.git 26545cc" \
+      "https://github.com/naxci1/ComfyUI-FlashVSR_Stable.git f7f55ba" \
+    ; do \
+      url="${spec% *}"; sha="${spec#* }"; d="$(basename "$url" .git)"; \
+      git clone --filter=blob:none "$url" "$d"; \
+      git -C "$d" checkout "$sha"; \
+    done
+RUN for d in */ ; do [ -f "$d/requirements.txt" ] && pip install --no-cache-dir -r "$d/requirements.txt" || true ; done
+
+# Weight DWPose 337MB. Đo trên pod thật: chúng nằm TRONG thư mục node, không nằm trong models/,
+# nên KHÔNG có trên Network Volume. Không bake thì mỗi cold start tải lại 337MB.
+RUN mkdir -p /app/ComfyUI/custom_nodes/comfyui_controlnet_aux/ckpts/hr16/yolox-onnx \
+             /app/ComfyUI/custom_nodes/comfyui_controlnet_aux/ckpts/hr16/DWPose-TorchScript-BatchSize5 \
+ && wget -q -O /app/ComfyUI/custom_nodes/comfyui_controlnet_aux/ckpts/hr16/yolox-onnx/yolox_l.torchscript.pt \
+      https://huggingface.co/hr16/yolox-onnx/resolve/main/yolox_l.torchscript.pt \
+ && wget -q -O /app/ComfyUI/custom_nodes/comfyui_controlnet_aux/ckpts/hr16/DWPose-TorchScript-BatchSize5/dw-ll_ucoco_384_bs5.torchscript.pt \
+      https://huggingface.co/hr16/DWPose-TorchScript-BatchSize5/resolve/main/dw-ll_ucoco_384_bs5.torchscript.pt
+
+COPY worker /app/worker
+RUN pip install --no-cache-dir -r /app/worker/requirements.txt runpod
+
+ENV PYTHONPATH=/app/worker PYTHONUNBUFFERED=1
+COPY worker/runpod/entrypoint-selfhosted.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+CMD ["/entrypoint.sh"]
