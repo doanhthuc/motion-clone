@@ -33,6 +33,14 @@ const JOB_TYPES = (process.env.DISPATCH_JOB_TYPES || DEFAULT_JOB_TYPES)
 // một job queued duy nhất kéo cả `max workers` lên chỉ vì dispatcher tưởng chưa ai lo cho nó.
 const COOLDOWN_MS = Math.max(1000, Number(process.env.DISPATCH_COOLDOWN_SEC || 180) * 1000)
 
+// Sàn cứng cho ngưỡng reclaim. Số đo 02/08/2026 trên chính worker đang giữ job: khoảng IM LẶNG
+// heartbeat dài nhất là 79 giây — heartbeat nhịp 15s trong vòng chờ ComfyUI, nhưng các pha tải
+// input, nạp model và upload output thì không nhịp gì cả. Job dài hơn (1080p, nhiều frame) upload
+// lâu hơn nên im lặng còn dài hơn. Ai đặt 60 giây "cho nhạy" sẽ GIẾT job đang chạy thật, và mất
+// luôn tiền GPU đã trả cho nó. Sàn này tồn tại để cấu hình sai không phá được dữ liệu.
+const MIN_ORPHAN_SEC = 300
+const DEFAULT_ORPHAN_SEC = 900
+
 const log = (...a) => console.log("[mc-dispatcher]", ...a)
 
 // Mốc thời gian (ms) của các lần /run đã bắn mà cold start có thể CHƯA xong. Đây là bộ nhớ TRONG
@@ -73,6 +81,56 @@ export function decideDispatch({ queued, inflight, maxInflight }) {
   return Math.min(need, room)
 }
 
+/** Ngưỡng (giây) coi một job `running` là mồ côi. Hàm thuần để test được cấu hình rác.
+ *
+ * `0` = TẮT hẳn, có chủ ý. Giá trị dương dưới `MIN_ORPHAN_SEC` bị kéo lên sàn thay vì tôn trọng —
+ * xem lý do ở chỗ khai báo sàn. Giá trị không phải số hoặc âm là cấu hình lỗi: về mặc định, KHÔNG
+ * tắt tính năng, vì tắt âm thầm thì người dùng chỉ thấy thanh tiến trình treo mà không hiểu vì sao. */
+export function orphanThresholdSec(raw) {
+  if (raw === undefined || raw === null || String(raw).trim() === "") return DEFAULT_ORPHAN_SEC
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n < 0) return DEFAULT_ORPHAN_SEC
+  if (n === 0) return 0
+  return Math.max(MIN_ORPHAN_SEC, Math.round(n))
+}
+
+const ORPHAN_SEC = orphanThresholdSec(process.env.DISPATCH_ORPHAN_SEC)
+
+/** Chuyển job `running` mồ côi của worker serverless sang `error`.
+ *
+ * Vì sao cần: `api/src/routes/jobs.js:219` reclaim job theo `worker_id` — nó chỉ chạy khi CHÍNH
+ * worker đó gọi `/worker/claim` lần nữa. Mỗi container serverless lại có `WORKER_ID` riêng
+ * (`serverless-<pod-id>`), nên nếu container chết giữa job thì không container nào mang đúng id đó
+ * để kích hoạt reclaim → job nằm `running` vĩnh viễn, người dùng nhìn một thanh tiến trình không
+ * bao giờ dừng. Đây là đường reclaim theo THỜI GIAN, không theo worker.
+ *
+ * Hai điều kiện phải cùng đúng, không phải một:
+ *   - `jobs.updated_at` cũ hơn ngưỡng — trigger `set_updated_at` chạm cột này mỗi lần PATCH tiến độ
+ *   - và bảng `workers` không có nhịp heartbeat nào mới hơn ngưỡng cho đúng worker đó
+ * Chỉ xét một trong hai là bắn oan: có pha job chạy mà không PATCH tiến độ (nạp model), và có pha
+ * heartbeat im (upload output). Cả hai cùng im mới là container đã chết thật.
+ *
+ * `worker_id LIKE 'serverless-%'` KHÔNG phải trang trí: nó ngăn dispatcher đụng vào job của worker
+ * local hay wf-worker — những tiến trình nó không điều khiển và đã có cơ chế reclaim riêng. */
+async function reclaimOrphans() {
+  if (!ORPHAN_SEC) return
+  const { rows } = await query(
+    `UPDATE jobs SET status='error',
+            error = 'Worker serverless mất tích — không có heartbeat nào trong ' || $1 || ' giây. Hãy chạy lại.',
+            finished_at = now()
+      WHERE status='running'
+        AND worker_id LIKE 'serverless-%'
+        AND updated_at < now() - ($1 || ' seconds')::interval
+        AND NOT EXISTS (
+              SELECT 1 FROM workers w
+               WHERE w.worker_id = jobs.worker_id
+                 AND w.last_seen_at > now() - ($1 || ' seconds')::interval)
+      RETURNING id, worker_id`,
+    [String(ORPHAN_SEC)],
+  )
+  for (const r of rows) log(`job mồ côi ${r.id} của ${r.worker_id} → error (im lặng > ${ORPHAN_SEC}s)`)
+}
+
 async function queuedRows() {
   const { rows } = await query(`SELECT id, type FROM jobs WHERE status='queued'`)
   return rows
@@ -96,6 +154,7 @@ async function fireOne() {
 }
 
 async function tick() {
+  await reclaimOrphans()
   const rows = await queuedRows()
   const dispatchable = filterQueuedTypes(rows, JOB_TYPES)
 
@@ -131,7 +190,8 @@ async function main() {
   }
   log(
     `bắt đầu · endpoint=${ENDPOINT} · poll=${POLL_MS}ms · maxInflight=${MAX_INFLIGHT} · ` +
-      `cooldown=${COOLDOWN_MS}ms · jobTypes=${JOB_TYPES.join(",")}`,
+      `cooldown=${COOLDOWN_MS}ms · jobTypes=${JOB_TYPES.join(",")} · ` +
+      `reclaimMồCôi=${ORPHAN_SEC ? ORPHAN_SEC + "s" : "TẮT"}`,
   )
   for (;;) {
     try {

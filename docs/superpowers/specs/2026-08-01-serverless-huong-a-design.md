@@ -3,8 +3,7 @@
 Ngày: 2026-08-01 · cập nhật 2026-08-02
 Trạng thái: **ĐÃ CHẠY THẬT 02/08/2026.** 5 job motion qua endpoint serverless, không job nào lỗi —
 xem [§Đã chạy thật](#da-chay-that) để có toàn bộ số đo, và
-[§Việc phải làm trước khi bật thật](#todo-truoc-task5) cho mục duy nhất còn treo (ngưỡng reclaim
-job mồ côi). Ba giả định ban đầu đo trên pod 01/08/2026 ở [§Đo thật](#measured).
+[§Việc phải làm trước khi bật thật](#todo-truoc-task5) — mọi mục ở đó nay đã đóng. Ba giả định ban đầu đo trên pod 01/08/2026 ở [§Đo thật](#measured).
 
 ## Vấn đề
 
@@ -409,7 +408,8 @@ nhặt lại" và mô tả đó là hành vi sẵn có. Đọc code thì không 
 Hệ quả cho serverless: mỗi container có `WORKER_ID` riêng (`serverless-<pod-id>`) nên nếu container
 chết giữa job, không container nào khác mang đúng id đó để kích hoạt reclaim → job nằm `running`
 vĩnh viễn, người dùng nhìn thấy một thanh tiến trình không bao giờ dừng. Đây là lỗ hổng có thật,
-theo dõi ở [§Việc phải làm trước khi bật thật](#todo-truoc-task5).
+đã xử lý bằng `reclaimOrphans()` trong `mc-dispatcher.js` — xem
+[§Việc phải làm trước khi bật thật](#todo-truoc-task5) mục 1.
 
 ## Kiểm chứng
 
@@ -473,31 +473,29 @@ Code handler, image, CI và dispatcher đã xong và đã review. Những mục 
 mà chưa đóng được, hoặc chỉ đóng được khi có endpoint thật. Không mục nào tự lộ ra trong bài kiểm
 "chạy một job thành công" — đó chính là lý do chúng nằm đây thay vì chờ phát hiện lúc chạy thật.
 
-1. **Job mồ côi nằm `running` vĩnh viễn — CẦN NGƯỜI QUYẾT, chưa code.** Xem ghi chú ở
-   [§Xử lý lỗi](#xu-ly-loi). Cơ chế reclaim sẵn có bám vào `worker_id`, mà mỗi container serverless
-   lại có id riêng, nên nó không bao giờ kích hoạt.
+1. ~~**Job mồ côi nằm `running` vĩnh viễn.**~~ **XONG 02/08/2026** — `reclaimOrphans()` trong
+   `mc-dispatcher.js`, chạy mỗi vòng poll. Ngưỡng `DISPATCH_ORPHAN_SEC`, **mặc định 900 giây**, sàn
+   cứng 300 giây (đặt thấp hơn bị kéo lên; `0` = tắt hẳn).
 
-   Vật liệu để sửa đã có sẵn, không cần đổi schema: bảng `workers` giữ `last_seen_at`, worker nhịp
-   `POST /worker/heartbeat` mỗi 15 giây (`linux.py:1177`), và `jobs.updated_at` tự tăng theo trigger
-   mỗi lần PATCH tiến độ. Container chết thì cả hai mốc cùng đứng yên:
+   Nền tảng: cơ chế reclaim sẵn có (`routes/jobs.js:219`) bám vào `worker_id` và chỉ chạy khi CHÍNH
+   worker đó claim lần nữa — mỗi container serverless có id riêng nên nó không bao giờ kích hoạt.
+   Đường mới reclaim theo THỜI GIAN. Đặt trong file mới, không sửa `routes/jobs.js`, vì
+   `scripts/sync-upstream.sh` ghi đè file upstream.
 
-   ```sql
-   UPDATE jobs SET status='error', error='Worker serverless mất tích', finished_at=now()
-    WHERE status='running' AND worker_id LIKE 'serverless-%'
-      AND updated_at < now() - ($1 || ' seconds')::interval
-      AND NOT EXISTS (SELECT 1 FROM workers w
-                       WHERE w.worker_id = jobs.worker_id
-                         AND w.last_seen_at > now() - ($1 || ' seconds')::interval)
-   ```
+   **Hai tín hiệu phải cùng im, không phải một:** `jobs.updated_at` (trigger `set_updated_at` chạm
+   mỗi lần PATCH tiến độ) VÀ `workers.last_seen_at` (heartbeat 15 giây, `linux.py:1177`). Chỉ xét
+   một là bắn oan — có pha job chạy mà không PATCH (nạp model), có pha heartbeat im (upload output).
+   Lọc `worker_id LIKE 'serverless-%'` để không đụng job của worker local/wf-worker.
 
-   Đặt trong `mc-dispatcher.js`, đừng sửa `routes/jobs.js` — `scripts/sync-upstream.sh` ghi đè file
-   upstream, file mới thì sống sót. Lọc `serverless-%` để không đụng job của worker local/wf-worker.
+   **Ngưỡng chọn từ số đo:** im lặng dài nhất TRONG lúc job chạy là **79 giây** (đo trên chính
+   worker đang giữ job, lấy mẫu mỗi 3 giây). 900 giây là hơn 11 lần mức đó. Sàn 300 giây tồn tại vì
+   đặt hụt là GIẾT một job đã trả tiền GPU, còn job treo thì không tốn thêm đồng nào — sai về phía
+   dài mới là an toàn.
 
-   **Ngưỡng — đã có số đo (02/08/2026):** im lặng dài nhất trong lúc job chạy là **79 giây**, đo
-   trên chính worker đang giữ job. Job dài hơn (1080p, nhiều frame) sẽ upload lâu hơn nên pha im
-   lặng dài hơn; đừng lấy 79s làm ngưỡng. **Đề xuất 900 giây** — hơn 11 lần số đo, mà vẫn cắt được
-   thanh tiến trình treo vĩnh viễn. Vẫn để người chốt: đặt hụt là GIẾT một job đã trả tiền GPU, và
-   job treo thì KHÔNG tốn thêm tiền (dispatcher chỉ đếm `queued`), nên sai về phía dài là đúng.
+   Câu `UPDATE` đã kiểm trên Postgres 18 thật với schema thật (`01_schema.sql` + `02_motion_features.sql`)
+   và 6 ca: worker im cả hai tín hiệu → `error`; worker còn heartbeat → **không đụng**; worker vừa
+   PATCH tiến độ → **không đụng**; job của `worker-1` local → **không đụng**; job `queued` và job
+   `done` → **không đụng**. Đúng 1/6 dòng bị đổi.
 
 2. ~~**Một nguồn worker tại một thời điểm.**~~ **XONG** — `pod-bootstrap.sh` nay `pm2 stop worker`
    khi bật dispatcher (`KEEP_LOCAL_WORKER=1` để cố tình chạy song song).

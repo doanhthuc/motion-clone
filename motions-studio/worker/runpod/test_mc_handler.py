@@ -36,7 +36,9 @@ def stub(monkeypatch):
 def test_khong_co_job_thi_thoat_ngay(stub):
     stub["next_job"] = None
     import mc_handler
-    assert mc_handler.handler({}) == {"ok": True, "claimed": False}
+    # Bốn khoá ở MỌI nhánh — nhánh này cũng phải có `job`/`error`, nếu không code gọi out["job"]
+    # dính KeyError đúng ở ca thường gặp nhất (hai worker cùng tỉnh, một job).
+    assert mc_handler.handler({}) == {"ok": True, "claimed": False, "job": None, "error": None}
     assert stub["ran"] == []
 
 
@@ -44,7 +46,7 @@ def test_co_job_thi_chay_dung_pipeline(stub):
     stub["next_job"] = {"id": "j1", "type": "motion"}
     import mc_handler
     out = mc_handler.handler({})
-    assert out["ok"] is True and out["job"] == "j1"
+    assert out == {"ok": True, "claimed": True, "job": "j1", "error": None}
     assert stub["ran"] == ["j1"]
 
 
@@ -52,7 +54,10 @@ def test_job_type_la_khong_ho_tro_thi_bao_error_chu_khong_treo(stub):
     stub["next_job"] = {"id": "j2", "type": "khong-ton-tai"}
     import mc_handler
     out = mc_handler.handler({})
-    assert out["ok"] is False
+    # Assert cả GIÁ TRỊ TRẢ VỀ, không chỉ lời gọi api_patch: handler báo lỗi cho RunPod qua giá
+    # trị này, nên bỏ nó khỏi test là bỏ đúng nửa hợp đồng.
+    assert out == {"ok": False, "claimed": True, "job": "j2",
+                   "error": "worker khong ho tro type 'khong-ton-tai'"}
     assert stub["patch"] == [("j2", {"status": "error",
                                      "error": "worker khong ho tro type 'khong-ton-tai'"})]
 

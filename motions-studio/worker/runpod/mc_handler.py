@@ -36,7 +36,10 @@ def handler(event):
     # đứa thứ hai nhận None rồi thoát — mất vài xu, không mất tính đúng đắn (spec §Quyết định 2).
     job = api_claim([])
     if not job:
-        return {"ok": True, "claimed": False}
+        # Bốn khoá ở MỌI nhánh, kể cả nhánh không có gì để làm. runpod.serverless.start không quan
+        # tâm, nhưng người đọc `output` trong dashboard hoặc code gọi out["job"] thay vì out.get()
+        # thì có: một nhánh trả 2 khoá, một nhánh trả 4 là cái bẫy KeyError không cần thiết.
+        return {"ok": True, "claimed": False, "job": None, "error": None}
 
     job_id = job.get("id")
     job_type = job.get("type")
@@ -48,7 +51,7 @@ def handler(event):
 
     try:
         fn(job)
-        return {"ok": True, "claimed": True, "job": job_id}
+        return {"ok": True, "claimed": True, "job": job_id, "error": None}
     except Exception as e:
         traceback.print_exc()
         api_patch(job_id, status="error", error=str(e))

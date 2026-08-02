@@ -1,7 +1,33 @@
 // motions-studio/api/src/test-mc-dispatcher.mjs
 // Chạy: node motions-studio/api/src/test-mc-dispatcher.mjs
 import assert from "node:assert/strict"
-import { decideDispatch, pruneExpired, filterQueuedTypes, isMainModule } from "./mc-dispatcher.js"
+import { decideDispatch, pruneExpired, filterQueuedTypes, isMainModule, orphanThresholdSec } from "./mc-dispatcher.js"
+
+// ── orphanThresholdSec (đặt hụt là GIẾT job đang chạy thật) ───────────────────
+
+// Không đặt gì → mặc định 900s: hơn 11 lần khoảng im lặng 79s đo được 02/08/2026.
+assert.equal(orphanThresholdSec(undefined), 900)
+assert.equal(orphanThresholdSec(""), 900)
+assert.equal(orphanThresholdSec(null), 900)
+
+// 0 = tắt hẳn, có chủ ý — phải tôn trọng, không kéo lên sàn.
+assert.equal(orphanThresholdSec(0), 0)
+assert.equal(orphanThresholdSec("0"), 0)
+
+// Dương nhưng dưới sàn 300s → kéo lên sàn. 60s "cho nhạy" sẽ giết job đang upload output.
+assert.equal(orphanThresholdSec(60), 300)
+assert.equal(orphanThresholdSec(299), 300)
+assert.equal(orphanThresholdSec(300), 300)
+
+// Trên sàn → tôn trọng đúng giá trị.
+assert.equal(orphanThresholdSec(1800), 1800)
+assert.equal(orphanThresholdSec("1200"), 1200)
+
+// Cấu hình rác → về MẶC ĐỊNH, KHÔNG tắt. Tắt âm thầm thì người dùng chỉ thấy tiến trình treo mà
+// không biết vì sao — cùng loại thất bại mà tính năng này sinh ra để chặn.
+assert.equal(orphanThresholdSec("abc"), 900)
+assert.equal(orphanThresholdSec(-1), 900)
+assert.equal(orphanThresholdSec(NaN), 900)
 
 // ── isMainModule (pm2 fork mode giấu đường dẫn script khỏi argv[1]) ───────────
 
