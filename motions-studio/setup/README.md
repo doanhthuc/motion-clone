@@ -12,6 +12,13 @@ Các trình cài đặt. **Chạy từ thư mục gốc repo** (script tự `cd`
 | `./setup/setup.sh` | **Docker** (Linux) | Linux + NVIDIA chạy cả stack bằng Docker Compose | Caddy (kèm domain) |
 | `./setup/fullstack-setup.sh` | **IP fullstack** (BE+FE) | Không có domain → chạy BE + FE qua `http://<IP>:port`. Gọi lại `setup-pm2.sh` (`SKIP_HTTPS=1`) | ❌ HTTP qua IP |
 
+Không phải trình cài đặt, nhưng chạy cùng chỗ:
+
+| Lệnh | Làm gì |
+|---|---|
+| `./setup/preload-models.sh` | Tải model thẳng vào Network Volume, **không cần GPU**. Chạy trên pod CPU $0.06/giờ thay vì để pod GPU $1.014/giờ ngồi chờ. Dùng chung `comfyui/catalog.json` với app nên Settings → Models AI sẽ thấy "đã cài". Xem `docs/gpu-pod.md#preload`. |
+| `./setup/pod-volume.sh` | Nối `models`/`PGDATA`/`MinIO` sang volume (idempotent; `--check` để nghiệm thu, `--adopt` để dời dữ liệu có sẵn lên volume). |
+
 ## Chọn profile: box CHUYÊN hay box ĐẦY ĐỦ
 
 Bốn script trên dùng chung thư viện **`lib-feature.sh`** (tham số hoá: `COMFY_NODES`, `JOB_TYPE`,

@@ -57,6 +57,21 @@ runpodctl network-volume create --name motion --size 100 --data-center-id <DC>
 Volume tính tiền **hàng tháng kể cả khi không có pod nào** — `make gpu-destroy` không tắt được
 đồng hồ đó, và không nên tắt: đó chính là thứ giữ 33GB model và database.
 
+**0.4 · Đổ model vào volume bằng pod CPU** — [chi tiết](#preload)
+
+Bước này **tuỳ chọn nhưng nên làm**, và cũng chỉ một lần cho mỗi volume. Tải model không cần GPU;
+làm nó trên pod CPU $0.06/giờ thay vì pod GPU $1.014/giờ, và pod GPU sau đó dựng lên là có model
+sẵn thay vì bạn ngồi chờ tải. Đo thật 02/08/2026: 38,9 GB trong 9 phút, tốn $0.08.
+
+```bash
+runpodctl pod create --name preload --compute-type CPU \
+  --image runpod/base:1.0.2-ubuntu2204 --data-center-ids <DC> \
+  --network-volume-id <vol-id> --container-disk-in-gb 20 --ssh
+# rồi trên pod: ./setup/preload-models.sh --list  →  chọn nhóm  →  tải  →  runpodctl pod delete
+```
+
+Bỏ qua bước này cũng được — bước 7 dưới đây tải qua UI, chỉ là đắt hơn và phải chờ.
+
 ---
 
 ### Giai đoạn 1 — dựng pod mới
@@ -88,6 +103,10 @@ Bước 5 làm, theo đúng thứ tự này (thứ tự có lý do — xem `scri
 
 `https://$FE_DOMAIN` → login bằng `SUPER_ADMIN` (bấm gửi OTP) → **Settings → Models AI** → nhóm
 **Wan 2.2 Animate** → **Cài cả nhóm** (~33GB).
+
+> **Bỏ qua được bước này** nếu đã làm [0.4 · đổ model bằng pod CPU](#preload) — Models AI sẽ hiện
+> "đã cài" sẵn. Làm ở đây nghĩa là pod GPU $1.014/giờ nằm chờ suốt lúc tải; ở 0.4 là $0.06/giờ.
+> Với `SETUP_PROFILE=full` thì catalog mở hết 245GB, càng không nên tải trên đồng hồ GPU.
 
 **8 · Kiểm chứng thật** — [`make gpu-smoke`](#smoke). Đừng tin
 màu xanh, chạy một job thật.
