@@ -2,7 +2,9 @@
 # Image RunPod Serverless cho stack TỰ CHỦ (khác Dockerfile cạnh nó, vốn cho Task Cloud).
 # Build từ thư mục motions-studio/:
 #   docker build -f worker/runpod/Dockerfile.selfhosted -t ghcr.io/<owner>/motion-serverless:latest .
-# Model KHÔNG bake — nằm trên Network Volume mount vào /app/ComfyUI/models.
+# Model KHÔNG bake — nằm trên Network Volume, RunPod mount CỐ ĐỊNH ở /runpod-volume (không đổi được
+# đường dẫn như template Pod); entrypoint-selfhosted.sh nối /runpod-volume/comfy-models sang
+# /app/ComfyUI/models lúc khởi động.
 FROM pytorch/pytorch:2.12.1-cuda13.0-cudnn9-runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
