@@ -637,7 +637,7 @@ Rồi tạo qua dashboard (runpod.io/console/serverless → New Endpoint) với 
 | Container Image | `ghcr.io/<owner>/motion-serverless:latest` |
 | GPU | RTX 5090 |
 | Datacenter | **EU-RO-1** — phải trùng volume `wfe86wzkpm` |
-| Network Volume | `motion`, mount `/app/ComfyUI/models` |
+| Network Volume | `motion` — mount path KHÔNG chỉnh được, RunPod luôn gắn ở `/runpod-volume` (sửa 02/08/2026: bảng này trước ghi `/app/ComfyUI/models`; template Serverless không có ô "Volume Mount Path" như template Pod. `entrypoint-selfhosted.sh` tự nối `/runpod-volume/comfy-models` → `/app/ComfyUI/models`) |
 | Container Disk | 30 GB |
 | Min / Max Workers | 0 / 3 |
 | Idle Timeout | 120 s |
@@ -759,4 +759,9 @@ nhiều endpoint tách theo job type · concurrency > 1 trong một worker · pr
 >100MB (đã đo 17.7MB, xem spec §Quyết định 3) · dời api/Postgres/MinIO sang VPS (bước riêng, sau
 khi serverless chứng minh chạy được).
 
-Job lỗi cứ trả về `queued` và worker local nhặt — hành vi sẵn có, không phải code mới.
+Job lỗi dừng ở `error` và người dùng bấm chạy lại — hành vi sẵn có, không phải code mới.
+
+> **Sửa 02/08/2026:** dòng trên trước đây ghi "job lỗi trả về `queued` và worker local nhặt". Sai:
+> `mc_handler.py` patch `status="error"`, và `routes/jobs.js:246` đặt `finished_at` cho `error` —
+> trạng thái cuối, không có đường quay về `queued`. Kéo theo một lỗ hổng thật (job mồ côi nằm
+> `running` vĩnh viễn) đã ghi ở §Việc phải làm trước khi bật thật trong spec.

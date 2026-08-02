@@ -62,8 +62,11 @@ remote() { ssh "${SSH_OPTS[@]}" "root@$HOST" "$1"; }
 
 log "syncing motions-studio/ → root@$HOST:$PORT:~/$REMOTE_DIR (code only — models download later, in-app)"
 remote "mkdir -p ~/$REMOTE_DIR"
+# --exclude='venv' (bên cạnh '.venv'): worker/runpod/venv (~27MB, dùng để chạy test_mc_handler.py cục
+# bộ) không phải tên ẩn — thiếu exclude này thì mỗi `make gpu-bootstrap` lại đẩy nó lên pod dù pod tự
+# tạo venv riêng của nó (setup-motion-transfer.sh), tốn băng thông/ thời gian rsync vô ích mỗi lần.
 rsync -az --delete \
-  --exclude='.git' --exclude='node_modules' --exclude='.venv' --exclude='__pycache__' \
+  --exclude='.git' --exclude='node_modules' --exclude='.venv' --exclude='venv' --exclude='__pycache__' \
   --exclude='.env' --exclude='.env.*' --exclude='.data' --exclude='data' --exclude='*.mp4' \
   --exclude='ltx-ss-prebuilt/*.safetensors' \
   -e "ssh ${SSH_OPTS[*]}" \
@@ -160,6 +163,54 @@ if [ -n "$POD_VOLUME" ]; then
       pm2 describe minio | grep 'script args' ; exit 1 ; \
     fi" \
     || warn "MinIO is not using the volume — objects will be lost on gpu-destroy. Check 'pm2 logs minio'"
+fi
+
+# ── Dispatcher serverless (tuỳ chọn) ──────────────────────────────────────────
+# Đăng ký bằng `pm2 start <script>` chứ không thêm vào ecosystem.config.cjs: file đó là upstream,
+# sửa vào là mất sau make sync-upstream.
+#
+# DATABASE_URL: ecosystem.config.cjs:9 ghi rõ api/wf-worker chỉ đọc process.env (không dotenv), và
+# ecosystem.config.cjs:62 tự DẪN XUẤT DATABASE_URL từ POSTGRES_USER/PASSWORD/PORT/DB trong .env —
+# biến này KHÔNG có sẵn trong .env, chỉ tồn tại sau khi ecosystem.config.cjs tính ra. Thiếu nó thì
+# pg.Pool trong db.js rơi về default connection (localhost, user hệ điều hành, không mật khẩu), lỗi
+# liên tục nhưng bị catch trong tick() nuốt — trong khi `pm2 status` vẫn báo online mãi mãi. Lấy
+# đúng giá trị bằng cách require lại chính ecosystem.config.cjs TRÊN POD (nó tự đọc
+# ~/motion-backend/.env, khác .env gốc ở máy local) thay vì chép công thức ra đây lần hai — lệch
+# một chi tiết (thứ tự host/port, tên biến…) là lại thêm một lỗi im lặng khác.
+RUNPOD_ENDPOINT_ID="$(env_get RUNPOD_ENDPOINT_ID)"
+RUNPOD_API_KEY_ENV="$(env_get RUNPOD_API_KEY)"
+if [ -n "$RUNPOD_ENDPOINT_ID" ] && [ -n "$RUNPOD_API_KEY_ENV" ]; then
+  log "starting mc-dispatcher (serverless) — endpoint $RUNPOD_ENDPOINT_ID"
+  remote "cd ~/$REMOTE_DIR && \
+    DBURL=\$(node -e \"console.log(require('./ecosystem.config.cjs').apps.find(a=>a.name==='api').env.DATABASE_URL)\" 2>/dev/null) ; \
+    if [ -z \"\$DBURL\" ]; then echo 'mc-dispatcher: không tính được DATABASE_URL từ ecosystem.config.cjs — bỏ qua'; exit 1; fi ; \
+    pm2 delete mc-dispatcher >/dev/null 2>&1 ; \
+    DATABASE_URL=\"\$DBURL\" RUNPOD_ENDPOINT_ID='$RUNPOD_ENDPOINT_ID' RUNPOD_API_KEY='$RUNPOD_API_KEY_ENV' \
+    pm2 start api/src/mc-dispatcher.js --name mc-dispatcher --update-env >/dev/null 2>&1 ; \
+    pm2 save >/dev/null 2>&1 ; sleep 6 ; \
+    if pm2 logs mc-dispatcher --lines 100 --nostream 2>/dev/null | grep -q 'tick lỗi:'; then \
+      echo 'mc-dispatcher: log có \"tick lỗi:\" — DATABASE_URL sai hoặc Postgres không kết nối được. Log gần nhất:' ; \
+      pm2 logs mc-dispatcher --lines 100 --nostream ; \
+      exit 1 ; \
+    fi ; \
+    pm2 jlist | python3 -c \"import sys,json;m=[p for p in json.load(sys.stdin) if p['name']=='mc-dispatcher'];print('mc-dispatcher', m[0]['pm2_env']['status'] if m else 'MISSING')\"" \
+    || warn "mc-dispatcher không start được hoặc không kết nối được database — xem 'pm2 logs mc-dispatcher'"
+
+  # MỘT nguồn worker tại một thời điểm (spec §Kiến trúc). Để cả `worker` local lẫn serverless cùng
+  # claim thì hỏng theo kiểu tốn tiền mà không ai thấy: worker local trên pod đang chạy sẵn nhặt
+  # job trong vài mili-giây, container serverless vẫn tỉnh dậy sau 1-3 phút cold start, thấy hàng
+  # đợi rỗng, thoát — và ta trả tiền cold start đó cho không. Hoá đơn tăng, log hai bên đều sạch.
+  # `pm2 stop` chứ không `pm2 delete`: giữ nguyên trong danh sách để bật lại bằng một lệnh.
+  if [ "${KEEP_LOCAL_WORKER:-0}" = "1" ]; then
+    log "KEEP_LOCAL_WORKER=1 → giữ worker local chạy song song dispatcher (hai nguồn cùng claim)"
+  else
+    log "dừng worker local — serverless là nguồn worker (đặt KEEP_LOCAL_WORKER=1 để giữ)"
+    remote "cd ~/$REMOTE_DIR && pm2 stop worker >/dev/null 2>&1 ; pm2 save >/dev/null 2>&1 ; \
+      pm2 jlist | python3 -c \"import sys,json;m=[p for p in json.load(sys.stdin) if p['name']=='worker'];print('worker', m[0]['pm2_env']['status'] if m else 'MISSING')\"" \
+      || warn "không dừng được worker local — kiểm 'pm2 status' rồi 'pm2 stop worker' bằng tay"
+  fi
+else
+  log "RUNPOD_ENDPOINT_ID/RUNPOD_API_KEY chưa đặt trong .env → bỏ qua dispatcher (worker local vẫn chạy)"
 fi
 
 # ── Gate: prove the volume is actually in use ─────────────────────────────────

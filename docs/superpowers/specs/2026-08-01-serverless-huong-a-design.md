@@ -27,6 +27,7 @@ tính tiền. Nhưng container serverless là stateless và chết sau mỗi job
 
 Nên handler đó là tham chiếu tốt, không phải thứ để tái dùng.
 
+<a id="kien-truc"></a>
 ## Kiến trúc
 
 Serverless **thay** worker local. Đúng một nguồn worker tại một thời điểm.
@@ -309,8 +310,9 @@ chặt hơn.
 Ngân sách trần theo ngày · fallback tự động khi serverless lỗi · autoscale theo độ dài hàng đợi ·
 nhiều endpoint tách theo job type · concurrency > 1 trong một worker.
 
-Chưa có số liệu tải thật thì mọi thứ trên là đoán. Job lỗi cứ trả về `queued`, worker local nhặt —
-đủ dùng, và là hành vi sẵn có chứ không phải code mới.
+Chưa có số liệu tải thật thì mọi thứ trên là đoán. Job lỗi thì dừng ở `error` và người dùng bấm
+chạy lại — thô, nhưng là hành vi sẵn có chứ không phải code mới. (Bản trước của đoạn này nói job
+lỗi "trả về `queued`, worker local nhặt"; sai — xem [§Xử lý lỗi](#xu-ly-loi).)
 
 <a id="assumptions"></a>
 ## Ba giả định chưa kiểm chứng
@@ -382,16 +384,30 @@ Ba hệ quả:
 13 file · 42 GB (nhóm Wan 2.2 Animate + FlashVSR Enhance). `pod-volume.sh --check` xác nhận
 không hồi quy.
 
+<a id="xu-ly-loi"></a>
 ## Xử lý lỗi
 
 | Hỏng | Hành vi |
 |---|---|
 | Worker tỉnh mà không còn job | `/worker/claim` trả 204 → thoát ngay, tốn vài giây |
-| Job lỗi giữa chừng | `PATCH /jobs/{id}` về `queued` như worker local; worker local nhặt lại |
+| Job lỗi giữa chừng | `PATCH /jobs/{id}` về `error` — TRẠNG THÁI CUỐI, không ai nhặt lại, người dùng phải bấm chạy lại. Xem ghi chú dưới bảng |
 | Presigned URL hết hạn | PUT trả 403 → worker xin URL mới một lần, rồi mới báo lỗi |
 | MinIO không với tới được từ RunPod | worker phát hiện lúc PUT → rơi về multipart qua api; job >100MB sẽ hỏng và phải báo rõ, không im lặng |
 | ComfyUI thiếu custom node | 400 *node type not found* → job fail, log giữ nguyên tên node thiếu |
-| Endpoint hết capacity | `/run` trả lỗi → dispatcher bỏ qua, job nằm `queued` cho worker local |
+| Endpoint hết capacity | `/run` trả lỗi → dispatcher bỏ qua, job nằm `queued`, vòng poll sau thử lại |
+
+**Sửa 02/08/2026 — bản trước của bảng này nói sai.** Nó ghi "job lỗi trả về `queued`, worker local
+nhặt lại" và mô tả đó là hành vi sẵn có. Đọc code thì không phải:
+
+- `mc_handler.py:46,54` gọi `api_patch(status="error")`, và `api/src/routes/jobs.js:246` đặt luôn
+  `finished_at` cho `error` — trạng thái CUỐI. Không có đường nào đưa job từ `error` về `queued`.
+- `jobs.js:220` reclaim job `running` mồ côi cũng chuyển sang `error` chứ không về `queued`, và
+  chỉ chạy khi CHÍNH `worker_id` đó gọi `/worker/claim` lần nữa.
+
+Hệ quả cho serverless: mỗi container có `WORKER_ID` riêng (`serverless-<pod-id>`) nên nếu container
+chết giữa job, không container nào khác mang đúng id đó để kích hoạt reclaim → job nằm `running`
+vĩnh viễn, người dùng nhìn thấy một thanh tiến trình không bao giờ dừng. Đây là lỗ hổng có thật,
+theo dõi ở [§Việc phải làm trước khi bật thật](#todo-truoc-task5).
 
 ## Kiểm chứng
 
@@ -422,3 +438,53 @@ Giả định 1 và 3 đã trả lời. Chỉ còn giả định 2, đo được
 
 Bỏ được mục 2 kéo theo: không đụng `storage.js`, không thêm route api, không sửa worker. Phần code
 mới thu về đúng ba thứ — handler, Dockerfile, dispatcher.
+
+<a id="todo-truoc-task5"></a>
+## Việc phải làm trước khi bật thật — 02/08/2026
+
+Code handler, image, CI và dispatcher đã xong và đã review. Những mục dưới đây là thứ review tìm ra
+mà chưa đóng được, hoặc chỉ đóng được khi có endpoint thật. Không mục nào tự lộ ra trong bài kiểm
+"chạy một job thành công" — đó chính là lý do chúng nằm đây thay vì chờ phát hiện lúc chạy thật.
+
+1. **Job mồ côi nằm `running` vĩnh viễn — CẦN NGƯỜI QUYẾT, chưa code.** Xem ghi chú ở
+   [§Xử lý lỗi](#xu-ly-loi). Cơ chế reclaim sẵn có bám vào `worker_id`, mà mỗi container serverless
+   lại có id riêng, nên nó không bao giờ kích hoạt.
+
+   Vật liệu để sửa đã có sẵn, không cần đổi schema: bảng `workers` giữ `last_seen_at`, worker nhịp
+   `POST /worker/heartbeat` mỗi 15 giây (`linux.py:1177`), và `jobs.updated_at` tự tăng theo trigger
+   mỗi lần PATCH tiến độ. Container chết thì cả hai mốc cùng đứng yên:
+
+   ```sql
+   UPDATE jobs SET status='error', error='Worker serverless mất tích', finished_at=now()
+    WHERE status='running' AND worker_id LIKE 'serverless-%'
+      AND updated_at < now() - ($1 || ' seconds')::interval
+      AND NOT EXISTS (SELECT 1 FROM workers w
+                       WHERE w.worker_id = jobs.worker_id
+                         AND w.last_seen_at > now() - ($1 || ' seconds')::interval)
+   ```
+
+   Đặt trong `mc-dispatcher.js`, đừng sửa `routes/jobs.js` — `scripts/sync-upstream.sh` ghi đè file
+   upstream, file mới thì sống sót. Lọc `serverless-%` để không đụng job của worker local/wf-worker.
+
+   **Lý do chưa làm:** đặt ngưỡng quá ngắn thì nó GIẾT job đang chạy thật. Heartbeat chỉ nhịp trong
+   vòng chờ ComfyUI; các pha tải input và upload output có im lặng bao lâu thì chưa ai đo. Rủi ro
+   hỏng một job đã trả tiền GPU lớn hơn phiền toái của một thanh tiến trình treo — và job treo
+   KHÔNG tốn thêm tiền (dispatcher chỉ đếm `queued`). Lấy số đo im lặng thật ở mục 5 trước, rồi
+   chọn ngưỡng theo số đó.
+2. **Một nguồn worker tại một thời điểm.** [§Kiến trúc](#kien-truc) chốt "một nguồn worker", nhưng
+   `scripts/pod-bootstrap.sh` hiện dựng dispatcher mà vẫn để `pm2 worker` local chạy. Hai nguồn
+   cùng claim thì serverless vẫn tỉnh dậy, thấy hàng đợi rỗng, và tính tiền cold start cho không.
+   Chốt cách chọn nguồn trước khi bật endpoint.
+3. **Gắn volume khoá endpoint vào một datacenter.** Volume `wfe86wzkpm` nằm EU-RO-1, nên endpoint
+   chỉ chạy được trên GPU còn trống ở EU-RO-1. Hết máy nghĩa là job chờ, không phải job lỗi.
+   RunPod mount volume ở `/runpod-volume` cố định — không có ô "Volume Mount Path" như template
+   Pod; `entrypoint-selfhosted.sh` nối sang `/app/ComfyUI/models` và exit sớm nếu không thấy.
+4. **`JOB_TYPES` phải khớp ba nơi**: `ENV` trong image, `JOB_TYPES` của endpoint, và
+   `DISPATCH_JOB_TYPES` của dispatcher. Lệch một bên thì hoặc job nằm `queued` vĩnh viễn, hoặc
+   worker claim job nó không chạy được rồi đặt `error`.
+5. **Số đo cần ghi lại từ job thật đầu tiên**: cold start thật (chỉnh `DISPATCH_COOLDOWN_SEC` theo
+   nó), kích thước output thật, khoảng IM LẶNG dài nhất giữa hai heartbeat trong suốt một job
+   (đây là con số quyết định ngưỡng ở mục 1 — đo bằng
+   `SELECT max(gap) FROM …` hoặc đơn giản là xem `workers.last_seen_at` nhảy thế nào trong lúc job
+   chạy), và ComfyUI có khởi động sạch trên commit đã ghim `32212244` (v0.29.2) hay không — commit
+   này chọn theo ngày pod chạy thành công, chưa có job nào chạy qua đúng image này để xác nhận.
