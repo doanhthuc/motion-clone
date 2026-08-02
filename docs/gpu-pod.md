@@ -717,3 +717,23 @@ Ghi đè bằng `FORCE=1`.
 
 Không dùng `--delete`: nó sẽ xoá mọi file fork thêm vào (`pod-volume.sh`, `scrub-secrets.sh`,
 specs). Đánh đổi: file bị xoá ở upstream thì còn sót lại đây. Đó là hướng sai an toàn hơn.
+
+<a id="local-deltas"></a>
+### Bản sửa cục bộ trên file upstream — `make check-deltas`
+
+Không dùng `--delete` vẫn **không** cứu được file upstream mà fork này đã sửa: `rsync` ghi đè chúng,
+âm thầm. Trước khi có cổng này, giữ được delta hay không phụ thuộc vào việc có ai nhớ ra, và mỗi lần
+quên thì hỏng chỉ lộ ra ở lần build hoặc lần dựng pod sau, dưới một triệu chứng **không liên quan gì
+tới chữ "sync"** — image chết kèm một bức tường chữ về `pipx`, hoặc Postgres chết ở bước rsync PGDATA.
+
+`make sync-upstream` giờ tự gọi cổng này và **từ chối commit** nếu thiếu delta nào:
+
+| File upstream | Phải còn | Mất thì hỏng ra sao |
+|---|---|---|
+| `comfyui/Dockerfile` | `ENV PIP_BREAK_SYSTEM_PACKAGES=1` | image KHÔNG build được (PEP 668) |
+| `worker/runpod/Dockerfile` | `ENV PIP_BREAK_SYSTEM_PACKAGES=1` | như trên, image Task Cloud |
+| `setup/pod-volume.sh` | `VOLUME_PGDATA:-1` | bootstrap chết ở `rsync PGDATA` ([§2](#runpod-gotchas)) |
+| `setup/pod-volume.sh` | `trỏ thẳng volume, không cần symlink` | `--check` báo đỏ oan cho MinIO đúng cấu hình |
+
+Thêm delta mới thì thêm một dòng vào `DELTAS` trong `scripts/check-local-deltas.sh`. Chọn chuỗi canh
+là **dòng lệnh thật**, đừng chọn dòng bình luận — bình luận dễ bị viết lại hơn.

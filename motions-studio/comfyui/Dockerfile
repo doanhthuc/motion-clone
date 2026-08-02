@@ -7,6 +7,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
+# ── ALD-local 02/08/2026 - PEP 668: không có dòng này thì image KHÔNG build được ───────────────
+# pytorch/pytorch:2.12.1-* dựng trên Ubuntu 24.04, nơi Python hệ thống có
+# /usr/lib/python3.12/EXTERNALLY-MANAGED → `pip install` từ chối cài vào system site-packages và
+# build chết ngay ở requirements.txt của ComfyUI. Đo thật 02/08/2026 trên GitHub Actions với
+# worker/runpod/Dockerfile.selfhosted (cùng base, cùng lệnh) — lỗi in ra là một bức tường chữ về
+# python3-full/pipx, không nói gì về việc bạn đang ở trong container.
+# Trong container thì "phá gói hệ thống" chính là điều ta muốn: cả image chỉ phục vụ một ứng dụng.
+# Đặt bằng ENV để mọi lệnh pip phía sau — kể cả lệnh thêm về sau — không quên mất nó.
+# Sửa CỤC BỘ trên file upstream: scripts/check-local-deltas.sh canh dòng này, và
+# scripts/sync-upstream.sh gọi nó để lần sync sau không âm thầm xoá đi.
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+
 WORKDIR /app
 RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git
 WORKDIR /app/ComfyUI

@@ -35,6 +35,9 @@ sync-upstream: ## Import upstream (ALD-Project) + re-scrub its secrets (PULL=1 t
 scrub-check: ## Gate: fail if any third-party credential or personal email is tracked
 	@bash motions-studio/setup/scrub-secrets.sh --check
 
+check-deltas: ## Gate: các bản sửa cục bộ trên file upstream còn nguyên (sync-upstream tự gọi)
+	@bash scripts/check-local-deltas.sh
+
 gpu-preflight: ## Check root .env is complete BEFORE you spend money on a pod
 	@bash scripts/gpu-preflight.sh
 

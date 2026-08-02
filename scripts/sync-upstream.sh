@@ -107,6 +107,19 @@ bash "$SCRUB" --check >/dev/null 2>&1 \
   || { bash "$SCRUB" --check; die "gate FAILED — secrets still present, NOT committing"; }
 ok "gate passed"
 
+# ── 3b. Gate: các bản sửa CỤC BỘ trên file upstream còn nguyên không ───────────
+# rsync ở bước 2 không dùng --delete (xem lý do ở đó), nhưng nó VẪN ghi đè mọi file upstream mà
+# fork này đã sửa — âm thầm. Trước cổng này, giữ được delta hay không phụ thuộc vào việc con người
+# có nhớ ra hay không, và mỗi lần quên thì hỏng chỉ lộ ra ở lần build hoặc lần dựng pod sau, dưới
+# một triệu chứng không liên quan gì tới chữ "sync".
+DELTA_CHECK="$ROOT/scripts/check-local-deltas.sh"
+if [ -f "$DELTA_CHECK" ]; then
+  log "gate: check-local-deltas.sh"
+  bash "$DELTA_CHECK" || die "delta cục bộ bị sync ghi đè — áp dụng lại rồi chạy lại, NOT committing"
+else
+  warn "không thấy scripts/check-local-deltas.sh — không kiểm được delta cục bộ"
+fi
+
 # ── 4. Record what we synced ──────────────────────────────────────────────────
 { printf '# Upstream commits this monorepo was last synced from.\n'
   printf '# Written by scripts/sync-upstream.sh — do not edit by hand.\n'
