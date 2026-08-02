@@ -59,12 +59,18 @@ export function filterQueuedTypes(rows, allowedTypes) {
  * CỐ Ý không dùng count(*) WHERE status='running' của bảng jobs: job 'running' có thể đang chạy trên
  * worker LOCAL hay wf-worker — những tiến trình dispatcher này không hề điều khiển và không cần chờ —
  * dùng nó làm mẫu số sẽ serialize oan, tưởng "đã có người lo" trong khi container serverless còn
- * nguội, và job cứ nằm queued không ai đánh thức. */
+ * nguội, và job cứ nằm queued không ai đánh thức.
+ *
+ * `maxInflight` là trần TỔNG số /run còn trong cửa sổ cooldown, KHÔNG phải trần mỗi vòng poll. Trần
+ * mỗi vòng (`Math.min(need, maxInflight)`) trông giống nhưng cộng dồn qua nhiều tick: hàng đợi 50 job,
+ * maxInflight=3, poll 5s, cooldown 180s → 105 giây bắn đủ 50 lần /run, vì mỗi tick lại thấy "còn
+ * need > 0, còn được bắn 3". Trừ `inflight` khỏi trần mới chặn đúng tổng. */
 export function decideDispatch({ queued, inflight, maxInflight }) {
   const need = queued - inflight
+  const room = maxInflight - inflight
   // maxInflight <= 0 là input sai (config lỗi) — không bao giờ trả số âm.
-  if (need <= 0 || maxInflight <= 0) return 0
-  return Math.min(need, maxInflight)
+  if (need <= 0 || room <= 0) return 0
+  return Math.min(need, room)
 }
 
 async function queuedRows() {

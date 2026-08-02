@@ -26,6 +26,48 @@ assert.equal(decideDispatch({ queued: 5, inflight: 0, maxInflight: -1 }), 0)
 // CRITICAL 3 — có in-flight (cold start có thể chưa xong) thì KHÔNG bắn thêm cho CÙNG job đó.
 assert.equal(decideDispatch({ queued: 1, inflight: 1, maxInflight: 3 }), 0)
 
+// maxInflight là trần TỔNG in-flight, không phải trần mỗi lượt: đã có 2 /run trong cửa sổ cooldown
+// thì trần 3 chỉ còn chỗ cho 1, dù hàng đợi dài bao nhiêu.
+assert.equal(decideDispatch({ queued: 50, inflight: 2, maxInflight: 3 }), 1)
+assert.equal(decideDispatch({ queued: 50, inflight: 3, maxInflight: 3 }), 0)
+
+// ── Mô phỏng NHIỀU tick (lỗi cộng dồn chỉ lộ ra qua thời gian, không qua một lệnh gọi đơn lẻ) ──
+//
+// Chạy đúng vòng lặp của tick(): prune theo cooldown → decideDispatch → push mốc đã bắn.
+// Trả về tổng số /run đã bắn và số in-flight cao nhất từng đạt.
+function simulate({ queued, maxInflight, cooldownMs, pollMs, ticks }) {
+  let fired = []
+  let total = 0
+  let peak = 0
+  for (let i = 0; i < ticks; i++) {
+    const now = i * pollMs
+    fired = pruneExpired(fired, cooldownMs, now)
+    const n = decideDispatch({ queued, inflight: fired.length, maxInflight })
+    for (let k = 0; k < n; k++) fired.push(now)
+    total += n
+    peak = Math.max(peak, fired.length)
+  }
+  return { total, peak }
+}
+
+{
+  // Kịch bản re-reviewer tái hiện: hàng đợi 50 job đứng yên (cold start chưa xong, chưa ai claim),
+  // poll 5s, cooldown 180s. Bản cũ `Math.min(need, maxInflight)` bắn đủ 50 lần trong ~105 giây.
+  // Đúng ra: trần 3 giữ nguyên suốt cả cửa sổ cooldown, hết cooldown mới được bắn tiếp.
+  const oneWindow = simulate({ queued: 50, maxInflight: 3, cooldownMs: 180_000, pollMs: 5000, ticks: 36 })
+  assert.equal(oneWindow.total, 3, "trong một cửa sổ cooldown chỉ được bắn tối đa maxInflight lần")
+  assert.equal(oneWindow.peak, 3)
+
+  // 21 tick nữa (tổng 57 tick = 285s) vượt qua mốc cooldown của loạt đầu → được bắn thêm đúng một loạt.
+  const twoWindows = simulate({ queued: 50, maxInflight: 3, cooldownMs: 180_000, pollMs: 5000, ticks: 57 })
+  assert.equal(twoWindows.total, 6)
+  assert.equal(twoWindows.peak, 3, "in-flight không bao giờ vượt maxInflight")
+
+  // Hàng đợi ngắn hơn trần: `need` mới là ràng buộc, không phải trần.
+  const shortQueue = simulate({ queued: 2, maxInflight: 3, cooldownMs: 180_000, pollMs: 5000, ticks: 36 })
+  assert.equal(shortQueue.total, 2)
+}
+
 // ── pruneExpired (theo dõi in-flight bằng cooldown, không phải DB) ────────────
 
 {
