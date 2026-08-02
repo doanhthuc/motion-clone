@@ -169,6 +169,11 @@ fi
 # Đăng ký bằng `pm2 start <script>` chứ không thêm vào ecosystem.config.cjs: file đó là upstream,
 # sửa vào là mất sau make sync-upstream.
 #
+# Cổng kiểm PHẢI đòi thấy dòng "bắt đầu", không chỉ đòi VẮNG dòng lỗi. Phiên bản cũ chỉ grep
+# 'tick lỗi:' và vì thế XANH khi log RỖNG HOÀN TOÀN — đúng cái đã xảy ra 02/08/2026: pm2 đặt
+# argv[1]=ProcessContainerFork.js nên main() không bao giờ chạy, pm2 báo online, không một dòng log,
+# cổng này qua. Vắng lỗi không phải là bằng chứng chạy được.
+#
 # DATABASE_URL: ecosystem.config.cjs:9 ghi rõ api/wf-worker chỉ đọc process.env (không dotenv), và
 # ecosystem.config.cjs:62 tự DẪN XUẤT DATABASE_URL từ POSTGRES_USER/PASSWORD/PORT/DB trong .env —
 # biến này KHÔNG có sẵn trong .env, chỉ tồn tại sau khi ecosystem.config.cjs tính ra. Thiếu nó thì
@@ -188,6 +193,11 @@ if [ -n "$RUNPOD_ENDPOINT_ID" ] && [ -n "$RUNPOD_API_KEY_ENV" ]; then
     DATABASE_URL=\"\$DBURL\" RUNPOD_ENDPOINT_ID='$RUNPOD_ENDPOINT_ID' RUNPOD_API_KEY='$RUNPOD_API_KEY_ENV' \
     pm2 start api/src/mc-dispatcher.js --name mc-dispatcher --update-env >/dev/null 2>&1 ; \
     pm2 save >/dev/null 2>&1 ; sleep 6 ; \
+    if ! pm2 logs mc-dispatcher --lines 100 --nostream 2>/dev/null | grep -q '\[mc-dispatcher\] bắt đầu'; then \
+      echo 'mc-dispatcher: KHÔNG thấy dòng \"bắt đầu\" trong log — tiến trình lên nhưng main() chưa chạy.' ; \
+      pm2 logs mc-dispatcher --lines 100 --nostream ; \
+      exit 1 ; \
+    fi ; \
     if pm2 logs mc-dispatcher --lines 100 --nostream 2>/dev/null | grep -q 'tick lỗi:'; then \
       echo 'mc-dispatcher: log có \"tick lỗi:\" — DATABASE_URL sai hoặc Postgres không kết nối được. Log gần nhất:' ; \
       pm2 logs mc-dispatcher --lines 100 --nostream ; \

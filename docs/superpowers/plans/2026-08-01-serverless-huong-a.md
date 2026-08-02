@@ -636,6 +636,7 @@ Rồi tạo qua dashboard (runpod.io/console/serverless → New Endpoint) với 
 |---|---|
 | Container Image | `ghcr.io/<owner>/motion-serverless:latest` |
 | GPU | RTX 5090 |
+| Min CUDA | **13.0** — image là cuda13.0; endpoint mặc định 12.0, để nguyên là worker rơi vào host driver cũ và torch chết |
 | Datacenter | **EU-RO-1** — phải trùng volume `wfe86wzkpm` |
 | Network Volume | `motion` — mount path KHÔNG chỉnh được, RunPod luôn gắn ở `/runpod-volume` (sửa 02/08/2026: bảng này trước ghi `/app/ComfyUI/models`; template Serverless không có ô "Volume Mount Path" như template Pod. `entrypoint-selfhosted.sh` tự nối `/runpod-volume/comfy-models` → `/app/ComfyUI/models`) |
 | Container Disk | 30 GB |
@@ -721,6 +722,7 @@ dispatcher không giao job cho ai, chỉ đánh thức.
 |---|---|
 | Image | `ghcr.io/<owner>/motion-serverless:latest` |
 | GPU | RTX 5090 |
+| Min CUDA | **13.0** — image là cuda13.0; endpoint mặc định 12.0, để nguyên là worker rơi vào host driver cũ và torch chết |
 | Datacenter | **phải trùng datacenter của Network Volume** |
 | Network Volume | mount `/app/ComfyUI/models` |
 | Container Disk | 30 GB |

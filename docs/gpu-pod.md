@@ -272,6 +272,28 @@ kiểu chợ.
 <a id="costs"></a>
 ## Costs — pod dừng vẫn tính tiền
 
+**RunPod, số đo thật 02/08/2026** (`runpodctl user` → `currentSpendPerHr`):
+
+| Trạng thái | $/giờ |
+|---|---|
+| Pod RTX 5090 đang chạy + volume 100GB | **1,014** |
+| Chỉ volume 100GB (pod đã destroy) | **0,0100** |
+| Serverless rỗi (kể cả khi `/health` báo `idle=2 ready=2`) | **0** — không cộng thêm gì |
+| Serverless, 5 job motion 540p/33 frame | 0,0116 **tổng cộng** |
+
+Nghĩa là volume 100GB tốn ~$7,3/tháng và `make gpu-destroy` KHÔNG dừng đồng hồ đó — cố ý, vì nó
+đang giữ 42GB model. Còn con số đáng nhớ nhất: một pod để quên qua đêm tốn nhiều hơn toàn bộ tiền
+GPU của 5 job serverless khoảng **2000 lần**.
+
+Kiểm bất cứ lúc nào:
+
+```bash
+runpodctl user | python3 -c "import sys,json;d=json.load(sys.stdin);print('balance \$%.3f | spend/hr \$%.4f'%(d['clientBalance'],d['currentSpendPerHr']))"
+runpodctl pod list          # [] = không còn pod nào
+```
+
+Phần dưới là luật của **vast.ai**, giữ lại cho trường hợp `GPU_PROVIDER=vast`:
+
 Vast.ai tính tiền **ổ đĩa theo giờ SUỐT THỜI GIAN INSTANCE TỒN TẠI** — kể cả khi đã `stop`. Không
 có chuyện "dừng rồi để đó tuần sau vào tiếp" miễn phí. Quy tắc:
 
@@ -511,7 +533,8 @@ runpodctl template create --serverless --name motion-serverless \
 runpodctl serverless create --name motion-serverless --template-id <tpl> \
   --gpu-id "NVIDIA GeForce RTX 5090" --data-center-ids EU-RO-1 \
   --network-volume-id <vol> --workers-min 0 --workers-max 3 --idle-timeout 120 \
-  --flash-boot --scale-by requests --scale-threshold 1
+  --flash-boot --scale-by requests --scale-threshold 1 \
+  --min-cuda-version 13.0   # BẮT BUỘC: image là cuda13.0, mặc định endpoint là 12.0
 
 # 4. Ghi vào .env gốc rồi make gpu-bootstrap (nó dựng mc-dispatcher và DỪNG worker local)
 #    RUNPOD_ENDPOINT_ID=<endpoint>   RUNPOD_API_KEY=<key>
