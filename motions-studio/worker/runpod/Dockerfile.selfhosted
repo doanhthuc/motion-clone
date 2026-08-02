@@ -37,16 +37,34 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Ghim commit ĐÚNG bản đã chạy được trên pod 01/08/2026. `--depth 1` không checkout commit cụ thể
 # được nên clone rồi fetch từng cái. Không ghim thì image trôi theo upstream và một ngày nào đó
 # ComfyUI trả 400 "node type not found" mà không ai đổi gì.
+# PROFILE chọn bộ node bake vào image — và VÌ THẾ chọn image này chạy được job type nào.
+#   motion (mặc định)  6 node · 4 type Wan. Nhẹ hơn nên cold start ngắn hơn.
+#   full               +3 node (GGUF, LTXVideo, SeedVR2) · 21 type — khớp setup/setup-full.sh.
+# MỘT biến quyết cả hai (danh sách node Ở ĐÂY và JOB_TYPES ở cuối file). Tách thành hai ARG rời
+# thì sớm muộn có người build với node của bản này và JOB_TYPES của bản kia: image claim job nó
+# không có node để chạy, rồi set error sau khi đã trả tiền cold start.
+# CI build cả hai bản, xem .github/workflows/build-serverless-image.yml.
+ARG PROFILE=motion
+
 WORKDIR /app/ComfyUI/custom_nodes
 RUN set -eux; \
-    for spec in \
+    set -- \
       "https://github.com/kijai/ComfyUI-WanVideoWrapper.git 088128b" \
       "https://github.com/kijai/ComfyUI-KJNodes.git 4d46ac1" \
       "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git 4ee72c0" \
       "https://github.com/Fannovel16/comfyui_controlnet_aux.git e8b689a" \
       "https://github.com/Fannovel16/ComfyUI-Frame-Interpolation.git 26545cc" \
       "https://github.com/naxci1/ComfyUI-FlashVSR_Stable.git f7f55ba" \
-    ; do \
+    ; \
+    case "$PROFILE" in \
+      motion) ;; \
+      full) set -- "$@" \
+        "https://github.com/city96/ComfyUI-GGUF.git 6ea2651" \
+        "https://github.com/Lightricks/ComfyUI-LTXVideo.git 3b9c5cd" \
+        "https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler.git 4490bd1" ;; \
+      *) echo "PROFILE không hợp lệ: '$PROFILE' — chỉ nhận motion | full" >&2; exit 1 ;; \
+    esac; \
+    for spec in "$@"; do \
       url="${spec% *}"; sha="${spec#* }"; d="$(basename "$url" .git)"; \
       git clone --filter=blob:none "$url" "$d"; \
       git -C "$d" checkout "$sha"; \
@@ -77,8 +95,15 @@ RUN pip install --no-cache-dir \
       einops safetensors tqdm pillow huggingface_hub psutil "opencv-python>=4.8.1.78" pyyaml
 # SageAttention = đường attention chính cho Wan (đồng bộ Dockerfile Task Cloud dòng ~36-39);
 # assert ngay lúc build để torch/CUDA gãy lộ ra ở CI, không phải lúc container đã chạy job đầu tiên.
+# Assert kiểm CẢ bản CUDA, không chỉ số phiên bản. Bản full cài ComfyUI-SeedVR2_VideoUpscaler,
+# requirements.txt của nó có `torch`/`torchvision` KHÔNG ghim — pip đổi wheel cu130 sang wheel CPU
+# thì `torch.__version__.split('+')[0]` vẫn đúng '2.12.1' và assert cũ vẫn xanh, còn container thì
+# chạy job đầu tiên mới phát hiện không có CUDA. torch.version.cuda đọc được lúc build (thuộc tính
+# của wheel), không cần GPU — nên CI bắt được.
 RUN pip install --no-cache-dir sageattention \
- && python -c "import torch, sageattention; assert torch.__version__.split('+')[0]=='2.12.1', torch.__version__"
+ && python -c "import torch, sageattention; \
+assert torch.__version__.split('+')[0]=='2.12.1', torch.__version__; \
+assert (torch.version.cuda or '').startswith('13'), f'wheel torch không phải CUDA 13: cuda={torch.version.cuda} ver={torch.__version__}'"
 
 # Weight DWPose 337MB. Đo trên pod thật: chúng nằm TRONG thư mục node, không nằm trong models/,
 # nên KHÔNG có trên Network Volume. Không bake thì mỗi cold start tải lại 337MB.
@@ -102,15 +127,25 @@ RUN pip install --no-cache-dir -r /app/worker/requirements.txt runpod
 # container. Tắt cả hai đường bằng cách đặt mặc định 0 ngay trong image (đồng bộ cách
 # Dockerfile Task Cloud cạnh nó đã làm với MOTION_FRESH_COMFY, dòng ~54).
 #
-# JOB_TYPES: linux.py:64-66 mặc định 19 type (tryon, talk, subtitle, voiceover, story-film...).
-# Image serverless này KHÔNG bake pipeline cho phần lớn trong số đó (không đủ custom node/model
-# trên Network Volume) — quên set JOB_TYPES lúc tạo RunPod Endpoint thì container vẫn claim được
-# job ngoài khả năng của nó rồi set 'error' (mc_handler.py: PIPELINES.get(job_type) → None →
-# api_patch error). Fail-safe phải nằm trong IMAGE, không chỉ trong một bảng hướng dẫn tạo
-# endpoint — endpoint vẫn override được bằng ENV riêng nếu cần mở rộng type.
 ENV MOTION_FRESH_COMFY=0 \
-    COMFY_RECYCLE_GB=0 \
-    JOB_TYPES=motion,teen-flycam,trend-tiktok,enhance
+    COMFY_RECYCLE_GB=0
+
+# JOB_TYPES: linux.py:64 mặc định 19 type (tryon, talk, subtitle, voiceover, story-film...) —
+# nhiều hơn cái image này chạy được. Quên set JOB_TYPES lúc tạo RunPod Endpoint thì container
+# claim cả job ngoài khả năng rồi set 'error' (mc_handler.py: PIPELINES.get(job_type) → None →
+# api_patch error), sau khi đã trả tiền cold start. Fail-safe phải nằm TRONG IMAGE, không chỉ
+# trong một bảng hướng dẫn tạo endpoint.
+#
+# Ghi ra FILE chứ không `ENV JOB_TYPES=...`: giá trị phụ thuộc ARG PROFILE, mà ENV không rẽ nhánh
+# theo ARG được. entrypoint-selfhosted.sh đọc file này KHI JOB_TYPES chưa đặt — nên Endpoint vẫn
+# override bằng ENV riêng y như trước.
+# Bản full = đúng JOB_TYPE của setup/setup-full.sh (registry PIPELINES trừ wan-dancer, 21 type).
+RUN set -eux; mkdir -p /etc/motion; \
+    case "$PROFILE" in \
+      full) printf '%s' "motion,bds,tryon,create-image,edit-image,product-overlay,teaser,video,text-to-video,wan-i2v,teen-flycam,trend-tiktok,ss,talk,face-motion,concat,reveal,voiceover,story-film,subtitle,enhance" > /etc/motion/job-types ;; \
+      *)    printf '%s' "motion,teen-flycam,trend-tiktok,enhance" > /etc/motion/job-types ;; \
+    esac; \
+    echo "PROFILE=$PROFILE → JOB_TYPES=$(cat /etc/motion/job-types)"
 
 ENV PYTHONPATH=/app/worker PYTHONUNBUFFERED=1
 COPY worker/runpod/entrypoint-selfhosted.sh /entrypoint.sh

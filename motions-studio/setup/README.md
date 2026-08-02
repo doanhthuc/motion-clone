@@ -7,17 +7,34 @@ Các trình cài đặt. **Chạy từ thư mục gốc repo** (script tự `cd`
 | `./setup/setup-create-image.sh` | **PM2 — box CHUYÊN create-image** (KHOÁ) | Box GPU chỉ tạo ảnh Qwen-Image-Edit | Cloudflare Tunnel / nginx+certbot |
 | `./setup/setup-motion-transfer.sh` | **PM2 — box CHUYÊN motion-transfer + teen-flycam + trend-tiktok** (KHOÁ) | Box GPU chạy motion theo video, Teen Flycam và Trend TikTok bằng cùng stack Wan | Cloudflare Tunnel / nginx+certbot |
 | `./setup/setup-tryon.sh` | **PM2 — box CHUYÊN Try-On** (KHOÁ) | Box GPU thử đồ (Qwen-Image-Edit 2509). Khác `setup-create-image.sh` ở chỗ nhận thêm `tryon,edit-image` — đây là box dùng cho Task Cloud capability `edit-image` | Cloudflare Tunnel / nginx+certbot |
-| `./setup/setup-pm2.sh` | **PM2 native — FULL** (mọi tính năng) | VPS Ubuntu 1 box ôm hết (cần GPU lớn) | Cloudflare Tunnel / nginx+certbot |
+| `./setup/setup-full.sh` | **PM2 — box ĐẦY ĐỦ** (21 type, catalog KHÔNG lọc) | Một box ôm hết: motion + tạo ảnh + tryon + LTX + dịch. Cần GPU lớn | Cloudflare Tunnel / nginx+certbot |
+| `./setup/setup-pm2.sh` | **PM2 native — FULL, monolith cũ** | Bản tiền-`lib-feature`. `setup-full.sh` làm cùng việc qua chuỗi phase chung — ưu tiên nó | Cloudflare Tunnel / nginx+certbot |
 | `./setup/setup.sh` | **Docker** (Linux) | Linux + NVIDIA chạy cả stack bằng Docker Compose | Caddy (kèm domain) |
 | `./setup/fullstack-setup.sh` | **IP fullstack** (BE+FE) | Không có domain → chạy BE + FE qua `http://<IP>:port`. Gọi lại `setup-pm2.sh` (`SKIP_HTTPS=1`) | ❌ HTTP qua IP |
 
-## Box CHUYÊN 1 chức năng (khuyên dùng — tránh tranh GPU/VRAM)
+## Chọn profile: box CHUYÊN hay box ĐẦY ĐỦ
 
-`setup-create-image.sh` và `setup-motion-transfer.sh` dùng chung thư viện **`lib-feature.sh`** (tham số hoá: `COMFY_NODES`, `JOB_TYPE`, `CATALOG_FILE`, `NEED_OLLAMA`, `PM2_APPS`). Mỗi box:
-- Chỉ clone **đúng custom node** của feature (không `ComfyUI-Manager`).
-- `JOB_TYPES` = đúng nhóm type của feature · `MODEL_CATALOG_PATH` → `../comfyui/catalog-<feature>.json` (allow-list) → **không pull được model/feature khác**.
-- **KHÔNG tải model lúc cài** — tải riêng qua Settings → Models AI (nhóm của feature).
-- Chỉ bật PM2: `minio,api,wf-worker,worker,comfyui` (không `bg-remover`).
+Bốn script trên dùng chung thư viện **`lib-feature.sh`** (tham số hoá: `COMFY_NODES`, `JOB_TYPE`,
+`CATALOG_FILE`, `NEED_OLLAMA`, `NEED_BG_REMOVER`, `PM2_APPS`). Cùng cơ chế, khác giá trị:
+
+| | box CHUYÊN (`motion-transfer`, `create-image`, `tryon`) | box ĐẦY ĐỦ (`full`) |
+|---|---|---|
+| Custom node | chỉ node của feature (2–6) | 9 node |
+| `JOB_TYPES` | đúng nhóm type của feature | 21 type (mọi handler trừ `wan-dancer`) |
+| Catalog | `catalog-<feature>.json` — allow-list, **không pull được model khác** | `catalog.json` — không lọc |
+| Ollama · bg-remover | tuỳ feature | cả hai |
+| Đánh đổi | ít thứ hỏng, cài nhanh, không tranh VRAM | một box làm mọi thứ, cài lâu hơn |
+
+Điểm chung cả hai: **không** `ComfyUI-Manager`, và **KHÔNG tải model lúc cài** — model tải riêng
+qua Settings → Models AI.
+
+`wan-dancer` cố ý nằm ngoài profile full: `run_wan_dancer` tự báo lỗi khi GPU < 90GB VRAM, mà card
+khuyến nghị của dự án là RTX 5090 32GB. Bật nó chỉ đổi "job nằm chờ" thành "job fail sau khi đã
+claim". Máy ≥90GB thì nối `,wan-dancer` vào `JOB_TYPES` trong `.env` rồi
+`pm2 restart ecosystem.config.cjs --only worker --update-env`.
+
+Các danh sách job type này bị chép ở nhiều file. Chạy `make check-job-types` ở repo gốc để kiểm
+chúng còn khớp nhau — lệch thì job nằm `queued` vĩnh viễn, không lỗi, không log.
 
 👉 Cấu hình máy đề xuất + cơ chế khoá: **[../DEPLOY.md](../DEPLOY.md)**.
 

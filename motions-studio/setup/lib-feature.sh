@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
 # ════════════════════════════════════════════════════════════════════════════
-# lib-feature.sh — Thư viện cài đặt NATIVE (PM2) cho các box CHUYÊN 1 chức năng,
-# dùng chung bởi:  setup/setup-create-image.sh  ·  setup/setup-motion-transfer.sh
+# lib-feature.sh — Thư viện cài đặt NATIVE (PM2) cho box motion, dùng chung bởi:
+#   setup/setup-create-image.sh · setup/setup-motion-transfer.sh · setup/setup-tryon.sh
+#   setup/setup-full.sh
 #
-# Mỗi box chỉ chạy ĐÚNG 1 feature, KHOÁ cứng:
-#   • Chỉ clone đúng custom node của feature đó (biến COMFY_NODES).
-#   • JOB_TYPES = đúng nhóm type của feature (biến JOB_TYPE) → worker không nhận job khác.
-#   • MODEL_CATALOG_PATH trỏ catalog RIÊNG (biến CATALOG_FILE) → Settings → Models AI
-#     chỉ thấy/tải được model của feature; không pull được model/feature khác.
+# Thư viện KHÔNG tự quyết phạm vi — profile gọi nó quyết, qua các biến dưới đây. Ba profile
+# đầu là box CHUYÊN, khoá cứng vào một nhóm type; setup-full.sh mở hết. Cơ chế giống nhau,
+# chỉ khác giá trị:
+#   • Chỉ clone đúng custom node profile khai (biến COMFY_NODES).
+#   • JOB_TYPES = đúng nhóm type profile khai (biến JOB_TYPE) → worker không nhận job khác.
+#   • MODEL_CATALOG_PATH trỏ catalog của profile (biến CATALOG_FILE) → Settings → Models AI
+#     chỉ thấy/tải được model trong catalog đó.
 #   • KHÔNG tải model trong lúc cài (tải riêng qua Settings → Models AI).
-#   • KHÔNG cài ComfyUI-Manager (không có UI cài node/model tuỳ ý).
+#   • KHÔNG cài ComfyUI-Manager (không có UI cài node/model tuỳ ý) — kể cả profile full:
+#     catalog đã mở hết model rồi, Manager chỉ thêm một đường cài node ngoài tầm kiểm soát.
 #   • Chỉ bật đúng PM2 app cần (biến PM2_APPS).
 #
 # Script gọi PHẢI export sẵn (trước khi source file này):
@@ -22,6 +26,10 @@
 #   MODEL_GROUP   tên nhóm model trong catalog (in hướng dẫn tải), vd "Qwen-Image-Edit"
 #   NEED_OLLAMA   1 = cài Ollama server (create-image dịch VN→EN) · 0 = bỏ
 #   PM2_APPS      danh sách app PM2 bật (vd "minio,api,wf-worker,worker,comfyui")
+#
+# Tuỳ chọn:
+#   NEED_BG_REMOVER 1 = dựng venv bg-remover (rembg) · mặc định 0. PHẢI đặt 1 nếu PM2_APPS
+#                   có "bg-remover", nếu không app đó khởi động rồi crash vòng lặp vì thiếu venv.
 #   DEFAULT_DOMAIN domain backend mặc định gợi ý
 #
 # Rồi gọi:  feature_main
@@ -455,8 +463,25 @@ phase_postgres() {
   ok "Postgres: role=${PG_USER} db=${PG_DB} @127.0.0.1:${PG_PORT} (schema tự nạp khi api khởi động)"
 }
 
+# bg-remover (rembg: tách nền, crop sản phẩm cho tryon — ecosystem.config.cjs:195). Box chuyên
+# không bật app này nên không dựng venv: rembg kéo theo onnxruntime, mất vài phút cài cho một
+# tiến trình sẽ không bao giờ nhận request. Profile full thì cần, và cần ở CẢ hai đường cài —
+# image dựng sẵn (worker-image/Dockerfile) KHÔNG có venv này, nên phase_prebuilt_deps cũng gọi.
+ensure_bg_remover() {
+  [ "${NEED_BG_REMOVER:-0}" = "1" ] || return 0
+  [ -x "$ROOT/bg-remover/venv/bin/python" ] || python3 -m venv "$ROOT/bg-remover/venv"
+  "$ROOT/bg-remover/venv/bin/pip" install -q --upgrade pip >/dev/null
+  "$ROOT/bg-remover/venv/bin/pip" install -q -r "$ROOT/bg-remover/requirements.txt" \
+    || warn "pip bg-remover có cảnh báo — tryon vẫn chạy, phần tách nền/crop sản phẩm tự tắt."
+  ok "bg-remover: venv xong"
+}
+
 phase_app_deps() {
-  say "5/11 · Cài deps app (api npm, worker venv) — KHÔNG bg-remover (box chuyên không dùng)"
+  if [ "${NEED_BG_REMOVER:-0}" = "1" ]; then
+    say "5/11 · Cài deps app (api npm, worker venv, bg-remover venv)"
+  else
+    say "5/11 · Cài deps app (api npm, worker venv) — KHÔNG bg-remover (box chuyên không dùng)"
+  fi
   ln -sfn ../db "$ROOT/api/db"
   ( cd api && npm install --omit=dev --no-audit --no-fund >/dev/null 2>&1 ) || die "npm install (api) lỗi."
   ok "api: node_modules xong"
@@ -464,6 +489,7 @@ phase_app_deps() {
   "$ROOT/worker/venv/bin/pip" install -q --upgrade pip >/dev/null
   "$ROOT/worker/venv/bin/pip" install -q -r "$ROOT/worker/requirements.txt" || warn "pip worker có cảnh báo."
   ok "worker: venv xong"
+  ensure_bg_remover
   mkdir -p "$ROOT/.data/minio"
 }
 
@@ -497,6 +523,9 @@ phase_prebuilt_deps() {
     rm -rf "$ROOT/worker/venv"
     ln -s "$prebuilt/worker-venv" "$ROOT/worker/venv"
   fi
+  # Image dựng sẵn không có venv bg-remover — dựng tại chỗ nếu profile cần (chậm hơn fast-boot
+  # vài phút, nhưng thiếu nó thì PM2 app bg-remover crash vòng lặp và tryon mất phần crop).
+  ensure_bg_remover
 
   COMFY_DIR="${COMFY_DIR:-$prebuilt/ComfyUI}"
   [ -f "$COMFY_DIR/main.py" ] || die "Image dựng sẵn thiếu ComfyUI tại $COMFY_DIR"

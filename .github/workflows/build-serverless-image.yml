@@ -25,6 +25,18 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      # fail-fast: false — bản full hỏng thì bản motion (đang chạy production) vẫn phải build ra.
+      # Để mặc định true thì một bản đỏ huỷ luôn bản kia, và ta mất cả hai vì một lỗi của một.
+      fail-fast: false
+      matrix:
+        include:
+          # suffix rỗng = bản mặc định, giữ nguyên tag `latest` mà endpoint hiện tại đang pull.
+          - profile: motion
+            suffix: ""
+          - profile: full
+            suffix: "-full"
+    name: build (${{ matrix.profile }})
     steps:
       - uses: actions/checkout@v4
 
@@ -52,13 +64,16 @@ jobs:
             # nhánh (vd serverless-huong-a), không phải push vào main. Không có guard này thì lần
             # chạy thử ĐÓ ghi đè tag `latest` — đúng cái endpoint RunPod pull — bằng image dựng từ
             # code chưa merge, còn chưa chắc đã chạy được.
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
-            type=sha,prefix=sha-
+            type=raw,value=latest${{ matrix.suffix }},enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,prefix=sha-,suffix=${{ matrix.suffix }}
 
       - uses: docker/build-push-action@v6
         with:
           context: motions-studio
           file: motions-studio/worker/runpod/Dockerfile.selfhosted
           push: true
+          # PROFILE quyết cả bộ custom node lẫn JOB_TYPES bake trong image — xem Dockerfile.
+          build-args: |
+            PROFILE=${{ matrix.profile }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

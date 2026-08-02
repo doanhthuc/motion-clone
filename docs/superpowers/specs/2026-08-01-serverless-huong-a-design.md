@@ -503,7 +503,16 @@ mà chưa đóng được, hoặc chỉ đóng được khi có endpoint thật.
    `done` → **không đụng**. Đúng 1/6 dòng bị đổi.
 
 2. ~~**Một nguồn worker tại một thời điểm.**~~ **XONG** — `pod-bootstrap.sh` nay `pm2 stop worker`
-   khi bật dispatcher (`KEEP_LOCAL_WORKER=1` để cố tình chạy song song).
+   khi bật dispatcher.
+
+   > **Sửa 02/08/2026:** cờ `KEEP_LOCAL_WORKER` nói ở đây đã bỏ, và nó từng có lỗi: script chỉ
+   > đọc được nó từ shell env nên đặt trong `.env` (đúng như `.env.example` hướng dẫn) bị bỏ qua
+   > im lặng. Thay bằng `WORKER_SOURCE=local|serverless|both` đọc qua `env_get`.
+   >
+   > Nguyên tắc cũng chỉnh cho đúng hơn: một nguồn worker cho **một job type**, không phải cho cả
+   > hệ. Hai nguồn nhận nhóm type rời nhau thì không có cuộc đua nào để thua — đó là cách profile
+   > `full` chạy được trên pod trong khi serverless vẫn gánh 4 type Wan. Xem
+   > [docs/gpu-pod.md#deploy-shapes](../../gpu-pod.md#deploy-shapes).
 3. ~~**Gắn volume khoá endpoint vào một datacenter.**~~ **ĐÃ XÁC NHẬN KHI CHẠY THẬT.** Volume `wfe86wzkpm` nằm EU-RO-1, nên endpoint
    chỉ chạy được trên GPU còn trống ở EU-RO-1. Hết máy nghĩa là job chờ, không phải job lỗi.
    RunPod mount volume ở `/runpod-volume` cố định — không có ô "Volume Mount Path" như template

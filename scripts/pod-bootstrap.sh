@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# rsync motions-studio/ onto the pod and run its OWN setup/setup-motion-transfer.sh there —
+# rsync motions-studio/ onto the pod and run its OWN setup/setup-<SETUP_PROFILE>.sh there —
 # idempotent (safe to re-run after an interruption, same guarantee the script itself documents).
 # Then pulls the FE .env block the script prints at the end and writes it straight into
 # motions/.env, so the local frontend points at the freshly-deployed backend.
@@ -55,6 +55,58 @@ POD_VOLUME="$(env_get POD_VOLUME)"
 MTC_PREBUILT="$(env_get MTC_PREBUILT)"
 MODELS_MIN_GB="$(env_get MODELS_MIN_GB)"
 
+# ── Hình dạng deploy: cài gì, và ai chạy job ─────────────────────────────────
+# Hai câu hỏi độc lập, hai biến.
+#
+# SETUP_PROFILE — box cài gì (chạy setup/setup-<profile>.sh trên pod):
+#   motion-transfer  (mặc định) 4 type Wan · catalog khoá · không Ollama — nhanh, rẻ, ít thứ hỏng
+#   full             21 type · catalog KHÔNG lọc (có Qwen/Flux/LTX) · Ollama + bg-remover
+#   create-image · tryon                                            — xem motions-studio/setup/README.md
+#
+# WORKER_SOURCE — ai claim job:
+#   local       worker trên pod. GPU pod đã trả tiền 24/7 nên worker này MIỄN PHÍ và không có
+#               cold start. Dispatcher không bật.
+#   serverless  dừng worker local, RunPod Serverless claim (scale-to-zero, trả theo giây GPU).
+#   both        cả hai. CHỈ hợp lý khi hai bên nhận NHÓM TYPE RỜI NHAU — xem cảnh báo ở khối
+#               dispatcher cuối file về việc trùng type làm ta trả tiền cold start cho không.
+#
+# Không đặt WORKER_SOURCE thì suy ra như cũ: có đủ RUNPOD_* → serverless, không thì local.
+SETUP_PROFILE="$(env_get SETUP_PROFILE)"; SETUP_PROFILE="${SETUP_PROFILE:-motion-transfer}"
+SETUP_SCRIPT="setup/setup-${SETUP_PROFILE}.sh"
+# Chỉ nhận profile đi qua lib-feature.sh. setup-pm2.sh cũng nằm cùng thư mục và cũng cài được cả
+# stack, nhưng nó là monolith cũ đi đường KHÁC: không có chuỗi phase, không hiểu MTC_PREBUILT, tự
+# quản JOB_TYPES/catalog theo cách riêng. Cho nó lọt vào đây thì `make gpu-bootstrap` lặng lẽ chạy
+# một cài đặt khác hẳn cái mọi cổng kiểm phía dưới giả định. setup-full.sh là bản lib-feature của nó.
+PROFILES="$(cd motions-studio/setup 2>/dev/null && grep -l 'lib-feature.sh' setup-*.sh 2>/dev/null | sed 's/^setup-//;s/\.sh$//' | paste -sd' ' -)"
+case " $PROFILES " in
+  *" $SETUP_PROFILE "*) ;;
+  *) die "SETUP_PROFILE=$SETUP_PROFILE không dùng được.
+  Profile có sẵn: $PROFILES" ;;
+esac
+[ -f "motions-studio/$SETUP_SCRIPT" ] || die "thiếu motions-studio/$SETUP_SCRIPT"
+
+RUNPOD_ENDPOINT_ID="$(env_get RUNPOD_ENDPOINT_ID)"
+RUNPOD_API_KEY_ENV="$(env_get RUNPOD_API_KEY)"
+WORKER_SOURCE="$(env_get WORKER_SOURCE)"
+if [ -n "${KEEP_LOCAL_WORKER:-}" ]; then
+  # KEEP_LOCAL_WORKER là tên cũ, và nó có một lỗi: chỉ đọc được từ shell env, nên đặt trong .env
+  # (đúng như .env.example từng hướng dẫn) bị bỏ qua IM LẶNG. WORKER_SOURCE đọc qua env_get.
+  warn "KEEP_LOCAL_WORKER đã bỏ — dùng WORKER_SOURCE=both trong .env. Đang tạm ánh xạ giá trị cũ."
+  [ "$KEEP_LOCAL_WORKER" = "1" ] && [ -z "$WORKER_SOURCE" ] && WORKER_SOURCE=both
+fi
+if [ -z "$WORKER_SOURCE" ]; then
+  if [ -n "$RUNPOD_ENDPOINT_ID" ] && [ -n "$RUNPOD_API_KEY_ENV" ]; then WORKER_SOURCE=serverless; else WORKER_SOURCE=local; fi
+fi
+case "$WORKER_SOURCE" in
+  local|serverless|both) ;;
+  *) die "WORKER_SOURCE=$WORKER_SOURCE không hợp lệ — chỉ nhận: local | serverless | both" ;;
+esac
+if [ "$WORKER_SOURCE" != "local" ] && { [ -z "$RUNPOD_ENDPOINT_ID" ] || [ -z "$RUNPOD_API_KEY_ENV" ]; }; then
+  die "WORKER_SOURCE=$WORKER_SOURCE cần RUNPOD_ENDPOINT_ID và RUNPOD_API_KEY trong .env — xem docs/gpu-pod.md#serverless.
+  (Muốn chạy job bằng GPU của chính pod thì đặt WORKER_SOURCE=local.)"
+fi
+log "hình dạng deploy: SETUP_PROFILE=$SETUP_PROFILE · WORKER_SOURCE=$WORKER_SOURCE"
+
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -p "$PORT")
 REMOTE_DIR="motion-backend"
 
@@ -106,7 +158,7 @@ else
   warn "lost every time the pod is re-created. See docs/gpu-pod.md#volume to set it up."
 fi
 
-log "running setup/setup-motion-transfer.sh on the pod — installs Postgres/MinIO/PM2, detects the"
+log "running $SETUP_SCRIPT on the pod — installs Postgres/MinIO/PM2, detects the"
 log "GPU/driver, installs ComfyUI + matching PyTorch/CUDA, and wires up the Cloudflare Tunnel. First"
 log "run takes a while (no models downloaded yet — that's a separate manual step, see below)."
 
@@ -125,9 +177,9 @@ GMAIL_APP_PASSWORD='$GMAIL_APP_PASSWORD' CF_API_TOKEN='$CF_API_TOKEN' \
 CF_TUNNEL_TOKEN='$CF_TUNNEL_TOKEN' CORS_ORIGINS='$CORS_ORIGINS' HF_TOKEN='' \
 ${FE_DOMAIN:+CF_FE_DOMAIN='$FE_DOMAIN' CF_FE_PORT='$FE_PORT' FRONTEND_URL='https://$FE_DOMAIN'} \
 MTC_PREBUILT='${MTC_PREBUILT:-0}' \
-./setup/setup-motion-transfer.sh" < /dev/null | tee "$LOG"
+./$SETUP_SCRIPT" < /dev/null | tee "$LOG"
 STATUS=${PIPESTATUS[0]}
-[ "$STATUS" -eq 0 ] || die "setup-motion-transfer.sh exited $STATUS — full log: $LOG"
+[ "$STATUS" -eq 0 ] || die "$SETUP_SCRIPT exited $STATUS — full log: $LOG"
 
 # ── MinIO must point AT the volume, not at a symlink to it ────────────────────
 # pod-volume.sh wires storage by symlinking .data/minio → $POD_VOLUME/minio, which works for every
@@ -182,9 +234,9 @@ fi
 # đúng giá trị bằng cách require lại chính ecosystem.config.cjs TRÊN POD (nó tự đọc
 # ~/motion-backend/.env, khác .env gốc ở máy local) thay vì chép công thức ra đây lần hai — lệch
 # một chi tiết (thứ tự host/port, tên biến…) là lại thêm một lỗi im lặng khác.
-RUNPOD_ENDPOINT_ID="$(env_get RUNPOD_ENDPOINT_ID)"
-RUNPOD_API_KEY_ENV="$(env_get RUNPOD_API_KEY)"
-if [ -n "$RUNPOD_ENDPOINT_ID" ] && [ -n "$RUNPOD_API_KEY_ENV" ]; then
+if [ "$WORKER_SOURCE" = "local" ]; then
+  log "WORKER_SOURCE=local → không bật dispatcher; worker trên pod claim mọi job trong JOB_TYPES"
+else
   log "starting mc-dispatcher (serverless) — endpoint $RUNPOD_ENDPOINT_ID"
   remote "cd ~/$REMOTE_DIR && \
     DBURL=\$(node -e \"console.log(require('./ecosystem.config.cjs').apps.find(a=>a.name==='api').env.DATABASE_URL)\" 2>/dev/null) ; \
@@ -206,21 +258,43 @@ if [ -n "$RUNPOD_ENDPOINT_ID" ] && [ -n "$RUNPOD_API_KEY_ENV" ]; then
     pm2 jlist | python3 -c \"import sys,json;m=[p for p in json.load(sys.stdin) if p['name']=='mc-dispatcher'];print('mc-dispatcher', m[0]['pm2_env']['status'] if m else 'MISSING')\"" \
     || warn "mc-dispatcher không start được hoặc không kết nối được database — xem 'pm2 logs mc-dispatcher'"
 
-  # MỘT nguồn worker tại một thời điểm (spec §Kiến trúc). Để cả `worker` local lẫn serverless cùng
-  # claim thì hỏng theo kiểu tốn tiền mà không ai thấy: worker local trên pod đang chạy sẵn nhặt
-  # job trong vài mili-giây, container serverless vẫn tỉnh dậy sau 1-3 phút cold start, thấy hàng
-  # đợi rỗng, thoát — và ta trả tiền cold start đó cho không. Hoá đơn tăng, log hai bên đều sạch.
+  # MỘT nguồn worker cho MỘT job type (spec §Kiến trúc). Để hai nguồn cùng claim CÙNG một type
+  # thì hỏng theo kiểu tốn tiền mà không ai thấy: worker local trên pod đang chạy sẵn nhặt job
+  # trong vài mili-giây, container serverless vẫn tỉnh dậy sau 1-3 phút cold start, thấy hàng đợi
+  # rỗng, thoát — và ta trả tiền cold start đó cho không. Hoá đơn tăng, log hai bên đều sạch.
   # `pm2 stop` chứ không `pm2 delete`: giữ nguyên trong danh sách để bật lại bằng một lệnh.
-  if [ "${KEEP_LOCAL_WORKER:-0}" = "1" ]; then
-    log "KEEP_LOCAL_WORKER=1 → giữ worker local chạy song song dispatcher (hai nguồn cùng claim)"
+  if [ "$WORKER_SOURCE" = "both" ]; then
+    log "WORKER_SOURCE=both → giữ worker local chạy song song dispatcher"
+    warn "both chỉ an toàn khi hai bên nhận nhóm type RỜI NHAU. Kiểm bằng tay:"
+    warn "  pod:        JOB_TYPES trong ~/$REMOTE_DIR/.env"
+    warn "  serverless: DISPATCH_JOB_TYPES (.env) và ENV JOB_TYPES bake trong image endpoint đang dùng"
+    warn "  Giao nhau khác rỗng = trả tiền cold start cho những lần serverless dậy tay không."
   else
-    log "dừng worker local — serverless là nguồn worker (đặt KEEP_LOCAL_WORKER=1 để giữ)"
+    log "dừng worker local — serverless là nguồn worker (WORKER_SOURCE=both để giữ cả hai)"
     remote "cd ~/$REMOTE_DIR && pm2 stop worker >/dev/null 2>&1 ; pm2 save >/dev/null 2>&1 ; \
       pm2 jlist | python3 -c \"import sys,json;m=[p for p in json.load(sys.stdin) if p['name']=='worker'];print('worker', m[0]['pm2_env']['status'] if m else 'MISSING')\"" \
       || warn "không dừng được worker local — kiểm 'pm2 status' rồi 'pm2 stop worker' bằng tay"
   fi
-else
-  log "RUNPOD_ENDPOINT_ID/RUNPOD_API_KEY chưa đặt trong .env → bỏ qua dispatcher (worker local vẫn chạy)"
+
+  # Cổng chặn lỗi im lặng: type nào pod claim được mà serverless KHÔNG, thì với WORKER_SOURCE=
+  # serverless nó nằm 'queued' vĩnh viễn — không lỗi, không log, chỉ là không ai nhận. Đúng cái
+  # xảy ra nếu mở SETUP_PROFILE=full mà vẫn trỏ endpoint dùng image 4 type.
+  if [ "$WORKER_SOURCE" = "serverless" ]; then
+    POD_TYPES="$(remote "grep -E '^JOB_TYPES=' ~/$REMOTE_DIR/.env | cut -d= -f2-" 2>/dev/null | tr -d '\r')"
+    DISPATCH_TYPES="$(env_get DISPATCH_JOB_TYPES)"
+    DISPATCH_TYPES="${DISPATCH_TYPES:-motion,teen-flycam,trend-tiktok,enhance}"
+    MISSING="$(python3 -c "
+import sys
+pod=[t for t in sys.argv[1].split(',') if t.strip()]
+sv={t.strip() for t in sys.argv[2].split(',') if t.strip()}
+print(','.join(t for t in pod if t.strip() not in sv))" "$POD_TYPES" "$DISPATCH_TYPES" 2>/dev/null)"
+    if [ -n "$MISSING" ]; then
+      warn "JOB_TYPES của pod có type mà dispatcher KHÔNG gửi đi: $MISSING"
+      warn "  Job thuộc các type đó sẽ nằm 'queued' mãi mãi (không worker nào nhận, không báo lỗi)."
+      warn "  Sửa một trong hai: dùng image serverless bản full và mở DISPATCH_JOB_TYPES cho khớp,"
+      warn "  hoặc đặt WORKER_SOURCE=both để worker trên pod gánh đúng những type còn lại."
+    fi
+  fi
 fi
 
 # ── Gate: prove the volume is actually in use ─────────────────────────────────

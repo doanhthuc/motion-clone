@@ -231,7 +231,7 @@ $(warn "Dry run — nothing rented.")
 
   After it rents (GPU_INSTANCE_ID is saved to .env for you automatically):
     1. make gpu-wait          # polls runpodctl, writes GPU_SSH_HOST/GPU_SSH_PORT into .env
-    2. make gpu-bootstrap     # rsyncs motions-studio + runs setup-motion-transfer.sh on the pod
+    2. make gpu-bootstrap     # rsyncs motions-studio + runs the SETUP_PROFILE setup script on the pod
     3. make gpu-status        # confirm the backend answers at https://\$DOMAIN
 
   A RunPod Network Volume bills monthly whether or not a pod exists — 'make gpu-destroy' does not
@@ -368,7 +368,7 @@ $(warn "Dry run — nothing rented.")
 
   After it rents (GPU_INSTANCE_ID is saved to .env for you automatically):
     1. make gpu-wait          # waits for SSH, writes GPU_SSH_HOST/GPU_SSH_PORT into .env for you
-    2. make gpu-bootstrap     # rsyncs motions-studio + runs setup-motion-transfer.sh on the pod
+    2. make gpu-bootstrap     # rsyncs motions-studio + runs the SETUP_PROFILE setup script on the pod
     3. make gpu-status        # confirm the backend answers at https://\$DOMAIN
 
   Also set a 15-minute idle auto-stop in the Vast UI — not to save money in the normal case, but

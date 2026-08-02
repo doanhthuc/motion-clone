@@ -32,6 +32,9 @@ env = $(shell grep -E '^$(1)=' .env 2>/dev/null | cut -d= -f2- | sed -E 's/[[:sp
 scrub-check: ## Gate: fail if any third-party credential or personal email is tracked
 	@bash motions-studio/setup/scrub-secrets.sh --check
 
+check-job-types: ## Gate: job type lists (image, setup profiles, dispatcher) must agree
+	@node scripts/check-job-types.mjs
+
 gpu-preflight: ## Check root .env is complete BEFORE you spend money on a pod
 	@bash scripts/gpu-preflight.sh
 
@@ -41,7 +44,7 @@ gpu-provision: ## Find + rent a GPU pod (dry-run; CONFIRM=yes to actually rent)
 gpu-wait: ## Wait for a freshly rented pod's SSH to come up (TIMEOUT=25 min); saves host/port to .env
 	@bash scripts/pod-wait.sh
 
-gpu-bootstrap: ## rsync motions-studio + run setup-motion-transfer.sh on the pod (idempotent; also deploys FE if FE_DOMAIN is set)
+gpu-bootstrap: ## rsync motions-studio + run the SETUP_PROFILE setup script on the pod (idempotent; also deploys FE if FE_DOMAIN is set)
 	@bash scripts/pod-bootstrap.sh
 
 gpu-fe: ## Re-deploy ONLY the frontend to the pod (rsync + build + PM2 restart, ~2 min)

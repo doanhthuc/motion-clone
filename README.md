@@ -16,8 +16,13 @@ motion-clone/
 
 Frontend không cần GPU nên chạy thẳng trên máy dev. Backend cần GPU cho Wan 2.2 Animate nên
 chạy trên máy thuê (vast.ai / RunPod). `make gpu-bootstrap` rsync `motions-studio/` lên pod,
-chạy `setup/setup-motion-transfer.sh` ở đó, rồi tự dán block `NUXT_MOTION_*` vào `motions/.env`
+chạy `setup/setup-<SETUP_PROFILE>.sh` ở đó, rồi tự dán block `NUXT_MOTION_*` vào `motions/.env`
 để FE local trỏ đúng backend vừa dựng.
+
+Hai biến trong `.env` quyết hình dạng deploy: **`SETUP_PROFILE`** (`motion-transfer` mặc định —
+4 job type, catalog khoá; hay `full` — 21 type, có Qwen/Flux/LTX + Ollama) và **`WORKER_SOURCE`**
+(`local` dùng GPU của chính pod, `serverless` đẩy sang RunPod Serverless, `both` chia việc).
+Bảng so sánh và các cạm bẫy khi ghép chúng: `docs/gpu-pod.md#deploy-shapes`.
 
 Máy thuê đều NAT nên dùng Cloudflare Tunnel thay vì mở port — chi tiết ở `docs/gpu-pod.md`.
 
@@ -63,9 +68,8 @@ Repo này **public**, nên có một cổng chặn bắt buộc:
 motions-studio/setup/scrub-secrets.sh --check    # phải exit 0 trước mọi lần commit
 ```
 
-Nó quét credentials và email cá nhân trên mọi file được track, kể cả `docs/`. Lý do phải chạy
-lại sau mỗi lần sync upstream: `rsync` ghi đè các file đã scrub và mang secret của upstream
-trở lại. Chi tiết: `motions-studio/docs/superpowers/specs/2026-07-31-toi-uu-khoi-tao-pod-design.md` §3.2
+Nó quét credentials và email cá nhân trên mọi file được track, kể cả `docs/`. Chi tiết:
+`motions-studio/docs/superpowers/specs/2026-07-31-toi-uu-khoi-tao-pod-design.md` §3.2
 
 File chứa secret thật **không bao giờ** vào git: `.env` (gốc và `motions/`),
 `motions-studio/setup/templates.json`, `motions-studio/setup/pod.env`.

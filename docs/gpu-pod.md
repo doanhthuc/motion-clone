@@ -4,7 +4,7 @@ Frontend (`motions`) mặc định chạy local (`make dev`); muốn nó chạy 
 mở được thì xem [Frontend on the pod](#frontend-on-the-pod). Backend (`motions-studio`) cần GPU NVIDIA
 (≥24GB VRAM cho Wan 2.2 Animate) nên chạy trên máy thuê theo giờ — vast.ai hoặc RunPod — thay vì
 máy Mac của bạn. Toàn bộ flow dưới đây tự động hoá đúng những bước thủ công đã làm ở lần chạy
-trước (SSH vào máy thuê, chạy `motions-studio/setup/setup-motion-transfer.sh`, dán `.env` in ra
+trước (SSH vào máy thuê, chạy script setup của profile trong `motions-studio/setup/`, dán `.env` in ra
 vào `motions/.env`).
 
 ## Runbook
@@ -75,7 +75,7 @@ Bước 5 làm, theo đúng thứ tự này (thứ tự có lý do — xem `scri
 1. rsync `motions-studio/` lên pod
 2. symlink `models` + `PGDATA` + `MinIO` sang volume — **trước** khi setup chạy, nếu không
    Postgres dựng cluster trên container disk rồi mất sạch khi destroy pod
-3. `setup-motion-transfer.sh`: Postgres, MinIO, ComfyUI, PyTorch khớp driver ([CUDA 13](#cuda-13)),
+3. `setup-<SETUP_PROFILE>.sh`: Postgres, MinIO, ComfyUI, PyTorch khớp driver ([CUDA 13](#cuda-13)),
    custom nodes, Cloudflare Tunnel với **2 hostname** (`DOMAIN`→:8080, `FE_DOMAIN`→:2030)
 4. ghi `motions/.env` **local** trỏ vào backend mới
 5. rsync + `npm install` + `npm run build` + PM2 cho frontend **trên pod**
@@ -496,6 +496,45 @@ rồi PM2 restart mãi — **37 lần** trước khi bị phát hiện, và `pm2
 `mount --bind` bị container từ chối. `ecosystem.config.cjs:58` đọc `MINIO_DATA_DIR`, nên
 `pod-bootstrap.sh` trỏ MinIO thẳng vào `$POD_VOLUME/minio`, bỏ qua symlink.
 
+<a id="deploy-shapes"></a>
+## Hai hình dạng deploy — chọn bằng hai biến
+
+`make gpu-bootstrap` đọc hai biến trong `.env`. Chúng độc lập: một cái quyết **box cài gì**, cái
+kia quyết **ai chạy job**.
+
+```
+SETUP_PROFILE=motion-transfer|full|create-image|tryon
+WORKER_SOURCE=local|serverless|both
+```
+
+| | `WORKER_SOURCE=local` | `WORKER_SOURCE=serverless` |
+|---|---|---|
+| Ai claim job | worker trên pod | container RunPod Serverless |
+| Chi phí GPU | **0 thêm** — pod đã trả theo giờ rồi | trả theo giây thực chạy |
+| Cold start | không có | ~155 giây lần đầu |
+| Dispatcher | không bật | `mc-dispatcher` chạy dưới PM2 |
+| Job type chạy được | mọi type trong `JOB_TYPES` của box | chỉ type bake trong image serverless |
+
+**Vì sao `local` không tốn thêm gì:** ở hình dạng giữ pod, bạn đã trả tiền GPU 24/7. Đẩy job sang
+serverless nghĩa là trả tiền lần thứ hai cho cùng công việc, *và* thêm cold start, trong khi GPU
+đã mua vẫn nằm không. Đây là kết luận của [spec §Kiến trúc](superpowers/specs/2026-08-01-serverless-huong-a-design.md).
+Serverless chỉ thắng khi box luôn bật KHÔNG có GPU — hình dạng VPS mà spec nhắm tới.
+
+**Cạm bẫy khi ghép `full` với `serverless`:** profile `full` cho box claim 21 type, nhưng image
+serverless bản mặc định chỉ bake 4. 17 type còn lại sẽ nằm `queued` **vĩnh viễn** — không lỗi,
+không log, chỉ là không ai nhận. Ba cách thoát:
+
+1. dùng image bản full (`:latest-full`) và mở `DISPATCH_JOB_TYPES` cho khớp;
+2. `WORKER_SOURCE=both` — pod gánh phần serverless không làm được;
+3. `WORKER_SOURCE=local` — đơn giản nhất khi pod đã có GPU.
+
+`pod-bootstrap.sh` so hai danh sách sau khi cài và **cảnh báo** nếu có type rơi vào khoảng trống
+đó. Cảnh báo, không chặn — nó không biết bạn có cố ý hay không.
+
+`WORKER_SOURCE=both` chỉ an toàn khi hai bên nhận nhóm type **rời nhau**. Trùng type thì worker
+local nhặt job trong vài mili-giây còn container serverless vẫn tỉnh dậy sau 1–3 phút, thấy hàng
+đợi rỗng rồi thoát — ta trả tiền cold start đó cho không, và log hai bên đều sạch.
+
 <a id="serverless"></a>
 ## RunPod Serverless — GPU chỉ tính tiền khi có job
 
@@ -517,15 +556,19 @@ qua đường serverless, không job nào lỗi. Con số quan trọng nhất:
 ### Dựng lại từ đầu
 
 ```bash
-# 1. Image: đẩy code lên main, CI tự build ghcr.io/<owner>/motion-serverless
+# 1. Image: đẩy code lên main, CI build HAI bản song song
+#    :latest      / :sha-<commit>        6 node · 4 type Wan   (nhẹ, cold start ngắn)
+#    :latest-full / :sha-<commit>-full   9 node · 21 type       (thêm GGUF, LTXVideo, SeedVR2)
 git push origin main
-gh run list --limit 1            # chờ 'success' (~10-18 phút)
+gh run list --limit 2            # chờ CẢ HAI 'success' (~10-18 phút mỗi bản)
 
 # 2. Template — dùng tag sha-<commit>, KHÔNG dùng :latest (xem bẫy 3 bên dưới)
+#    JOB_TYPES ở đây chỉ để GHI ĐÈ; bỏ trống thì entrypoint lấy đúng list bake trong image
+#    (/etc/motion/job-types), nên bản full tự nhận đủ 21 type mà không cần chép lại danh sách.
 WT=$(ssh -p $GPU_SSH_PORT root@$GPU_SSH_HOST "grep -E '^WORKER_TOKEN=' ~/motion-backend/.env | cut -d= -f2-")
 runpodctl template create --serverless --name motion-serverless \
   --image ghcr.io/<owner>/motion-serverless:sha-<commit> --container-disk-in-gb 40 \
-  --env "{\"API_URL\":\"https://api.doanhthuc.xyz\",\"WORKER_TOKEN\":\"$WT\",\"JOB_TYPES\":\"motion,teen-flycam,trend-tiktok,enhance\"}"
+  --env "{\"API_URL\":\"https://api.doanhthuc.xyz\",\"WORKER_TOKEN\":\"$WT\"}"
 
 # 3. Endpoint — datacenter PHẢI trùng volume
 runpodctl serverless create --name motion-serverless --template-id <tpl> \
@@ -535,7 +578,9 @@ runpodctl serverless create --name motion-serverless --template-id <tpl> \
   --min-cuda-version 13.0   # BẮT BUỘC: image là cuda13.0, mặc định endpoint là 12.0
 
 # 4. Ghi vào .env gốc rồi make gpu-bootstrap (nó dựng mc-dispatcher và DỪNG worker local)
-#    RUNPOD_ENDPOINT_ID=<endpoint>   RUNPOD_API_KEY=<key>
+#    RUNPOD_ENDPOINT_ID=<endpoint>   RUNPOD_API_KEY=<key>   WORKER_SOURCE=serverless
+#    Dùng image bản full thì mở luôn DISPATCH_JOB_TYPES cho khớp 21 type — xem §Hai hình dạng
+#    deploy. Bỏ quên là 17 type nằm queued vĩnh viễn.
 ```
 
 ### Bốn cái bẫy, cả bốn đều trả giá bằng một vòng chạy

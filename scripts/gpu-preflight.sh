@@ -49,7 +49,7 @@ check DISK          required "GB — DEPLOY.md minimum for the motion-transfer b
 check MAX_DPH       required "\$/hour ceiling so a search never surprises you" 1
 
 echo
-echo "Backend deploy (passed straight to setup/setup-motion-transfer.sh on the pod)"
+echo "Backend deploy (passed straight to the SETUP_PROFILE setup script on the pod)"
 check DOMAIN        required "domain you control on Cloudflare — the box's HTTPS tunnel hostname" 1
 check SUPER_ADMIN   required "only email that can log in as admin after deploy" 1
 cf_api="$(get CF_API_TOKEN)"; cf_tunnel="$(get CF_TUNNEL_TOKEN)"

@@ -30,6 +30,14 @@ fi
 
 echo "[entrypoint] WORKER_ID=$WORKER_ID"
 
+# JOB_TYPES bake theo ARG PROFILE lúc build (Dockerfile.selfhosted ghi /etc/motion/job-types).
+# Phải là mặc định-khi-trống chứ không ghi đè: Endpoint vẫn cần quyền set JOB_TYPES riêng.
+# Không có file (image cũ build trước 02/08/2026) thì để nguyên — linux.py:64 tự lo mặc định.
+if [ -z "${JOB_TYPES:-}" ] && [ -s /etc/motion/job-types ]; then
+  export JOB_TYPES="$(cat /etc/motion/job-types)"
+fi
+echo "[entrypoint] JOB_TYPES=${JOB_TYPES:-<mặc định của linux.py>}"
+
 export COMFY_URL="${COMFY_URL:-http://127.0.0.1:8188}"
 
 # ── Network Volume ────────────────────────────────────────────────────────────
