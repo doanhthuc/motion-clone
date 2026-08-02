@@ -195,6 +195,20 @@ if [ -n "$RUNPOD_ENDPOINT_ID" ] && [ -n "$RUNPOD_API_KEY_ENV" ]; then
     fi ; \
     pm2 jlist | python3 -c \"import sys,json;m=[p for p in json.load(sys.stdin) if p['name']=='mc-dispatcher'];print('mc-dispatcher', m[0]['pm2_env']['status'] if m else 'MISSING')\"" \
     || warn "mc-dispatcher không start được hoặc không kết nối được database — xem 'pm2 logs mc-dispatcher'"
+
+  # MỘT nguồn worker tại một thời điểm (spec §Kiến trúc). Để cả `worker` local lẫn serverless cùng
+  # claim thì hỏng theo kiểu tốn tiền mà không ai thấy: worker local trên pod đang chạy sẵn nhặt
+  # job trong vài mili-giây, container serverless vẫn tỉnh dậy sau 1-3 phút cold start, thấy hàng
+  # đợi rỗng, thoát — và ta trả tiền cold start đó cho không. Hoá đơn tăng, log hai bên đều sạch.
+  # `pm2 stop` chứ không `pm2 delete`: giữ nguyên trong danh sách để bật lại bằng một lệnh.
+  if [ "${KEEP_LOCAL_WORKER:-0}" = "1" ]; then
+    log "KEEP_LOCAL_WORKER=1 → giữ worker local chạy song song dispatcher (hai nguồn cùng claim)"
+  else
+    log "dừng worker local — serverless là nguồn worker (đặt KEEP_LOCAL_WORKER=1 để giữ)"
+    remote "cd ~/$REMOTE_DIR && pm2 stop worker >/dev/null 2>&1 ; pm2 save >/dev/null 2>&1 ; \
+      pm2 jlist | python3 -c \"import sys,json;m=[p for p in json.load(sys.stdin) if p['name']=='worker'];print('worker', m[0]['pm2_env']['status'] if m else 'MISSING')\"" \
+      || warn "không dừng được worker local — kiểm 'pm2 status' rồi 'pm2 stop worker' bằng tay"
+  fi
 else
   log "RUNPOD_ENDPOINT_ID/RUNPOD_API_KEY chưa đặt trong .env → bỏ qua dispatcher (worker local vẫn chạy)"
 fi
