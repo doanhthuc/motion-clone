@@ -1,8 +1,10 @@
 # RunPod Serverless cho stack tự chủ (hướng A) — thiết kế
 
-Ngày: 2026-08-01
-Trạng thái: **thiết kế, chưa triển khai.** Cả ba giả định đã đo xong trên pod thật 01/08/2026 —
-xem [§Đo thật](#measured). Spec sẵn sàng chuyển thành plan.
+Ngày: 2026-08-01 · cập nhật 2026-08-02
+Trạng thái: **ĐÃ CHẠY THẬT 02/08/2026.** 5 job motion qua endpoint serverless, không job nào lỗi —
+xem [§Đã chạy thật](#da-chay-that) để có toàn bộ số đo, và
+[§Việc phải làm trước khi bật thật](#todo-truoc-task5) cho mục duy nhất còn treo (ngưỡng reclaim
+job mồ côi). Ba giả định ban đầu đo trên pod 01/08/2026 ở [§Đo thật](#measured).
 
 ## Vấn đề
 
@@ -439,6 +441,31 @@ Giả định 1 và 3 đã trả lời. Chỉ còn giả định 2, đo được
 Bỏ được mục 2 kéo theo: không đụng `storage.js`, không thêm route api, không sửa worker. Phần code
 mới thu về đúng ba thứ — handler, Dockerfile, dispatcher.
 
+<a id="da-chay-that"></a>
+## ĐÃ CHẠY THẬT — 02/08/2026
+
+Endpoint `fggbwsbhidwbdi`, image `ghcr.io/doanhthuc/motion-serverless:sha-f8c546b`, volume
+`wfe86wzkpm` (EU-RO-1). 5 job `motion` 540p/33 frame qua serverless, không job nào lỗi.
+
+| Mục Kiểm chứng | Kết quả |
+|---|---|
+| 1. `custom_nodes/` khớp pod, đối chiếu commit | ✓ ghim 6 node + ComfyUI lõi v0.29.2 (`32212244`) |
+| 2. Một job motion chạy hết qua serverless | ✓ `worker_id=serverless-l194c8v437yy2y`, 2 phút 46 giây |
+| 3. Kích thước output thật | ✓ **344 KB** — [§Quyết định 3](#quyet-dinh-3) vẫn đóng đúng |
+| 4. `pm2 stop worker`, job vẫn chạy | ✓ worker local dừng suốt cả bài kiểm |
+| 5. Rỗi → hoá đơn không tăng | ✓ `currentSpendPerHr` đứng yên 1.014 (= pod + volume) qua 5 phút rỗi |
+| 6. Hai job cùng lúc, không giết nhau | ✓ hai worker khác nhau, **không** job nào có "Worker khởi động lại giữa chừng" |
+
+Số đo khác: cold start (kéo image 5,09GB nén) ~155 giây; worker ấm delay 1,9s + execution 0,3s;
+tổng tiền serverless cho cả 5 job **$0,0116** (25,3 giây GPU được tính) so với pod **$1,014/giờ**.
+
+Dispatcher chạy trên pod tự đánh thức worker cho hai job liên tiếp, mỗi lần đúng một `/run` —
+không ai gọi `/run` bằng tay.
+
+**Khoảng im lặng heartbeat dài nhất TRONG lúc job chạy: 79 giây** (đo trên chính worker đang giữ
+job, lấy mẫu mỗi 3 giây). Nhịp heartbeat là 15 giây trong vòng chờ ComfyUI, nên 79 giây đến từ các
+pha không nhịp: tải input, nạp model, upload output. Đây là con số mục 1 bên dưới đang chờ.
+
 <a id="todo-truoc-task5"></a>
 ## Việc phải làm trước khi bật thật — 02/08/2026
 
@@ -466,16 +493,15 @@ mà chưa đóng được, hoặc chỉ đóng được khi có endpoint thật.
    Đặt trong `mc-dispatcher.js`, đừng sửa `routes/jobs.js` — `scripts/sync-upstream.sh` ghi đè file
    upstream, file mới thì sống sót. Lọc `serverless-%` để không đụng job của worker local/wf-worker.
 
-   **Lý do chưa làm:** đặt ngưỡng quá ngắn thì nó GIẾT job đang chạy thật. Heartbeat chỉ nhịp trong
-   vòng chờ ComfyUI; các pha tải input và upload output có im lặng bao lâu thì chưa ai đo. Rủi ro
-   hỏng một job đã trả tiền GPU lớn hơn phiền toái của một thanh tiến trình treo — và job treo
-   KHÔNG tốn thêm tiền (dispatcher chỉ đếm `queued`). Lấy số đo im lặng thật ở mục 5 trước, rồi
-   chọn ngưỡng theo số đó.
-2. **Một nguồn worker tại một thời điểm.** [§Kiến trúc](#kien-truc) chốt "một nguồn worker", nhưng
-   `scripts/pod-bootstrap.sh` hiện dựng dispatcher mà vẫn để `pm2 worker` local chạy. Hai nguồn
-   cùng claim thì serverless vẫn tỉnh dậy, thấy hàng đợi rỗng, và tính tiền cold start cho không.
-   Chốt cách chọn nguồn trước khi bật endpoint.
-3. **Gắn volume khoá endpoint vào một datacenter.** Volume `wfe86wzkpm` nằm EU-RO-1, nên endpoint
+   **Ngưỡng — đã có số đo (02/08/2026):** im lặng dài nhất trong lúc job chạy là **79 giây**, đo
+   trên chính worker đang giữ job. Job dài hơn (1080p, nhiều frame) sẽ upload lâu hơn nên pha im
+   lặng dài hơn; đừng lấy 79s làm ngưỡng. **Đề xuất 900 giây** — hơn 11 lần số đo, mà vẫn cắt được
+   thanh tiến trình treo vĩnh viễn. Vẫn để người chốt: đặt hụt là GIẾT một job đã trả tiền GPU, và
+   job treo thì KHÔNG tốn thêm tiền (dispatcher chỉ đếm `queued`), nên sai về phía dài là đúng.
+
+2. ~~**Một nguồn worker tại một thời điểm.**~~ **XONG** — `pod-bootstrap.sh` nay `pm2 stop worker`
+   khi bật dispatcher (`KEEP_LOCAL_WORKER=1` để cố tình chạy song song).
+3. ~~**Gắn volume khoá endpoint vào một datacenter.**~~ **ĐÃ XÁC NHẬN KHI CHẠY THẬT.** Volume `wfe86wzkpm` nằm EU-RO-1, nên endpoint
    chỉ chạy được trên GPU còn trống ở EU-RO-1. Hết máy nghĩa là job chờ, không phải job lỗi.
    RunPod mount volume ở `/runpod-volume` cố định — không có ô "Volume Mount Path" như template
    Pod; `entrypoint-selfhosted.sh` nối sang `/app/ComfyUI/models` và exit sớm nếu không thấy.

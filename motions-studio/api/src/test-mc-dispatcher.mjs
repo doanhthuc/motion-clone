@@ -1,7 +1,23 @@
 // motions-studio/api/src/test-mc-dispatcher.mjs
 // Chạy: node motions-studio/api/src/test-mc-dispatcher.mjs
 import assert from "node:assert/strict"
-import { decideDispatch, pruneExpired, filterQueuedTypes } from "./mc-dispatcher.js"
+import { decideDispatch, pruneExpired, filterQueuedTypes, isMainModule } from "./mc-dispatcher.js"
+
+// ── isMainModule (pm2 fork mode giấu đường dẫn script khỏi argv[1]) ───────────
+
+// Chạy tay: node api/src/mc-dispatcher.js
+assert.equal(isMainModule(undefined, "/root/motion-backend/api/src/mc-dispatcher.js"), true)
+
+// pm2 fork mode: argv[1] là lớp bọc của pm2, đường dẫn thật nằm ở pm_exec_path. Đây là ca đã làm
+// dispatcher thành tiến trình rỗng mà pm2 vẫn báo online — đo trên pod thật 02/08/2026.
+assert.equal(
+  isMainModule("/root/motion-backend/api/src/mc-dispatcher.js", "/usr/lib/node_modules/pm2/lib/ProcessContainerFork.js"),
+  true,
+)
+
+// Bị import bởi test: không có đường dẫn nào trỏ tới file này → KHÔNG chạy main().
+assert.equal(isMainModule(undefined, "/usr/local/bin/node_modules/.bin/mocha"), false)
+assert.equal(isMainModule(undefined, undefined), false)
 
 // ── decideDispatch ────────────────────────────────────────────────────────────
 

@@ -143,4 +143,21 @@ async function main() {
   }
 }
 
-if (process.argv[1] && process.argv[1].endsWith("mc-dispatcher.js")) main()
+/** Có phải file này đang được chạy như chương trình chính không (khác với being imported bởi test)?
+ *
+ * KHÔNG dùng được `process.argv[1]` một mình: pm2 fork mode chạy script qua một lớp bọc, nên
+ * argv[1] là `/usr/lib/node_modules/pm2/lib/ProcessContainerFork.js` chứ không phải đường dẫn
+ * script. Đo trên pod thật 02/08/2026. Hậu quả của phiên bản cũ đúng bằng thứ tệ nhất có thể:
+ * `pm2 start api/src/mc-dispatcher.js` báo `online`, `restarts=0`, log RỖNG HOÀN TOÀN, và
+ * main() không bao giờ chạy — dispatcher là tiến trình rỗng nằm đó mãi mãi. Cả cổng kiểm log
+ * trong pod-bootstrap.sh (grep 'tick lỗi:') cũng xanh, vì không có log nào để mà lỗi.
+ *
+ * pm2 đặt `pm_exec_path` = đường dẫn script thật, nên xét nó trước, rồi mới tới argv[1] cho
+ * trường hợp chạy tay `node api/src/mc-dispatcher.js`.
+ *
+ * Hàm thuần, nhận đường dẫn qua tham số để test được không cần pm2. */
+export function isMainModule(execPath, argvPath) {
+  return [execPath, argvPath].some((p) => typeof p === "string" && p.endsWith("mc-dispatcher.js"))
+}
+
+if (isMainModule(process.env.pm_exec_path, process.argv[1])) main()

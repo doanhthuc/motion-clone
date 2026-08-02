@@ -476,6 +476,81 @@ rồi PM2 restart mãi — **37 lần** trước khi bị phát hiện, và `pm2
 `mount --bind` bị container từ chối. `ecosystem.config.cjs:58` đọc `MINIO_DATA_DIR`, nên
 `pod-bootstrap.sh` trỏ MinIO thẳng vào `$POD_VOLUME/minio`, bỏ qua symlink.
 
+<a id="serverless"></a>
+## RunPod Serverless — GPU chỉ tính tiền khi có job
+
+Chạy được thật, đo trên endpoint `fggbwsbhidwbdi` ngày 02/08/2026: 5 job `motion` 540p/33 frame
+qua đường serverless, không job nào lỗi. Con số quan trọng nhất:
+
+| Đo | Giá trị |
+|---|---|
+| Pod GPU luôn bật | **$1.014/giờ** — trả cả lúc không ai dùng |
+| Serverless, tổng cho 5 job | **$0.0116** (25,3 giây GPU được tính) |
+| Job 540p/33 frame, worker ấm | 2 phút 46 giây từ `queued` → `done` |
+| Cold start (kéo image 5,09GB nén lần đầu) | ~155 giây |
+| Worker ấm | delay 1,9s · execution 0,3s |
+| Output thật | 344 KB — xa dưới ngưỡng 100MB của [§Quyết định 3](superpowers/specs/2026-08-01-serverless-huong-a-design.md) |
+
+`GET /v2/<endpoint>/health` báo `idle=2 ready=2` cả khi rỗi, nhưng `currentSpendPerHr` KHÔNG đổi
+(vẫn đúng bằng pod + volume). Đó là slot FlashBoot, không phải worker tính tiền — đừng hoảng.
+
+### Dựng lại từ đầu
+
+```bash
+# 1. Image: đẩy code lên main, CI tự build ghcr.io/<owner>/motion-serverless
+git push origin main
+gh run list --limit 1            # chờ 'success' (~10-18 phút)
+
+# 2. Template — dùng tag sha-<commit>, KHÔNG dùng :latest (xem bẫy 3 bên dưới)
+WT=$(ssh -p $GPU_SSH_PORT root@$GPU_SSH_HOST "grep -E '^WORKER_TOKEN=' ~/motion-backend/.env | cut -d= -f2-")
+runpodctl template create --serverless --name motion-serverless \
+  --image ghcr.io/<owner>/motion-serverless:sha-<commit> --container-disk-in-gb 40 \
+  --env "{\"API_URL\":\"https://api.doanhthuc.xyz\",\"WORKER_TOKEN\":\"$WT\",\"JOB_TYPES\":\"motion,teen-flycam,trend-tiktok,enhance\"}"
+
+# 3. Endpoint — datacenter PHẢI trùng volume
+runpodctl serverless create --name motion-serverless --template-id <tpl> \
+  --gpu-id "NVIDIA GeForce RTX 5090" --data-center-ids EU-RO-1 \
+  --network-volume-id <vol> --workers-min 0 --workers-max 3 --idle-timeout 120 \
+  --flash-boot --scale-by requests --scale-threshold 1
+
+# 4. Ghi vào .env gốc rồi make gpu-bootstrap (nó dựng mc-dispatcher và DỪNG worker local)
+#    RUNPOD_ENDPOINT_ID=<endpoint>   RUNPOD_API_KEY=<key>
+```
+
+### Bốn cái bẫy, cả bốn đều trả giá bằng một vòng chạy
+
+**1. `{"input":{}}` bị RunPod bỏ.** SDK kiểm bằng độ chân trị của Python nên `{}` (falsy) bị coi là
+THIẾU `input`: `Job has missing field(s): id or input.` → thử lại một lần → trả về
+`job timed out after 1 retries`. Thông báo đó không hề chỉ về payload, và đây từng là lỗi trong
+chính `mc-dispatcher.js` — dispatcher không đánh thức được worker nào, lần nào cũng vậy. Luôn gửi
+một khoá gì đó: `{"input":{"wake":1}}`.
+
+**2. `WORKER_TOKEN` ≠ `API_KEY`.** `auth.js:12` đọc header `x-worker-token` và so với biến môi
+trường `WORKER_TOKEN` của api. Điền nhầm `API_KEY` thì handler chạy tới nơi rồi ăn 401 ở
+`/worker/claim`.
+
+**3. Đổi env của template KHÔNG chạm tới worker đang sống.** Sau `POST /endpoints/<id>/update`,
+worker cũ vẫn phục vụ request với env cũ thêm một lúc. Triệu chứng đánh lừa: `API_URL` và
+`JOB_TYPES` trông đúng (vì hai template chỉ khác một biến), chỉ mình biến vừa sửa là sai. Bắn lại
+vài lần cho tới khi trúng worker mới, hoặc đợi hẳn.
+
+**4. Không có đường lấy log bằng lệnh.** Không `runpodctl serverless logs`, REST v1 chỉ có
+`/endpoints`, GraphQL tắt introspection. Vì thế `entrypoint-selfhosted.sh` tee toàn bộ stdout ra
+`/runpod-volume/serverless-logs/<worker-id>.log`; đọc từ pod:
+
+```bash
+ssh -p $GPU_SSH_PORT root@$GPU_SSH_HOST 'ls -t /workspace/serverless-logs/ | head; cat /workspace/serverless-logs/<file>'
+```
+
+Riêng việc file có xuất hiện hay không đã là tín hiệu: không có file nào = volume không mount được.
+
+### Volume mount ở đâu
+
+`/runpod-volume`, **cố định** — template Serverless không có ô "Volume Mount Path" như template Pod
+(pod của ta dùng `/workspace`). `entrypoint-selfhosted.sh` tự nối `comfy-models/` và `hf-cache/`
+sang `/app/ComfyUI/`, và `exit 1` kèm cách sửa nếu không thấy. Gắn volume KHOÁ endpoint vào
+datacenter của volume — hết GPU trống ở đó nghĩa là job chờ, không phải job lỗi.
+
 <a id="network-volume"></a>
 <a id="volume"></a>
 ## Network Volume — hết tải lại model, hết mất database
