@@ -48,16 +48,17 @@ if [ "$MODE" = list ]; then
   python3 - "$CATALOG" <<'PY'
 import json,sys,collections
 d=json.load(open(sys.argv[1]))
-g=collections.OrderedDict()
-for e in d["comfy"]:
-    g.setdefault(e["group"], [0,0])
-    g[e["group"]][0]+=e.get("sizeBytes",0); g[e["group"]][1]+=1
 tot=0
-print(f'{"GB":>8}  {"file":>4}  nhóm')
-for name,(b,n) in sorted(g.items(), key=lambda x:-x[1][0]):
-    print(f"{b/1e9:8.1f}  {n:4d}  {name}"); tot+=b
-print(f'{"-"*8}')
-print(f"{tot/1e9:8.1f}  TỔNG")
+for kind,key in (("ComfyUI","comfy"),("Ollama","ollama")):
+    g=collections.OrderedDict()
+    for e in d.get(key,[]):
+        g.setdefault(e["group"], [0,0])
+        g[e["group"]][0]+=e.get("sizeBytes",0); g[e["group"]][1]+=1
+    if not g: continue
+    print(f'\n{kind}\n{"GB":>8}  {"file":>4}  nhóm')
+    for name,(b,n) in sorted(g.items(), key=lambda x:-x[1][0]):
+        print(f"{b/1e9:8.1f}  {n:4d}  {name}"); tot+=b
+print(f'\n{"-"*8}\n{tot/1e9:8.1f}  TỔNG (cả hai)')
 PY
   exit 0
 fi
@@ -83,17 +84,25 @@ cat, models, mode = sys.argv[1], sys.argv[2], sys.argv[3]
 groups={x for x in base64.b64decode(sys.argv[4]).decode().split("\n") if x.strip()}
 ids   ={x for x in base64.b64decode(sys.argv[5]).decode().split("\n") if x.strip()}
 d=json.load(open(cat))
-sel=[e for e in d["comfy"] if mode=="all" or e["group"] in groups or e["id"] in ids]
-if not sel:
+comfy, olla = d.get("comfy",[]), d.get("ollama",[])
+pick = lambda e: mode=="all" or e["group"] in groups or e["id"] in ids
+sel_c=[e for e in comfy if pick(e)]
+sel_o=[e for e in olla  if pick(e)]
+if not sel_c and not sel_o:
     sys.exit(3)   # không in gì — shell in thông báo tiếng Việt kèm gợi ý --list
-unknown = (groups - {e["group"] for e in d["comfy"]}) | (ids - {e["id"] for e in d["comfy"]})
-for u in sorted(unknown): print(f"UNKNOWN\t{u}")
-for e in sel:
+known_g={e["group"] for e in comfy+olla}; known_i={e["id"] for e in comfy+olla}
+for u in sorted((groups-known_g) | (ids-known_i)): print(f"UNKNOWN\t{u}")
+for e in sel_c:
     dest=os.path.join(models, e["type"], e["filename"])
     have=os.path.getsize(dest) if os.path.exists(dest) else -1
     want=e.get("sizeBytes",0)
     state = "SKIP" if have==want and want>0 else ("PARTIAL" if have>=0 else "GET")
     print(f"{state}\t{e['id']}\t{e['type']}\t{e['filename']}\t{want}\t{have}\t{e['url']}")
+# Ollama đi đường HOÀN TOÀN khác: `ollama pull` chứ không aria2c, ghi vào ollama-models/ chứ không
+# comfy-models/, và không so cỡ file được (ollama chia model thành nhiều blob). Trạng thái do
+# `ollama list` quyết ở dưới, nên ở đây luôn phát ra OLLAMA và để shell lọc.
+for e in sel_o:
+    print(f"OLLAMA\t{e['id']}\tollama\t{e['model']}\t{e.get('sizeBytes',0)}\t-1\t-")
 PY
 rc=$?
 [ "$rc" -eq 3 ] && die "không mục nào khớp lựa chọn — xem './setup/preload-models.sh --list'"
@@ -101,8 +110,8 @@ rc=$?
 
 awk -F'\t' '$1=="UNKNOWN"{print "  ! không có trong catalog: " $2}' "$PLAN"
 
-NEED=$(awk -F'\t' '$1=="GET"||$1=="PARTIAL"{s+=$5-($6>0?$6:0)} END{print s+0}' "$PLAN")
-NGET=$(awk -F'\t' '$1=="GET"||$1=="PARTIAL"{n++} END{print n+0}' "$PLAN")
+NEED=$(awk -F'\t' '$1=="GET"||$1=="PARTIAL"||$1=="OLLAMA"{s+=$5-($6>0?$6:0)} END{print s+0}' "$PLAN")
+NGET=$(awk -F'\t' '$1=="GET"||$1=="PARTIAL"||$1=="OLLAMA"{n++} END{print n+0}' "$PLAN")
 NSKIP=$(awk -F'\t' '$1=="SKIP"{n++} END{print n+0}' "$PLAN")
 AVAIL=$(df -B1 --output=avail "$MODELS" 2>/dev/null | tail -1 | tr -d ' ')
 AVAIL="${AVAIL:-0}"
@@ -122,9 +131,42 @@ fi
 [ "$DRY" = 1 ] && { ok "--dry-run: dừng ở đây"; exit 0; }
 
 # ── Tải ──────────────────────────────────────────────────────────────────────
+# Ollama: cài server một lần, trỏ kho model vào volume. Cùng layout pod-volume.sh:87 tạo
+# (ollama-models/), nên pod sau `ollama list` là thấy sẵn, không pull lại.
+OLLAMA_READY=0
+ollama_setup() {
+  [ "$OLLAMA_READY" = 1 ] && return 0
+  export OLLAMA_MODELS="$VOL/ollama-models"
+  mkdir -p "$OLLAMA_MODELS" || die "không tạo được $OLLAMA_MODELS"
+  command -v ollama >/dev/null 2>&1 || {
+    say "cài Ollama …"
+    curl -fsSL https://ollama.com/install.sh | sh >/dev/null 2>&1 || die "cài Ollama lỗi"
+  }
+  # Container thường KHÔNG có systemd → `systemctl start ollama` vô nghĩa. Chạy nền rồi chờ API.
+  if ! curl -s --max-time 3 http://127.0.0.1:11434/api/version >/dev/null 2>&1; then
+    ( OLLAMA_MODELS="$OLLAMA_MODELS" nohup ollama serve >/tmp/ollama-preload.log 2>&1 & )
+    for _ in $(seq 1 30); do
+      curl -s --max-time 2 http://127.0.0.1:11434/api/version >/dev/null 2>&1 && break; sleep 1
+    done
+  fi
+  curl -s --max-time 3 http://127.0.0.1:11434/api/version >/dev/null 2>&1 \
+    || die "ollama serve không lên — xem /tmp/ollama-preload.log"
+  OLLAMA_READY=1
+}
+
 FAIL=0; DONE=0
 while IFS=$'\t' read -r state id type filename want have url; do
   case "$state" in SKIP) ok "bỏ qua $filename (đã có, đúng cỡ)"; continue ;; UNKNOWN) continue ;; esac
+  if [ "$state" = OLLAMA ]; then
+    ollama_setup
+    if ollama list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$filename"; then
+      ok "bỏ qua $filename (ollama đã có)"; NSKIP=$((NSKIP+1)); continue
+    fi
+    say "$id → ollama pull $filename  ($(echo "$want" | awk '{printf "%.1f", $1/1e9}') GB)"
+    if ollama pull "$filename"; then ok "xong $filename"; DONE=$((DONE+1))
+    else warn "ollama pull $filename lỗi"; FAIL=$((FAIL+1)); fi
+    continue
+  fi
   [ "$state" = PARTIAL ] && warn "$filename có sẵn nhưng SAI CỠ ($have ≠ $want) → tải lại"
   dir="$MODELS/$type"; mkdir -p "$dir"
   dest="$dir/$filename"; tmp="$dest.part"

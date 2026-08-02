@@ -526,6 +526,12 @@ Script dùng **chung `comfyui/catalog.json` với app**, ghi vào đúng đườ
 (`comfy-models/<type>/<filename>`, xem `api/src/models-install.js:93-95`), nên pod sau bấm
 Settings → Models AI sẽ thấy "đã cài" chứ không tải lại.
 
+Nó lo cả **model Ollama** (nhóm `Ollama (LLM nội bộ)`, 12,2 GB — dịch VN→EN cho `create-image`,
+dịch phụ đề cho `subtitle`, vision cho tryon Auto). Đường của chúng khác hẳn: `ollama pull` chứ
+không `aria2c`, và ghi vào `ollama-models/` chứ không `comfy-models/`. Script tự cài Ollama, trỏ
+`OLLAMA_MODELS` vào volume, và chạy `ollama serve` nền — container không có systemd nên
+`systemctl start ollama` vô nghĩa ở đây.
+
 Nó **kiểm cỡ file trước khi đổi tên** `.part` → tên thật. Đây không phải cẩn thận thừa: HuggingFace
 trả 200 kèm trang HTML lỗi thì `aria2c` vẫn exit 0, và bạn có một "model" vài KB mà ComfyUI chỉ báo
 lỗi ở job đầu tiên — sau khi đã thuê GPU. Sai cỡ thì script giữ `.part` và báo đỏ.
