@@ -759,4 +759,9 @@ nhiều endpoint tách theo job type · concurrency > 1 trong một worker · pr
 >100MB (đã đo 17.7MB, xem spec §Quyết định 3) · dời api/Postgres/MinIO sang VPS (bước riêng, sau
 khi serverless chứng minh chạy được).
 
-Job lỗi cứ trả về `queued` và worker local nhặt — hành vi sẵn có, không phải code mới.
+Job lỗi dừng ở `error` và người dùng bấm chạy lại — hành vi sẵn có, không phải code mới.
+
+> **Sửa 02/08/2026:** dòng trên trước đây ghi "job lỗi trả về `queued` và worker local nhặt". Sai:
+> `mc_handler.py` patch `status="error"`, và `routes/jobs.js:246` đặt `finished_at` cho `error` —
+> trạng thái cuối, không có đường quay về `queued`. Kéo theo một lỗ hổng thật (job mồ côi nằm
+> `running` vĩnh viễn) đã ghi ở §Việc phải làm trước khi bật thật trong spec.

@@ -11,8 +11,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       git wget aria2 ffmpeg libgl1 libglib2.0-0 ca-certificates build-essential pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
+# Ghim cả ComfyUI lõi, không chỉ custom node. Ghim 6 node mà thả lõi trôi theo master là ghim hụt:
+# node và lõi khớp nhau qua API nội bộ của ComfyUI, và lõi là bên đổi API. Hai build cách nhau một
+# tuần từ CÙNG một Dockerfile sẽ cho hai image khác nhau, nên khi một cái hỏng thì không có gì để
+# so. v0.29.2 (32212244, 31/07/2026) là release mới nhất tại thời điểm pod 01/08/2026 chạy job thật
+# thành công — pod clone bằng `--depth 1` từ master nên chạy đúng nhánh release này.
+# `--depth 1` không checkout được commit cụ thể; fetch riêng đúng một commit cho nhẹ.
 WORKDIR /app
-RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git
+RUN git clone --filter=blob:none https://github.com/comfyanonymous/ComfyUI.git \
+ && git -C ComfyUI checkout 322122449c9d2ba8b8df1bb517364527dd0615f1
 WORKDIR /app/ComfyUI
 RUN pip install --no-cache-dir -r requirements.txt
 
