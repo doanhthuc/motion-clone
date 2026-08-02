@@ -505,21 +505,31 @@ Tải model không cần GPU — nó là việc mạng cộng đĩa. Làm việc
 trả tiền cho một card 5090 ngồi không suốt thời gian `aria2c` chạy. Volume thì dùng lại được cho
 mọi pod sau, nên đây là việc làm **một lần cho mỗi volume**.
 
+Công thức dưới đây đã chạy thật 02/08/2026: **$0.06/giờ**, tải 38,9 GB trong **9 phút**, tổng
+khoảng **$0.08**. Cùng việc đó trên pod GPU là $1.014/giờ.
+
 ```bash
-# 1. Pod CPU, cùng datacenter với volume (EU-RO-1 — volume khoá vào đó)
-runpodctl create pod --name preload --computeType CPU --vcpu 4 \
-  --networkVolumeId wfe86wzkpm --imageName runpod/base:latest --cost 0.20
+# 1. Pod CPU, cùng datacenter với volume (EU-RO-1 — volume khoá vào đó).
+#    --image PHẢI là runpod/* : RunPod không tiêm sshd, image tự thoát sẽ restart vô hạn (#runpod-gotchas §1).
+#    --terminate-after: lưới an toàn, pod tự chết kể cả khi bạn quên.
+runpodctl pod create --name preload --compute-type CPU \
+  --image runpod/base:1.0.2-ubuntu2204 \
+  --data-center-ids EU-RO-1 --network-volume-id <vol-id> \
+  --container-disk-in-gb 20 --ssh --terminate-after 2026-08-02T21:00:00Z
 
-# 2. SSH vào, lấy code (chỉ cần catalog + script, không cần cài gì)
-git clone <repo> motion-backend && cd motion-backend/motions-studio
+# 2. SSH vào (KHÔNG chờ runtime.ports — với pod CPU nó ở null mãi, sshd vẫn lên bình thường)
+runpodctl ssh info <pod-id>          # in sẵn câu lệnh ssh
+git clone https://github.com/<owner>/motion-clone.git && cd motion-clone/motions-studio
 
-# 3. Xem có gì, rồi tải đúng nhóm cần
-POD_VOLUME=/workspace ./setup/preload-models.sh --list
-POD_VOLUME=/workspace ./setup/preload-models.sh --group "Qwen-Image-Edit" --dry-run
-POD_VOLUME=/workspace ./setup/preload-models.sh --group "Qwen-Image-Edit"
+# 3. Xem có gì, thử khan, rồi tải. VOLUME_GB = quota volume, thiếu nó là cổng chặn tắt.
+POD_VOLUME=/workspace VOLUME_GB=100 ./setup/preload-models.sh --list
+POD_VOLUME=/workspace VOLUME_GB=100 ./setup/preload-models.sh --group "Qwen-Image-Edit" --dry-run
+nohup env POD_VOLUME=/workspace VOLUME_GB=100 ./setup/preload-models.sh \
+  --group "Qwen-Image-Edit" > /workspace/preload.log 2>&1 &
 
 # 4. XOÁ pod ngay khi xong — pod CPU vẫn tính tiền theo giờ
-runpodctl remove pod <id>
+runpodctl pod delete <pod-id>
+runpodctl pod list        # phải rỗng
 ```
 
 Script dùng **chung `comfyui/catalog.json` với app**, ghi vào đúng đường app ghi
@@ -532,15 +542,32 @@ không `aria2c`, và ghi vào `ollama-models/` chứ không `comfy-models/`. Scr
 `OLLAMA_MODELS` vào volume, và chạy `ollama serve` nền — container không có systemd nên
 `systemctl start ollama` vô nghĩa ở đây.
 
-Nó **kiểm cỡ file trước khi đổi tên** `.part` → tên thật. Đây không phải cẩn thận thừa: HuggingFace
-trả 200 kèm trang HTML lỗi thì `aria2c` vẫn exit 0, và bạn có một "model" vài KB mà ComfyUI chỉ báo
-lỗi ở job đầu tiên — sau khi đã thuê GPU. Sai cỡ thì script giữ `.part` và báo đỏ.
+Nó **kiểm cỡ file trước khi đổi tên** `.part` → tên thật, và mốc kiểm là **`Content-Length` của máy
+chủ**, KHÔNG phải `sizeBytes` trong catalog. Chuyện này học bằng một lần chạy hỏng: `sizeBytes` là
+số cũ và lệch **cả hai chiều** — `qwen-vae` ghi 257.698.037 còn HF trả 253.806.246 (thiếu 3,9 MB),
+`qwen-vl-7b` ghi 9.384.497.971 còn HF trả 9.384.670.680 (**thừa** 172 KB). Lấy catalog làm mốc thì
+5/5 file tải hoàn chỉnh bị báo hỏng và kẹt ở `.part`.
 
-Chạy lại an toàn: file đã đủ cỡ thì bỏ qua, file dở thì `--continue` tải tiếp.
+Catalog vẫn còn một việc: nếu `Content-Length` **nhỏ hơn nửa** số catalog thì script dừng cả mẻ.
+So `Content-Length` với chính file tải về không bắt được trường hợp HuggingFace trả 200 kèm trang
+HTML lỗi — lúc đó header khớp thân HTML nên phép so luôn "đúng", và bạn có một "model" vài KB mà
+ComfyUI chỉ báo lỗi ở job đầu tiên, sau khi đã thuê GPU.
 
-**Dung lượng là ràng buộc thật.** Catalog đầy đủ là **245 GB**; volume mặc định của dự án là 100 GB
-và đã có sẵn ~42.6 GB nhóm Wan motion. Script cộng trước tổng cần tải, so với chỗ trống, và **dừng
-trước khi tải** nếu không đủ — thay vì chết giữa chừng sau 40 phút và để lại một đống `.part`.
+Chạy lại an toàn: file khớp `Content-Length` thì bỏ qua, file dở thì `--continue` tải tiếp.
+
+**Dung lượng là ràng buộc thật.** Catalog đầy đủ là **245 GB** (ComfyUI) + 12,2 GB (Ollama); volume
+mặc định của dự án là 100 GB.
+
+`df` **không dùng được** để đo chỗ trống ở đây. Đo thật trên pod 02/08/2026:
+
+```
+mfs#euro-3.runpod.net:9421   1.4P   1.1P   344T   76%   /workspace
+```
+
+Đó là dung lượng cả cụm MooseFS, không phải quota volume. Cổng chặn dựa vào `df` sẽ báo "còn 344TB"
+ngay cả khi volume đầy. Vì thế script đòi **`VOLUME_GB`** (quota, lấy từ `runpodctl network-volume
+list`) và trừ đi mức dùng thật đo bằng `du -sb`; thiếu biến đó thì nó **nói rõ là cổng đang tắt**
+chứ không im lặng cho qua.
 
 | Muốn thêm | Dung lượng |
 |---|---|
