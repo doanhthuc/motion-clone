@@ -446,11 +446,31 @@ Code handler, image, CI và dispatcher đã xong và đã review. Những mục 
 mà chưa đóng được, hoặc chỉ đóng được khi có endpoint thật. Không mục nào tự lộ ra trong bài kiểm
 "chạy một job thành công" — đó chính là lý do chúng nằm đây thay vì chờ phát hiện lúc chạy thật.
 
-1. **Job mồ côi nằm `running` vĩnh viễn.** Xem ghi chú ở [§Xử lý lỗi](#xu-ly-loi). Cơ chế reclaim
-   sẵn có bám vào `worker_id`, mà mỗi container serverless lại có id riêng, nên nó không bao giờ
-   kích hoạt. Cần một đường reclaim theo THỜI GIAN (job `running` quá N phút không có tiến triển)
-   chứ không theo worker. Đặt trong `mc-dispatcher.js` chứ đừng sửa `routes/jobs.js`:
-   `scripts/sync-upstream.sh` sẽ ghi đè file upstream, file mới thì sống sót.
+1. **Job mồ côi nằm `running` vĩnh viễn — CẦN NGƯỜI QUYẾT, chưa code.** Xem ghi chú ở
+   [§Xử lý lỗi](#xu-ly-loi). Cơ chế reclaim sẵn có bám vào `worker_id`, mà mỗi container serverless
+   lại có id riêng, nên nó không bao giờ kích hoạt.
+
+   Vật liệu để sửa đã có sẵn, không cần đổi schema: bảng `workers` giữ `last_seen_at`, worker nhịp
+   `POST /worker/heartbeat` mỗi 15 giây (`linux.py:1177`), và `jobs.updated_at` tự tăng theo trigger
+   mỗi lần PATCH tiến độ. Container chết thì cả hai mốc cùng đứng yên:
+
+   ```sql
+   UPDATE jobs SET status='error', error='Worker serverless mất tích', finished_at=now()
+    WHERE status='running' AND worker_id LIKE 'serverless-%'
+      AND updated_at < now() - ($1 || ' seconds')::interval
+      AND NOT EXISTS (SELECT 1 FROM workers w
+                       WHERE w.worker_id = jobs.worker_id
+                         AND w.last_seen_at > now() - ($1 || ' seconds')::interval)
+   ```
+
+   Đặt trong `mc-dispatcher.js`, đừng sửa `routes/jobs.js` — `scripts/sync-upstream.sh` ghi đè file
+   upstream, file mới thì sống sót. Lọc `serverless-%` để không đụng job của worker local/wf-worker.
+
+   **Lý do chưa làm:** đặt ngưỡng quá ngắn thì nó GIẾT job đang chạy thật. Heartbeat chỉ nhịp trong
+   vòng chờ ComfyUI; các pha tải input và upload output có im lặng bao lâu thì chưa ai đo. Rủi ro
+   hỏng một job đã trả tiền GPU lớn hơn phiền toái của một thanh tiến trình treo — và job treo
+   KHÔNG tốn thêm tiền (dispatcher chỉ đếm `queued`). Lấy số đo im lặng thật ở mục 5 trước, rồi
+   chọn ngưỡng theo số đó.
 2. **Một nguồn worker tại một thời điểm.** [§Kiến trúc](#kien-truc) chốt "một nguồn worker", nhưng
    `scripts/pod-bootstrap.sh` hiện dựng dispatcher mà vẫn để `pm2 worker` local chạy. Hai nguồn
    cùng claim thì serverless vẫn tỉnh dậy, thấy hàng đợi rỗng, và tính tiền cold start cho không.
@@ -463,6 +483,8 @@ mà chưa đóng được, hoặc chỉ đóng được khi có endpoint thật.
    `DISPATCH_JOB_TYPES` của dispatcher. Lệch một bên thì hoặc job nằm `queued` vĩnh viễn, hoặc
    worker claim job nó không chạy được rồi đặt `error`.
 5. **Số đo cần ghi lại từ job thật đầu tiên**: cold start thật (chỉnh `DISPATCH_COOLDOWN_SEC` theo
-   nó), kích thước output thật, và ComfyUI có khởi động sạch trên commit đã ghim `32212244`
-   (v0.29.2) hay không — commit này chọn theo ngày pod chạy thành công, chưa có job nào chạy qua
-   đúng image này để xác nhận.
+   nó), kích thước output thật, khoảng IM LẶNG dài nhất giữa hai heartbeat trong suốt một job
+   (đây là con số quyết định ngưỡng ở mục 1 — đo bằng
+   `SELECT max(gap) FROM …` hoặc đơn giản là xem `workers.last_seen_at` nhảy thế nào trong lúc job
+   chạy), và ComfyUI có khởi động sạch trên commit đã ghim `32212244` (v0.29.2) hay không — commit
+   này chọn theo ngày pod chạy thành công, chưa có job nào chạy qua đúng image này để xác nhận.
