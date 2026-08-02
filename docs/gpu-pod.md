@@ -40,7 +40,9 @@ quyền bắt buộc.
 
 **0.3 · Network Volume** — [chi tiết](#network-volume)
 
-Datacenter và dung lượng **không sửa được sau khi tạo**. Chọn datacenter còn stock GPU bạn thuê:
+**Datacenter** không sửa được sau khi tạo — chọn nơi còn stock GPU bạn thuê. **Dung lượng** thì
+nới lên được (`runpodctl network-volume update <id> --size <GB>`, chỉ tăng, không giảm), nên
+đừng mua dư ngay từ đầu: nó tính tiền hằng tháng kể cả khi không có pod nào.
 
 ```bash
 runpodctl gpu list -o json | python3 -c 'import sys,json
@@ -495,6 +497,54 @@ rồi PM2 restart mãi — **37 lần** trước khi bị phát hiện, và `pm2
 
 `mount --bind` bị container từ chối. `ecosystem.config.cjs:58` đọc `MINIO_DATA_DIR`, nên
 `pod-bootstrap.sh` trỏ MinIO thẳng vào `$POD_VOLUME/minio`, bỏ qua symlink.
+
+<a id="preload"></a>
+## Tải model vào volume TRƯỚC, bằng máy CPU rẻ tiền
+
+Tải model không cần GPU — nó là việc mạng cộng đĩa. Làm việc đó trên pod GPU $1.014/giờ nghĩa là
+trả tiền cho một card 5090 ngồi không suốt thời gian `aria2c` chạy. Volume thì dùng lại được cho
+mọi pod sau, nên đây là việc làm **một lần cho mỗi volume**.
+
+```bash
+# 1. Pod CPU, cùng datacenter với volume (EU-RO-1 — volume khoá vào đó)
+runpodctl create pod --name preload --computeType CPU --vcpu 4 \
+  --networkVolumeId wfe86wzkpm --imageName runpod/base:latest --cost 0.20
+
+# 2. SSH vào, lấy code (chỉ cần catalog + script, không cần cài gì)
+git clone <repo> motion-backend && cd motion-backend/motions-studio
+
+# 3. Xem có gì, rồi tải đúng nhóm cần
+POD_VOLUME=/workspace ./setup/preload-models.sh --list
+POD_VOLUME=/workspace ./setup/preload-models.sh --group "Qwen-Image-Edit" --dry-run
+POD_VOLUME=/workspace ./setup/preload-models.sh --group "Qwen-Image-Edit"
+
+# 4. XOÁ pod ngay khi xong — pod CPU vẫn tính tiền theo giờ
+runpodctl remove pod <id>
+```
+
+Script dùng **chung `comfyui/catalog.json` với app**, ghi vào đúng đường app ghi
+(`comfy-models/<type>/<filename>`, xem `api/src/models-install.js:93-95`), nên pod sau bấm
+Settings → Models AI sẽ thấy "đã cài" chứ không tải lại.
+
+Nó **kiểm cỡ file trước khi đổi tên** `.part` → tên thật. Đây không phải cẩn thận thừa: HuggingFace
+trả 200 kèm trang HTML lỗi thì `aria2c` vẫn exit 0, và bạn có một "model" vài KB mà ComfyUI chỉ báo
+lỗi ở job đầu tiên — sau khi đã thuê GPU. Sai cỡ thì script giữ `.part` và báo đỏ.
+
+Chạy lại an toàn: file đã đủ cỡ thì bỏ qua, file dở thì `--continue` tải tiếp.
+
+**Dung lượng là ràng buộc thật.** Catalog đầy đủ là **245 GB**; volume mặc định của dự án là 100 GB
+và đã có sẵn ~42.6 GB nhóm Wan motion. Script cộng trước tổng cần tải, so với chỗ trống, và **dừng
+trước khi tải** nếu không đủ — thay vì chết giữa chừng sau 40 phút và để lại một đống `.part`.
+
+| Muốn thêm | Dung lượng |
+|---|---|
+| Tạo ảnh / tryon (Qwen-Image-Edit) | **31,5 GB** — vừa chỗ trống hiện có |
+| Flux (text→image) | 34,5 GB |
+| LTX-2.3 (node SS, `video`, `text-to-video`) | 39,8 GB |
+| Wan I2V · Wan T2V | 47,0 · 44,5 GB |
+
+Thiếu chỗ thì nới volume (`network-volume update --size`), nhưng nhớ nó tính tiền hằng tháng mãi
+mãi theo mức mới — rẻ hơn là chỉ tải nhóm thật sự dùng.
 
 <a id="deploy-shapes"></a>
 ## Hai hình dạng deploy — chọn bằng hai biến
