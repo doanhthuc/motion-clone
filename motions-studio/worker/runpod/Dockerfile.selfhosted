@@ -11,6 +11,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       git wget aria2 ffmpeg libgl1 libglib2.0-0 ca-certificates build-essential pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
+# pytorch/pytorch:2.12.1-* dựng trên Ubuntu 24.04, nơi Python hệ thống có
+# /usr/lib/python3.12/EXTERNALLY-MANAGED (PEP 668) → `pip install` từ chối cài thẳng vào system
+# site-packages và build chết ngay ở requirements.txt của ComfyUI. Trong container thì "phá gói hệ
+# thống" chính là điều ta muốn: cả image này chỉ phục vụ một ứng dụng, dựng venv thêm chỉ tổ phải
+# nhớ activate nó ở entrypoint và ở mọi lệnh pip phía dưới.
+# Đặt bằng ENV (không phải cờ --break-system-packages rải từng dòng) để KHÔNG có lệnh pip nào phía
+# sau — kể cả lệnh thêm về sau — quên mất nó.
+# Ghi chú: worker/runpod/Dockerfile (bản Task Cloud) cùng base, cùng lệnh pip, KHÔNG có dòng này —
+# nó cũng không build được. Chưa sửa vì nó là file upstream, sync-upstream sẽ ghi đè.
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+
 # Ghim cả ComfyUI lõi, không chỉ custom node. Ghim 6 node mà thả lõi trôi theo master là ghim hụt:
 # node và lõi khớp nhau qua API nội bộ của ComfyUI, và lõi là bên đổi API. Hai build cách nhau một
 # tuần từ CÙNG một Dockerfile sẽ cho hai image khác nhau, nên khi một cái hỏng thì không có gì để
