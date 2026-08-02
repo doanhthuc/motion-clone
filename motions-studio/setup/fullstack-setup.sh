@@ -10,7 +10,7 @@
 #       Bạn phải tạo Public Hostname trên Cloudflare trước/sau: FE→localhost:2030, BE→localhost:8080.
 #   • Không có token → chạy qua IP VPS (http://<IP>:2030). Cần VPS có IP public + mở cổng.
 #
-#   git clone git@github.com:ALD-Project/motion-backend.git && cd motion-backend
+#   git clone git@github.com:doanhthuc/motion-clone.git && cd motion-clone/motions-studio
 #   ./setup/fullstack-setup.sh
 #
 # Hỏi: URL Frontend · URL Backend · Cloudflare API/Tunnel Token · SuperAdmin email · Gmail · App Password.
@@ -112,7 +112,11 @@ cf_api_preflight_fullstack() {
   ok "Cloudflare API Token preflight OK cho FE+BE."
 }
 
-MOTIONS_REPO="${MOTIONS_REPO:-git@github.com:ALD-Project/motions.git}"
+# Không còn default trỏ ALD-Project (source đã mua): fork này tự sở hữu code từ 02/08/2026, và
+# repo đó bạn CHỈ có quyền đọc — `git push --dry-run` trả "Write access not granted", đo 02/08/2026.
+# Để trống thì bước clone bên dưới die kèm hướng dẫn, thay vì lặng lẽ kéo về bản của người khác.
+# Trên GPU pod thì biến này không dùng tới: scripts/pod-fe.sh rsync motions/ từ máy bạn lên.
+MOTIONS_REPO="${MOTIONS_REPO:-}"
 MOTIONS_DIR="${MOTIONS_DIR:-$HOME/motions}"
 MOTIONS_BRANCH="${MOTIONS_BRANCH:-development}"
 FE_PORT="${FE_PORT:-2030}"
@@ -344,6 +348,9 @@ if [ -d "$MOTIONS_DIR/.git" ]; then
     warn "Không cập nhật được motions từ origin/$MOTIONS_BRANCH (giữ working tree hiện tại)."
   fi
 else
+  [ -n "$MOTIONS_REPO" ] || die "MOTIONS_REPO trống — đặt repo chứa frontend rồi chạy lại:
+      MOTIONS_REPO=git@github.com:<bạn>/<repo>.git ./setup/fullstack-setup.sh
+    Trên GPU pod thì dùng 'make gpu-fe' thay vì đường này (nó rsync motions/ từ máy bạn)."
   git clone --branch "$MOTIONS_BRANCH" --single-branch "$MOTIONS_REPO" "$MOTIONS_DIR" \
     || die "Clone motions nhánh $MOTIONS_BRANCH lỗi — kiểm tra SSH key GitHub có quyền đọc repo."
 fi

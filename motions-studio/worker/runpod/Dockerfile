@@ -8,14 +8,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git wget aria2 ffmpeg libgl1 libglib2.0-0 ca-certificates build-essential pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-# ── ALD-local 02/08/2026 - PEP 668: không có dòng này thì image KHÔNG build được ───────────────
+# ── PEP 668: không có dòng này thì image KHÔNG build được ─────────────────────────────────────
 # Base Ubuntu 24.04 có /usr/lib/python3.12/EXTERNALLY-MANAGED → pip từ chối cài vào system
 # site-packages, build chết ở requirements.txt của ComfyUI với một bức tường chữ về python3-full và
 # pipx, không hề nói rằng bạn đang ở trong container. Đo thật 02/08/2026 trên GitHub Actions bằng
 # Dockerfile.selfhosted cạnh đây (cùng base, cùng lệnh pip).
 # Lệnh build trong README-runpod.md và ở đầu file này vì thế đang KHÔNG chạy được — dòng này sửa nó.
-# Sửa CỤC BỘ trên file upstream: scripts/check-local-deltas.sh canh dòng này, và
-# scripts/sync-upstream.sh gọi nó để lần sync sau không âm thầm xoá đi.
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
 
 # ───────────────── ComfyUI + custom nodes (ĐỒNG BỘ với comfyui/Dockerfile) ─────────────────

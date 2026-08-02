@@ -38,12 +38,22 @@ Toàn bộ quy trình theo thứ tự — dựng lần đầu, dùng hằng ngà
 `docs/gpu-pod.md` mục **Runbook**. Đọc nó trước lần thuê đầu tiên, đặc biệt phần chi phí:
 **pod dừng vẫn tính tiền ổ đĩa**, và Network Volume tính tiền cả khi không có pod nào.
 
-## Quan hệ với upstream
+## Nguồn gốc code
 
-`motions/` và `motions-studio/` có nguồn gốc từ `ALD-Project` (source đã mua). Bản theo dõi
-upstream giữ riêng ở `~/Desktop/motion-upstream-tracking/`, đã khóa đường push để không đẩy
-nhầm lên đó. Lấy bản mới: `git pull` trong bản theo dõi → rsync sang đây → chạy lại
-`motions-studio/setup/scrub-secrets.sh`.
+`motions/` và `motions-studio/` khởi nguồn từ `ALD-Project` (source đã mua). **Từ 02/08/2026 repo
+này không lấy bản mới từ đó nữa** — hai thư mục đó là code của chúng ta, sửa thẳng vào, không có
+khái niệm "file upstream đừng sửa".
+
+Kéo theo, đã bỏ hẳn: `scripts/sync-upstream.sh`, `make sync-upstream`, `UPSTREAM_SHA`, và cổng
+`check-local-deltas.sh` (nó chỉ tồn tại để giữ các bản sửa cục bộ khỏi bị `rsync` của sync ghi đè).
+Lịch sử của chúng còn trong git nếu cần dựng lại.
+
+Quyền trên `ALD-Project` đo ngày 02/08/2026: **đọc được, không push được** (`git push --dry-run` →
+`Write access to repository not granted`). Nên sửa tận gốc bên đó là việc không làm được — đó là
+một lý do nữa để dứt khoát sở hữu code ở đây.
+
+`motions-studio/setup/scrub-secrets.sh` **vẫn giữ**, nhưng vì lý do khác trước: nó không còn phải
+dọn lại secret mà sync mang về, nó là cổng chặn trước mỗi commit lên một repo public. Xem §Secrets.
 
 ## Secrets
 

@@ -1,3 +1,14 @@
+# ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+# │ FILE NÀY KHÔNG CHẠY. GitHub Actions chỉ đọc `.github/workflows/` ở GỐC repo, còn file này    │
+# │ nằm trong `motions-studio/.github/`. Nó chưa từng chạy lần nào trong repo này.               │
+# │                                                                                             │
+# │ Giữ lại làm tham chiếu, KHÔNG dời lên gốc mà chưa sửa: các giá trị bên dưới là của           │
+# │ ALD-Project (source đã mua) chứ không phải của bạn — registry `ghcr.io/ald-project/...` bạn  │
+# │ không có quyền ghi, và secrets VPS_* là của hạ tầng họ. Dời lên gốc nguyên trạng thì job     │
+# │ chạy và fail ở bước đăng nhập registry.                                                     │
+# │ Muốn dùng thật: đổi sang registry của bạn, khai lại secrets, rồi mới chuyển sang .github/    │
+# │ workflows/ ở gốc. Xem .github/workflows/build-serverless-image.yml làm mẫu đã hoạt động.     │
+# └─────────────────────────────────────────────────────────────────────────────────────────────┘
 # Push lên main → tự deploy lên VPS: rsync code + apply migration + docker compose up -d --build.
 # Cần GitHub Secrets (Settings → Secrets and variables → Actions):
 #   VPS_HOST      IP/hostname VPS            (vd 101.99.25.165 hoặc motion-server.datools.info)

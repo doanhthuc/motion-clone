@@ -29,14 +29,8 @@ clean: down ## Remove FE node_modules/.nuxt/.output (keeps motions/.env)
 
 env = $(shell grep -E '^$(1)=' .env 2>/dev/null | cut -d= -f2- | sed -E 's/[[:space:]]*\#.*$$//' | tr -d '"')
 
-sync-upstream: ## Import upstream (ALD-Project) + re-scrub its secrets (PULL=1 to git pull, COMMIT=1 to commit)
-	@bash scripts/sync-upstream.sh
-
 scrub-check: ## Gate: fail if any third-party credential or personal email is tracked
 	@bash motions-studio/setup/scrub-secrets.sh --check
-
-check-deltas: ## Gate: các bản sửa cục bộ trên file upstream còn nguyên (sync-upstream tự gọi)
-	@bash scripts/check-local-deltas.sh
 
 gpu-preflight: ## Check root .env is complete BEFORE you spend money on a pod
 	@bash scripts/gpu-preflight.sh

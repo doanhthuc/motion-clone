@@ -5,6 +5,11 @@ Trạng thái: **ĐÃ CHẠY THẬT 02/08/2026.** 5 job motion qua endpoint serv
 xem [§Đã chạy thật](#da-chay-that) để có toàn bộ số đo, và
 [§Việc phải làm trước khi bật thật](#todo-truoc-task5) — mọi mục ở đó nay đã đóng. Ba giả định ban đầu đo trên pod 01/08/2026 ở [§Đo thật](#measured).
 
+> **Ghi chú 02/08/2026:** spec này nhiều chỗ lý luận theo giả định "`motions-studio/` là code
+> upstream, đừng sửa". Giả định đó đã bỏ — repo không sync từ `ALD-Project` nữa. Các quyết định
+> chịu ảnh hưởng (dispatcher là tiến trình riêng, mọi thứ là file mới) vẫn giữ vì chúng vẫn đúng
+> vì lý do khác, không phải vì ràng buộc upstream.
+
 ## Vấn đề
 
 GPU pod tính tiền theo giờ suốt thời gian tồn tại, kể cả khi không có job nào. Với tải thưa —

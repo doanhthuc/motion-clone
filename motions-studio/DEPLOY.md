@@ -177,9 +177,12 @@ sudo systemctl restart cloudflared      # restart tunnel
 Dùng khi muốn 1 VPS chạy CẢ backend (`motion-backend`) lẫn frontend (`motions`) — end-user chỉ mở 1 link.
 
 ```bash
-git clone git@github.com:ALD-Project/motion-backend.git && cd motion-backend
+# Trong fork này, backend là thư mục con motions-studio/ của monorepo, không phải repo riêng:
+git clone git@github.com:doanhthuc/motion-clone.git && cd motion-clone/motions-studio
 ./setup/fullstack-setup.sh
 ```
+> Lệnh gốc của upstream (`git clone …ALD-Project/motion-backend.git`) không dùng được ở đây: repo
+> đó là source đã mua, chỉ có quyền đọc, và code của nó nay sống trong monorepo này.
 Hỏi tương tác: **URL Frontend · URL Backend · Cloudflare API Token · email SuperAdmin · Gmail + App Password**.
 
 **2 chế độ — tự chọn theo việc có Cloudflare API Token hay không:**

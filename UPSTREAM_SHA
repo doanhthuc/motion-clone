@@ -1,4 +1,0 @@
-# Upstream commits this monorepo was last synced from.
-# Written by scripts/sync-upstream.sh — do not edit by hand.
-motions-studio=b9c3c34 (main)
-motions=6da2e4c (main)

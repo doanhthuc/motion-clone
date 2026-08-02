@@ -12,6 +12,12 @@ Spec: [`docs/superpowers/specs/2026-08-01-serverless-huong-a-design.md`](../spec
 
 ## Global Constraints
 
+> **HẾT HIỆU LỰC 02/08/2026 — ràng buộc đầu tiên bên dưới.** Repo này không lấy bản mới từ
+> `ALD-Project` nữa, nên không còn "file upstream": `motions-studio/` là code của chúng ta, sửa
+> thẳng vào. `scripts/sync-upstream.sh` và cổng delta đã bị xoá. Giữ nguyên chữ bên dưới làm hồ sơ
+> vì nó giải thích vì sao dispatcher là một tiến trình riêng thay vì một hook trong `jobs.js` —
+> lý do đó đã lỗi thời, nhưng thiết kế vẫn tốt (poll 5 giây là vô nghĩa so với cold start 1-3 phút).
+
 - **Không sửa file upstream nào trong `motions-studio/`.** `scripts/sync-upstream.sh:81` rsync **không** dùng `--delete`, nên file MỚI sống sót qua sync còn file upstream ĐÃ SỬA bị ghi đè. Mọi thứ trong plan này là file mới, trừ `scripts/pod-bootstrap.sh` và `.github/` vốn thuộc fork.
 - **Mỗi container serverless phải có `WORKER_ID` riêng.** `api/src/routes/jobs.js:219-224` reclaim job theo `worker_id` cộng `active_job_ids` mỗi lần có ai gọi `/worker/claim`; `worker_runtime/linux.py:36` mặc định `worker-1`. Trùng id ⇒ worker B chuyển job đang chạy của worker A sang `error`.
 - **Registry:** `ghcr.io/${{ github.repository_owner }}/motion-serverless`. Không gõ cứng tên tài khoản.

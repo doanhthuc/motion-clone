@@ -9,9 +9,13 @@
 # IDEMPOTENT: chạy lại bao nhiêu lần cũng ra cùng kết quả.
 #
 # VÌ SAO PHẢI CÓ SCRIPT NÀY thay vì sửa tay một lần:
-#   sync-upstream.sh dùng rsync để lấy bản mới từ upstream, và rsync GHI ĐÈ
-#   nguyên các file đã scrub → mọi secret quay trở lại. Script này được gọi lại
-#   sau mỗi lần sync. Sửa tay là loại lỗi bạn sẽ không nhớ ra.
+#   Ban đầu là vì rsync của sync-upstream.sh ghi đè các file đã scrub, đưa mọi
+#   secret quay lại. Từ 02/08/2026 fork này KHÔNG lấy bản mới từ upstream nữa
+#   (xem README §Nguồn gốc code), nên vai trò đó hết. Cái CÒN lại mới là lý do
+#   thật để giữ nó: `--check` là cổng chặn trước mỗi commit lên một repo PUBLIC.
+#   Secret không chỉ về theo đường sync — nó về theo đường ai đó dán một key vào
+#   .env.example, hay thêm một seed có email thật. Cổng theo pattern bắt được cả
+#   hai, và bắt được ở lúc còn sửa được.
 #
 # HAI NGUYÊN TẮC BẮT BUỘC:
 #   1. Dò theo PATTERN, không theo số dòng — upstream đổi thứ tự dòng vẫn bắt được.
@@ -155,10 +159,11 @@ _scrub_emails db/seed_users.sql                'user-mau-1@example.com'
 _scrub_emails db/seeds/face_motion_workflow.sql 'admin-mau@example.com'
 
 # ── 5b. Cưỡng chế .gitignore ────────────────────────────────────────────────
-# rsync trong sync-upstream.sh ghi đè .gitignore bằng bản của upstream → các dòng
-# fork thêm vào BIẾN MẤT, và lớp bảo vệ mất im lặng: lần sau ai vô tình tạo
-# setup/templates.json là nó lọt vào git. Đã xảy ra thật ở lần sync đầu tiên.
-# Nên coi đây là một mục scrub, không phải việc-làm-một-lần.
+# Hai dòng này từng biến mất một lần thật: rsync của sync-upstream.sh ghi đè
+# .gitignore bằng bản upstream, và lớp bảo vệ mất IM LẶNG — lần sau ai vô tình
+# tạo setup/templates.json là nó lọt vào git. Đường sync đó đã bỏ (02/08/2026),
+# nhưng cưỡng chế vẫn giữ: .gitignore là thứ người ta dọn dẹp mà không nghĩ, và
+# hậu quả của việc mất đúng hai dòng này là một secret vào repo public.
 GITIGNORE_MUST=(setup/templates.json setup/pod.env)
 GI="$ROOT/.gitignore"
 _missing_gi=""

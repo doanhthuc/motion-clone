@@ -1,3 +1,8 @@
+# ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+# │ FILE NÀY KHÔNG CHẠY. GitHub Actions chỉ đọc `.github/workflows/` ở GỐC repo, còn file này    │
+# │ nằm trong `motions/.github/`. Muốn bật typecheck cho CI thì chuyển nó lên `.github/          │
+# │ workflows/` ở gốc và sửa đường dẫn cho đúng layout monorepo (`motions/` là thư mục con).     │
+# └─────────────────────────────────────────────────────────────────────────────────────────────┘
 # ALD 15/06/2026 - Type-check gate (non-blocking). Hiện lỗi type để dọn dần, KHÔNG chặn build.
 # strict/typeCheck đang off trong nuxt.config → chạy lần đầu có thể nhiều lỗi tồn đọng → continue-on-error.
 name: typecheck

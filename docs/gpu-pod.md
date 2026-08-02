@@ -479,8 +479,6 @@ ssh -p $GPU_SSH_PORT root@$GPU_SSH_HOST \
 Kiểm dump có toàn vẹn không trước khi tin: `gzip -t <file>`. Một bản dump hỏng còn tệ hơn không
 có, vì nó khiến bạn yên tâm destroy.
 
-*Sửa cho việc này nằm trong `motions-studio/setup/pod-volume.sh`, tức là sửa **cục bộ trên file
-upstream**. Phải làm lại sau mỗi `make sync-upstream`.*
 
 ### 3 · MinIO từ chối symlink làm drive
 
@@ -694,46 +692,25 @@ Animate **từ volume** → DWPose → sampling → VAE decode → MinIO → API
 Thiếu `GPU_SSH_HOST`/`GPU_SSH_PORT` trong `.env` thì lớp 3-5 tự bỏ qua kèm thông báo rõ, không
 im lặng báo pass.
 
-## Lấy bản mới từ upstream: `make sync-upstream`
+## Không còn lấy bản mới từ upstream
 
-```bash
-make sync-upstream           # rsync + scrub + gate, rồi cho bạn xem diff
-make sync-upstream PULL=1    # git pull bản theo dõi trước
-make sync-upstream COMMIT=1  # commit nếu gate pass
-```
+`motions/` và `motions-studio/` khởi nguồn từ `ALD-Project` (source đã mua). **Từ 02/08/2026 repo
+này không sync nữa** — coi hai thư mục đó là code của mình, sửa thẳng vào.
 
-Bản theo dõi upstream nằm ở `../motion-upstream-tracking/` (ngoài repo này, đã khóa push). Đổi chỗ
-bằng `UPSTREAM_DIR=`.
+Đã xoá: `scripts/sync-upstream.sh`, `make sync-upstream`, `UPSTREAM_SHA`, `scripts/check-local-deltas.sh`
+và `make check-deltas`. Cái cổng delta cuối chỉ tồn tại để giữ các bản sửa cục bộ khỏi bị `rsync`
+của sync ghi đè âm thầm; không còn sync thì không còn gì ghi đè, nên nó là nghi thức rỗng.
 
-**Vì sao phải là script:** `rsync` ghi đè các file `scrub-secrets.sh` đã dọn, nên mỗi lần sync là
-credentials của upstream quay lại — `DEFAULT_API_KEY` (key **chia sẻ** giữa mọi bản deploy của
-source này), admin key Motion Task Cloud, `setup/templates.json`, vài email cá nhân, **và các dòng
-`.gitignore` mà fork thêm vào**. Lần sync đầu tiên đã mất đúng 4 dòng `.gitignore` đó, nên
-`scrub-secrets.sh` giờ cưỡng chế luôn cả chúng.
+Hai thứ trước đây phải canh giờ đơn giản là code của ta:
 
-Script từ chối chạy khi working tree bẩn: nếu không thì trong diff kết quả bạn không phân biệt được
-hunk nào của upstream, hunk nào của mình — mà diff đó là lần review duy nhất bản import này có.
-Ghi đè bằng `FORCE=1`.
+| Từng là "delta cục bộ" | Bây giờ |
+|---|---|
+| `ENV PIP_BREAK_SYSTEM_PACKAGES=1` trong `comfyui/Dockerfile` và `worker/runpod/Dockerfile` | dòng bình thường trong file của mình |
+| `VOLUME_PGDATA=0` + kiểm MinIO hai-cách-hợp-lệ trong `setup/pod-volume.sh` | như trên |
 
-Không dùng `--delete`: nó sẽ xoá mọi file fork thêm vào (`pod-volume.sh`, `scrub-secrets.sh`,
-specs). Đánh đổi: file bị xoá ở upstream thì còn sót lại đây. Đó là hướng sai an toàn hơn.
+`motions-studio/setup/scrub-secrets.sh` thì **giữ**: nó không còn dọn secret mà sync mang về, nhưng
+`--check` vẫn là cổng chặn trước mỗi commit lên repo public — secret về theo đường ai đó dán một key
+vào `.env.example` cũng nguy hiểm y như về theo đường sync.
 
-<a id="local-deltas"></a>
-### Bản sửa cục bộ trên file upstream — `make check-deltas`
-
-Không dùng `--delete` vẫn **không** cứu được file upstream mà fork này đã sửa: `rsync` ghi đè chúng,
-âm thầm. Trước khi có cổng này, giữ được delta hay không phụ thuộc vào việc có ai nhớ ra, và mỗi lần
-quên thì hỏng chỉ lộ ra ở lần build hoặc lần dựng pod sau, dưới một triệu chứng **không liên quan gì
-tới chữ "sync"** — image chết kèm một bức tường chữ về `pipx`, hoặc Postgres chết ở bước rsync PGDATA.
-
-`make sync-upstream` giờ tự gọi cổng này và **từ chối commit** nếu thiếu delta nào:
-
-| File upstream | Phải còn | Mất thì hỏng ra sao |
-|---|---|---|
-| `comfyui/Dockerfile` | `ENV PIP_BREAK_SYSTEM_PACKAGES=1` | image KHÔNG build được (PEP 668) |
-| `worker/runpod/Dockerfile` | `ENV PIP_BREAK_SYSTEM_PACKAGES=1` | như trên, image Task Cloud |
-| `setup/pod-volume.sh` | `VOLUME_PGDATA:-1` | bootstrap chết ở `rsync PGDATA` ([§2](#runpod-gotchas)) |
-| `setup/pod-volume.sh` | `trỏ thẳng volume, không cần symlink` | `--check` báo đỏ oan cho MinIO đúng cấu hình |
-
-Thêm delta mới thì thêm một dòng vào `DELTAS` trong `scripts/check-local-deltas.sh`. Chọn chuỗi canh
-là **dòng lệnh thật**, đừng chọn dòng bình luận — bình luận dễ bị viết lại hơn.
+Nếu sau này muốn lấy lại một bản vá từ upstream: `git clone` họ vào đâu đó, `diff` bằng tay, chọn
+hunk. Không đáng dựng lại cả bộ máy sync cho việc đó.

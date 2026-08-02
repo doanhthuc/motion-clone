@@ -166,8 +166,8 @@ if [ -n "$POD_VOLUME" ]; then
 fi
 
 # ── Dispatcher serverless (tuỳ chọn) ──────────────────────────────────────────
-# Đăng ký bằng `pm2 start <script>` chứ không thêm vào ecosystem.config.cjs: file đó là upstream,
-# sửa vào là mất sau make sync-upstream.
+# Đăng ký bằng `pm2 start <script>` chứ không thêm vào ecosystem.config.cjs: dispatcher là tuỳ chọn,
+# bật/tắt theo .env, nên đừng nhồi vào file khai báo mọi tiến trình bắt buộc.
 #
 # Cổng kiểm PHẢI đòi thấy dòng "bắt đầu", không chỉ đòi VẮNG dòng lỗi. Phiên bản cũ chỉ grep
 # 'tick lỗi:' và vì thế XANH khi log RỖNG HOÀN TOÀN — đúng cái đã xảy ra 02/08/2026: pm2 đặt

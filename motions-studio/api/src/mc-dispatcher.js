@@ -4,8 +4,8 @@
 // Worker tỉnh dậy TỰ gọi /worker/claim — dispatcher không giao job cho ai cả, chỉ đánh thức.
 // Claim đã atomic trong Postgres nên thừa một worker chỉ tốn vài giây, không sai kết quả.
 //
-// File MỚI, không sửa file upstream nào: scripts/sync-upstream.sh không dùng --delete nên file
-// mới sống sót qua sync, còn file upstream đã sửa thì bị ghi đè.
+// File riêng, không nhồi vào ecosystem.config.cjs: giữ dispatcher tách khỏi cấu hình PM2 chung để
+// bật/tắt được bằng một biến môi trường mà không phải sửa file khai báo mọi tiến trình khác.
 import { query } from "./db.js"
 
 const ENDPOINT = process.env.RUNPOD_ENDPOINT_ID || ""
