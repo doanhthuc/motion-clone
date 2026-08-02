@@ -642,7 +642,7 @@ Rồi tạo qua dashboard (runpod.io/console/serverless → New Endpoint) với 
 | Min / Max Workers | 0 / 3 |
 | Idle Timeout | 120 s |
 | FlashBoot | ON |
-| Env | `API_URL=https://api.doanhthuc.xyz` · `WORKER_TOKEN=<API_KEY trong .env backend>` · `JOB_TYPES=motion,teen-flycam,trend-tiktok,enhance` |
+| Env | `API_URL=https://api.doanhthuc.xyz` · `WORKER_TOKEN=<WORKER_TOKEN trong .env backend — KHÔNG phải API_KEY>` · `JOB_TYPES=motion,teen-flycam,trend-tiktok,enhance` |
 
 Chép Endpoint ID vào `.env` gốc là `RUNPOD_ENDPOINT_ID`, và API key RunPod vào `RUNPOD_API_KEY`.
 
@@ -654,7 +654,7 @@ EP=$(grep -E '^RUNPOD_ENDPOINT_ID=' .env | cut -d= -f2-)
 KEY=$(grep -E '^RUNPOD_API_KEY=' .env | cut -d= -f2-)
 curl -s -X POST "https://api.runpod.ai/v2/$EP/runsync" \
   -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
-  -d '{"input":{}}' | python3 -m json.tool
+  -d '{"input":{"wake":1}}' | python3 -m json.tool
 ```
 Expected: `{"output": {"ok": true, "claimed": false}}` khi hàng đợi rỗng. Đây chứng minh container boot được, `API_URL`/`WORKER_TOKEN` đúng, và `/worker/claim` tới được api. Cold start lần đầu 1-3 phút.
 

@@ -78,11 +78,18 @@ async function queuedRows() {
   return rows
 }
 
+// `input` PHẢI khác rỗng. SDK runpod kiểm bằng độ chân trị của Python, nên `{}` (falsy) bị coi là
+// THIẾU: request chết với "Job has missing field(s): id or input.", RunPod thử lại một lần rồi trả
+// "job timed out after 1 retries" — một thông báo không hề gợi ý rằng lỗi nằm ở payload. Đo thật
+// trên endpoint fggbwsbhidwbdi ngày 02/08/2026. Handler KHÔNG đọc `input` (nó tự claim), nên nội
+// dung không quan trọng, chỉ cần có một khoá.
+const WAKE_BODY = JSON.stringify({ input: { wake: 1 } })
+
 async function fireOne() {
   const res = await fetch(`https://api.runpod.ai/v2/${ENDPOINT}/run`, {
     method: "POST",
     headers: { Authorization: `Bearer ${API_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ input: {} }),
+    body: WAKE_BODY,
   })
   if (!res.ok) throw new Error(`/run ${res.status} ${(await res.text()).slice(0, 200)}`)
   return (await res.json())?.id || "?"
