@@ -8,6 +8,26 @@ set -euo pipefail
 # lỗi này xảy ra ngay job thứ hai, và triệu chứng ("Worker khởi động lại giữa chừng") không hề
 # gợi ý nguyên nhân. Ưu tiên id RunPod cấp; không có thì sinh ngẫu nhiên.
 export WORKER_ID="${WORKER_ID:-serverless-${RUNPOD_POD_ID:-$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')}}"
+
+VOL="${MOTION_VOLUME:-/runpod-volume}"
+
+# ── Log ra Network Volume ─────────────────────────────────────────────────────
+# Container serverless là hộp đen: RunPod KHÔNG có API log (không `runpodctl serverless logs`, REST
+# v1 chỉ có /endpoints, GraphQL tắt introspection) — log chỉ xem được bằng mắt trên dashboard. Khi
+# một request trả về "job timed out" thì không có cách nào bằng lệnh để biết container chết ở đâu.
+# Volume thì pod đọc được, nên đổ toàn bộ stdout/stderr vào đó luôn.
+# Đặt TRƯỚC cổng kiểm comfy-models bên dưới, để chính thông báo lỗi của cổng đó cũng được ghi lại.
+# Bản thân việc file log có xuất hiện hay không đã là một tín hiệu: không có file nào nghĩa là
+# volume không mount được, chưa cần đọc nội dung.
+if [ -d "$VOL" ] && mkdir -p "$VOL/serverless-logs" 2>/dev/null; then
+  LOGF="$VOL/serverless-logs/$WORKER_ID.log"
+  exec > >(tee -a "$LOGF") 2>&1
+  echo "[entrypoint] ---- khởi động $(date -u +%FT%TZ) ----"
+  echo "[entrypoint] log → $LOGF"
+else
+  echo "[entrypoint] CẢNH BÁO: $VOL không ghi được → không có log trên volume, chỉ còn dashboard."
+fi
+
 echo "[entrypoint] WORKER_ID=$WORKER_ID"
 
 export COMFY_URL="${COMFY_URL:-http://127.0.0.1:8188}"
@@ -21,7 +41,6 @@ export COMFY_URL="${COMFY_URL:-http://127.0.0.1:8188}"
 #
 # Không nối thì ComfyUI vẫn khởi động bình thường với models/ rỗng, rồi MỌI job fail ở bước load
 # checkpoint — thất bại lộ ra ở tận cuối, sau khi đã trả tiền cho cold start và cho GPU.
-VOL="${MOTION_VOLUME:-/runpod-volume}"
 if [ ! -d "$VOL/comfy-models" ]; then
   echo "[entrypoint] LỖI: không thấy $VOL/comfy-models — endpoint chưa gắn Network Volume, hoặc"
   echo "[entrypoint]   volume chưa từng chạy setup/pod-volume.sh để dựng layout."
