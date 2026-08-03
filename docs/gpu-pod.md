@@ -637,6 +637,21 @@ không log, chỉ là không ai nhận. Ba cách thoát:
 local nhặt job trong vài mili-giây còn container serverless vẫn tỉnh dậy sau 1–3 phút, thấy hàng
 đợi rỗng rồi thoát — ta trả tiền cold start đó cho không, và log hai bên đều sạch.
 
+### Để trống hai biến này là chọn, không phải hoãn
+
+Bỏ trống `WORKER_SOURCE` thì nó vẫn được suy ra: có đủ `RUNPOD_ENDPOINT_ID` + `RUNPOD_API_KEY` →
+`serverless`, không thì `local`. Nghĩa là hai key RunPod điền từ đời nào cũng đủ để bootstrap
+`pm2 stop worker` trên pod bạn vừa trả tiền — không ai đọc `.env` mà đoán ra điều đó.
+
+Nên `make gpu-preflight` in cả khối **Hình dạng deploy** ra trước khi đồng hồ tiền chạy: profile
+nào, ai claim job, giá trị đó *đặt trong `.env`* hay *suy ra*, và năm biến `DISPATCH_*` cái nào
+đang có hiệu lực. Nó chặn (exit ≠ 0) đúng những cấu hình mà `pod-bootstrap.sh` sẽ chết vì chúng —
+`WORKER_SOURCE` sai chính tả, khai `serverless` mà thiếu key RunPod, `SETUP_PROFILE` không tồn tại.
+
+Cách suy ra nằm ở `scripts/lib-deploy-shape.sh`, được **cả hai** script source. Chép logic sang
+preflight là cách hiển nhiên và là cách sai: lệch một chi tiết giữa hai bản chép thì cổng kiểm báo
+một đằng, pod dựng một nẻo.
+
 <a id="serverless"></a>
 ## RunPod Serverless — GPU chỉ tính tiền khi có job
 
@@ -685,7 +700,7 @@ runpodctl serverless create --name motion-serverless --template-id <tpl> \
 #    deploy. Bỏ quên là 17 type nằm queued vĩnh viễn.
 ```
 
-### Bốn cái bẫy, cả bốn đều trả giá bằng một vòng chạy
+### Năm cái bẫy, cả năm đều trả giá bằng một vòng chạy
 
 **1. `{"input":{}}` bị RunPod bỏ.** SDK kiểm bằng độ chân trị của Python nên `{}` (falsy) bị coi là
 THIẾU `input`: `Job has missing field(s): id or input.` → thử lại một lần → trả về
@@ -711,6 +726,18 @@ ssh -p $GPU_SSH_PORT root@$GPU_SSH_HOST 'ls -t /workspace/serverless-logs/ | hea
 ```
 
 Riêng việc file có xuất hiện hay không đã là tín hiệu: không có file nào = volume không mount được.
+
+**5. `pm2 start <script>` không đọc file `.env` nào cả.** Chỉ `ecosystem.config.cjs` mới có khối
+`env:`; dispatcher được start thẳng bằng `pm2 start api/src/mc-dispatcher.js`, nên mọi biến nó cần
+phải được `pod-bootstrap.sh` **chuyển tay** vào dòng lệnh. Trước 03/08/2026 nó chỉ chuyển
+`DATABASE_URL`, `RUNPOD_ENDPOINT_ID`, `RUNPOD_API_KEY` — cả năm biến `DISPATCH_*` đặt trong `.env`
+gốc là no-op im lặng, dispatcher luôn chạy bằng default. Không có triệu chứng nào: `.env.example`
+mô tả chúng đầy đủ, `pm2 status` báo online, log sạch. Nặng nhất là `DISPATCH_ORPHAN_SEC=0` —
+`.env.example` nói "tắt hẳn" trong khi thực tế vẫn reclaim job ở 900 giây.
+
+Thêm biến `DISPATCH_*` mới thì **phải** thêm tên nó vào vòng lặp trong `scripts/pod-bootstrap.sh`,
+nếu không lỗi này quay lại y nguyên. `make gpu-preflight` in ra biến nào đang có hiệu lực và biến
+nào đang rơi về default, nên lệch là thấy được từ máy local.
 
 ### Volume mount ở đâu
 

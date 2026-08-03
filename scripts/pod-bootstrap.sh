@@ -56,7 +56,9 @@ MTC_PREBUILT="$(env_get MTC_PREBUILT)"
 MODELS_MIN_GB="$(env_get MODELS_MIN_GB)"
 
 # ── Hình dạng deploy: cài gì, và ai chạy job ─────────────────────────────────
-# Hai câu hỏi độc lập, hai biến.
+# Hai câu hỏi độc lập, hai biến. Cách suy ra nằm ở scripts/lib-deploy-shape.sh vì
+# `make gpu-preflight` cũng phải trả lời được đúng hai câu đó — TRƯỚC khi đồng hồ tiền chạy, chứ
+# không phải sau 30 phút bootstrap. Một bản logic, hai người đọc.
 #
 # SETUP_PROFILE — box cài gì (chạy setup/setup-<profile>.sh trên pod):
 #   motion-transfer  (mặc định) 4 type Wan · catalog khoá · không Ollama — nhanh, rẻ, ít thứ hỏng
@@ -71,40 +73,11 @@ MODELS_MIN_GB="$(env_get MODELS_MIN_GB)"
 #               dispatcher cuối file về việc trùng type làm ta trả tiền cold start cho không.
 #
 # Không đặt WORKER_SOURCE thì suy ra như cũ: có đủ RUNPOD_* → serverless, không thì local.
-SETUP_PROFILE="$(env_get SETUP_PROFILE)"; SETUP_PROFILE="${SETUP_PROFILE:-motion-transfer}"
-SETUP_SCRIPT="setup/setup-${SETUP_PROFILE}.sh"
-# Chỉ nhận profile đi qua lib-feature.sh. setup-pm2.sh cũng nằm cùng thư mục và cũng cài được cả
-# stack, nhưng nó là monolith cũ đi đường KHÁC: không có chuỗi phase, không hiểu MTC_PREBUILT, tự
-# quản JOB_TYPES/catalog theo cách riêng. Cho nó lọt vào đây thì `make gpu-bootstrap` lặng lẽ chạy
-# một cài đặt khác hẳn cái mọi cổng kiểm phía dưới giả định. setup-full.sh là bản lib-feature của nó.
-PROFILES="$(cd motions-studio/setup 2>/dev/null && grep -l 'lib-feature.sh' setup-*.sh 2>/dev/null | sed 's/^setup-//;s/\.sh$//' | paste -sd' ' -)"
-case " $PROFILES " in
-  *" $SETUP_PROFILE "*) ;;
-  *) die "SETUP_PROFILE=$SETUP_PROFILE không dùng được.
-  Profile có sẵn: $PROFILES" ;;
-esac
-[ -f "motions-studio/$SETUP_SCRIPT" ] || die "thiếu motions-studio/$SETUP_SCRIPT"
-
-RUNPOD_ENDPOINT_ID="$(env_get RUNPOD_ENDPOINT_ID)"
-RUNPOD_API_KEY_ENV="$(env_get RUNPOD_API_KEY)"
-WORKER_SOURCE="$(env_get WORKER_SOURCE)"
-if [ -n "${KEEP_LOCAL_WORKER:-}" ]; then
-  # KEEP_LOCAL_WORKER là tên cũ, và nó có một lỗi: chỉ đọc được từ shell env, nên đặt trong .env
-  # (đúng như .env.example từng hướng dẫn) bị bỏ qua IM LẶNG. WORKER_SOURCE đọc qua env_get.
-  warn "KEEP_LOCAL_WORKER đã bỏ — dùng WORKER_SOURCE=both trong .env. Đang tạm ánh xạ giá trị cũ."
-  [ "$KEEP_LOCAL_WORKER" = "1" ] && [ -z "$WORKER_SOURCE" ] && WORKER_SOURCE=both
-fi
-if [ -z "$WORKER_SOURCE" ]; then
-  if [ -n "$RUNPOD_ENDPOINT_ID" ] && [ -n "$RUNPOD_API_KEY_ENV" ]; then WORKER_SOURCE=serverless; else WORKER_SOURCE=local; fi
-fi
-case "$WORKER_SOURCE" in
-  local|serverless|both) ;;
-  *) die "WORKER_SOURCE=$WORKER_SOURCE không hợp lệ — chỉ nhận: local | serverless | both" ;;
-esac
-if [ "$WORKER_SOURCE" != "local" ] && { [ -z "$RUNPOD_ENDPOINT_ID" ] || [ -z "$RUNPOD_API_KEY_ENV" ]; }; then
-  die "WORKER_SOURCE=$WORKER_SOURCE cần RUNPOD_ENDPOINT_ID và RUNPOD_API_KEY trong .env — xem docs/gpu-pod.md#serverless.
-  (Muốn chạy job bằng GPU của chính pod thì đặt WORKER_SOURCE=local.)"
-fi
+# shellcheck source=lib-deploy-shape.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib-deploy-shape.sh"
+resolve_deploy_shape
+for _w in ${DEPLOY_SHAPE_WARNINGS+"${DEPLOY_SHAPE_WARNINGS[@]}"}; do warn "$_w"; done
+for _e in ${DEPLOY_SHAPE_ERRORS+"${DEPLOY_SHAPE_ERRORS[@]}"}; do die "$_e"; done
 log "hình dạng deploy: SETUP_PROFILE=$SETUP_PROFILE · WORKER_SOURCE=$WORKER_SOURCE"
 
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -p "$PORT")
@@ -237,12 +210,32 @@ fi
 if [ "$WORKER_SOURCE" = "local" ]; then
   log "WORKER_SOURCE=local → không bật dispatcher; worker trên pod claim mọi job trong JOB_TYPES"
 else
+  # Năm biến DISPATCH_* phải được CHUYỂN sang pm2 bằng tay. `pm2 start <script>` không đọc file .env
+  # nào cả (chỉ ecosystem.config.cjs mới có `env:`), nên trước đây đặt chúng trong .env gốc là một
+  # no-op im lặng: .env.example mô tả chúng đầy đủ, cổng kiểm ở dưới còn đọc DISPATCH_JOB_TYPES để
+  # so khớp, trong khi dispatcher trên pod luôn chạy bằng default gốc. Nguy nhất là
+  # DISPATCH_ORPHAN_SEC=0 ("tắt hẳn" theo .env.example) vẫn reclaim job ở 900 giây.
+  # Chỉ chuyển biến THỰC SỰ được đặt — để trống nghĩa là dùng default của mc-dispatcher.js, và
+  # default phải sống đúng một chỗ. Với DISPATCH_ORPHAN_SEC thì "0" và "" là hai ý khác nhau.
+  DISPATCH_ENV=""
+  for _k in DISPATCH_JOB_TYPES DISPATCH_MAX_INFLIGHT DISPATCH_ORPHAN_SEC DISPATCH_POLL_SEC DISPATCH_COOLDOWN_SEC; do
+    eval "_v=\${$_k}"
+    [ -n "$_v" ] || continue
+    # Giá trị đi thẳng vào một lệnh chạy qua ssh. Chỉ nhận chữ-số-phẩy để không có đường nào cho
+    # dấu nháy hay ; đi lạc vào shell trên pod.
+    case "$_v" in
+      *[!A-Za-z0-9,_.-]*) die "$_k='$_v' có ký tự không hợp lệ — chỉ nhận chữ, số, và , _ . -" ;;
+    esac
+    DISPATCH_ENV="$DISPATCH_ENV $_k='$_v'"
+    log "  dispatcher: $_k=$_v"
+  done
+
   log "starting mc-dispatcher (serverless) — endpoint $RUNPOD_ENDPOINT_ID"
   remote "cd ~/$REMOTE_DIR && \
     DBURL=\$(node -e \"console.log(require('./ecosystem.config.cjs').apps.find(a=>a.name==='api').env.DATABASE_URL)\" 2>/dev/null) ; \
     if [ -z \"\$DBURL\" ]; then echo 'mc-dispatcher: không tính được DATABASE_URL từ ecosystem.config.cjs — bỏ qua'; exit 1; fi ; \
     pm2 delete mc-dispatcher >/dev/null 2>&1 ; \
-    DATABASE_URL=\"\$DBURL\" RUNPOD_ENDPOINT_ID='$RUNPOD_ENDPOINT_ID' RUNPOD_API_KEY='$RUNPOD_API_KEY_ENV' \
+    DATABASE_URL=\"\$DBURL\" RUNPOD_ENDPOINT_ID='$RUNPOD_ENDPOINT_ID' RUNPOD_API_KEY='$RUNPOD_API_KEY_ENV'$DISPATCH_ENV \
     pm2 start api/src/mc-dispatcher.js --name mc-dispatcher --update-env >/dev/null 2>&1 ; \
     pm2 save >/dev/null 2>&1 ; sleep 6 ; \
     if ! pm2 logs mc-dispatcher --lines 100 --nostream 2>/dev/null | grep -q '\[mc-dispatcher\] bắt đầu'; then \
@@ -281,8 +274,9 @@ else
   # xảy ra nếu mở SETUP_PROFILE=full mà vẫn trỏ endpoint dùng image 4 type.
   if [ "$WORKER_SOURCE" = "serverless" ]; then
     POD_TYPES="$(remote "grep -E '^JOB_TYPES=' ~/$REMOTE_DIR/.env | cut -d= -f2-" 2>/dev/null | tr -d '\r')"
-    DISPATCH_TYPES="$(env_get DISPATCH_JOB_TYPES)"
-    DISPATCH_TYPES="${DISPATCH_TYPES:-motion,teen-flycam,trend-tiktok,enhance}"
+    # Default lấy từ lib chứ không gõ lại: cổng này so khớp cái mà dispatcher THẬT SỰ dùng, nên
+    # một danh sách chép tay lệch đi sẽ làm cổng báo "khớp" trong khi thực tế không khớp.
+    DISPATCH_TYPES="${DISPATCH_JOB_TYPES:-$DS_DEFAULT_JOB_TYPES}"
     MISSING="$(python3 -c "
 import sys
 pod=[t for t in sys.argv[1].split(',') if t.strip()]

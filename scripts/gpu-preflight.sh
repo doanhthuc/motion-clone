@@ -84,6 +84,63 @@ check MIN_CUDA_VERSION recommended "passed to 'runpodctl pod create --min-cuda-v
 check MTC_PREBUILT  recommended "1 = pod image ships /opt/mtc-prebuilt, skips ~20-35 min of installing (needs worker-image/Dockerfile)" 1
 
 echo
+echo "Hình dạng deploy (pod sẽ dựng ra cái gì, và ai chạy job)"
+# Suy ra bằng ĐÚNG hàm mà pod-bootstrap.sh dùng — xem scripts/lib-deploy-shape.sh về lý do không
+# chép logic sang đây. Trước khi có khối này, preflight in toàn màu xanh mà không hề nhắc tới hai
+# biến quyết định hình dạng pod: bạn thuê máy, chờ 30 phút bootstrap, rồi mới thấy worker local
+# đã bị dừng. Cổng kiểm không nói ra thì nó không phải cổng kiểm.
+# shellcheck source=lib-deploy-shape.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib-deploy-shape.sh"
+resolve_deploy_shape
+
+printf "  ${G}✓${X} %-22s ${D}%s${X}\n" "SETUP_PROFILE" \
+  "$SETUP_PROFILE — chạy motions-studio/$SETUP_SCRIPT (có sẵn: $SETUP_PROFILES_AVAILABLE)"
+
+case "$WORKER_SOURCE_ORIGIN" in
+  env)   ws_note="đặt trong .env" ;;
+  suy-ra) ws_note="SUY RA (WORKER_SOURCE trống trong .env)" ;;
+  *)     ws_note="ánh xạ từ KEEP_LOCAL_WORKER (tên cũ)" ;;
+esac
+case "$WORKER_SOURCE" in
+  local)      ws_effect="worker trên pod claim job · dispatcher TẮT · không cold start" ;;
+  serverless) ws_effect="bootstrap DỪNG worker local · RunPod Serverless claim · scale-to-zero" ;;
+  both)       ws_effect="cả hai cùng chạy — chỉ đúng khi hai bên nhận nhóm type RỜI NHAU" ;;
+  *)          ws_effect="" ;;
+esac
+printf "  ${G}✓${X} %-22s ${D}%s [%s]${X}\n" "WORKER_SOURCE" "$WORKER_SOURCE" "$ws_note"
+printf "    %-20s ${D}%s${X}\n" "" "$ws_effect"
+
+if [ "$WORKER_SOURCE" != "local" ]; then
+  # Năm biến này chỉ tới được dispatcher vì pod-bootstrap.sh chuyển tay sang pm2 — `pm2 start
+  # <script>` không đọc .env. In cả giá trị lẫn "mặc định" để thấy rõ cái nào thật sự có hiệu lực.
+  for pair in "DISPATCH_JOB_TYPES:$DS_DEFAULT_JOB_TYPES" \
+              "DISPATCH_MAX_INFLIGHT:$DS_DEFAULT_MAX_INFLIGHT" \
+              "DISPATCH_ORPHAN_SEC:$DS_DEFAULT_ORPHAN_SEC" \
+              "DISPATCH_POLL_SEC:$DS_DEFAULT_POLL_SEC" \
+              "DISPATCH_COOLDOWN_SEC:$DS_DEFAULT_COOLDOWN_SEC"; do
+    k="${pair%%:*}"; dflt="${pair#*:}"; v="$(get "$k")"
+    if [ -n "$v" ]; then printf "  ${G}✓${X} %-22s ${D}%s${X}\n" "$k" "$v"
+    else printf "  ${D}·${X} %-22s ${D}(không đặt → dispatcher dùng mặc định %s)${X}\n" "$k" "$dflt"; fi
+  done
+fi
+
+for w in ${DEPLOY_SHAPE_WARNINGS+"${DEPLOY_SHAPE_WARNINGS[@]}"}; do
+  printf "  ${Y}!${X} %s\n" "$w"
+done
+for e in ${DEPLOY_SHAPE_ERRORS+"${DEPLOY_SHAPE_ERRORS[@]}"}; do
+  blocking=$((blocking + 1))
+  printf "  ${R}✗${X} %s\n" "$e"
+done
+
+# Default hiển thị ở trên là bản sao của mc-dispatcher.js. Bản sao trôi khỏi bản gốc trong im lặng
+# là chuyện xảy ra được, và hậu quả là cổng kiểm nói "mặc định 900" khi dispatcher đã đổi số khác.
+drift="$(deploy_shape_check_drift)"
+if [ -n "$drift" ]; then
+  printf "  ${Y}!${X} %s\n" "default trong lib-deploy-shape.sh lệch khỏi mc-dispatcher.js: $drift"
+  printf "    ${D}%s${X}\n" "Số in ở trên là sai — sửa DS_DEFAULT_* trong scripts/lib-deploy-shape.sh cho khớp."
+fi
+
+echo
 echo "After rent (make gpu-provision / gpu-wait fill these in for you)"
 check GPU_INSTANCE_ID after-rent "make gpu-up / gpu-down / gpu-destroy" 1
 check GPU_SSH_HOST    after-rent "make gpu-bootstrap" 1
