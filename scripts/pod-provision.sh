@@ -22,7 +22,7 @@ GPU_PROVIDER="${GPU_PROVIDER:-$(env_get GPU_PROVIDER)}"; GPU_PROVIDER="${GPU_PRO
 # COMPUTE_TYPE=cpu thuê box KHÔNG GPU (Postgres/MinIO/api/FE), job render đi qua RunPod Serverless.
 # Mặc định `gpu` nên đường cũ không đổi một byte nào — xem docs/gpu-pod.md#box-cpu.
 COMPUTE_TYPE="${COMPUTE_TYPE:-$(env_get COMPUTE_TYPE)}"; COMPUTE_TYPE="$(printf '%s' "${COMPUTE_TYPE:-gpu}" | tr 'A-Z' 'a-z')"
-CPU_FLAVOR="${CPU_FLAVOR:-$(env_get CPU_FLAVOR)}"; CPU_FLAVOR="${CPU_FLAVOR:-cpu5g}"
+CPU_FLAVOR="${CPU_FLAVOR:-$(env_get CPU_FLAVOR)}"; CPU_FLAVOR="${CPU_FLAVOR:-cpu5c}"
 CPU_VCPU="${CPU_VCPU:-$(env_get CPU_VCPU)}"; CPU_VCPU="${CPU_VCPU:-4}"
 GPU="${GPU:-$(env_get GPU)}"; GPU="${GPU:-RTX_4090}"
 DISK="${DISK:-$(env_get DISK)}"; DISK="${DISK:-120}"

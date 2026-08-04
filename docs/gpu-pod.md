@@ -794,11 +794,14 @@ flavor hay số vCPU — nó luôn cấp **2 vCPU / 4 GB RAM**. `POST /v1/pods` 
 `vcpuCount`, nên script dùng nó. (Nhưng xem [16 GB là thừa](#box-cpu-ram) trước khi trả tiền cho
 flavor lớn — 4 GB có thể đã đủ, chưa ai đo.)
 
-| Flavor | RAM | Mặc định của repo |
-|---|---|---|
-| `cpu3c` · `cpu5c` Compute | vCPU × 2 | |
-| `cpu3g` · `cpu5g` General | vCPU × 4 | **`cpu5g` + 4 vCPU = 16 GB** |
-| `cpu3m` · `cpu5m` Memory | vCPU × 8 | |
+| Flavor | RAM | Đĩa | Giá đo thật 04/08/2026 |
+|---|---|---|---|
+| `cpu3c × 2` (mặc định `runpodctl`) | 4 GB | 10 GB/vCPU | **$0,06/giờ** = $43/tháng |
+| `cpu5c × 2` | 4 GB | 15 GB/vCPU | $0,07/giờ = $50/tháng |
+| **`cpu5c × 4`** ← mặc định của repo | **8 GB** | 15 GB/vCPU | **$0,14/giờ = $101/tháng** |
+| `cpu5g × 4` | 16 GB | 15 GB/vCPU | $0,184/giờ = $132/tháng |
+
+Hệ số RAM theo hậu tố: `c` = vCPU × 2 (Compute) · `g` = × 4 (General) · `m` = × 8 (Memory).
 
 <a id="box-cpu-ram"></a>
 #### 16 GB gần như chắc chắn là thừa — và nó đắt gấp 3
@@ -816,18 +819,28 @@ flavor lớn — 4 GB có thể đã đủ, chưa ai đo.)
 Cộng Postgres (~100-300 MB) thì **chạy ổn định dưới 1 GB**. 16 GB không phục vụ việc chạy. Nó phục
 vụ **đúng một** việc: `npm run build` của Nuxt trong `pod-fe.sh`, một lần mỗi lần deploy FE.
 
-> **Và chưa ai đo rằng 4 GB KHÔNG đủ cho build đó.** Mới chỉ đo 16 GB thì đủ. Mặc định `cpu5g × 4`
-> ra đời từ một phỏng đoán, và phỏng đoán đó tốn **$0,184/giờ so với $0,06** — $132 so với
-> $43/tháng, tức **$89/tháng**.
+**Đã đo build cần bao nhiêu** (04/08/2026, `/usr/bin/time -l npm run build` trên `motions/`):
+**đỉnh 2,49 GB RSS**, 26 giây. Cộng ~0,7 GB của Postgres/MinIO/api đang chạy song song → **3,2 GB**.
 
-Bốn cách rẻ hơn, **chưa thử cách nào**:
+Nên chọn thế nào:
 
-| Cách | Tiết kiệm | Rủi ro |
+| Box | Build 3,2 GB vừa không | Giá |
 |---|---|---|
-| Bỏ trống `CPU_FLAVOR`/`CPU_VCPU` → 2 vCPU/4 GB | $89/tháng | build có thể OOM, nhưng biết ngay sau 1 lần chạy |
-| `CPU_FLAVOR=cpu5m CPU_VCPU=2` → cũng 16 GB, ít vCPU | chưa đo, có thể ~½ | giá flavor memory-optimized chưa đo |
-| **Build FE ở CI rồi rsync `.output`** | $89/tháng **và** `make gpu-fe` nhanh hẳn | phải thêm workflow |
-| `NODE_OPTIONS=--max-old-space-size` + swap | $89/tháng | build chậm, có thể vẫn OOM |
+| 4 GB | 80% trần — **sát quá** | $0,06-0,07/giờ |
+| **8 GB** (`cpu5c × 4`) | **40% trần, thoải mái** | **$0,14/giờ** |
+| 16 GB | 20% trần — thừa | $0,184/giờ |
+
+**Repo dùng `cpu5c × 4` = 8 GB.** Hạ từ `cpu5g × 4` (16 GB) tiết kiệm $31/tháng mà giữ nguyên 4 vCPU
+nên build không chậm đi. Chọn 8 GB thay vì 4 GB là dựa trên số 2,49 GB đó, không phải phỏng đoán.
+
+`pod-fe.sh` nay tự chốt `NODE_OPTIONS=--max-old-space-size` theo **cgroup limit**, không theo RAM
+node tự thấy — vì trong container node thấy RAM của **host** (box CPU RunPod báo 755 GB), nên nó cho
+heap phình tới hàng chục GB rồi bị OOM-killer của cgroup giết. Triệu chứng là `Killed` trần trụi,
+không stack trace, không dòng nào nhắc tới RAM. Nhờ chốt này, box 4 GB (heap 2896 MB) **có thể** đủ —
+nhưng chưa ai thử.
+
+Cách rẻ nhất và đúng nhất vẫn chưa làm: **build FE ở CI rồi rsync `.output`** — xoá hẳn đỉnh RAM
+*và* bỏ luôn phần chậm nhất của `make gpu-fe`.
 
 Cách 3 đúng nhất về kiến trúc. Lý do `pod-fe.sh:13` build trên pod là `sharp` — `node_modules/@img/`
 ở máy dev chứa `sharp-darwin-arm64`, copy sang pod Linux x64 thì build xong mà chết lúc chạy. Lý do

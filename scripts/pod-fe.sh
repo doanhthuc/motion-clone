@@ -89,7 +89,35 @@ umask 022
 echo "  .env written: server-side→127.0.0.1:\$APIP · client-side→https://$DOMAIN"
 
 npm install --no-audit --no-fund || { echo "npm install failed"; exit 1; }
-npm run build || { echo "nuxt build failed"; exit 1; }
+
+# Chốt heap V8 theo RAM THỰC của container, không theo RAM của host.
+# Vì sao cần: node tự chọn max-old-space theo RAM nó THẤY, và trong container nó thấy RAM của HOST
+# (box CPU RunPod báo 755 GB) chứ không thấy cgroup limit 4-8 GB. Node vì thế cho phép heap phình
+# tới hàng chục GB rồi bị OOM-killer của cgroup giết — triệu chứng là "Killed" trần trụi, không
+# stack trace, không dòng nào nói tới RAM.
+# Đo 04/08/2026: build này đỉnh 2,49 GB RSS. Chừa ~1,2 GB cho Postgres/MinIO/api đang chạy song song
+# cộng phần non-heap của node, nên lấy (limit - 1200MB) và kẹp trong [1536, 6144].
+CG=/sys/fs/cgroup/memory.max
+[ -r "$CG" ] || CG=/sys/fs/cgroup/memory/memory.limit_in_bytes
+LIM_MB=$(awk '{ if ($1 ~ /^[0-9]+$/) printf "%.0f", $1/1048576; else print 0 }' "$CG" 2>/dev/null || echo 0)
+if [ "${LIM_MB:-0}" -gt 0 ] && [ "$LIM_MB" -lt 200000 ]; then
+  HEAP=$(( LIM_MB - 1200 ))
+  [ "$HEAP" -lt 1536 ] && HEAP=1536
+  [ "$HEAP" -gt 6144 ] && HEAP=6144
+  echo "  RAM container ${LIM_MB}MB → NODE_OPTIONS=--max-old-space-size=$HEAP (build đo được đỉnh ~2.5GB)"
+  export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=$HEAP"
+else
+  echo "  không đọc được cgroup memory limit — để node tự chọn heap"
+fi
+
+npm run build || {
+  echo "nuxt build failed"
+  echo "  Nếu chỉ thấy 'Killed' mà không có stack: OOM. Build này cần ~2.5GB đỉnh, và Postgres/"
+  echo "  MinIO/api đang chạy song song chiếm thêm ~0.7GB. Trên box 4GB là sát trần."
+  echo "  Sửa: tăng CPU_VCPU (RAM = vCPU × hệ số flavor) hoặc đổi CPU_FLAVOR sang bản nhiều RAM hơn"
+  echo "  (c=×2 · g=×4 · m=×8). Xem docs/gpu-pod.md#box-cpu-ram."
+  exit 1
+}
 
 chmod +x .run.sh
 pm2 delete motions >/dev/null 2>&1
