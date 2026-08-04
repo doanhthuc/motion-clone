@@ -1,6 +1,40 @@
 # Box CPU + GPU serverless — Design
 
-**Ngày:** 04/08/2026 · **Trạng thái:** spec, chưa thành plan (còn 3 câu phải đo, xem §Phải đo trước)
+**Ngày:** 04/08/2026 · **Trạng thái:** **ĐÃ DỰNG THẬT VÀ CHẠY** — box CPU đầu-cuối OK, nhưng
+serverless bị `throttled` nên chưa có job nào chạy qua. Xem [§Đã dựng thật](#da-dung-that).
+
+<a id="da-dung-that"></a>
+## ĐÃ DỰNG THẬT — 04/08/2026
+
+Box `cpu5g × 4 vCPU`, **$0,184/giờ**, EU-RO-1, volume `wfe86wzkpm`. Chạy ~2,5 giờ rồi destroy.
+
+| Mục | Kết quả |
+|---|---|
+| Pod CPU + volume ở EU-RO-1 | ✅ tạo được, mount `/workspace` (MooseFS), model còn nguyên |
+| Giá | ✅ **$0,184/giờ** ở 4 vCPU/16 GB · $0,06/giờ ở 2 vCPU/4 GB |
+| `setup-cpu-box.sh` | ✅ **~90 giây** (profile GPU ~30 phút — bỏ hẳn phần torch) |
+| `npm run build` Nuxt trên 16 GB | ✅ không OOM |
+| PM2 | ✅ `api`·`wf-worker`·`minio`·`motions`·`mc-dispatcher`, KHÔNG `worker`/`comfyui`/`task-cloud-auto` |
+| `/health` · frontend | ✅ cả hai, `https://app.doanhthuc.xyz` live |
+| `mc-dispatcher` | ✅ online, log sạch, cấu hình đúng |
+| **Job chạy qua serverless** | ❌ **worker `throttled: 3`** — RunPod hết GPU trống |
+
+**Hai bug lộ ra khi chạy, cả hai đã sửa:**
+
+1. `pod-volume.sh:261` `awk '{print $1*1024}'` → mawk (awk của Ubuntu) in volume 76,8GB thành
+   `7.67828e+10`, `$(( ))` chết, bootstrap **abort trước khi cài gì**. Không lộ ở local vì awk của
+   macOS in nguyên số. Cùng bug commit `4b6a388` đã sửa ở `preload-models.sh`. Sửa: `%.0f` + `_int()`.
+2. Pod CPU có **trần đĩa container = `diskLimitPerVcpu × vCPU`** (`cpu5*` = 15 GB/vCPU → 60 GB).
+   `DISK=100` của đường GPU đụng trần → REST trả 500. `pod-provision.sh` nay hỏi API rồi tự hạ.
+
+**Kinh tế cập nhật theo giá thật $0,184** (không phải $0,10 đã giả định): ngưỡng đảo chiều
+**79 job/ngày** (≈51% GPU bận) thay vì 87. Box 24/7 = $132/tháng; 20 job/ngày = **$282/tháng** so
+với **$720** của pod GPU 24/7.
+
+**Blocker còn lại, ngoài tầm kiểm soát:** giao của `gpuTypeIds=[5090]` × `minCudaVersion=13.0` ×
+EU-RO-1 (volume ghim cứng) đang **rỗng** cho serverless. Ba đường thoát chưa thử ở
+[docs/gpu-pod.md#serverless-throttled](../../gpu-pod.md#serverless-throttled). Đây là rủi ro cố hữu:
+**serverless không có SLA về chỗ trống**; worker local trên pod GPU không có vấn đề này.
 
 ## Mục tiêu
 
@@ -60,6 +94,11 @@ destroy box**. Bẫy này tồn tại chỉ vì pod GPU $1/giờ buộc phải d
 rẻ thì cứ để chạy, container disk còn nguyên.
 
 ## Phải đo trước — cả ba đều rẻ, và mục 1 có thể chặn cả hướng
+
+> **Mục 1 và 2: ĐÃ TRẢ LỜI 04/08/2026** — có, pod CPU tồn tại ở EU-RO-1 và mount được volume; giá
+> $0,184/giờ ở 4 vCPU. Xem [§Đã dựng thật](#da-dung-that). Giữ nguyên chữ dưới đây làm hồ sơ vì nó
+> ghi cách đo. **Mục 3 vẫn mở**, và nay có thêm một blocker mới không ai lường: worker serverless
+> `throttled`.
 
 1. **Pod CPU có tồn tại ở EU-RO-1 không, và mount được volume không.**
    Volume `wfe86wzkpm` nằm EU-RO-1 và **không dời được**. Không có pod CPU ở đó thì MinIO không có
