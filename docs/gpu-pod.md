@@ -753,8 +753,28 @@ Bật-tắt theo phiên làm việc thì không có thời gian rỗi nào để
 <a id="box-cpu"></a>
 ### Dựng box CPU
 
-Đo thật trên pod CPU RunPod EU-RO-1 ngày 04/08/2026: **$0,06/giờ** ở 2 vCPU, Network Volume
-**mount được** ở `/workspace` (MooseFS), `nvidia-smi` không tồn tại, 81,7/100 GB volume đã dùng.
+**Đã dựng thật 04/08/2026** — box `cpu5g × 4 vCPU`, và đây là toàn bộ số đo:
+
+| | |
+|---|---|
+| Giá | **$0,184/giờ** (≈$132/tháng nếu bật 24/7) |
+| RAM · đĩa | 16 GB · trần container disk **60 GB** |
+| Giá ở 2 vCPU (probe riêng) | $0,06/giờ, RAM 4 GB |
+| `setup-cpu-box.sh` trên box | **~90 giây** — so với ~30 phút của profile GPU, vì bỏ hẳn phần cài torch |
+| `npm run build` Nuxt trên 16 GB | ✅ xong, không OOM |
+| PM2 sau bootstrap | `api` · `wf-worker` · `minio` · `motions` · `mc-dispatcher` — **không** `worker`/`comfyui`/`task-cloud-auto` |
+| `/health` · frontend | ✅ cả hai |
+| Volume | mount `/workspace` (MooseFS), model còn nguyên, 81,7/100 GB đã dùng |
+| `nvidia-smi` | không tồn tại — đúng là box CPU |
+
+Giá thật $0,184 (không phải $0,10 như từng giả định) kéo ngưỡng đảo chiều xuống: **79 job/ngày**
+thay vì 87, tức ≈51% GPU bận. Dưới mức đó box CPU + serverless vẫn rẻ hơn nhiều — 20 job/ngày là
+**$282/tháng** so với **$720** của pod GPU bật 24/7.
+
+**Trần đĩa container của pod CPU = `diskLimitPerVcpu × vCPU`** (`cpu3*` = 10 GB/vCPU · `cpu5*` = 15).
+Với `cpu5g × 4` là 60 GB. Vượt trần thì REST trả `500 Container Disk must be less than or equal to
+N` — `DISK=100` của đường GPU đụng đúng cái này. `pod-provision.sh` nay hỏi API để lấy trần rồi tự
+hạ kèm cảnh báo, thay vì để bạn mất một vòng chạy.
 
 ```bash
 # .env
@@ -788,9 +808,39 @@ serverless bake.
 worker local nghĩa là không ai chạy được job nào — box vẫn lên xanh, `/health` vẫn trả lời, job nằm
 `queued` vĩnh viễn. Không có cách đọc nào hợp lý nên cổng kiểm chặn thay vì cảnh báo.
 
-**Còn mở:** chưa chạy `make gpu-bootstrap` thật trên box CPU. Đã đo phần hạ tầng (volume mount,
-giá, không GPU) và đã chặn các cấu hình sai, nhưng phần cài đặt 11 phase trên máy không GPU thì
-chưa ai chạy — RAM 16 GB là suy ra từ công thức flavor, không phải đo.
+<a id="serverless-throttled"></a>
+### Chỗ hình dạng này thật sự tắc: worker serverless bị `throttled`
+
+Box CPU chạy hoàn hảo, nhưng `GET /v2/<ep>/health` trả:
+
+```json
+"workers": { "idle": 0, "ready": 0, "running": 0, "throttled": 3 }
+```
+
+`throttled` = RunPod **không có GPU trống** cho endpoint này, nên job nằm `IN_QUEUE` vô hạn. Không
+phải lỗi cấu hình — `WORKER_TOKEN` đã khớp, dispatcher log sạch, `JOB_TYPES` khớp ba nơi.
+
+Nguyên nhân là **giao của ba ràng buộc, và nó đang rỗng**:
+
+| Ràng buộc | Vì sao có |
+|---|---|
+| `gpuTypeIds` = chỉ RTX 5090 | chọn lúc tạo endpoint |
+| `minCudaVersion` = 13.0 | image là cuda13.0; hạ xuống là torch chết trên host driver cũ |
+| datacenter EU-RO-1 | **Network Volume ghim cứng**, không dời được |
+
+`runpodctl datacenter list` báo 5090 ở EU-RO-1 là `Medium` — nhưng đó là stock cho **pod**, pool
+khác với serverless. Đừng dùng nó để suy ra serverless có chỗ.
+
+Ba đường thoát, chưa thử cái nào:
+
+1. **Thêm loại card vào endpoint** — `RTX PRO 6000` (Low) hoặc `A100 SXM 80GB` (Low) ở EU-RO-1, đều
+   ≥24GB VRAM. Mở rộng pool mà không đụng volume. Đắt hơn mỗi giây, nhưng đắt vẫn hơn không chạy.
+2. **Chờ.** Throttle là tạm thời theo định nghĩa. Job vẫn nằm `queued`, không mất.
+3. **Bỏ Network Volume khỏi endpoint** và bake model vào image → endpoint chạy được ở mọi
+   datacenter. Đổi lại image phồng thêm ~40GB và cold start dài ra nhiều.
+
+Đây là rủi ro cố hữu của hình dạng box CPU mà spec đã cảnh báo, nay đã gặp thật: **serverless không
+có SLA về chỗ trống**. Worker local trên pod GPU không có vấn đề này — bạn thuê là bạn có.
 
 **Cạm bẫy khi ghép `full` với `serverless`:** profile `full` cho box claim 21 type, nhưng image
 serverless bản mặc định chỉ bake 4. 17 type còn lại sẽ nằm `queued` **vĩnh viễn** — không lỗi,

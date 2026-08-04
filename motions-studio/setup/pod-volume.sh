@@ -258,17 +258,27 @@ fi
 say "Manifest model"
 # du -sk (KB) chứ không -sb: -sb là GNU-only, thiếu nó thì BYTES rỗng và ngưỡng
 # kiểm tra âm thầm luôn pass — mất đúng cái bảo vệ mình vừa dựng.
-_models_bytes() { du -sk "$MODELS" 2>/dev/null | awk '{print $1 * 1024}'; }
+_models_bytes() { du -sk "$MODELS" 2>/dev/null | awk '{printf "%.0f", $1 * 1024}'; }
 _models_files() { find "$MODELS" -type f ! -name '.manifest.tsv' 2>/dev/null | wc -l | tr -d ' '; }
 
-BYTES="$(_models_bytes)"; FILES="$(_models_files)"
-GB=$(( ${BYTES:-0} / 1000000000 ))
+# `print $1 * 1024` là bug: mawk (awk MẶC ĐỊNH của Ubuntu, tức là của pod) dùng OFMT="%.6g" nên số
+# lớn ra dạng KHOA HỌC — đo 04/08/2026 trên box CPU với volume 76,8GB: "7.67828e+10". Rồi
+# $(( ... )) của bash chết "invalid arithmetic operator", GB thành unbound, bootstrap abort.
+# Không lộ ra ở local vì awk của macOS (BWK) in nguyên số. `%.0f` chứ KHÔNG `%d`: %d trong mawk là
+# int 32-bit nên 42,8GB bị kẹp thành 2147483647 — đúng cái bẫy commit 4b6a388 đã gặp ở preload-models.sh.
+#
+# _int: mọi số vào phép tính đều phải qua đây. Cần vì manifest do bản CŨ ghi có thể ĐANG chứa
+# "7.67828e+10" — sửa hàm sinh số là chưa đủ, còn phải đọc lại được cái đã ghi sai.
+_int() { awk -v v="${1:-0}" 'BEGIN{ if (v+0 != v+0) v=0; printf "%.0f", v+0 }' 2>/dev/null || echo 0; }
+
+BYTES="$(_int "$(_models_bytes)")"; FILES="$(_models_files)"
+GB=$(( BYTES / 1000000000 ))
 printf '  %s file · %s GB\n' "${FILES:-0}" "$GB"
 
 if [ -f "$MANIFEST" ]; then
-  OLD_B="$(awk -F'\t' '$1=="total_bytes"{print $2}' "$MANIFEST" | tail -1)"
-  OLD_F="$(awk -F'\t' '$1=="total_files"{print $2}' "$MANIFEST" | tail -1)"
-  printf '  manifest trước: %s file · %s GB\n' "${OLD_F:-?}" "$(( ${OLD_B:-0} / 1000000000 ))"
+  OLD_B="$(_int "$(awk -F'\t' '$1=="total_bytes"{print $2}' "$MANIFEST" | tail -1)")"
+  OLD_F="$(_int "$(awk -F'\t' '$1=="total_files"{print $2}' "$MANIFEST" | tail -1)")"
+  printf '  manifest trước: %s file · %s GB\n' "${OLD_F:-?}" "$(( OLD_B / 1000000000 ))"
   # HỒI QUY là lỗi cứng, không phải cảnh báo. Mức tuyệt đối thì chỉ advisory: lần
   # đầu volume rỗng là bình thường. Nhưng số file GIẢM thì luôn nghĩa là mất dữ
   # liệu — và đó chính là ca "thành công giả" mà --check tồn tại để bắt.

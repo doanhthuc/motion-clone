@@ -235,6 +235,38 @@ for v in out:
     [ -n "$RP_KEY" ] || die "COMPUTE_TYPE=cpu cần RUNPOD_API_KEY trong .env (đường REST, runpodctl không chọn được flavor CPU)."
     [ -n "$POD_VOLUME_ID" ] || die "COMPUTE_TYPE=cpu cần POD_VOLUME_ID: box CPU không có ổ nào khác để chứa MinIO và model."
 
+    # Pod CPU có TRẦN đĩa container = diskLimitPerVcpu × vcpuCount, và vượt trần thì REST trả
+    # 500 "Container Disk must be less than or equal to N" — mất một vòng chạy để biết (04/08/2026,
+    # DISK=100 của đường GPU đụng trần 60 của cpu5g×4). Hỏi API thay vì gõ cứng, để trần không trôi
+    # khi RunPod đổi flavor. cpu3* = 10 GB/vCPU · cpu5* = 15 GB/vCPU tại thời điểm đo.
+    FLAVOR_JSON="$(curl -s -X POST "https://api.runpod.io/graphql?api_key=$RP_KEY" \
+      -H 'Content-Type: application/json' \
+      -d '{"query":"query { cpuFlavors { id diskLimitPerVcpu ramMultiplier } }"}' 2>/dev/null)"
+    CPU_LIMITS="$(printf '%s' "$FLAVOR_JSON" | CPU_FLAVOR="$CPU_FLAVOR" python3 -c '
+import sys, json, os
+want = os.environ["CPU_FLAVOR"]
+try:
+    for f in json.load(sys.stdin)["data"]["cpuFlavors"]:
+        if f["id"] == want:
+            print("%s %s" % (f["diskLimitPerVcpu"], f["ramMultiplier"])); break
+except Exception:
+    pass' 2>/dev/null)"
+    if [ -n "$CPU_LIMITS" ]; then
+      DISK_PER_VCPU="${CPU_LIMITS%% *}"; RAM_MULT="${CPU_LIMITS##* }"
+      DISK_MAX=$(( DISK_PER_VCPU * CPU_VCPU ))
+      log "flavor $CPU_FLAVOR × $CPU_VCPU vCPU → RAM $(( RAM_MULT * CPU_VCPU )) GB · trần đĩa $DISK_MAX GB"
+      if [ "$DISK" -gt "$DISK_MAX" ]; then
+        # Hạ chứ không chết: DISK trong .env là số ĐÚNG cho đường GPU (pod GPU cho tới 100+ GB), và
+        # bắt người ta sửa nó sẽ làm hỏng đường kia. Nhưng nói to, không lặng lẽ.
+        warn "DISK=$DISK vượt trần $DISK_MAX GB của pod CPU ($CPU_FLAVOR × $CPU_VCPU vCPU) → dùng $DISK_MAX."
+        warn "  DISK trong .env là số cho pod GPU, không sửa. Muốn đĩa lớn hơn thì tăng CPU_VCPU."
+        DISK="$DISK_MAX"
+      fi
+    else
+      warn "không đọc được trần đĩa của flavor $CPU_FLAVOR từ API — nếu REST trả 'Container Disk must be"
+      warn "  less than or equal to N' thì hạ DISK hoặc tăng CPU_VCPU (trần = ${CPU_FLAVOR%%[0-9]*}? GB/vCPU × vCPU)."
+    fi
+
     BODY="$(POD_VOLUME_ID="$POD_VOLUME_ID" VOL_DC="${VOL_DC:-}" IMAGE="$IMAGE" DISK="$DISK" \
             CPU_FLAVOR="$CPU_FLAVOR" CPU_VCPU="$CPU_VCPU" POD_VOLUME="$POD_VOLUME" python3 -c '
 import json, os
