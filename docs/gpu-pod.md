@@ -701,6 +701,16 @@ SETUP_PROFILE=motion-transfer|full|create-image|tryon|cpu-box
 WORKER_SOURCE=local|serverless|both
 ```
 
+> **Hình dạng đang dùng, chốt 04/08/2026: pod GPU + `local`.** motion-clone hiện là **tool dùng
+> riêng, bật theo phiên làm việc**, không phải service 24/7. Đã dựng và đo cả hình dạng box CPU —
+> nó chạy được — nhưng chọn pod GPU vì ba lý do **không phải tiền**: throttle serverless đã gặp
+> thật (job nằm `IN_QUEUE` vô hạn, mà đang ngồi dùng thì chờ vô hạn tệ hơn trả thêm), cold start
+> ~155 giây cho job đầu mỗi phiên, và mỗi box mới phải đồng bộ `WORKER_TOKEN` sang template.
+>
+> Ngưỡng tiền nếu cần tính lại: box CPU rẻ hơn khi chạy **dưới ~2,6-3,7 job mỗi giờ bật máy** (GPU
+> rỗi phần lớn thời gian). Ở 4 giờ/ngày: 5 job/ngày → $62 so với $119; 15 job/ngày → $120 so với
+> $119; 26 job/ngày → $202 so với $119. Hình dạng cpu còn nguyên, đổi lại là ba dòng `.env`.
+
 Ba tổ hợp có nghĩa; mọi tổ hợp khác bị cổng kiểm chặn hoặc cảnh báo:
 
 | Hình dạng | `COMPUTE_TYPE` | `SETUP_PROFILE` | `WORKER_SOURCE` | Khi nào đúng |
