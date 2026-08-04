@@ -131,9 +131,17 @@ else
   warn "lost every time the pod is re-created. See docs/gpu-pod.md#volume to set it up."
 fi
 
-log "running $SETUP_SCRIPT on the pod — installs Postgres/MinIO/PM2, detects the"
-log "GPU/driver, installs ComfyUI + matching PyTorch/CUDA, and wires up the Cloudflare Tunnel. First"
-log "run takes a while (no models downloaded yet — that's a separate manual step, see below)."
+if [ "$SETUP_PROFILE" = "cpu-box" ]; then
+  # Nói đúng cái sẽ xảy ra. Profile cpu-box đặt SKIP_COMFY=1 nên GPU_OK=0, và cả khối ComfyUI
+  # (kể cả motion_install_best_pytorch) bị bỏ qua — lib-feature.sh:597. Nhanh hơn nhiều.
+  log "running $SETUP_SCRIPT on the pod — installs Postgres/MinIO/PM2 and wires up the"
+  log "Cloudflare Tunnel. NO ComfyUI, NO PyTorch/CUDA, NO worker: đây là box CPU, GPU do RunPod"
+  log "Serverless lo. Nhanh hơn profile GPU đáng kể vì bỏ hẳn phần cài torch."
+else
+  log "running $SETUP_SCRIPT on the pod — installs Postgres/MinIO/PM2, detects the"
+  log "GPU/driver, installs ComfyUI + matching PyTorch/CUDA, and wires up the Cloudflare Tunnel. First"
+  log "run takes a while (no models downloaded yet — that's a separate manual step, see below)."
+fi
 
 TS="$(env_get GPU_INSTANCE_ID)"; TS="${TS:-run}"
 LOG="/tmp/motion-clone-bootstrap-${TS}.log"
