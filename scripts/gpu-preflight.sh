@@ -47,6 +47,16 @@ check GPU_PROVIDER required "vast | runpod — picks the CLI make gpu-provision/
 check GPU          required "card filter — vast uses RTX_5090, RunPod uses 'NVIDIA GeForce RTX 5090'. Needs >=24GB VRAM" 1
 check DISK          required "GB — DEPLOY.md minimum for the motion-transfer box is 120" 1
 check MAX_DPH       required "\$/hour ceiling so a search never surprises you" 1
+# Lưới chống quên tắt. In ra ở đây vì đây là khối "tiền", và vì im lặng về nó nghĩa là người dùng
+# không biết mình có lưới hay không — mà đó đúng là thứ chỉ phát hiện được khi đã mất $700.
+pmh="$(get POD_MAX_HOURS)"; pmh="${pmh:-8}"
+if [ "$pmh" = "0" ]; then
+  printf "  ${Y}!${X} %-22s ${Y}0 = KHÔNG có lưới${X} ${D}— quên tắt pod là \$0,99/giờ chạy tiếp (~\$713/tháng)${X}\n" "POD_MAX_HOURS"
+else
+  printf "  ${G}✓${X} %-22s ${D}%s giờ → pod tự DỪNG (giữ DB); một lần quên tốn ~\$%.0f thay vì ~\$713${X}\n" \
+    "POD_MAX_HOURS" "$pmh" "$(awk -v h="$pmh" 'BEGIN{printf "%.0f", h*0.99}')"
+  [ "$(get COMPUTE_TYPE)" = "cpu" ] && printf "    %-20s ${D}%s${X}\n" "" "không áp được cho box CPU — REST không có field auto-stop"
+fi
 
 echo
 echo "Backend deploy (passed straight to the SETUP_PROFILE setup script on the pod)"

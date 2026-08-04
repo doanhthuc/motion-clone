@@ -304,6 +304,28 @@ kiểu chợ.
 Nghĩa là volume 100GB tốn ~$7,1/tháng và `make gpu-destroy` KHÔNG dừng đồng hồ đó — cố ý, vì nó
 đang giữ 42GB model.
 
+<a id="pod-max-hours"></a>
+### Lưới chống quên tắt pod: `POD_MAX_HOURS`
+
+Nhịp dùng thật đo 24/07 → 02/08: **1,19 giờ/ngày ≈ $35/tháng**. Nhưng **một** lần quên tắt để pod
+chạy cả tháng là **$713** — gấp 20 lần. `POD_MAX_HOURS` (mặc định **8**) truyền `--stop-after` vào
+`runpodctl pod create`, nên một lần quên tốn **~$8** thay vì $713.
+
+**`--stop-after`, không `--terminate-after`** — và đây là lựa chọn có chủ ý. Cả hai đều dừng tiền
+GPU, nhưng `terminate` **xoá pod**, mà `VOLUME_PGDATA=0` (mặc định, vì MooseFS chặn `chown`) nghĩa
+là PGDATA nằm trên container disk → **mất database**. Một lưới an toàn không được tự phá dữ liệu.
+`stop` giữ container disk nên DB sống, và `make gpu-up` bật lại được.
+
+Đổi lại, và phải nhớ: **pod đã dừng vẫn tính tiền container disk.** Lưới này chặn khoản đắt (GPU
+$0,99/giờ), không chặn hết. Dọn hẳn vẫn là `make gpu-destroy`.
+
+`make gpu-preflight` in ra mốc này trong khối **Pod rental**, kèm số tiền một lần quên sẽ tốn. Đặt
+`POD_MAX_HOURS=0` để tắt lưới — preflight sẽ cảnh báo vàng thay vì im lặng.
+
+**Không áp được cho `COMPUTE_TYPE=cpu`**: `POST /v1/pods` không có field auto-stop (đã đọc
+`openapi.json`). Rủi ro ở đó nhỏ hơn nhiều — box CPU để quên cả tháng ~$50 so với $713 — và
+`pod-provision.sh` nói rõ điều này ngay trong dry-run thay vì để bạn tưởng có lưới.
+
 <a id="hoa-don-that"></a>
 ### Hoá đơn thật, không phải số suy ra — sửa 04/08/2026
 

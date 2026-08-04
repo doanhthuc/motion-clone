@@ -24,6 +24,8 @@ GPU_PROVIDER="${GPU_PROVIDER:-$(env_get GPU_PROVIDER)}"; GPU_PROVIDER="${GPU_PRO
 COMPUTE_TYPE="${COMPUTE_TYPE:-$(env_get COMPUTE_TYPE)}"; COMPUTE_TYPE="$(printf '%s' "${COMPUTE_TYPE:-gpu}" | tr 'A-Z' 'a-z')"
 CPU_FLAVOR="${CPU_FLAVOR:-$(env_get CPU_FLAVOR)}"; CPU_FLAVOR="${CPU_FLAVOR:-cpu5c}"
 CPU_VCPU="${CPU_VCPU:-$(env_get CPU_VCPU)}"; CPU_VCPU="${CPU_VCPU:-4}"
+# Lưới an toàn cho việc quên tắt pod. 0 = tắt hẳn lưới.
+POD_MAX_HOURS="${POD_MAX_HOURS:-$(env_get POD_MAX_HOURS)}"; POD_MAX_HOURS="${POD_MAX_HOURS:-8}"
 GPU="${GPU:-$(env_get GPU)}"; GPU="${GPU:-RTX_4090}"
 DISK="${DISK:-$(env_get DISK)}"; DISK="${DISK:-120}"
 MAX_DPH="${MAX_DPH:-$(env_get MAX_DPH)}"; MAX_DPH="${MAX_DPH:-0.60}"
@@ -43,6 +45,32 @@ case "$COMPUTE_TYPE" in
   gpu|cpu) ;;
   *) die "COMPUTE_TYPE=$COMPUTE_TYPE không hợp lệ — chỉ nhận: gpu | cpu" ;;
 esac
+
+# ── Lưới an toàn: tự DỪNG pod sau POD_MAX_HOURS giờ ───────────────────────────
+# Vì sao cần: pod GPU $0,99/giờ. Nhịp dùng thật đo được 1,19 giờ/ngày ≈ $35/tháng, nhưng MỘT lần
+# quên tắt để chạy cả tháng là $713 — gấp 20 lần. Lưới này biến một lần quên thành $8 thay vì $713.
+#
+# Dùng --stop-after, KHÔNG --terminate-after. Cả hai đều dừng tiền GPU, nhưng terminate XOÁ pod và
+# với VOLUME_PGDATA=0 (mặc định, vì MooseFS chặn chown) thì PGDATA nằm trên container disk → mất
+# database. Một lưới an toàn không được tự phá dữ liệu. `stop` giữ container disk nên DB sống, và
+# `make gpu-up` bật lại được.
+#
+# Đổi lại: pod đã dừng VẪN tính tiền container disk. Nên lưới này chặn khoản đắt (GPU), không chặn
+# hết. Dọn hẳn vẫn là `make gpu-destroy` — xem docs/gpu-pod.md#costs.
+STOP_AFTER_ARG=()
+if [ "$POD_MAX_HOURS" != "0" ]; then
+  case "$POD_MAX_HOURS" in
+    ''|*[!0-9]*) die "POD_MAX_HOURS=$POD_MAX_HOURS phải là số giờ nguyên dương (hoặc 0 để tắt lưới)." ;;
+  esac
+  # BSD date (macOS) và GNU date (Linux) có cú pháp khác nhau — thử cả hai, script này chạy ở máy dev.
+  STOP_AT="$(date -u -v+"${POD_MAX_HOURS}"H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+             || date -u -d "+${POD_MAX_HOURS} hours" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+  if [ -n "$STOP_AT" ]; then
+    STOP_AFTER_ARG=(--stop-after "$STOP_AT")
+  else
+    warn "không tính được mốc thời gian cho --stop-after (date không hỗ trợ cả hai cú pháp) → KHÔNG có lưới an toàn."
+  fi
+fi
 if [ "$COMPUTE_TYPE" = "cpu" ] && [ "$GPU_PROVIDER" != "runpod" ]; then
   die "COMPUTE_TYPE=cpu chỉ có trên RunPod (GPU_PROVIDER=$GPU_PROVIDER hiện tại).
   vast.ai là chợ GPU, không bán máy CPU thuần."
@@ -233,6 +261,14 @@ for v in out:
   # Flavor: cpu3c/cpu5c = ram ×2 · cpu3g/cpu5g = ×4 (General) · cpu3m/cpu5m = ×8 (Memory).
   # Mặc định cpu5g + 4 vCPU = 16 GB RAM, đủ cho Postgres + MinIO + api + build Nuxt.
   if [ "$COMPUTE_TYPE" = "cpu" ]; then
+    # Ước giá/giờ để câu cảnh báo dưới đây không gõ cứng con số. Đo 04/08/2026: cpu5c $0,035/vCPU ·
+    # cpu5g $0,046/vCPU. Chỉ dùng để HIỂN THỊ; giá thật đọc từ costPerHr trong phản hồi.
+    case "$CPU_FLAVOR" in
+      *g) CPU_HOURLY_EST="$(awk -v v="$CPU_VCPU" 'BEGIN{printf "%.3f", v*0.046}')" ;;
+      *m) CPU_HOURLY_EST="$(awk -v v="$CPU_VCPU" 'BEGIN{printf "%.3f", v*0.070}')" ;;
+      *)  CPU_HOURLY_EST="$(awk -v v="$CPU_VCPU" 'BEGIN{printf "%.3f", v*0.035}')" ;;
+    esac
+
     RP_KEY="$(env_get RUNPOD_API_KEY)"
     [ -n "$RP_KEY" ] || die "COMPUTE_TYPE=cpu cần RUNPOD_API_KEY trong .env (đường REST, runpodctl không chọn được flavor CPU)."
     [ -n "$POD_VOLUME_ID" ] || die "COMPUTE_TYPE=cpu cần POD_VOLUME_ID: box CPU không có ổ nào khác để chứa MinIO và model."
@@ -267,6 +303,14 @@ except Exception:
     else
       warn "không đọc được trần đĩa của flavor $CPU_FLAVOR từ API — nếu REST trả 'Container Disk must be"
       warn "  less than or equal to N' thì hạ DISK hoặc tăng CPU_VCPU (trần = ${CPU_FLAVOR%%[0-9]*}? GB/vCPU × vCPU)."
+    fi
+
+    # REST /v1/pods KHÔNG có field auto-stop/terminate (đã đọc openapi.json 04/08/2026). Nói ra ở
+    # ĐÂY, trong cả dry-run, thay vì để người dùng tưởng POD_MAX_HOURS có tác dụng. Rủi ro nhỏ hơn
+    # nhiều so với pod GPU: box CPU để quên cả tháng ~$50, pod GPU ~$713.
+    if [ "$POD_MAX_HOURS" != "0" ]; then
+      warn "POD_MAX_HOURS=$POD_MAX_HOURS KHÔNG áp được cho box CPU — REST /v1/pods không có field auto-stop."
+      warn "  Để quên cả tháng ≈ \$$(awk -v c="$CPU_HOURLY_EST" 'BEGIN{printf "%.0f", c*720}') thay vì \$713 của pod GPU. Tự tắt bằng: make gpu-destroy"
     fi
 
     BODY="$(POD_VOLUME_ID="$POD_VOLUME_ID" VOL_DC="${VOL_DC:-}" IMAGE="$IMAGE" DISK="$DISK" \
@@ -331,7 +375,7 @@ $RAW"
     --container-disk-in-gb "$DISK"
     --ports "22/tcp"
     --min-cuda-version "$MIN_CUDA_VERSION"
-    "${VOL_ARGS[@]}" "${DC_ARG[@]}")
+    "${VOL_ARGS[@]}" "${DC_ARG[@]}" ${STOP_AFTER_ARG[@]+"${STOP_AFTER_ARG[@]}"})
 
   # %q not [*]: the gpu id has spaces ("NVIDIA GeForce RTX 5090"), and this line is meant to be
   # copy-pasteable. [*] would print it unquoted and the paste would be parsed as four arguments.
@@ -353,6 +397,9 @@ $(warn "Dry run — nothing rented.")
 
   A RunPod Network Volume bills monthly whether or not a pod exists — 'make gpu-destroy' does not
   stop that meter, and is not supposed to. See docs/gpu-pod.md#costs.
+$( [ ${#STOP_AFTER_ARG[@]} -gt 0 ] \
+   && printf '  Lưới an toàn: pod TỰ DỪNG lúc %s (POD_MAX_HOURS=%s).\n  Dừng chỉ chặn tiền GPU — container disk vẫn tính. Dọn hẳn: make gpu-destroy.' "$STOP_AT" "$POD_MAX_HOURS" \
+   || printf '  KHÔNG có lưới an toàn (POD_MAX_HOURS=0) — quên tắt là $0,99/giờ chạy tiếp.' )
 EOF
     exit 0
   fi
