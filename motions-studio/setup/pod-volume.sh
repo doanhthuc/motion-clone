@@ -219,7 +219,7 @@ elif command -v pg_lsclusters >/dev/null 2>&1; then
       # Chưa có pgdata trên volume → nhận cluster hiện tại (initdb của apt) sang
       if [ ! -f "$PGDATA/PG_VERSION" ]; then
         if [ -n "$CUR_DD" ] && [ -f "$CUR_DD/PG_VERSION" ]; then
-          act "dời cluster $CUR_DD → $PGDATA…"
+          act "dời cluster $CUR_DD → ${PGDATA}…"
           $SUDO pg_ctlcluster "$PGVER" "${PGCLU:-main}" stop >/dev/null 2>&1 || true
           for _i in $(seq 1 30); do [ -f "$CUR_DD/postmaster.pid" ] || break; sleep 1; done
           $SUDO rsync -a "$CUR_DD/" "$PGDATA/" || die "rsync PGDATA lỗi — cluster nguồn còn nguyên, không mất gì."

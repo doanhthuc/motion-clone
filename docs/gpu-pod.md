@@ -847,10 +847,31 @@ nhưng chưa ai thử.
 
 | | `FE_BUILD=pod` | `FE_BUILD=ci` |
 |---|---|---|
-| Trên pod | `npm install` + `npm run build` | rsync **33 MB** |
+| Trên pod | `npm install` + `npm run build` | rsync **31 MB** |
 | Đỉnh RAM trên pod | 2,49 GB | **0** |
-| `make gpu-fe` | ~2-4 phút | ~15 giây |
-| Box CPU đủ dùng | 8 GB ($0,14/giờ) | **4 GB ($0,06/giờ)** |
+| `make gpu-fe` | ~2-4 phút | **84 giây** (đo 04/08) |
+| Box CPU đủ dùng | 8 GB ($0,14/giờ) | **4 GB ($0,07/giờ)** |
+| `node_modules` trên pod | ~290 MB | **không có** |
+
+**Đã chạy thật 04/08/2026** trên box `cpu5c × 2` = 4 GB, **$0,07/giờ**:
+
+| Đo | Kết quả |
+|---|---|
+| `sharp` nạp được trên pod Linux | ✅ `require('./.output/server/node_modules/sharp')` OK |
+| **`API_KEY` theo pod, inject lúc chạy** | ✅ `GET app.…/api/motion/jobs` → **HTTP 200** |
+| RAM | **1929 / 3815 MB (51%)** |
+| Đĩa container | 1,6 / 30 GB (6%) — thoải mái vì không có `node_modules` |
+| `motions` RSS | 76 MB |
+| `make gpu-fe` | 84 giây (tải artifact + rsync 31 MB + chờ tunnel trả lời) |
+
+Mục thứ hai là mục quan trọng nhất: `server/api/motion/jobs.get.js:4` đọc `useRuntimeConfig()` rồi
+gọi backend bằng header `X-API-Key`. Route đó trả 200 nghĩa là **một artifact build sẵn ở CI dùng
+được với `API_KEY` sinh riêng cho từng pod** — điều tưởng sẽ chặn cả hướng, nay đã chứng minh chứ
+không còn là suy luận.
+
+> **84 giây, không phải ~15 giây như từng ghi ở đây.** Tải artifact + rsync 31 MB + vòng chờ
+> `https://$FE_DOMAIN` trả lời đều tính vào. Vẫn nhanh hơn build trên pod 2-3 lần, nhưng con số cũ
+> là suy đoán.
 
 **Vì sao CI được mà máy dev thì không** — đây là chỗ comment `pod-fe.sh:13` nói đúng nhưng chỉ đúng
 một nửa. Nitro **nhúng** sharp vào `.output/server/node_modules/@img/`. Build trên macOS ra

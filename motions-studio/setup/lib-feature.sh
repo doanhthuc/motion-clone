@@ -171,7 +171,7 @@ setup_cloudflare_tunnel_auto() {
   local ingresp
   ingresp="$(cfjson PUT "/accounts/$acc/cfd_tunnel/$tid/configurations" "{\"config\":{\"ingress\":[${ing}{\"service\":\"http_status:404\"}]}}")"
   printf '%s' "$ingresp" | cf_ok || { warn "Cấu hình ingress lỗi: $(printf '%s' "$ingresp" | cf_err)"; return 1; }
-  ok "Ingress: $dom→:$apip"
+  ok "Ingress: ${dom}→:$apip"
 
   cf_zone_for_host() { cf_zone_lookup "$tok" "$1" | awk '{print $1, $3}'; }
   local rdom recid dnsresp body hzinfo hzid hzname
@@ -810,7 +810,7 @@ NUXT_PUBLIC_MOTION_BACKEND_URL=$BE_URL
 FEENV
   echo
   if [ -n "$(get_kv GMAIL_USER)" ]; then
-    say "    Gửi email thông tin kết nối FE tới $SUPER_ADMIN…"
+    say "    Gửi email thông tin kết nối FE tới ${SUPER_ADMIN}…"
     if send_setup_email >/dev/null 2>&1; then ok "Đã gửi email tới $SUPER_ADMIN (kiểm tra cả Spam)."
     else warn "Gửi email thất bại — kiểm tra GMAIL_USER/GMAIL_APP_PASSWORD. Thông tin vẫn in ở trên."; fi
   fi

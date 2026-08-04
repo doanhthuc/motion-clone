@@ -212,7 +212,7 @@ setup_cloudflare_tunnel_auto() {
   local ingresp
   ingresp="$(cfjson PUT "/accounts/$acc/cfd_tunnel/$tid/configurations" "{\"config\":{\"ingress\":[${ing}{\"service\":\"http_status:404\"}]}}")"
   printf '%s' "$ingresp" | cf_ok || { warn "Cấu hình ingress lỗi: $(printf '%s' "$ingresp" | cf_err)"; return 1; }
-  ok "Ingress: $dom→:$apip${CF_FE_DOMAIN:+ · $CF_FE_DOMAIN→:${CF_FE_PORT:-2030}}"
+  ok "Ingress: ${dom}→:$apip${CF_FE_DOMAIN:+ · ${CF_FE_DOMAIN}→:${CF_FE_PORT:-2030}}"
 
   # 4) DNS CNAME proxied cho TỪNG hostname (ghi đè record cũ → khỏi xoá tay)
   cf_zone_for_host() { cf_zone_lookup "$tok" "$1" | awk '{print $1, $3}'; }
@@ -1002,7 +1002,7 @@ echo
 
 # Gửi thông tin kết nối cho admin qua email (nếu đã cấu hình Gmail).
 if [ -n "$(get_kv GMAIL_USER)" ]; then
-  say "    Gửi email thông tin kết nối FE tới $SUPER_ADMIN…"
+  say "    Gửi email thông tin kết nối FE tới ${SUPER_ADMIN}…"
   if send_setup_email >/dev/null 2>&1; then
     ok "Đã gửi email tới $SUPER_ADMIN (kiểm tra hộp thư, kể cả Spam)."
   else

@@ -115,7 +115,7 @@ for r in runs:
 
   CI_TMP="$(mktemp -d)"
   trap 'rm -rf "$CI_TMP"' EXIT
-  log "tải artifact từ run $RUN_ID…"
+  log "tải artifact từ run ${RUN_ID}…"
   gh run download "$RUN_ID" -n motions-output -D "$CI_TMP" \
     || die "gh run download thất bại — artifact có thể đã hết hạn (giữ 90 ngày).
   Chạy lại CI:  gh workflow run build-frontend.yml --ref \$(git rev-parse --abbrev-ref HEAD)"
@@ -195,9 +195,12 @@ npm install --no-audit --no-fund || { echo "npm install failed"; exit 1; }
 # stack trace, không dòng nào nói tới RAM.
 # Đo 04/08/2026: build này đỉnh 2,49 GB RSS. Chừa ~1,2 GB cho Postgres/MinIO/api đang chạy song song
 # cộng phần non-heap của node, nên lấy (limit - 1200MB) và kẹp trong [1536, 6144].
-# MỌI $ dưới đây phải escape: heredoc là <<REMOTE (không đóng ngoặc) nên $x không escape sẽ giãn
-# ở MÁY LOCAL thành rỗng, không phải trên pod. Bản trước của khối này thiếu escape và vì thế
-# `[ -r "$CG" ]` trở thành `[ -r "" ]` — chưa ai thấy vì nó chưa từng chạy trên pod nào.
+# MỌI ký hiệu đô-la dưới đây phải escape. Heredoc là <<REMOTE (không đóng ngoặc) nên biến KHÔNG
+# escape sẽ giãn ở MÁY LOCAL thành rỗng thay vì giãn trên pod. Bản trước của khối này thiếu escape
+# nên phép kiểm cgroup trở thành so sánh với chuỗi rỗng — chưa ai thấy vì nó chưa từng chạy.
+# Và chính dòng chú thích này từng viết một tên biến không escape, làm bash chết với
+# 'unbound variable' ngay tại dòng mở heredoc (đã gặp 04/08/2026). Nên: trong heredoc, ngay cả
+# COMMENT cũng không được chứa biến chưa escape.
 CG=/sys/fs/cgroup/memory.max
 [ -r "\$CG" ] || CG=/sys/fs/cgroup/memory/memory.limit_in_bytes
 LIM_MB=\$(awk '{ if (\$1 ~ /^[0-9]+\$/) printf "%.0f", \$1/1048576; else print 0 }' "\$CG" 2>/dev/null || echo 0)
