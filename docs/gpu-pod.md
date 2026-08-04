@@ -330,6 +330,61 @@ Ngày 02/08 trả **cả hai**: $1,49 pod GPU **và** $0,39 serverless. Đó là
 lần" — không phải tính chất của serverless, mà vì cái box luôn bật lúc đó là một pod GPU. Xem
 [§Hai hình dạng deploy](#deploy-shapes).
 
+<a id="premium-serverless"></a>
+### Serverless đắt hơn pod bao nhiêu — và con số này đứng vững tới đâu
+
+Cả hai dòng hoá đơn đều gộp tiền đĩa (`diskSpaceBilledGB`) vào `amount`, nên chia thẳng
+`amount / thời gian` ra **giá all-in**, không phải giá GPU. Tiền đĩa áp cho cả hai bên nên nó phần
+lớn triệt tiêu, và tỉ lệ bền qua mọi giả định:
+
+| Đơn giá đĩa giả định | Pod $/giờ | Serverless $/giờ | Tỉ lệ |
+|---|---|---|---|
+| 0 (**all-in — số phòng thủ được nhất**) | 1,003 | 1,586 | **1,58×** |
+| $0,0000108/GB-h | 0,990 | 1,559 | 1,57× |
+| $0,0000972/GB-h (đơn giá volume đo được) | 0,886 | 1,348 | 1,52× |
+| $0,000300/GB-h | 0,640 | 0,853 | 1,33× |
+
+**Serverless đắt hơn pod 1,33–1,58× cho mỗi giây GPU.** Mỏ neo độc lập: hoá đơn pod all-in
+**$1,003/giờ** khớp giá niêm yết **$0,99** (`gpuTypes.securePrice` cho RTX 5090) cộng chút đĩa — nên
+cách đọc hoá đơn đúng, không phải đọc nhầm cột.
+
+**Vì sao đắt hơn:** bạn mua **quyền có 0 worker**. Nhà cung cấp vẫn phải giữ năng lực sẵn và chịu
+rủi ro máy nằm không; phần chênh là tiền trả cho việc đó. Serverless không bán GPU rẻ hơn — nó bán
+hoá đơn $0 lúc rỗi. Không rỗi thì không mua được gì. (RunPod có tier rẻ hơn là **Active workers**,
+`workersMin > 0`, nhưng bật nó là trả liên tục, tức mất đúng lý do dùng serverless.)
+
+> **Chưa xác minh được:** giá serverless **niêm yết**. Không có trong REST `/v1` (đã đọc
+> `openapi.json`), không có trong GraphQL (`gpuTypes` chỉ có `securePrice`/`communityPrice`/spot/
+> 1-3-6 tháng), không có trong object endpoint. Toàn bộ số serverless ở trên đến từ **một** dòng hoá
+> đơn, 884 giây, một ngày.
+
+<a id="community-cloud"></a>
+### Community Cloud rẻ hơn 30% — và không dùng được với Network Volume
+
+| RTX 5090 | $/giờ |
+|---|---|
+| Secure Cloud | 0,99 |
+| Community Cloud | **0,69** |
+
+`scripts/pod-provision.sh` **không bao giờ set `--cloud-type`**, nên nó luôn dùng SECURE. Con số
+$0,69 nhìn như giảm 30% miễn phí. Nó không phải.
+
+**Đo 04/08/2026** — Community Cloud **không tồn tại ở datacenter nào có Network Volume**:
+
+| Thử | Kết quả |
+|---|---|
+| COMMUNITY + volume `wfe86wzkpm`, EU-RO-1 | `no instances available` |
+| COMMUNITY, EU-RO-1, **không** volume — 5090 · 4090 · A4000 · A4500 · L4 | cả 5: `no instances available` |
+| COMMUNITY, A4000, ở 4 DC khác có `storageSupport=true` (EU-CZ-1 · EU-FR-1 · US-TX-3 · US-IL-1) | cả 4: `no instances available` |
+| COMMUNITY, A4000, **không ràng DC** (đối chứng dương) | ✅ **tạo được**, $0,17/giờ |
+
+Community chạy được — chỉ là không ở nơi có network storage. 5 datacenter `storageSupport=true` đã
+thử đều không có máy community nào. Volume **không dời được datacenter**, nên với dự án này
+Community Cloud là ngõ cụt: hoặc volume, hoặc giá $0,69, không thể cả hai.
+
+Suy luận từ 5 DC + 1 đối chứng dương, **không** từ tài liệu RunPod — nếu sau này cần $0,69 thì thử
+lại, có thể họ đã mở community ở DC có storage.
+
 **Giá pod CPU: chưa đo được.** Không có `runpodctl cpu list`; REST `/v1` không có endpoint giá;
 GraphQL `cpuFlavors` cho spec (6 flavor: `cpu3c/g/m`, `cpu5c/g/m`, 2–32 vCPU) nhưng **không** có
 field giá nào qua ~14 lần dò tên. Phải đọc trên dashboard hoặc thuê một cái rồi xem hoá đơn. Kéo
@@ -670,8 +725,9 @@ serverless, cho cùng một khối công việc. Xem [§Hoá đơn thật](#hoa-
 
 ### Câu hỏi quyết định không phải "bao nhiêu job", mà "GPU có rỗi không"
 
-Đơn giá serverless **$1,586/giờ** so với pod **$1,00/giờ** — serverless đắt hơn **1,59×** cho mỗi
-giây GPU (cả hai từ hoá đơn thật). Nó không rẻ hơn về đơn giá; nó chỉ tính $0 khi rỗi.
+Đơn giá all-in serverless **$1,586/giờ** so với pod **$1,003/giờ** — serverless đắt hơn
+**1,33–1,58×** cho mỗi giây GPU tuỳ cách tách tiền đĩa ([bảng độ bền](#premium-serverless)). Nó
+không rẻ hơn về đơn giá; nó chỉ tính $0 khi rỗi.
 
 Với job thật **~9 phút** (motion + enhance, clip 15-20s — quan sát 04/08, kiểm chéo với 0,85 s/frame
 trong `worker_runtime/linux.py:850`):
@@ -679,8 +735,8 @@ trong `worker_runtime/linux.py:850`):
 | Cách dùng | GPU bận | Rẻ hơn |
 |---|---|---|
 | Bật khi làm việc, job nối nhau (2-8 giờ/ngày) | gần 100% | **pod GPU + `local`** — $60-240/tháng, so với $169-467 |
-| App bật 24/7, dưới ~100 job/ngày | 12-62% | **box CPU + serverless** — $221-519/tháng, so với $720 |
-| App bật 24/7, trên ~100 job/ngày | trên 62% | pod GPU + `local` |
+| App bật 24/7, dưới **87 job/ngày** | dưới 57% | **box CPU + serverless** — $221-519/tháng, so với $720 |
+| App bật 24/7, trên **87 job/ngày** | trên 57% | pod GPU + `local` |
 
 Bật-tắt theo phiên làm việc thì không có thời gian rỗi nào để serverless tiết kiệm — chỉ còn phần
 đắt thêm 59%. Chi tiết bảng và cách tính:

@@ -85,6 +85,13 @@ rẻ thì cứ để chạy, container disk còn nguyên.
    (0,15 giờ × $0,06 = $0,009, không phải $0,08) và **không có dòng pod CPU nào** trong cả 7 dòng
    `billing pods` từ 24/07 đến 02/08. Mục 1 sẽ trả lời luôn cả câu này.
 
+   **Đã loại một lối thoát:** giá rẻ **không** đến từ Community Cloud. RTX 5090 community $0,69/giờ
+   so với secure $0,99 nhìn như giảm 30%, nhưng đo 04/08/2026 thì Community Cloud **không tồn tại ở
+   bất kỳ datacenter nào có Network Volume** — 5 GPU thử ở EU-RO-1 và A4000 thử ở 4 DC khác có
+   `storageSupport=true`, cả 9 lần đều `no instances available`, trong khi cùng lệnh đó bỏ ràng buộc
+   DC thì tạo được pod ngay. Volume không dời DC được, nên: hoặc volume, hoặc $0,69 — không cả hai.
+   Chi tiết: [docs/gpu-pod.md#community-cloud](../../gpu-pod.md#community-cloud).
+
 3. **Chi phí serverless thật khi dùng hằng ngày.** $0,3894 là của một ngày chạy thử 5 job dồn cục.
    Nó không nói được gì về ngày có 30 job rải rác — mà theo §Vì sao bây giờ thì đó mới là hình dạng
    đắt. Cần một tuần dùng thật rồi đọc `billing serverless`.
@@ -105,9 +112,16 @@ Hai nguồn độc lập khớp nhau, nên lấy **9 phút/job** làm mốc tín
 
 ### Hệ quả: serverless thắng hay thua phụ thuộc CÁCH DÙNG, không phụ thuộc số job
 
-Đơn giá serverless **$1,586/giờ** so với pod **$1,00/giờ** — serverless đắt hơn **1,59×** cho mỗi
-giây GPU. Nó không rẻ hơn về đơn giá; nó chỉ tính $0 khi rỗi. Nên phép so thật là: *bạn có đang trả
-tiền cho thời gian rỗi hay không.*
+Đơn giá **all-in** serverless $1,586/giờ so với pod $1,003/giờ — serverless đắt hơn **1,33–1,58×**
+cho mỗi giây GPU, tuỳ cách tách `diskSpaceBilledGB` ra khỏi `amount` (cả hai dòng hoá đơn đều gộp
+tiền đĩa; tiền đĩa áp cho cả hai nên phần lớn triệt tiêu — [bảng độ
+bền](../../gpu-pod.md#premium-serverless)). Mỏ neo: hoá đơn pod all-in $1,003 khớp giá niêm yết
+$0,99. Bảng dưới dùng **all-in cho cả hai** ($1,586 và $1,00) — cùng một cách tính, không thiên vị
+bên nào. Trừ tiền đĩa ở cả hai thì hai cột cùng co lại và ngưỡng đảo chiều nhích từ 87 lên 89
+job/ngày; **không kết luận nào đổi.**
+
+Serverless không rẻ hơn về đơn giá; nó chỉ tính $0 khi rỗi — bạn đang mua **quyền có 0 worker**.
+Nên phép so thật là: *bạn có đang trả tiền cho thời gian rỗi hay không.*
 
 **Kiểu B — bật khi làm việc, job chạy nối nhau** (kiểu đang dùng: 11,9 giờ trong 10 ngày):
 
@@ -128,10 +142,11 @@ serverless tiết kiệm — chỉ còn phần đắt thêm 59%.
 | 60 | 38% | $720 | **$519** |
 | 110 | 69% | **$720** | $892 |
 
-Ngưỡng đảo chiều **~100 job/ngày** (≈62% GPU bận) — khớp với break-even 57-63% ở §Vì sao bây giờ.
+Ngưỡng đảo chiều **87 job/ngày** (≈57% GPU bận, c=$0,10) — khớp break-even 57-63% ở §Vì sao bây
+giờ. Trừ tiền đĩa ở cả hai cột thì ngưỡng là 89, gần như không đổi.
 
 > **Vì thế spec này chỉ đáng làm nếu đích đến là kiểu A**: app mở cho người ngoài 24/7, tải dưới
-> ~100 job/ngày. Nếu cách dùng vẫn là bật-tắt theo phiên làm việc thì hình dạng đúng là **pod GPU +
+> ~87 job/ngày. Nếu cách dùng vẫn là bật-tắt theo phiên làm việc thì hình dạng đúng là **pod GPU +
 > `WORKER_SOURCE=local`**, và hướng box CPU nên để đó chờ. Đây là ràng buộc quan trọng nhất của
 > spec, và nó không lộ ra từ bất kỳ số nào trong hoá đơn — chỉ lộ ra khi hỏi *"GPU có rỗi không?"*.
 
