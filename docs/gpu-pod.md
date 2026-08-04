@@ -942,6 +942,18 @@ Ba đường thoát, chưa thử cái nào:
 Đây là rủi ro cố hữu của hình dạng box CPU mà spec đã cảnh báo, nay đã gặp thật: **serverless không
 có SLA về chỗ trống**. Worker local trên pod GPU không có vấn đề này — bạn thuê là bạn có.
 
+**Throttle DAO ĐỘNG, không phải chặn cứng.** Đo 04/08/2026 trong vòng vài phút: `throttled:3` →
+`idle:3 ready:3 throttled:0` → `throttled:3` trở lại. Nên đường thoát số 2 (chờ) là thật, và kéo
+theo hai điều thực dụng:
+
+- Đừng kết luận endpoint hỏng từ **một** lần đọc `/health`. Đọc vài lần cách nhau vài phút.
+- Job nằm `queued` trong lúc throttle **không mất** — dispatcher vẫn poll, và worker nhặt khi có chỗ.
+  Nhưng nếu bạn destroy box giữa lúc đó thì worker tỉnh dậy sẽ không gọi được api. Nên **purge hàng
+  đợi trước khi destroy**: `curl -X POST https://api.runpod.ai/v2/<ep>/purge-queue -H "Authorization: Bearer $KEY"`.
+
+Cũng xác nhận được điều docs nói ở [§Costs](#costs): worker `idle`/`ready` của FlashBoot **không**
+tính tiền — lúc `ready:3` thì `currentSpendPerHr` vẫn đúng bằng mức chỉ-có-volume ($0,0100).
+
 **Cạm bẫy khi ghép `full` với `serverless`:** profile `full` cho box claim 21 type, nhưng image
 serverless bản mặc định chỉ bake 4. 17 type còn lại sẽ nằm `queued` **vĩnh viễn** — không lỗi,
 không log, chỉ là không ai nhận. Ba cách thoát:
