@@ -839,8 +839,39 @@ heap phình tới hàng chục GB rồi bị OOM-killer của cgroup giết. Tri
 không stack trace, không dòng nào nhắc tới RAM. Nhờ chốt này, box 4 GB (heap 2896 MB) **có thể** đủ —
 nhưng chưa ai thử.
 
-Cách rẻ nhất và đúng nhất vẫn chưa làm: **build FE ở CI rồi rsync `.output`** — xoá hẳn đỉnh RAM
-*và* bỏ luôn phần chậm nhất của `make gpu-fe`.
+<a id="fe-build-ci"></a>
+#### Build FE ở CI — đã làm, và nó xoá hẳn câu hỏi RAM
+
+`FE_BUILD=ci` (mặc định) không build gì trên pod. `.github/workflows/build-frontend.yml` build
+`motions/` trên `ubuntu-latest`, `pod-fe.sh` tải artifact về rồi rsync `.output` lên pod.
+
+| | `FE_BUILD=pod` | `FE_BUILD=ci` |
+|---|---|---|
+| Trên pod | `npm install` + `npm run build` | rsync **33 MB** |
+| Đỉnh RAM trên pod | 2,49 GB | **0** |
+| `make gpu-fe` | ~2-4 phút | ~15 giây |
+| Box CPU đủ dùng | 8 GB ($0,14/giờ) | **4 GB ($0,06/giờ)** |
+
+**Vì sao CI được mà máy dev thì không** — đây là chỗ comment `pod-fe.sh:13` nói đúng nhưng chỉ đúng
+một nửa. Nitro **nhúng** sharp vào `.output/server/node_modules/@img/`. Build trên macOS ra
+`sharp-darwin-arm64`, copy sang pod Linux x64 là chết lúc chạy. `ubuntu-latest` là linux-x64, đúng
+kiến trúc pod — nên cùng cơ chế nhúng đó lại thành ưu điểm. Workflow có cổng kiểm bắt buộc thấy
+`@img/sharp-linux*` trong `.output`, và `pod-fe.sh` kiểm lại lần nữa trước khi rsync.
+
+**API key theo từng pod vẫn hoạt động** — đây là điều kiện tưởng sẽ chặn cả hướng mà lại không.
+`nuxt.config.js:35` đưa cả ba giá trị qua `runtimeConfig`, tên biến khớp quy ước `NUXT_*`, và
+`motions/.run.sh` nạp `motions/.env` **lúc khởi động** rồi `exec node .output/server/index.mjs`.
+Nên một artifact build sẵn dùng được với `API_KEY` sinh riêng cho từng pod. App là SSR nên client
+nhận `public` từ payload server, tức giá trị runtime thắng giá trị baked lúc build.
+
+Hai cổng chặn trong `pod-fe.sh`:
+
+- `motions/` có thay đổi **chưa commit** → chặn. Artifact build từ commit nên không chứa chúng, và
+  deploy ra một bản FE khác cái bạn đang sửa là lỗi mất hàng giờ mới nhận ra.
+- Không có run **thành công** cho đúng commit HEAD → chặn, kèm ba cách sửa. Không tự lấy artifact
+  của commit khác: deploy code cũ trong im lặng còn tệ hơn báo lỗi.
+
+Đang sửa FE mà chưa muốn push thì `FE_BUILD=pod bash scripts/pod-fe.sh`.
 
 Cách 3 đúng nhất về kiến trúc. Lý do `pod-fe.sh:13` build trên pod là `sharp` — `node_modules/@img/`
 ở máy dev chứa `sharp-darwin-arm64`, copy sang pod Linux x64 thì build xong mà chết lúc chạy. Lý do

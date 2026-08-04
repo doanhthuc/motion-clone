@@ -52,6 +52,85 @@ remote "test -f ~/motion-backend/.env" \
   || die "~/motion-backend/.env not on the pod — the backend isn't deployed. Run: make gpu-bootstrap"
 log "pod: Node $NODE_V · backend .env present"
 
+# ── FE_BUILD: build ở CI (mặc định) hay build trên pod ────────────────────────
+# ci   tải .output đã build sẵn từ artifact của workflow build-frontend.yml rồi rsync lên pod.
+#      Pod KHÔNG npm install, KHÔNG build → đỉnh RAM về 0 (build đo được 2,49 GB) nên box CPU
+#      4 GB $0,06/giờ dùng được, và bước này từ ~2-4 phút xuống ~15 giây.
+# pod  build trên pod như trước. Đường thoát khi bạn đang sửa FE mà chưa muốn push.
+FE_BUILD="${FE_BUILD:-$(env_get FE_BUILD)}"; FE_BUILD="${FE_BUILD:-ci}"
+case "$FE_BUILD" in
+  ci|pod) ;;
+  *) die "FE_BUILD=$FE_BUILD không hợp lệ — chỉ nhận: ci | pod" ;;
+esac
+
+CI_OUTPUT=""
+if [ "$FE_BUILD" = ci ]; then
+  command -v gh >/dev/null || die "FE_BUILD=ci cần GitHub CLI:  brew install gh && gh auth login
+  (hoặc FE_BUILD=pod bash scripts/pod-fe.sh để build trên pod như trước)"
+
+  # motions/ có thay đổi chưa commit thì artifact KHÔNG chứa chúng — và deploy ra một bản FE khác
+  # cái bạn đang sửa là loại lỗi mất hàng giờ mới nhận ra. Chặn thẳng.
+  if [ -n "$(git status --porcelain -- motions/ 2>/dev/null)" ]; then
+    die "motions/ có thay đổi chưa commit — artifact CI build từ commit, nên nó KHÔNG chứa các thay đổi đó.
+  Commit + push rồi chờ CI, hoặc:  FE_BUILD=pod bash scripts/pod-fe.sh"
+  fi
+
+  SHA="$(git rev-parse HEAD 2>/dev/null)"
+  [ -n "$SHA" ] || die "không đọc được HEAD — đây có phải git repo?"
+  log "tìm artifact FE cho commit ${SHA:0:8}…"
+  RUNS_JSON="$(gh run list --workflow build-frontend.yml --limit 40 \
+                 --json databaseId,headSha,conclusion,status 2>&1)"
+  # Phân biệt "workflow chưa tồn tại trên default branch" với "có workflow nhưng chưa run nào xong".
+  # Lần dùng đầu tiên LUÔN rơi vào ca thứ nhất, và nếu gộp hai ca thì message chỉ đường sai.
+  case "$RUNS_JSON" in
+    *"not found on the default branch"*|*"HTTP 404"*)
+      die "GitHub chưa biết workflow build-frontend.yml — nó phải nằm trên DEFAULT BRANCH mới chạy được.
+  Push nó lên:  git push
+  Rồi chờ CI:   gh run watch
+  Hoặc build trên pod ngay bây giờ:  FE_BUILD=pod bash scripts/pod-fe.sh" ;;
+  esac
+  RUN_ID="$(printf '%s' "$RUNS_JSON" | SHA="$SHA" python3 -c '
+import sys, json, os
+sha = os.environ["SHA"]
+try: runs = json.load(sys.stdin)
+except Exception: runs = []
+for r in runs:
+    if r.get("headSha") == sha and r.get("conclusion") == "success":
+        print(r["databaseId"]); break
+' 2>/dev/null)"
+  if [ -z "$RUN_ID" ]; then
+    # Nói rõ commit này ĐÃ push chưa — hai nguyên nhân khác nhau, hai cách sửa khác nhau.
+    if git branch -r --contains "$SHA" >/dev/null 2>&1 && [ -n "$(git branch -r --contains "$SHA" 2>/dev/null)" ]; then
+      PUSHED="commit này đã push"
+    else
+      PUSHED="commit này CHƯA push — đó gần như chắc chắn là nguyên nhân"
+    fi
+    die "không có lần chạy build-frontend.yml THÀNH CÔNG cho commit ${SHA:0:8} ($PUSHED).
+  Ba cách:
+    1. push rồi chờ CI:              git push && gh run watch
+    2. chạy tay cho branch hiện tại: gh workflow run build-frontend.yml --ref \$(git rev-parse --abbrev-ref HEAD)
+    3. build trên pod (chậm, cần RAM): FE_BUILD=pod bash scripts/pod-fe.sh
+  Xem trạng thái:  gh run list --workflow build-frontend.yml --limit 5"
+  fi
+
+  CI_TMP="$(mktemp -d)"
+  trap 'rm -rf "$CI_TMP"' EXIT
+  log "tải artifact từ run $RUN_ID…"
+  gh run download "$RUN_ID" -n motions-output -D "$CI_TMP" \
+    || die "gh run download thất bại — artifact có thể đã hết hạn (giữ 90 ngày).
+  Chạy lại CI:  gh workflow run build-frontend.yml --ref \$(git rev-parse --abbrev-ref HEAD)"
+  tar -xzf "$CI_TMP/motions-output.tar.gz" -C "$CI_TMP" || die "giải nén artifact thất bại"
+  [ -d "$CI_TMP/.output/server" ] || die "artifact không có .output/server — workflow đổi cấu trúc?"
+  # Cổng kiểm cuối, ở phía client: sharp phải là linux. CI đã kiểm, nhưng artifact có thể là bản cũ
+  # từ trước khi cổng đó tồn tại, và hỏng ở đây thì triệu chứng là FE chết trên pod.
+  if ! find "$CI_TMP/.output" -path '*@img/sharp-linux*' -type d 2>/dev/null | grep -q .; then
+    die "artifact không chứa @img/sharp-linux* → sẽ chết trên pod Linux.
+  Build lại: gh workflow run build-frontend.yml --ref \$(git rev-parse --abbrev-ref HEAD)"
+  fi
+  CI_OUTPUT="$CI_TMP/.output"
+  log "artifact OK ($(du -sh "$CI_OUTPUT" | cut -f1), sharp linux-x64)"
+fi
+
 # ── Ship the source ───────────────────────────────────────────────────────────
 # No .env: the pod's copy is generated below from the backend's own API_KEY, and the local one
 # points at the public URL (right for `make dev`, wrong for a process sitting next to the API).
@@ -62,6 +141,15 @@ rsync -az --delete \
   -e "ssh ${SSH_OPTS[*]}" \
   motions/ "root@$HOST:~/motions/" \
   || die "rsync failed"
+
+# .output đi riêng một lần rsync, vì lần trên --delete và exclude nó. --delete ở đây nữa để bản
+# build cũ trên pod không để lại file mồ côi mà nitro vẫn phục vụ.
+if [ -n "$CI_OUTPUT" ]; then
+  log "đẩy .output từ CI lên pod ($(du -sh "$CI_OUTPUT" | cut -f1))…"
+  rsync -az --delete -e "ssh ${SSH_OPTS[*]}" \
+    "$CI_OUTPUT/" "root@$HOST:~/motions/.output/" \
+    || die "rsync .output thất bại"
+fi
 
 # ── Build + run, entirely on the pod ──────────────────────────────────────────
 # API_KEY is read from the backend's .env ON THE POD and never crosses the wire to this machine,
@@ -88,6 +176,16 @@ FEENV
 umask 022
 echo "  .env written: server-side→127.0.0.1:\$APIP · client-side→https://$DOMAIN"
 
+if [ "$FE_BUILD" = ci ]; then
+  # .output đã được rsync từ artifact CI. Không npm install (nitro nhúng sẵn server deps vào
+  # .output/server/node_modules, 26MB, kể cả sharp), không build → không có đỉnh RAM nào.
+  [ -d .output/server ] || { echo ".output/server không có trên pod — rsync artifact thất bại?"; exit 1; }
+  echo "  FE_BUILD=ci → dùng .output build sẵn từ CI, KHÔNG npm install, KHÔNG build"
+  node -e 'require("./.output/server/node_modules/sharp")' 2>/dev/null \
+    && echo "  sharp nạp được trên pod ✓" \
+    || echo "  !! sharp KHÔNG nạp được — kiến trúc binary sai, FE sẽ lỗi khi xử lý ảnh"
+else
+
 npm install --no-audit --no-fund || { echo "npm install failed"; exit 1; }
 
 # Chốt heap V8 theo RAM THỰC của container, không theo RAM của host.
@@ -97,15 +195,18 @@ npm install --no-audit --no-fund || { echo "npm install failed"; exit 1; }
 # stack trace, không dòng nào nói tới RAM.
 # Đo 04/08/2026: build này đỉnh 2,49 GB RSS. Chừa ~1,2 GB cho Postgres/MinIO/api đang chạy song song
 # cộng phần non-heap của node, nên lấy (limit - 1200MB) và kẹp trong [1536, 6144].
+# MỌI $ dưới đây phải escape: heredoc là <<REMOTE (không đóng ngoặc) nên $x không escape sẽ giãn
+# ở MÁY LOCAL thành rỗng, không phải trên pod. Bản trước của khối này thiếu escape và vì thế
+# `[ -r "$CG" ]` trở thành `[ -r "" ]` — chưa ai thấy vì nó chưa từng chạy trên pod nào.
 CG=/sys/fs/cgroup/memory.max
-[ -r "$CG" ] || CG=/sys/fs/cgroup/memory/memory.limit_in_bytes
-LIM_MB=$(awk '{ if ($1 ~ /^[0-9]+$/) printf "%.0f", $1/1048576; else print 0 }' "$CG" 2>/dev/null || echo 0)
-if [ "${LIM_MB:-0}" -gt 0 ] && [ "$LIM_MB" -lt 200000 ]; then
-  HEAP=$(( LIM_MB - 1200 ))
-  [ "$HEAP" -lt 1536 ] && HEAP=1536
-  [ "$HEAP" -gt 6144 ] && HEAP=6144
-  echo "  RAM container ${LIM_MB}MB → NODE_OPTIONS=--max-old-space-size=$HEAP (build đo được đỉnh ~2.5GB)"
-  export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=$HEAP"
+[ -r "\$CG" ] || CG=/sys/fs/cgroup/memory/memory.limit_in_bytes
+LIM_MB=\$(awk '{ if (\$1 ~ /^[0-9]+\$/) printf "%.0f", \$1/1048576; else print 0 }' "\$CG" 2>/dev/null || echo 0)
+if [ "\${LIM_MB:-0}" -gt 0 ] && [ "\$LIM_MB" -lt 200000 ]; then
+  HEAP=\$(( LIM_MB - 1200 ))
+  [ "\$HEAP" -lt 1536 ] && HEAP=1536
+  [ "\$HEAP" -gt 6144 ] && HEAP=6144
+  echo "  RAM container \${LIM_MB}MB → NODE_OPTIONS=--max-old-space-size=\$HEAP (build đỉnh ~2.5GB)"
+  export NODE_OPTIONS="\${NODE_OPTIONS:-} --max-old-space-size=\$HEAP"
 else
   echo "  không đọc được cgroup memory limit — để node tự chọn heap"
 fi
@@ -115,9 +216,12 @@ npm run build || {
   echo "  Nếu chỉ thấy 'Killed' mà không có stack: OOM. Build này cần ~2.5GB đỉnh, và Postgres/"
   echo "  MinIO/api đang chạy song song chiếm thêm ~0.7GB. Trên box 4GB là sát trần."
   echo "  Sửa: tăng CPU_VCPU (RAM = vCPU × hệ số flavor) hoặc đổi CPU_FLAVOR sang bản nhiều RAM hơn"
-  echo "  (c=×2 · g=×4 · m=×8). Xem docs/gpu-pod.md#box-cpu-ram."
+  echo "  (c=×2 · g=×4 · m=×8), hoặc bỏ hẳn build khỏi pod bằng FE_BUILD=ci (mặc định)."
+  echo "  Xem docs/gpu-pod.md#box-cpu-ram."
   exit 1
 }
+
+fi   # hết nhánh FE_BUILD=pod
 
 chmod +x .run.sh
 pm2 delete motions >/dev/null 2>&1

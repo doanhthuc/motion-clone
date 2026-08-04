@@ -1,0 +1,86 @@
+# .github/workflows/build-frontend.yml
+# PHẢI nằm ở GỐC repo — GitHub Actions chỉ đọc .github/workflows/ ở gốc.
+#
+# Build `motions/` (Nuxt) trên ubuntu-latest rồi upload .output làm artifact, để scripts/pod-fe.sh
+# tải về và rsync lên pod THAY VÌ build trên pod.
+#
+# Vì sao: build trên pod đo được đỉnh 2,49 GB RSS, và lúc đó Postgres/MinIO/api đã chạy chiếm thêm
+# ~0,7 GB. Trên box CPU 4 GB ($0,06/giờ) là 80% trần. Bỏ build khỏi pod thì đỉnh RAM về 0, box rẻ
+# nhất dùng được, và `make gpu-fe` từ ~2-4 phút xuống ~15 giây.
+#
+# Vì sao phải là CI chứ không phải máy dev: @nuxt/image kéo sharp, và nitro NHÚNG sharp vào
+# .output/server/node_modules/@img/. Build trên macOS ra `sharp-darwin-arm64` — copy sang pod Linux
+# x64 thì chạy lên rồi chết. ubuntu-latest là linux-x64, đúng kiến trúc pod. Đó cũng chính là lý do
+# comment ở pod-fe.sh:13 nói "đừng rsync .output từ local" — đúng với local, không đúng với CI.
+name: Build frontend
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - motions/**
+      - .github/workflows/build-frontend.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: frontend-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Khớp node của máy dev (v22.14 đo 04/08/2026). Nitro nhúng binary theo ABI của node
+          # build, nên lệch major giữa CI và pod là rủi ro thật.
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: motions/package-lock.json
+
+      - name: Cài deps
+        working-directory: motions
+        # `npm ci` chứ không `npm install`: khoá đúng package-lock, không tự nâng version.
+        run: npm ci --no-audit --no-fund
+
+      - name: Build
+        working-directory: motions
+        # KHÔNG truyền NUXT_MOTION_* nào vào đây, và đó là chủ ý. Cả ba giá trị đi qua
+        # runtimeConfig (nuxt.config.js:35) nên .run.sh nạp chúng từ motions/.env LÚC CHẠY trên pod.
+        # Nhờ vậy API_KEY sinh riêng cho từng pod vẫn dùng được với một artifact build sẵn.
+        run: npm run build
+
+      - name: Đóng gói .output thành tar
+        working-directory: motions
+        # tar chứ không upload thẳng thư mục: actions/upload-artifact zip lại và KHÔNG giữ được
+        # symlink lẫn bit thực thi. .output/server/node_modules có native binary của sharp —
+        # mất permission là chết lúc chạy, mà lỗi thì hiện ra ở pod chứ không ở đây.
+        run: |
+          tar -czf motions-output.tar.gz .output
+          ls -lh motions-output.tar.gz
+          echo "--- sharp trong .output phải là linux-x64 ---"
+          find .output -maxdepth 4 -path '*@img*' -type d -print | sed 's|.*/||' | sort -u
+      - name: Cổng kiểm — sharp PHẢI là linux-x64
+        working-directory: motions
+        # Không có cổng này thì một ngày nào đó runner đổi kiến trúc và artifact lặng lẽ mang
+        # binary sai; triệu chứng chỉ hiện khi frontend chết trên pod.
+        run: |
+          if ! find .output -path '*@img/sharp-linux*' -type d | grep -q .; then
+            echo "✗ không thấy @img/sharp-linux* trong .output — artifact này sẽ chết trên pod"
+            find .output -maxdepth 4 -path '*@img*' -type d || true
+            exit 1
+          fi
+          echo "✓ sharp linux-x64 có trong .output"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: motions-output
+          path: motions/motions-output.tar.gz
+          if-no-files-found: error
+          # 90 ngày là mặc định của repo; pod-fe.sh báo lỗi rõ nếu artifact đã hết hạn.
+          retention-days: 90
