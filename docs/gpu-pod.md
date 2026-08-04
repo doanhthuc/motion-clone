@@ -668,6 +668,24 @@ serverless, cho cùng một khối công việc. Xem [§Hoá đơn thật](#hoa-
 > chưa lấy được bằng lệnh), và ba chỗ hỏng lặng lẽ:
 > [spec box CPU](superpowers/specs/2026-08-04-box-cpu-serverless-design.md).
 
+### Câu hỏi quyết định không phải "bao nhiêu job", mà "GPU có rỗi không"
+
+Đơn giá serverless **$1,586/giờ** so với pod **$1,00/giờ** — serverless đắt hơn **1,59×** cho mỗi
+giây GPU (cả hai từ hoá đơn thật). Nó không rẻ hơn về đơn giá; nó chỉ tính $0 khi rỗi.
+
+Với job thật **~9 phút** (motion + enhance, clip 15-20s — quan sát 04/08, kiểm chéo với 0,85 s/frame
+trong `worker_runtime/linux.py:850`):
+
+| Cách dùng | GPU bận | Rẻ hơn |
+|---|---|---|
+| Bật khi làm việc, job nối nhau (2-8 giờ/ngày) | gần 100% | **pod GPU + `local`** — $60-240/tháng, so với $169-467 |
+| App bật 24/7, dưới ~100 job/ngày | 12-62% | **box CPU + serverless** — $221-519/tháng, so với $720 |
+| App bật 24/7, trên ~100 job/ngày | trên 62% | pod GPU + `local` |
+
+Bật-tắt theo phiên làm việc thì không có thời gian rỗi nào để serverless tiết kiệm — chỉ còn phần
+đắt thêm 59%. Chi tiết bảng và cách tính:
+[spec box CPU §Độ dài một job thật](superpowers/specs/2026-08-04-box-cpu-serverless-design.md#job-9-phut).
+
 **Cạm bẫy khi ghép `full` với `serverless`:** profile `full` cho box claim 21 type, nhưng image
 serverless bản mặc định chỉ bake 4. 17 type còn lại sẽ nằm `queued` **vĩnh viễn** — không lỗi,
 không log, chỉ là không ai nhận. Ba cách thoát:

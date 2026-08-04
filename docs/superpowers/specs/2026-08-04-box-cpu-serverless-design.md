@@ -89,6 +89,52 @@ rẻ thì cứ để chạy, container disk còn nguyên.
    Nó không nói được gì về ngày có 30 job rải rác — mà theo §Vì sao bây giờ thì đó mới là hình dạng
    đắt. Cần một tuần dùng thật rồi đọc `billing serverless`.
 
+<a id="job-9-phut"></a>
+## Độ dài một job thật: 8-10 phút — và nó đảo kết luận
+
+Thuc quan sát 04/08/2026: một job **motion + enhance, clip 15-20s, mất 8-10 phút**. Đây là
+wall-clock nhìn từ UI (gồm chờ hàng đợi, tải input, upload output), **không phải** giây GPU được
+tính tiền — nhưng nó nhất quán với hằng số đo trong code, nên dùng được để tính:
+
+| | |
+|---|---|
+| Enhance 240 frame × 0,85 s/frame (`worker_runtime/linux.py:850`, đo thật trên 5090) | 3,4 phút |
+| Phần còn lại cho motion, nếu tổng là 8-10 phút | 4,6-6,6 phút |
+
+Hai nguồn độc lập khớp nhau, nên lấy **9 phút/job** làm mốc tính.
+
+### Hệ quả: serverless thắng hay thua phụ thuộc CÁCH DÙNG, không phụ thuộc số job
+
+Đơn giá serverless **$1,586/giờ** so với pod **$1,00/giờ** — serverless đắt hơn **1,59×** cho mỗi
+giây GPU. Nó không rẻ hơn về đơn giá; nó chỉ tính $0 khi rỗi. Nên phép so thật là: *bạn có đang trả
+tiền cho thời gian rỗi hay không.*
+
+**Kiểu B — bật khi làm việc, job chạy nối nhau** (kiểu đang dùng: 11,9 giờ trong 10 ngày):
+
+| Giờ/ngày | Job/ngày | Pod GPU | Box CPU + serverless (c=$0,10) |
+|---|---|---|---|
+| 2h | 13 | **$60/tháng** | $169 |
+| 4h | 26 | **$120/tháng** | $266 |
+| 8h | 53 | **$240/tháng** | $467 |
+
+**Pod GPU thắng đậm.** GPU bận gần 100% suốt số giờ đã trả, nên không có thời gian rỗi nào để
+serverless tiết kiệm — chỉ còn phần đắt thêm 59%.
+
+**Kiểu A — app luôn truy cập được** (người dùng thật, box bật 24/7):
+
+| Job/ngày | GPU bận | Pod GPU 24/7 | Box CPU + serverless |
+|---|---|---|---|
+| 20 | 12% | $720 | **$221** |
+| 60 | 38% | $720 | **$519** |
+| 110 | 69% | **$720** | $892 |
+
+Ngưỡng đảo chiều **~100 job/ngày** (≈62% GPU bận) — khớp với break-even 57-63% ở §Vì sao bây giờ.
+
+> **Vì thế spec này chỉ đáng làm nếu đích đến là kiểu A**: app mở cho người ngoài 24/7, tải dưới
+> ~100 job/ngày. Nếu cách dùng vẫn là bật-tắt theo phiên làm việc thì hình dạng đúng là **pod GPU +
+> `WORKER_SOURCE=local`**, và hướng box CPU nên để đó chờ. Đây là ràng buộc quan trọng nhất của
+> spec, và nó không lộ ra từ bất kỳ số nào trong hoá đơn — chỉ lộ ra khi hỏi *"GPU có rỗi không?"*.
+
 **Không có ba số này thì phép so "CPU + serverless rẻ hơn GPU pod" là niềm tin, không phải kết
 luận.** Hướng này *rất có thể* rẻ hơn — $720/tháng là mốc rất cao để vượt — nhưng spec không ghi
 con số nó chưa đo.
