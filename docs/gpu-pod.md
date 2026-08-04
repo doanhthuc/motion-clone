@@ -693,13 +693,21 @@ mãi theo mức mới — rẻ hơn là chỉ tải nhóm thật sự dùng.
 <a id="deploy-shapes"></a>
 ## Hai hình dạng deploy — chọn bằng hai biến
 
-`make gpu-bootstrap` đọc hai biến trong `.env`. Chúng độc lập: một cái quyết **box cài gì**, cái
-kia quyết **ai chạy job**.
+Ba biến trong `.env`, ba câu hỏi độc lập: **box có GPU không**, **box cài gì**, **ai chạy job**.
 
 ```
-SETUP_PROFILE=motion-transfer|full|create-image|tryon
+COMPUTE_TYPE=gpu|cpu                                  ← pod-provision.sh đọc
+SETUP_PROFILE=motion-transfer|full|create-image|tryon|cpu-box
 WORKER_SOURCE=local|serverless|both
 ```
+
+Ba tổ hợp có nghĩa; mọi tổ hợp khác bị cổng kiểm chặn hoặc cảnh báo:
+
+| Hình dạng | `COMPUTE_TYPE` | `SETUP_PROFILE` | `WORKER_SOURCE` | Khi nào đúng |
+|---|---|---|---|---|
+| **Pod GPU** (mặc định) | `gpu` | `motion-transfer` … | `local` | bật theo phiên, job nối nhau |
+| **Box CPU** | `cpu` | `cpu-box` | `serverless` | app 24/7, dưới ~87 job/ngày |
+| **Test serverless** | `gpu` | `motion-transfer` | `serverless` | chỉ để đo, GPU nằm không |
 
 | | `WORKER_SOURCE=local` | `WORKER_SOURCE=serverless` |
 |---|---|---|
@@ -741,6 +749,48 @@ trong `worker_runtime/linux.py:850`):
 Bật-tắt theo phiên làm việc thì không có thời gian rỗi nào để serverless tiết kiệm — chỉ còn phần
 đắt thêm 59%. Chi tiết bảng và cách tính:
 [spec box CPU §Độ dài một job thật](superpowers/specs/2026-08-04-box-cpu-serverless-design.md#job-9-phut).
+
+<a id="box-cpu"></a>
+### Dựng box CPU
+
+Đo thật trên pod CPU RunPod EU-RO-1 ngày 04/08/2026: **$0,06/giờ** ở 2 vCPU, Network Volume
+**mount được** ở `/workspace` (MooseFS), `nvidia-smi` không tồn tại, 81,7/100 GB volume đã dùng.
+
+```bash
+# .env
+COMPUTE_TYPE=cpu
+SETUP_PROFILE=cpu-box
+WORKER_SOURCE=serverless
+
+make gpu-preflight                              # in cả ba biến + RAM suy ra từ flavor
+COMPUTE_TYPE=cpu bash scripts/pod-provision.sh  # dry-run, đọc body REST nó in
+CONFIRM=yes COMPUTE_TYPE=cpu bash scripts/pod-provision.sh
+make gpu-wait                                   # hoạt động với pod CPU, cùng đường runpodctl
+make gpu-bootstrap
+```
+
+**Nhánh `cpu` đi qua REST, không qua `runpodctl`.** `runpodctl pod create` không có cờ nào chọn
+flavor hay số vCPU — nó luôn cấp **2 vCPU / 4 GB RAM**, và 4 GB là mức chật: `npm run build` của
+Nuxt là chỗ vỡ trước tiên. `POST /v1/pods` có `cpuFlavorIds` + `vcpuCount`, nên script dùng nó.
+
+| Flavor | RAM | Mặc định của repo |
+|---|---|---|
+| `cpu3c` · `cpu5c` Compute | vCPU × 2 | |
+| `cpu3g` · `cpu5g` General | vCPU × 4 | **`cpu5g` + 4 vCPU = 16 GB** |
+| `cpu3m` · `cpu5m` Memory | vCPU × 8 | |
+
+`SETUP_PROFILE=cpu-box` khác `motion-transfer` ở ba điểm: `PM2_APPS="minio,api,wf-worker"` (bỏ
+`comfyui`, `worker`, và `task-cloud-auto` — cái cuối throw `"COMFY_URL chưa cấu hình"` rồi
+crash-loop vĩnh viễn nếu để lại), `SKIP_COMFY=1` tường minh, và `JOB_TYPES` đúng 4 type mà image
+serverless bake.
+
+**Cặp bị chặn cứng:** `COMPUTE_TYPE=cpu` + `WORKER_SOURCE=local`. Box không GPU mà job giao cho
+worker local nghĩa là không ai chạy được job nào — box vẫn lên xanh, `/health` vẫn trả lời, job nằm
+`queued` vĩnh viễn. Không có cách đọc nào hợp lý nên cổng kiểm chặn thay vì cảnh báo.
+
+**Còn mở:** chưa chạy `make gpu-bootstrap` thật trên box CPU. Đã đo phần hạ tầng (volume mount,
+giá, không GPU) và đã chặn các cấu hình sai, nhưng phần cài đặt 11 phase trên máy không GPU thì
+chưa ai chạy — RAM 16 GB là suy ra từ công thức flavor, không phải đo.
 
 **Cạm bẫy khi ghép `full` với `serverless`:** profile `full` cho box claim 21 type, nhưng image
 serverless bản mặc định chỉ bake 4. 17 type còn lại sẽ nằm `queued` **vĩnh viễn** — không lỗi,

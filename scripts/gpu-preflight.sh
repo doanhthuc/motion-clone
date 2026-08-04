@@ -93,6 +93,21 @@ echo "Hình dạng deploy (pod sẽ dựng ra cái gì, và ai chạy job)"
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib-deploy-shape.sh"
 resolve_deploy_shape
 
+case "$COMPUTE_TYPE" in
+  cpu) ct_effect="box KHÔNG GPU (\$0,06/giờ ở 2 vCPU) — GPU do serverless lo, trả theo giây" ;;
+  *)   ct_effect="box CÓ GPU ($(get GPU)) — \$0,99/giờ, dùng được cho worker local" ;;
+esac
+printf "  ${G}✓${X} %-22s ${D}%s${X}\n" "COMPUTE_TYPE" "$COMPUTE_TYPE"
+printf "    %-20s ${D}%s${X}\n" "" "$ct_effect"
+if [ "$COMPUTE_TYPE" = "cpu" ]; then
+  cf="$(get CPU_FLAVOR)"; cv="$(get CPU_VCPU)"
+  # RAM = vCPU × hệ số flavor: c=×2 · g=×4 · m=×8. Đo 04/08: mặc định của runpodctl là 2 vCPU/4GB,
+  # và 4GB không đủ cho `npm run build` của Nuxt — nên in RAM suy ra ra đây, không để ai phải đoán.
+  case "${cf:-cpu5g}" in *c) mult=2 ;; *m) mult=8 ;; *) mult=4 ;; esac
+  printf "  ${D}·${X} %-22s ${D}%s · %s vCPU → ~%s GB RAM${X}\n" "CPU_FLAVOR / CPU_VCPU" \
+    "${cf:-cpu5g (mặc định)}" "${cv:-4 (mặc định)}" "$(( ${cv:-4} * mult ))"
+fi
+
 printf "  ${G}✓${X} %-22s ${D}%s${X}\n" "SETUP_PROFILE" \
   "$SETUP_PROFILE — chạy motions-studio/$SETUP_SCRIPT (có sẵn: $SETUP_PROFILES_AVAILABLE)"
 

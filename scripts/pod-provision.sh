@@ -19,6 +19,11 @@ set -uo pipefail
 env_get() { grep -E "^$1=" .env 2>/dev/null | cut -d= -f2- | sed -E 's/[[:space:]]*#.*$//' | tr -d '"'; }
 
 GPU_PROVIDER="${GPU_PROVIDER:-$(env_get GPU_PROVIDER)}"; GPU_PROVIDER="${GPU_PROVIDER:-vast}"
+# COMPUTE_TYPE=cpu thuê box KHÔNG GPU (Postgres/MinIO/api/FE), job render đi qua RunPod Serverless.
+# Mặc định `gpu` nên đường cũ không đổi một byte nào — xem docs/gpu-pod.md#box-cpu.
+COMPUTE_TYPE="${COMPUTE_TYPE:-$(env_get COMPUTE_TYPE)}"; COMPUTE_TYPE="$(printf '%s' "${COMPUTE_TYPE:-gpu}" | tr 'A-Z' 'a-z')"
+CPU_FLAVOR="${CPU_FLAVOR:-$(env_get CPU_FLAVOR)}"; CPU_FLAVOR="${CPU_FLAVOR:-cpu5g}"
+CPU_VCPU="${CPU_VCPU:-$(env_get CPU_VCPU)}"; CPU_VCPU="${CPU_VCPU:-4}"
 GPU="${GPU:-$(env_get GPU)}"; GPU="${GPU:-RTX_4090}"
 DISK="${DISK:-$(env_get DISK)}"; DISK="${DISK:-120}"
 MAX_DPH="${MAX_DPH:-$(env_get MAX_DPH)}"; MAX_DPH="${MAX_DPH:-0.60}"
@@ -33,6 +38,15 @@ SKIP="${SKIP:-}"
 log()  { printf '\033[36m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m !!\033[0m %s\n' "$*"; }
 die()  { printf '\033[31m ✗ \033[0m%s\n' "$*" >&2; exit 1; }
+
+case "$COMPUTE_TYPE" in
+  gpu|cpu) ;;
+  *) die "COMPUTE_TYPE=$COMPUTE_TYPE không hợp lệ — chỉ nhận: gpu | cpu" ;;
+esac
+if [ "$COMPUTE_TYPE" = "cpu" ] && [ "$GPU_PROVIDER" != "runpod" ]; then
+  die "COMPUTE_TYPE=cpu chỉ có trên RunPod (GPU_PROVIDER=$GPU_PROVIDER hiện tại).
+  vast.ai là chợ GPU, không bán máy CPU thuần."
+fi
 
 # setup-motion-transfer.sh installs EVERYTHING native (apt + PM2) — Postgres and MinIO are plain
 # binaries, not containers, so no Docker-in-Docker is needed inside the pod at all. Just needs a
@@ -58,7 +72,12 @@ die()  { printf '\033[31m ✗ \033[0m%s\n' "$*" >&2; exit 1; }
 #             and blocks.
 IMAGE="${IMAGE:-$(env_get POD_IMAGE)}"
 if [ -z "$IMAGE" ]; then
-  if [ "$GPU_PROVIDER" = "runpod" ]; then
+  if [ "$COMPUTE_TYPE" = "cpu" ]; then
+    # Box CPU không cần CUDA gì cả, và runpod/pytorch kéo về vài GB layer torch để không dùng.
+    # runpod/base vẫn ship /start.sh (sshd + block) nên không rơi vào bẫy crash-loop ở trên.
+    # Đây đúng là image đã kiểm trên pod CPU EU-RO-1 ngày 04/08/2026.
+    IMAGE="runpod/base:1.0.2-ubuntu2204"
+  elif [ "$GPU_PROVIDER" = "runpod" ]; then
     IMAGE="runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404"
   else
     IMAGE="pytorch/pytorch:2.12.1-cuda13.0-cudnn9-devel"
@@ -203,6 +222,70 @@ for v in out:
     [ -n "${VOL_DC:-}" ] && [ "$VOL_DC" != "?" ] && DC_ARG=(--data-center-ids "$VOL_DC")
   else
     warn "POD_VOLUME empty — this pod re-downloads ~33GB of models and loses its database when destroyed."
+  fi
+
+  # ── Nhánh CPU: box không GPU, job render đi qua RunPod Serverless ───────────
+  # Đi qua REST chứ KHÔNG qua runpodctl, vì `runpodctl pod create` không có cờ nào chọn flavor hay
+  # số vCPU — nó luôn cấp mặc định 2 vCPU / 4 GB RAM. Đo 04/08/2026: 4 GB là mức chật, `npm run
+  # build` của Nuxt là chỗ vỡ trước tiên. REST /v1/pods có cpuFlavorIds + vcpuCount.
+  # Flavor: cpu3c/cpu5c = ram ×2 · cpu3g/cpu5g = ×4 (General) · cpu3m/cpu5m = ×8 (Memory).
+  # Mặc định cpu5g + 4 vCPU = 16 GB RAM, đủ cho Postgres + MinIO + api + build Nuxt.
+  if [ "$COMPUTE_TYPE" = "cpu" ]; then
+    RP_KEY="$(env_get RUNPOD_API_KEY)"
+    [ -n "$RP_KEY" ] || die "COMPUTE_TYPE=cpu cần RUNPOD_API_KEY trong .env (đường REST, runpodctl không chọn được flavor CPU)."
+    [ -n "$POD_VOLUME_ID" ] || die "COMPUTE_TYPE=cpu cần POD_VOLUME_ID: box CPU không có ổ nào khác để chứa MinIO và model."
+
+    BODY="$(POD_VOLUME_ID="$POD_VOLUME_ID" VOL_DC="${VOL_DC:-}" IMAGE="$IMAGE" DISK="$DISK" \
+            CPU_FLAVOR="$CPU_FLAVOR" CPU_VCPU="$CPU_VCPU" POD_VOLUME="$POD_VOLUME" python3 -c '
+import json, os
+b = {
+  "name": "motion-cpu-box",
+  "computeType": "CPU",
+  "cpuFlavorIds": [os.environ["CPU_FLAVOR"]],
+  "vcpuCount": int(os.environ["CPU_VCPU"]),
+  "imageName": os.environ["IMAGE"],
+  "containerDiskInGb": int(os.environ["DISK"]),
+  "ports": ["22/tcp"],
+  "networkVolumeId": os.environ["POD_VOLUME_ID"],
+  "volumeMountPath": os.environ["POD_VOLUME"],
+}
+dc = os.environ.get("VOL_DC","").strip()
+if dc and dc != "?": b["dataCenterIds"] = [dc]
+print(json.dumps(b))')"
+
+    echo
+    echo "  curl -X POST https://rest.runpod.io/v1/pods \\"
+    echo "    -H 'Authorization: Bearer \$RUNPOD_API_KEY' -H 'Content-Type: application/json' \\"
+    echo "    -d '$BODY'"
+    echo
+
+    if [ "${CONFIRM:-}" != "yes" ]; then
+      warn "Dry run — chưa thuê gì."
+      cat <<EOF
+
+  Box CPU: flavor $CPU_FLAVOR · $CPU_VCPU vCPU · đĩa ${DISK}GB · volume $POD_VOLUME_ID → $POD_VOLUME
+  Giá đo được 04/08/2026: 2 vCPU = \$0,06/giờ. $CPU_VCPU vCPU flavor $CPU_FLAVOR sẽ cao hơn —
+  đọc costPerHr trong phản hồi, và \`runpodctl billing pods\` hôm sau để biết số thật.
+
+  Hình dạng này CHỈ rẻ hơn pod GPU khi app bật 24/7 và dưới ~87 job/ngày.
+  Bật-tắt theo phiên làm việc thì pod GPU + WORKER_SOURCE=local rẻ hơn — docs/gpu-pod.md#deploy-shapes.
+
+  Chạy thật:   CONFIRM=yes COMPUTE_TYPE=cpu bash scripts/pod-provision.sh
+EOF
+      exit 0
+    fi
+
+    log "thuê box CPU qua REST…"
+    RAW="$(curl -sS -X POST "https://rest.runpod.io/v1/pods" \
+      -H "Authorization: Bearer $RP_KEY" -H 'Content-Type: application/json' \
+      -d "$BODY" 2>&1)" || die "REST /v1/pods lỗi: $RAW"
+    NEW_ID="$(printf '%s' "$RAW" | rp_pick id,podId)"
+    [ -n "$NEW_ID" ] || die "không tạo được box CPU. Phản hồi:
+$RAW"
+    COST="$(printf '%s' "$RAW" | rp_pick costPerHr)"
+    env_set GPU_INSTANCE_ID "$NEW_ID"
+    log "thuê xong — box CPU $NEW_ID${COST:+ (\$$COST/giờ)}, đã ghi vào .env. Tiếp: make gpu-wait"
+    exit 0
   fi
 
   # --min-cuda-version is the real lever for the cu130 path in lib-gpu.sh: it keeps you off hosts

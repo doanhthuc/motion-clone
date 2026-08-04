@@ -41,6 +41,18 @@ resolve_deploy_shape() {
   DEPLOY_SHAPE_ERRORS=()
   DEPLOY_SHAPE_WARNINGS=()
 
+  # ── COMPUTE_TYPE: box có GPU hay không ──────────────────────────────────────
+  # Câu hỏi thứ ba, độc lập với hai câu dưới. Mặc định gpu = đường cũ, không đổi gì.
+  COMPUTE_TYPE="$(_ds_env_get COMPUTE_TYPE)"
+  COMPUTE_TYPE="$(printf '%s' "${COMPUTE_TYPE:-gpu}" | tr 'A-Z' 'a-z')"
+  case "$COMPUTE_TYPE" in
+    gpu|cpu) ;;
+    *) DEPLOY_SHAPE_ERRORS+=("COMPUTE_TYPE=$COMPUTE_TYPE không hợp lệ — chỉ nhận: gpu | cpu") ;;
+  esac
+  if [ "$COMPUTE_TYPE" = "cpu" ] && [ "$(_ds_env_get GPU_PROVIDER)" != "runpod" ]; then
+    DEPLOY_SHAPE_ERRORS+=("COMPUTE_TYPE=cpu chỉ có trên RunPod — vast.ai là chợ GPU, không bán máy CPU thuần.")
+  fi
+
   # ── SETUP_PROFILE ───────────────────────────────────────────────────────────
   # Chỉ nhận profile đi qua lib-feature.sh. setup-pm2.sh cũng nằm cùng thư mục và cũng cài được cả
   # stack, nhưng nó là monolith cũ đi đường KHÁC: không có chuỗi phase, không hiểu MTC_PREBUILT, tự
@@ -91,6 +103,25 @@ resolve_deploy_shape() {
 
   if [ "$WORKER_SOURCE" != "local" ] && { [ -z "$RUNPOD_ENDPOINT_ID" ] || [ -z "$RUNPOD_API_KEY_ENV" ]; }; then
     DEPLOY_SHAPE_ERRORS+=("WORKER_SOURCE=$WORKER_SOURCE cần RUNPOD_ENDPOINT_ID và RUNPOD_API_KEY trong .env — xem docs/gpu-pod.md#serverless. (Muốn chạy job bằng GPU của chính pod thì đặt WORKER_SOURCE=local.)")
+  fi
+
+  # Cặp chết người: box không GPU mà lại giao job cho worker local. Không ai chạy được job nào, và
+  # KHÔNG có triệu chứng nào — box lên xanh, /health trả lời, job nằm 'queued' vĩnh viễn. Chặn, chứ
+  # không cảnh báo: `local` trên box CPU không có cách đọc nào là hợp lý.
+  if [ "$COMPUTE_TYPE" = "cpu" ] && [ "$WORKER_SOURCE" = "local" ]; then
+    DEPLOY_SHAPE_ERRORS+=("COMPUTE_TYPE=cpu + WORKER_SOURCE=local: box không có GPU mà job lại giao cho worker local → không job nào chạy được, và không báo lỗi gì. Đặt WORKER_SOURCE=serverless.")
+  fi
+  # Ngược lại thì chỉ là tiền, không phải lỗi — nhưng là tiền thật, nên phải nói ra.
+  if [ "$COMPUTE_TYPE" = "gpu" ] && [ "$WORKER_SOURCE" = "serverless" ]; then
+    DEPLOY_SHAPE_WARNINGS+=("Box CÓ GPU nhưng job đẩy sang serverless: GPU vừa thuê nằm không, và serverless đắt hơn pod 1,33-1,58× mỗi giây GPU. Chỉ hợp lý khi đang TEST đường serverless. Xem docs/gpu-pod.md#deploy-shapes.")
+  fi
+  # Profile cpu-box cài đúng cho box không GPU (bỏ comfyui/worker/task-cloud-auto). Ghép lệch với
+  # COMPUTE_TYPE là hai kiểu hỏng khác nhau, cả hai đều im lặng.
+  if [ "$COMPUTE_TYPE" = "cpu" ] && [ "$SETUP_PROFILE" != "cpu-box" ]; then
+    DEPLOY_SHAPE_WARNINGS+=("COMPUTE_TYPE=cpu nhưng SETUP_PROFILE=$SETUP_PROFILE — profile đó bật PM2 app cần ComfyUI/GPU (task-cloud-auto sẽ crash-loop). Dùng SETUP_PROFILE=cpu-box.")
+  fi
+  if [ "$COMPUTE_TYPE" = "gpu" ] && [ "$SETUP_PROFILE" = "cpu-box" ]; then
+    DEPLOY_SHAPE_WARNINGS+=("SETUP_PROFILE=cpu-box trên box CÓ GPU: profile này SKIP_COMFY=1 và không bật worker, nên GPU vừa thuê sẽ không được dùng.")
   fi
 
   # ── Tham số dispatcher ──────────────────────────────────────────────────────
