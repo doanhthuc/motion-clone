@@ -226,8 +226,10 @@ for v in out:
 
   # ── Nhánh CPU: box không GPU, job render đi qua RunPod Serverless ───────────
   # Đi qua REST chứ KHÔNG qua runpodctl, vì `runpodctl pod create` không có cờ nào chọn flavor hay
-  # số vCPU — nó luôn cấp mặc định 2 vCPU / 4 GB RAM. Đo 04/08/2026: 4 GB là mức chật, `npm run
-  # build` của Nuxt là chỗ vỡ trước tiên. REST /v1/pods có cpuFlavorIds + vcpuCount.
+  # số vCPU — nó luôn cấp mặc định 2 vCPU / 4 GB RAM. REST /v1/pods có cpuFlavorIds + vcpuCount.
+  # LƯU Ý mặc định cpu5g×4 (16 GB) của repo gần như là THỪA: đo 04/08/2026 thì toàn bộ PM2 chỉ
+  # 311 MB. Chỉ `npm run build` của Nuxt cần nhiều, và chưa ai đo 4 GB có đủ hay không —
+  # xem docs/gpu-pod.md#box-cpu-ram.
   # Flavor: cpu3c/cpu5c = ram ×2 · cpu3g/cpu5g = ×4 (General) · cpu3m/cpu5m = ×8 (Memory).
   # Mặc định cpu5g + 4 vCPU = 16 GB RAM, đủ cho Postgres + MinIO + api + build Nuxt.
   if [ "$COMPUTE_TYPE" = "cpu" ]; then

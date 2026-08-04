@@ -706,7 +706,7 @@ Ba tổ hợp có nghĩa; mọi tổ hợp khác bị cổng kiểm chặn hoặ
 | Hình dạng | `COMPUTE_TYPE` | `SETUP_PROFILE` | `WORKER_SOURCE` | Khi nào đúng |
 |---|---|---|---|---|
 | **Pod GPU** (mặc định) | `gpu` | `motion-transfer` … | `local` | bật theo phiên, job nối nhau |
-| **Box CPU** | `cpu` | `cpu-box` | `serverless` | app 24/7, dưới ~87 job/ngày |
+| **Box CPU** | `cpu` | `cpu-box` | `serverless` | app 24/7, dưới ~79 job/ngày |
 | **Test serverless** | `gpu` | `motion-transfer` | `serverless` | chỉ để đo, GPU nằm không |
 
 | | `WORKER_SOURCE=local` | `WORKER_SOURCE=serverless` |
@@ -743,8 +743,8 @@ trong `worker_runtime/linux.py:850`):
 | Cách dùng | GPU bận | Rẻ hơn |
 |---|---|---|
 | Bật khi làm việc, job nối nhau (2-8 giờ/ngày) | gần 100% | **pod GPU + `local`** — $60-240/tháng, so với $169-467 |
-| App bật 24/7, dưới **87 job/ngày** | dưới 57% | **box CPU + serverless** — $221-519/tháng, so với $720 |
-| App bật 24/7, trên **87 job/ngày** | trên 57% | pod GPU + `local` |
+| App bật 24/7, dưới **79 job/ngày** | dưới 51% | **box CPU + serverless** — $170-580/tháng, so với $720 |
+| App bật 24/7, trên **79 job/ngày** | trên 51% | pod GPU + `local` |
 
 Bật-tắt theo phiên làm việc thì không có thời gian rỗi nào để serverless tiết kiệm — chỉ còn phần
 đắt thêm 59%. Chi tiết bảng và cách tính:
@@ -790,14 +790,49 @@ make gpu-bootstrap
 ```
 
 **Nhánh `cpu` đi qua REST, không qua `runpodctl`.** `runpodctl pod create` không có cờ nào chọn
-flavor hay số vCPU — nó luôn cấp **2 vCPU / 4 GB RAM**, và 4 GB là mức chật: `npm run build` của
-Nuxt là chỗ vỡ trước tiên. `POST /v1/pods` có `cpuFlavorIds` + `vcpuCount`, nên script dùng nó.
+flavor hay số vCPU — nó luôn cấp **2 vCPU / 4 GB RAM**. `POST /v1/pods` có `cpuFlavorIds` +
+`vcpuCount`, nên script dùng nó. (Nhưng xem [16 GB là thừa](#box-cpu-ram) trước khi trả tiền cho
+flavor lớn — 4 GB có thể đã đủ, chưa ai đo.)
 
 | Flavor | RAM | Mặc định của repo |
 |---|---|---|
 | `cpu3c` · `cpu5c` Compute | vCPU × 2 | |
 | `cpu3g` · `cpu5g` General | vCPU × 4 | **`cpu5g` + 4 vCPU = 16 GB** |
 | `cpu3m` · `cpu5m` Memory | vCPU × 8 | |
+
+<a id="box-cpu-ram"></a>
+#### 16 GB gần như chắc chắn là thừa — và nó đắt gấp 3
+
+Đo thật lúc box chạy: **toàn bộ PM2 chỉ 311 MB.**
+
+| Tiến trình | RSS |
+|---|---|
+| `minio` | 119 MB |
+| `api` | 70 MB |
+| `wf-worker` | 65 MB |
+| `mc-dispatcher` | 55 MB |
+| `motions` | 2 MB (mới lên 0 giây; sẽ tăng ~150-250 MB) |
+
+Cộng Postgres (~100-300 MB) thì **chạy ổn định dưới 1 GB**. 16 GB không phục vụ việc chạy. Nó phục
+vụ **đúng một** việc: `npm run build` của Nuxt trong `pod-fe.sh`, một lần mỗi lần deploy FE.
+
+> **Và chưa ai đo rằng 4 GB KHÔNG đủ cho build đó.** Mới chỉ đo 16 GB thì đủ. Mặc định `cpu5g × 4`
+> ra đời từ một phỏng đoán, và phỏng đoán đó tốn **$0,184/giờ so với $0,06** — $132 so với
+> $43/tháng, tức **$89/tháng**.
+
+Bốn cách rẻ hơn, **chưa thử cách nào**:
+
+| Cách | Tiết kiệm | Rủi ro |
+|---|---|---|
+| Bỏ trống `CPU_FLAVOR`/`CPU_VCPU` → 2 vCPU/4 GB | $89/tháng | build có thể OOM, nhưng biết ngay sau 1 lần chạy |
+| `CPU_FLAVOR=cpu5m CPU_VCPU=2` → cũng 16 GB, ít vCPU | chưa đo, có thể ~½ | giá flavor memory-optimized chưa đo |
+| **Build FE ở CI rồi rsync `.output`** | $89/tháng **và** `make gpu-fe` nhanh hẳn | phải thêm workflow |
+| `NODE_OPTIONS=--max-old-space-size` + swap | $89/tháng | build chậm, có thể vẫn OOM |
+
+Cách 3 đúng nhất về kiến trúc. Lý do `pod-fe.sh:13` build trên pod là `sharp` — `node_modules/@img/`
+ở máy dev chứa `sharp-darwin-arm64`, copy sang pod Linux x64 thì build xong mà chết lúc chạy. Lý do
+đó loại **máy bạn**, không loại **CI**: GitHub Actions `ubuntu-latest` là linux-x64, đúng kiến trúc
+pod. Build Nuxt trên 2 vCPU cũng là phần lâu nhất của `make gpu-fe`, nên cách này xoá cả hai vấn đề.
 
 `SETUP_PROFILE=cpu-box` khác `motion-transfer` ở ba điểm: `PM2_APPS="minio,api,wf-worker"` (bỏ
 `comfyui`, `worker`, và `task-cloud-auto` — cái cuối throw `"COMFY_URL chưa cấu hình"` rồi

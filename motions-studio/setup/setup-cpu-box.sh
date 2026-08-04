@@ -9,7 +9,7 @@
 # chúng là trả tiền cho một GPU nằm không 24/7 ($0,99/giờ ≈ $720/tháng). Box CPU $0,06/giờ làm
 # đúng những việc đó, và job render đi qua RunPod Serverless — trả theo giây, $0 khi rỗi.
 #
-# CHỈ đúng khi app cần bật 24/7 và tải dưới ~87 job/ngày. Nếu bạn chỉ bật máy lúc ngồi làm và job
+# CHỈ đúng khi app cần bật 24/7 và tải dưới ~79 job/ngày (đo giá box thật $0,184/giờ 04/08/2026). Nếu bạn chỉ bật máy lúc ngồi làm và job
 # chạy nối nhau thì pod GPU + WORKER_SOURCE=local RẺ HƠN, vì serverless đắt hơn pod 1,33-1,58× cho
 # mỗi giây GPU và không có thời gian rỗi nào để nó tiết kiệm.
 # Xem docs/gpu-pod.md#deploy-shapes và specs/2026-08-04-box-cpu-serverless-design.md.
@@ -26,8 +26,9 @@
 #
 # Đo thật trên pod CPU RunPod EU-RO-1 ngày 04/08/2026:
 #   $0,06/giờ · 2 vCPU · RAM container 4 GB · Network Volume mount được ở /workspace (MooseFS)
-#   → RAM 4 GB là mức CHẬT. `npm run build` của Nuxt là chỗ vỡ trước tiên; xem
-#     docs/gpu-pod.md#box-cpu về cách xin flavor nhiều RAM hơn (runpodctl KHÔNG làm được, phải REST).
+#   → Đo thật lúc chạy: toàn bộ PM2 chỉ 311 MB, cộng Postgres thì dưới 1 GB. Thứ DUY NHẤT cần
+#     nhiều RAM là `npm run build` của Nuxt trong pod-fe.sh — và chưa ai đo rằng 4 GB không đủ
+#     cho nó. Xem docs/gpu-pod.md#box-cpu-ram trước khi trả tiền cho flavor lớn.
 #
 # Cờ env tuỳ chọn: DOMAIN, SUPER_ADMIN, GMAIL_USER, GMAIL_APP_PASSWORD,
 #   CF_API_TOKEN, CF_TUNNEL_TOKEN, CORS_ORIGINS, HF_TOKEN, SKIP_HTTPS.

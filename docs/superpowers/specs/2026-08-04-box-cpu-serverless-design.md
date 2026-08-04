@@ -56,7 +56,7 @@ Hoá đơn thật (`runpodctl billing`), không phải `currentSpendPerHr`:
 | Pod GPU nếu bật 24/7 | **~$720/tháng** |
 | Serverless, cả ngày chạy thử 02/08 | **$0,3894** (884 giây được tính) |
 | Volume 100GB | ~**$7,10/tháng**, không tránh được ở mọi hình dạng |
-| Pod CPU | **CHƯA ĐO ĐƯỢC** — xem §Phải đo trước, mục 2 |
+| Pod CPU | **$0,184/giờ** ở `cpu5g × 4 vCPU`/16 GB · **$0,06/giờ** ở 2 vCPU/4 GB (đo 04/08) |
 
 Ngày 02/08 trả **cả hai**: $1,49 pod GPU **và** $0,39 serverless, cùng một ngày, cho cùng một khối
 công việc. Đó là chỗ tiền chảy ra hai lần — và nó không phải tính chất của serverless, mà là hệ quả
@@ -181,11 +181,11 @@ serverless tiết kiệm — chỉ còn phần đắt thêm 59%.
 | 60 | 38% | $720 | **$519** |
 | 110 | 69% | **$720** | $892 |
 
-Ngưỡng đảo chiều **87 job/ngày** (≈57% GPU bận, c=$0,10) — khớp break-even 57-63% ở §Vì sao bây
-giờ. Trừ tiền đĩa ở cả hai cột thì ngưỡng là 89, gần như không đổi.
+Ngưỡng đảo chiều **79 job/ngày** (≈51% GPU bận) — tính với giá box CPU **thật $0,184/giờ** đo
+04/08/2026. Bảng trên dùng c=$0,10 (giả định cũ) nên cho 87; con số đúng là 79.
 
 > **Vì thế spec này chỉ đáng làm nếu đích đến là kiểu A**: app mở cho người ngoài 24/7, tải dưới
-> ~87 job/ngày. Nếu cách dùng vẫn là bật-tắt theo phiên làm việc thì hình dạng đúng là **pod GPU +
+> ~79 job/ngày. Nếu cách dùng vẫn là bật-tắt theo phiên làm việc thì hình dạng đúng là **pod GPU +
 > `WORKER_SOURCE=local`**, và hướng box CPU nên để đó chờ. Đây là ràng buộc quan trọng nhất của
 > spec, và nó không lộ ra từ bất kỳ số nào trong hoá đơn — chỉ lộ ra khi hỏi *"GPU có rỗi không?"*.
 
