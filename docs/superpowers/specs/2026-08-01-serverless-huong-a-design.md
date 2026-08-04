@@ -462,7 +462,14 @@ Endpoint `fggbwsbhidwbdi`, image `ghcr.io/doanhthuc/motion-serverless:sha-f8c546
 | 6. Hai job cùng lúc, không giết nhau | ✓ hai worker khác nhau, **không** job nào có "Worker khởi động lại giữa chừng" |
 
 Số đo khác: cold start (kéo image 5,09GB nén) ~155 giây; worker ấm delay 1,9s + execution 0,3s;
-tổng tiền serverless cho cả 5 job **$0,0116** (25,3 giây GPU được tính) so với pod **$1,014/giờ**.
+tổng tiền serverless cho cả 5 job **$0,3894** so với pod **$1,014/giờ**.
+
+> **Sửa 04/08/2026:** dòng trên trước ghi **$0,0116 (25,3 giây GPU được tính)**. Sai. Đó là tổng
+> *execution* của 5 job; hoá đơn thật (`runpodctl billing serverless`) là **$0,3894 cho 884 giây**
+> được tính — gấp 35 lần thời lượng, 33 lần số tiền. Cold start và khoảng chờ idle-timeout đều bị
+> tính. Hệ quả cho thiết kế: chi phí serverless bị chi phối bởi **số lần đánh thức**, không phải độ
+> dài job, nên `DISPATCH_COOLDOWN_SEC` và idle timeout là hai núm **chi phí**. Vẫn rẻ tuyệt đối, và
+> không mục Kiểm chứng nào đổi kết luận. Xem [docs/gpu-pod.md#hoa-don-that](../../gpu-pod.md#hoa-don-that).
 
 Dispatcher chạy trên pod tự đánh thức worker cho hai job liên tiếp, mỗi lần đúng một `/run` —
 không ai gọi `/run` bằng tay.

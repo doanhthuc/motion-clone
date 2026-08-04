@@ -1,0 +1,140 @@
+# Box CPU + GPU serverless — Design
+
+**Ngày:** 04/08/2026 · **Trạng thái:** spec, chưa thành plan (còn 3 câu phải đo, xem §Phải đo trước)
+
+## Mục tiêu
+
+Bỏ GPU khỏi cái máy luôn bật. `api`, Postgres, MinIO và frontend đều là việc CPU — thuê RTX 5090
+để chạy chúng là trả tiền cho một con GPU nằm không 24/7. GPU chỉ xuất hiện khi có job, qua RunPod
+Serverless, và tắt hẳn khi không.
+
+Đây là bước mà [spec hướng A](2026-08-01-serverless-huong-a-design.md) cố ý hoãn: *"dời
+api/Postgres/MinIO sang VPS — bước riêng, sau khi serverless chứng minh chạy được"*. Serverless đã
+chứng minh 02/08/2026 (5 job, không job nào lỗi). Nên bước này đang mở.
+
+## Vì sao bây giờ, bằng số thật
+
+Hoá đơn thật (`runpodctl billing`), không phải `currentSpendPerHr`:
+
+| Khoản | Đo được |
+|---|---|
+| 7 phiên pod GPU, 24/07 → 02/08 | **$11,79** cho 11,9 giờ (~$1,00/giờ) |
+| Pod GPU nếu bật 24/7 | **~$720/tháng** |
+| Serverless, cả ngày chạy thử 02/08 | **$0,3894** (884 giây được tính) |
+| Volume 100GB | ~**$7,10/tháng**, không tránh được ở mọi hình dạng |
+| Pod CPU | **CHƯA ĐO ĐƯỢC** — xem §Phải đo trước, mục 2 |
+
+Ngày 02/08 trả **cả hai**: $1,49 pod GPU **và** $0,39 serverless, cùng một ngày, cho cùng một khối
+công việc. Đó là chỗ tiền chảy ra hai lần — và nó không phải tính chất của serverless, mà là hệ quả
+của việc cái box luôn bật có GPU.
+
+**Một hệ quả mới rút ra từ hoá đơn**, chưa có trong spec hướng A: chi phí serverless bị chi phối bởi
+**số lần đánh thức**, không phải độ dài job. 884 giây được tính so với 25,3 giây execution — phần
+lớn tiền đi vào cold start và khoảng chờ idle-timeout. Nên `DISPATCH_COOLDOWN_SEC`, `idle timeout`
+và `DISPATCH_MAX_INFLIGHT` là ba núm **chi phí**, không phải ba núm hiệu năng. Job rải rác đắt hơn
+job dồn cục.
+
+## Kiến trúc
+
+```
+box CPU (luôn bật)                          RunPod Serverless (0 khi rỗi)
+├── Postgres      ← PGDATA container disk    └── container GPU
+├── MinIO         ← data trên volume            ├── ComfyUI + 6 node ghim commit
+├── api           ← HTTPS qua CF Tunnel         └── worker_runtime → HTTP về api
+├── frontend Nuxt                                    ↑ mount cùng Network Volume
+└── mc-dispatcher ── POST /run ────────────────────┘   (model 42GB, chỉ đọc)
+   KHÔNG có: ComfyUI, worker, task-cloud-auto
+```
+
+Không có gì mới về giao thức. Worker serverless đã nói HTTP với api từ 02/08; đổi box từ GPU sang
+CPU không chạm vào đường đó. Cái đổi là **box cài ít hơn**, không phải box nói khác đi.
+
+### Một tác dụng phụ tốt: bẫy PGDATA tự hết
+
+`VOLUME_PGDATA=0` là mặc định vì MooseFS chặn `chown` nên Postgres không sống được trên Network
+Volume ([docs/gpu-pod.md#runpod-gotchas §2](../../gpu-pod.md#runpod-gotchas)). Hệ quả hiện nay: DB
+**mất** khi `gpu-destroy`.
+
+Ở hình dạng CPU, hệ quả đó biến mất — không phải vì ta sửa được MooseFS, mà vì **không còn lý do
+destroy box**. Bẫy này tồn tại chỉ vì pod GPU $1/giờ buộc phải destroy giữa các lần dùng. Box CPU
+rẻ thì cứ để chạy, container disk còn nguyên.
+
+## Phải đo trước — cả ba đều rẻ, và mục 1 có thể chặn cả hướng
+
+1. **Pod CPU có tồn tại ở EU-RO-1 không, và mount được volume không.**
+   Volume `wfe86wzkpm` nằm EU-RO-1 và **không dời được**. Không có pod CPU ở đó thì MinIO không có
+   nơi lưu và cả hướng này phải đổi (dùng VPS ngoài + S3 khác, phạm vi lớn hơn nhiều).
+   `runpodctl datacenter list` **chỉ báo GPU**, không nói gì về CPU — nên phải thử thật:
+   ```bash
+   runpodctl pod create --name cpu-probe --compute-type cpu \
+     --image runpod/base:1.0.2-ubuntu2204 --data-center-ids EU-RO-1 \
+     --network-volume-id wfe86wzkpm --container-disk-in-gb 20 --ssh
+   # rồi: ssh vào, `df -h /workspace`, `ls /workspace`, xong `runpodctl pod delete`
+   ```
+   Bằng chứng gián tiếp là bước preload 02/08 đã làm đúng việc này — nhưng xem mục 2, bằng chứng đó
+   không đứng vững.
+
+2. **Giá pod CPU.** Không có đường nào lấy bằng lệnh: `runpodctl` không có `cpu list`; REST `/v1`
+   không có endpoint giá (đã đọc `openapi.json`, 23 path, không path nào về giá); GraphQL
+   `cpuFlavors` trả spec (6 flavor `cpu3c/g/m` · `cpu5c/g/m`, 2–32 vCPU, ram ×2/×4/×8) nhưng
+   **không có field giá** qua ~14 lần dò tên. Phải đọc dashboard, hoặc thuê một cái ở mục 1 rồi xem
+   `runpodctl billing pods` hôm sau.
+
+   Kéo theo: con số *"pod CPU $0,06/giờ, 9 phút, ~$0,08"* trong
+   [docs/gpu-pod.md#preload](../../gpu-pod.md#preload) là **chưa kiểm chứng**. Nó tự mâu thuẫn
+   (0,15 giờ × $0,06 = $0,009, không phải $0,08) và **không có dòng pod CPU nào** trong cả 7 dòng
+   `billing pods` từ 24/07 đến 02/08. Mục 1 sẽ trả lời luôn cả câu này.
+
+3. **Chi phí serverless thật khi dùng hằng ngày.** $0,3894 là của một ngày chạy thử 5 job dồn cục.
+   Nó không nói được gì về ngày có 30 job rải rác — mà theo §Vì sao bây giờ thì đó mới là hình dạng
+   đắt. Cần một tuần dùng thật rồi đọc `billing serverless`.
+
+**Không có ba số này thì phép so "CPU + serverless rẻ hơn GPU pod" là niềm tin, không phải kết
+luận.** Hướng này *rất có thể* rẻ hơn — $720/tháng là mốc rất cao để vượt — nhưng spec không ghi
+con số nó chưa đo.
+
+## Phải sửa những gì
+
+| File | Sửa gì | Vì sao |
+|---|---|---|
+| `scripts/pod-provision.sh` | thêm `COMPUTE_TYPE=gpu\|cpu`; khi `cpu` thì bỏ `--gpu-id`/`--gpu-count`/`--min-cuda-version`, thêm `--compute-type cpu` | hiện tại **luôn** tạo pod GPU; pod CPU hôm preload là lệnh gõ tay trong docs |
+| `scripts/gpu-preflight.sh` | in `COMPUTE_TYPE` trong khối Hình dạng deploy; chặn `cpu` + `WORKER_SOURCE=local` | box CPU mà worker local nghĩa là **không ai chạy được job nào** — phải chặn, không phải cảnh báo |
+| `motions-studio/setup/` | profile mới `setup-cpu-box.sh`: `PM2_APPS="minio,api,wf-worker"`, `SKIP_COMFY=1` | bỏ `comfyui`, `worker`, `task-cloud-auto` |
+| `.env` / `.env.example` | `COMPUTE_TYPE=cpu` · `WORKER_SOURCE=serverless` · `SETUP_PROFILE=cpu-box` | |
+| `docs/gpu-pod.md` | mục hình dạng thứ ba | |
+
+### Ba chỗ hỏng lặng lẽ nếu bỏ qua
+
+1. **`task-cloud-auto` throw `"COMFY_URL chưa cấu hình"`** (`task-cloud/auto-worker.js:100`, đã ghi
+   ở spec hướng A §Quyết định). Nó nằm trong `PM2_APPS` của `setup-motion-transfer.sh`. Không bỏ nó
+   khỏi danh sách thì PM2 có một app crash-loop vĩnh viễn trên box mới.
+
+2. **`phase_comfyui` không chết khi thiếu GPU — nó *cảnh báo*** (`lib-feature.sh:582`: *"Không có
+   GPU NVIDIA → bỏ ComfyUI. Set COMFY_URL trong .env trỏ box GPU khác"*). Nghe như tin tốt, và đúng
+   là tin tốt: setup chạy được trên box CPU không cần sửa gì. Nhưng nó cũng nghĩa là **quên
+   `COMPUTE_TYPE` sẽ không có ai báo** — box dựng xong, xanh hết, `/health` trả lời, và không job nào
+   chạy được. Đó là lý do cổng chặn ở bảng trên là *chặn*, không phải *cảnh báo*.
+
+3. **MinIO từ chối symlink làm drive** ([§3](../../gpu-pod.md#runpod-gotchas)). Ràng buộc này
+   **không** đổi ở box CPU — vẫn phải theo đúng cách hiện tại đang làm.
+
+## Cố tình KHÔNG làm
+
+- **Dời khỏi RunPod hẳn** (Hetzner/VPS thường, rẻ hơn nữa). Volume EU-RO-1 giữ 42GB model *và* dữ
+  liệu MinIO; dời box ra ngoài RunPod nghĩa là serverless vẫn mount volume để đọc model, nhưng MinIO
+  phải chuyển sang chỗ khác — một bước riêng, sau khi hình dạng này chạy được.
+- Autoscale, ngân sách trần theo ngày, nhiều endpoint theo job type. Như spec hướng A.
+- Bỏ `WORKER_SOURCE=local`. Nó vẫn là hình dạng đúng khi ai đó *muốn* thuê pod GPU (job dồn cục, cần
+  không có cold start). Hai hình dạng cùng tồn tại.
+
+## Kiểm chứng
+
+1. `runpodctl billing pods` cho box CPU sau 24 giờ → số $/giờ thật, ghi vào docs
+2. Job `motion` chạy hết qua serverless với box **không có GPU** — `nvidia-smi` trên box phải
+   *không tồn tại*, và job vẫn `done`
+3. `pm2 status` trên box: không app nào ở `errored`/restart-loop (đây là bài kiểm cho
+   `task-cloud-auto`)
+4. `gpu-preflight` chặn đúng cặp `COMPUTE_TYPE=cpu` + `WORKER_SOURCE=local`
+5. Reboot box → Postgres và MinIO tự lên, DB còn nguyên
+6. Một tuần dùng thật → `billing serverless` + `billing pods`, so với $720/tháng của hình dạng cũ.
+   **Đây là mục quyết định hướng này có thắng hay không**, và là mục duy nhất không rẻ để chạy.

@@ -300,17 +300,54 @@ kiểu chợ.
 | Pod RTX 5090 đang chạy + volume 100GB | **1,014** |
 | Chỉ volume 100GB (pod đã destroy) | **0,0100** |
 | Serverless rỗi (kể cả khi `/health` báo `idle=2 ready=2`) | **0** — không cộng thêm gì |
-| Serverless, 5 job motion 540p/33 frame | 0,0116 **tổng cộng** |
 
-Nghĩa là volume 100GB tốn ~$7,3/tháng và `make gpu-destroy` KHÔNG dừng đồng hồ đó — cố ý, vì nó
-đang giữ 42GB model. Còn con số đáng nhớ nhất: một pod để quên qua đêm tốn nhiều hơn toàn bộ tiền
-GPU của 5 job serverless khoảng **2000 lần**.
+Nghĩa là volume 100GB tốn ~$7,1/tháng và `make gpu-destroy` KHÔNG dừng đồng hồ đó — cố ý, vì nó
+đang giữ 42GB model.
+
+<a id="hoa-don-that"></a>
+### Hoá đơn thật, không phải số suy ra — sửa 04/08/2026
+
+`currentSpendPerHr` là **tốc độ tiêu tiền tại một thời điểm**, không phải số tiền đã trả. Đối chiếu
+với hoá đơn (`runpodctl billing pods` · `billing serverless` · `billing network-volume`):
+
+| Khoản | Hoá đơn thật |
+|---|---|
+| 7 phiên pod GPU, 24/07 → 02/08 | **$11,79** cho 11,9 giờ (~$1,00/giờ, ổn định) |
+| Serverless, cả ngày chạy thử 02/08 | **$0,3894** cho **884 giây** được tính |
+| Volume 100GB | $0,00972/giờ → **~$7,10/tháng** |
+
+> **Con số $0,0116 trước đây ở đây là SAI**, và nó là con số chống lưng cho toàn bộ lập luận chi
+> phí của đường serverless. Nó tính theo 25,3 giây *execution* của 5 job. RunPod tính **884 giây** —
+> gấp 35 lần — vì **cold start và khoảng chờ idle-timeout cũng được tính tiền**, không chỉ lúc GPU
+> thật sự chạy. Thực thu $0,3894, tức **33 lần** số đã ghi.
+>
+> Vẫn rẻ về tuyệt đối, nhưng hệ quả thì đổi: chi phí serverless bị chi phối bởi **số lần đánh
+> thức**, không phải bởi độ dài job. Ba job rải rác trong ngày đắt hơn ba job liên tiếp cùng một
+> worker ấm. `DISPATCH_COOLDOWN_SEC` và `idle timeout` do đó là hai núm chi phí, không phải hai núm
+> hiệu năng.
+
+Ngày 02/08 trả **cả hai**: $1,49 pod GPU **và** $0,39 serverless. Đó là hình dạng "trả tiền GPU hai
+lần" — không phải tính chất của serverless, mà vì cái box luôn bật lúc đó là một pod GPU. Xem
+[§Hai hình dạng deploy](#deploy-shapes).
+
+**Giá pod CPU: chưa đo được.** Không có `runpodctl cpu list`; REST `/v1` không có endpoint giá;
+GraphQL `cpuFlavors` cho spec (6 flavor: `cpu3c/g/m`, `cpu5c/g/m`, 2–32 vCPU) nhưng **không** có
+field giá nào qua ~14 lần dò tên. Phải đọc trên dashboard hoặc thuê một cái rồi xem hoá đơn. Kéo
+theo: con số *"pod CPU $0,06/giờ, 9 phút, ~$0,08"* ở [§Tải model vào volume trước](#preload) là
+**chưa kiểm chứng** — nó tự mâu thuẫn (0,15 giờ × $0,06 = $0,009, không phải $0,08) và **không có
+dòng pod CPU nào** trong cả 7 dòng hoá đơn từ 24/07 đến 02/08.
 
 Kiểm bất cứ lúc nào:
 
 ```bash
+# Tốc độ tiêu tiền LÚC NÀY (không phải số đã trả)
 runpodctl user | python3 -c "import sys,json;d=json.load(sys.stdin);print('balance \$%.3f | spend/hr \$%.4f'%(d['clientBalance'],d['currentSpendPerHr']))"
 runpodctl pod list          # [] = không còn pod nào
+
+# Số ĐÃ TRẢ, theo ngày. Dùng cái này khi so chi phí hai hình dạng deploy — spend/hr không
+# thấy được cold start lẫn idle-timeout của serverless, và đó là chỗ tiền serverless thật sự đi.
+runpodctl billing pods -o json | python3 -c "import sys,json;d=json.load(sys.stdin);[print(r['time'][:10], '\$%.3f'%r['amount'], '%.2fh'%(r['timeBilledMs']/3.6e6)) for r in sorted(d,key=lambda x:x['time'])];print('tổng \$%.2f'%sum(r['amount'] for r in d))"
+runpodctl billing serverless -o json | python3 -c "import sys,json;[print(r['time'][:10], r['endpointId'], '\$%.4f'%r['amount'], '%.0fs'%(r['timeBilledMs']/1000)) for r in json.load(sys.stdin)]"
 ```
 
 Phần dưới là luật của **vast.ai**, giữ lại cho trường hợp `GPU_PROVIDER=vast`:
@@ -622,6 +659,15 @@ serverless nghĩa là trả tiền lần thứ hai cho cùng công việc, *và*
 đã mua vẫn nằm không. Đây là kết luận của [spec §Kiến trúc](superpowers/specs/2026-08-01-serverless-huong-a-design.md).
 Serverless chỉ thắng khi box luôn bật KHÔNG có GPU — hình dạng VPS mà spec nhắm tới.
 
+Đo được, ngày 02/08/2026: trả **cả hai** trong cùng một ngày — $1,49 pod GPU **và** $0,39
+serverless, cho cùng một khối công việc. Xem [§Hoá đơn thật](#hoa-don-that).
+
+> **Còn một hình dạng thứ ba, chưa dựng: box CPU + serverless.** `api`/Postgres/MinIO/FE đều là
+> việc CPU, nên bỏ GPU khỏi máy luôn bật là cách duy nhất khiến serverless thật sự thắng. Pod GPU
+> bật 24/7 là **~$720/tháng**, nên mốc để vượt rất cao. Thiết kế, ba số phải đo trước (giá pod CPU
+> chưa lấy được bằng lệnh), và ba chỗ hỏng lặng lẽ:
+> [spec box CPU](superpowers/specs/2026-08-04-box-cpu-serverless-design.md).
+
 **Cạm bẫy khi ghép `full` với `serverless`:** profile `full` cho box claim 21 type, nhưng image
 serverless bản mặc định chỉ bake 4. 17 type còn lại sẽ nằm `queued` **vĩnh viễn** — không lỗi,
 không log, chỉ là không ai nhận. Ba cách thoát:
@@ -661,7 +707,7 @@ qua đường serverless, không job nào lỗi. Con số quan trọng nhất:
 | Đo | Giá trị |
 |---|---|
 | Pod GPU luôn bật | **$1.014/giờ** — trả cả lúc không ai dùng |
-| Serverless, tổng cho 5 job | **$0.0116** (25,3 giây GPU được tính) |
+| Serverless, tổng cho 5 job | **$0.3894** — hoá đơn thật, 884 giây được tính ([vì sao không phải $0.0116](#hoa-don-that)) |
 | Job 540p/33 frame, worker ấm | 2 phút 46 giây từ `queued` → `done` |
 | Cold start (kéo image 5,09GB nén lần đầu) | ~155 giây |
 | Worker ấm | delay 1,9s · execution 0,3s |
