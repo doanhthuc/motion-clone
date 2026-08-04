@@ -45,8 +45,21 @@ jobs:
 
       - name: Cài deps
         working-directory: motions
-        # `npm ci` chứ không `npm install`: khoá đúng package-lock, không tự nâng version.
-        run: npm ci --no-audit --no-fund
+        # `npm install`, KHÔNG `npm ci` — và đây là chủ ý, không phải lười.
+        #
+        # `npm ci` là lựa chọn đúng về nguyên tắc (tái lập được), nhưng lockfile hiện tại lệch
+        # package.json đúng một entry (`@nuxt/cli/node_modules/commander@13.1.0`) nên nó từ chối
+        # chạy — đã gặp thật ở run 30889888557 ngày 04/08/2026.
+        #
+        # Và sửa lockfile KHÔNG làm được từ máy dev macOS: `npm install --package-lock-only` ở đó
+        # XOÁ 201 dòng `"libc": ["glibc"]` / `["musl"]` khỏi lock (đo 04/08). Đó chính là metadata
+        # npm dùng để chọn đúng biến thể native trên Linux — kể cả 24 entry sharp-linux-*. Commit
+        # bản lock đó là làm hỏng đúng cái workflow này tồn tại để bảo đảm.
+        #
+        # `npm install` là ĐÚNG BẰNG cái scripts/pod-fe.sh vẫn chạy trên pod, nên artifact có cùng
+        # cây deps mà pod tự dựng — đổi chỗ build, không đổi kết quả.
+        # Muốn quay lại npm ci thì phải sinh lock TRÊN LINUX (container hoặc chính CI) rồi commit.
+        run: npm install --no-audit --no-fund
 
       - name: Build
         working-directory: motions
