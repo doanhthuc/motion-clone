@@ -95,7 +95,11 @@ name: Build prebuilt pod image
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    # mtc-prebuilt-runpod: nhánh phát triển của spec này. `gh` trên máy dev đăng nhập bằng tài
+    # khoản chỉ có quyền READ nên KHÔNG chạy `gh workflow run` được; đẩy nhánh là cách kích hoạt
+    # build. XOÁ dòng nhánh này ở Task 7 trước khi merge — để lại thì mọi push nhánh đều đốt
+    # ~40 phút CI.
+    branches: [main, mtc-prebuilt-runpod]
     paths:
       # Image bake dependency của api, worker và bg-remover — ba file requirements đó đổi là
       # image lệch code. Theo dõi cả ba, không chỉ Dockerfile.
@@ -172,12 +176,15 @@ git commit -m "Khung image prebuilt + CI: chứng minh đường ống GHCR trư
 git push -u origin mtc-prebuilt-runpod
 ```
 
-- [ ] **Step 5: Chạy workflow bằng tay và xác nhận nó XANH**
+- [ ] **Step 5: Chờ build (đã tự chạy do push ở Step 4) và xác nhận nó XANH**
+
+`gh` trên máy này chỉ có quyền READ nên **không** dùng `gh workflow run`; push ở Step 4 đã kích hoạt build. Đọc kết quả thì quyền READ là đủ:
 
 ```bash
-gh workflow run "Build prebuilt pod image" --ref mtc-prebuilt-runpod
-sleep 20 && gh run list --workflow="Build prebuilt pod image" --limit 1
-gh run watch "$(gh run list --workflow='Build prebuilt pod image' --limit 1 --json databaseId -q '.[0].databaseId')"
+sleep 20
+RID=$(gh run list --repo doanhthuc/motion-clone --workflow="Build prebuilt pod image" --limit 1 --json databaseId -q '.[0].databaseId')
+gh run watch "$RID" --repo doanhthuc/motion-clone
+gh run view "$RID" --repo doanhthuc/motion-clone --log | grep -A3 "TỔNG NÉN"
 ```
 
 Mong đợi: kết luận `success`. Bước "In dung lượng image" in ra khoảng **2-4 GB** (base runpod/pytorch, chưa có gì thêm).
@@ -320,11 +327,13 @@ git commit -m "Lớp ComfyUI + torch cu130 + 9 node, bê chuỗi đã chứng mi
 git push
 ```
 
-- [ ] **Step 4: Chạy workflow và xác nhận assert torch XANH**
+- [ ] **Step 4: Chờ build (push ở Step 3 đã kích hoạt) và xác nhận assert torch XANH**
 
 ```bash
-gh workflow run "Build prebuilt pod image" --ref mtc-prebuilt-runpod
-gh run watch "$(gh run list --workflow='Build prebuilt pod image' --limit 1 --json databaseId -q '.[0].databaseId')"
+sleep 20
+RID=$(gh run list --repo doanhthuc/motion-clone --workflow="Build prebuilt pod image" --limit 1 --json databaseId -q '.[0].databaseId')
+gh run watch "$RID" --repo doanhthuc/motion-clone
+gh run view "$RID" --repo doanhthuc/motion-clone --log | grep -A3 "TỔNG NÉN"
 ```
 
 Mong đợi: `success`, và trong log có dòng của assert chạy qua (không có `AssertionError`). Dung lượng in ra tăng lên khoảng **15-25 GB**.
@@ -454,11 +463,13 @@ git commit -m "Lớp pod: Postgres/MinIO/Node/pm2/Ollama + ba venv, và symlink 
 git push
 ```
 
-- [ ] **Step 6: Chạy workflow, xác nhận xanh, ghi dung lượng**
+- [ ] **Step 6: Chờ build (push ở Step 5 đã kích hoạt), xác nhận xanh, ghi dung lượng**
 
 ```bash
-gh workflow run "Build prebuilt pod image" --ref mtc-prebuilt-runpod
-gh run watch "$(gh run list --workflow='Build prebuilt pod image' --limit 1 --json databaseId -q '.[0].databaseId')"
+sleep 20
+RID=$(gh run list --repo doanhthuc/motion-clone --workflow="Build prebuilt pod image" --limit 1 --json databaseId -q '.[0].databaseId')
+gh run watch "$RID" --repo doanhthuc/motion-clone
+gh run view "$RID" --repo doanhthuc/motion-clone --log | grep -A3 "TỔNG NÉN"
 echo "Task3 image nén: <số> GB" >> /tmp/mtc-prebuilt-do.txt
 ```
 
@@ -837,24 +848,36 @@ Thêm ngay sau: nêu con số mới khi `MTC_PREBUILT=1`, và giữ số cũ cho
 
 Sửa dòng 3-4 của `docs/superpowers/specs/2026-08-05-mtc-prebuilt-runpod-design.md` từ `**Trạng thái:** thiết kế, **chưa dựng**` thành trạng thái thật kèm ngày và kết quả sáu bước verify.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: GỠ nhánh dev khỏi trigger của workflow**
+
+Trong `.github/workflows/build-prebuilt-image.yml`, đổi lại:
+
+```yaml
+    branches: [main]
+```
+
+và xoá khối comment giải thích về nhánh dev. Để lại thì mọi push lên nhánh đó đốt ~40 phút CI. Đây là bước dễ quên nhất của cả plan — nó không làm gì hỏng ngay, chỉ âm thầm tốn.
+
+- [ ] **Step 6: Commit và đẩy**
 
 ```bash
-git add docs/gpu-pod.md docs/superpowers/specs/2026-08-05-mtc-prebuilt-runpod-design.md
+git add docs/gpu-pod.md docs/superpowers/specs/2026-08-05-mtc-prebuilt-runpod-design.md \
+        .github/workflows/build-prebuilt-image.yml
 git commit -m "Số đo thật MTC_PREBUILT: <TỔNG> phút thay vì 20-35, image <X> GB"
 git push
 ```
 
-- [ ] **Step 6: Mở PR**
+- [ ] **Step 7: Mở PR trên web UI**
 
-```bash
-gh pr create --title "MTC_PREBUILT trên RunPod: image dựng sẵn + profile full" \
-  --body "Xoá ~20-35 phút cài phần mềm khỏi mỗi lần dựng pod. Spec: docs/superpowers/specs/2026-08-05-mtc-prebuilt-runpod-design.md
+`gh` trên máy này chỉ có quyền READ nên không tạo PR được. Mở:
 
-Đo thật: xem docs/gpu-pod.md §Image dựng sẵn.
-
-🤖 Generated with [Claude Code](https://claude.com/claude-code)"
 ```
+https://github.com/doanhthuc/motion-clone/compare/main...mtc-prebuilt-runpod
+```
+
+Tiêu đề: `MTC_PREBUILT trên RunPod: image dựng sẵn + profile full`
+
+Nội dung: xoá ~20-35 phút cài phần mềm khỏi mỗi lần dựng pod; spec ở `docs/superpowers/specs/2026-08-05-mtc-prebuilt-runpod-design.md`; số đo thật ở `docs/gpu-pod.md` §Image dựng sẵn.
 
 ---
 
