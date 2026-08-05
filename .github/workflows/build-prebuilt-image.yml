@@ -85,4 +85,9 @@ jobs:
           gb=sum(l["size"] for l in ls)/2**30
           print("số layer:", len(ls))
           print("TỔNG NÉN: %.2f GB" % gb)
-          print("Ước giải nén (~2-2,5x): %.0f-%.0f GB — phải vừa DISK=100 cùng OS và PGDATA" % (gb*2, gb*2.5))'
+          print("Ước giải nén (~2-2,5x): %.0f-%.0f GB — phải vừa DISK=100 cùng OS và PGDATA" % (gb*2, gb*2.5))
+          if gb < 5 or len(ls) < 10:
+              # Cổng chặn: lấy nhầm manifest attestation cho ra vài MB / 1-2 layer, in ra vẫn "hợp lệ".
+              # Image này không bao giờ nhỏ hơn base runpod/pytorch (~9,8 GB, 35 layer), nên số dưới
+              # ngưỡng này nghĩa là ĐO SAI, không phải image nhẹ. Thà đỏ còn hơn cho ra số không tin được.
+              sys.exit("ĐO SAI: %.2f GB / %d layer — dưới sàn hợp lý, nhiều khả năng đọc nhầm manifest attestation" % (gb, len(ls)))'
