@@ -27,7 +27,7 @@ RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
 RUN git clone --filter=blob:none https://github.com/comfyanonymous/ComfyUI.git /opt/mtc-prebuilt/ComfyUI \
  && git -C /opt/mtc-prebuilt/ComfyUI checkout 322122449c9d2ba8b8df1bb517364527dd0615f1
 
-# venv RIÊNG, không dùng python hệ thống: setup/lib-feature.sh:532 `die` nếu thiếu
+# venv RIÊNG, không dùng python hệ thống: setup/lib-feature.sh:544 `die` nếu thiếu
 # $COMFY_DIR/venv/bin/python, và venv tránh luôn PEP 668 của Ubuntu 24.04.
 # --system-site-packages: KHÔNG dùng. Base có torch 2.8/cu128, kế thừa nó vào venv thì
 # pip có thể coi torch là "đã có" và bỏ qua bản cu130 ta cần.
@@ -139,22 +139,27 @@ RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends zstd \
 # CHẶN Ở BUILD: layer npm hỏng/cache dở từng cho ra api-node_modules thiếu dependency bắc cầu
 # (pg có, pg-types không). Runtime chỉ lộ ra bằng "Cannot find module" lúc worker crash-loop —
 # rất tốn công truy. Nạp thử vài package chính, thiếu là fail build luôn.
-# (setup/lib-feature.sh:513-522 cũng tự kiểm và cài lại ở runtime; đây là lớp chặn sớm hơn.)
+# (setup/lib-feature.sh:518-533 cũng tự kiểm và cài lại ở runtime; đây là lớp chặn sớm hơn.)
 WORKDIR /opt/mtc-build/api
 COPY api/package.json ./package.json
 RUN npm install --omit=dev --no-audit --no-fund \
     && node -e "require('pg');require('pg-types');require('express')" \
     && mv node_modules /opt/mtc-prebuilt/api-node_modules
 
-# venv worker — setup/lib-feature.sh:488 symlink worker/venv sang đây.
+# venv worker — setup/lib-feature.sh:536 symlink worker/venv sang đây.
 WORKDIR /opt/mtc-build/worker
 COPY worker/requirements.txt ./requirements.txt
+# CHẶN Ở BUILD: cùng lý do với api-node_modules ở trên — layer pip hỏng thiếu dependency bắc cầu
+# thì không gì bắt được cho tới lúc worker crash-loop trên pod thật. Nạp thử vài module chính.
+# Tên MODULE khác tên PACKAGE: websocket-client → websocket, Pillow → PIL, faster-whisper →
+# faster_whisper (kiểm chéo với worker/requirements.txt trước khi đổi danh sách này).
 RUN python3 -m venv /opt/mtc-prebuilt/worker-venv \
     && /opt/mtc-prebuilt/worker-venv/bin/pip install --no-cache-dir -U pip wheel \
-    && /opt/mtc-prebuilt/worker-venv/bin/pip install --no-cache-dir -r requirements.txt
+    && /opt/mtc-prebuilt/worker-venv/bin/pip install --no-cache-dir -r requirements.txt \
+    && /opt/mtc-prebuilt/worker-venv/bin/python -c "import requests, websocket, PIL, faster_whisper"
 
 # venv bg-remover — MỚI so với bản Dockerfile cũ. setup/setup-full.sh:57 đặt NEED_BG_REMOVER=1,
-# và ensure_bg_remover (lib-feature.sh:470-477, gọi từ phase_prebuilt_deps:528) dựng venv này ở
+# và ensure_bg_remover (lib-feature.sh:470-489, gọi từ phase_prebuilt_deps:540) dựng venv này ở
 # RUNTIME mỗi lần boot — comment của nó tự thú "chậm hơn fast-boot vài phút". Với profile
 # motion-transfer thì NEED_BG_REMOVER=0 nên không ai để ý; với full nó ăn đúng vào cái fast-boot
 # đang mua. Bake vào đây thì mất hẳn.
@@ -167,6 +172,21 @@ RUN python3 -m venv /opt/mtc-prebuilt/bg-remover-venv \
 RUN mkdir -p /opt/mtc-prebuilt/ComfyUI/models/uploads && rm -rf /opt/mtc-build
 WORKDIR /root
 
-# Marker cuối cùng: setup/lib-feature.sh:504 `die` nếu thiếu file này. Đặt ở cuối image để một
+# Cổng chặn hợp đồng: marker .ready dưới đây là lời hứa "image đủ ruột" mà lib-feature.sh tin
+# tuyệt đối (nó `die` nếu thiếu marker, và KHÔNG kiểm lại gì bên trong). Nếu không bảo chứng lời
+# hứa ở đây thì một RUN im lặng thiếu thứ gì vẫn cho ra image có marker — pod dựng xong mới chết,
+# trên đồng hồ GPU $1/giờ. Kiểm đúng những gì lib-feature.sh sẽ đòi.
+RUN set -eux; \
+    test -f /opt/mtc-prebuilt/ComfyUI/main.py; \
+    test -x /opt/mtc-prebuilt/ComfyUI/venv/bin/python; \
+    test -d /opt/mtc-prebuilt/api-node_modules; \
+    test -x /opt/mtc-prebuilt/worker-venv/bin/python; \
+    test -x /opt/mtc-prebuilt/bg-remover-venv/bin/python; \
+    test -x /usr/bin/ollama; \
+    test -x /usr/local/bin/minio; \
+    n=$(ls /opt/mtc-prebuilt/ComfyUI/custom_nodes | wc -l); \
+    [ "$n" = 9 ] || { echo "cần 9 custom node, đếm được $n" >&2; exit 1; }
+
+# Marker cuối cùng: setup/lib-feature.sh:516 `die` nếu thiếu file này. Đặt ở cuối image để một
 # build hỏng giữa chừng KHÔNG bao giờ cho ra image có marker nhưng thiếu ruột.
 RUN mkdir -p /opt/mtc-prebuilt && touch /opt/mtc-prebuilt/.ready
