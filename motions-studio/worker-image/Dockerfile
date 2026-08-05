@@ -177,6 +177,10 @@ WORKDIR /root
 # tuyệt đối (nó `die` nếu thiếu marker, và KHÔNG kiểm lại gì bên trong). Nếu không bảo chứng lời
 # hứa ở đây thì một RUN im lặng thiếu thứ gì vẫn cho ra image có marker — pod dựng xong mới chết,
 # trên đồng hồ GPU $1/giờ. Kiểm đúng những gì lib-feature.sh sẽ đòi.
+#
+# Node kiểm theo TÊN, không đếm số: ComfyUI ship sẵn vài file trong custom_nodes/ nên `ls | wc -l`
+# ra 11 chứ không phải 9. Và đếm số vẫn im lặng cho qua khi thiếu một node mà thừa một thư mục
+# lạ — đúng loại lỗi cổng chặn này tồn tại để bắt.
 RUN set -eux; \
     test -f /opt/mtc-prebuilt/ComfyUI/main.py; \
     test -x /opt/mtc-prebuilt/ComfyUI/venv/bin/python; \
@@ -185,8 +189,13 @@ RUN set -eux; \
     test -x /opt/mtc-prebuilt/bg-remover-venv/bin/python; \
     test -x /usr/bin/ollama; \
     test -x /usr/local/bin/minio; \
-    n=$(ls /opt/mtc-prebuilt/ComfyUI/custom_nodes | wc -l); \
-    [ "$n" = 9 ] || { echo "cần 9 custom node, đếm được $n" >&2; exit 1; }
+    for d in ComfyUI-WanVideoWrapper ComfyUI-KJNodes ComfyUI-VideoHelperSuite \
+             comfyui_controlnet_aux ComfyUI-Frame-Interpolation ComfyUI-FlashVSR_Stable \
+             ComfyUI-GGUF ComfyUI-LTXVideo ComfyUI-SeedVR2_VideoUpscaler; do \
+      test -d "/opt/mtc-prebuilt/ComfyUI/custom_nodes/$d" \
+        || { echo "thiếu custom node: $d" >&2; exit 1; }; \
+    done; \
+    ls -1 /opt/mtc-prebuilt/ComfyUI/custom_nodes
 
 # Marker cuối cùng: setup/lib-feature.sh:516 `die` nếu thiếu file này. Đặt ở cuối image để một
 # build hỏng giữa chừng KHÔNG bao giờ cho ra image có marker nhưng thiếu ruột.
