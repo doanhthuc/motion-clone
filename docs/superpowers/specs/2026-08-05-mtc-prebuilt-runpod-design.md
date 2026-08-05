@@ -212,10 +212,26 @@ serverless.
 | 51 | `MTC_PREBUILT=0` | `MTC_PREBUILT=1` — **chỉ sau khi image build xanh** |
 | 117 | `SETUP_PROFILE=motion-transfer` | `SETUP_PROFILE=full` |
 | — (thêm mới; `.env` chưa có dòng này, `.env.example:39` có) | `POD_IMAGE=` | `ghcr.io/<owner>/motion-prebuilt:sha-<commit>` |
+| — (thêm mới) | `JOB_TYPES_OVERRIDE=` | 16 type ở trên |
 | 135 | `DISPATCH_JOB_TYPES=motion,teen-flycam,trend-tiktok,enhance` | 16 type ở trên |
 
 `DISPATCH_JOB_TYPES` chỉ có tác dụng với dispatcher serverless, mà `WORKER_SOURCE=local`; sửa để
 khỏi lệch nếu sau này đổi ý.
+
+### `JOB_TYPES_OVERRIDE` — cơ chế phải làm mới
+
+Phát hiện lúc viết plan: **hiện không có đường nào thu hẹp `JOB_TYPES`.** `lib-feature.sh:397` ghi
+`set_kv JOB_TYPES "$JOB_TYPE"`, mà `JOB_TYPE` là hằng cứng trong profile — `setup-full.sh:49` khai
+đủ 21 type. `DISPATCH_JOB_TYPES` **không** thay được: nó chỉ điều khiển dispatcher serverless.
+
+Nên phải thêm một biến đi từ `.env` gốc → `pod-bootstrap.sh` → `phase_dotenv`:
+
+- chỉ **cắt bớt** được, type ngoài profile là cổng chặn `die` — type ngoài profile nghĩa là thiếu
+  custom node, worker chết ở `/prompt` chứ không phải chỉ thiếu model
+- bỏ trống = dùng nguyên `JOB_TYPE` của profile
+
+**Không sửa thẳng `setup-full.sh:49`.** Profile khai *phần mềm chạy được gì*; model thiếu là sự thật
+*của volume này*. Trộn hai thứ thì volume sau tải đủ model vẫn bị khoá ở 16 type mà không ai nhớ vì sao.
 
 ## Kiểm chứng — rẻ trước, đắt sau
 
