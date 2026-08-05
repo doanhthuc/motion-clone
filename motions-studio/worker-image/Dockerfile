@@ -110,6 +110,63 @@ RUN mkdir -p /opt/mtc-prebuilt/ComfyUI/custom_nodes/comfyui_controlnet_aux/ckpts
  && wget -q -O /opt/mtc-prebuilt/ComfyUI/custom_nodes/comfyui_controlnet_aux/ckpts/hr16/DWPose-TorchScript-BatchSize5/dw-ll_ucoco_384_bs5.torchscript.pt \
       https://huggingface.co/hr16/DWPose-TorchScript-BatchSize5/resolve/main/dw-ll_ucoco_384_bs5.torchscript.pt
 
+# Postgres/MinIO/Node chạy NATIVE trên pod (apt + PM2), KHÔNG qua docker compose —
+# xem docs/gpu-pod.md#kiến-trúc-thật-trên-pod.
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+      gnupg postgresql postgresql-contrib \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null \
+    && apt-get install -y -qq --no-install-recommends nodejs \
+    && npm install -g pm2 \
+    && curl -fsSL -o /usr/local/bin/minio https://dl.min.io/server/minio/release/linux-amd64/minio \
+    && chmod +x /usr/local/bin/minio \
+    && rm -rf /var/lib/apt/lists/* /root/.cache
+
+# GHIM PHIÊN BẢN OLLAMA LÀ BẮT BUỘC, không phải cẩn thận thừa.
+# Bản cũ tải ollama-linux-amd64.tgz — Ollama ĐÃ BỎ định dạng .tgz, nay chỉ phát hành .tar.zst
+# (kiểm 26/07/2026: .tgz trả 404). `curl -f` gặp 404 thoát khác 0 → vỡ RUN đầu tiên → build CHẾT,
+# không bao giờ ra image. ĐÂY CHÍNH LÀ LÝ DO GHCR LUÔN TRỐNG trước spec này.
+# Ollama cần cho profile full: setup/setup-full.sh:56 NEED_OLLAMA=1 (dịch VN→EN cho create-image,
+# dịch phụ đề cho subtitle, tryon Auto).
+ARG OLLAMA_VERSION=v0.32.4
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends zstd \
+    && curl -fsSL -o /tmp/ollama.tar.zst \
+         "https://github.com/ollama/ollama/releases/download/${OLLAMA_VERSION}/ollama-linux-amd64.tar.zst" \
+    && tar --use-compress-program=unzstd -xf /tmp/ollama.tar.zst -C /usr \
+    && rm -f /tmp/ollama.tar.zst \
+    && test -x /usr/bin/ollama \
+    && rm -rf /var/lib/apt/lists/* /root/.cache
+
+# CHẶN Ở BUILD: layer npm hỏng/cache dở từng cho ra api-node_modules thiếu dependency bắc cầu
+# (pg có, pg-types không). Runtime chỉ lộ ra bằng "Cannot find module" lúc worker crash-loop —
+# rất tốn công truy. Nạp thử vài package chính, thiếu là fail build luôn.
+# (setup/lib-feature.sh:513-522 cũng tự kiểm và cài lại ở runtime; đây là lớp chặn sớm hơn.)
+WORKDIR /opt/mtc-build/api
+COPY api/package.json ./package.json
+RUN npm install --omit=dev --no-audit --no-fund \
+    && node -e "require('pg');require('pg-types');require('express')" \
+    && mv node_modules /opt/mtc-prebuilt/api-node_modules
+
+# venv worker — setup/lib-feature.sh:488 symlink worker/venv sang đây.
+WORKDIR /opt/mtc-build/worker
+COPY worker/requirements.txt ./requirements.txt
+RUN python3 -m venv /opt/mtc-prebuilt/worker-venv \
+    && /opt/mtc-prebuilt/worker-venv/bin/pip install --no-cache-dir -U pip wheel \
+    && /opt/mtc-prebuilt/worker-venv/bin/pip install --no-cache-dir -r requirements.txt
+
+# venv bg-remover — MỚI so với bản Dockerfile cũ. setup/setup-full.sh:57 đặt NEED_BG_REMOVER=1,
+# và ensure_bg_remover (lib-feature.sh:470-477, gọi từ phase_prebuilt_deps:528) dựng venv này ở
+# RUNTIME mỗi lần boot — comment của nó tự thú "chậm hơn fast-boot vài phút". Với profile
+# motion-transfer thì NEED_BG_REMOVER=0 nên không ai để ý; với full nó ăn đúng vào cái fast-boot
+# đang mua. Bake vào đây thì mất hẳn.
+WORKDIR /opt/mtc-build/bg-remover
+COPY bg-remover/requirements.txt ./requirements.txt
+RUN python3 -m venv /opt/mtc-prebuilt/bg-remover-venv \
+    && /opt/mtc-prebuilt/bg-remover-venv/bin/pip install --no-cache-dir -U pip wheel \
+    && /opt/mtc-prebuilt/bg-remover-venv/bin/pip install --no-cache-dir -r requirements.txt
+
+RUN mkdir -p /opt/mtc-prebuilt/ComfyUI/models/uploads && rm -rf /opt/mtc-build
+WORKDIR /root
+
 # Marker cuối cùng: setup/lib-feature.sh:504 `die` nếu thiếu file này. Đặt ở cuối image để một
 # build hỏng giữa chừng KHÔNG bao giờ cho ra image có marker nhưng thiếu ruột.
 RUN mkdir -p /opt/mtc-prebuilt && touch /opt/mtc-prebuilt/.ready

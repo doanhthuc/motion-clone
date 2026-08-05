@@ -469,6 +469,18 @@ phase_postgres() {
 # image dựng sẵn (worker-image/Dockerfile) KHÔNG có venv này, nên phase_prebuilt_deps cũng gọi.
 ensure_bg_remover() {
   [ "${NEED_BG_REMOVER:-0}" = "1" ] || return 0
+  # ALD 05/08/2026 - Image dựng sẵn có venv bg-remover → symlink thay vì pip lại vài phút mỗi boot.
+  # Kiểm chạy được chứ không tin nó có mặt là đủ, cùng cách phase_prebuilt_deps kiểm api-node_modules.
+  local _pre="${MTC_PREBUILT_DIR:-/opt/mtc-prebuilt}/bg-remover-venv"
+  if [ "${MTC_PREBUILT:-0}" = "1" ] && [ -x "$_pre/bin/python" ]; then
+    if "$_pre/bin/python" -c "import rembg" >/dev/null 2>&1; then
+      rm -rf "$ROOT/bg-remover/venv"
+      ln -s "$_pre" "$ROOT/bg-remover/venv"
+      ok "bg-remover: dùng venv dựng sẵn từ image"
+      return 0
+    fi
+    warn "venv bg-remover dựng sẵn không import được rembg → dựng lại tại chỗ."
+  fi
   [ -x "$ROOT/bg-remover/venv/bin/python" ] || python3 -m venv "$ROOT/bg-remover/venv"
   "$ROOT/bg-remover/venv/bin/pip" install -q --upgrade pip >/dev/null
   "$ROOT/bg-remover/venv/bin/pip" install -q -r "$ROOT/bg-remover/requirements.txt" \
