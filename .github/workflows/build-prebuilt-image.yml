@@ -73,7 +73,16 @@ jobs:
       # In ra ngay trong log build thay vì bắt người ta vào GHCR bấm tìm.
       - name: In dung lượng image
         run: |
-          docker buildx imagetools inspect \
-            "ghcr.io/${{ github.repository_owner }}/motion-prebuilt:sha-${GITHUB_SHA::7}" \
-            --raw | python3 -c 'import json,sys; m=json.load(sys.stdin); \
-            print("TỔNG NÉN:", round(sum(l["size"] for l in m.get("layers",[]))/2**30, 2), "GB")'
+          REF="ghcr.io/${{ github.repository_owner }}/motion-prebuilt:sha-${GITHUB_SHA::7}"
+          # --raw trả OCI image index (khoá `manifests`), KHÔNG phải image đơn (khoá `layers`).
+          # Đọc thẳng `layers` ở tầng này luôn ra 0 GB và bước vẫn xanh — thành công giả.
+          # Phải lấy digest amd64 trước, rồi mới cộng layer của chính manifest đó.
+          D=$(docker buildx imagetools inspect "$REF" --raw \
+            | python3 -c 'import json,sys; m=json.load(sys.stdin); print([x["digest"] for x in m["manifests"] if x.get("platform",{}).get("architecture")=="amd64"][0])')
+          docker buildx imagetools inspect "ghcr.io/${{ github.repository_owner }}/motion-prebuilt@$D" --raw \
+            | python3 -c 'import json,sys
+          m=json.load(sys.stdin); ls=m["layers"]
+          gb=sum(l["size"] for l in ls)/2**30
+          print("số layer:", len(ls))
+          print("TỔNG NÉN: %.2f GB" % gb)
+          print("Ước giải nén (~2-2,5x): %.0f-%.0f GB — phải vừa DISK=100 cùng OS và PGDATA" % (gb*2, gb*2.5))'
