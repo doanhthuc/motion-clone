@@ -1,0 +1,79 @@
+# .github/workflows/build-prebuilt-image.yml
+# PHẢI nằm ở GỐC repo. GitHub Actions chỉ đọc .github/workflows/ ở gốc — workflow trong
+# motions-studio/.github/ là file chết, chưa từng chạy lần nào.
+name: Build prebuilt pod image
+
+on:
+  workflow_dispatch:
+  push:
+    # mtc-prebuilt-runpod: nhánh phát triển của spec này. `gh` trên máy dev đăng nhập bằng tài
+    # khoản chỉ có quyền READ nên KHÔNG chạy `gh workflow run` được; đẩy nhánh là cách kích hoạt
+    # build. XOÁ dòng nhánh này ở Task 7 trước khi merge — để lại thì mọi push nhánh đều đốt
+    # ~40 phút CI.
+    branches: [main, mtc-prebuilt-runpod]
+    paths:
+      # Image bake dependency của api, worker và bg-remover — ba file requirements đó đổi là
+      # image lệch code. Theo dõi cả ba, không chỉ Dockerfile.
+      - motions-studio/worker-image/Dockerfile
+      - motions-studio/api/package.json
+      - motions-studio/worker/requirements.txt
+      - motions-studio/bg-remover/requirements.txt
+      - .github/workflows/build-prebuilt-image.yml
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: prebuilt-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Runner tiêu chuẩn chỉ còn ~14GB trống; image này vài chục GB sau khi giải nén.
+      - name: Dọn disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          df -h /
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          # repository_owner, không gõ cứng: ai fork cũng build vào registry của mình.
+          images: ghcr.io/${{ github.repository_owner }}/motion-prebuilt
+          tags: |
+            # enable= guard: build thử gần như chắc chắn chạy bằng workflow_dispatch trên một
+            # nhánh, không phải push vào main. Không có guard này thì lần chạy thử ĐÓ ghi đè
+            # `latest` bằng image dựng từ code chưa merge.
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,prefix=sha-
+
+      - uses: docker/build-push-action@v6
+        id: build
+        with:
+          context: motions-studio
+          file: motions-studio/worker-image/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      # Dung lượng image là RỦI RO LỚN NHẤT của cả thiết kế: pull chậm ăn hết phần tiết kiệm.
+      # In ra ngay trong log build thay vì bắt người ta vào GHCR bấm tìm.
+      - name: In dung lượng image
+        run: |
+          docker buildx imagetools inspect \
+            "ghcr.io/${{ github.repository_owner }}/motion-prebuilt:sha-${GITHUB_SHA::7}" \
+            --raw | python3 -c 'import json,sys; m=json.load(sys.stdin); \
+            print("TỔNG NÉN:", round(sum(l["size"] for l in m.get("layers",[]))/2**30, 2), "GB")'
