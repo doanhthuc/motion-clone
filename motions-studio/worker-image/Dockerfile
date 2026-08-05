@@ -34,10 +34,11 @@ RUN git clone --filter=blob:none https://github.com/comfyanonymous/ComfyUI.git /
 RUN python3 -m venv /opt/mtc-prebuilt/ComfyUI/venv \
  && /opt/mtc-prebuilt/ComfyUI/venv/bin/pip install --no-cache-dir -U pip wheel
 
-# torch TRONG IMAGE là torch cuối cùng chạy trên pod: MTC_PREBUILT=1 bỏ qua
-# motion_install_best_pytorch (lib-feature.sh:828-836), nên không có bước nào cài lại cho khớp
-# driver ở runtime. Base ship 2.8.0+cu128; ta cài đè 2.12.1+cu130 cho khớp chuỗi đã chứng minh
-# của Dockerfile.selfhosted và MIN_CUDA_VERSION=13.0.
+# torch TRONG IMAGE là torch cuối cùng chạy trên pod: nhánh MTC_PREBUILT=1 (lib-feature.sh:840)
+# bỏ qua phase_comfyui (lib-feature.sh:574) — nơi duy nhất gọi motion_install_best_pytorch
+# (định nghĩa ở setup/lib-gpu.sh:6; gọi tại lib-feature.sh:627 và :651) — nên không có bước nào
+# cài lại torch cho khớp driver ở runtime. Base ship 2.8.0+cu128; ta cài đè 2.12.1+cu130 cho khớp
+# chuỗi đã chứng minh của Dockerfile.selfhosted và MIN_CUDA_VERSION=13.0.
 RUN /opt/mtc-prebuilt/ComfyUI/venv/bin/pip install --no-cache-dir \
       --index-url https://download.pytorch.org/whl/cu130 \
       torch==2.12.1 torchvision torchaudio
@@ -87,7 +88,7 @@ RUN set -eux; \
     done
 
 # Danh sách runtime tường minh của FlashVSR (bỏ qua requirements.txt hỏng của chính nó ở trên).
-# KHÔNG cần flash-attn/triton — node fallback được, xem setup/lib-feature.sh:594-606.
+# KHÔNG cần flash-attn/triton — node fallback được, xem setup/lib-feature.sh:635-647.
 RUN /opt/mtc-prebuilt/ComfyUI/venv/bin/pip install --no-cache-dir \
       einops safetensors tqdm pillow huggingface_hub psutil "opencv-python>=4.8.1.78" pyyaml
 
