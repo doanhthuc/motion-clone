@@ -394,7 +394,22 @@ phase_dotenv() {
   # ── KHOÁ #1: catalog RIÊNG của feature (Settings → Models AI chỉ thấy model này) ──
   set_kv MODEL_CATALOG_PATH "$CATALOG_FILE"
   # ── KHOÁ #2: JOB_TYPES = ĐÚNG nhóm type của feature → worker không nhận job khác ──
-  set_kv JOB_TYPES "$JOB_TYPE"
+  # ALD 05/08/2026 - JOB_TYPES_OVERRIDE hẹp hơn JOB_TYPE của profile: dùng khi volume chưa có
+  # model cho hết số type profile khai. Chỉ CẮT BỚT, không thêm — type ngoài profile nghĩa là
+  # thiếu custom node, worker sẽ chết ở /prompt chứ không phải chỉ thiếu model.
+  _JT="$JOB_TYPE"
+  if [ -n "${JOB_TYPES_OVERRIDE:-}" ]; then
+    _bad=""
+    for _t in $(echo "$JOB_TYPES_OVERRIDE" | tr ',' ' '); do
+      case ",$JOB_TYPE," in *",$_t,"*) ;; *) _bad="$_bad $_t" ;; esac
+    done
+    if [ -n "$_bad" ]; then
+      die "JOB_TYPES_OVERRIDE có type ngoài profile $FEATURE:$_bad — profile khai: $JOB_TYPE"
+    fi
+    _JT="$JOB_TYPES_OVERRIDE"
+    warn "JOB_TYPES bị thu hẹp bằng JOB_TYPES_OVERRIDE: $_JT (profile khai $(echo "$JOB_TYPE" | tr ',' '\n' | wc -l | tr -d ' ') type)"
+  fi
+  set_kv JOB_TYPES "$_JT"
   if [ "${NEED_OLLAMA:-0}" = "1" ]; then set_kv OLLAMA_URL "http://127.0.0.1:11434"; else set_kv OLLAMA_URL ""; fi
   [ -n "${CORS_ORIGINS:-}" ] && set_kv CORS_ORIGINS "$CORS_ORIGINS"
   [ -n "${HF_TOKEN:-}" ] && set_kv HF_TOKEN "$HF_TOKEN"
@@ -406,7 +421,7 @@ phase_dotenv() {
     warn "Chưa đặt Gmail → login OTP CHƯA gửi được. Sửa GMAIL_USER/GMAIL_APP_PASSWORD trong .env rồi 'pm2 restart api'."
   fi
   chmod 600 .env
-  ok ".env sẵn sàng (JOB_TYPES=$JOB_TYPE)"
+  ok ".env sẵn sàng (JOB_TYPES=$_JT)"
 
   PG_USER="$(get_kv POSTGRES_USER)";  PG_USER="${PG_USER:-motion}"
   PG_PASS="$(get_kv POSTGRES_PASSWORD)"

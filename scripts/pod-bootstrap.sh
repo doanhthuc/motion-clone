@@ -54,6 +54,9 @@ fi
 POD_VOLUME="$(env_get POD_VOLUME)"
 MTC_PREBUILT="$(env_get MTC_PREBUILT)"
 MODELS_MIN_GB="$(env_get MODELS_MIN_GB)"
+# ALD 05/08/2026 - Khoá JOB_TYPES hẹp hơn profile khai. Profile nói phần mềm chạy được gì;
+# biến này nói VOLUME NÀY có model cho gì. Bỏ trống = dùng nguyên JOB_TYPE của profile.
+JOB_TYPES_OVERRIDE="$(env_get JOB_TYPES_OVERRIDE)"
 
 # ── Hình dạng deploy: cài gì, và ai chạy job ─────────────────────────────────
 # Hai câu hỏi độc lập, hai biến. Cách suy ra nằm ở scripts/lib-deploy-shape.sh vì
@@ -158,6 +161,7 @@ GMAIL_APP_PASSWORD='$GMAIL_APP_PASSWORD' CF_API_TOKEN='$CF_API_TOKEN' \
 CF_TUNNEL_TOKEN='$CF_TUNNEL_TOKEN' CORS_ORIGINS='$CORS_ORIGINS' HF_TOKEN='' \
 ${FE_DOMAIN:+CF_FE_DOMAIN='$FE_DOMAIN' CF_FE_PORT='$FE_PORT' FRONTEND_URL='https://$FE_DOMAIN'} \
 MTC_PREBUILT='${MTC_PREBUILT:-0}' \
+${JOB_TYPES_OVERRIDE:+JOB_TYPES_OVERRIDE='$JOB_TYPES_OVERRIDE'} \
 ./$SETUP_SCRIPT" < /dev/null | tee "$LOG"
 STATUS=${PIPESTATUS[0]}
 [ "$STATUS" -eq 0 ] || die "$SETUP_SCRIPT exited $STATUS — full log: $LOG"
