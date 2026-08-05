@@ -27,16 +27,16 @@ RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
 RUN git clone --filter=blob:none https://github.com/comfyanonymous/ComfyUI.git /opt/mtc-prebuilt/ComfyUI \
  && git -C /opt/mtc-prebuilt/ComfyUI checkout 322122449c9d2ba8b8df1bb517364527dd0615f1
 
-# venv RIÊNG, không dùng python hệ thống: setup/lib-feature.sh:544 `die` nếu thiếu
-# $COMFY_DIR/venv/bin/python, và venv tránh luôn PEP 668 của Ubuntu 24.04.
+# venv RIÊNG, không dùng python hệ thống: phase_prebuilt_deps() trong setup/lib-feature.sh
+# `die` nếu thiếu $COMFY_DIR/venv/bin/python, và venv tránh luôn PEP 668 của Ubuntu 24.04.
 # --system-site-packages: KHÔNG dùng. Base có torch 2.8/cu128, kế thừa nó vào venv thì
 # pip có thể coi torch là "đã có" và bỏ qua bản cu130 ta cần.
 RUN python3 -m venv /opt/mtc-prebuilt/ComfyUI/venv \
  && /opt/mtc-prebuilt/ComfyUI/venv/bin/pip install --no-cache-dir -U pip wheel
 
-# torch TRONG IMAGE là torch cuối cùng chạy trên pod: nhánh MTC_PREBUILT=1 (lib-feature.sh:840)
-# bỏ qua phase_comfyui (lib-feature.sh:574) — nơi duy nhất gọi motion_install_best_pytorch
-# (định nghĩa ở setup/lib-gpu.sh:6; gọi tại lib-feature.sh:627 và :651) — nên không có bước nào
+# torch TRONG IMAGE là torch cuối cùng chạy trên pod: nhánh MTC_PREBUILT=1 trong feature_main()
+# (setup/lib-feature.sh) bỏ qua phase_comfyui() — nơi duy nhất gọi motion_install_best_pytorch()
+# (định nghĩa ở setup/lib-gpu.sh, gọi từ hai nhánh trong phase_comfyui()) — nên không có bước nào
 # cài lại torch cho khớp driver ở runtime. Base ship 2.8.0+cu128; ta cài đè 2.12.1+cu130 cho khớp
 # chuỗi đã chứng minh của Dockerfile.selfhosted và MIN_CUDA_VERSION=13.0.
 RUN /opt/mtc-prebuilt/ComfyUI/venv/bin/pip install --no-cache-dir \
@@ -88,7 +88,8 @@ RUN set -eux; \
     done
 
 # Danh sách runtime tường minh của FlashVSR (bỏ qua requirements.txt hỏng của chính nó ở trên).
-# KHÔNG cần flash-attn/triton — node fallback được, xem setup/lib-feature.sh:635-647.
+# KHÔNG cần flash-attn/triton — node fallback được, xem khối cài dependency runtime tường minh
+# cho ComfyUI-FlashVSR_Stable trong phase_comfyui() (setup/lib-feature.sh).
 RUN /opt/mtc-prebuilt/ComfyUI/venv/bin/pip install --no-cache-dir \
       einops safetensors tqdm pillow huggingface_hub psutil "opencv-python>=4.8.1.78" pyyaml
 
@@ -140,14 +141,15 @@ RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends zstd \
 # CHẶN Ở BUILD: layer npm hỏng/cache dở từng cho ra api-node_modules thiếu dependency bắc cầu
 # (pg có, pg-types không). Runtime chỉ lộ ra bằng "Cannot find module" lúc worker crash-loop —
 # rất tốn công truy. Nạp thử vài package chính, thiếu là fail build luôn.
-# (setup/lib-feature.sh:518-533 cũng tự kiểm và cài lại ở runtime; đây là lớp chặn sớm hơn.)
+# (phase_prebuilt_deps() trong setup/lib-feature.sh cũng tự kiểm api-node_modules và cài lại ở
+# runtime; đây là lớp chặn sớm hơn.)
 WORKDIR /opt/mtc-build/api
 COPY api/package.json ./package.json
 RUN npm install --omit=dev --no-audit --no-fund \
     && node -e "require('pg');require('pg-types');require('express')" \
     && mv node_modules /opt/mtc-prebuilt/api-node_modules
 
-# venv worker — setup/lib-feature.sh:536 symlink worker/venv sang đây.
+# venv worker — phase_prebuilt_deps() trong setup/lib-feature.sh symlink worker/venv sang đây.
 WORKDIR /opt/mtc-build/worker
 COPY worker/requirements.txt ./requirements.txt
 # CHẶN Ở BUILD: cùng lý do với api-node_modules ở trên — layer pip hỏng thiếu dependency bắc cầu
@@ -160,7 +162,7 @@ RUN python3 -m venv /opt/mtc-prebuilt/worker-venv \
     && /opt/mtc-prebuilt/worker-venv/bin/python -c "import requests, websocket, PIL, faster_whisper"
 
 # venv bg-remover — MỚI so với bản Dockerfile cũ. setup/setup-full.sh:57 đặt NEED_BG_REMOVER=1,
-# và ensure_bg_remover (lib-feature.sh:470-489, gọi từ phase_prebuilt_deps:540) dựng venv này ở
+# và ensure_bg_remover() (setup/lib-feature.sh, gọi từ phase_prebuilt_deps()) dựng venv này ở
 # RUNTIME mỗi lần boot — comment của nó tự thú "chậm hơn fast-boot vài phút". Với profile
 # motion-transfer thì NEED_BG_REMOVER=0 nên không ai để ý; với full nó ăn đúng vào cái fast-boot
 # đang mua. Bake vào đây thì mất hẳn.
@@ -197,6 +199,6 @@ RUN set -eux; \
     done; \
     ls -1 /opt/mtc-prebuilt/ComfyUI/custom_nodes
 
-# Marker cuối cùng: setup/lib-feature.sh:516 `die` nếu thiếu file này. Đặt ở cuối image để một
+# Marker cuối cùng: phase_prebuilt_deps() trong setup/lib-feature.sh `die` nếu thiếu file này. Đặt ở cuối image để một
 # build hỏng giữa chừng KHÔNG bao giờ cho ra image có marker nhưng thiếu ruột.
 RUN mkdir -p /opt/mtc-prebuilt && touch /opt/mtc-prebuilt/.ready

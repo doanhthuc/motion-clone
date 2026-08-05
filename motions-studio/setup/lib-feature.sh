@@ -272,7 +272,7 @@ phase_bootstrap() {
   fi
   USER_NAME="$(id -un)"; HOME_DIR="$HOME"
   ok "User=$USER_NAME · Home=$HOME_DIR · $(lsb_release -ds 2>/dev/null || echo Linux)"
-  ok "KHOÁ: JOB_TYPES=$JOB_TYPE · catalog=$(basename "$CATALOG_FILE") · KHÔNG tải model lúc cài"
+  ok "profile khai JOB_TYPES=$JOB_TYPE (có thể bị thu hẹp bằng JOB_TYPES_OVERRIDE ở phase_dotenv) · catalog=$(basename "$CATALOG_FILE") · KHÔNG tải model lúc cài"
 }
 
 phase_prompt() {
@@ -407,7 +407,9 @@ phase_dotenv() {
       die "JOB_TYPES_OVERRIDE có type ngoài profile $FEATURE:$_bad — profile khai: $JOB_TYPE"
     fi
     _JT="$JOB_TYPES_OVERRIDE"
-    warn "JOB_TYPES bị thu hẹp bằng JOB_TYPES_OVERRIDE: $_JT (profile khai $(echo "$JOB_TYPE" | tr ',' '\n' | wc -l | tr -d ' ') type)"
+    # Chỉ báo "bị thu hẹp" khi thật sự khác — trùng y hệt profile (vd. người vận hành điền
+    # nguyên JOB_TYPE vào JOB_TYPES_OVERRIDE cho rõ ràng) thì đây không phải một cú cắt, im lặng.
+    [ "$_JT" = "$JOB_TYPE" ] || warn "JOB_TYPES bị thu hẹp bằng JOB_TYPES_OVERRIDE: $_JT (profile khai $(echo "$JOB_TYPE" | tr ',' '\n' | wc -l | tr -d ' ') type)"
   fi
   set_kv JOB_TYPES "$_JT"
   if [ "${NEED_OLLAMA:-0}" = "1" ]; then set_kv OLLAMA_URL "http://127.0.0.1:11434"; else set_kv OLLAMA_URL ""; fi
@@ -821,7 +823,7 @@ phase_done() {
   printf '\033[1;32m════════ Motion Backend (%s) đã chạy (PM2) ════════\033[0m\n' "$FEATURE"
   echo "  Health   : curl $BE_URL/health   (local: http://127.0.0.1:8080/health)"
   echo "  Admin    : $SUPER_ADMIN  → FE bấm gửi OTP để đăng nhập"
-  echo "  Khoá     : JOB_TYPES=$JOB_TYPE · catalog=$(basename "$CATALOG_FILE") · KHÔNG có ComfyUI-Manager"
+  echo "  Khoá     : JOB_TYPES=$_JT · catalog=$(basename "$CATALOG_FILE") · KHÔNG có ComfyUI-Manager"
   echo "  PM2      : pm2 ls   ·   pm2 logs api   ·   pm2 restart ecosystem.config.cjs --only $PM2_APPS"
   [ "${GPU_OK:-0}" = "1" ] && echo "  ComfyUI  : pm2 logs comfyui   (native ở ${COMFY_DIR:-?})" || echo "  ComfyUI  : KHÔNG cài local — set COMFY_URL trỏ box GPU rồi 'pm2 restart worker'"
   echo
