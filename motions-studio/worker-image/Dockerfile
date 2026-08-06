@@ -224,7 +224,20 @@ WORKDIR /root
 # Node kiểm theo TÊN, không đếm số: ComfyUI ship sẵn vài file trong custom_nodes/ nên `ls | wc -l`
 # ra 11 chứ không phải 9. Và đếm số vẫn im lặng cho qua khi thiếu một node mà thừa một thư mục
 # lạ — đúng loại lỗi cổng chặn này tồn tại để bắt.
+#
+# ALD 06/08/2026 - ENV MTC_PREBUILT_DIR (đầu file) và ~40 chỗ /opt/mtc-prebuilt gõ cứng trong file
+# này PHẢI luôn khớp: runtime (phase_prebuilt_deps() trong setup/lib-feature.sh, và
+# setup/pod-volume.sh) đọc biến với fallback ${MTC_PREBUILT_DIR:-/opt/mtc-prebuilt}, lệch một chút
+# là image bake vào một đường còn runtime tìm ở đường khác.
+# KHÔNG thay 40 chỗ gõ cứng bằng $MTC_PREBUILT_DIR — đó là bản sửa "đúng" đầu tiên ai cũng nghĩ tới
+# nhưng là bước lùi: SHELL của file là `bash -o pipefail -c` (khai ở trên), KHÔNG có `-u`, nên một
+# biến gõ nhầm/rỗng nở thành chuỗi rỗng và `mkdir -p /ComfyUI`, `touch /.ready` sẽ ghi vào GỐC hệ
+# thống — còn cổng chặn hợp đồng ngay dưới đây, nếu cũng đổi sang dùng $MTC_PREBUILT_DIR, sẽ kiểm
+# đúng những đường sai đó rồi PASS: một lỗ thành-công-giả MỚI, tệ hơn cái đang sửa. Nên giữ đường
+# gõ cứng, chỉ assert ENV phải khớp với nó — lệch thì build ĐỎ ngay, không lặng lẽ trỏ hai nơi.
 RUN set -eux; \
+    [ "$MTC_PREBUILT_DIR" = "/opt/mtc-prebuilt" ] \
+      || { echo "LỖI: ENV MTC_PREBUILT_DIR=\"$MTC_PREBUILT_DIR\" lệch với đường /opt/mtc-prebuilt gõ cứng trong Dockerfile — sửa ENV ở đầu file hoặc sửa lại đường gõ cứng cho khớp." >&2; exit 1; }; \
     test -f /opt/mtc-prebuilt/ComfyUI/main.py; \
     test -x /opt/mtc-prebuilt/ComfyUI/venv/bin/python; \
     test -d /opt/mtc-prebuilt/api-node_modules; \

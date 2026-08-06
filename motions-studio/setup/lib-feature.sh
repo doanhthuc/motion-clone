@@ -542,7 +542,7 @@ phase_prebuilt_deps() {
   if [ -d "$prebuilt/api-node_modules" ]; then
     rm -rf "$ROOT/api/node_modules"
     ln -s "$prebuilt/api-node_modules" "$ROOT/api/node_modules"
-    if ! (cd "$ROOT/api" && node -e "require('pg');require('express')" >/dev/null 2>&1); then
+    if ! (cd "$ROOT/api" && node -e "require('pg');require('pg-types');require('express')" >/dev/null 2>&1); then
       warn "node_modules dựng sẵn thiếu dependency → cài lại tại chỗ (chậm hơn vài phút nhưng chắc)."
       rm -f "$ROOT/api/node_modules"
       (cd "$ROOT/api" && npm install --omit=dev --no-audit --no-fund >/dev/null 2>&1) \
