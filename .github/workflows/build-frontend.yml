@@ -33,9 +33,11 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      # v7 = runtime node24 của CHÍNH action (hết warning "Node 20 is being deprecated").
+      # KHÔNG liên quan tới node-version bên dưới — cái đó vẫn là node dựng Nuxt, giữ nguyên 22.
+      - uses: actions/setup-node@v7
         with:
           # Khớp node của máy dev (v22.14 đo 04/08/2026). Nitro nhúng binary theo ABI của node
           # build, nên lệch major giữa CI và pod là rủi ro thật.
@@ -90,7 +92,9 @@ jobs:
           fi
           echo "✓ sharp linux-x64 có trong .output"
 
-      - uses: actions/upload-artifact@v4
+      # Giữ mặc định archive (v7 có `archive: false` upload file trần, ĐỪNG bật): tắt archive thì
+      # tên artifact lấy theo tên file, còn pod-fe.sh:185 gọi `gh run download -n motions-output`.
+      - uses: actions/upload-artifact@v7
         with:
           name: motions-output
           path: motions/motions-output.tar.gz
