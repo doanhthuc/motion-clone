@@ -571,7 +571,8 @@ phase_prebuilt_deps() {
   # Bỏ qua im lặng nếu không có thư mục seed (image cũ, hoặc đường không-prebuilt).
   local _seed="$prebuilt/comfy-models-seed"
   if [ -d "$_seed" ]; then
-    cp -rn "$_seed/." "$COMFY_DIR/models/" 2>/dev/null || true
+    cp -rn "$_seed/." "$COMFY_DIR/models/" \
+      || warn "gieo seed models từ $_seed sang $COMFY_DIR/models lỗi (hết chỗ trên volume? quyền ghi?) — model người dùng không mất, nhưng thiếu placeholder/configs của ComfyUI."
   fi
 
   set_kv COMFY_LOCAL "1"

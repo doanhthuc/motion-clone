@@ -31,8 +31,9 @@ CORS_ORIGINS="$(env_get CORS_ORIGINS)"
 
 # ── Frontend on the pod (optional) ────────────────────────────────────────────
 # FE_DOMAIN set → setup-pm2.sh adds a SECOND public hostname to the same Cloudflare Tunnel
-# (CF_FE_DOMAIN → localhost:FE_PORT, plus its DNS record), and scripts/pod-fe.sh deploys the
-# Nuxt app behind it at the end. End-users then open one HTTPS link and your laptop can be off.
+# (CF_FE_DOMAIN → localhost:FE_PORT, plus its DNS record) here in this script. Deploying the Nuxt
+# app behind it is a SEPARATE step, not done by this script: run `make gpu-fe` once the ingress
+# exists. End-users then open one HTTPS link and your laptop can be off.
 # Leave it empty to keep the old shape: backend on the pod, frontend local via `make dev`.
 FE_DOMAIN="$(env_get FE_DOMAIN)"
 FE_PORT="$(env_get FE_PORT)"; FE_PORT="${FE_PORT:-2030}"
