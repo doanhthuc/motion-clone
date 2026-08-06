@@ -119,7 +119,7 @@ gpu-volume-check: ## Prove the volume is really in use (catches "green but re-do
 		"cd ~/motion-backend && POD_VOLUME=$(call env,POD_VOLUME) \
 		 MODELS_MIN_GB=$(call env,MODELS_MIN_GB) ./setup/pod-volume.sh --check"
 
-gpu-smoke: ## Prove the pod really works end-to-end (SMOKE_REF=img SMOKE_DRIVER=vid for a real job)
+gpu-smoke: ## Prove the pod really works end-to-end (SMOKE_REF=img SMOKE_DRIVER=vid for a motion job, +SMOKE_PRODUCT=img for tryon, SMOKE_PROMPT="..." for create-image)
 	@bash scripts/pod-smoke.sh
 
 gpu-status: ## Is the pod up, and is the backend answering?
