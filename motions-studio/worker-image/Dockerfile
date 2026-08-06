@@ -236,7 +236,7 @@ RUN set -eux; \
       || { echo "LỖI: node không phải v20.x: $(node --version). curl|bash của nodesource có thể đã 404 âm thầm và apt-get install nodejs rơi về Node 18 của Ubuntu — xem SHELL pipefail ở layer cài Postgres/MinIO/Node." >&2; exit 1; }; \
     minio --version | grep -qF "${MINIO_VERSION}" \
       || { echo "LỖI: minio không đúng bản ghim ${MINIO_VERSION}: $(minio --version)" >&2; exit 1; }; \
-    pm2 --version | grep -qF "${PM2_VERSION}" \
+    pm2 --version | grep -qx "${PM2_VERSION}" \
       || { echo "LỖI: pm2 không đúng bản ghim ${PM2_VERSION}: $(pm2 --version)" >&2; exit 1; }; \
     if [ -e /opt/mtc-prebuilt/ComfyUI/models ]; then \
       echo "LỖI: /opt/mtc-prebuilt/ComfyUI/models vẫn còn trong image — sẽ chặn setup/pod-volume.sh" >&2; \
