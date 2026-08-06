@@ -100,11 +100,14 @@ Bước 5 làm, theo đúng thứ tự này (thứ tự có lý do — xem `scri
    custom nodes, Cloudflare Tunnel với **2 hostname** (`DOMAIN`→:8080, `FE_DOMAIN`→:2030)
 4. ghi `motions/.env` **local** trỏ vào backend mới
 
-`make gpu-bootstrap` **không** deploy frontend nữa (từng làm, đã bỏ): `build-frontend.yml` chỉ
-trigger theo path `motions/`, nên một commit chỉ chạm backend/infra không có artifact cho SHA đó
-→ bước FE luôn đỏ dù backend hoàn toàn ổn, và một lệnh luôn kết thúc bằng lỗi thì che mất lỗi thật.
-Muốn frontend chạy trên pod thì chạy riêng bước 6: `make gpu-fe`
-([chi tiết](#frontend-on-the-pod)).
+`make gpu-bootstrap` **không** deploy frontend nữa (từng làm, đã bỏ) — nó là bước riêng, bước 6:
+`make gpu-fe` ([chi tiết](#frontend-on-the-pod)). Không phải vì bước FE luôn thất bại: `pod-fe.sh`
+so **cây** `motions/` (`git diff --quiet <headSha-của-run> HEAD -- motions/`), không so đúng SHA,
+nên một commit chỉ chạm backend/infra vẫn dùng được artifact CI của lần build FE gần nhất — miễn
+`motions/` chưa đổi từ đó — và script in rõ commit nào khi artifact không phải build từ HEAD. Tách
+riêng vì hai lý do khác: `gpu-bootstrap` chạy lại (idempotent) mỗi lần sửa backend, không cần build
+lại FE mỗi lần; và khi `motions/` THẬT SỰ đổi mà chưa có CI xanh, `gh` chưa login, hay artifact đã
+hết hạn (giữ 90 ngày) — lỗi FE đó không nên chặn luôn backend đã ổn trong cùng một lệnh.
 
 **8 · Tải model** — không tự động, cố ý ([lý do](#no-auto-models)). Chỉ cần làm
 **một lần cho mỗi volume**, pod sau không phải tải lại:

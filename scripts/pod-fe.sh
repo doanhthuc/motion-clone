@@ -80,15 +80,30 @@ if [ "$FE_BUILD" = ci ]; then
   log "tìm artifact FE cho commit ${SHA:0:8}…"
   RUNS_JSON="$(gh run list --workflow build-frontend.yml --limit 40 \
                  --json databaseId,headSha,conclusion,status 2>&1)"
-  # Phân biệt "workflow chưa tồn tại trên default branch" với "có workflow nhưng chưa run nào xong".
-  # Lần dùng đầu tiên LUÔN rơi vào ca thứ nhất, và nếu gộp hai ca thì message chỉ đường sai.
-  case "$RUNS_JSON" in
-    *"not found on the default branch"*|*"HTTP 404"*)
-      die "GitHub chưa biết workflow build-frontend.yml — nó phải nằm trên DEFAULT BRANCH mới chạy được.
+  RUNS_RC=$?
+  # RUNS_RC != 0 nghĩa là KHÔNG GỌI ĐƯỢC GitHub — khác hẳn "gọi được nhưng chưa có run nào xong".
+  # Hai nguyên nhân đó cần hai thông báo khác nhau: gộp chung thì die ở dưới (chưa có run THÀNH
+  # CÔNG cho commit này) sẽ chỉ sai đường — token hết hạn / mất mạng / rate-limit không sửa được
+  # bằng "push rồi chờ CI" hay "gh workflow run", vì chính lệnh gọi gh cũng sẽ thất bại như vậy.
+  if [ "$RUNS_RC" -ne 0 ]; then
+    # Trong lỗi gọi-gh, còn một trường hợp riêng biệt: workflow chưa từng chạy trên default branch
+    # (luôn gặp ở lần dùng đầu tiên) — đường sửa của nó (push lên rồi chờ CI) khác đường sửa của
+    # "không gọi được GitHub" (kiểm auth/mạng), nên vẫn tách case này ra trước.
+    case "$RUNS_JSON" in
+      *"not found on the default branch"*|*"HTTP 404"*)
+        die "GitHub chưa biết workflow build-frontend.yml — nó phải nằm trên DEFAULT BRANCH mới chạy được.
   Push nó lên:  git push
   Rồi chờ CI:   gh run watch
   Hoặc build trên pod ngay bây giờ:  FE_BUILD=pod bash scripts/pod-fe.sh" ;;
-  esac
+    esac
+    die "gọi \`gh run list\` thất bại (exit $RUNS_RC) — đây là KHÔNG GỌI ĐƯỢC GitHub, không phải
+  \"chưa có run cho commit này\". Token hết hạn, mất mạng, hoặc rate-limit đều rơi vào đây, và push
+  rồi chờ CI sẽ không sửa được gì vì bản thân lệnh gh cũng sẽ lại thất bại như vậy.
+  Kiểm tra:  gh auth status
+  Hoặc build trên pod ngay bây giờ (không cần gh):  FE_BUILD=pod bash scripts/pod-fe.sh
+  Lỗi gh thật:
+$RUNS_JSON"
+  fi
   # So CÂY motions/, không so đúng SHA: build-frontend.yml chỉ trigger theo
   # paths: [motions/**, .github/workflows/build-frontend.yml], nên một commit chỉ chạm
   # backend/infra không hề có run riêng cho headSha của nó — dù motions/ chưa đổi một byte từ lần
