@@ -11,3 +11,9 @@ __pycache__/
 # — liệt kê ở đây để nếu ai đó copy vào trong thì cũng không lọt vào git.
 motions-studio-upstream/
 motions-upstream/
+
+# Ảnh/video cho gpu-smoke lớp 6. KHÔNG commit: repo này public và đây là media cá nhân.
+.smoke/
+
+# macOS junk
+.DS_Store

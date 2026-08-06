@@ -687,7 +687,11 @@ POD_VOLUME=/workspace VOLUME_GB=100 ./setup/preload-models.sh --list
 POD_VOLUME=/workspace VOLUME_GB=100 ./setup/preload-models.sh --id ollama-qwen25vl-7b --dry-run
 ```
 
-Mong đợi từ `--list`: `qwen2.5:7b-instruct` báo đã cài, `qwen2.5vl:7b` báo chưa. `--dry-run` in ra kế hoạch tải 5,6 GB và **không** báo hết chỗ (`VOLUME_GB=100` bật cổng chặn; thiếu biến này là tắt cổng).
+**`--list` KHÔNG báo trạng thái đã-cài** — nó chỉ in catalog theo nhóm. Đó là thiết kế, xem comment trong `preload-models.sh`: *"Liệt kê: không đụng volume, chạy được cả trên máy local"*. Dùng nó để đối chiếu id, không để biết đã có gì.
+
+Chỗ báo đã-cài thật là **`--dry-run`**: nó in `cần tải : N file, X GB` và `đã có : M file`, cộng dòng `volume : 100 GB quota · … đã dùng · … trống`. Mong đợi: `cần tải : 1 file, 5.6 GB`, và **không** báo hết chỗ. `VOLUME_GB=100` bật cổng chặn đó; thiếu biến này là tắt cổng.
+
+> **Đơn vị:** `preload-models.sh:167` dùng `du -sb` chia `1e9` → **GB thập phân**. `du -sh` ở shell in **GiB**. 76,6 GiB = 82,2 GB thập phân — cùng một số, đừng đọc thành hai. Chính script có comment cảnh báo đúng loại lỗi này.
 
 - [ ] **Step 4: Tải thật**
 
