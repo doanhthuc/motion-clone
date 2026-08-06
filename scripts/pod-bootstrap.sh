@@ -361,13 +361,15 @@ if [ -n "$DASHBOARD_STEP" ]; then
 fi
 
 # ── Frontend on the pod ───────────────────────────────────────────────────────
-# Last, deliberately: the tunnel ingress it depends on was just created above, and it reads the
-# backend's API_KEY off the pod's own .env, which only exists once setup has finished.
+# Deliberately NOT deployed here anymore. build-frontend.yml only triggers on changes under
+# motions/, so a commit that only touches backend/infra has no successful artifact for its SHA —
+# scripts/pod-fe.sh would then fail every single time, making gpu-bootstrap exit non-zero even
+# though the backend just finished installing cleanly. A command that always ends in red teaches
+# you to ignore the red, and the one time the backend is actually broken slips right through.
+# Deploy the frontend on its own with: make gpu-fe
 if [ -n "$FE_DOMAIN" ]; then
-  echo
-  log "deploying the frontend onto the pod (rsync + build + PM2)…"
-  bash scripts/pod-fe.sh || die "frontend deploy failed — the backend is up, re-run just the frontend with: make gpu-fe"
   APP_URL="https://$FE_DOMAIN"
+  echo "  backend is up. FE_DOMAIN is set — deploy the frontend with:   make gpu-fe"
 else
   APP_URL="http://localhost:2030"
   echo "  restart the FE dev server to pick it up:   make down && make dev"

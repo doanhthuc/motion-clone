@@ -24,8 +24,19 @@ RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
 # Ghim cả ComfyUI lõi, không chỉ custom node. Ghim 9 node mà thả lõi trôi theo master là ghim hụt:
 # node và lõi khớp nhau qua API nội bộ của ComfyUI, và lõi là bên đổi API.
 # `--depth 1` không checkout được commit cụ thể → clone --filter rồi checkout.
+#
+# `mv models comfy-models-seed` NGAY SAU clone, cùng layer: repo ComfyUI mang theo sẵn cây
+# models/ (mỗi thư mục con một placeholder put_*_here, cộng 11 file models/configs/*.yaml).
+# setup/pod-volume.sh (chạy TRÊN POD, trước setup) nối $COMFY_DIR/models sang Network Volume bằng
+# symlink, và TỪ CHỐI làm việc đó nếu models/ là thư mục THẬT đang có dữ liệu — cổng chặn đó đúng
+# (không tự xoá dữ liệu người dùng), nhưng ComfyUI ship sẵn cây này nên image PHẢI dọn đường trước.
+# Đường không-prebuilt không gặp lỗi này vì pod-volume.sh chạy TRƯỚC khi phase_comfyui() clone
+# ComfyUI; với MTC_PREBUILT=1 thì ComfyUI đã nằm sẵn trong image → hai bên đụng nhau.
+# Seed dời sang comfy-models-seed được setup/lib-feature.sh (phase_prebuilt_deps) chép ngược lại
+# vào volume bằng `cp -rn` (không ghi đè) SAU khi $COMFY_DIR/models đã là symlink.
 RUN git clone --filter=blob:none https://github.com/comfyanonymous/ComfyUI.git /opt/mtc-prebuilt/ComfyUI \
- && git -C /opt/mtc-prebuilt/ComfyUI checkout 322122449c9d2ba8b8df1bb517364527dd0615f1
+ && git -C /opt/mtc-prebuilt/ComfyUI checkout 322122449c9d2ba8b8df1bb517364527dd0615f1 \
+ && mv /opt/mtc-prebuilt/ComfyUI/models /opt/mtc-prebuilt/comfy-models-seed
 
 # venv RIÊNG, không dùng python hệ thống: phase_prebuilt_deps() trong setup/lib-feature.sh
 # `die` nếu thiếu $COMFY_DIR/venv/bin/python, và venv tránh luôn PEP 668 của Ubuntu 24.04.
@@ -172,7 +183,10 @@ RUN python3 -m venv /opt/mtc-prebuilt/bg-remover-venv \
     && /opt/mtc-prebuilt/bg-remover-venv/bin/pip install --no-cache-dir -U pip wheel \
     && /opt/mtc-prebuilt/bg-remover-venv/bin/pip install --no-cache-dir -r requirements.txt
 
-RUN mkdir -p /opt/mtc-prebuilt/ComfyUI/models/uploads && rm -rf /opt/mtc-build
+# KHÔNG mkdir models/uploads ở đây: models/ không còn tồn tại trong image (dời sang
+# comfy-models-seed ở trên) và phase_prebuilt_deps() trong setup/lib-feature.sh đã tự
+# `mkdir -p "$COMFY_DIR/models/uploads"/...` ở RUNTIME, sau khi volume đã nối — đúng chỗ.
+RUN rm -rf /opt/mtc-build
 WORKDIR /root
 
 # Cổng chặn hợp đồng: marker .ready dưới đây là lời hứa "image đủ ruột" mà lib-feature.sh tin
@@ -191,6 +205,14 @@ RUN set -eux; \
     test -x /opt/mtc-prebuilt/bg-remover-venv/bin/python; \
     test -x /usr/bin/ollama; \
     test -x /usr/local/bin/minio; \
+    if [ -e /opt/mtc-prebuilt/ComfyUI/models ]; then \
+      echo "LỖI: /opt/mtc-prebuilt/ComfyUI/models vẫn còn trong image — sẽ chặn setup/pod-volume.sh" >&2; \
+      echo "     nối \$COMFY_DIR/models sang Network Volume (nó từ chối xoá thư mục THẬT có dữ liệu)." >&2; \
+      echo "     Xem RUN mv .../models .../comfy-models-seed ngay sau lệnh git clone ComfyUI." >&2; \
+      exit 1; \
+    fi; \
+    test -d /opt/mtc-prebuilt/comfy-models-seed \
+      || { echo "LỖI: thiếu /opt/mtc-prebuilt/comfy-models-seed — RUN mv models sau git clone ComfyUI đã bị xoá/đổi tên." >&2; exit 1; }; \
     for d in ComfyUI-WanVideoWrapper ComfyUI-KJNodes ComfyUI-VideoHelperSuite \
              comfyui_controlnet_aux ComfyUI-Frame-Interpolation ComfyUI-FlashVSR_Stable \
              ComfyUI-GGUF ComfyUI-LTXVideo ComfyUI-SeedVR2_VideoUpscaler; do \

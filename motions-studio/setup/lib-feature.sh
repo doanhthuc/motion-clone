@@ -560,6 +560,20 @@ phase_prebuilt_deps() {
   [ -f "$COMFY_DIR/main.py" ] || die "Image dựng sẵn thiếu ComfyUI tại $COMFY_DIR"
   [ -x "$COMFY_DIR/venv/bin/python" ] || die "Image dựng sẵn thiếu Python venv của ComfyUI"
   mkdir -p "$ROOT/.data/minio" "$COMFY_DIR/models/uploads"/{loras,checkpoints,unet,vae,text_encoders,clip_vision}
+
+  # Seed models của chính ComfyUI (configs/*.yaml + placeholder) do image dời sang comfy-models-seed
+  # để pod-volume.sh nối được $COMFY_DIR/models sang volume. Chép phần CÒN THIẾU sang volume:
+  # `cp -rn` không bao giờ ghi đè, nên model người dùng đã tải an toàn tuyệt đối.
+  # Đặt SAU khi COMFY_DIR đã set và sau mkdir -p models/uploads ở trên, để chắc chắn $COMFY_DIR/models
+  # đã là symlink trỏ vào volume: scripts/pod-bootstrap.sh chạy setup/pod-volume.sh (nối volume)
+  # TRƯỚC khi gọi setup-full.sh → feature_main() → phase_prebuilt_deps() này. Nếu cp chạy trước khi
+  # có symlink, nó ghi vào container disk và mất sạch, im lặng, lúc gpu-destroy.
+  # Bỏ qua im lặng nếu không có thư mục seed (image cũ, hoặc đường không-prebuilt).
+  local _seed="$prebuilt/comfy-models-seed"
+  if [ -d "$_seed" ]; then
+    cp -rn "$_seed/." "$COMFY_DIR/models/" 2>/dev/null || true
+  fi
+
   set_kv COMFY_LOCAL "1"
   set_kv COMFY_DIR "$COMFY_DIR"
   set_kv COMFY_MODELS_DIR "$COMFY_DIR/models"

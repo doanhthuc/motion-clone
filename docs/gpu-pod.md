@@ -83,8 +83,9 @@ make gpu-preflight                          # 1. chặn mọi lỗi cấu hình 
 bash scripts/pod-provision.sh               # 2. dry-run — ĐỌC lệnh pod create nó in ra
 CONFIRM=yes bash scripts/pod-provision.sh   # 3. thuê thật; tự ghi GPU_INSTANCE_ID vào .env
 make gpu-wait                               # 4. chờ SSH; tự ghi GPU_SSH_HOST/PORT vào .env
-make gpu-bootstrap                          # 5. ~30 phút, xem bên dưới nó làm gì
-make gpu-volume-check                       # 6. chứng minh volume thật sự đang được dùng
+make gpu-bootstrap                          # 5. ~30 phút, CHỈ backend — xem bên dưới nó làm gì
+make gpu-fe                                 # 6. (tuỳ chọn) đưa frontend lên pod, nếu FE_DOMAIN đã đặt
+make gpu-volume-check                       # 7. chứng minh volume thật sự đang được dùng
 ```
 
 Bước 5 làm, theo đúng thứ tự này (thứ tự có lý do — xem `scripts/pod-bootstrap.sh`):
@@ -95,10 +96,14 @@ Bước 5 làm, theo đúng thứ tự này (thứ tự có lý do — xem `scri
 3. `setup-<SETUP_PROFILE>.sh`: Postgres, MinIO, ComfyUI, PyTorch khớp driver ([CUDA 13](#cuda-13)),
    custom nodes, Cloudflare Tunnel với **2 hostname** (`DOMAIN`→:8080, `FE_DOMAIN`→:2030)
 4. ghi `motions/.env` **local** trỏ vào backend mới
-5. rsync + `npm install` + `npm run build` + PM2 cho frontend **trên pod**
-   ([chi tiết](#frontend-on-the-pod))
 
-**7 · Tải model** — không tự động, cố ý ([lý do](#no-auto-models)). Chỉ cần làm
+`make gpu-bootstrap` **không** deploy frontend nữa (từng làm, đã bỏ): `build-frontend.yml` chỉ
+trigger theo path `motions/`, nên một commit chỉ chạm backend/infra không có artifact cho SHA đó
+→ bước FE luôn đỏ dù backend hoàn toàn ổn, và một lệnh luôn kết thúc bằng lỗi thì che mất lỗi thật.
+Muốn frontend chạy trên pod thì chạy riêng bước 6: `make gpu-fe`
+([chi tiết](#frontend-on-the-pod)).
+
+**8 · Tải model** — không tự động, cố ý ([lý do](#no-auto-models)). Chỉ cần làm
 **một lần cho mỗi volume**, pod sau không phải tải lại:
 
 `https://$FE_DOMAIN` → login bằng `SUPER_ADMIN` (bấm gửi OTP) → **Settings → Models AI** → nhóm
@@ -108,7 +113,7 @@ Bước 5 làm, theo đúng thứ tự này (thứ tự có lý do — xem `scri
 > "đã cài" sẵn. Làm ở đây nghĩa là pod GPU $1.014/giờ nằm chờ suốt lúc tải; ở 0.4 là $0.06/giờ.
 > Với `SETUP_PROFILE=full` thì catalog mở hết 245GB, càng không nên tải trên đồng hồ GPU.
 
-**8 · Kiểm chứng thật** — [`make gpu-smoke`](#smoke). Đừng tin
+**9 · Kiểm chứng thật** — [`make gpu-smoke`](#smoke). Đừng tin
 màu xanh, chạy một job thật.
 
 ---
@@ -168,7 +173,8 @@ Lần dựng pod tiếp theo: quay lại **giai đoạn 1**, bỏ qua bước 7 
 
 Mặc định FE chạy local, nghĩa là **tắt máy bạn là không ai vào được app**. Muốn đưa cho người
 dùng thật thì cho FE chạy luôn trên pod: điền `FE_DOMAIN` (và `FE_PORT`, mặc định 2030) vào
-`.env`, thêm `https://<FE_DOMAIN>` vào `CORS_ORIGINS`, rồi `make gpu-bootstrap`.
+`.env`, thêm `https://<FE_DOMAIN>` vào `CORS_ORIGINS`, chạy `make gpu-bootstrap` (dựng ingress FE
+trên tunnel), rồi `make gpu-fe` (build + deploy chính FE lên pod).
 
 ```
                     ┌─ Cloudflare Tunnel (1 tunnel, 2 hostname)
@@ -183,7 +189,7 @@ Cả hai vẫn chạy song song: pod phục vụ người dùng, `make dev` đ�
 
 | Lệnh | Làm gì | Mất bao lâu |
 |---|---|---|
-| `make gpu-bootstrap` | backend + tunnel 2 hostname + frontend | lần đầu ~30 phút |
+| `make gpu-bootstrap` | backend + tunnel 2 hostname (KHÔNG deploy FE) | lần đầu ~30 phút |
 | `make gpu-fe` | CHỈ frontend: rsync + build + PM2 restart | ~2 phút |
 
 Sửa code FE xong thì `make gpu-fe`, không cần bootstrap lại.

@@ -44,7 +44,7 @@ gpu-provision: ## Find + rent a GPU pod (dry-run; CONFIRM=yes to actually rent)
 gpu-wait: ## Wait for a freshly rented pod's SSH to come up (TIMEOUT=25 min); saves host/port to .env
 	@bash scripts/pod-wait.sh
 
-gpu-bootstrap: ## rsync motions-studio + run the SETUP_PROFILE setup script on the pod (idempotent; also deploys FE if FE_DOMAIN is set)
+gpu-bootstrap: ## rsync motions-studio + run the SETUP_PROFILE setup script on the pod (idempotent)
 	@bash scripts/pod-bootstrap.sh
 
 gpu-fe: ## Re-deploy ONLY the frontend to the pod (rsync + build + PM2 restart, ~2 min)
