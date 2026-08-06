@@ -181,6 +181,16 @@ fi
 run_and_check_job() {
   local out_path="$1" min_bytes="$2" proves="$3"
   shift 3
+  # SMOKE_TIMEOUT_MIN<=0 is a nonsensical config (DEADLINE is already in the past before the
+  # first poll) — block it here, before POSTing the job, rather than let it burn a real job slot
+  # and surface as a confusing instant "timeout" below. This check lives per-layer (not once at
+  # the top of the script) because TIMEOUT_MIN only matters to layers 6-8, which share this
+  # function; layers 1-5 don't touch it and shouldn't be blocked by a var they never read.
+  if [ "$TIMEOUT_MIN" -le 0 ] 2>/dev/null; then
+    bad "SMOKE_TIMEOUT_MIN=$TIMEOUT_MIN is meaningless — the deadline would already be in the past
+       before the first poll. Set a positive number of minutes (default is 20)."
+    return
+  fi
   JOB="$(curl -s --max-time 120 -X POST "https://$DOMAIN/jobs" -H "x-api-key: $KEY" "$@")"
   JOB_ID="$(printf '%s' "$JOB" | python3 -c 'import json,sys; print((json.load(sys.stdin) or {}).get("id",""))' 2>/dev/null)"
   if [ -z "$JOB_ID" ]; then
@@ -190,6 +200,12 @@ run_and_check_job() {
   ok "job $JOB_ID queued — polling up to ${TIMEOUT_MIN}m"
   DEADLINE=$(( $(date +%s) + TIMEOUT_MIN * 60 ))
   LAST=""
+  # ST is only assigned inside the while loop below. With the TIMEOUT_MIN<=0 guard above this
+  # can no longer happen via that path, but ST is initialized here anyway as defense in depth —
+  # any other way the loop body never runs (clock skew, a future refactor) must not hit
+  # `set -u`'s "unbound variable" on the "$ST" reference in the bad() call after the loop.
+  # A truthful placeholder, not "": "(still )" reads as a truncated, broken message.
+  ST="(never polled)"
   while [ "$(date +%s)" -lt "$DEADLINE" ]; do
     sleep 10
     R="$(curl -s --max-time 20 -H "x-api-key: $KEY" "https://$DOMAIN/jobs/$JOB_ID")"

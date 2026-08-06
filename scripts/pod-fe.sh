@@ -132,11 +132,26 @@ for r in runs:
       # Commit của run có thể chưa fetch về máy dev — git diff trên ref không tồn tại lỗi mù mờ,
       # nên bỏ qua ứng viên đó thay vì die nhầm nguyên nhân.
       git cat-file -e "${CAND_SHA}^{commit}" 2>/dev/null || continue
-      if git diff --quiet "$CAND_SHA" HEAD -- motions/; then
+      # git diff --quiet trả 0 = giống hệt, 1 = khác nội dung, >1 = lỗi git thật (thiếu object do
+      # partial/shallow clone, repo hỏng…). Ba trường hợp cần ba xử lý khác nhau — gộp "khác 0"
+      # thành một nhánh (như `if git diff --quiet ...; then` làm) khiến lỗi git thật lặng lẽ rơi
+      # vào "ứng viên không khớp, thử tiếp", rồi cuối cùng die sai nguyên nhân ("không có run nào
+      # THÀNH CÔNG") trong khi vấn đề thật nằm ở repo local. Cùng lỗi đã sửa cho `gh run list` ở
+      # RUNS_RC phía trên, chỉ khác chỗ — nên bắt $? ngay dòng sau, không có lệnh nào chen giữa.
+      git diff --quiet "$CAND_SHA" HEAD -- motions/
+      DIFF_RC=$?
+      if [ "$DIFF_RC" -eq 0 ]; then
         RUN_ID="$CAND_ID"
         RUN_SHA="$CAND_SHA"
         break
+      elif [ "$DIFF_RC" -gt 1 ]; then
+        die "git diff --quiet lỗi (exit $DIFF_RC) khi so cây motions/ giữa ${CAND_SHA:0:8} và HEAD —
+  đây là LỖI GIT khi so cây, không phải \"ứng viên này không khớp\". Nguyên nhân thường gặp: thiếu
+  object do partial/shallow clone, hoặc repo local hỏng.
+  Thử:  git fetch --unshallow
+  Hoặc kiểm repo:  git fsck"
       fi
+      # DIFF_RC == 1: khác nội dung thật, im lặng thử ứng viên kế — trường hợp bình thường.
     done <<<"$CANDIDATES"
   fi
 

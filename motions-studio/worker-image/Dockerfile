@@ -137,12 +137,24 @@ RUN mkdir -p /opt/mtc-prebuilt/ComfyUI/custom_nodes/comfyui_controlnet_aux/ckpts
 # một layer, và tự bảo vệ mọi `| bash`/`| sh` thêm sau này. Lớp kiểm hợp đồng ở cuối file assert
 # `node --version` là lớp chặn thứ hai, độc lập với SHELL — phòng khi ai đó đổi SHELL sau này.
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+# GHIM MINIO VÀ PM2 LÀ BẮT BUỘC, cùng lý do với OLLAMA_VERSION dưới đây: tải qua URL "latest"/
+# không ghim version nghĩa là hai lần build cách nhau một tuần từ CÙNG Dockerfile ra hai image
+# khác nhau, và khi một cái hỏng thì không có gì để so. Ghim đúng bản đang chạy trong image đã
+# verify trên pod thật (RELEASE.2025-09-07T16-13-09Z / pm2 7.0.3), không phải "bản mới nhất" tình
+# cờ tại thời điểm build.
+# MINIO_SHA256 chống tải hỏng và chống nội dung bị đổi dưới cùng một tên — ghim URL chỉ chống
+# trôi phiên bản, không chống hai lỗi đó.
+ARG MINIO_VERSION=RELEASE.2025-09-07T16-13-09Z
+ARG MINIO_SHA256=7c5bd8512c6e966455b1d198209358b2d191c77a83ab377c4073281065fb855f
+ARG PM2_VERSION=7.0.3
 RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
       gnupg postgresql postgresql-contrib \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null \
     && apt-get install -y -qq --no-install-recommends nodejs \
-    && npm install -g pm2 \
-    && curl -fsSL -o /usr/local/bin/minio https://dl.min.io/server/minio/release/linux-amd64/minio \
+    && npm install -g pm2@${PM2_VERSION} \
+    && curl -fsSL -o /usr/local/bin/minio \
+         "https://dl.min.io/server/minio/release/linux-amd64/archive/minio.${MINIO_VERSION}" \
+    && echo "${MINIO_SHA256}  /usr/local/bin/minio" | sha256sum -c - \
     && chmod +x /usr/local/bin/minio \
     && rm -rf /var/lib/apt/lists/* /root/.cache
 
@@ -222,6 +234,10 @@ RUN set -eux; \
     test -x /usr/local/bin/minio; \
     node --version | grep -q '^v20\.' \
       || { echo "LỖI: node không phải v20.x: $(node --version). curl|bash của nodesource có thể đã 404 âm thầm và apt-get install nodejs rơi về Node 18 của Ubuntu — xem SHELL pipefail ở layer cài Postgres/MinIO/Node." >&2; exit 1; }; \
+    minio --version | grep -qF "${MINIO_VERSION}" \
+      || { echo "LỖI: minio không đúng bản ghim ${MINIO_VERSION}: $(minio --version)" >&2; exit 1; }; \
+    pm2 --version | grep -qF "${PM2_VERSION}" \
+      || { echo "LỖI: pm2 không đúng bản ghim ${PM2_VERSION}: $(pm2 --version)" >&2; exit 1; }; \
     if [ -e /opt/mtc-prebuilt/ComfyUI/models ]; then \
       echo "LỖI: /opt/mtc-prebuilt/ComfyUI/models vẫn còn trong image — sẽ chặn setup/pod-volume.sh" >&2; \
       echo "     nối \$COMFY_DIR/models sang Network Volume (nó từ chối xoá thư mục THẬT có dữ liệu)." >&2; \
