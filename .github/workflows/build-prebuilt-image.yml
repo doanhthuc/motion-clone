@@ -6,7 +6,7 @@ name: Build prebuilt pod image
 on:
   workflow_dispatch:
   push:
-    branches: [main, mtc-prebuilt-runpod]
+    branches: [main]
     paths:
       # Image bake dependency của api, worker và bg-remover — ba file requirements đó đổi là
       # image lệch code. Theo dõi cả ba, không chỉ Dockerfile.
