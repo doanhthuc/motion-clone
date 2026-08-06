@@ -6,11 +6,7 @@ name: Build prebuilt pod image
 on:
   workflow_dispatch:
   push:
-    # mtc-prebuilt-runpod: nhánh phát triển của spec này. `gh` trên máy dev đăng nhập bằng tài
-    # khoản chỉ có quyền READ nên KHÔNG chạy `gh workflow run` được; đẩy nhánh là cách kích hoạt
-    # build. XOÁ dòng nhánh này ở Task 7 trước khi merge — để lại thì mọi push nhánh đều đốt
-    # ~40 phút CI.
-    branches: [main, mtc-prebuilt-runpod]
+    branches: [main]
     paths:
       # Image bake dependency của api, worker và bg-remover — ba file requirements đó đổi là
       # image lệch code. Theo dõi cả ba, không chỉ Dockerfile.

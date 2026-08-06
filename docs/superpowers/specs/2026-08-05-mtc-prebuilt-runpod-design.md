@@ -1,7 +1,13 @@
 # MTC_PREBUILT trên RunPod — Design
 
-**Ngày:** 05/08/2026 · **Trạng thái:** thiết kế, **chưa dựng**. Image `worker-image/Dockerfile`
-chưa từng được build thành công lần nào — xem [§Vì sao GHCR luôn trống](#ghcr-trong).
+**Ngày:** 05/08/2026, cập nhật 06/08/2026 · **Trạng thái:** đã dựng, đã verify trên pod GPU RunPod
+thật. Sáu bước ở mục §Kiểm chứng — rẻ trước, đắt sau (phía dưới trong file này) đều đạt: (1) CI
+xanh, image `sha-f17ef55` nén 16,20 GB / 60 layer; (2) pod CPU đã tải `qwen2.5vl:7b`, pod đã xoá;
+(3) pull + `make gpu-bootstrap` đo được 176 + 108 = **284 giây ≈ 4,7 phút**, rc=0 — thay baseline
+20-35 phút; (4) `torch.cuda.get_device_capability()` ra `(12, 0)` trên RTX 5090; (5) `make gpu-smoke`
+8/8 lớp pass; (6) một job `tryon` (1378 KB png) và một job `create-image` (1785 KB png) chạy thật.
+Tổng chi phí thuê pod để verify: 2 lần, ~36 phút. Số đo đầy đủ ở
+[gpu-pod.md §Image dựng sẵn](../../gpu-pod.md#image-dung-san).
 
 ## Mục tiêu
 

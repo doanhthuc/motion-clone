@@ -76,7 +76,10 @@ Bỏ qua bước này cũng được — bước 7 dưới đây tải qua UI, c
 
 ### Giai đoạn 1 — dựng pod mới
 
-Từ đây trở đi đồng hồ chạy. Toàn bộ giai đoạn này mất ~30-40 phút, phần lớn là chờ.
+Từ đây trở đi đồng hồ chạy. Toàn bộ giai đoạn này mất ~30-40 phút, phần lớn là chờ — **trừ khi
+`MTC_PREBUILT=1`**: đo thật 06/08/2026 trên pod GPU, bước 4-5 (chờ SSH + `make gpu-bootstrap`) gộp
+lại còn **284 giây ≈ 4,7 phút** (pull image 16,20 GB + boot 176 giây, `make gpu-bootstrap` 108
+giây). Số ~30-40 phút cũ vẫn đúng cho đường không prebuilt (`MTC_PREBUILT=0`, cài từ đầu).
 
 ```bash
 make gpu-preflight                          # 1. chặn mọi lỗi cấu hình TRƯỚC khi tốn tiền
@@ -1125,7 +1128,7 @@ Hai chi phí lặp lại mỗi lần dựng pod, và cách xoá chúng:
 | Chi phí | Nguyên nhân | Cách xoá |
 |---|---|---|
 | ~33GB tải model **trong app** | `lib-feature.sh` cố ý không tải model; bạn tự bấm Settings → Models AI mỗi pod mới | `POD_VOLUME` |
-| ~20-35 phút cài phần mềm | `setup-motion-transfer.sh` cài ComfyUI + torch + custom node từ đầu | `MTC_PREBUILT=1` |
+| ~20-35 phút cài phần mềm | `setup-motion-transfer.sh` cài ComfyUI + torch + custom node từ đầu | `MTC_PREBUILT=1` — **đo 06/08/2026 trên pod GPU thật: còn 284 giây ≈ 4,7 phút** (pull image 16,20 GB + boot 176 giây + `make gpu-bootstrap` 108 giây, rc=0) |
 | Mất users/jobs/workflows | Postgres nằm ở `/var/lib/postgresql` trên container disk, bị dựng lại mỗi Stop/Start | `POD_VOLUME` |
 
 ### Tạo volume (một lần)
@@ -1192,15 +1195,42 @@ cứng (exit 1) — và manifest cố ý **không** bị ghi đè lúc đó, đ�
   đọc hàng nghìn file nhỏ, mà `run_enhance` gọi `comfy_recycle` giữa mỗi chunk RIFE nên ComfyUI
   restart nhiều lần trong một job. Phần mềm để `MTC_PREBUILT=1` lo.
 
+<a id="image-dung-san"></a>
 ### Image dựng sẵn (`MTC_PREBUILT=1`)
 
-`motions-studio/worker-image/Dockerfile` bake ComfyUI + custom node + `worker-venv` +
-`api-node_modules` vào `/opt/mtc-prebuilt`. Build, push, dùng làm image của pod, rồi đặt
-`MTC_PREBUILT=1` trong `.env`. `lib-feature.sh:475` sẽ symlink thẳng vào đó và bỏ qua toàn bộ
-phần cài đặt.
+`motions-studio/worker-image/Dockerfile` — base `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404`
+(ship sẵn `/start.sh` sshd, không va [bẫy §1](#runpod-gotchas)) — bake ComfyUI lõi ghim commit +
+9 custom node ghim SHA + `worker-venv` + `bg-remover-venv` + `api-node_modules` + Ollama vào
+`/opt/mtc-prebuilt`. CI (`.github/workflows/build-prebuilt-image.yml`) build và push image lên
+`ghcr.io/<owner>/motion-prebuilt`, tag `sha-<commit>` (và `latest` chỉ khi push `main`). Đặt
+`POD_IMAGE=ghcr.io/<owner>/motion-prebuilt:sha-<commit>` — **ghim tag, không dùng `latest`** — và
+`MTC_PREBUILT=1` trong `.env`. Hàm `phase_prebuilt_deps()` (`setup/lib-feature.sh`) symlink thẳng
+vào đó và bỏ qua toàn bộ phần cài đặt.
 
 Thiếu `/opt/mtc-prebuilt/.ready` là setup `die` ngay — cố ý, để bạn không âm thầm rơi về đường
 cài-từ-đầu mà không biết.
+
+**Số đo thật, 06/08/2026, pod RunPod thật** (image `sha-f17ef55`, nén 16,20 GB / 60 layer, profile
+`full`):
+
+| | |
+|---|---|
+| Pull image + boot container + sshd sẵn sàng | 176 giây |
+| `make gpu-bootstrap` (backend, đường sạch không can thiệp tay), rc=0 | 108 giây |
+| **Tổng đường đi sạch** | **284 giây ≈ 4,7 phút**, so với baseline 20-35 phút |
+| torch trong image | `2.12.1+cu130` — `torch.cuda.get_device_capability()` ra `(12, 0)` trên RTX 5090 |
+| `JOB_TYPES` thật (bị `JOB_TYPES_OVERRIDE` cắt từ 21 type của profile `full` xuống, vì model chưa tải đủ — xem `.env.example`) | 16 type |
+| `make gpu-smoke` | 8/8 lớp pass (lớp 6 motion, lớp 7 tryon, lớp 8 create-image — trigger bằng `SMOKE_PRODUCT`/`SMOKE_PROMPT`, xem [§Kiểm chứng](#smoke)) |
+
+Hai điều tưởng đúng lúc thiết kế nhưng đo thật thì sai:
+
+- **Pull image không phải nút thắt.** 16,20 GB kéo về trong ~3 phút — pod RunPod nằm trong
+  datacenter, băng thông nội bộ lớn (đo được `maxDownloadSpeedMbps: 6674` trên một pod CPU cùng
+  đợt), không phải băng thông Internet gia đình.
+- **Image không ăn quota container disk.** Lo image giải nén 32-41 GB phải vừa chung `DISK=100`
+  với OS và PGDATA là sai mô hình: layer image nằm ở tầng đọc-riêng (read-only) của overlayfs, chỉ
+  tầng ghi (writable) mới tính vào quota container disk. Đo thật: `df -h /` báo `401M / 100G, dùng
+  1%`; `du -sh /opt/mtc-prebuilt` = 9,0 GB.
 
 ---
 
@@ -1212,7 +1242,7 @@ cài-từ-đầu mà không biết.
 node, hoặc `models/` là thư mục rỗng trên container disk. Lỗi đắt tiền nhất ở đây không ồn ào mà
 là **thành công giả**: mọi thứ xanh, và app lặng lẽ tải lại 33GB.
 
-`make gpu-smoke` kiểm sáu lớp, rẻ trước đắt sau, mỗi lớp in ra nó **chứng minh** điều gì:
+`make gpu-smoke` kiểm tám lớp, rẻ trước đắt sau, mỗi lớp in ra nó **chứng minh** điều gì:
 
 | Lớp | Kiểm | Chứng minh |
 |---|---|---|
@@ -1222,16 +1252,25 @@ là **thành công giả**: mọi thứ xanh, và app lặng lẽ tải lại 33
 | 4 | `/object_info/WanVideoModelLoader` | custom node đã nạp thật; thiếu là job motion chết với 400 *"node type not found"* |
 | 5 | `pod-volume.sh --check` | volume thật sự đang được dùng, số file model không giảm |
 | 6 | một job motion thật | năm lớp trên chứng minh từng mảnh đúng; chỉ job thật chứng minh chúng **ghép lại** đúng |
+| 7 | một job tryon thật | `qwen2.5vl:7b` auto-detect trang phục + venv `bg-remover` bake trong image — chỉ profile `full` mới có, chưa lớp nào trên chạm tới |
+| 8 | một job create-image thật | Qwen-Image-Edit chạy chỉ-bằng-prompt (không cần ảnh) |
 
-Lớp 6 là opt-in vì repo không có sẵn video dẫn động:
+Lớp 6-8 opt-in, mỗi lớp một biến trigger riêng — repo không có sẵn media mẫu, và lớp 8 cố ý
+**không** chạy cùng `SMOKE_REF`/`SMOKE_DRIVER` để `make gpu-smoke` trần giữ đúng cam kết "chỉ kiểm
+readiness, không tốn GPU" khi không đặt biến:
 
 ```bash
-SMOKE_REF=nhanvat.jpg SMOKE_DRIVER=dandong.mp4 make gpu-smoke
+SMOKE_REF=nhanvat.jpg SMOKE_DRIVER=dandong.mp4 make gpu-smoke   # + lớp 6: motion
+SMOKE_REF=nhanvat.jpg SMOKE_PRODUCT=aoso.jpg make gpu-smoke     # + lớp 7: tryon
+SMOKE_PROMPT="a red car" make gpu-smoke                          # + lớp 8: create-image
 ```
 
-Nó gửi job nhỏ nhất mà vẫn đi hết đường ống (540p, 33 frame), poll tới khi `done`, rồi tải output
-về `/tmp/smoke-out.mp4` và kiểm dung lượng. Đường đi: Postgres → worker claim → ComfyUI nạp Wan
-Animate **từ volume** → DWPose → sampling → VAE decode → MinIO → API trả URL.
+Lớp 6 gửi job nhỏ nhất mà vẫn đi hết đường ống (540p, 33 frame), poll tới khi `done`, rồi tải
+output về `/tmp/smoke-out.mp4` và kiểm dung lượng. Đường đi: Postgres → worker claim → ComfyUI nạp
+Wan Animate **từ volume** → DWPose → sampling → VAE decode → MinIO → API trả URL. Lớp 7-8 cùng cơ
+chế, tải về `/tmp/smoke-out-tryon.png` và `/tmp/smoke-out-create.png`.
+
+Đo thật 06/08/2026: 8/8 lớp pass — motion 286 KB mp4, tryon 1378 KB png, create-image 1785 KB png.
 
 Thiếu `GPU_SSH_HOST`/`GPU_SSH_PORT` trong `.env` thì lớp 3-5 tự bỏ qua kèm thông báo rõ, không
 im lặng báo pass.
