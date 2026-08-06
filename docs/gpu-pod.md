@@ -534,7 +534,7 @@ xem `/etc/systemd/system/cloudflared.service` và `/tmp/cloudflared.log` (lệnh
 
 ## motions-studio/.env — có cần điền tay gì thêm không
 
-Không. `setup-motion-transfer.sh` (phase `phase_dotenv`, `lib-feature.sh:370`) tự sinh **toàn bộ**
+Không. `setup-motion-transfer.sh` (hàm `phase_dotenv()` trong `setup/lib-feature.sh`) tự sinh **toàn bộ**
 `.env` thật trên pod từ 6 flag `pod-bootstrap.sh` đã truyền (DOMAIN, SUPER_ADMIN, GMAIL_USER,
 GMAIL_APP_PASSWORD, CF_API_TOKEN/CF_TUNNEL_TOKEN, CORS_ORIGINS):
 
