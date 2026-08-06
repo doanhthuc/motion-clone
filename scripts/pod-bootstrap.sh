@@ -363,11 +363,15 @@ if [ -n "$DASHBOARD_STEP" ]; then
 fi
 
 # ── Frontend on the pod ───────────────────────────────────────────────────────
-# Deliberately NOT deployed here anymore. build-frontend.yml only triggers on changes under
-# motions/, so a commit that only touches backend/infra has no successful artifact for its SHA —
-# scripts/pod-fe.sh would then fail every single time, making gpu-bootstrap exit non-zero even
-# though the backend just finished installing cleanly. A command that always ends in red teaches
-# you to ignore the red, and the one time the backend is actually broken slips right through.
+# Deliberately NOT deployed here anymore — but no longer for the reason first written here.
+# The original reason was that pod-fe.sh matched the artifact by exact HEAD sha, so a backend-only
+# commit failed every time and gpu-bootstrap always ended in red. That is fixed: pod-fe.sh now
+# compares the motions/ TREE, so it reuses the last FE artifact when the frontend has not changed.
+#
+# It stays separate for two reasons that still hold. gpu-bootstrap is idempotent and gets re-run on
+# every backend edit; rebuilding the frontend each time buys nothing. And when motions/ HAS really
+# changed with no green CI yet — or gh is not logged in, or the artifact aged out — that frontend
+# failure must not take down a backend install that finished cleanly in the same command.
 # Deploy the frontend on its own with: make gpu-fe
 if [ -n "$FE_DOMAIN" ]; then
   APP_URL="https://$FE_DOMAIN"
