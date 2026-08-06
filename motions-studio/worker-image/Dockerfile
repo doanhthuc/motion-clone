@@ -46,10 +46,12 @@ RUN python3 -m venv /opt/mtc-prebuilt/ComfyUI/venv \
  && /opt/mtc-prebuilt/ComfyUI/venv/bin/pip install --no-cache-dir -U pip wheel
 
 # torch TRONG IMAGE là torch cuối cùng chạy trên pod: nhánh MTC_PREBUILT=1 trong feature_main()
-# (setup/lib-feature.sh) bỏ qua phase_comfyui() — nơi duy nhất gọi motion_install_best_pytorch()
-# (định nghĩa ở setup/lib-gpu.sh, gọi từ hai nhánh trong phase_comfyui()) — nên không có bước nào
-# cài lại torch cho khớp driver ở runtime. Base ship 2.8.0+cu128; ta cài đè 2.12.1+cu130 cho khớp
-# chuỗi đã chứng minh của Dockerfile.selfhosted và MIN_CUDA_VERSION=13.0.
+# (setup/lib-feature.sh) bỏ qua phase_comfyui() — trong đường feature_main(), đây là nơi duy nhất
+# gọi motion_install_best_pytorch() (định nghĩa ở setup/lib-gpu.sh). Hai lần gọi nằm trong CÙNG
+# một khối `if [ "$GPU_OK" = "1" ]` của phase_comfyui(), gọi tuần tự — không phải hai nhánh rời.
+# (setup/setup-pm2.sh cũng gọi motion_install_best_pytorch() riêng, ngoài đường feature_main().)
+# Nên không có bước nào cài lại torch cho khớp driver ở runtime. Base ship 2.8.0+cu128; ta cài đè
+# 2.12.1+cu130 cho khớp chuỗi đã chứng minh của Dockerfile.selfhosted và MIN_CUDA_VERSION=13.0.
 RUN /opt/mtc-prebuilt/ComfyUI/venv/bin/pip install --no-cache-dir \
       --index-url https://download.pytorch.org/whl/cu130 \
       torch==2.12.1 torchvision torchaudio
@@ -125,6 +127,16 @@ RUN mkdir -p /opt/mtc-prebuilt/ComfyUI/custom_nodes/comfyui_controlnet_aux/ckpts
 
 # Postgres/MinIO/Node chạy NATIVE trên pod (apt + PM2), KHÔNG qua docker compose —
 # xem docs/gpu-pod.md#kiến-trúc-thật-trên-pod.
+#
+# SHELL bash -o pipefail TRƯỚC layer này: RUN mặc định chạy /bin/sh (dash), KHÔNG có pipefail.
+# `curl -f https://deb.nodesource.com/setup_20.x | bash` — nếu curl gặp lỗi (404, mạng đứt) thì
+# `curl -f` thoát khác 0, nhưng dash trong một pipeline chỉ nhìn exit code của lệnh CUỐI (`bash`
+# đọc EOF từ pipe rỗng → exit 0) → cả RUN vẫn xanh, và apt-get install nodejs bên dưới cài Node 18
+# của Ubuntu thay vì Node 20 — build XANH với Node sai. Đặt SHELL ở đây (mọi RUN phía dưới, không
+# chỉ layer này) rẻ và tổng quát hơn tách `curl | bash` thành `curl -o file && bash file` cho riêng
+# một layer, và tự bảo vệ mọi `| bash`/`| sh` thêm sau này. Lớp kiểm hợp đồng ở cuối file assert
+# `node --version` là lớp chặn thứ hai, độc lập với SHELL — phòng khi ai đó đổi SHELL sau này.
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
       gnupg postgresql postgresql-contrib \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null \
@@ -179,9 +191,12 @@ RUN python3 -m venv /opt/mtc-prebuilt/worker-venv \
 # đang mua. Bake vào đây thì mất hẳn.
 WORKDIR /opt/mtc-build/bg-remover
 COPY bg-remover/requirements.txt ./requirements.txt
+# CHẶN Ở BUILD, cùng lý do với api-node_modules và worker-venv ở trên: venv bake mà thiếu
+# dependency bắc cầu chỉ lộ ra lúc PM2 app bg-remover crash-loop trên pod thật.
 RUN python3 -m venv /opt/mtc-prebuilt/bg-remover-venv \
     && /opt/mtc-prebuilt/bg-remover-venv/bin/pip install --no-cache-dir -U pip wheel \
-    && /opt/mtc-prebuilt/bg-remover-venv/bin/pip install --no-cache-dir -r requirements.txt
+    && /opt/mtc-prebuilt/bg-remover-venv/bin/pip install --no-cache-dir -r requirements.txt \
+    && /opt/mtc-prebuilt/bg-remover-venv/bin/python -c "import rembg"
 
 # KHÔNG mkdir models/uploads ở đây: models/ không còn tồn tại trong image (dời sang
 # comfy-models-seed ở trên) và phase_prebuilt_deps() trong setup/lib-feature.sh đã tự
@@ -205,6 +220,8 @@ RUN set -eux; \
     test -x /opt/mtc-prebuilt/bg-remover-venv/bin/python; \
     test -x /usr/bin/ollama; \
     test -x /usr/local/bin/minio; \
+    node --version | grep -q '^v20\.' \
+      || { echo "LỖI: node không phải v20.x: $(node --version). curl|bash của nodesource có thể đã 404 âm thầm và apt-get install nodejs rơi về Node 18 của Ubuntu — xem SHELL pipefail ở layer cài Postgres/MinIO/Node." >&2; exit 1; }; \
     if [ -e /opt/mtc-prebuilt/ComfyUI/models ]; then \
       echo "LỖI: /opt/mtc-prebuilt/ComfyUI/models vẫn còn trong image — sẽ chặn setup/pod-volume.sh" >&2; \
       echo "     nối \$COMFY_DIR/models sang Network Volume (nó từ chối xoá thư mục THẬT có dữ liệu)." >&2; \

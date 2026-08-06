@@ -92,6 +92,14 @@ check MODELS_MIN_GB recommended "threshold below which pod-volume.sh assumes the
 check POD_VOLUME_ID recommended "RunPod volume id to attach — pod-provision.sh fills this in for you if you own exactly one" 1
 check MIN_CUDA_VERSION recommended "passed to 'runpodctl pod create --min-cuda-version' — 13.0 keeps you off R570 hosts that fall back to cu128" 1
 check MTC_PREBUILT  recommended "1 = pod image ships /opt/mtc-prebuilt, skips ~20-35 min of installing (needs worker-image/Dockerfile)" 1
+# Cổng chặn: MTC_PREBUILT=1 mà POD_IMAGE trống là đường hỏng thật, không phải cảnh báo. Không
+# chặn ở đây thì pod-provision.sh lặng lẽ rơi về image mặc định (runpod/pytorch), bạn thuê pod,
+# chờ SSH, rồi phase_prebuilt_deps() `die` vì thiếu /opt/mtc-prebuilt/.ready — trả tiền cho cả
+# vòng thuê+chờ đó vì một biến quên điền.
+if [ "$(get MTC_PREBUILT)" = "1" ] && [ -z "$(get POD_IMAGE)" ]; then
+  blocking=$((blocking + 1))
+  printf "  ${R}✗${X} %-22s ${R}MISSING${X} ${D}— MTC_PREBUILT=1 nhưng POD_IMAGE trống: sẽ thuê pod bằng image mặc định, chờ SSH, rồi setup die vì thiếu /opt/mtc-prebuilt/.ready. Điền POD_IMAGE=ghcr.io/<owner>/motion-prebuilt:sha-<commit>, hoặc đặt MTC_PREBUILT=0.${X}\n" "POD_IMAGE"
+fi
 
 echo
 echo "Hình dạng deploy (pod sẽ dựng ra cái gì, và ai chạy job)"

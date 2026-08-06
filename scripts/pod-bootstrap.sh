@@ -136,8 +136,9 @@ else
 fi
 
 if [ "$SETUP_PROFILE" = "cpu-box" ]; then
-  # Nói đúng cái sẽ xảy ra. Profile cpu-box đặt SKIP_COMFY=1 nên GPU_OK=0, và cả khối ComfyUI
-  # (kể cả motion_install_best_pytorch) bị bỏ qua — lib-feature.sh:597. Nhanh hơn nhiều.
+  # Nói đúng cái sẽ xảy ra. Profile cpu-box đặt SKIP_COMFY=1 nên GPU_OK=0, và cả khối
+  # `if [ "$GPU_OK" = "1" ]` của phase_comfyui() (kể cả motion_install_best_pytorch, setup/lib-feature.sh)
+  # bị bỏ qua. Nhanh hơn nhiều.
   log "running $SETUP_SCRIPT on the pod — installs Postgres/MinIO/PM2 and wires up the"
   log "Cloudflare Tunnel. NO ComfyUI, NO PyTorch/CUDA, NO worker: đây là box CPU, GPU do RunPod"
   log "Serverless lo. Nhanh hơn profile GPU đáng kể vì bỏ hẳn phần cài torch."

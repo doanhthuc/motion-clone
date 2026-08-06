@@ -44,8 +44,10 @@ TIMEOUT_MIN="${SMOKE_TIMEOUT_MIN:-20}"
 # Qwen-Image-Edit compresses far worse than the >100KB mp4 threshold below would suggest is needed,
 # but 5 KB is still comfortably above "0 bytes" or a JSON error body saved to the output path by
 # mistake, and comfortably below any real image output — so it catches a broken download without
-# false-failing on a working one.
-SMOKE_IMAGE_MIN_BYTES=5000
+# false-failing on a working one. Measured real outputs (06/08/2026 pod run): tryon 1378 KB,
+# create-image 1785 KB — both far above 5000 bytes, so the default stays right; override lets a
+# future run with a genuinely tiny expected output turn the floor down without editing the script.
+SMOKE_IMAGE_MIN_BYTES="${SMOKE_IMAGE_MIN_BYTES:-5000}"
 [ -n "$DOMAIN" ] || { bad "DOMAIN missing from .env"; exit 1; }
 
 SSH_OK=0

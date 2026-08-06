@@ -483,7 +483,9 @@ phase_postgres() {
 # bg-remover (rembg: tách nền, crop sản phẩm cho tryon — ecosystem.config.cjs:195). Box chuyên
 # không bật app này nên không dựng venv: rembg kéo theo onnxruntime, mất vài phút cài cho một
 # tiến trình sẽ không bao giờ nhận request. Profile full thì cần, và cần ở CẢ hai đường cài —
-# image dựng sẵn (worker-image/Dockerfile) KHÔNG có venv này, nên phase_prebuilt_deps cũng gọi.
+# image dựng sẵn (worker-image/Dockerfile) từ 05/08/2026 CÓ bake venv này; ensure_bg_remover()
+# symlink vào đó (kiểm import chạy được trước khi tin), và phase_prebuilt_deps() cũng gọi cùng
+# hàm để dùng chung một đường kiểm.
 ensure_bg_remover() {
   [ "${NEED_BG_REMOVER:-0}" = "1" ] || return 0
   # ALD 05/08/2026 - Image dựng sẵn có venv bg-remover → symlink thay vì pip lại vài phút mỗi boot.
@@ -552,8 +554,9 @@ phase_prebuilt_deps() {
     rm -rf "$ROOT/worker/venv"
     ln -s "$prebuilt/worker-venv" "$ROOT/worker/venv"
   fi
-  # Image dựng sẵn không có venv bg-remover — dựng tại chỗ nếu profile cần (chậm hơn fast-boot
-  # vài phút, nhưng thiếu nó thì PM2 app bg-remover crash vòng lặp và tryon mất phần crop).
+  # Image dựng sẵn ĐÃ bake venv bg-remover (worker-image/Dockerfile) — ensure_bg_remover() symlink
+  # vào đó khi import chạy được. Chỉ dựng tại chỗ (chậm hơn fast-boot vài phút) khi venv dựng sẵn
+  # thiếu/hỏng; thiếu cả hai đường thì PM2 app bg-remover crash vòng lặp và tryon mất phần crop.
   ensure_bg_remover
 
   COMFY_DIR="${COMFY_DIR:-$prebuilt/ComfyUI}"

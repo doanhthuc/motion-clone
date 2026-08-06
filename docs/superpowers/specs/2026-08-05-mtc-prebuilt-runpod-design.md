@@ -36,12 +36,12 @@ Toàn bộ phía runtime đã nối xong từ trước, chỉ chưa bao giờ ch
 
 | Thành phần | Vị trí | Làm gì |
 |---|---|---|
-| Truyền cờ xuống pod | `scripts/pod-bootstrap.sh:55,120,160` | đọc `MTC_PREBUILT` từ `.env`, truyền vào setup |
-| Rẽ nhánh fast-boot | `setup/lib-feature.sh:828-836` | bỏ `phase_apt`, `phase_app_deps`, `phase_comfyui` |
-| Nối dependency | `setup/lib-feature.sh:501-530` | symlink `api-node_modules`, `worker-venv`, `ComfyUI` |
-| Cổng chặn | `setup/lib-feature.sh:504` | thiếu `/opt/mtc-prebuilt/.ready` là `die` ngay |
-| Tự chữa npm hỏng | `setup/lib-feature.sh:513-522` | chạy thử `require('pg')`, thiếu thì `npm install` lại |
-| Chọn image | `scripts/pod-provision.sh:101` | `IMAGE="${IMAGE:-$(env_get POD_IMAGE)}"` |
+| Truyền cờ xuống pod | `scripts/pod-bootstrap.sh` (biến `MTC_PREBUILT`, phần "Network Volume + prebuilt image") | đọc `MTC_PREBUILT` từ `.env`, truyền vào setup qua SSH exec |
+| Rẽ nhánh fast-boot | `feature_main()` (setup/lib-feature.sh) | nhánh `if [ "$MTC_PREBUILT" = "1" ]` bỏ `phase_apt`, `phase_app_deps`, `phase_comfyui` |
+| Nối dependency | `phase_prebuilt_deps()` (setup/lib-feature.sh) | symlink `api-node_modules`, `worker-venv`, `ComfyUI` |
+| Cổng chặn | `phase_prebuilt_deps()` (setup/lib-feature.sh) | thiếu `/opt/mtc-prebuilt/.ready` là `die` ngay |
+| Tự chữa npm hỏng | `phase_prebuilt_deps()` (setup/lib-feature.sh) | chạy thử `require('pg')`, thiếu thì `npm install` lại |
+| Chọn image | đầu `scripts/pod-provision.sh` (biến `IMAGE`) | `IMAGE="${IMAGE:-$(env_get POD_IMAGE)}"` |
 
 Thiếu đúng hai thứ: **image chưa tồn tại** và **`POD_IMAGE` đang trống**.
 
@@ -80,8 +80,8 @@ Nên hướng đi là **viết lại** `worker-image/Dockerfile`, bê chuỗi đ
 ### Base image: `runpod/pytorch`
 
 Chốt `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404` — image mặc định đã kiểm của repo, ship
-`/start.sh` (sshd + block) nên thoả [bẫy RunPod §1](../../gpu-pod.md#runpod-gotchas), và
-`pod-provision.sh:118` hết cảnh báo.
+`/start.sh` (sshd + block) nên thoả [bẫy RunPod §1](../../gpu-pod.md#runpod-gotchas), và khối guard
+"non-runpod image on RunPod" trong `scripts/pod-provision.sh` hết cảnh báo.
 
 Base cũ `vastai/comfy` **không** va với bẫy §1 như từng lo — entrypoint của nó bung supervisord kèm
 ssh (Dockerfile:95-102). Nhưng nó là image bên thứ ba, và tên gọi gây hiểu nhầm là đang dùng
@@ -99,10 +99,12 @@ assert lúc build.
 **giữ Ollama** (`setup-full.sh:56` `NEED_OLLAMA=1`), **thêm venv bg-remover**
 (`setup-full.sh:57` `NEED_BG_REMOVER=1`).
 
-Venv bg-remover là khoản mới: `phase_prebuilt_deps` gọi `ensure_bg_remover` ở runtime
-(`lib-feature.sh:528`) và comment tự thú *"chậm hơn fast-boot vài phút"*. Với `motion-transfer` thì
-`NEED_BG_REMOVER=0` nên không ai để ý; với `full` nó chạy **mỗi lần boot**, ăn đúng vào cái
-fast-boot đang mua.
+Venv bg-remover là khoản mới: ban đầu `phase_prebuilt_deps()` gọi `ensure_bg_remover()`
+(setup/lib-feature.sh) mà hàm này build venv ở RUNTIME **mỗi lần boot** — với `motion-transfer` thì
+`NEED_BG_REMOVER=0` nên không ai để ý, nhưng với `full` nó ăn đúng vào cái fast-boot đang mua.
+**Đã sửa trong lúc dựng**: `worker-image/Dockerfile` bake `bg-remover-venv` (kèm cổng chặn import
+`rembg` lúc build), và `ensure_bg_remover()` giờ symlink vào đó, kiểm import chạy được trước khi
+tin — chỉ còn build tại chỗ khi venv dựng sẵn thiếu/hỏng.
 
 ## Số đo thật — volume, 05/08/2026
 
@@ -226,9 +228,10 @@ khỏi lệch nếu sau này đổi ý.
 
 ### `JOB_TYPES_OVERRIDE` — cơ chế phải làm mới
 
-Phát hiện lúc viết plan: **hiện không có đường nào thu hẹp `JOB_TYPES`.** `lib-feature.sh:397` ghi
-`set_kv JOB_TYPES "$JOB_TYPE"`, mà `JOB_TYPE` là hằng cứng trong profile — `setup-full.sh:49` khai
-đủ 21 type. `DISPATCH_JOB_TYPES` **không** thay được: nó chỉ điều khiển dispatcher serverless.
+Phát hiện lúc viết plan: **hiện không có đường nào thu hẹp `JOB_TYPES`.** `phase_dotenv()`
+(setup/lib-feature.sh) ghi `set_kv JOB_TYPES "$JOB_TYPE"`, mà `JOB_TYPE` là hằng cứng trong profile
+— `setup-full.sh:49` khai đủ 21 type. `DISPATCH_JOB_TYPES` **không** thay được: nó chỉ điều khiển
+dispatcher serverless.
 
 Nên phải thêm một biến đi từ `.env` gốc → `pod-bootstrap.sh` → `phase_dotenv`:
 
@@ -247,7 +250,7 @@ Nên phải thêm một biến đi từ `.env` gốc → `pod-bootstrap.sh` → 
 | 2 | Pod CPU: tải `qwen2.5vl:7b`, xoá pod | luồng ảnh đủ model | ~$0,01 |
 | 3 | Pod GPU `POD_IMAGE` + `MTC_PREBUILT=1`: đo **pull + `gpu-bootstrap`** | con số thật so baseline 20-35 phút | ~$0,5 |
 | 4 | `torch.cuda.get_device_capability()` trên pod | phải ra `(12, 0)` — prebuilt bỏ bước cài torch khớp driver | — |
-| 5 | `make gpu-smoke` đủ 6 lớp, có `SMOKE_REF`/`SMOKE_DRIVER` | sáu mảnh ghép lại đúng | — |
+| 5 | `make gpu-smoke` đủ 8 lớp, có `SMOKE_REF`/`SMOKE_DRIVER` (lớp 6), `SMOKE_PRODUCT` (lớp 7), `SMOKE_PROMPT` (lớp 8) | tám mảnh ghép lại đúng | — |
 | 6 | Một job `tryon` **và** một job `create-image` | đường mới mở: `qwen2.5vl` + venv bg-remover trong image chạy thật | — |
 
 **Con số quyết định là `pull + bootstrap`, không phải riêng bootstrap.** Dời việc từ pod sang CI vẫn
@@ -260,11 +263,11 @@ lệch 33×.
 
 | Rủi ro | Mức | Xử lý |
 |---|---|---|
-| **Image quá to → pull ăn hết phần tiết kiệm** | cao | bước verify 1 trả lời trước khi tốn tiền. Không đạt thì bỏ bake Ollama — `phase_ollama:550` tự cài lúc runtime bằng `curl ollama.com/install.sh`, nên mất vài phút boot chứ không mất chức năng |
+| Image quá to → pull ăn hết phần tiết kiệm | **thấp — đo thật đã bác mức "cao" ban đầu** | đo trên pod RunPod thật 06/08/2026: image 16,20 GB pull xong trong ~3 phút (băng thông nội bộ datacenter, không phải Internet nhà), gộp với boot 176 giây tổng đường sạch vẫn còn 284 giây so baseline 20-35 phút. Không còn coi là rủi ro chính của thiết kế |
 | torch 2.12.1+cu130 không chạy sm_120 trên base runpod | trung bình | assert lúc build (CI bắt) + bước 4 (pod bắt) |
-| `DISK=100` không đủ cho image + OS + PGDATA | trung bình | biết dung lượng ở bước 1 thì tính được; model ở volume nên không đụng |
+| `DISK=100` không đủ cho image + OS + PGDATA | **đã bác — không phải rủi ro** | mô hình sai lúc thiết kế: layer image nằm ở tầng đọc-riêng (read-only) của overlayfs, chỉ tầng ghi (writable) mới tính vào quota container disk. Đo thật: `df -h /` trên pod báo `401M / 100G, dùng 1%` dù image giải nén ước 32-41 GB |
 | GHCR package private → RunPod không pull được | thấp | đặt package public, hoặc thêm registry credential vào pod |
-| worker-venv lệch code | thấp | CI auto-build theo path đã đóng phần lớn; **không** có kiểm tự chữa như phía api |
+| worker-venv lệch code | thấp | CI auto-build theo path đã đóng phần lớn; nhánh đã thêm cổng chặn import lúc build (`python -c "import requests, websocket, PIL, faster_whisper"` trong `worker-image/Dockerfile`) — câu đúng còn lại chỉ là: **không** có kiểm tự chữa **ở runtime** như phía api (`phase_prebuilt_deps()` tự `npm install` lại nếu `require('pg')` fail; không có nhánh tương đương cho worker-venv) |
 
 > **Chưa xác minh:** RunPod có cho mở rộng network volume tại chỗ không (nếu sau này cần >100 GB);
 > thời gian `gpu-up` từ pod đã dừng; tiền container disk của pod stopped ở `DISK=100`.

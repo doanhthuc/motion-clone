@@ -6,7 +6,7 @@ name: Build prebuilt pod image
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches: [main, mtc-prebuilt-runpod]
     paths:
       # Image bake dependency của api, worker và bg-remover — ba file requirements đó đổi là
       # image lệch code. Theo dõi cả ba, không chỉ Dockerfile.
@@ -65,23 +65,30 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
-      # Dung lượng image là RỦI RO LỚN NHẤT của cả thiết kế: pull chậm ăn hết phần tiết kiệm.
-      # In ra ngay trong log build thay vì bắt người ta vào GHCR bấm tìm.
+      # Dung lượng image ban đầu được coi là rủi ro lớn nhất — đo thật trên pod RunPod (06/08/2026)
+      # đã bác điều đó: image 16,20 GB pull xong trong ~3 phút (băng thông nội bộ datacenter), và
+      # `df -h /` trên pod báo 401M/100G vì layer image nằm ở tầng đọc-riêng (read-only) của
+      # overlayfs — chỉ tầng ghi (writable) mới tính vào quota container disk DISK=100. In số ra
+      # vẫn hữu ích để bắt lỗi đo (xem ngưỡng dưới), chỉ bỏ kết luận "pull chậm/DISK không đủ".
       - name: In dung lượng image
         run: |
-          REF="ghcr.io/${{ github.repository_owner }}/motion-prebuilt:sha-${GITHUB_SHA::7}"
+          OWNER="${{ github.repository_owner }}"
+          # Hạ chữ thường: chủ repo có chữ hoa (vd "ThucPham") thì ghcr.io từ chối path chữ hoa —
+          # metadata-action ở bước build đã tự hạ, nhưng REF ghép tay ở đây thì không.
+          OWNER="${OWNER,,}"
+          REF="ghcr.io/${OWNER}/motion-prebuilt:sha-${GITHUB_SHA::7}"
           # --raw trả OCI image index (khoá `manifests`), KHÔNG phải image đơn (khoá `layers`).
           # Đọc thẳng `layers` ở tầng này luôn ra 0 GB và bước vẫn xanh — thành công giả.
           # Phải lấy digest amd64 trước, rồi mới cộng layer của chính manifest đó.
           D=$(docker buildx imagetools inspect "$REF" --raw \
             | python3 -c 'import json,sys; m=json.load(sys.stdin); print([x["digest"] for x in m["manifests"] if x.get("platform",{}).get("architecture")=="amd64"][0])')
-          docker buildx imagetools inspect "ghcr.io/${{ github.repository_owner }}/motion-prebuilt@$D" --raw \
+          docker buildx imagetools inspect "ghcr.io/${OWNER}/motion-prebuilt@$D" --raw \
             | python3 -c 'import json,sys
           m=json.load(sys.stdin); ls=m["layers"]
           gb=sum(l["size"] for l in ls)/2**30
           print("số layer:", len(ls))
           print("TỔNG NÉN: %.2f GB" % gb)
-          print("Ước giải nén (~2-2,5x): %.0f-%.0f GB — phải vừa DISK=100 cùng OS và PGDATA" % (gb*2, gb*2.5))
+          print("Đo thật trên pod RunPod (06/08/2026, image 16,20 GB): pull ~3 phút, df / báo 401M/100G — layer image ở tầng read-only overlayfs, không tính vào quota container disk.")
           if gb < 5 or len(ls) < 10:
               # Cổng chặn: lấy nhầm manifest attestation cho ra vài MB / 1-2 layer, in ra vẫn "hợp lệ".
               # Image này không bao giờ nhỏ hơn base runpod/pytorch (~9,8 GB, 35 layer), nên số dưới
