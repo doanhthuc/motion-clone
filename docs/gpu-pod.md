@@ -930,8 +930,13 @@ Hai cổng chặn trong `pod-fe.sh`:
 
 - `motions/` có thay đổi **chưa commit** → chặn. Artifact build từ commit nên không chứa chúng, và
   deploy ra một bản FE khác cái bạn đang sửa là lỗi mất hàng giờ mới nhận ra.
-- Không có run **thành công** cho đúng commit HEAD → chặn, kèm ba cách sửa. Không tự lấy artifact
-  của commit khác: deploy code cũ trong im lặng còn tệ hơn báo lỗi.
+- Không có run **thành công** nào mà `motions/` khớp HEAD → chặn, kèm ba cách sửa. `pod-fe.sh` so
+  **cây** (`git diff --quiet <headSha-của-run> HEAD -- motions/`), không so đúng SHA — vì
+  `build-frontend.yml` chỉ trigger theo `paths: [motions/**, ...]`, nên một commit chỉ chạm
+  backend/infra không có run riêng cho nó dù `motions/` chưa đổi một byte từ lần build gần nhất. So
+  SHA (cách cũ) thì `make gpu-fe` đỏ đúng vào lúc tài liệu này bảo chạy nó. Chọn được run của một
+  commit khác HEAD thì script **in rõ** commit đó là gì và vì sao vẫn đúng (`motions/` giống hệt) —
+  không âm thầm dùng artifact của commit khác, đó là loại "thành công giả" `pod-smoke.sh` cảnh báo.
 
 Đang sửa FE mà chưa muốn push thì `FE_BUILD=pod bash scripts/pod-fe.sh`.
 
