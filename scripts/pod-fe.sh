@@ -80,24 +80,81 @@ if [ "$FE_BUILD" = ci ]; then
   log "tìm artifact FE cho commit ${SHA:0:8}…"
   RUNS_JSON="$(gh run list --workflow build-frontend.yml --limit 40 \
                  --json databaseId,headSha,conclusion,status 2>&1)"
-  # Phân biệt "workflow chưa tồn tại trên default branch" với "có workflow nhưng chưa run nào xong".
-  # Lần dùng đầu tiên LUÔN rơi vào ca thứ nhất, và nếu gộp hai ca thì message chỉ đường sai.
-  case "$RUNS_JSON" in
-    *"not found on the default branch"*|*"HTTP 404"*)
-      die "GitHub chưa biết workflow build-frontend.yml — nó phải nằm trên DEFAULT BRANCH mới chạy được.
+  RUNS_RC=$?
+  # RUNS_RC != 0 nghĩa là KHÔNG GỌI ĐƯỢC GitHub — khác hẳn "gọi được nhưng chưa có run nào xong".
+  # Hai nguyên nhân đó cần hai thông báo khác nhau: gộp chung thì die ở dưới (chưa có run THÀNH
+  # CÔNG cho commit này) sẽ chỉ sai đường — token hết hạn / mất mạng / rate-limit không sửa được
+  # bằng "push rồi chờ CI" hay "gh workflow run", vì chính lệnh gọi gh cũng sẽ thất bại như vậy.
+  if [ "$RUNS_RC" -ne 0 ]; then
+    # Trong lỗi gọi-gh, còn một trường hợp riêng biệt: workflow chưa từng chạy trên default branch
+    # (luôn gặp ở lần dùng đầu tiên) — đường sửa của nó (push lên rồi chờ CI) khác đường sửa của
+    # "không gọi được GitHub" (kiểm auth/mạng), nên vẫn tách case này ra trước.
+    case "$RUNS_JSON" in
+      *"not found on the default branch"*|*"HTTP 404"*)
+        die "GitHub chưa biết workflow build-frontend.yml — nó phải nằm trên DEFAULT BRANCH mới chạy được.
   Push nó lên:  git push
   Rồi chờ CI:   gh run watch
   Hoặc build trên pod ngay bây giờ:  FE_BUILD=pod bash scripts/pod-fe.sh" ;;
-  esac
-  RUN_ID="$(printf '%s' "$RUNS_JSON" | SHA="$SHA" python3 -c '
-import sys, json, os
-sha = os.environ["SHA"]
+    esac
+    die "gọi \`gh run list\` thất bại (exit $RUNS_RC) — đây là KHÔNG GỌI ĐƯỢC GitHub, không phải
+  \"chưa có run cho commit này\". Token hết hạn, mất mạng, hoặc rate-limit đều rơi vào đây, và push
+  rồi chờ CI sẽ không sửa được gì vì bản thân lệnh gh cũng sẽ lại thất bại như vậy.
+  Kiểm tra:  gh auth status
+  Hoặc build trên pod ngay bây giờ (không cần gh):  FE_BUILD=pod bash scripts/pod-fe.sh
+  Lỗi gh thật:
+$RUNS_JSON"
+  fi
+  # So CÂY motions/, không so đúng SHA: build-frontend.yml chỉ trigger theo
+  # paths: [motions/**, .github/workflows/build-frontend.yml], nên một commit chỉ chạm
+  # backend/infra không hề có run riêng cho headSha của nó — dù motions/ chưa đổi một byte từ lần
+  # build gần nhất. So `headSha == HEAD` (cách cũ) thì die oan ở đúng tình huống docs bảo chạy lệnh
+  # này. Điều cần kiểm thật ra là "artifact có đúng NỘI DUNG motions/ của HEAD không", và đó kiểm
+  # trực tiếp được bằng `git diff --quiet <headSha-của-run> HEAD -- motions/`.
+  #
+  # python3 ở đây CHỈ lọc JSON (giữ thứ tự "mới nhất trước" mà `gh run list` đã trả) — mọi lệnh git
+  # (cat-file, diff) chạy ở bash ngay dưới. Không gọi git bằng subprocess trong Python: cả file này
+  # đã toàn gọi git thuần bash (git status --porcelain ở trên, git rev-parse ngay trên, git branch -r
+  # --contains ngay dưới) — tách lệnh git ra khỏi khối Python giữ cho cả file chỉ một chỗ dò lỗi git.
+  CANDIDATES="$(printf '%s' "$RUNS_JSON" | python3 -c '
+import sys, json
 try: runs = json.load(sys.stdin)
 except Exception: runs = []
 for r in runs:
-    if r.get("headSha") == sha and r.get("conclusion") == "success":
-        print(r["databaseId"]); break
+    if r.get("conclusion") == "success" and r.get("headSha") and r.get("databaseId"):
+        print(str(r["databaseId"]) + "\t" + r["headSha"])
 ' 2>/dev/null)"
+
+  RUN_ID=""
+  RUN_SHA=""
+  if [ -n "$CANDIDATES" ]; then
+    while IFS=$'\t' read -r CAND_ID CAND_SHA; do
+      [ -n "$CAND_ID" ] || continue
+      # Commit của run có thể chưa fetch về máy dev — git diff trên ref không tồn tại lỗi mù mờ,
+      # nên bỏ qua ứng viên đó thay vì die nhầm nguyên nhân.
+      git cat-file -e "${CAND_SHA}^{commit}" 2>/dev/null || continue
+      # git diff --quiet trả 0 = giống hệt, 1 = khác nội dung, >1 = lỗi git thật (thiếu object do
+      # partial/shallow clone, repo hỏng…). Ba trường hợp cần ba xử lý khác nhau — gộp "khác 0"
+      # thành một nhánh (như `if git diff --quiet ...; then` làm) khiến lỗi git thật lặng lẽ rơi
+      # vào "ứng viên không khớp, thử tiếp", rồi cuối cùng die sai nguyên nhân ("không có run nào
+      # THÀNH CÔNG") trong khi vấn đề thật nằm ở repo local. Cùng lỗi đã sửa cho `gh run list` ở
+      # RUNS_RC phía trên, chỉ khác chỗ — nên bắt $? ngay dòng sau, không có lệnh nào chen giữa.
+      git diff --quiet "$CAND_SHA" HEAD -- motions/
+      DIFF_RC=$?
+      if [ "$DIFF_RC" -eq 0 ]; then
+        RUN_ID="$CAND_ID"
+        RUN_SHA="$CAND_SHA"
+        break
+      elif [ "$DIFF_RC" -gt 1 ]; then
+        die "git diff --quiet lỗi (exit $DIFF_RC) khi so cây motions/ giữa ${CAND_SHA:0:8} và HEAD —
+  đây là LỖI GIT khi so cây, không phải \"ứng viên này không khớp\". Nguyên nhân thường gặp: thiếu
+  object do partial/shallow clone, hoặc repo local hỏng.
+  Thử:  git fetch --unshallow
+  Hoặc kiểm repo:  git fsck"
+      fi
+      # DIFF_RC == 1: khác nội dung thật, im lặng thử ứng viên kế — trường hợp bình thường.
+    done <<<"$CANDIDATES"
+  fi
+
   if [ -z "$RUN_ID" ]; then
     # Nói rõ commit này ĐÃ push chưa — hai nguyên nhân khác nhau, hai cách sửa khác nhau.
     if git branch -r --contains "$SHA" >/dev/null 2>&1 && [ -n "$(git branch -r --contains "$SHA" 2>/dev/null)" ]; then
@@ -111,6 +168,15 @@ for r in runs:
     2. chạy tay cho branch hiện tại: gh workflow run build-frontend.yml --ref \$(git rev-parse --abbrev-ref HEAD)
     3. build trên pod (chậm, cần RAM): FE_BUILD=pod bash scripts/pod-fe.sh
   Xem trạng thái:  gh run list --workflow build-frontend.yml --limit 5"
+  fi
+
+  # BẮT BUỘC nói rõ khi artifact không phải build từ HEAD — im lặng dùng artifact của commit khác
+  # là đúng kiểu "thành công giả" mà pod-smoke.sh mở đầu bằng cách cảnh báo. `motions/` giống hệt
+  # là điều đã kiểm ở trên (git diff --quiet), không phải suy đoán.
+  if [ "$RUN_SHA" != "$SHA" ]; then
+    warn "artifact KHÔNG build từ HEAD (${SHA:0:8}) — nó build từ ${RUN_SHA:0:8}."
+    warn "Vẫn đúng: motions/ tại ${RUN_SHA:0:8} giống hệt motions/ tại HEAD (đã kiểm bằng git diff --quiet"
+    warn "  ${RUN_SHA:0:8} HEAD -- motions/, không có khác biệt) — chỉ backend/infra khác giữa hai commit."
   fi
 
   CI_TMP="$(mktemp -d)"

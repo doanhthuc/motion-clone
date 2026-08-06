@@ -76,15 +76,19 @@ Bỏ qua bước này cũng được — bước 7 dưới đây tải qua UI, c
 
 ### Giai đoạn 1 — dựng pod mới
 
-Từ đây trở đi đồng hồ chạy. Toàn bộ giai đoạn này mất ~30-40 phút, phần lớn là chờ.
+Từ đây trở đi đồng hồ chạy. Toàn bộ giai đoạn này mất ~30-40 phút, phần lớn là chờ — **trừ khi
+`MTC_PREBUILT=1`**: đo thật 06/08/2026 trên pod GPU, bước 4-5 (chờ SSH + `make gpu-bootstrap`) gộp
+lại còn **284 giây ≈ 4,7 phút** (pull image 16,20 GB + boot 176 giây, `make gpu-bootstrap` 108
+giây). Số ~30-40 phút cũ vẫn đúng cho đường không prebuilt (`MTC_PREBUILT=0`, cài từ đầu).
 
 ```bash
 make gpu-preflight                          # 1. chặn mọi lỗi cấu hình TRƯỚC khi tốn tiền
 bash scripts/pod-provision.sh               # 2. dry-run — ĐỌC lệnh pod create nó in ra
 CONFIRM=yes bash scripts/pod-provision.sh   # 3. thuê thật; tự ghi GPU_INSTANCE_ID vào .env
 make gpu-wait                               # 4. chờ SSH; tự ghi GPU_SSH_HOST/PORT vào .env
-make gpu-bootstrap                          # 5. ~30 phút, xem bên dưới nó làm gì
-make gpu-volume-check                       # 6. chứng minh volume thật sự đang được dùng
+make gpu-bootstrap                          # 5. ~30 phút, CHỈ backend — xem bên dưới nó làm gì
+make gpu-fe                                 # 6. (tuỳ chọn) đưa frontend lên pod, nếu FE_DOMAIN đã đặt
+make gpu-volume-check                       # 7. chứng minh volume thật sự đang được dùng
 ```
 
 Bước 5 làm, theo đúng thứ tự này (thứ tự có lý do — xem `scripts/pod-bootstrap.sh`):
@@ -95,10 +99,17 @@ Bước 5 làm, theo đúng thứ tự này (thứ tự có lý do — xem `scri
 3. `setup-<SETUP_PROFILE>.sh`: Postgres, MinIO, ComfyUI, PyTorch khớp driver ([CUDA 13](#cuda-13)),
    custom nodes, Cloudflare Tunnel với **2 hostname** (`DOMAIN`→:8080, `FE_DOMAIN`→:2030)
 4. ghi `motions/.env` **local** trỏ vào backend mới
-5. rsync + `npm install` + `npm run build` + PM2 cho frontend **trên pod**
-   ([chi tiết](#frontend-on-the-pod))
 
-**7 · Tải model** — không tự động, cố ý ([lý do](#no-auto-models)). Chỉ cần làm
+`make gpu-bootstrap` **không** deploy frontend nữa (từng làm, đã bỏ) — nó là bước riêng, bước 6:
+`make gpu-fe` ([chi tiết](#frontend-on-the-pod)). Không phải vì bước FE luôn thất bại: `pod-fe.sh`
+so **cây** `motions/` (`git diff --quiet <headSha-của-run> HEAD -- motions/`), không so đúng SHA,
+nên một commit chỉ chạm backend/infra vẫn dùng được artifact CI của lần build FE gần nhất — miễn
+`motions/` chưa đổi từ đó — và script in rõ commit nào khi artifact không phải build từ HEAD. Tách
+riêng vì hai lý do khác: `gpu-bootstrap` chạy lại (idempotent) mỗi lần sửa backend, không cần build
+lại FE mỗi lần; và khi `motions/` THẬT SỰ đổi mà chưa có CI xanh, `gh` chưa login, hay artifact đã
+hết hạn (giữ 90 ngày) — lỗi FE đó không nên chặn luôn backend đã ổn trong cùng một lệnh.
+
+**8 · Tải model** — không tự động, cố ý ([lý do](#no-auto-models)). Chỉ cần làm
 **một lần cho mỗi volume**, pod sau không phải tải lại:
 
 `https://$FE_DOMAIN` → login bằng `SUPER_ADMIN` (bấm gửi OTP) → **Settings → Models AI** → nhóm
@@ -108,7 +119,7 @@ Bước 5 làm, theo đúng thứ tự này (thứ tự có lý do — xem `scri
 > "đã cài" sẵn. Làm ở đây nghĩa là pod GPU $1.014/giờ nằm chờ suốt lúc tải; ở 0.4 là $0.06/giờ.
 > Với `SETUP_PROFILE=full` thì catalog mở hết 245GB, càng không nên tải trên đồng hồ GPU.
 
-**8 · Kiểm chứng thật** — [`make gpu-smoke`](#smoke). Đừng tin
+**9 · Kiểm chứng thật** — [`make gpu-smoke`](#smoke). Đừng tin
 màu xanh, chạy một job thật.
 
 ---
@@ -168,7 +179,8 @@ Lần dựng pod tiếp theo: quay lại **giai đoạn 1**, bỏ qua bước 7 
 
 Mặc định FE chạy local, nghĩa là **tắt máy bạn là không ai vào được app**. Muốn đưa cho người
 dùng thật thì cho FE chạy luôn trên pod: điền `FE_DOMAIN` (và `FE_PORT`, mặc định 2030) vào
-`.env`, thêm `https://<FE_DOMAIN>` vào `CORS_ORIGINS`, rồi `make gpu-bootstrap`.
+`.env`, thêm `https://<FE_DOMAIN>` vào `CORS_ORIGINS`, chạy `make gpu-bootstrap` (dựng ingress FE
+trên tunnel), rồi `make gpu-fe` (build + deploy chính FE lên pod).
 
 ```
                     ┌─ Cloudflare Tunnel (1 tunnel, 2 hostname)
@@ -183,7 +195,7 @@ Cả hai vẫn chạy song song: pod phục vụ người dùng, `make dev` đ�
 
 | Lệnh | Làm gì | Mất bao lâu |
 |---|---|---|
-| `make gpu-bootstrap` | backend + tunnel 2 hostname + frontend | lần đầu ~30 phút |
+| `make gpu-bootstrap` | backend + tunnel 2 hostname (KHÔNG deploy FE) | lần đầu ~30 phút |
 | `make gpu-fe` | CHỈ frontend: rsync + build + PM2 restart | ~2 phút |
 
 Sửa code FE xong thì `make gpu-fe`, không cần bootstrap lại.
@@ -525,7 +537,7 @@ xem `/etc/systemd/system/cloudflared.service` và `/tmp/cloudflared.log` (lệnh
 
 ## motions-studio/.env — có cần điền tay gì thêm không
 
-Không. `setup-motion-transfer.sh` (phase `phase_dotenv`, `lib-feature.sh:370`) tự sinh **toàn bộ**
+Không. `setup-motion-transfer.sh` (hàm `phase_dotenv()` trong `setup/lib-feature.sh`) tự sinh **toàn bộ**
 `.env` thật trên pod từ 6 flag `pod-bootstrap.sh` đã truyền (DOMAIN, SUPER_ADMIN, GMAIL_USER,
 GMAIL_APP_PASSWORD, CF_API_TOKEN/CF_TUNNEL_TOKEN, CORS_ORIGINS):
 
@@ -921,8 +933,13 @@ Hai cổng chặn trong `pod-fe.sh`:
 
 - `motions/` có thay đổi **chưa commit** → chặn. Artifact build từ commit nên không chứa chúng, và
   deploy ra một bản FE khác cái bạn đang sửa là lỗi mất hàng giờ mới nhận ra.
-- Không có run **thành công** cho đúng commit HEAD → chặn, kèm ba cách sửa. Không tự lấy artifact
-  của commit khác: deploy code cũ trong im lặng còn tệ hơn báo lỗi.
+- Không có run **thành công** nào mà `motions/` khớp HEAD → chặn, kèm ba cách sửa. `pod-fe.sh` so
+  **cây** (`git diff --quiet <headSha-của-run> HEAD -- motions/`), không so đúng SHA — vì
+  `build-frontend.yml` chỉ trigger theo `paths: [motions/**, ...]`, nên một commit chỉ chạm
+  backend/infra không có run riêng cho nó dù `motions/` chưa đổi một byte từ lần build gần nhất. So
+  SHA (cách cũ) thì `make gpu-fe` đỏ đúng vào lúc tài liệu này bảo chạy nó. Chọn được run của một
+  commit khác HEAD thì script **in rõ** commit đó là gì và vì sao vẫn đúng (`motions/` giống hệt) —
+  không âm thầm dùng artifact của commit khác, đó là loại "thành công giả" `pod-smoke.sh` cảnh báo.
 
 Đang sửa FE mà chưa muốn push thì `FE_BUILD=pod bash scripts/pod-fe.sh`.
 
@@ -1119,7 +1136,7 @@ Hai chi phí lặp lại mỗi lần dựng pod, và cách xoá chúng:
 | Chi phí | Nguyên nhân | Cách xoá |
 |---|---|---|
 | ~33GB tải model **trong app** | `lib-feature.sh` cố ý không tải model; bạn tự bấm Settings → Models AI mỗi pod mới | `POD_VOLUME` |
-| ~20-35 phút cài phần mềm | `setup-motion-transfer.sh` cài ComfyUI + torch + custom node từ đầu | `MTC_PREBUILT=1` |
+| ~20-35 phút cài phần mềm | `setup-motion-transfer.sh` cài ComfyUI + torch + custom node từ đầu | `MTC_PREBUILT=1` — **đo 06/08/2026 trên pod GPU thật: còn 284 giây ≈ 4,7 phút** (pull image 16,20 GB + boot 176 giây + `make gpu-bootstrap` 108 giây, rc=0) |
 | Mất users/jobs/workflows | Postgres nằm ở `/var/lib/postgresql` trên container disk, bị dựng lại mỗi Stop/Start | `POD_VOLUME` |
 
 ### Tạo volume (một lần)
@@ -1186,15 +1203,42 @@ cứng (exit 1) — và manifest cố ý **không** bị ghi đè lúc đó, đ�
   đọc hàng nghìn file nhỏ, mà `run_enhance` gọi `comfy_recycle` giữa mỗi chunk RIFE nên ComfyUI
   restart nhiều lần trong một job. Phần mềm để `MTC_PREBUILT=1` lo.
 
+<a id="image-dung-san"></a>
 ### Image dựng sẵn (`MTC_PREBUILT=1`)
 
-`motions-studio/worker-image/Dockerfile` bake ComfyUI + custom node + `worker-venv` +
-`api-node_modules` vào `/opt/mtc-prebuilt`. Build, push, dùng làm image của pod, rồi đặt
-`MTC_PREBUILT=1` trong `.env`. `lib-feature.sh:475` sẽ symlink thẳng vào đó và bỏ qua toàn bộ
-phần cài đặt.
+`motions-studio/worker-image/Dockerfile` — base `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404`
+(ship sẵn `/start.sh` sshd, không va [bẫy §1](#runpod-gotchas)) — bake ComfyUI lõi ghim commit +
+9 custom node ghim SHA + `worker-venv` + `bg-remover-venv` + `api-node_modules` + Ollama vào
+`/opt/mtc-prebuilt`. CI (`.github/workflows/build-prebuilt-image.yml`) build và push image lên
+`ghcr.io/<owner>/motion-prebuilt`, tag `sha-<commit>` (và `latest` chỉ khi push `main`). Đặt
+`POD_IMAGE=ghcr.io/<owner>/motion-prebuilt:sha-<commit>` — **ghim tag, không dùng `latest`** — và
+`MTC_PREBUILT=1` trong `.env`. Hàm `phase_prebuilt_deps()` (`setup/lib-feature.sh`) symlink thẳng
+vào đó và bỏ qua toàn bộ phần cài đặt.
 
 Thiếu `/opt/mtc-prebuilt/.ready` là setup `die` ngay — cố ý, để bạn không âm thầm rơi về đường
 cài-từ-đầu mà không biết.
+
+**Số đo thật, 06/08/2026, pod RunPod thật** (image `sha-f17ef55`, nén 16,20 GB / 60 layer, profile
+`full`):
+
+| | |
+|---|---|
+| Pull image + boot container + sshd sẵn sàng | 176 giây |
+| `make gpu-bootstrap` (backend, đường sạch không can thiệp tay), rc=0 | 108 giây |
+| **Tổng đường đi sạch** | **284 giây ≈ 4,7 phút**, so với baseline 20-35 phút |
+| torch trong image | `2.12.1+cu130` — `torch.cuda.get_device_capability()` ra `(12, 0)` trên RTX 5090 |
+| `JOB_TYPES` thật (bị `JOB_TYPES_OVERRIDE` cắt từ 21 type của profile `full` xuống, vì model chưa tải đủ — xem `.env.example`) | 16 type |
+| `make gpu-smoke` | 8/8 lớp pass (lớp 6 motion, lớp 7 tryon, lớp 8 create-image — trigger bằng `SMOKE_PRODUCT`/`SMOKE_PROMPT`, xem [§Kiểm chứng](#smoke)) |
+
+Hai điều tưởng đúng lúc thiết kế nhưng đo thật thì sai:
+
+- **Pull image không phải nút thắt.** 16,20 GB kéo về trong ~3 phút — pod RunPod nằm trong
+  datacenter, băng thông nội bộ lớn (đo được `maxDownloadSpeedMbps: 6674` trên một pod CPU cùng
+  đợt), không phải băng thông Internet gia đình.
+- **Image không ăn quota container disk.** Lo image giải nén 32-41 GB phải vừa chung `DISK=100`
+  với OS và PGDATA là sai mô hình: layer image nằm ở tầng đọc-riêng (read-only) của overlayfs, chỉ
+  tầng ghi (writable) mới tính vào quota container disk. Đo thật: `df -h /` báo `401M / 100G, dùng
+  1%`; `du -sh /opt/mtc-prebuilt` = 9,0 GB.
 
 ---
 
@@ -1206,7 +1250,7 @@ cài-từ-đầu mà không biết.
 node, hoặc `models/` là thư mục rỗng trên container disk. Lỗi đắt tiền nhất ở đây không ồn ào mà
 là **thành công giả**: mọi thứ xanh, và app lặng lẽ tải lại 33GB.
 
-`make gpu-smoke` kiểm sáu lớp, rẻ trước đắt sau, mỗi lớp in ra nó **chứng minh** điều gì:
+`make gpu-smoke` kiểm tám lớp, rẻ trước đắt sau, mỗi lớp in ra nó **chứng minh** điều gì:
 
 | Lớp | Kiểm | Chứng minh |
 |---|---|---|
@@ -1216,16 +1260,25 @@ là **thành công giả**: mọi thứ xanh, và app lặng lẽ tải lại 33
 | 4 | `/object_info/WanVideoModelLoader` | custom node đã nạp thật; thiếu là job motion chết với 400 *"node type not found"* |
 | 5 | `pod-volume.sh --check` | volume thật sự đang được dùng, số file model không giảm |
 | 6 | một job motion thật | năm lớp trên chứng minh từng mảnh đúng; chỉ job thật chứng minh chúng **ghép lại** đúng |
+| 7 | một job tryon thật | `qwen2.5vl:7b` auto-detect trang phục + venv `bg-remover` bake trong image — chỉ profile `full` mới có, chưa lớp nào trên chạm tới |
+| 8 | một job create-image thật | Qwen-Image-Edit chạy chỉ-bằng-prompt (không cần ảnh) |
 
-Lớp 6 là opt-in vì repo không có sẵn video dẫn động:
+Lớp 6-8 opt-in, mỗi lớp một biến trigger riêng — repo không có sẵn media mẫu, và lớp 8 cố ý
+**không** chạy cùng `SMOKE_REF`/`SMOKE_DRIVER` để `make gpu-smoke` trần giữ đúng cam kết "chỉ kiểm
+readiness, không tốn GPU" khi không đặt biến:
 
 ```bash
-SMOKE_REF=nhanvat.jpg SMOKE_DRIVER=dandong.mp4 make gpu-smoke
+SMOKE_REF=nhanvat.jpg SMOKE_DRIVER=dandong.mp4 make gpu-smoke   # + lớp 6: motion
+SMOKE_REF=nhanvat.jpg SMOKE_PRODUCT=aoso.jpg make gpu-smoke     # + lớp 7: tryon
+SMOKE_PROMPT="a red car" make gpu-smoke                          # + lớp 8: create-image
 ```
 
-Nó gửi job nhỏ nhất mà vẫn đi hết đường ống (540p, 33 frame), poll tới khi `done`, rồi tải output
-về `/tmp/smoke-out.mp4` và kiểm dung lượng. Đường đi: Postgres → worker claim → ComfyUI nạp Wan
-Animate **từ volume** → DWPose → sampling → VAE decode → MinIO → API trả URL.
+Lớp 6 gửi job nhỏ nhất mà vẫn đi hết đường ống (540p, 33 frame), poll tới khi `done`, rồi tải
+output về `/tmp/smoke-out.mp4` và kiểm dung lượng. Đường đi: Postgres → worker claim → ComfyUI nạp
+Wan Animate **từ volume** → DWPose → sampling → VAE decode → MinIO → API trả URL. Lớp 7-8 cùng cơ
+chế, tải về `/tmp/smoke-out-tryon.png` và `/tmp/smoke-out-create.png`.
+
+Đo thật 06/08/2026: 8/8 lớp pass — motion 286 KB mp4, tryon 1378 KB png, create-image 1785 KB png.
 
 Thiếu `GPU_SSH_HOST`/`GPU_SSH_PORT` trong `.env` thì lớp 3-5 tự bỏ qua kèm thông báo rõ, không
 im lặng báo pass.

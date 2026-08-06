@@ -34,6 +34,10 @@ RELIABILITY="${RELIABILITY:-$(env_get RELIABILITY)}"; RELIABILITY="${RELIABILITY
 # sit just under the measured median so a normal search still returns plenty of offers.
 MIN_DISK_BW="${MIN_DISK_BW:-$(env_get MIN_DISK_BW)}"; MIN_DISK_BW="${MIN_DISK_BW:-3000}"
 MIN_CPU_GHZ="${MIN_CPU_GHZ:-$(env_get MIN_CPU_GHZ)}"; MIN_CPU_GHZ="${MIN_CPU_GHZ:-2.5}"
+# Dùng để bỏ qua cảnh báo "not a runpod/* image" bên dưới — image prebuilt KHÔNG mang tiền tố
+# runpod/* (nó ở ghcr.io/...) nhưng base của nó (worker-image/Dockerfile) đúng là runpod/pytorch,
+# nên vẫn ship sshd + block như cảnh báo đó yêu cầu.
+MTC_PREBUILT="${MTC_PREBUILT:-$(env_get MTC_PREBUILT)}"; MTC_PREBUILT="${MTC_PREBUILT:-0}"
 OFFER="${OFFER:-}"
 SKIP="${SKIP:-}"
 
@@ -112,7 +116,12 @@ if [ -z "$IMAGE" ]; then
   fi
 fi
 # Guard the exact mistake above: a non-runpod image on RunPod is a crash loop, not a slow boot.
-if [ "$GPU_PROVIDER" = "runpod" ]; then
+# MTC_PREBUILT=1 skips this: the image is ghcr.io/<owner>/motion-prebuilt, not runpod/*, by
+# construction (Task 1 built it that way, pushed to GHCR, not RunPod's registry). It still ships
+# sshd + blocks — motions-studio/worker-image/Dockerfile:10 is FROM runpod/pytorch, so the part
+# this guard actually cares about (sshd) is inherited. Warning here would be noise every single
+# run, not a real risk.
+if [ "$GPU_PROVIDER" = "runpod" ] && [ "$MTC_PREBUILT" != "1" ]; then
   case "$IMAGE" in
     runpod/*) ;;
     *) warn "POD_IMAGE='$IMAGE' is not a runpod/* image. RunPod injects no sshd, so unless this"

@@ -272,7 +272,7 @@ phase_bootstrap() {
   fi
   USER_NAME="$(id -un)"; HOME_DIR="$HOME"
   ok "User=$USER_NAME · Home=$HOME_DIR · $(lsb_release -ds 2>/dev/null || echo Linux)"
-  ok "KHOÁ: JOB_TYPES=$JOB_TYPE · catalog=$(basename "$CATALOG_FILE") · KHÔNG tải model lúc cài"
+  ok "profile khai JOB_TYPES=$JOB_TYPE (có thể bị thu hẹp bằng JOB_TYPES_OVERRIDE ở phase_dotenv) · catalog=$(basename "$CATALOG_FILE") · KHÔNG tải model lúc cài"
 }
 
 phase_prompt() {
@@ -394,7 +394,24 @@ phase_dotenv() {
   # ── KHOÁ #1: catalog RIÊNG của feature (Settings → Models AI chỉ thấy model này) ──
   set_kv MODEL_CATALOG_PATH "$CATALOG_FILE"
   # ── KHOÁ #2: JOB_TYPES = ĐÚNG nhóm type của feature → worker không nhận job khác ──
-  set_kv JOB_TYPES "$JOB_TYPE"
+  # ALD 05/08/2026 - JOB_TYPES_OVERRIDE hẹp hơn JOB_TYPE của profile: dùng khi volume chưa có
+  # model cho hết số type profile khai. Chỉ CẮT BỚT, không thêm — type ngoài profile nghĩa là
+  # thiếu custom node, worker sẽ chết ở /prompt chứ không phải chỉ thiếu model.
+  _JT="$JOB_TYPE"
+  if [ -n "${JOB_TYPES_OVERRIDE:-}" ]; then
+    _bad=""
+    for _t in $(echo "$JOB_TYPES_OVERRIDE" | tr ',' ' '); do
+      case ",$JOB_TYPE," in *",$_t,"*) ;; *) _bad="$_bad $_t" ;; esac
+    done
+    if [ -n "$_bad" ]; then
+      die "JOB_TYPES_OVERRIDE có type ngoài profile $FEATURE:$_bad — profile khai: $JOB_TYPE"
+    fi
+    _JT="$JOB_TYPES_OVERRIDE"
+    # Chỉ báo "bị thu hẹp" khi thật sự khác — trùng y hệt profile (vd. người vận hành điền
+    # nguyên JOB_TYPE vào JOB_TYPES_OVERRIDE cho rõ ràng) thì đây không phải một cú cắt, im lặng.
+    [ "$_JT" = "$JOB_TYPE" ] || warn "JOB_TYPES bị thu hẹp bằng JOB_TYPES_OVERRIDE: $_JT (profile khai $(echo "$JOB_TYPE" | tr ',' '\n' | wc -l | tr -d ' ') type)"
+  fi
+  set_kv JOB_TYPES "$_JT"
   if [ "${NEED_OLLAMA:-0}" = "1" ]; then set_kv OLLAMA_URL "http://127.0.0.1:11434"; else set_kv OLLAMA_URL ""; fi
   [ -n "${CORS_ORIGINS:-}" ] && set_kv CORS_ORIGINS "$CORS_ORIGINS"
   [ -n "${HF_TOKEN:-}" ] && set_kv HF_TOKEN "$HF_TOKEN"
@@ -406,7 +423,7 @@ phase_dotenv() {
     warn "Chưa đặt Gmail → login OTP CHƯA gửi được. Sửa GMAIL_USER/GMAIL_APP_PASSWORD trong .env rồi 'pm2 restart api'."
   fi
   chmod 600 .env
-  ok ".env sẵn sàng (JOB_TYPES=$JOB_TYPE)"
+  ok ".env sẵn sàng (JOB_TYPES=$_JT)"
 
   PG_USER="$(get_kv POSTGRES_USER)";  PG_USER="${PG_USER:-motion}"
   PG_PASS="$(get_kv POSTGRES_PASSWORD)"
@@ -466,9 +483,23 @@ phase_postgres() {
 # bg-remover (rembg: tách nền, crop sản phẩm cho tryon — ecosystem.config.cjs:195). Box chuyên
 # không bật app này nên không dựng venv: rembg kéo theo onnxruntime, mất vài phút cài cho một
 # tiến trình sẽ không bao giờ nhận request. Profile full thì cần, và cần ở CẢ hai đường cài —
-# image dựng sẵn (worker-image/Dockerfile) KHÔNG có venv này, nên phase_prebuilt_deps cũng gọi.
+# image dựng sẵn (worker-image/Dockerfile) từ 05/08/2026 CÓ bake venv này; ensure_bg_remover()
+# symlink vào đó (kiểm import chạy được trước khi tin), và phase_prebuilt_deps() cũng gọi cùng
+# hàm để dùng chung một đường kiểm.
 ensure_bg_remover() {
   [ "${NEED_BG_REMOVER:-0}" = "1" ] || return 0
+  # ALD 05/08/2026 - Image dựng sẵn có venv bg-remover → symlink thay vì pip lại vài phút mỗi boot.
+  # Kiểm chạy được chứ không tin nó có mặt là đủ, cùng cách phase_prebuilt_deps kiểm api-node_modules.
+  local _pre="${MTC_PREBUILT_DIR:-/opt/mtc-prebuilt}/bg-remover-venv"
+  if [ "${MTC_PREBUILT:-0}" = "1" ] && [ -x "$_pre/bin/python" ]; then
+    if "$_pre/bin/python" -c "import rembg" >/dev/null 2>&1; then
+      rm -rf "$ROOT/bg-remover/venv"
+      ln -s "$_pre" "$ROOT/bg-remover/venv"
+      ok "bg-remover: dùng venv dựng sẵn từ image"
+      return 0
+    fi
+    warn "venv bg-remover dựng sẵn không import được rembg → dựng lại tại chỗ."
+  fi
   [ -x "$ROOT/bg-remover/venv/bin/python" ] || python3 -m venv "$ROOT/bg-remover/venv"
   "$ROOT/bg-remover/venv/bin/pip" install -q --upgrade pip >/dev/null
   "$ROOT/bg-remover/venv/bin/pip" install -q -r "$ROOT/bg-remover/requirements.txt" \
@@ -511,7 +542,7 @@ phase_prebuilt_deps() {
   if [ -d "$prebuilt/api-node_modules" ]; then
     rm -rf "$ROOT/api/node_modules"
     ln -s "$prebuilt/api-node_modules" "$ROOT/api/node_modules"
-    if ! (cd "$ROOT/api" && node -e "require('pg');require('express')" >/dev/null 2>&1); then
+    if ! (cd "$ROOT/api" && node -e "require('pg');require('pg-types');require('express')" >/dev/null 2>&1); then
       warn "node_modules dựng sẵn thiếu dependency → cài lại tại chỗ (chậm hơn vài phút nhưng chắc)."
       rm -f "$ROOT/api/node_modules"
       (cd "$ROOT/api" && npm install --omit=dev --no-audit --no-fund >/dev/null 2>&1) \
@@ -523,14 +554,30 @@ phase_prebuilt_deps() {
     rm -rf "$ROOT/worker/venv"
     ln -s "$prebuilt/worker-venv" "$ROOT/worker/venv"
   fi
-  # Image dựng sẵn không có venv bg-remover — dựng tại chỗ nếu profile cần (chậm hơn fast-boot
-  # vài phút, nhưng thiếu nó thì PM2 app bg-remover crash vòng lặp và tryon mất phần crop).
+  # Image dựng sẵn ĐÃ bake venv bg-remover (worker-image/Dockerfile) — ensure_bg_remover() symlink
+  # vào đó khi import chạy được. Chỉ dựng tại chỗ (chậm hơn fast-boot vài phút) khi venv dựng sẵn
+  # thiếu/hỏng; thiếu cả hai đường thì PM2 app bg-remover crash vòng lặp và tryon mất phần crop.
   ensure_bg_remover
 
   COMFY_DIR="${COMFY_DIR:-$prebuilt/ComfyUI}"
   [ -f "$COMFY_DIR/main.py" ] || die "Image dựng sẵn thiếu ComfyUI tại $COMFY_DIR"
   [ -x "$COMFY_DIR/venv/bin/python" ] || die "Image dựng sẵn thiếu Python venv của ComfyUI"
   mkdir -p "$ROOT/.data/minio" "$COMFY_DIR/models/uploads"/{loras,checkpoints,unet,vae,text_encoders,clip_vision}
+
+  # Seed models của chính ComfyUI (configs/*.yaml + placeholder) do image dời sang comfy-models-seed
+  # để pod-volume.sh nối được $COMFY_DIR/models sang volume. Chép phần CÒN THIẾU sang volume:
+  # `cp -rn` không bao giờ ghi đè, nên model người dùng đã tải an toàn tuyệt đối.
+  # Đặt SAU khi COMFY_DIR đã set và sau mkdir -p models/uploads ở trên, để chắc chắn $COMFY_DIR/models
+  # đã là symlink trỏ vào volume: scripts/pod-bootstrap.sh chạy setup/pod-volume.sh (nối volume)
+  # TRƯỚC khi gọi setup-full.sh → feature_main() → phase_prebuilt_deps() này. Nếu cp chạy trước khi
+  # có symlink, nó ghi vào container disk và mất sạch, im lặng, lúc gpu-destroy.
+  # Bỏ qua im lặng nếu không có thư mục seed (image cũ, hoặc đường không-prebuilt).
+  local _seed="$prebuilt/comfy-models-seed"
+  if [ -d "$_seed" ]; then
+    cp -rn "$_seed/." "$COMFY_DIR/models/" \
+      || warn "gieo seed models từ $_seed sang $COMFY_DIR/models lỗi (hết chỗ trên volume? quyền ghi?) — model người dùng không mất, nhưng thiếu placeholder/configs của ComfyUI."
+  fi
+
   set_kv COMFY_LOCAL "1"
   set_kv COMFY_DIR "$COMFY_DIR"
   set_kv COMFY_MODELS_DIR "$COMFY_DIR/models"
@@ -794,7 +841,7 @@ phase_done() {
   printf '\033[1;32m════════ Motion Backend (%s) đã chạy (PM2) ════════\033[0m\n' "$FEATURE"
   echo "  Health   : curl $BE_URL/health   (local: http://127.0.0.1:8080/health)"
   echo "  Admin    : $SUPER_ADMIN  → FE bấm gửi OTP để đăng nhập"
-  echo "  Khoá     : JOB_TYPES=$JOB_TYPE · catalog=$(basename "$CATALOG_FILE") · KHÔNG có ComfyUI-Manager"
+  echo "  Khoá     : JOB_TYPES=$_JT · catalog=$(basename "$CATALOG_FILE") · KHÔNG có ComfyUI-Manager"
   echo "  PM2      : pm2 ls   ·   pm2 logs api   ·   pm2 restart ecosystem.config.cjs --only $PM2_APPS"
   [ "${GPU_OK:-0}" = "1" ] && echo "  ComfyUI  : pm2 logs comfyui   (native ở ${COMFY_DIR:-?})" || echo "  ComfyUI  : KHÔNG cài local — set COMFY_URL trỏ box GPU rồi 'pm2 restart worker'"
   echo

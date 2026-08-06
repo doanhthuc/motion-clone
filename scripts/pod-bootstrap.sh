@@ -31,8 +31,9 @@ CORS_ORIGINS="$(env_get CORS_ORIGINS)"
 
 # ── Frontend on the pod (optional) ────────────────────────────────────────────
 # FE_DOMAIN set → setup-pm2.sh adds a SECOND public hostname to the same Cloudflare Tunnel
-# (CF_FE_DOMAIN → localhost:FE_PORT, plus its DNS record), and scripts/pod-fe.sh deploys the
-# Nuxt app behind it at the end. End-users then open one HTTPS link and your laptop can be off.
+# (CF_FE_DOMAIN → localhost:FE_PORT, plus its DNS record) here in this script. Deploying the Nuxt
+# app behind it is a SEPARATE step, not done by this script: run `make gpu-fe` once the ingress
+# exists. End-users then open one HTTPS link and your laptop can be off.
 # Leave it empty to keep the old shape: backend on the pod, frontend local via `make dev`.
 FE_DOMAIN="$(env_get FE_DOMAIN)"
 FE_PORT="$(env_get FE_PORT)"; FE_PORT="${FE_PORT:-2030}"
@@ -54,6 +55,9 @@ fi
 POD_VOLUME="$(env_get POD_VOLUME)"
 MTC_PREBUILT="$(env_get MTC_PREBUILT)"
 MODELS_MIN_GB="$(env_get MODELS_MIN_GB)"
+# ALD 05/08/2026 - Khoá JOB_TYPES hẹp hơn profile khai. Profile nói phần mềm chạy được gì;
+# biến này nói VOLUME NÀY có model cho gì. Bỏ trống = dùng nguyên JOB_TYPE của profile.
+JOB_TYPES_OVERRIDE="$(env_get JOB_TYPES_OVERRIDE)"
 
 # ── Hình dạng deploy: cài gì, và ai chạy job ─────────────────────────────────
 # Hai câu hỏi độc lập, hai biến. Cách suy ra nằm ở scripts/lib-deploy-shape.sh vì
@@ -132,8 +136,9 @@ else
 fi
 
 if [ "$SETUP_PROFILE" = "cpu-box" ]; then
-  # Nói đúng cái sẽ xảy ra. Profile cpu-box đặt SKIP_COMFY=1 nên GPU_OK=0, và cả khối ComfyUI
-  # (kể cả motion_install_best_pytorch) bị bỏ qua — lib-feature.sh:597. Nhanh hơn nhiều.
+  # Nói đúng cái sẽ xảy ra. Profile cpu-box đặt SKIP_COMFY=1 nên GPU_OK=0, và cả khối
+  # `if [ "$GPU_OK" = "1" ]` của phase_comfyui() (kể cả motion_install_best_pytorch, setup/lib-feature.sh)
+  # bị bỏ qua. Nhanh hơn nhiều.
   log "running $SETUP_SCRIPT on the pod — installs Postgres/MinIO/PM2 and wires up the"
   log "Cloudflare Tunnel. NO ComfyUI, NO PyTorch/CUDA, NO worker: đây là box CPU, GPU do RunPod"
   log "Serverless lo. Nhanh hơn profile GPU đáng kể vì bỏ hẳn phần cài torch."
@@ -158,6 +163,7 @@ GMAIL_APP_PASSWORD='$GMAIL_APP_PASSWORD' CF_API_TOKEN='$CF_API_TOKEN' \
 CF_TUNNEL_TOKEN='$CF_TUNNEL_TOKEN' CORS_ORIGINS='$CORS_ORIGINS' HF_TOKEN='' \
 ${FE_DOMAIN:+CF_FE_DOMAIN='$FE_DOMAIN' CF_FE_PORT='$FE_PORT' FRONTEND_URL='https://$FE_DOMAIN'} \
 MTC_PREBUILT='${MTC_PREBUILT:-0}' \
+${JOB_TYPES_OVERRIDE:+JOB_TYPES_OVERRIDE='$JOB_TYPES_OVERRIDE'} \
 ./$SETUP_SCRIPT" < /dev/null | tee "$LOG"
 STATUS=${PIPESTATUS[0]}
 [ "$STATUS" -eq 0 ] || die "$SETUP_SCRIPT exited $STATUS — full log: $LOG"
@@ -357,13 +363,19 @@ if [ -n "$DASHBOARD_STEP" ]; then
 fi
 
 # ── Frontend on the pod ───────────────────────────────────────────────────────
-# Last, deliberately: the tunnel ingress it depends on was just created above, and it reads the
-# backend's API_KEY off the pod's own .env, which only exists once setup has finished.
+# Deliberately NOT deployed here anymore — but no longer for the reason first written here.
+# The original reason was that pod-fe.sh matched the artifact by exact HEAD sha, so a backend-only
+# commit failed every time and gpu-bootstrap always ended in red. That is fixed: pod-fe.sh now
+# compares the motions/ TREE, so it reuses the last FE artifact when the frontend has not changed.
+#
+# It stays separate for two reasons that still hold. gpu-bootstrap is idempotent and gets re-run on
+# every backend edit; rebuilding the frontend each time buys nothing. And when motions/ HAS really
+# changed with no green CI yet — or gh is not logged in, or the artifact aged out — that frontend
+# failure must not take down a backend install that finished cleanly in the same command.
+# Deploy the frontend on its own with: make gpu-fe
 if [ -n "$FE_DOMAIN" ]; then
-  echo
-  log "deploying the frontend onto the pod (rsync + build + PM2)…"
-  bash scripts/pod-fe.sh || die "frontend deploy failed — the backend is up, re-run just the frontend with: make gpu-fe"
   APP_URL="https://$FE_DOMAIN"
+  echo "  backend is up. FE_DOMAIN is set — deploy the frontend with:   make gpu-fe"
 else
   APP_URL="http://localhost:2030"
   echo "  restart the FE dev server to pick it up:   make down && make dev"

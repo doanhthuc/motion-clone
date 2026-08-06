@@ -26,9 +26,9 @@ Bảng so sánh và các cạm bẫy khi ghép chúng: `docs/gpu-pod.md#deploy-s
 
 Máy thuê đều NAT nên dùng Cloudflare Tunnel thay vì mở port — chi tiết ở `docs/gpu-pod.md`.
 
-Muốn người khác dùng được app mà không cần máy bạn bật: điền `FE_DOMAIN` vào `.env`, khi đó
-`make gpu-bootstrap` chạy luôn frontend trên pod và tunnel phục vụ 2 hostname
-(`app.…`→FE, `api.…`→BE). Sửa code FE sau đó chỉ cần `make gpu-fe`.
+Muốn người khác dùng được app mà không cần máy bạn bật: điền `FE_DOMAIN` vào `.env`, khi đó tunnel
+phục vụ 2 hostname (`app.…`→FE, `api.…`→BE). Frontend deploy bằng **bước riêng** `make gpu-fe` —
+`make gpu-bootstrap` chỉ lo backend. Sửa code FE sau đó cũng chỉ cần `make gpu-fe`.
 Xem `docs/gpu-pod.md#frontend-on-the-pod`.
 
 ## Bắt đầu
