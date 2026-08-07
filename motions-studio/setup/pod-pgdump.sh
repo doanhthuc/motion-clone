@@ -132,6 +132,13 @@ _row_counts() {
 #       Nên: gom vào mảng `bad`, in ra STDERR, và `exit 1` ở END → _dump_row_counts trả khác 0
 #       → do_dump cảnh báo to và trả 1. .meta THIẾU bảng đó (chứ không chứa khoá rác), nên
 #       --verify sau đó sẽ đỏ — và người đọc đã có sẵn lời giải thích từ lúc --dump.
+#     - dòng KẾT THÚC `FROM stdin;` nhưng NHÁY KÉP KHÔNG CÂN, ví dụ `COPY jobs " FROM stdin;`
+#       trong thân CREATE FUNCTION (đo bằng pg_dump 18 — hình dạng THẬT, không bịa). Ở đây báo
+#       to là ĐÚNG dù .meta vẫn đầy đủ: nhánh này không thể im, vì nếu để dòng ấy parse tiếp thì
+#       `s` = `jobs "` mở một khối giả và ghi khoá rác `jobs "=N` — đúng thứ đoạn NGUYÊN TẮC
+#       dưới cấm. Nhưng nó là nguyên nhân THỨ HAI làm cờ meta_incomplete được ghi, và ở trường
+#       hợp này .meta ĐẦY ĐỦ và --verify XANH. Thông điệp ở cuối do_dump() nói cả hai; đừng viết
+#       lại thành "nguyên nhân duy nhất là identifier có xuống dòng" — đã sai một lần rồi.
 #     - bảng phân vùng (parent trong pg_tables nhưng dữ liệu ở các leaf) vẫn đếm khác _row_counts.
 #
 #   Schema hiện tại không chạm tới dạng nào ở nhóm hai (đã grep motions-studio/db/: không
@@ -461,11 +468,24 @@ do_dump() {
   # MỌI `--verify` sau này trên bản dump ấy đều đỏ. Không báo bây giờ thì ba tuần nữa gpu-smoke
   # đỏ ở lớp 6 và không ai truy ra được vì sao.
   if [ "$meta_rc" != 0 ]; then
-    warn "BẢN DUMP TỐT NHƯNG .meta THIẾU BẢNG — có header COPY không parse được (chi tiết ở trên)."
-    warn "Nguyên nhân đã biết duy nhất: identifier chứa ký tự XUỐNG DÒNG (tên bảng hoặc tên cột),"
-    warn "pg_dump phát header vỡ làm hai dòng và awk đọc theo dòng nên không ghép lại được."
-    warn "Dump ĐÃ ghi xong ở $out và vẫn --restore được — KHÔNG xoá nó."
-    warn "Nhưng --verify trên bản này sẽ đỏ vì .meta cụt, chứ không phải vì file hỏng."
+    warn "BẢN DUMP TỐT — nhưng có dòng COPY parser không xử được (chi tiết ở trên)."
+    # ĐÍNH CHÍNH 2026-08-08: bản trước nói "nguyên nhân đã biết DUY NHẤT: identifier chứa XUỐNG
+    # DÒNG" và khẳng định thẳng ".meta THIẾU BẢNG". Cả hai đều SAI, đã đo bằng pg_dump 18: một
+    # dòng `COPY jobs " FROM stdin;` nằm trong thân CREATE FUNCTION cũng tới được đây, và ở đó
+    # .meta ĐẦY ĐỦ, --verify XANH. Nói chắc là thiếu bảng khi nó không thiếu chính là kiểu sai
+    # hướng mà khối này tồn tại để chặn.
+    warn "HAI nguyên nhân đã biết, phân biệt bằng chính dòng in ở trên:"
+    warn " 1. identifier chứa ký tự XUỐNG DÒNG (tên bảng hoặc tên cột): pg_dump phát header vỡ"
+    warn "    làm nhiều dòng vật lý, awk đọc theo dòng nên không ghép lại được. .meta THẬT SỰ"
+    warn "    thiếu bảng đó ⇒ --verify trên bản này sẽ ĐỎ, và đỏ vì .meta cụt chứ không phải"
+    warn "    vì file hỏng. Dòng in ở trên khi đó là một header CỤT (kết thúc giữa chừng)."
+    warn " 2. một dòng SQL bình thường pg_dump chép NGUYÊN VĂN (thân CREATE FUNCTION, COMMENT ON,"
+    warn "    định nghĩa view) trông đủ giống header: mở đầu \`COPY \`, kết thúc \`FROM stdin;\`,"
+    warn "    nhưng nháy kép không cân hoặc tên bảng rỗng. Khi đó .meta VẪN ĐẦY ĐỦ và --verify"
+    warn "    XANH. Parser báo to thay vì đoán, vì đoán sai ở đây là ghi KHOÁ RÁC vào .meta —"
+    warn "    thứ làm --verify đỏ khó hiểu ba tuần sau trên một bản dump hoàn toàn tốt."
+    warn "Chạy \`--verify\` để biết mình đang ở trường hợp nào. Dump ĐÃ ghi xong ở $out và vẫn"
+    warn "--restore được — KHÔNG xoá nó, cả hai trường hợp."
   fi
 
   # Phần đỏ của symlink, hoãn từ trên xuống. In SAU cảnh báo quyền để không nuốt mất nó khi cả
@@ -533,10 +553,14 @@ do_check() {
   log "số dòng ghi trong .meta:"
   grep -vE '^(created|pg_version|dump_bytes|meta_incomplete)=' "$meta" 2>/dev/null | sed 's/^/    /'
 
-  # Nói ngay ở --check, đừng đợi --verify đỏ rồi mới đoán: danh sách ngay trên là KHÔNG ĐẦY ĐỦ.
+  # Nói ngay ở --check, đừng đợi --verify đỏ rồi mới đoán: danh sách ngay trên CÓ THỂ thiếu bảng.
+  # "CÓ THỂ", không phải "THIẾU" — xem đính chính 2026-08-08 ở cuối do_dump: cờ này cũng được ghi
+  # cho một dòng SQL chép nguyên văn trông giống header, và ở trường hợp đó danh sách ĐẦY ĐỦ.
+  # --check không đọc lại file dump nên nó KHÔNG phân biệt được hai trường hợp; chỉ --verify mới.
   if grep -q '^meta_incomplete=1' "$meta" 2>/dev/null; then
-    warn "…và danh sách trên THIẾU BẢNG: lúc --dump có header COPY không parse được."
-    warn "Bản dump vẫn tốt và vẫn --restore được; chỉ .meta cụt, nên --verify trên bản này sẽ đỏ."
+    warn "…và danh sách trên CÓ THỂ THIẾU BẢNG: lúc --dump có dòng COPY parser không xử được."
+    warn "Bản dump vẫn tốt và vẫn --restore được. Chạy --verify để biết chắc: XANH nghĩa là danh"
+    warn "sách trên vẫn đủ (dòng kia chỉ là SQL trông giống header); ĐỎ nghĩa là .meta thật sự cụt."
   fi
 
   # return 0 TƯỜNG MINH, đừng bỏ. Không có nó thì giá trị trả về của hàm là exit status của
@@ -568,6 +592,11 @@ do_verify() {
 
   if gzip -dc "$target" | PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" \
        -d "$vdb" --single-transaction -v ON_ERROR_STOP=1 -q >/dev/null 2>&1; then
+    # Bộ lọc `meta_incomplete` ở đây KHÔNG phải phòng thủ suông — nó tới được, và có test đỏ
+    # được. Đo 2026-08-08: một dòng `COPY jobs " FROM stdin;` trong thân CREATE FUNCTION làm
+    # --dump ghi cờ NHƯNG .meta vẫn ĐẦY ĐỦ. Bỏ `meta_incomplete` khỏi bộ lọc này thì `want` thừa
+    # đúng một dòng `meta_incomplete=1`, và --verify ĐỎ trên một bản dump hoàn hảo với phần diff
+    # vô nghĩa. Đã dựng mutant đúng như vậy và assertion tương ứng trong pgdump-test.sh đỏ.
     want="$(grep -vE '^(created|pg_version|dump_bytes|meta_incomplete)=' "$meta" 2>/dev/null | sort)"
     got="$(_row_counts "$vdb")"
     if [ "$want" = "$got" ]; then
@@ -580,15 +609,23 @@ do_verify() {
       # vào giữa pg_dump và lần đếm — không còn sinh ra triệu chứng này được nữa.
       warn "Hai vế đều đọc từ CÙNG bản dump này: vế trái là số dòng ghi trong file, vế phải là"
       warn "số dòng đếm được sau khi nạp thật file đó vào một DB tạm."
-      # Đọc CỜ trước khi chẩn đoán. Có đúng một nguyên nhân đã biết làm `.meta` cụt NGAY TỪ LÚC
-      # GHI, và nó đã được ghi thẳng vào file lúc --dump. Không hỏi cờ mà đọc thẳng câu "nghi ngờ
-      # file hỏng hoặc .meta bị sửa tay" là chỉ SAI HƯỚNG đúng vào kịch bản phổ biến nhất — người
-      # đọc sẽ đi soi gzip và mtime của một bản dump hoàn toàn lành.
+      # Đọc CỜ trước khi chẩn đoán. Nếu cờ có mặt thì .meta đã được đánh dấu không đầy đủ NGAY
+      # TỪ LÚC GHI. Không hỏi cờ mà đọc thẳng câu "nghi ngờ file hỏng hoặc .meta bị sửa tay" là
+      # chỉ SAI HƯỚNG đúng vào kịch bản phổ biến nhất — người đọc sẽ đi soi gzip và mtime của
+      # một bản dump hoàn toàn lành.
+      #
+      # Cờ + verify ĐỎ ⇒ gần như chắc chắn là nguyên nhân (1) ở cuối do_dump (identifier có
+      # xuống dòng): nguyên nhân (2) để lại .meta ĐẦY ĐỦ nên nó làm verify XANH, không tới đây.
+      # "Gần như" chứ không "chắc chắn": (2) cộng thêm một lệch thật sự khác vẫn rơi vào nhánh
+      # này. Vì thế câu dưới nói KHẢ NĂNG CAO NHẤT và vẫn chỉ đường kiểm lại, không chốt cứng.
       if grep -q '^meta_incomplete=1' "$meta" 2>/dev/null; then
-        warn "NGUYÊN NHÂN ĐÃ BIẾT: .meta này ĐÃ ĐƯỢC ĐÁNH DẤU KHÔNG ĐẦY ĐỦ ngay lúc --dump —"
-        warn "lúc đó có header COPY không parse được (identifier chứa ký tự XUỐNG DÒNG), nên"
-        warn ".meta thiếu hẳn bảng chứ file dump KHÔNG hỏng. Đọc phần diff trên: vế phải (nạp"
-        warn "lại thật) mới là số đúng. Đừng đi soi file dump — nó vẫn --restore được bình thường."
+        warn "KHẢ NĂNG CAO NHẤT: .meta này ĐÃ ĐƯỢC ĐÁNH DẤU KHÔNG ĐẦY ĐỦ ngay lúc --dump — lúc"
+        warn "đó có dòng COPY parser không xử được, điển hình là identifier chứa ký tự XUỐNG DÒNG."
+        warn "Khi đó .meta thiếu hẳn bảng chứ file dump KHÔNG hỏng. Đọc phần diff trên: nếu nó chỉ"
+        warn "gồm những dòng CHỈ CÓ Ở VẾ PHẢI thì đúng là vậy — vế phải (nạp lại thật) mới là số"
+        warn "đúng, và đừng đi soi file dump, nó vẫn --restore được bình thường. Còn nếu diff có"
+        warn "bảng CÓ Ở CẢ HAI VẾ mà số đếm lệch, thì cờ này KHÔNG giải thích được nó — đó là một"
+        warn "lệch thật, phải truy riêng và không được bỏ qua."
       else
         warn "Lệch nghĩa là nạp lại KHÔNG ra đúng nội dung — nghi ngờ file hỏng, hoặc .meta bị"
         warn "sửa tay. Đây KHÔNG còn là đua ghi-trong-lúc-dump; đừng bỏ qua nó như trước."

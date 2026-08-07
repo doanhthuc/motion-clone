@@ -399,7 +399,10 @@ assert_eq "1" "$NL_RC" "identifier có xuống dòng: --dump trả khác 0 — k
 printf '%s' "$NL_OUT" | grep -q "header COPY không parse được" \
   && ok "identifier có xuống dòng: in ra ĐÚNG dòng header không parse được" \
   || bad "identifier có xuống dòng: không nói gì — parser nuốt lỗi"
-printf '%s' "$NL_OUT" | grep -q ".meta THIẾU BẢNG" \
+# Hệ quả phải được NÊU ĐÍCH DANH: .meta thật sự thiếu bảng, và --verify sau này sẽ đỏ vì thế.
+# Từ 2026-08-08 thông điệp liệt kê HAI nguyên nhân (xem đính chính cuối do_dump) nên nó không
+# còn khẳng định phẳng ".meta THIẾU BẢNG" nữa; grep vào cụm mô tả nhánh (1), là nhánh đúng ở đây.
+printf '%s' "$NL_OUT" | grep -q "XUỐNG DÒNG" && printf '%s' "$NL_OUT" | grep -q "sẽ ĐỎ" \
   && ok "identifier có xuống dòng: nói rõ hệ quả (.meta cụt ⇒ --verify sau này đỏ)" \
   || bad "identifier có xuống dòng: không giải thích hệ quả — người đọc không truy ra được"
 M8="$(ls "$VOL"/pg/dumps/*.meta | head -1)"
@@ -529,6 +532,49 @@ assert_eq "0" "$(grep -c '^meta_incomplete=' "$M10" | tr -d ' ')" \
   'dấu " lẻ: KHÔNG có cờ meta_incomplete — cờ ghi vĩnh viễn vào file, tố oan là hỏng mãi mãi'
 assert_ok 'dấu " lẻ: --verify xanh' -- bash "$SCRIPT" --verify
 q 'DROP VIEW vdoc; DROP FUNCTION fdoc(); COMMENT ON TABLE users IS NULL;' >/dev/null
+
+# (6) NHÁNH CÒN LẠI của parser, và là thứ làm bộ lọc `meta_incomplete` ở do_verify TỚI ĐƯỢC.
+#
+# Việc siết ở khối (5) chỉ chạm nhánh "không kết thúc FROM stdin;". Còn một nhánh nữa: dòng
+# KẾT THÚC `FROM stdin;` nhưng nháy kép KHÔNG CÂN (`if (q) bad`). Đo bằng pg_dump 18, một dòng
+# `COPY jobs " FROM stdin;` trong thân CREATE FUNCTION rơi đúng vào đó. Nhánh này CỐ Ý giữ ồn:
+# bỏ nó đi thì dòng ấy được PARSE làm header thật, mở một khối giả và ghi khoá rác `jobs "=N`
+# vào .meta — đúng thứ cả thiết kế này cấm. Thà báo to còn hơn ghi rác trong im lặng.
+#
+# Nhưng hệ quả: cờ meta_incomplete=1 được ghi TRONG KHI .meta VẪN ĐẦY ĐỦ. Đó là kịch bản DUY
+# NHẤT làm bộ lọc `meta_incomplete` ở do_verify có tác dụng quan sát được — ở dạng identifier có
+# xuống dòng (khối (3)) verify đã đỏ sẵn vì thiếu bảng, nên bỏ bộ lọc cũng không đổi kết quả.
+# Đo bằng mutant: bỏ `meta_incomplete` khỏi bộ lọc ở do_verify ⇒ `want` thừa một dòng
+# `meta_incomplete=1` ⇒ --verify ĐỎ trên một bản dump hoàn hảo, với diff vô nghĩa. Assertion
+# "--verify XANH" ngay dưới là cái đỏ lên khi đó — nó KHÔNG phải chỗ lấp cho có.
+rm -rf "$VOL/pg"; seed
+q 'CREATE FUNCTION fq() RETURNS text LANGUAGE sql AS $fn$
+SELECT $doc$vi du:
+COPY jobs " FROM stdin;
+het$doc$::text
+$fn$;' >/dev/null
+UQ_OUT="$(bash "$SCRIPT" --dump 2>&1)"; UQ_RC=$?
+assert_eq "1" "$UQ_RC" 'nháy kép không cân trong thân function: --dump trả 1 (báo to, không đoán)'
+MU="$(ls "$VOL"/pg/dumps/*.meta | head -1)"
+assert_eq "7" "$(grep '^jobs=' "$MU" | cut -d= -f2)" 'nháy không cân: .meta VẪN ĐẦY ĐỦ (jobs=7)'
+assert_eq "3" "$(grep '^users=' "$MU" | cut -d= -f2)" 'nháy không cân: .meta VẪN ĐẦY ĐỦ (users=3)'
+assert_eq "0" "$(meta_junk "$MU")" 'nháy không cân: KHÔNG ghi khoá rác `jobs "=N` vào .meta'
+assert_eq "1" "$(grep -c '^meta_incomplete=1' "$MU" | tr -d ' ')" 'nháy không cân: có cờ meta_incomplete=1'
+# Cờ CÓ, .meta ĐẦY ĐỦ ⇒ verify phải XANH. Đây là assertion khoá bộ lọc meta_incomplete ở do_verify.
+assert_ok 'nháy không cân: --verify XANH dù .meta mang cờ (bộ lọc meta_incomplete ở do_verify)' \
+  -- bash "$SCRIPT" --verify
+# …và thông điệp của --dump KHÔNG được khẳng định thiếu bảng: ở đây nó không thiếu gì.
+printf '%s' "$UQ_OUT" | grep -q 'BẢN DUMP TỐT NHƯNG .meta THIẾU BẢNG' \
+  && bad "nháy không cân: --dump khẳng định '.meta THIẾU BẢNG' — sai sự thật, .meta đầy đủ" \
+  || ok "nháy không cân: --dump KHÔNG khẳng định sai rằng .meta thiếu bảng"
+printf '%s' "$UQ_OUT" | grep -q 'Nguyên nhân đã biết duy nhất' \
+  && bad "nháy không cân: --dump vẫn nói 'nguyên nhân đã biết DUY NHẤT là xuống dòng' — sai" \
+  || ok "nháy không cân: --dump không còn quy kết 'nguyên nhân duy nhất là identifier xuống dòng'"
+CHKU="$(bash "$SCRIPT" --check 2>&1)"
+printf '%s' "$CHKU" | grep -q 'CÓ THỂ THIẾU BẢNG' \
+  && ok "nháy không cân: --check nói 'CÓ THỂ thiếu' chứ không chốt cứng là thiếu" \
+  || bad "nháy không cân: --check chốt cứng danh sách là thiếu, trong khi nó đầy đủ"
+q 'DROP FUNCTION fq();' >/dev/null
 
 # Bảng ở schema KHÁC public không được lọt vào .meta: _row_counts (vế `got` của verify) chỉ
 # đếm schema public, nên thêm vào là verify đỏ oan. Nhưng khối COPY của nó vẫn phải được ĐỌC

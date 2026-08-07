@@ -1249,6 +1249,21 @@ $POD_VOLUME/pg/
 └── latest -> dumps/motion-20260807-083529.sql.gz   # symlink tương đối, luôn trỏ bản mới nhất
 ```
 
+Có thêm **một khoá tuỳ chọn**, chỉ xuất hiện khi cần: `meta_incomplete=1`. `--dump` ghi nó khi
+parser gặp một dòng mở đầu bằng `COPY ` mà nó không xử được, và cờ đi cùng **file** chứ không chỉ
+cùng lần chạy — cảnh báo trên terminal biến mất khi màn hình cuộn qua, hệ quả thì sống với bản
+dump. Hai nguyên nhân, và chúng khác nhau ở chỗ quan trọng nhất:
+
+| Nguyên nhân | `.meta` | `--verify` |
+|---|---|---|
+| identifier (tên bảng/cột) chứa ký tự **xuống dòng** — `pg_dump` phát header COPY vỡ làm nhiều dòng vật lý | **thiếu hẳn** bảng đó | **đỏ**, và đỏ vì `.meta` cụt chứ không phải vì file hỏng |
+| một dòng SQL `pg_dump` chép nguyên văn (thân `CREATE FUNCTION`, `COMMENT ON`, định nghĩa view) trông giống header nhưng nháy kép không cân — `COPY jobs " FROM stdin;` | **đầy đủ** | **xanh** |
+
+Nên `meta_incomplete=1` đọc là *"danh sách bảng CÓ THỂ thiếu"*, không phải *"chắc chắn thiếu"*.
+`--check` không đọc lại file dump nên nó không phân biệt được hai trường hợp và nói đúng như vậy;
+chỉ `--verify` mới trả lời dứt điểm. Cả hai trường hợp: **bản dump vẫn tốt và vẫn `--restore`
+được** — cờ này không bao giờ là lý do để xoá một bản backup.
+
 **Ba điểm gọi `--dump`, không cái nào định kỳ (không cron, không app PM2):**
 
 1. **`make gpu-down`** — điểm chính. Đây là lúc **cuối cùng** còn SSH vào pod được trước khi dừng
