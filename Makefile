@@ -85,13 +85,14 @@ endif
 # only found out from the invoice.
 gpu-destroy: ## Permanently destroy the pod (frees the GPU, deletes its disk — irreversible)
 	@test -n "$(call env,GPU_INSTANCE_ID)" || { echo "GPU_INSTANCE_ID is empty in .env — nothing to destroy"; exit 1; }
-	@# Cố sao lưu lần cuối. Pod đang DỪNG thì ssh không vào được và volume cũng không đọc
-	@# được (volume chỉ mount qua pod) — lúc đó không có cách nào biết bản dump gần nhất bao
-	@# giờ. Vẫn xoá theo đúng lựa chọn thiết kế: không có cổng chặn nào.
+	@# Cố sao lưu lần cuối. KHÔNG nuốt stderr: pod-pgdump.sh báo lỗi nghiêm trọng qua die() ra
+	@# stderr, và đây là ngay trước một thao tác không hoàn tác được. Nếu pod đã dừng thì ssh tự
+	@# in lỗi kết nối — ồn hơn một chút, nhưng đó là tiếng ồn TRUNG THỰC. Nuốt hết rồi đoán
+	@# "pod đã dừng?" là khẳng định một nguyên nhân ta không biết, ngay lúc người dùng cần biết nhất.
 	@ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
 		-p $(call env,GPU_SSH_PORT) root@$(call env,GPU_SSH_HOST) \
-		"cd ~/motion-backend && bash ./setup/pod-pgdump.sh --dump" 2>/dev/null \
-		|| echo "!! không sao lưu được (pod đã dừng?) — XOÁ TIẾP. Bản dump gần nhất là lần 'make gpu-down' hoặc 'make gpu-db-dump' cuối cùng."
+		"cd ~/motion-backend && bash ./setup/pod-pgdump.sh --dump" \
+		|| echo "!! sao lưu lần cuối KHÔNG thành công (lý do ở ngay trên) — vẫn XOÁ pod theo yêu cầu."
 ifeq ($(shell grep -E '^GPU_PROVIDER=' .env 2>/dev/null | cut -d= -f2),runpod)
 	@runpodctl pod delete $(call env,GPU_INSTANCE_ID) || true
 	@sleep 3

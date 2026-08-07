@@ -927,14 +927,19 @@ gpu-down: ## Stop the pod (DO NOT FORGET — an idle pod bills by the hour)
 Chèn vào đầu target `gpu-destroy`, ngay sau dòng `@test -n "$(call env,GPU_INSTANCE_ID)" || ...`:
 
 ```makefile
-	@# Cố sao lưu lần cuối. Pod đang DỪNG thì ssh không vào được và volume cũng không đọc
-	@# được (volume chỉ mount qua pod) — lúc đó không có cách nào biết bản dump gần nhất bao
-	@# giờ. Vẫn xoá theo đúng lựa chọn thiết kế: không có cổng chặn nào.
+	@# Cố sao lưu lần cuối. KHÔNG nuốt stderr: pod-pgdump.sh báo lỗi nghiêm trọng qua die() ra
+	@# stderr, và đây là ngay trước một thao tác không hoàn tác được. Nếu pod đã dừng thì ssh tự
+	@# in lỗi kết nối — ồn hơn một chút, nhưng đó là tiếng ồn TRUNG THỰC. Nuốt hết rồi đoán
+	@# "pod đã dừng?" là khẳng định một nguyên nhân ta không biết, ngay lúc người dùng cần biết nhất.
 	@ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
 		-p $(call env,GPU_SSH_PORT) root@$(call env,GPU_SSH_HOST) \
-		"cd ~/motion-backend && bash ./setup/pod-pgdump.sh --dump" 2>/dev/null \
-		|| echo "!! không sao lưu được (pod đã dừng?) — XOÁ TIẾP. Bản dump gần nhất là lần 'make gpu-down' hoặc 'make gpu-db-dump' cuối cùng."
+		"cd ~/motion-backend && bash ./setup/pod-pgdump.sh --dump" \
+		|| echo "!! sao lưu lần cuối KHÔNG thành công (lý do ở ngay trên) — vẫn XOÁ pod theo yêu cầu."
 ```
+
+(Fix round 1: bỏ `2>/dev/null` — nó nuốt cả thông báo lỗi thật từ `die()` trong pod-pgdump.sh khi
+pod còn sống nhưng dump hỏng vì lý do khác (volume đầy, Postgres chưa lên...), rồi câu fallback cũ
+"pod đã dừng?" khẳng định sai nguyên nhân ngay trước một thao tác không hoàn tác được.)
 
 - [ ] **Step 4: Kiểm Makefile parse được và target hiện trong help**
 
