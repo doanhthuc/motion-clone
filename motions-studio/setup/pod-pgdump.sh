@@ -152,7 +152,49 @@ do_dump() {
   fi
 }
 
+do_restore() {
+  local tables meta created age_h target
+  if [ ! -L "$LATEST" ] && [ ! -f "$LATEST" ]; then
+    log "chưa có bản dump nào trên volume — bỏ qua (đây là phiên đầu)."
+    return 0
+  fi
+  target="$(readlink "$LATEST" 2>/dev/null || printf '%s' "$LATEST")"
+  [ -f "$target" ] || { warn "latest trỏ file không tồn tại: $target"; return 1; }
+
+  # In tuổi TRƯỚC khi biết có nạp được hay không: operator chạy --restore trên một DB đã
+  # có bảng (bị bỏ qua) vẫn cần biết bản dump gần nhất mới tới đâu, không chỉ khi thực sự
+  # nạp. Tách khỏi nhánh nạp để không lặp lại logic đọc .meta ở cả hai nơi.
+  meta="${target%.sql.gz}.meta"
+  created="$(grep -m1 '^created=' "$meta" 2>/dev/null | cut -d= -f2)"
+  if [ -n "$created" ]; then
+    age_h=$(( ( $(date -u +%s) - created ) / 3600 ))
+    log "tuổi bản dump: ${age_h} giờ ($(basename "$target"))"
+    [ "$age_h" -gt 168 ] && warn "bản dump này CŨ HƠN 7 NGÀY — dữ liệu sau mốc đó không có trong này."
+  else
+    warn "tuổi bản dump: không đọc được (thiếu .meta) — $(basename "$target")"
+  fi
+
+  tables="$(_table_count)"
+  [ -n "$tables" ] || { warn "không hỏi được danh sách bảng — DB có chạy không?"; return 1; }
+  if [ "$tables" != "0" ]; then
+    log "DB đã có $tables bảng trong schema public — KHÔNG nạp đè. Bỏ qua."
+    return 0
+  fi
+
+  gzip -t "$target" 2>/dev/null || { warn "file dump hỏng (gzip -t đỏ): $target"; return 1; }
+
+  # --single-transaction VÀ ON_ERROR_STOP=1 phải đi CÙNG NHAU. Thiếu ON_ERROR_STOP thì psql
+  # chạy tiếp qua statement lỗi rồi COMMIT — cho ra một DB nạp dở mà app vẫn chạy lên được,
+  # và không ai biết đang thiếu gì. Có cả hai thì lỗi bất kỳ đâu cũng rollback về DB trống.
+  if ! gzip -dc "$target" | _psql -d "$PG_DB" --single-transaction -v ON_ERROR_STOP=1 -q >/dev/null; then
+    warn "nạp dump thất bại — đã rollback, DB vẫn trống như trước."
+    return 1
+  fi
+  ok "khôi phục xong từ $(basename "$target")"
+}
+
 case "${1:-}" in
-  --dump)  do_dump ;;
+  --dump)    do_dump ;;
+  --restore) do_restore ;;
   *) echo "dùng: $0 --dump|--restore|--check|--verify" >&2; exit 2 ;;
 esac

@@ -132,6 +132,49 @@ NN="$(ls "$VOL"/pg/dumps/*.sql.gz 2>/dev/null | wc -l | tr -d ' ')"
 [ -e "$(readlink "$VOL/pg/latest")" ] && ok "KEEP âm: latest vẫn trỏ file có thật" \
                                       || bad "KEEP âm: latest thành symlink treo"
 
+# ── Task 3 ────────────────────────────────────────────────────────────────
+info "Task 3 — --restore"
+rm -rf "$VOL/pg"; seed
+bash "$SCRIPT" --dump >/dev/null
+q "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" >/dev/null   # giả lập pod mới: DB trống
+assert_ok "--restore trả 0 khi DB trống" -- bash "$SCRIPT" --restore
+assert_eq "7" "$(q 'SELECT count(*) FROM jobs')"  "restore trả lại đủ dòng bảng jobs"
+assert_eq "3" "$(q 'SELECT count(*) FROM users')" "restore trả lại đủ dòng bảng users"
+
+# Chạy lại trên DB ĐÃ CÓ dữ liệu: phải bỏ qua, KHÔNG nhân đôi, và KHÔNG coi là lỗi
+assert_ok "--restore trả 0 khi DB đã có dữ liệu" -- bash "$SCRIPT" --restore
+assert_eq "7" "$(q 'SELECT count(*) FROM jobs')" "restore không nạp đè khi DB đã có bảng"
+
+# In tuổi bản dump ra stdout
+#
+# Bắt buộc chạy XONG rồi mới grep (không phải pipe sống): `grep -q` thoát ngay khi khớp
+# dòng ĐẦU, và nếu do_restore còn ghi thêm dòng log sau đó (ví dụ "DB đã có ... Bỏ qua."),
+# writer nhận SIGPIPE giữa lúc chạy → bash thoát 141 → với `pipefail` đang bật, TOÀN BỘ
+# pipeline báo lỗi dù grep ĐÃ khớp — sai ngẫu nhiên, không liên quan gì tới do_restore().
+RESTORE_OUT="$(bash "$SCRIPT" --restore 2>&1)"
+printf '%s' "$RESTORE_OUT" | grep -qi "tuổi" && ok "restore in tuổi bản dump" \
+                                              || bad "restore không in tuổi bản dump"
+
+# Chưa có dump nào → bỏ qua, không phải lỗi
+rm -rf "$VOL/pg"
+assert_ok "--restore trả 0 khi chưa có dump nào" -- bash "$SCRIPT" --restore
+
+# File dump HỎNG → phải đỏ, và DB phải còn TRỐNG (rollback sạch, không nạp nửa chừng).
+#
+# Làm hỏng bằng cách NỐI THÊM một câu SQL sai vào CUỐI dump, không phải cắt cụt đầu file.
+# Cắt cụt ở 400 byte đầu chỉ lấy được phần comment + SET của pg_dump — toàn statement hợp lệ,
+# psql chạy xong trả 0, và test sẽ đỏ vì lý do sai hoàn toàn. Nối lỗi vào cuối thì psql tạo
+# xong hết bảng RỒI mới gặp lỗi, nên nó kiểm đúng thứ ta cần kiểm: --single-transaction có
+# thật sự rollback những bảng đã tạo hay không.
+rm -rf "$VOL/pg"; seed; bash "$SCRIPT" --dump >/dev/null
+q "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" >/dev/null
+D="$(readlink "$VOL/pg/latest")"
+{ gzip -dc "$D"; echo "SELECT * FROM khong_ton_tai_bang_nay;"; } | gzip -c > "$D.part"
+mv "$D.part" "$D"
+assert_fail "--restore đỏ khi dump có statement lỗi" -- bash "$SCRIPT" --restore
+assert_eq "0" "$(q "SELECT count(*) FROM pg_tables WHERE schemaname='public'")" \
+  "dump lỗi KHÔNG để lại bảng nào — chứng minh --single-transaction rollback thật"
+
 echo
 info "$PASSED xanh · $FAILED đỏ"
 [ "$FAILED" -eq 0 ]
