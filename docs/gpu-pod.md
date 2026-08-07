@@ -1286,7 +1286,7 @@ một rủi ro nhỏ hơn nhiều (mất phần ghi từ lần dump cuối, khô
 
 Pod 2 không có gì chung với Pod 1 ngoài cùng một volume. Số dòng quay về đúng những gì Pod 1 đã ghi
 trước khi bị xoá — chứng minh cả đường dây: dump ở `gpu-down` → `gpu-destroy` (dump lần cuối thất
-bại vì pod đã dừng, vẫn xoá) → provision pod mới → `gpu-bootstrap` tự khôi phục từ bản dump cũ nhất
+bại vì pod đã dừng, vẫn xoá) → provision pod mới → `gpu-bootstrap` tự khôi phục từ bản dump mới nhất
 còn đọc được (bản của `gpu-down`, vì bản của `gpu-destroy` không tạo được).
 
 **Chưa đo:** lớp 6 mới trong `make gpu-smoke` (`pod-pgdump.sh --check && --verify`, xem
@@ -1403,7 +1403,7 @@ create-image 1785 KB png. Lớp 6 sao lưu DB (numbering hiện tại) được 
 chạy qua `make gpu-smoke` trên pod thật** — nghiệm thu 07/08/2026 gọi thẳng `make gpu-db-check`
 thay vì full smoke, xem [§Sao lưu database](#pg-backup).
 
-Thiếu `GPU_SSH_HOST`/`GPU_SSH_PORT` trong `.env` thì lớp 3-5 tự bỏ qua kèm thông báo rõ, không
+Thiếu `GPU_SSH_HOST`/`GPU_SSH_PORT` trong `.env` thì lớp 3-6 tự bỏ qua kèm thông báo rõ, không
 im lặng báo pass.
 
 ## Không còn lấy bản mới từ upstream
