@@ -327,12 +327,21 @@ PG_DUMP_KEEP=0 bash "$SCRIPT" --dump >/dev/null
 N0="$(ls "$VOL"/pg/dumps/*.sql.gz 2>/dev/null | wc -l | tr -d ' ')"
 [ "$N0" -ge 1 ] && ok "KEEP=0 vẫn giữ lại ít nhất 1 bản (không xoá sạch)" || bad "KEEP=0 đã xoá sạch"
 [ -e "$(readlink "$VOL/pg/latest")" ] && ok "KEEP=0: latest vẫn trỏ file có thật" || bad "KEEP=0: latest treo"
-# KEEP không phải số: kiểm exit code, vì script sập trước khi xoá
+# KEEP không phải số. Thứ phân biệt code vá với chưa vá ở đây KHÔNG phải exit code và cũng
+# không phải số file còn lại — cả hai đều giống nhau ở hai bên:
+#   - $((n - keep)) với keep="abc" làm bash coi "abc" là TÊN BIẾN chưa đặt → set -u báo lỗi,
+#     nhưng lỗi đó xảy ra khi mở rộng tham số cho MỘT PHẦN TỬ PIPELINE nên chỉ giết subshell
+#     của `head`. Shell cha sống tiếp, không có set -e, _prune không được kiểm return → script
+#     vẫn thoát 0 và vẫn còn nguyên file. Đo thật: PIPESTATUS=0 0 0.
+# Dấu hiệu quan sát được duy nhất là STDERR: chưa vá thì có "unbound variable", vá rồi thì sạch.
 rm -rf "$VOL/pg"; seed
-PG_DUMP_KEEP=abc bash "$SCRIPT" --dump >/dev/null 2>&1; sleep 1
-PG_DUMP_KEEP=abc bash "$SCRIPT" --dump >/dev/null 2>&1
-RC_ABC=$?
-assert_eq "0" "$RC_ABC" "KEEP=abc: --dump chạy trót lọt, không sập vì unbound variable"
+PG_DUMP_KEEP=abc bash "$SCRIPT" --dump >/dev/null 2>"$VOL/abc-stderr.txt"; sleep 1
+PG_DUMP_KEEP=abc bash "$SCRIPT" --dump >/dev/null 2>>"$VOL/abc-stderr.txt"
+if grep -q "unbound variable" "$VOL/abc-stderr.txt"; then
+  bad "KEEP=abc: script báo 'unbound variable' — keep chưa được kẹp trước khi vào \$(( ))"
+else
+  ok "KEEP=abc: không có 'unbound variable' trên stderr"
+fi
 NA="$(ls "$VOL"/pg/dumps/*.sql.gz 2>/dev/null | wc -l | tr -d ' ')"
 [ "$NA" -ge 1 ] && ok "KEEP=abc vẫn giữ lại ít nhất 1 bản" || bad "KEEP=abc xoá sạch"
 # KEEP âm: nguy hiểm nhất, không sập nhưng xoá sạch

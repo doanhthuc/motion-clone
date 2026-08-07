@@ -104,15 +104,21 @@ N0="$(ls "$VOL"/pg/dumps/*.sql.gz 2>/dev/null | wc -l | tr -d ' ')"
                 || bad "KEEP=0 đã xoá SẠCH backup — còn $N0 bản"
 [ -e "$(readlink "$VOL/pg/latest")" ] && ok "KEEP=0: latest vẫn trỏ file có thật" \
                                       || bad "KEEP=0: latest thành symlink treo"
-# KEEP không phải số. Trên code CHƯA vá, $((n - keep)) làm bash coi "abc" là tên biến chưa đặt
-# → set -u giết script NGAY tại đó, tức trước cả đường xoá file. Vì vậy assertion "còn ít nhất
-# 1 bản" là VÔ NGHĨA ở đây: nó xanh trên cả hai bên, vì code hỏng sập trước khi kịp xoá.
-# Thứ thật sự khác nhau là EXIT CODE — sập thì khác 0, đã kẹp keep thì chạy trót lọt.
+# KEEP không phải số. Thứ phân biệt code vá với chưa vá ở đây KHÔNG phải exit code và cũng
+# không phải số file còn lại — cả hai đều giống nhau ở hai bên:
+#   - $((n - keep)) với keep="abc" làm bash coi "abc" là TÊN BIẾN chưa đặt → set -u báo lỗi,
+#     nhưng lỗi đó xảy ra khi mở rộng tham số cho MỘT PHẦN TỬ PIPELINE nên chỉ giết subshell
+#     của `head`. Shell cha sống tiếp, không có set -e, _prune không được kiểm return → script
+#     vẫn thoát 0 và vẫn còn nguyên file. Đo thật: PIPESTATUS=0 0 0.
+# Dấu hiệu quan sát được duy nhất là STDERR: chưa vá thì có "unbound variable", vá rồi thì sạch.
 rm -rf "$VOL/pg"; seed
-PG_DUMP_KEEP=abc bash "$SCRIPT" --dump >/dev/null 2>&1; sleep 1
-PG_DUMP_KEEP=abc bash "$SCRIPT" --dump >/dev/null 2>&1
-RC_ABC=$?
-assert_eq "0" "$RC_ABC" "KEEP=abc: --dump chạy trót lọt, không sập vì unbound variable"
+PG_DUMP_KEEP=abc bash "$SCRIPT" --dump >/dev/null 2>"$VOL/abc-stderr.txt"; sleep 1
+PG_DUMP_KEEP=abc bash "$SCRIPT" --dump >/dev/null 2>>"$VOL/abc-stderr.txt"
+if grep -q "unbound variable" "$VOL/abc-stderr.txt"; then
+  bad "KEEP=abc: script báo 'unbound variable' — keep chưa được kẹp trước khi vào \$(( ))"
+else
+  ok "KEEP=abc: không có 'unbound variable' trên stderr"
+fi
 NA="$(ls "$VOL"/pg/dumps/*.sql.gz 2>/dev/null | wc -l | tr -d ' ')"
 [ "$NA" -ge 1 ] && ok "KEEP=abc vẫn giữ lại ít nhất 1 bản" || bad "KEEP=abc đã xoá sạch backup"
 # KEEP âm là trường hợp XẤU NHẤT, và là trường hợp DUY NHẤT không tự lộ ra: khác "abc",
