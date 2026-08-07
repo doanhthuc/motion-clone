@@ -19,7 +19,7 @@ Mọi task đều ngầm chịu các ràng buộc này:
 - **Không dump định kỳ.** Không thêm app PM2, không cron.
 - **Quyền:** thư mục dump `700`, file `600`.
 - **"DB trống" = không có bảng nào trong schema `public`** (`SELECT count(*) FROM pg_tables WHERE schemaname='public'`), không phải "có bảng nhưng 0 dòng".
-- **`--restore` phải dùng `psql --single-transaction -v ON_ERROR_STOP=1`.** Thiếu `ON_ERROR_STOP` thì psql chạy tiếp qua lỗi rồi COMMIT một DB nạp dở — đúng cái phải chặn.
+- **`--restore` phải dùng `psql --single-transaction -v ON_ERROR_STOP=1`.** Hai cờ mua hai thứ khác nhau: `--single-transaction` cho tính nguyên tử (lỗi giữa chừng thì Postgres tự biến COMMIT cuối thành ROLLBACK, không bao giờ có DB nạp nửa vời); `ON_ERROR_STOP=1` cho exit code trung thực (thiếu nó, psql thoát 0 sau một lần nạp đã hỏng và đã rollback — báo "khôi phục xong" trên một DB rỗng). Đo thật: cùng một dump lỗi, không `ON_ERROR_STOP` → exit 0 / 0 bảng; có `ON_ERROR_STOP` → exit khác 0 / 0 bảng; bỏ luôn `--single-transaction` → bảng sống sót thật.
 - **Không bao giờ xoá bản dump cuối cùng còn lại**, kể cả khi `PG_DUMP_KEEP=1`.
 - **Đọc cấu hình theo khuôn `pod-volume.sh:188`**: ưu tiên biến môi trường, thiếu thì `get_kv` từ `.env`.
 - **Kết nối qua TCP** bằng `POSTGRES_USER/PASSWORD/DB/PORT`, không dùng `sudo -u postgres`. Nhờ vậy script chạy y hệt nhau trên pod và trong test ở local.

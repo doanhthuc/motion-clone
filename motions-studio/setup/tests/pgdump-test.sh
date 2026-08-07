@@ -175,6 +175,23 @@ assert_fail "--restore đỏ khi dump có statement lỗi" -- bash "$SCRIPT" --r
 assert_eq "0" "$(q "SELECT count(*) FROM pg_tables WHERE schemaname='public'")" \
   "dump lỗi KHÔNG để lại bảng nào — chứng minh --single-transaction rollback thật"
 
+# Guard "DB đã có bảng" tồn tại để chặn ĐÚNG kịch bản này, và đây là kịch bản duy nhất chứng
+# minh được nó. Nạp lại chính bản dump của DB đó KHÔNG chứng minh gì: pg_dump sinh CREATE TABLE
+# trước COPY, nên nó chết ở "relation already exists" — tức bị chặn bởi một cơ chế khác hẳn,
+# xoá guard đi thì test vẫn xanh.
+# Ở đây DB có sẵn một bảng KHÁC hoàn toàn với bảng trong dump, nên không tên nào đụng nhau:
+# gỡ guard là dump chảy thẳng vào DB đang có dữ liệu, exit 0, không một lời cảnh báo.
+rm -rf "$VOL/pg"; seed
+bash "$SCRIPT" --dump >/dev/null                       # dump chứa jobs + users
+q "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" >/dev/null
+q "CREATE TABLE sessions (id int primary key);
+   INSERT INTO sessions VALUES (1);" >/dev/null        # DB có dữ liệu, nhưng bảng KHÁC
+assert_ok "--restore trả 0 khi DB có bảng rời rạc" -- bash "$SCRIPT" --restore
+assert_eq "1" "$(q "SELECT count(*) FROM pg_tables WHERE schemaname='public'")" \
+  "restore KHÔNG đổ dump vào DB đang có bảng khác (vẫn đúng 1 bảng)"
+assert_eq "" "$(q "SELECT to_regclass('public.jobs')")" \
+  "bảng jobs từ dump KHÔNG được tạo ra"
+
 echo
 info "$PASSED xanh · $FAILED đỏ"
 [ "$FAILED" -eq 0 ]

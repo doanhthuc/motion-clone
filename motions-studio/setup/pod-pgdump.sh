@@ -183,9 +183,13 @@ do_restore() {
 
   gzip -t "$target" 2>/dev/null || { warn "file dump hỏng (gzip -t đỏ): $target"; return 1; }
 
-  # --single-transaction VÀ ON_ERROR_STOP=1 phải đi CÙNG NHAU. Thiếu ON_ERROR_STOP thì psql
-  # chạy tiếp qua statement lỗi rồi COMMIT — cho ra một DB nạp dở mà app vẫn chạy lên được,
-  # và không ai biết đang thiếu gì. Có cả hai thì lỗi bất kỳ đâu cũng rollback về DB trống.
+  # Hai cờ này mua hai thứ KHÁC NHAU, cần cả hai:
+  #   --single-transaction  → tính nguyên tử. Lỗi giữa chừng thì transaction abort, và Postgres
+  #     tự biến COMMIT cuối thành ROLLBACK, nên không bao giờ có DB nạp nửa vời.
+  #   ON_ERROR_STOP=1       → exit code TRUNG THỰC. Thiếu nó, psql thoát 0 sau một lần nạp đã
+  #     hỏng và đã rollback — ta báo "khôi phục xong" trên một DB rỗng. Đúng loại thành công giả.
+  # Đo thật trong container: cùng một dump lỗi, không ON_ERROR_STOP → exit 0 / 0 bảng;
+  # có ON_ERROR_STOP → exit 3 / 0 bảng; bỏ luôn --single-transaction → 2 bảng sống sót.
   if ! gzip -dc "$target" | _psql -d "$PG_DB" --single-transaction -v ON_ERROR_STOP=1 -q >/dev/null; then
     warn "nạp dump thất bại — đã rollback, DB vẫn trống như trước."
     return 1

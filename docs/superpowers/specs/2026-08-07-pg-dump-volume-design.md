@@ -180,9 +180,12 @@ làm mất DB (container disk còn nguyên). Chặn việc dừng để bảo v�
 giữ thứ chưa bị đe doạ.
 
 **Chỗ duy nhất phải thật cẩn thận là `--restore`**, vì nạp nửa chừng tệ hơn không nạp: bạn được một
-DB có vài bảng, app chạy lên bình thường, và không biết mình đang thiếu gì. Chặn bằng
-`psql --single-transaction` — lỗi ở bất kỳ statement nào là rollback sạch về DB trống, tức quay về
-đúng trạng thái "chưa nạp" chứ không phải một trạng thái lai.
+DB có vài bảng, app chạy lên bình thường, và không biết mình đang thiếu gì. Hai cờ
+`psql --single-transaction -v ON_ERROR_STOP=1` mua hai thứ khác nhau, cần cả hai: `--single-transaction`
+cho tính nguyên tử — lỗi ở bất kỳ statement nào thì Postgres tự biến COMMIT cuối thành ROLLBACK,
+rollback sạch về DB trống, tức quay về đúng trạng thái "chưa nạp" chứ không phải một trạng thái lai.
+`ON_ERROR_STOP=1` cho exit code trung thực — thiếu nó, psql vẫn thoát 0 sau một lần nạp đã hỏng và
+đã rollback, khiến script báo "khôi phục xong" trên một DB thật ra vẫn trống: đúng loại thành công giả.
 
 **Tuổi bản dump luôn in ra lúc restore**, cỡ chữ ngang các dòng `✓` khác. Không từ chối vì cũ —
 nhưng nạp âm thầm một bản ba tuần tuổi rồi để người dùng tưởng là dữ liệu hôm qua thì đúng là thành
