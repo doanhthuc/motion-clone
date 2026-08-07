@@ -607,24 +607,38 @@ Nên `VOLUME_PGDATA=0` là mặc định. Hệ quả:
 | | |
 |---|---|
 | DB sống qua `gpu-down` → `gpu-up` | ✅ container disk còn |
-| DB sống qua `gpu-destroy` | ❌ **mất** |
+| PGDATA nằm trên volume | ❌ không thể (MooseFS chặn `chown`) |
+| DB sống qua `gpu-destroy` | ✅ dựng lại từ bản `pg_dump` trên volume — mất phần ghi SAU lần dump cuối |
 | Model 33GB | ✅ vẫn trên volume, vẫn không phải tải lại |
 
-Muốn giữ DB qua `destroy` thì dump ra volume **trước khi destroy** (chưa tự động hoá):
+PGDATA vẫn ở container disk và `gpu-destroy` vẫn xoá nó. Thứ sống sót là một bản sao **logic**
+(`pg_dump`) đặt trên volume — ghi file thường lên MooseFS thì bình thường, chỉ `chown` mới bị
+chặn. `setup/pod-pgdump.sh` là nơi duy nhất biết bố cục thư mục dump; đừng ghi backup vào chỗ
+khác, `--restore` sẽ không thấy.
+
+Đã tự động hoá, **không cần gõ `pg_dump` tay**:
 
 ```bash
-# trên pod, TRƯỚC make gpu-destroy
-ssh -p $GPU_SSH_PORT root@$GPU_SSH_HOST \
-  'mkdir -p /workspace/pg-backup && sudo -u postgres pg_dump motion \
-   | gzip > /workspace/pg-backup/motion-$(date +%Y%m%d-%H%M).sql.gz'
-
-# trên pod MỚI, SAU make gpu-bootstrap
-ssh -p $GPU_SSH_PORT root@$GPU_SSH_HOST \
-  'zcat $(ls -t /workspace/pg-backup/*.sql.gz | head -1) | sudo -u postgres psql motion'
+make gpu-db-dump     # sao lưu ngay bây giờ
+make gpu-db-check    # bản mới nhất bao lâu rồi + NẠP THỬ vào một DB tạm rồi so số dòng
+make gpu-down        # tự dump trước khi dừng pod
+make gpu-destroy     # cố dump lần cuối trước khi xoá
+make gpu-bootstrap   # trên pod MỚI: tự khôi phục, nhưng CHỈ khi DB đang trống
 ```
 
-Kiểm dump có toàn vẹn không trước khi tin: `gzip -t <file>`. Một bản dump hỏng còn tệ hơn không
-có, vì nó khiến bạn yên tâm destroy.
+Ba điều cần biết trước khi tin vào nó:
+
+- **Không có cổng chặn nào.** Dump hỏng thì `gpu-down`/`gpu-destroy` in cảnh báo rồi **vẫn chạy
+  tiếp** — không để một backup hỏng giữ lại một pod đang tính tiền theo giờ. Nghĩa là bạn phải
+  ĐỌC output, không chỉ nhìn nó chạy xong.
+- **`--restore` chỉ nạp khi schema `public` không có bảng nào.** DB đã có bảng thì nó bỏ qua và
+  không nạp đè. Muốn khôi phục lên một DB đang có dữ liệu thì phải tự quyết và tự làm.
+- **`make gpu-db-check` là bằng chứng, `ls` thì không.** Một file `.sql.gz` rỗng vẫn là một file.
+  `--verify` nạp thật vào DB tạm rồi so số dòng với `.meta`, nên nó chứng minh chứ không ghi nhận.
+  Chạy nó **trước** `gpu-destroy`, không phải sau.
+
+Lớp 6 của `make gpu-smoke` chạy đúng hai lệnh này và làm smoke **đỏ** nếu đã đặt `POD_VOLUME` mà
+không có bản dump nạp được.
 
 
 ### 3 · MinIO từ chối symlink làm drive
