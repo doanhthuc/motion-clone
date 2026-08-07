@@ -301,6 +301,59 @@ assert_eq "1" "$(grep '^weird name (x)=' "$M5" | cut -d= -f2)" \
 assert_ok "--verify xanh với tên bảng trích dẫn + dữ liệu chứa bẫy \\. và COPY" -- bash "$SCRIPT" --verify
 q 'DROP TABLE "order"; DROP TABLE "weird name (x)";' >/dev/null
 
+# ── Ba điểm mù của parser header COPY ─────────────────────────────────────
+# Cả ba đều đo bằng pg_dump THẬT (postgres:18), không bằng chuỗi tự bịa: chính pg_dump quyết
+# định header trông ra sao, và ở hai dạng đầu nó trông khác hẳn hình dung ban đầu.
+#
+# Bất biến chung, quan trọng hơn cả việc đếm đúng: KHÔNG BAO GIỜ phát ra KHOÁ RÁC. Một khoá rác
+# trong .meta làm --verify ĐỎ trên một bản dump hoàn toàn tốt, tức phá đúng cái cổng bằng-chứng
+# mà cả tính năng này dựa vào. Vì thế mỗi khối dưới đây đều có một assertion "không còn khoá nào
+# dính đuôi FROM stdin;" — nó là thứ bắt được cả hai dạng hỏng cũ cùng lúc.
+
+# (1) Bảng 0 CỘT: pg_dump phát `COPY public.t0  FROM stdin;` — KHÔNG có danh sách cột, chỉ còn
+#     một dấu cách thừa. Regex cũ đòi `\(…\)` nên trượt → khoá `t0  FROM stdin;=2`.
+# (2) Tên CỘT chứa ngoặc: `COPY public.parencol ("col (x)") FROM stdin;` — lớp `[^()]*` của regex
+#     cũ không nhảy qua nổi cặp ngoặc lồng bên trong → khoá `parencol ("col (x)") FROM stdin;=2`.
+rm -rf "$VOL/pg"; seed
+q 'CREATE TABLE t0 (); INSERT INTO t0 DEFAULT VALUES; INSERT INTO t0 DEFAULT VALUES;' >/dev/null
+q 'CREATE TABLE parencol ("col (x)" int); INSERT INTO parencol VALUES (1),(2);' >/dev/null
+assert_ok "bảng 0 cột + tên cột chứa ngoặc: --dump trả 0" -- bash "$SCRIPT" --dump
+M7="$(ls "$VOL"/pg/dumps/*.meta | head -1)"
+assert_eq "2" "$(grep '^t0=' "$M7" | cut -d= -f2)"       "bảng 0 CỘT vào .meta với khoá TRẦN t0="
+assert_eq "2" "$(grep '^parencol=' "$M7" | cut -d= -f2)" "tên cột chứa ngoặc: khoá TRẦN parencol="
+assert_eq "0" "$(grep -c 'FROM stdin;' "$M7" | tr -d ' ')" \
+  ".meta KHÔNG còn khoá rác nào dính đuôi 'FROM stdin;'"
+assert_ok "--verify xanh với bảng 0 cột và tên cột chứa ngoặc" -- bash "$SCRIPT" --verify
+q 'DROP TABLE t0; DROP TABLE parencol;' >/dev/null
+
+# (3) Identifier chứa XUỐNG DÒNG — dạng KHÔNG xử được chắc chắn. pg_dump phát header vỡ làm hai
+#     dòng vật lý; awk đọc theo dòng nên không ghép lại được. Và sửa ở parser cũng vô ích: vế
+#     `got` của verify (_row_counts) in mỗi bảng MỘT DÒNG `<tên>=<số>`, nên tên chứa <LF> đã tự
+#     vỡ ở vế kia rồi — cả ĐỊNH DẠNG .meta không biểu diễn nổi dạng này.
+#     Yêu cầu ở đây vì thế KHÔNG phải "đếm đúng" mà là: BÁO LỖI TO thay vì đoán.
+rm -rf "$VOL/pg"; seed
+q 'CREATE TABLE "new
+line" (id int); INSERT INTO "new
+line" VALUES (1);' >/dev/null
+NL_OUT="$(bash "$SCRIPT" --dump 2>&1)"; NL_RC=$?
+assert_eq "1" "$NL_RC" "identifier có xuống dòng: --dump trả khác 0 — không bỏ qua trong im lặng"
+printf '%s' "$NL_OUT" | grep -q "header COPY không parse được" \
+  && ok "identifier có xuống dòng: in ra ĐÚNG dòng header không parse được" \
+  || bad "identifier có xuống dòng: không nói gì — parser nuốt lỗi"
+printf '%s' "$NL_OUT" | grep -q ".meta THIẾU BẢNG" \
+  && ok "identifier có xuống dòng: nói rõ hệ quả (.meta cụt ⇒ --verify sau này đỏ)" \
+  || bad "identifier có xuống dòng: không giải thích hệ quả — người đọc không truy ra được"
+M8="$(ls "$VOL"/pg/dumps/*.meta | head -1)"
+assert_eq "0" "$(grep -c 'FROM stdin;' "$M8" | tr -d ' ')" \
+  "identifier có xuống dòng: .meta thiếu bảng NHƯNG không có khoá rác"
+# Đỏ ở đây là cảnh báo về .meta, KHÔNG phải mất backup — bản dump vẫn phải ghi xong và hợp lệ.
+D8="$(ls "$VOL"/pg/dumps/motion-*.sql.gz 2>/dev/null | head -1)"
+{ [ -n "$D8" ] && gzip -t "$D8" 2>/dev/null; } \
+  && ok "identifier có xuống dòng: bản dump VẪN ghi xong và hợp lệ (gzip -t xanh)" \
+  || bad "identifier có xuống dòng: mất bản dump — đỏ ở .meta không được kéo theo mất backup"
+q 'DROP TABLE "new
+line";' >/dev/null
+
 # Bảng ở schema KHÁC public không được lọt vào .meta: _row_counts (vế `got` của verify) chỉ
 # đếm schema public, nên thêm vào là verify đỏ oan. Nhưng khối COPY của nó vẫn phải được ĐỌC
 # HẾT, nếu không các dòng dữ liệu của nó bị tính nhầm sang bảng sau.

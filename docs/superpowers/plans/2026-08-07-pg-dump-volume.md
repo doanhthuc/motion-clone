@@ -1250,15 +1250,29 @@ nhưng trên pod MỚI chưa tồn tại lúc `pod-volume.sh` chạy. Mỗi ngu�
 chứa `\.`. `_row_counts()` **giữ nguyên** — `do_verify` vẫn cần nó để đếm DB tạm sau khi nạp. Lý do
 và lập luận "vì sao verify vẫn có nghĩa" ghi ở spec, mục `.meta`.
 
-Bốn chi tiết cài đặt không hiển nhiên, mỗi cái có một test riêng:
+Năm chi tiết cài đặt không hiển nhiên, mỗi cái có một test riêng:
 1. Cắt tiền tố `public.` để khớp tên trần mà `_row_counts` in ra.
 2. Bỏ trích dẫn kép: pg_dump sinh `COPY public."order" (…)` cho từ khoá. Và **không được cắt tên
    bảng từ dấu `(` đầu tiên** — pg_dump sinh thật `COPY public."weird name (x)" (id) FROM stdin;`.
-   Regex cắt danh sách cột neo ở CUỐI dòng.
+   *(Sửa 2026-08-07, dọn nợ)* Bản đầu dùng **một** regex neo cuối dòng nuốt cả
+   `\(…\)[ \t]+FROM stdin;$`; đo bằng `pg_dump` thật cho thấy nó hỏng ở hai dạng:
+   bảng **0 cột** (pg_dump phát `COPY public.t0  FROM stdin;`, không có `(…)` nên regex trượt)
+   và **tên cột chứa ngoặc** (`("col (x)")` — lớp `[^()]*` không nhảy qua nổi). Cả hai để lại
+   **khoá rác** trong `.meta` (`t0  FROM stdin;=2`, `parencol ("col (x)") FROM stdin;=2`) và làm
+   `--verify` đỏ trên dump tốt. Cách đúng: **bỏ đuôi ` FROM stdin;` trước**, rồi cắt danh sách cột
+   ở dấu `(` đầu tiên **nằm ngoài nháy kép** (quét trái→phải, `""` chỉ là tắt-rồi-bật) — ngoặc
+   trong tên bảng bắt buộc nằm trong nháy kép vì identifier trần của Postgres không chứa được nó.
 3. Chỉ dòng **chỉ chứa** `\.` mới kết thúc khối, và phải kiểm "đang trong khối" TRƯỚC khi thử nhận
    diện header — một ô text chứa đúng chuỗi `COPY … FROM stdin;` là dữ liệu hợp lệ.
 4. Bảng ngoài schema `public` phải đọc hết khối nhưng **không** in ra, vì `_row_counts` (vế `got`
    của verify) chỉ đếm `public`.
+5. *(Thêm 2026-08-07, dọn nợ)* **Không bao giờ phát khoá rác trong im lặng.** Dòng nào mở đầu bằng
+   `COPY ` mà không tách nổi thành `<bảng> FROM stdin;` thì gom lại, in ra **stderr**, và `exit 1`
+   ở `END` → `_dump_row_counts` trả khác 0 → `do_dump` cảnh báo to và trả `1` (bản dump vẫn ghi
+   xong và vẫn `--restore` được; đỏ ở đây là cảnh báo `.meta` cụt). Dạng duy nhất đã biết rơi vào
+   đường này là **identifier chứa xuống dòng**: pg_dump phát header vỡ làm hai dòng vật lý. Sửa ở
+   parser cũng vô ích — `_row_counts` in mỗi bảng một dòng `<tên>=<số>` nên tên chứa `<LF>` đã tự
+   vỡ ở vế `got` rồi; **định dạng `.meta`** mới là thứ không biểu diễn nổi dạng này.
 
 **Cách dựng đua cho test — chỗ dễ sai nhất.** Lần đầu viết test theo kiểu "dump xong rồi mới
 `INSERT` rồi `--verify`" và nó **xanh trên cả code vá lẫn chưa vá** (64 xanh · 0 đỏ ở cả hai bên):

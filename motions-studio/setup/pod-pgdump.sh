@@ -92,9 +92,36 @@ _row_counts() {
 # Một pass `awk`, không `grep -c` nhiều lần: nhiều pass vừa chậm (giải nén lại cả file mỗi lần)
 # vừa không đếm nổi ranh giới khối.
 #
-# Giới hạn đã biết: bảng phân vùng (parent trong pg_tables nhưng dữ liệu nằm ở các leaf) sẽ đếm
-# khác _row_counts. Schema hiện tại không có PARTITION BY / INHERITS / UNLOGGED nào (đã grep
-# motions-studio/db/), nên chưa phải lo; nếu sau này thêm thì --verify sẽ đỏ và chỉ thẳng vào đây.
+# Giới hạn đã biết — cập nhật 2026-08-07 sau khi ĐO bằng pg_dump thật (postgres:18) trên một DB
+# dựng riêng chứa mọi dạng tên khó, chạy dưới CẢ awk của macOS (BWK) lẫn mawk (awk mặc định của
+# Ubuntu, tức của pod — repo đã có một lỗi mawk-vs-BWK ở pod-volume.sh:264):
+#
+#   XỬ ĐÚNG (đã đo, cả hai awk):
+#     - tên trích dẫn kép: "order", "weird name (x)", "we""ird", "public.x"
+#     - bảng 0 CỘT: pg_dump phát `COPY public.t0  FROM stdin;` — KHÔNG có danh sách cột
+#     - tên CỘT chứa ngoặc: `COPY public.parencol ("col (x)") FROM stdin;`
+#     - bảng rỗng (khối COPY 0 dòng), bảng ở schema khác public (đọc hết khối, không in)
+#
+#   KHÔNG xử được, và giờ BÁO LỖI TO thay vì đoán:
+#     - identifier chứa XUỐNG DÒNG (`CREATE TABLE "new<LF>line"`, hoặc cột `"c<LF>c"`). pg_dump
+#       phát header vỡ làm hai dòng vật lý; awk đọc theo dòng nên dòng đầu (`COPY public."new`)
+#       không thể parse. Và sửa ở ĐÂY cũng vô ích: `_row_counts` — vế `got` của verify — in ra
+#       `<tên>=<số>` mỗi bảng MỘT DÒNG, nên một tên chứa <LF> đã tự vỡ thành hai dòng ở vế kia
+#       rồi (đo thật: nó phát ra "new" và "line=1" thành hai dòng). Cả ĐỊNH DẠNG .meta không
+#       biểu diễn nổi dạng tên này, không riêng gì parser. Sửa đúng sẽ là đổi định dạng .meta
+#       — việc lớn hơn nhiều, và không có gì trong schema hiện tại đòi nó.
+#       Nên: gom vào mảng `bad`, in ra STDERR, và `exit 1` ở END → _dump_row_counts trả khác 0
+#       → do_dump cảnh báo to và trả 1. .meta THIẾU bảng đó (chứ không chứa khoá rác), nên
+#       --verify sau đó sẽ đỏ — và người đọc đã có sẵn lời giải thích từ lúc --dump.
+#     - bảng phân vùng (parent trong pg_tables nhưng dữ liệu ở các leaf) vẫn đếm khác _row_counts.
+#
+#   Schema hiện tại không chạm tới dạng nào ở nhóm hai (đã grep motions-studio/db/: không
+#   PARTITION BY, không INHERITS, không bảng 0 cột, không identifier có ngoặc/xuống dòng).
+#
+# NGUYÊN TẮC XẾP THEO ƯU TIÊN: không bao giờ phát ra KHOÁ RÁC trong im lặng. Một khoá rác
+# (`t0  FROM stdin;=0`, `parencol ("col (x)") FROM stdin;=2` — đúng những gì bản trước phát ra)
+# làm --verify ĐỎ trên một bản dump hoàn toàn tốt, tức phá chính cái cổng bằng-chứng mà cả tính
+# năng này dựa vào. Thà đỏ TO ở --dump còn hơn đỏ khó hiểu ở --verify ba tuần sau.
 #
 # LC_ALL=C: awk xử lý theo BYTE. Không có nó, awk trên một số nền tảng abort giữa chừng khi gặp
 # byte không hợp lệ theo locale, và .meta sẽ cụt lặng lẽ.
@@ -108,12 +135,31 @@ _dump_row_counts() {
       if ($0 == "\\.") { if (pub) printf "%s=%d\n", tbl, n; intbl = 0 } else n++
       next
     }
-    /^COPY .* FROM stdin;$/ {
+    # Bắt MỌI dòng mở đầu bằng "COPY ", không chỉ dòng parse được. Dòng nào không tách nổi thành
+    # <bảng> FROM stdin; sẽ vào mảng `bad` và làm cả hàm đỏ — đó là điểm khác quan trọng nhất so
+    # với bản trước, vốn để regex không khớp rồi đi tiếp trong im lặng.
+    /^COPY[ \t]/ {
       s = $0
       sub(/^COPY[ \t]+/, "", s)
-      # Cắt danh sách cột + đuôi, NEO Ở CUỐI DÒNG. Không cắt từ dấu "(" đầu tiên: tên bảng có
-      # thể chứa nó — pg_dump sinh thật `COPY public."weird name (x)" (id) FROM stdin;`.
-      sub(/[ \t]*\([^()]*\)[ \t]+FROM stdin;$/, "", s)
+      # ĐUÔI TRƯỚC, danh sách cột sau. Ngược lại (một regex nuốt cả `\(…\)[ \t]+FROM stdin;$`)
+      # là chỗ hỏng của bản trước: bảng 0 cột không có `(…)` nên regex trượt, và tên cột chứa
+      # ngoặc làm lớp `[^()]*` không nhảy qua nổi. Cả hai đều thành khoá rác.
+      if (s !~ /[ \t]FROM stdin;$/) { bad[++nbad] = $0; next }
+      sub(/[ \t]+FROM stdin;$/, "", s)
+      # Cắt danh sách cột: dấu "(" ĐẦU TIÊN NẰM NGOÀI nháy kép. Không cắt từ dấu "(" đầu tiên
+      # tuyệt đối — tên bảng có thể chứa nó (`public."weird name (x)"`); nhưng khi đó nó BẮT BUỘC
+      # nằm trong nháy kép, vì identifier trần của Postgres không chứa được ngoặc. Quét trái sang
+      # phải, `""` bên trong nháy chỉ là tắt-rồi-bật nên không cần xử riêng.
+      q = 0; cut = 0
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (c == "\"") q = !q
+        else if (!q && c == "(") { cut = i; break }
+      }
+      if (q) { bad[++nbad] = $0; next }        # nháy kép không đóng ⇒ identifier vỡ dòng
+      if (cut) s = substr(s, 1, cut - 1)
+      sub(/[ \t]+$/, "", s)                    # bảng 0 cột để lại đúng một dấu cách thừa ở đây
+      if (s == "") { bad[++nbad] = $0; next }
       # Chỉ schema public, khớp đúng phạm vi của _row_counts (nó lọc schemaname=public). Bảng ở
       # schema khác vẫn phải ĐỌC HẾT khối để không đếm nhầm dòng, chỉ là không in ra.
       if (s ~ /^public\./)                      { s = substr(s, 8);  pub = 1 }
@@ -124,6 +170,18 @@ _dump_row_counts() {
       # Bỏ trích dẫn kép để khớp _row_counts, vốn in tên TRẦN (format %L trên tablename).
       if (s ~ /^".*"$/) { s = substr(s, 2, length(s) - 2); gsub(/""/, "\"", s) }
       tbl = s; n = 0; intbl = 1; next
+    }
+    # STDERR + exit 1, KHÔNG in vào stdout: stdout của hàm này chảy thẳng vào .meta, nên báo lỗi
+    # ở đó cũng chính là ghi khoá rác — đúng thứ ta đang bịt. mawk 1.3.4 hỗ trợ "/dev/stderr"
+    # (đã đo trong container ubuntu:24.04), BWK awk cũng vậy.
+    # Cắt ở 5 dòng: một dump lỗi cả loạt không được biến thành mấy nghìn dòng cảnh báo.
+    END {
+      if (nbad > 0) {
+        for (i = 1; i <= nbad && i <= 5; i++)
+          printf "  header COPY không parse được: %s\n", bad[i] > "/dev/stderr"
+        if (nbad > 5) printf "  … và %d dòng nữa\n", nbad - 5 > "/dev/stderr"
+        exit 1
+      }
     }
   ' | LC_ALL=C sort
 }
@@ -242,6 +300,10 @@ do_dump() {
   #
   # $tmp chứ không phải $out: `mv` xuống dưới mới chạy. Cả hai là cùng một file, nhưng đọc
   # $tmp giữ được thứ tự "ghi xong hết mới công bố".
+  # `{ … }` KHÔNG phải subshell, nên $meta_rc gán bên trong vẫn thấy được ở ngoài. Cần đúng
+  # tính chất đó: _dump_row_counts trả khác 0 khi nó gặp một dòng `COPY …` không parse nổi,
+  # và tín hiệu ấy phải sống sót ra khỏi khối chuyển hướng để do_dump nói ra được.
+  local meta_rc=0
   {
     echo "created=$(date -u +%s)"
     # server_version_num, KHÔNG dùng server_version: bản Ubuntu đóng gói trả chuỗi kiểu
@@ -249,7 +311,7 @@ do_dump() {
     # trong .meta. server_version_num là số nguyên (vd 160004), không cần parse gì thêm.
     echo "pg_version=$(_psql -d "$PG_DB" -tAc 'SHOW server_version_num' | tr -d ' ')"
     echo "dump_bytes=$(wc -c < "$tmp" | tr -d ' ')"
-    _dump_row_counts "$tmp"
+    _dump_row_counts "$tmp" || meta_rc=1
   } > "$meta"
   chmod 600 "$meta" 2>/dev/null || true
 
@@ -304,11 +366,24 @@ do_dump() {
     warn "tự kiểm tra và chmod tay, rồi tìm hiểu vì sao chmod trong do_dump không ăn."
   fi
 
+  # .meta KHÔNG ĐẦY ĐỦ — dòng chi tiết đã do awk in ra stderr ngay trên. Nói to ở đây vì hệ quả
+  # nằm ở TƯƠNG LAI, không ở lần chạy này: bản dump vẫn nạp lại được, nhưng .meta thiếu bảng nên
+  # MỌI `--verify` sau này trên bản dump ấy đều đỏ. Không báo bây giờ thì ba tuần nữa gpu-smoke
+  # đỏ ở lớp 6 và không ai truy ra được vì sao.
+  if [ "$meta_rc" != 0 ]; then
+    warn "BẢN DUMP TỐT NHƯNG .meta THIẾU BẢNG — có header COPY không parse được (chi tiết ở trên)."
+    warn "Nguyên nhân đã biết duy nhất: identifier chứa ký tự XUỐNG DÒNG (tên bảng hoặc tên cột),"
+    warn "pg_dump phát header vỡ làm hai dòng và awk đọc theo dòng nên không ghép lại được."
+    warn "Dump ĐÃ ghi xong ở $out và vẫn --restore được — KHÔNG xoá nó."
+    warn "Nhưng --verify trên bản này sẽ đỏ vì .meta cụt, chứ không phải vì file hỏng."
+  fi
+
   # Phần đỏ của symlink, hoãn từ trên xuống. In SAU cảnh báo quyền để không nuốt mất nó khi cả
   # hai cùng hỏng — hai chuyện độc lập, người đọc cần thấy cả hai chứ không phải cái nào tới trước.
   [ "$_ln_rc" = 0 ] || die "không tạo được symlink $LATEST — bản dump ĐÃ ghi xong ở $out, không mất gì. --restore/--check vẫn tìm được nó bằng cách quét $DUMPS."
 
   [ -z "$bad_perm" ] || return 1
+  [ "$meta_rc" = 0 ] || return 1
 }
 
 do_restore() {
