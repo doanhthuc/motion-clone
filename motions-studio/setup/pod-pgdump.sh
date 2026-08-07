@@ -63,6 +63,30 @@ _row_counts() {
 
 _table_count() { _psql -d "$PG_DB" -tAc "SELECT count(*) FROM pg_tables WHERE schemaname='public'"; }
 
+# In ra đường dẫn bản dump mới nhất, hoặc trả khác 0 nếu KHÔNG có bản nào dùng được.
+#
+# $LATEST là ĐƯỜNG NHANH, KHÔNG phải nguồn sự thật. Volume trên pod là MooseFS và CÙNG mount
+# đó đã chặn `chown` kể cả khi là root (pod-volume.sh:179-191) — chưa ai đo `symlink()` ở đó.
+# Nếu chỉ nhìn $LATEST: link vắng hoặc treo ⇒ ta nói "đây là phiên đầu" và trả 0, trong khi
+# $DUMPS đang nằm đầy dump tốt. Đó là mất dữ liệu hoàn chỉnh với exit 0 ở mọi bước.
+# Nên: thử $LATEST trước, không được thì quét $DUMPS.
+#
+# Sort theo TÊN, không phải `ls -t`: tên dạng motion-YYYYmmdd-HHMMSS (UTC, độ dài cố định) nên
+# thứ tự chữ cái TRÙNG thứ tự thời gian, đúng khuôn _prune đang dùng, và không phải tin vào
+# mtime của MooseFS.
+_latest_dump() {
+  local t=""
+  if [ -L "$LATEST" ] || [ -f "$LATEST" ]; then
+    t="$(readlink "$LATEST" 2>/dev/null || printf '%s' "$LATEST")"
+    # Link TƯƠNG ĐỐI (dumps/motion-….sql.gz) phải giải theo thư mục CHỨA link, không theo cwd.
+    case "$t" in /*) ;; *) t="$PGDIR/$t" ;; esac
+    [ -f "$t" ] || { warn "latest trỏ file không tồn tại: $t — tìm bản mới nhất trong $DUMPS" >&2; t=""; }
+  fi
+  [ -n "$t" ] || t="$(ls -1 "$DUMPS"/motion-*.sql.gz 2>/dev/null | sort | tail -1)"
+  [ -n "$t" ] && [ -f "$t" ] || return 1
+  printf '%s' "$t"
+}
+
 # stat khác cú pháp giữa BSD (macOS, máy dev) và GNU (Ubuntu, pod) — thử cả hai.
 _mode() { stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1" 2>/dev/null; }
 
@@ -127,7 +151,19 @@ do_dump() {
 
   # mv trong CÙNG filesystem là nguyên tử → latest không bao giờ trỏ một file ghi dở.
   mv "$tmp" "$out" || { rm -f "$tmp" "$meta"; die "mv dump thất bại"; }
-  ln -sfn "$out" "$LATEST"
+
+  # Link TƯƠNG ĐỐI, không tuyệt đối. `latest` và `dumps/` nằm cùng một cây thư mục trên volume,
+  # nên link tương đối đúng bất kể volume được mount ở đâu. Link tuyệt đối chốt cứng $POD_VOLUME
+  # của POD ĐÃ TẠO RA nó — pod sau mount ở path khác (hoặc người dùng đổi POD_VOLUME) là link
+  # treo ngay, đúng vào lúc ta cần nó nhất.
+  #
+  # `|| die` chứ không bỏ qua: chưa ai đo `symlink()` trên MooseFS, mà cùng mount đó đã chặn
+  # `chown`. Không kiểm thì --dump in "ok" và trả 0 trên một volume không có `latest`.
+  # Dump và .meta ĐÃ ghi xong trước dòng này nên die ở đây KHÔNG mất backup — _latest_dump()
+  # vẫn tìm thấy file qua $DUMPS. Đỏ ở đây nghĩa là "latest không tin được nữa", không phải
+  # "mất dump"; nhưng nó phải đỏ, vì một cơ chế backup im lặng hỏng một nửa là cơ chế tồi nhất.
+  ln -sfn "dumps/$(basename "$out")" "$LATEST" \
+    || die "không tạo được symlink $LATEST (bản dump ĐÃ ghi xong ở $out — không mất gì, nhưng volume này không cho tạo symlink)"
   _prune "$KEEP"
 
   # Kiểm KẾT QUẢ thật bằng stat, KHÔNG kiểm exit code của chmod ở trên. Trên pod, volume
@@ -154,12 +190,11 @@ do_dump() {
 
 do_restore() {
   local tables meta created age_h target
-  if [ ! -L "$LATEST" ] && [ ! -f "$LATEST" ]; then
+  # "phiên đầu" chỉ được nói khi $DUMPS THẬT SỰ rỗng — không phải khi mỗi symlink latest vắng.
+  if ! target="$(_latest_dump)"; then
     log "chưa có bản dump nào trên volume — bỏ qua (đây là phiên đầu)."
     return 0
   fi
-  target="$(readlink "$LATEST" 2>/dev/null || printf '%s' "$LATEST")"
-  [ -f "$target" ] || { warn "latest trỏ file không tồn tại: $target"; return 1; }
 
   # In tuổi TRƯỚC khi biết có nạp được hay không: operator chạy --restore trên một DB đã
   # có bảng (bị bỏ qua) vẫn cần biết bản dump gần nhất mới tới đâu, không chỉ khi thực sự
@@ -199,12 +234,7 @@ do_restore() {
 
 do_check() {
   local target meta created age_h
-  if [ ! -L "$LATEST" ] && [ ! -f "$LATEST" ]; then
-    warn "chưa có bản dump nào trên volume ($PGDIR)."
-    return 1
-  fi
-  target="$(readlink "$LATEST" 2>/dev/null || printf '%s' "$LATEST")"
-  [ -f "$target" ] || { warn "latest trỏ file không tồn tại: $target"; return 1; }
+  target="$(_latest_dump)" || { warn "chưa có bản dump nào trên volume ($PGDIR)."; return 1; }
   gzip -t "$target" 2>/dev/null || { warn "file dump hỏng (gzip -t đỏ): $target"; return 1; }
 
   meta="${target%.sql.gz}.meta"
@@ -227,7 +257,9 @@ do_check() {
 do_verify() {
   local target meta vdb rc=0 got want
   do_check >/dev/null || { warn "không có bản dump đọc được để verify."; return 1; }
-  target="$(readlink "$LATEST" 2>/dev/null || printf '%s' "$LATEST")"
+  # Cùng đường phân giải với do_check ở trên (kể cả fallback khi latest vắng/treo), nếu không
+  # --verify sẽ đi kiểm một file KHÁC với file --check vừa báo xanh.
+  target="$(_latest_dump)" || { warn "không có bản dump đọc được để verify."; return 1; }
   meta="${target%.sql.gz}.meta"
   vdb="${PG_DB}_verify"
 
