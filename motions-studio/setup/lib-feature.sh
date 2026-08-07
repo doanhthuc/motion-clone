@@ -875,11 +875,18 @@ FEENV
 #     nạp dump có CREATE TABLE vào DB đã có bảng rỗng là lỗi trùng.
 # Không có volume thì đi qua như không có gì.
 phase_pg_restore() {
-  # POD_VOLUME đọc theo khuôn env-trước-.env-sau (giống pod-volume.sh:188 và pod-pgdump.sh):
-  # scripts/pod-bootstrap.sh có HAI lệnh ssh, và chỉ lệnh đầu (chạy pod-volume.sh) mang
-  # POD_VOLUME theo. Lệnh thứ hai — lệnh chạy setup và dẫn tới đây — thì không. Chỉ dựa vào
-  # biến môi trường là cổng dưới đây luôn đóng, phase này lặng lẽ không chạy, và người dùng
-  # mất DB mà vẫn thấy mọi thứ xanh. pod-volume.sh đã ghi POD_VOLUME vào .env chính vì vậy.
+  # POD_VOLUME đọc theo khuôn env-trước-.env-sau (giống pod-volume.sh:188 và pod-pgdump.sh).
+  # Có ĐÚNG HAI nguồn, và cần cả hai vì mỗi nguồn hụt ở một đường vào khác nhau:
+  #   1. Biến môi trường qua ssh — scripts/pod-bootstrap.sh có hai lệnh ssh và cả hai đều mang
+  #      POD_VOLUME theo (lệnh chạy pod-volume.sh, và lệnh chạy setup dẫn tới đây — :173).
+  #      Nhưng nó CHỈ có mặt khi phase này chạy từ pod-bootstrap.sh. Người gõ tay
+  #      `./setup/setup-motion-transfer.sh` trên pod, hoặc bất kỳ caller nào khác, không có nó.
+  #   2. `.env` trên pod qua get_kv — luôn có mặt, không phụ thuộc lệnh gọi. Nhưng trên pod MỚI
+  #      thì `.env` chưa tồn tại lúc pod-volume.sh chạy (rsync loại trừ .env và .env.*), nên
+  #      khối set_kv_local của nó bị bỏ qua và key này chưa vào được `.env` ở lần dựng đầu tiên.
+  # Nguồn (1) bịt đúng lỗ của nguồn (2) ở lần dựng đầu, và `set_kv` ngay dưới đây bịt lỗ của
+  # nguồn (1) cho mọi lần chạy sau. Bỏ một trong hai là phase này lặng lẽ không chạy ở đúng
+  # kịch bản nó tồn tại để phục vụ — người dùng mất DB mà vẫn thấy mọi thứ xanh.
   local _vol="${POD_VOLUME:-}"
   [ -n "$_vol" ] || _vol="$(get_kv POD_VOLUME)"
   [ -n "$_vol" ] || return 0
