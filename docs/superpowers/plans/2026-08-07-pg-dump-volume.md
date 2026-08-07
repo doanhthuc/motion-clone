@@ -1267,12 +1267,41 @@ Năm chi tiết cài đặt không hiển nhiên, mỗi cái có một test riê
 4. Bảng ngoài schema `public` phải đọc hết khối nhưng **không** in ra, vì `_row_counts` (vế `got`
    của verify) chỉ đếm `public`.
 5. *(Thêm 2026-08-07, dọn nợ)* **Không bao giờ phát khoá rác trong im lặng.** Dòng nào mở đầu bằng
-   `COPY ` mà không tách nổi thành `<bảng> FROM stdin;` thì gom lại, in ra **stderr**, và `exit 1`
-   ở `END` → `_dump_row_counts` trả khác 0 → `do_dump` cảnh báo to và trả `1` (bản dump vẫn ghi
-   xong và vẫn `--restore` được; đỏ ở đây là cảnh báo `.meta` cụt). Dạng duy nhất đã biết rơi vào
-   đường này là **identifier chứa xuống dòng**: pg_dump phát header vỡ làm hai dòng vật lý. Sửa ở
-   parser cũng vô ích — `_row_counts` in mỗi bảng một dòng `<tên>=<số>` nên tên chứa `<LF>` đã tự
-   vỡ ở vế `got` rồi; **định dạng `.meta`** mới là thứ không biểu diễn nổi dạng này.
+   `COPY ` mà không tách nổi thành `<bảng> FROM stdin;` **và có số dấu `"` LẺ** thì gom lại, in ra
+   **stderr**, và `exit 1` ở `END` → `_dump_row_counts` trả khác 0 → `do_dump` cảnh báo to và trả
+   `1` (bản dump vẫn ghi xong và vẫn `--restore` được; đỏ ở đây là cảnh báo `.meta` cụt). Dạng duy
+   nhất đã biết rơi vào đường này là **identifier chứa xuống dòng**: pg_dump phát header vỡ làm
+   hai dòng vật lý, và dòng vật lý đầu luôn để lại `1 + 2k` dấu `"` chưa đóng.
+
+   *(Sửa 2026-08-07, review bắt được — hai lỗi ở bước 5.)*
+
+   **(a) Hồi quy hành vi.** Bản đầu của bước này tố **mọi** dòng `^COPY[ \t]`. Nhưng pg_dump chép
+   nguyên văn thân `CREATE FUNCTION $$…$$`, `COMMENT ON` và định nghĩa view, nên một dòng SQL
+   trong đó bắt đầu ngay ở cột 0. Đo thật với một function có dòng `COPY public.jobs FROM <file>
+   CSV;` trong thân: parser cũ `RC=0, .meta = jobs=7`; parser mới `RC=1, .meta = jobs=7` — **y
+   hệt, không thiếu gì** — kèm `!! BẢN DUMP TỐT NHƯNG .meta THIẾU BẢNG` và `--verify` ngay sau đó
+   **XANH**. Tức thông điệp sai sự thật, `make gpu-down` in "sao lưu DB thất bại" mỗi lần, và
+   `make gpu-db-dump` (`Makefile:156-161`, không có `|| echo`) hỏng thẳng. Cổng `"` lẻ ở trên là
+   bản vá: nó giữ nguyên hành vi cũ cho dòng không-header (0 dấu `"` ⇒ chẵn ⇒ bỏ qua) và vẫn bắt
+   được header vỡ. Nhận sai còn lại, cố ý chấp nhận: dòng không-header có số `"` lẻ.
+
+   **(b) Lý do ghi lại là SAI.** Bản đầu ghi "sửa ở parser cũng vô ích — **định dạng `.meta`** mới
+   là thứ không biểu diễn nổi dạng này". Đo trực tiếp thì bác được: `_row_counts` (vế `got`) đúng
+   là vỡ, phát ra hai dòng `new` và `line=1`; **nhưng vế `want` đọc từ `.meta` cũng vỡ y hệt**, và
+   cả hai vế đều đi qua `sort` nên **trùng khít**. Nối đúng hai dòng đó vào `.meta` rồi chạy
+   `--verify`: **XANH, `rc=0`**. Vậy **sửa ở parser thôi cũng đủ**; định dạng `.meta` không phải
+   ràng buộc chặn. Quyết định **báo lỗi to thay vì đoán vẫn giữ nguyên**, nhưng lý do đúng là:
+   biểu diễn ấy **nhập nhằng** — trong chính lần đo đó `--verify` xanh một cách **tình cờ** (hai
+   lỗi vỡ giống nhau khử nhau) và đếm **"3 bảng" cho một DB có 2 bảng**. Một cổng bằng-chứng xanh
+   nhờ trùng hợp còn tệ hơn một cổng đỏ. Sửa cho đúng sẽ phải đổi định dạng `.meta` sang thứ
+   **thoát** được `<LF>` — việc lớn hơn, và không có gì trong schema hiện tại đòi nó.
+
+   **(c) Assertion neo sai chỗ.** `grep -c 'FROM stdin;' == 0` neo vào hình dạng khoá rác **cũ**,
+   không vào bất biến đang khai. Mutant: bỏ ` > "/dev/stderr"` ở khối `END` (in dòng lỗi thẳng vào
+   stdout, mà stdout của `_dump_row_counts` **chính là** `.meta`) làm `.meta` chứa khoá rác thật
+   mà **toàn bộ 93 assertion vẫn xanh**. Thay bằng: đếm số dòng trong `.meta` không khớp
+   `^(created|pg_version|dump_bytes|meta_incomplete)=` và cũng không khớp `^[^=]+=[0-9]+$`, phải
+   bằng 0 — đỏ đúng dưới mutant (92 xanh · 1 đỏ).
 
 **Cách dựng đua cho test — chỗ dễ sai nhất.** Lần đầu viết test theo kiểu "dump xong rồi mới
 `INSERT` rồi `--verify`" và nó **xanh trên cả code vá lẫn chưa vá** (64 xanh · 0 đỏ ở cả hai bên):

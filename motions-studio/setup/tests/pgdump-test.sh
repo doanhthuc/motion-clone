@@ -336,10 +336,14 @@ assert_eq "0" "$(meta_junk "$M7")" \
 assert_ok "--verify xanh với bảng 0 cột và tên cột chứa ngoặc" -- bash "$SCRIPT" --verify
 q 'DROP TABLE t0; DROP TABLE parencol;' >/dev/null
 
-# (3) Identifier chứa XUỐNG DÒNG — dạng KHÔNG xử được chắc chắn. pg_dump phát header vỡ làm hai
-#     dòng vật lý; awk đọc theo dòng nên không ghép lại được. Và sửa ở parser cũng vô ích: vế
-#     `got` của verify (_row_counts) in mỗi bảng MỘT DÒNG `<tên>=<số>`, nên tên chứa <LF> đã tự
-#     vỡ ở vế kia rồi — cả ĐỊNH DẠNG .meta không biểu diễn nổi dạng này.
+# (3) Identifier chứa XUỐNG DÒNG. pg_dump phát header vỡ làm hai dòng vật lý; awk đọc theo dòng
+#     nên không ghép lại được ở dạng hiện tại.
+#     ĐÍNH CHÍNH 2026-08-07: comment cũ ở đây nói "sửa ở parser cũng vô ích vì định dạng .meta
+#     không biểu diễn nổi dạng này". SAI — đo rồi: `_row_counts` (vế `got`) vỡ thành `new` +
+#     `line=1`, nhưng vế `want` đọc từ .meta cũng vỡ Y HỆT và cả hai đều `sort`, nên chúng trùng
+#     khít; nối đúng hai dòng đó vào .meta rồi `--verify` → XANH, rc=0. Sửa ở parser thôi cũng đủ.
+#     Quyết định BÁO LỖI TO vẫn giữ, vì lý do khác: biểu diễn ấy NHẬP NHẰNG — verify xanh một
+#     cách tình cờ (hai lỗi vỡ khử nhau) và đếm "3 bảng" cho một DB có 2 bảng.
 #     Yêu cầu ở đây vì thế KHÔNG phải "đếm đúng" mà là: BÁO LỖI TO thay vì đoán.
 rm -rf "$VOL/pg"; seed
 q 'CREATE TABLE "new

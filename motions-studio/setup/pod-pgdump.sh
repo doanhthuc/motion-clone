@@ -106,14 +106,24 @@ _row_counts() {
 #       `COPY public.jobs FROM '/tmp/x.csv' CSV;` xuất hiện thật ở cột 0 → BỎ QUA im lặng
 #       (số dấu " chẵn ⇒ không phải header vỡ). Tố nó là báo động giả trên một dump hoàn hảo.
 #
-#   KHÔNG xử được, và giờ BÁO LỖI TO thay vì đoán:
+#   CHỌN BÁO LỖI TO thay vì đoán:
 #     - identifier chứa XUỐNG DÒNG (`CREATE TABLE "new<LF>line"`, hoặc cột `"c<LF>c"`). pg_dump
 #       phát header vỡ làm hai dòng vật lý; awk đọc theo dòng nên dòng đầu (`COPY public."new`)
-#       không thể parse. Và sửa ở ĐÂY cũng vô ích: `_row_counts` — vế `got` của verify — in ra
-#       `<tên>=<số>` mỗi bảng MỘT DÒNG, nên một tên chứa <LF> đã tự vỡ thành hai dòng ở vế kia
-#       rồi (đo thật: nó phát ra "new" và "line=1" thành hai dòng). Cả ĐỊNH DẠNG .meta không
-#       biểu diễn nổi dạng tên này, không riêng gì parser. Sửa đúng sẽ là đổi định dạng .meta
-#       — việc lớn hơn nhiều, và không có gì trong schema hiện tại đòi nó.
+#       không parse được ở dạng hiện tại.
+#
+#       ĐÍNH CHÍNH 2026-08-07 (review bắt được): bản trước ghi ở đây rằng "sửa ở parser cũng vô
+#       ích vì ĐỊNH DẠNG .meta không biểu diễn nổi dạng tên này". SAI, và đã đo để bác:
+#         `_row_counts` (vế `got`) đúng là vỡ — nó phát ra hai dòng `new` và `line=1`.
+#         NHƯNG vế `want` đọc từ .meta cũng vỡ Y HỆT, và cả hai vế đều đi qua `sort`, nên chúng
+#         TRÙNG KHÍT. Nối đúng hai dòng đó vào .meta rồi chạy `--verify`: XANH, rc=0.
+#       Tức sửa Ở PARSER THÔI CŨNG ĐỦ để verify khớp; định dạng .meta KHÔNG phải ràng buộc chặn.
+#
+#       Vẫn giữ nguyên quyết định báo lỗi to, nhưng vì lý do KHÁC: biểu diễn ấy NHẬP NHẰNG. Cùng
+#       lần đo trên, `--verify` xanh một cách TÌNH CỜ (hai lỗi vỡ giống nhau khử nhau, không phải
+#       vì ai đó chứng minh được gì) và nó đếm "3 bảng" cho một DB có 2 bảng. Một cổng bằng-chứng
+#       xanh nhờ trùng hợp còn tệ hơn một cổng đỏ: nó dạy người đọc tin vào thứ không kiểm gì.
+#       Sửa cho đúng sẽ phải đổi định dạng .meta sang thứ thoát được <LF> (mỗi bảng vẫn một dòng,
+#       nhưng tên được escape) — việc lớn hơn, và không có gì trong schema hiện tại đòi nó.
 #       Nên: gom vào mảng `bad`, in ra STDERR, và `exit 1` ở END → _dump_row_counts trả khác 0
 #       → do_dump cảnh báo to và trả 1. .meta THIẾU bảng đó (chứ không chứa khoá rác), nên
 #       --verify sau đó sẽ đỏ — và người đọc đã có sẵn lời giải thích từ lúc --dump.
