@@ -337,6 +337,12 @@ Thêm vào `pod-pgdump.sh` ngay trước `do_dump()`:
 # parse output của ls là thứ vỡ ngay khi có tên lạ.
 _prune() {
   local keep="$1" all n f
+  # Làm sạch keep TRƯỚC mọi phép tính. `.env` là file người sửa tay, nên KEEP có thể rỗng,
+  # có chữ, hoặc bằng 0. Với keep=0 thì `head -n $((n-keep))` xoá đúng TẤT CẢ, gồm cả bản
+  # $LATEST đang trỏ vào — mất sạch lịch sử backup vì một ký tự gõ nhầm. Kẹp về 1 là diễn
+  # giải đúng của ràng buộc: giữ ít nhất một bản, luôn luôn.
+  case "$keep" in ''|*[!0-9]*) keep=1 ;; esac
+  [ "$keep" -ge 1 ] || keep=1
   all="$(ls -1 "$DUMPS"/motion-*.sql.gz 2>/dev/null | sort)"
   n="$(printf '%s\n' "$all" | sed '/^$/d' | wc -l | tr -d ' ')"
   [ "$n" -le 1 ] && return 0          # không bao giờ xoá bản cuối cùng còn lại

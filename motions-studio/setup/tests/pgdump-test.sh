@@ -94,6 +94,24 @@ assert_eq "2" "$(ls "$VOL"/pg/dumps/*.meta   | wc -l | tr -d ' ')" "prune xoá .
 # KEEP=1 mà chỉ có 1 bản: không được xoá sạch
 rm -rf "$VOL/pg"; PG_DUMP_KEEP=1 bash "$SCRIPT" --dump >/dev/null
 assert_eq "1" "$(ls "$VOL"/pg/dumps/*.sql.gz | wc -l | tr -d ' ')" "KEEP=1 vẫn giữ lại bản duy nhất"
+# KEEP=0 (gõ nhầm trong .env) KHÔNG được xoá sạch. Đây là bất biến quan trọng nhất của _prune:
+# mất một bản cũ chỉ là mất tiện; mất bản CUỐI CÙNG là mất hẳn dữ liệu.
+rm -rf "$VOL/pg"; seed
+PG_DUMP_KEEP=0 bash "$SCRIPT" --dump >/dev/null; sleep 1
+PG_DUMP_KEEP=0 bash "$SCRIPT" --dump >/dev/null; sleep 1
+PG_DUMP_KEEP=0 bash "$SCRIPT" --dump >/dev/null
+N0="$(ls "$VOL"/pg/dumps/*.sql.gz 2>/dev/null | wc -l | tr -d ' ')"
+[ "$N0" -ge 1 ] && ok "KEEP=0 vẫn giữ lại ít nhất 1 bản (không xoá sạch)" \
+                || bad "KEEP=0 đã xoá SẠCH backup — còn $N0 bản"
+[ -e "$(readlink "$VOL/pg/latest")" ] && ok "KEEP=0: latest vẫn trỏ file có thật" \
+                                      || bad "KEEP=0: latest thành symlink treo"
+# KEEP không phải số cũng không được xoá sạch
+rm -rf "$VOL/pg"; seed
+PG_DUMP_KEEP=abc bash "$SCRIPT" --dump >/dev/null; sleep 1
+PG_DUMP_KEEP=abc bash "$SCRIPT" --dump >/dev/null
+NA="$(ls "$VOL"/pg/dumps/*.sql.gz 2>/dev/null | wc -l | tr -d ' ')"
+[ "$NA" -ge 1 ] && ok "KEEP không phải số vẫn giữ lại ít nhất 1 bản" \
+                || bad "KEEP=abc đã xoá sạch backup"
 
 echo
 info "$PASSED xanh · $FAILED đỏ"
