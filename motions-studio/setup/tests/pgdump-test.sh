@@ -192,6 +192,29 @@ assert_eq "1" "$(q "SELECT count(*) FROM pg_tables WHERE schemaname='public'")" 
 assert_eq "" "$(q "SELECT to_regclass('public.jobs')")" \
   "bảng jobs từ dump KHÔNG được tạo ra"
 
+# ── Task 4 ────────────────────────────────────────────────────────────────
+info "Task 4 — --check và --verify"
+rm -rf "$VOL/pg"; seed; bash "$SCRIPT" --dump >/dev/null
+
+assert_ok "--check trả 0 khi có dump" -- bash "$SCRIPT" --check
+bash "$SCRIPT" --check 2>&1 | grep -q "jobs=7" && ok "--check in số dòng từ .meta" \
+                                               || bad "--check không in số dòng"
+assert_eq "7" "$(q 'SELECT count(*) FROM jobs')" "--check không sửa DB thật"
+
+assert_ok "--verify trả 0 khi dump khớp .meta" -- bash "$SCRIPT" --verify
+assert_eq "" "$(q "SELECT 1 FROM pg_database WHERE datname='motion_verify'")" \
+  "--verify xoá DB tạm sau khi xong"
+
+# .meta bị sửa lệch → verify PHẢI đỏ. Đây là lý do .meta tồn tại.
+M="$(ls "$VOL"/pg/dumps/*.meta | head -1)"
+sed -i '' 's/^jobs=7$/jobs=999/' "$M"
+assert_fail "--verify đỏ khi số dòng lệch .meta" -- bash "$SCRIPT" --verify
+assert_eq "" "$(q "SELECT 1 FROM pg_database WHERE datname='motion_verify'")" \
+  "--verify vẫn xoá DB tạm khi hỏng"
+
+rm -rf "$VOL/pg"
+assert_fail "--check đỏ khi chưa có dump nào" -- bash "$SCRIPT" --check
+
 echo
 info "$PASSED xanh · $FAILED đỏ"
 [ "$FAILED" -eq 0 ]

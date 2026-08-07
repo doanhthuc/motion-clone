@@ -197,8 +197,64 @@ do_restore() {
   ok "khôi phục xong từ $(basename "$target")"
 }
 
+do_check() {
+  local target meta created age_h
+  if [ ! -L "$LATEST" ] && [ ! -f "$LATEST" ]; then
+    warn "chưa có bản dump nào trên volume ($PGDIR)."
+    return 1
+  fi
+  target="$(readlink "$LATEST" 2>/dev/null || printf '%s' "$LATEST")"
+  [ -f "$target" ] || { warn "latest trỏ file không tồn tại: $target"; return 1; }
+  gzip -t "$target" 2>/dev/null || { warn "file dump hỏng (gzip -t đỏ): $target"; return 1; }
+
+  meta="${target%.sql.gz}.meta"
+  created="$(grep -m1 '^created=' "$meta" 2>/dev/null | cut -d= -f2)"
+  age_h="?"; [ -n "$created" ] && age_h=$(( ( $(date -u +%s) - created ) / 3600 ))
+  ok "bản dump mới nhất: $(basename "$target") · ${age_h} giờ tuổi · $(wc -c < "$target" | tr -d ' ') bytes"
+  log "số bản đang giữ: $(ls -1 "$DUMPS"/motion-*.sql.gz 2>/dev/null | wc -l | tr -d ' ')"
+  log "số dòng ghi trong .meta:"
+  grep -vE '^(created|pg_version|dump_bytes)=' "$meta" 2>/dev/null | sed 's/^/    /'
+}
+
+# Bằng chứng, không phải dấu vết: nạp thật vào một DB tạm rồi so số dòng. Không có bước này
+# thì cả cơ chế backup chỉ là niềm tin, và niềm tin đó được kiểm lần đầu vào đúng lúc tệ nhất.
+do_verify() {
+  local target meta vdb rc=0 got want
+  do_check >/dev/null || { warn "không có bản dump đọc được để verify."; return 1; }
+  target="$(readlink "$LATEST" 2>/dev/null || printf '%s' "$LATEST")"
+  meta="${target%.sql.gz}.meta"
+  vdb="${PG_DB}_verify"
+
+  _psql -d postgres -q -c "DROP DATABASE IF EXISTS $vdb" >/dev/null 2>&1
+  _psql -d postgres -q -c "CREATE DATABASE $vdb OWNER $PG_USER" >/dev/null 2>&1 \
+    || { warn "không tạo được DB tạm $vdb — role $PG_USER có quyền CREATEDB chưa?"; return 1; }
+
+  if gzip -dc "$target" | PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" \
+       -d "$vdb" --single-transaction -v ON_ERROR_STOP=1 -q >/dev/null 2>&1; then
+    want="$(grep -vE '^(created|pg_version|dump_bytes)=' "$meta" 2>/dev/null | sort)"
+    got="$(_row_counts "$vdb")"
+    if [ "$want" = "$got" ]; then
+      ok "verify: nạp lại được và số dòng khớp .meta ($(printf '%s\n' "$got" | wc -l | tr -d ' ') bảng)"
+    else
+      warn "verify ĐỎ — số dòng lệch so với .meta:"
+      diff <(printf '%s\n' "$want") <(printf '%s\n' "$got") | sed 's/^/    /'
+      rc=1
+    fi
+  else
+    warn "verify ĐỎ — không nạp lại được bản dump này."
+    rc=1
+  fi
+
+  # Xoá DB tạm KỂ CẢ khi hỏng: để lại một DB rác tên motion_verify sẽ làm lần verify sau
+  # đỏ vì lý do khác hẳn, và truy ra rất mất công.
+  _psql -d postgres -q -c "DROP DATABASE IF EXISTS $vdb" >/dev/null 2>&1
+  return "$rc"
+}
+
 case "${1:-}" in
   --dump)    do_dump ;;
   --restore) do_restore ;;
+  --check)   do_check ;;
+  --verify)  do_verify ;;
   *) echo "dùng: $0 --dump|--restore|--check|--verify" >&2; exit 2 ;;
 esac
