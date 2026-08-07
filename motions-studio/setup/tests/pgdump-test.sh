@@ -449,15 +449,17 @@ line";' >/dev/null
 #          trước khi luật /^COPY/ nhìn thấy, nếu không nó bị xử như một header riêng.
 #          (pg_dump còn rải `COPY y" (` và `COPY y" OWNER TO motion;` trong phần DDL — hai dòng
 #          không-header có dấu " lẻ, và chúng KHÔNG được tố.)
-#        - `"a<LF>b<LF>c"` → header trải BA dòng vật lý, nên dòng nối KHÔNG phải dòng ngay sau.
-#          Đây là dạng duy nhất làm CỠ CỬA SỔ trở thành số đo được: đã đo, cửa sổ = 1 bỏ lọt
-#          dạng này (rc=0, im lặng), cửa sổ = 4 bắt được. Bỏ dòng này đi là để lại một hằng số
-#          không assertion nào chạm tới.
+#        - `"a<LF>b<LF>c"` (k=2) và `"a<LF>…<LF>f"` (k=5) → header trải BA và SÁU dòng vật lý,
+#          nên dòng nối KHÔNG phải dòng ngay sau. Hai dạng này là thứ duy nhất làm CỠ CỬA SỔ
+#          trở thành số ĐO ĐƯỢC: đã đo, cửa sổ = 1 bỏ lọt k=2, cửa sổ = 4 bỏ lọt k=5 (rc=0,
+#          IM LẶNG — chiều hỏng xấu nhất), cửa sổ = 8 bắt cả hai. Bỏ hai dòng này đi là để lại
+#          một hằng số không assertion nào chạm tới.
 for spec in \
   'quotenl|CREATE TABLE "a""b\nc" (id int); INSERT INTO "a""b\nc" VALUES (1);|DROP TABLE "a""b\nc";' \
   'colnl|CREATE TABLE colnl ("c\nc" int); INSERT INTO colnl VALUES (5);|DROP TABLE colnl;' \
   'xcopyy|CREATE TABLE "x\nCOPY y" (id int); INSERT INTO "x\nCOPY y" VALUES (1);|DROP TABLE "x\nCOPY y";' \
-  'nl2|CREATE TABLE "a\nb\nc" (id int); INSERT INTO "a\nb\nc" VALUES (1);|DROP TABLE "a\nb\nc";'
+  'nl2|CREATE TABLE "a\nb\nc" (id int); INSERT INTO "a\nb\nc" VALUES (1);|DROP TABLE "a\nb\nc";' \
+  'nl5|CREATE TABLE "a\nb\nc\nd\ne\nf" (id int); INSERT INTO "a\nb\nc\nd\ne\nf" VALUES (1);|DROP TABLE "a\nb\nc\nd\ne\nf";'
 do
   nm="${spec%%|*}"; rest="${spec#*|}"; mk="${rest%%|*}"; dr="${rest#*|}"
   rm -rf "$VOL/pg"; seed

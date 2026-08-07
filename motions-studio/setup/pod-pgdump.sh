@@ -181,10 +181,24 @@ _dump_row_counts() {
     #      `COPY public.jobs FROM x " y` cách header thật `COPY public.jobs (id, kind) FROM
     #      stdin;` đúng 10 dòng, và tổng dấu " là 1 ⇒ LẺ ⇒ không tố. Đúng như phải thế.
     #
-    # CỬA SỔ 4 DÒNG: một header vỡ dòng trải 1 + k dòng vật lý với k = số ký tự xuống dòng trong
-    # identifier; cả bốn dạng đã đo (`"new<LF>line"`, `"a""b<LF>c"`, cột `"c<LF>c"`, bảng
-    # `"x<LF>COPY y"`) đều có k=1, tức dòng nối là dòng NGAY SAU. k>4 là bệnh lý. Giới hạn nhỏ là
-    # cổng thứ ba, độc lập với parity: càng ít dòng nhìn tiếp thì càng ít cơ hội ghép nhầm.
+    # CỬA SỔ 8 DÒNG: một header vỡ dòng trải 1 + k dòng vật lý với k = số ký tự xuống dòng trong
+    # identifier; bốn dạng đã đo (`"new<LF>line"`, `"a""b<LF>c"`, cột `"c<LF>c"`, bảng
+    # `"x<LF>COPY y"`) đều có k=1, tức dòng nối là dòng NGAY SAU.
+    #
+    # Con số 8 là ĐO, không phải cảm tính. Đã chạy nhóm ba dạng tố oan và một bảng k=5 qua cửa
+    # sổ 4/8/20/100:
+    #     cửa sổ  4  → nhóm tố oan SẠCH, k=5 BỎ LỌT TRONG IM LẶNG (rc=0, .meta thiếu bảng, KHÔNG cờ)
+    #     cửa sổ  8  → nhóm tố oan SẠCH, k=5 báo to (rc=1)
+    #     cửa sổ 20/100 → y hệt 8
+    # Tức 4 không mua thêm an toàn nào so với 8, mà đổi một lỗi ỒN lấy một lỗi IM — sai chiều so
+    # với nguyên tắc của file này. Chọn 8 vì nó là giá trị nhỏ nhất đo được là đủ cho k=5, và vì
+    # cửa sổ hẹp vẫn là cổng thứ ba độc lập với parity nếu sau này parity bị bào mòn.
+    #
+    # Vì sao cửa sổ rộng KHÔNG làm nhóm tố oan hỏng, dù dạng COMMENT ON cách header thật 20 dòng
+    # và có một dấu `"` xen giữa (đủ để parity thành chẵn): dòng `"` xen giữa ấy CŨNG mở đầu bằng
+    # `COPY ` và cũng lẻ, nên nó RƠI XUỐNG và TREO LẠI hàng chờ từ đầu, đặt lại pendbuf. Hành vi
+    # đúng, nhưng là hệ quả PHỤ của việc treo-đè chứ không phải thứ được thiết kế ra để chặn —
+    # nên đừng bỏ cửa sổ đi chỉ vì nó "có vẻ thừa".
     #
     # Không khớp thì RƠI XUỐNG (không `next`): dòng đang xét vẫn phải được xử như dòng thường —
     # nó có thể chính là một header COPY hợp lệ.
@@ -195,7 +209,7 @@ _dump_row_counts() {
         pend = 0
         next                                 # nuốt dòng nối: nó là ĐUÔI của header vỡ, không phải dòng riêng
       }
-      if (++pendn >= 4) pend = 0              # hết cửa sổ ⇒ dòng khả nghi là dòng thường, KHÔNG tố
+      if (++pendn >= 8) pend = 0              # hết cửa sổ ⇒ dòng khả nghi là dòng thường, KHÔNG tố
     }
     # Bắt MỌI dòng mở đầu bằng "COPY ", không chỉ dòng parse được — nhưng KHÔNG phải dòng nào
     # không khớp cũng là lỗi. Xem hàng chờ ngay trên: chỉ dòng mang CHỮ KÝ của một header
