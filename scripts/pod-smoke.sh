@@ -19,9 +19,10 @@
 #   3 PM2 processes             every app online, none in restart-loop
 #   4 ComfyUI custom nodes      /object_info/WanVideoModelLoader
 #   5 volume really in use      setup/pod-volume.sh --check
-#   6 a real motion job         Wan Animate pipeline runs end to end   (optional)
-#   7 a real tryon job          qwen2.5vl:7b auto-detect + bg-remover venv work (optional)
-#   8 a real create-image job   Qwen-Image-Edit runs prompt-only        (opt-in)
+#   6 DB backup on the volume   pod-pgdump.sh --check && --verify (restores into a temp DB)
+#   7 a real motion job         Wan Animate pipeline runs end to end   (optional)
+#   8 a real tryon job          qwen2.5vl:7b auto-detect + bg-remover venv work (optional)
+#   9 a real create-image job   Qwen-Image-Edit runs prompt-only        (opt-in)
 #
 set -uo pipefail
 cd "$(dirname "$0")/.."; ROOT="$(pwd)"
@@ -40,7 +41,7 @@ HOST="$(env_get GPU_SSH_HOST)"; PORT="$(env_get GPU_SSH_PORT)"
 POD_VOLUME="$(env_get POD_VOLUME)"
 MODELS_MIN_GB="$(env_get MODELS_MIN_GB)"
 TIMEOUT_MIN="${SMOKE_TIMEOUT_MIN:-20}"
-# Layer 6 (mp4) and layers 7-8 (PNG) need different size floors. A real photographic PNG from
+# Layer 7 (mp4) and layers 8-9 (PNG) need different size floors. A real photographic PNG from
 # Qwen-Image-Edit compresses far worse than the >100KB mp4 threshold below would suggest is needed,
 # but 5 KB is still comfortably above "0 bytes" or a JSON error body saved to the output path by
 # mistake, and comfortably below any real image output — so it catches a broken download without
@@ -55,7 +56,7 @@ if [ -n "$HOST" ] && [ -n "$PORT" ]; then SSH_OK=1; fi
 remote() { ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -p "$PORT" "root@$HOST" "$1" 2>/dev/null; }
 
 # ── 1. Tunnel + api process ───────────────────────────────────────────────────
-log "1/8 tunnel + api process"
+log "1/9 tunnel + api process"
 if curl -sf --max-time 15 "https://$DOMAIN/health" >/dev/null 2>&1; then
   ok "https://$DOMAIN/health answers → Cloudflare Tunnel up, api process alive"
 else
@@ -67,7 +68,7 @@ fi
 
 # ── 2. Auth + Postgres ────────────────────────────────────────────────────────
 # GET /jobs runs a real query, so a 200 proves api → Postgres → auth all at once.
-log "2/8 API key + Postgres"
+log "2/9 API key + Postgres"
 KEY="$(grep -E '^NUXT_MOTION_API_KEY=' "$ROOT/motions/.env" 2>/dev/null | cut -d= -f2- | tr -d '"')"
 if [ -z "$KEY" ] && [ "$SSH_OK" = 1 ]; then
   KEY="$(remote "grep -E '^API_KEY=' ~/motion-backend/.env | cut -d= -f2-" | tr -d '\r\n')"
@@ -89,9 +90,9 @@ else
 fi
 
 # ── 3. PM2 processes ──────────────────────────────────────────────────────────
-log "3/8 PM2 processes"
+log "3/9 PM2 processes"
 if [ "$SSH_OK" != 1 ]; then
-  skip "no GPU_SSH_HOST/GPU_SSH_PORT in .env → skipping every SSH-based check (3,4,5)"
+  skip "no GPU_SSH_HOST/GPU_SSH_PORT in .env → skipping every SSH-based check (3,4,5,6)"
 else
   PM2="$(remote "pm2 jlist 2>/dev/null")"
   if [ -z "$PM2" ]; then
@@ -137,7 +138,7 @@ fi
 # ComfyUI answering /system_stats only proves it is breathing. The workflow dies
 # with HTTP 400 "node type not found" if the custom nodes did not load, so check a
 # node the motion workflow actually uses — same mechanism as _comfy_has_node().
-log "4/8 ComfyUI custom nodes"
+log "4/9 ComfyUI custom nodes"
 if [ "$SSH_OK" != 1 ]; then
   skip "needs SSH"
 else
@@ -152,7 +153,7 @@ else
 fi
 
 # ── 5. Volume really in use ───────────────────────────────────────────────────
-log "5/8 Network Volume"
+log "5/9 Network Volume"
 if [ "$SSH_OK" != 1 ]; then
   skip "needs SSH"
 elif [ -z "$POD_VOLUME" ]; then
@@ -170,9 +171,9 @@ else
   fi
 fi
 
-# ── Shared job runner (layers 6-8) ────────────────────────────────────────────
+# ── Shared job runner (layers 7-9) ────────────────────────────────────────────
 # POST /jobs, poll until done/error/cancelled or TIMEOUT_MIN, download the output and check its
-# size. Extracted so layers 6, 7 and 8 don't each carry their own ~45-line copy of queue → poll →
+# size. Extracted so layers 7, 8 and 9 don't each carry their own ~45-line copy of queue → poll →
 # download → size-check that would drift out of sync.
 #   $1        output file path to download into (pick the extension for the job's real content type)
 #   $2        minimum acceptable download size in bytes
@@ -184,8 +185,8 @@ run_and_check_job() {
   # SMOKE_TIMEOUT_MIN<=0 is a nonsensical config (DEADLINE is already in the past before the
   # first poll) — block it here, before POSTing the job, rather than let it burn a real job slot
   # and surface as a confusing instant "timeout" below. This check lives per-layer (not once at
-  # the top of the script) because TIMEOUT_MIN only matters to layers 6-8, which share this
-  # function; layers 1-5 don't touch it and shouldn't be blocked by a var they never read.
+  # the top of the script) because TIMEOUT_MIN only matters to layers 7-9, which share this
+  # function; layers 1-6 don't touch it and shouldn't be blocked by a var they never read.
   if [ "$TIMEOUT_MIN" -le 0 ] 2>/dev/null; then
     bad "SMOKE_TIMEOUT_MIN=$TIMEOUT_MIN is meaningless — the deadline would already be in the past
        before the first poll. Set a positive number of minutes (default is 20)."
@@ -236,18 +237,36 @@ EOF2
   bad "job did not finish within ${TIMEOUT_MIN}m (still $ST) — raise SMOKE_TIMEOUT_MIN or check pm2 logs worker"
 }
 
-# ── 6. A real motion job ──────────────────────────────────────────────────────
-# The five checks above prove each piece works. Only a real job proves they work
+# ── 6. Database backup on the volume ──────────────────────────────────────────
+# Chứng minh: có bản dump trên volume, và nó NẠP LẠI ĐƯỢC. Chỉ kiểm "có file" thì vô
+# nghĩa — một file .sql.gz rỗng vẫn là một file. --verify nạp thật vào DB tạm rồi so
+# số dòng với .meta, nên nó là bằng chứng chứ không phải dấu vết. Cùng nhóm "rẻ" với
+# các lớp 1-5: chạy trước lớp cần GPU đầu tiên (motion, bên dưới).
+log "6/9 Sao lưu database trên volume"
+if [ "$SSH_OK" != 1 ]; then
+  skip "needs SSH"
+elif [ -z "$POD_VOLUME" ]; then
+  # skip chứ không bad: pod không gắn volume là cấu hình hợp lệ, không phải hỏng hóc.
+  skip "bỏ qua — không đặt POD_VOLUME"
+elif remote "cd ~/motion-backend && bash ./setup/pod-pgdump.sh --check && bash ./setup/pod-pgdump.sh --verify"; then
+  ok "có bản dump, và nạp lại được (đã diễn tập vào DB tạm)"
+else
+  # warn chứ không bad: thiếu backup không làm pod sai chức năng, nhưng phải nói to.
+  warn "chưa có bản dump nạp được — chạy 'make gpu-db-dump'"
+fi
+
+# ── 7. A real motion job ──────────────────────────────────────────────────────
+# The checks above prove each piece works. Only a real job proves they work
 # TOGETHER: Postgres → worker claim → ComfyUI loads Wan Animate FROM THE VOLUME →
 # DWPose → sampling → VAE decode → MinIO upload → API hands back a URL.
-log "6/8 real motion job"
+log "7/9 real motion job"
 if [ -z "${SMOKE_REF:-}" ] || [ -z "${SMOKE_DRIVER:-}" ]; then
   skip "set SMOKE_REF=<character image> and SMOKE_DRIVER=<driver video> to run one.
       No sample driver video ships with the repo, so this stays opt-in."
 elif [ -z "${KEY:-}" ]; then
   skip "no API key (see layer 2)"
 else
-  # Check-only flags, not reassigning SMOKE_REF/SMOKE_DRIVER to "": layer 7 below reuses
+  # Check-only flags, not reassigning SMOKE_REF/SMOKE_DRIVER to "": layer 8 below reuses
   # SMOKE_REF, and clobbering the shared var here would make its check misreport "not set".
   ref_ok=1; driver_ok=1
   [ -f "$SMOKE_REF" ]    || { bad "SMOKE_REF not found: $SMOKE_REF"; ref_ok=0; }
@@ -265,13 +284,13 @@ else
   fi
 fi
 
-# ── 7. A real tryon job ───────────────────────────────────────────────────────
+# ── 8. A real tryon job ───────────────────────────────────────────────────────
 # Proves qwen2.5vl:7b (just downloaded onto the volume) and the bg-remover venv baked into the
 # image both actually run — the only path that exercises either one. SETUP_PROFILE=full added
 # them without any layer above checking either.
-log "7/8 real tryon job"
+log "8/9 real tryon job"
 if [ -z "${SMOKE_REF:-}" ] || [ -z "${SMOKE_PRODUCT:-}" ]; then
-  skip "set SMOKE_REF=<person image> (reused from layer 6) and SMOKE_PRODUCT=<garment image> to run one."
+  skip "set SMOKE_REF=<person image> (reused from layer 7) and SMOKE_PRODUCT=<garment image> to run one."
 elif [ -z "${KEY:-}" ]; then
   skip "no API key (see layer 2)"
 else
@@ -291,11 +310,11 @@ else
   fi
 fi
 
-# ── 8. A real create-image job ────────────────────────────────────────────────
+# ── 9. A real create-image job ────────────────────────────────────────────────
 # Proves the Qwen-Image-Edit path runs prompt-only (no files), the other half of what
 # SETUP_PROFILE=full added. Opt-in only (SMOKE_PROMPT) so plain `make gpu-smoke` keeps its
 # existing contract of "readiness checks only, never spends GPU time".
-log "8/8 real create-image job"
+log "9/9 real create-image job"
 if [ -z "${SMOKE_PROMPT:-}" ]; then
   skip "set SMOKE_PROMPT=<English prompt> to run one. Opt-in only: this is the one layer that
       make gpu-smoke must NOT run by default, so it needs its own trigger var."

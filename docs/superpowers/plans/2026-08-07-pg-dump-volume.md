@@ -980,21 +980,41 @@ Helper có sẵn ở `pod-smoke.sh:29-36,55`, dùng đúng chúng, không địn
 
 - [ ] **Step 2: Thêm lớp backup**
 
+Bản triển khai thật (sửa hai điểm so với mẫu ở trên, xem "Fix round 1" dưới Task 7 report):
+1. Thêm nhánh `[ "$SSH_OK" != 1 ]` **trước** nhánh `POD_VOLUME`, cùng thứ tự với lớp 5 (Network
+   Volume). Mẫu gốc thiếu nhánh này — nếu không có SSH, `remote()` vẫn chạy (với `ssh` tới
+   host/port rỗng), lỗi ra là lỗi ssh chung, và layer sẽ báo "chưa có bản dump" — SAI, lý do
+   thật là "không có SSH", không phải "chưa có backup".
+2. Gọi `bash ./setup/pod-pgdump.sh` (không phải `./setup/pod-pgdump.sh`), đồng bộ với quyết định
+   ở Task 6: không dựa vào bit thực thi trên pod.
+
+Vì chèn trước lớp motion (giờ đã đổi số vì có thêm 1 lớp: 6/9, không phải 6/8), toàn bộ số
+`N/8` của các lớp 1-5 và số của motion/tryon/create-image (6→7, 7→8, 8→9) cũng được cập nhật
+trong `scripts/pod-smoke.sh`, cùng các dòng comment nhắc số lớp cũ (header 1-8 layers, "layers
+6-8" ở shared job runner, "layer 6/7" ở các dòng skip của tryon/motion).
+
 ```bash
 # Lớp: sao lưu DB. Chứng minh: có bản dump trên volume, và nó NẠP LẠI ĐƯỢC.
 # Chỉ kiểm "có file" thì vô nghĩa — một file .sql.gz rỗng vẫn là một file. --verify nạp
 # thật vào DB tạm rồi so số dòng với .meta, nên nó là bằng chứng chứ không phải dấu vết.
-log "Sao lưu database trên volume"
-if [ -z "$POD_VOLUME" ]; then
+log "6/9 Sao lưu database trên volume"
+if [ "$SSH_OK" != 1 ]; then
+  skip "needs SSH"
+elif [ -z "$POD_VOLUME" ]; then
   # skip chứ không bad: pod không gắn volume là cấu hình hợp lệ, không phải hỏng hóc.
   skip "bỏ qua — không đặt POD_VOLUME"
-elif remote "cd ~/motion-backend && ./setup/pod-pgdump.sh --check && ./setup/pod-pgdump.sh --verify"; then
+elif remote "cd ~/motion-backend && bash ./setup/pod-pgdump.sh --check && bash ./setup/pod-pgdump.sh --verify"; then
   ok "có bản dump, và nạp lại được (đã diễn tập vào DB tạm)"
 else
   # warn chứ không bad: thiếu backup không làm pod sai chức năng, nhưng phải nói to.
   warn "chưa có bản dump nạp được — chạy 'make gpu-db-dump'"
 fi
 ```
+
+Ghi chú cho Task 8: `docs/gpu-pod.md` (dòng ~1231, ~1253-1281) mô tả `make gpu-smoke` là
+"8/8 lớp" với "lớp 6 motion, lớp 7 tryon, lớp 8 create-image" — số này giờ SAI (đã thành 9
+lớp: 7 motion, 8 tryon, 9 create-image). Task 7 không sửa `docs/gpu-pod.md` — đó là việc của
+Task 8 ("Nghiệm thu trên pod thật + docs").
 
 - [ ] **Step 3: Kiểm cú pháp**
 
