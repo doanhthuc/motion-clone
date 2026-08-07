@@ -224,6 +224,84 @@ assert_eq "" "$(q "SELECT 1 FROM pg_database WHERE datname='motion_verify'")" \
 rm -rf "$VOL/pg"
 assert_fail "--check đỏ khi chưa có dump nào" -- bash "$SCRIPT" --check
 
+# ── Khử đua: .meta phải đếm từ FILE DUMP, không phải từ một truy vấn DB thứ hai ──────────
+# pg_dump chụp snapshot riêng. Nếu .meta lấy số bằng cách hỏi DB lần nữa SAU khi pg_dump xong
+# thì một INSERT xen vào giữa làm .meta lệch với nội dung file — và lệch VĨNH VIỄN, nên mọi
+# --verify sau này trên bản dump ấy đều đỏ dù dump hoàn toàn tốt. gpu-down dump khi api/worker
+# vẫn online, và lớp 6 pod-smoke.sh dùng `bad`, nên đây là đường làm gpu-smoke đỏ trên pod khoẻ.
+#
+# CÁCH DỰNG ĐUA CHO TẤT ĐỊNH — quan trọng, đừng đơn giản hoá:
+# Ghi vào DB *sau khi* `--dump` đã trả về thì KHÔNG tái hiện được gì (thử rồi: xanh trên cả code
+# vá lẫn chưa vá), vì lúc đó cả pg_dump lẫn lần đếm .meta đều đã chạy xong. Cửa sổ đua nằm ĐÚNG
+# giữa hai mốc đó, và bình thường nó rộng vài mili-giây.
+# Mở nó ra bằng khoá: một session giữ ACCESS EXCLUSIVE trên `users` làm pg_dump chặn ở bước
+# `LOCK TABLE`, mà bước đó chạy SAU khi pg_dump đã lấy snapshot REPEATABLE READ. Ghi vào `jobs`
+# trong lúc pg_dump đang chờ ⇒ file dump giữ 7 dòng (snapshot cũ), còn DB thật thành 14.
+#   - cách tính CŨ (_row_counts sau pg_dump): .meta ghi 14, file có 7 → --verify ĐỎ vĩnh viễn.
+#   - cách tính MỚI (_dump_row_counts đọc file): .meta ghi 7 → --verify XANH.
+info "Khử đua — .meta đếm từ chính file dump"
+rm -rf "$VOL/pg"; seed
+( q "BEGIN; LOCK TABLE users IN ACCESS EXCLUSIVE MODE; SELECT pg_sleep(8); COMMIT;" ) >/dev/null 2>&1 &
+LOCKER=$!
+sleep 1
+bash "$SCRIPT" --dump >/dev/null 2>&1 &
+DUMPER=$!
+# Tiền đề PHẢI kiểm: nếu pg_dump chưa kịp lấy snapshot và chưa chờ khoá thì INSERT bên dưới lọt
+# VÀO trong snapshot, file dump có 14 dòng, và test xanh một cách vô nghĩa trên cả hai bản code.
+BLOCKED=0
+for _ in $(seq 1 60); do
+  W="$(q "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type='Lock' AND query ILIKE 'LOCK TABLE%'")"
+  [ "${W:-0}" -ge 1 ] 2>/dev/null && { BLOCKED=1; break; }
+  sleep 0.5
+done
+[ "$BLOCKED" = 1 ] && ok "tiền đề: pg_dump đã lấy snapshot và đang chờ khoá" \
+                   || bad "tiền đề KHÔNG dựng được: pg_dump không chờ khoá — hai assertion sau vô nghĩa"
+q "INSERT INTO jobs SELECT g, 'motion' FROM generate_series(100,106) g;" >/dev/null
+wait "$LOCKER" 2>/dev/null; wait "$DUMPER" 2>/dev/null
+M3="$(ls "$VOL"/pg/dumps/*.meta | head -1)"
+assert_eq "14" "$(q 'SELECT count(*) FROM jobs')" "DB thật ĐÃ đổi trong lúc pg_dump chạy (7→14)"
+assert_eq "7" "$(grep '^jobs=' "$M3" | cut -d= -f2)" \
+  ".meta ghi số dòng CỦA FILE DUMP (7), không phải của DB tại lúc đếm (14)"
+assert_ok "--verify XANH dù có ghi xen giữa snapshot pg_dump và lúc ghi .meta" -- bash "$SCRIPT" --verify
+
+# Bảng rỗng vẫn phải có mặt trong .meta: khối COPY của nó tồn tại với 0 dòng. Thiếu dòng này
+# thì `want` cụt so với `got` (_row_counts liệt kê MỌI bảng public) và verify đỏ oan.
+rm -rf "$VOL/pg"; seed
+q "CREATE TABLE trong_rong (id int);" >/dev/null
+bash "$SCRIPT" --dump >/dev/null
+M4="$(ls "$VOL"/pg/dumps/*.meta | head -1)"
+assert_eq "0" "$(grep '^trong_rong=' "$M4" | cut -d= -f2)" "bảng rỗng vào .meta với 0 dòng"
+assert_ok "--verify xanh khi có bảng rỗng" -- bash "$SCRIPT" --verify
+
+# Tên bảng bị pg_dump trích dẫn kép (từ khoá, hoặc có dấu cách/ngoặc) phải cắt được về tên TRẦN
+# cho khớp _row_counts. pg_dump sinh thật `COPY public."weird name (x)" (id) FROM stdin;` —
+# cắt tên bảng từ dấu "(" ĐẦU TIÊN là hỏng ngay ở đây.
+# Dữ liệu cũng cài hai cái bẫy: một ô đúng bằng `\.` (pg_dump thoát thành `\\.`, không được
+# tính là hết khối) và một ô trông y hệt một dòng header COPY.
+rm -rf "$VOL/pg"; seed
+q 'CREATE TABLE "order" (id int primary key, note text)' >/dev/null
+q $'INSERT INTO "order" VALUES (1, E\'\\\\.\'), (2, \'COPY public.gia_mao (x) FROM stdin;\')' >/dev/null
+q 'CREATE TABLE "weird name (x)" (id int); INSERT INTO "weird name (x)" VALUES (9);' >/dev/null
+bash "$SCRIPT" --dump >/dev/null
+M5="$(ls "$VOL"/pg/dumps/*.meta | head -1)"
+assert_eq "2" "$(grep '^order=' "$M5" | cut -d= -f2)" \
+  'tên bảng trích dẫn kép ("order") vào .meta ở dạng trần, đếm đúng'
+assert_eq "1" "$(grep '^weird name (x)=' "$M5" | cut -d= -f2)" \
+  'tên bảng có dấu cách + ngoặc ("weird name (x)") đếm đúng'
+assert_ok "--verify xanh với tên bảng trích dẫn + dữ liệu chứa bẫy \\. và COPY" -- bash "$SCRIPT" --verify
+q 'DROP TABLE "order"; DROP TABLE "weird name (x)";' >/dev/null
+
+# Bảng ở schema KHÁC public không được lọt vào .meta: _row_counts (vế `got` của verify) chỉ
+# đếm schema public, nên thêm vào là verify đỏ oan. Nhưng khối COPY của nó vẫn phải được ĐỌC
+# HẾT, nếu không các dòng dữ liệu của nó bị tính nhầm sang bảng sau.
+rm -rf "$VOL/pg"; seed
+q "CREATE SCHEMA khac; CREATE TABLE khac.thing (id int); INSERT INTO khac.thing VALUES (1),(2);" >/dev/null
+bash "$SCRIPT" --dump >/dev/null
+M6="$(ls "$VOL"/pg/dumps/*.meta | head -1)"
+assert_eq "" "$(grep '^thing=' "$M6" | cut -d= -f2)" "bảng ngoài schema public KHÔNG vào .meta"
+assert_eq "7" "$(grep '^jobs=' "$M6" | cut -d= -f2)" "bảng schema khác không làm lệch bảng kế tiếp"
+q "DROP SCHEMA khac CASCADE;" >/dev/null
+
 # Dump từ một DB CHƯA CÓ BẢNG NÀO vẫn là bản dump hợp lệ, và --check phải nói đúng như vậy.
 # Đây là đường mà các test trước không chạm tới: mọi seed đều tạo sẵn bảng, nên .meta luôn có
 # dòng bảng và cái bẫy exit-code của pipeline cuối hàm không bao giờ lộ ra.

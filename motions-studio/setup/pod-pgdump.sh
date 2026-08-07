@@ -56,6 +56,9 @@ _pg_dump() { PGPASSWORD="$PG_PASS" pg_dump -h "$PG_HOST" -p "$PG_PORT" -U "$PG_U
 # Nhận TÊN DATABASE làm tham số (mặc định $PG_DB) vì --verify sẽ gọi lại chính hàm này trên
 # DB tạm. Không tham số hoá thì --verify phải chép lại cả đoạn truy vấn, và hai bản chép sẽ
 # trôi khỏi nhau đúng lúc không ai để ý.
+#
+# CHỈ do_verify() còn dùng hàm này, và chỉ trên DB TẠM sau khi đã nạp xong bản dump — đó là vế
+# "bằng chứng thật" của verify. `.meta` KHÔNG còn lấy số từ đây (xem _dump_row_counts).
 _row_counts() {
   local db="${1:-$PG_DB}" q
   q="$(_psql -d "$db" -tAc \
@@ -63,6 +66,66 @@ _row_counts() {
      FROM pg_tables WHERE schemaname='public'")"
   [ -n "$q" ] || return 0
   _psql -d "$db" -tAc "$q" | sed '/^$/d' | sort
+}
+
+# Đếm số dòng từng bảng TỪ CHÍNH FILE DUMP, không hỏi DB lần thứ hai.
+#
+# VÌ SAO không dùng _row_counts cho .meta: `pg_dump` chụp snapshot riêng của nó, nên một
+# INSERT/DELETE xen vào giữa lúc pg_dump xong và lúc _row_counts chạy làm .meta lệch với nội
+# dung file dump — và lệch VĨNH VIỄN, vì nó nằm trong file. Mọi `--verify` sau đó trên bản dump
+# ấy đều đỏ dù bản dump hoàn toàn tốt. Không phải giả thuyết: `gpu-down` dump khi api/worker vẫn
+# online, và lớp 6 của `pod-smoke.sh` dùng `bad`, nên cái đua này làm `make gpu-smoke` đỏ trên
+# một pod khoẻ mạnh. Đọc từ file dump thì hai vế cùng một nguồn, đua biến mất theo định nghĩa.
+#
+# Điều này KHÔNG làm --verify thành vô nghĩa. Sau khi đổi, --verify so "số dòng file dump tự
+# khai" với "số dòng thật sau khi nạp chính file đó vào Postgres". Vế thứ hai vẫn là bằng chứng
+# thật — nó chứng minh file nạp lại được và nạp ra đúng nội dung, tức đúng câu hỏi mà một hệ
+# backup cần trả lời. Chỉ vế "so với DB gốc tại MỘT THỜI ĐIỂM KHÁC" bị bỏ, và đó chính là vế
+# gây đua, đồng thời cũng là vế không chứng minh được gì về bản dump.
+#
+# Định dạng plain của pg_dump, mỗi bảng một khối:
+#     COPY public.jobs (id, kind) FROM stdin;
+#     <dòng dữ liệu>…
+#     \.
+# Bảng rỗng vẫn có khối COPY với 0 dòng, nên không bảng nào bị bỏ sót.
+#
+# Một pass `awk`, không `grep -c` nhiều lần: nhiều pass vừa chậm (giải nén lại cả file mỗi lần)
+# vừa không đếm nổi ranh giới khối.
+#
+# Giới hạn đã biết: bảng phân vùng (parent trong pg_tables nhưng dữ liệu nằm ở các leaf) sẽ đếm
+# khác _row_counts. Schema hiện tại không có PARTITION BY / INHERITS / UNLOGGED nào (đã grep
+# motions-studio/db/), nên chưa phải lo; nếu sau này thêm thì --verify sẽ đỏ và chỉ thẳng vào đây.
+#
+# LC_ALL=C: awk xử lý theo BYTE. Không có nó, awk trên một số nền tảng abort giữa chừng khi gặp
+# byte không hợp lệ theo locale, và .meta sẽ cụt lặng lẽ.
+_dump_row_counts() {
+  gzip -dc "$1" | LC_ALL=C awk '
+    # Đang TRONG một khối COPY thì mọi dòng là DỮ LIỆU cho tới dòng CHỈ chứa \. — kiểm điều này
+    # TRƯỚC khi thử nhận diện header, nếu không một ô text chứa đúng chuỗi "COPY … FROM stdin;"
+    # sẽ mở một khối giả (pg_dump sinh thật dòng dữ liệu như vậy nếu người dùng nhập chuỗi đó).
+    # Dòng dữ liệu KHÔNG BAO GIỜ bằng đúng \. vì pg_dump thoát backslash: giá trị \. ghi ra \\.
+    intbl {
+      if ($0 == "\\.") { if (pub) printf "%s=%d\n", tbl, n; intbl = 0 } else n++
+      next
+    }
+    /^COPY .* FROM stdin;$/ {
+      s = $0
+      sub(/^COPY[ \t]+/, "", s)
+      # Cắt danh sách cột + đuôi, NEO Ở CUỐI DÒNG. Không cắt từ dấu "(" đầu tiên: tên bảng có
+      # thể chứa nó — pg_dump sinh thật `COPY public."weird name (x)" (id) FROM stdin;`.
+      sub(/[ \t]*\([^()]*\)[ \t]+FROM stdin;$/, "", s)
+      # Chỉ schema public, khớp đúng phạm vi của _row_counts (nó lọc schemaname=public). Bảng ở
+      # schema khác vẫn phải ĐỌC HẾT khối để không đếm nhầm dòng, chỉ là không in ra.
+      if (s ~ /^public\./)                      { s = substr(s, 8);  pub = 1 }
+      else if (s ~ /^"public"\./)               { s = substr(s, 10); pub = 1 }
+      else if (s ~ /^[^".]+\./)                 { pub = 0 }
+      else if (s ~ /^"/ && index(s, "\".") > 0) { pub = 0 }
+      else                                      { pub = 1 }   # không có tiền tố schema
+      # Bỏ trích dẫn kép để khớp _row_counts, vốn in tên TRẦN (format %L trên tablename).
+      if (s ~ /^".*"$/) { s = substr(s, 2, length(s) - 2); gsub(/""/, "\"", s) }
+      tbl = s; n = 0; intbl = 1; next
+    }
+  ' | LC_ALL=C sort
 }
 
 _table_count() { _psql -d "$PG_DB" -tAc "SELECT count(*) FROM pg_tables WHERE schemaname='public'"; }
@@ -142,13 +205,12 @@ do_dump() {
   fi
   chmod 600 "$tmp" 2>/dev/null || true
 
-  # ĐUA ĐÃ BIẾT, chưa sửa trong đợt này (finding I1 — không chặn merge):
-  # `pg_dump` chạy ở trên, `_row_counts` chạy ngay dưới. Một INSERT chen vào giữa hai mốc đó
-  # làm .meta ghi số dòng KHÁC với số dòng thật trong file dump — và lệch đó là VĨNH VIỄN, nên
-  # mọi `--verify` sau này trên chính bản dump ấy đều đỏ dù bản dump hoàn toàn tốt. Chuyện này
-  # có thật: `make gpu-down` dump khi api/worker vẫn đang online.
-  # Sửa đúng cách là đọc cả hai từ CÙNG một snapshot (một transaction REPEATABLE READ dùng chung,
-  # hoặc lấy số dòng từ chính nội dung dump) — việc của một đợt sau.
+  # Số dòng lấy từ CHÍNH FILE DUMP vừa ghi ($tmp), KHÔNG truy vấn DB lần hai — xem
+  # _dump_row_counts() để biết vì sao. Tóm tắt: hỏi DB lần hai mở ra một cửa sổ đua với
+  # pg_dump, và lệch sinh ra ở đó nằm vĩnh viễn trong .meta.
+  #
+  # $tmp chứ không phải $out: `mv` xuống dưới mới chạy. Cả hai là cùng một file, nhưng đọc
+  # $tmp giữ được thứ tự "ghi xong hết mới công bố".
   {
     echo "created=$(date -u +%s)"
     # server_version_num, KHÔNG dùng server_version: bản Ubuntu đóng gói trả chuỗi kiểu
@@ -156,7 +218,7 @@ do_dump() {
     # trong .meta. server_version_num là số nguyên (vd 160004), không cần parse gì thêm.
     echo "pg_version=$(_psql -d "$PG_DB" -tAc 'SHOW server_version_num' | tr -d ' ')"
     echo "dump_bytes=$(wc -c < "$tmp" | tr -d ' ')"
-    _row_counts
+    _dump_row_counts "$tmp"
   } > "$meta"
   chmod 600 "$meta" 2>/dev/null || true
 
@@ -302,11 +364,13 @@ do_verify() {
     else
       warn "verify ĐỎ — số dòng lệch so với .meta:"
       diff <(printf '%s\n' "$want") <(printf '%s\n' "$got") | sed 's/^/    /'
-      # Đừng để dòng trên bị đọc thành "bản dump hỏng" — thường thì không phải.
-      warn "Lệch KHÔNG chắc là dump hỏng: .meta được đếm SAU khi pg_dump chạy xong, nên một"
-      warn "INSERT xen vào giữa hai mốc đó cũng cho ra đúng triệu chứng này (gpu-down dump khi"
-      warn "api/worker còn online). Dấu hiệu phân biệt: lệch vài dòng ở đúng các bảng đang ghi"
-      warn "= gần như chắc chắn là đua; thiếu hẳn bảng, hoặc số vênh lớn = mới đáng ngờ dump."
+      # Lệch ở đây giờ NGHIÊM TRỌNG HƠN trước. `.meta` được đếm từ chính nội dung file dump
+      # (_dump_row_counts), không phải từ một truy vấn DB thứ hai, nên cái đua cũ — INSERT chen
+      # vào giữa pg_dump và lần đếm — không còn sinh ra triệu chứng này được nữa.
+      warn "Hai vế đều đọc từ CÙNG bản dump này: vế trái là số dòng ghi trong file, vế phải là"
+      warn "số dòng đếm được sau khi nạp thật file đó vào một DB tạm. Lệch nghĩa là nạp lại KHÔNG"
+      warn "ra đúng nội dung — nghi ngờ file hỏng, hoặc .meta bị sửa tay. Đây KHÔNG còn là đua"
+      warn "ghi-trong-lúc-dump; đừng bỏ qua nó như trước."
       rc=1
     fi
   else

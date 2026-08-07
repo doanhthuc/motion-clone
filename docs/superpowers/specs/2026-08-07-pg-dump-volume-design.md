@@ -75,6 +75,20 @@ thước khác 0; chỉ khi so số dòng mới phân biệt được "dump ch�
 **thành công giả** mà cả repo đang phòng — cùng họ với cổng chặn manifest model ở
 `pod-volume.sh` §5.
 
+**Số dòng trong `.meta` đọc từ chính file dump, không từ một truy vấn DB thứ hai.**
+`_dump_row_counts()` giải nén một lần và `awk` đếm số dòng giữa `COPY … FROM stdin;` và dòng chỉ
+chứa `\.` của từng khối. Lý do là một cái đua thật: `pg_dump` chụp snapshot riêng, nên nếu `.meta`
+lấy số bằng cách hỏi DB lần nữa sau khi dump xong thì một `INSERT`/`DELETE` xen vào giữa làm `.meta`
+lệch với nội dung file — và lệch **vĩnh viễn**, vì nó nằm trong file. Mọi `--verify` sau đó trên bản
+dump ấy đều đỏ dù bản dump hoàn toàn tốt. Chuyện có thật chứ không lý thuyết: `gpu-down` dump khi
+api/worker vẫn online, và lớp 6 của `pod-smoke.sh` dùng `bad`, nên cái đua này đủ sức làm
+`make gpu-smoke` đỏ trên một pod khoẻ mạnh.
+
+Đổi như vậy **không** làm `--verify` thành vô nghĩa: nó vẫn so "số dòng file dump tự khai" với "số
+dòng thật sau khi nạp chính file đó vào Postgres", và vế thứ hai vẫn là bằng chứng thật — nó chứng
+minh file nạp lại được và nạp ra đúng nội dung. Chỉ vế "so với DB gốc tại một thời điểm khác" bị
+bỏ, mà đó vừa là vế gây đua vừa là vế không nói được gì về bản dump.
+
 Thư mục `700`, file `600`: dump chứa `api_keys`, `user_sessions.token_hash` và token của
 `social_accounts`.
 

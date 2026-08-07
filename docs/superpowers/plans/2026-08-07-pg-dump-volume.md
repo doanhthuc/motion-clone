@@ -36,7 +36,10 @@ Mọi task đều ngầm chịu các ràng buộc này:
 - Consumes: không có (task đầu).
 - Produces:
   - `motions-studio/setup/pod-pgdump.sh --dump` → exit `0` khi tạo được `$POD_VOLUME/pg/dumps/motion-<STAMP>.sql.gz` + `.meta` + symlink `latest`; exit `1` kèm lý do khi hỏng.
-  - `_row_counts()` → in ra các dòng `<tên bảng>=<số dòng>` đã `sort`.
+  - `_row_counts([db])` → hỏi DB, in ra các dòng `<tên bảng>=<số dòng>` đã `sort`. Sau F3 chỉ còn
+    `do_verify()` dùng, và chỉ trên DB tạm đã nạp xong.
+  - `_dump_row_counts(<file.sql.gz>)` (F3) → cùng định dạng, nhưng đếm từ chính nội dung file dump.
+    Đây là nguồn số liệu của `.meta`.
   - Định dạng `.meta`: các dòng `key=value`, gồm `created` (giây epoch UTC), `pg_version`, `dump_bytes`, rồi các dòng `<bảng>=<số dòng>`.
   - `motions-studio/setup/tests/pgdump-test.sh` → chạy toàn bộ test, exit `0` khi tất cả xanh.
 
@@ -1118,6 +1121,8 @@ bản dump ấy đều đỏ dù dump tốt (`gpu-down` dump khi api/worker vẫ
 trong đợt này.** Chỉ thêm comment ở chỗ tính `.meta` mô tả cái đua + hướng sửa đúng (đọc cả hai
 từ CÙNG một snapshot), và mấy dòng ở nhánh verify-đỏ nói rõ nguyên nhân có thể là ghi xen giữa,
 kèm dấu hiệu phân biệt với dump thật sự hỏng.
+→ **Đã sửa hẳn ở F3 (đợt sửa cuối trước merge, bên dưới).** Cả comment mô tả đua lẫn mấy dòng
+verify-đỏ nói trên đều đã được viết lại cho khớp cơ chế mới.
 
 ---
 
@@ -1199,6 +1204,43 @@ Sửa: ghi cờ `_ln_rc` tại chỗ, chạy hết phần sau, rồi `die` ở C
 
 2 assertion mới. **Bằng chứng ĐỎ trên code chưa vá: 53 xanh · 2 đỏ** — `_prune` không chạy nên còn
 2 bản dù `PG_DUMP_KEEP=1`, và stdout không có dòng `dump: motion-…`.
+
+**F2 — comment lỗi thời ở `lib-feature.sh` `phase_pg_restore()`.** Comment nói lệnh ssh thứ hai của
+`pod-bootstrap.sh` không mang `POD_VOLUME` theo; `pod-bootstrap.sh:173` đã truyền nó từ Task 5, và
+comment cũ mâu thuẫn với chính lý do tồn tại của `set_kv POD_VOLUME` ngay bên dưới. Viết lại theo
+hiện trạng: hai nguồn, và **lỗ riêng của từng nguồn** — env qua ssh chỉ có mặt khi phase chạy từ
+`pod-bootstrap.sh` (gõ tay `./setup/setup-motion-transfer.sh` thì không); `.env` thì luôn có mặt
+nhưng trên pod MỚI chưa tồn tại lúc `pod-volume.sh` chạy. Mỗi nguồn bịt đúng lỗ của nguồn kia.
+
+**F3 — khử đua khi đếm dòng `.meta`** (giải quyết I1). `.meta` giờ đếm từ **chính file dump** qua
+`_dump_row_counts()`: một pass `gzip -dc | awk`, đếm số dòng giữa `COPY … FROM stdin;` và dòng chỉ
+chứa `\.`. `_row_counts()` **giữ nguyên** — `do_verify` vẫn cần nó để đếm DB tạm sau khi nạp. Lý do
+và lập luận "vì sao verify vẫn có nghĩa" ghi ở spec, mục `.meta`.
+
+Bốn chi tiết cài đặt không hiển nhiên, mỗi cái có một test riêng:
+1. Cắt tiền tố `public.` để khớp tên trần mà `_row_counts` in ra.
+2. Bỏ trích dẫn kép: pg_dump sinh `COPY public."order" (…)` cho từ khoá. Và **không được cắt tên
+   bảng từ dấu `(` đầu tiên** — pg_dump sinh thật `COPY public."weird name (x)" (id) FROM stdin;`.
+   Regex cắt danh sách cột neo ở CUỐI dòng.
+3. Chỉ dòng **chỉ chứa** `\.` mới kết thúc khối, và phải kiểm "đang trong khối" TRƯỚC khi thử nhận
+   diện header — một ô text chứa đúng chuỗi `COPY … FROM stdin;` là dữ liệu hợp lệ.
+4. Bảng ngoài schema `public` phải đọc hết khối nhưng **không** in ra, vì `_row_counts` (vế `got`
+   của verify) chỉ đếm `public`.
+
+**Cách dựng đua cho test — chỗ dễ sai nhất.** Lần đầu viết test theo kiểu "dump xong rồi mới
+`INSERT` rồi `--verify`" và nó **xanh trên cả code vá lẫn chưa vá** (64 xanh · 0 đỏ ở cả hai bên):
+lúc `--dump` trả về thì cả `pg_dump` lẫn lần đếm `.meta` đều đã chạy xong, không còn cửa sổ nào.
+Cửa sổ thật nằm đúng giữa hai mốc đó. Mở nó ra bằng khoá: một session giữ `ACCESS EXCLUSIVE` trên
+`users` làm `pg_dump` chặn ở bước `LOCK TABLE`, mà bước đó chạy **sau** khi nó đã lấy snapshot
+`REPEATABLE READ`. `INSERT` vào `jobs` trong lúc chờ ⇒ file dump giữ 7 dòng, DB thật thành 14.
+Kèm một assertion **tiền đề** (poll `pg_stat_activity` cho tới khi thấy `pg_dump` thật sự đang chờ
+khoá), nếu không máy chậm sẽ cho test xanh một cách vô nghĩa.
+
+11 assertion mới. **Bằng chứng ĐỎ trên code chưa vá (đổi `_dump_row_counts "$tmp"` về
+`_row_counts`): 64 xanh · 2 đỏ** — `.meta` ghi `jobs=14` trong khi file dump có 7, và `--verify`
+đỏ; assertion tiền đề vẫn xanh, tức cái đua đã được tái hiện thật.
+
+**Tổng bộ test sau đợt này: 66 xanh · 0 đỏ** (53 trước đó + 2 của F1 + 11 của F3).
 
 ## Sau khi xong
 
