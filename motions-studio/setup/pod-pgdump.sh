@@ -168,13 +168,18 @@ do_dump() {
   # của POD ĐÃ TẠO RA nó — pod sau mount ở path khác (hoặc người dùng đổi POD_VOLUME) là link
   # treo ngay, đúng vào lúc ta cần nó nhất.
   #
-  # `|| die` chứ không bỏ qua: chưa ai đo `symlink()` trên MooseFS, mà cùng mount đó đã chặn
-  # `chown`. Không kiểm thì --dump in "ok" và trả 0 trên một volume không có `latest`.
-  # Dump và .meta ĐÃ ghi xong trước dòng này nên die ở đây KHÔNG mất backup — _latest_dump()
-  # vẫn tìm thấy file qua $DUMPS. Đỏ ở đây nghĩa là "latest không tin được nữa", không phải
-  # "mất dump"; nhưng nó phải đỏ, vì một cơ chế backup im lặng hỏng một nửa là cơ chế tồi nhất.
-  ln -sfn "dumps/$(basename "$out")" "$LATEST" \
-    || die "không tạo được symlink $LATEST (bản dump ĐÃ ghi xong ở $out — không mất gì, nhưng volume này không cho tạo symlink)"
+  # Hỏng symlink PHẢI làm --dump đỏ: chưa ai đo `symlink()` trên MooseFS, mà cùng mount đó đã
+  # chặn `chown`. Không kiểm thì --dump in "ok" và trả 0 trên một volume không có `latest`.
+  #
+  # Nhưng GHI CỜ rồi đỏ ở CUỐI HÀM, không `|| die` ngay tại đây. `die` ở đúng dòng này chặn mất
+  # ba thứ nằm phía sau nó, và cả ba đều quan trọng hơn cái symlink:
+  #   1. `_prune` không bao giờ chạy → dump tích tụ vô hạn, PG_DUMP_KEEP mất tác dụng hoàn toàn
+  #      trên đúng cái volume đang hỏng symlink (tức volume ta chạy mọi lần dump lên đó);
+  #   2. khối kiểm quyền 700/600 không chạy → mất cảnh báo "dump chứa api_keys đang lộ quyền rộng";
+  #   3. dòng `ok "dump: …"` không in → mất tín hiệu tích cực duy nhất cho biết dump ĐÃ ghi xong.
+  # Dump và .meta đã nằm trên đĩa từ trước dòng này, nên hoãn phần đỏ lại không mất gì thêm.
+  local _ln_rc=0
+  ln -sfn "dumps/$(basename "$out")" "$LATEST" || _ln_rc=1
   _prune "$KEEP"
 
   # Kiểm KẾT QUẢ thật bằng stat, KHÔNG kiểm exit code của chmod ở trên. Trên pod, volume
@@ -195,8 +200,13 @@ do_dump() {
     warn "Dump chứa dữ liệu nhạy cảm (api_keys, user_sessions.token_hash, token social_accounts)"
     warn "và có thể đang lộ rộng hơn dự tính. KHÔNG xoá — mất hẳn backup còn tệ hơn một bản backup"
     warn "quyền rộng. Tự kiểm tra và chmod tay, rồi tìm hiểu vì sao chmod không ăn trên volume này."
-    return 1
   fi
+
+  # Phần đỏ của symlink, hoãn từ trên xuống. In SAU cảnh báo quyền để không nuốt mất nó khi cả
+  # hai cùng hỏng — hai chuyện độc lập, người đọc cần thấy cả hai chứ không phải cái nào tới trước.
+  [ "$_ln_rc" = 0 ] || die "không tạo được symlink $LATEST — bản dump ĐÃ ghi xong ở $out, không mất gì. --restore/--check vẫn tìm được nó bằng cách quét $DUMPS."
+
+  [ -z "$bad_perm" ] || return 1
 }
 
 do_restore() {

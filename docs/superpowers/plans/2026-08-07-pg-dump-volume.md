@@ -1185,6 +1185,21 @@ với Postgres trong docker."
 
 ---
 
+## Đợt sửa cuối trước merge (2026-08-07)
+
+**F1 — `ln -sfn … || die` đặt sai chỗ, chặn ba thứ phía sau.** Fix C2 đặt `|| die` ngay tại dòng
+`ln`, tức TRƯỚC `_prune "$KEEP"`, trước khối kiểm quyền 700/600, và trước dòng `ok "dump: …"`.
+Trên một volume không cho `symlink()` (chưa ai đo MooseFS, mà cùng mount đó đã chặn `chown`) thì
+cả ba đều không bao giờ chạy: dump tích tụ vô hạn nên `PG_DUMP_KEEP` mất tác dụng hoàn toàn, mất
+cảnh báo "dump chứa `api_keys` đang lộ quyền rộng", và mất tín hiệu tích cực duy nhất.
+
+Sửa: ghi cờ `_ln_rc` tại chỗ, chạy hết phần sau, rồi `die` ở CUỐI hàm — sau khối `warn` quyền
+(để hai chuyện độc lập không nuốt nhau khi cùng hỏng), trước `return 1` của `bad_perm`. Exit khác
+0 giữ nguyên, nên assertion `--dump đỏ khi không tạo được latest` vẫn xanh.
+
+2 assertion mới. **Bằng chứng ĐỎ trên code chưa vá: 53 xanh · 2 đỏ** — `_prune` không chạy nên còn
+2 bản dù `PG_DUMP_KEEP=1`, và stdout không có dòng `dump: motion-…`.
+
 ## Sau khi xong
 
 Bài toán còn lại (spec riêng, chưa viết): **hạ `DISK`**. Spec này là điều kiện cần cho nó — bước thu hoạch của bài đó là dựng pod mới với `DISK` nhỏ, tức đúng thao tác `gpu-destroy` mà tới giờ mới an toàn. Nghi vấn chính cần đo trước: `worker_runtime/linux.py` có 24 lần `tempfile.mkdtemp()` nhưng chỉ 1 `shutil.rmtree`, không janitor, không `rm -rf /tmp` lúc boot, không đặt `TMPDIR` — thư mục tạm của gần như mọi job có thể đang tích luỹ vĩnh viễn.

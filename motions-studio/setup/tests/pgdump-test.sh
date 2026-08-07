@@ -259,6 +259,22 @@ rm -f "$VOL/pg/latest"; mkdir -p "$VOL/pg/latest"; chmod 500 "$VOL/pg/latest"
 assert_fail "--dump đỏ khi không tạo được latest" -- bash "$SCRIPT" --dump
 chmod 700 "$VOL/pg/latest"; rm -rf "$VOL/pg/latest"
 
+# …và cái đỏ đó KHÔNG được chặn ba thứ nằm sau nó trong do_dump.
+# Trên code cũ (`ln -sfn … || die` đặt ngay tại chỗ) thì: _prune không bao giờ chạy nên
+# PG_DUMP_KEEP mất tác dụng hoàn toàn trên đúng volume đang hỏng symlink, khối kiểm quyền
+# không chạy nên mất cảnh báo "dump đang lộ quyền rộng", và dòng `ok "dump: …"` không in.
+# Cả hai assertion dưới đây đỏ trên code cũ, xanh trên code đã vá.
+rm -rf "$VOL/pg"; seed
+PG_DUMP_KEEP=1 bash "$SCRIPT" --dump >/dev/null; sleep 1
+rm -f "$VOL/pg/latest"; mkdir -p "$VOL/pg/latest"; chmod 500 "$VOL/pg/latest"
+LN_OUT="$(PG_DUMP_KEEP=1 bash "$SCRIPT" --dump 2>&1)"
+assert_eq "1" "$(ls "$VOL"/pg/dumps/motion-*.sql.gz 2>/dev/null | wc -l | tr -d ' ')" \
+  "ln hỏng: _prune VẪN chạy (PG_DUMP_KEEP=1 giữ đúng 1 bản)"
+printf '%s' "$LN_OUT" | grep -q "dump: motion-" \
+  && ok "ln hỏng: vẫn in dòng ok 'dump: …'" \
+  || bad "ln hỏng: mất dòng ok 'dump: …' — die chặn mất phần cuối do_dump"
+chmod 700 "$VOL/pg/latest"; rm -rf "$VOL/pg/latest"
+
 # latest VẮNG nhưng $DUMPS còn dump hợp lệ → --restore phải NẠP, không được nói "phiên đầu".
 rm -rf "$VOL/pg"; seed; bash "$SCRIPT" --dump >/dev/null
 rm -f "$VOL/pg/latest"
