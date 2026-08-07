@@ -242,17 +242,29 @@ EOF2
 # nghĩa — một file .sql.gz rỗng vẫn là một file. --verify nạp thật vào DB tạm rồi so
 # số dòng với .meta, nên nó là bằng chứng chứ không phải dấu vết. Cùng nhóm "rẻ" với
 # các lớp 1-5: chạy trước lớp cần GPU đầu tiên (motion, bên dưới).
+#
+# KHÔNG dùng remote(): nó nuốt stderr (2>/dev/null), mà pod-pgdump.sh báo mọi lỗi nghiêm trọng
+# qua die() ra stderr — "POD_VOLUME trống", "volume chưa mount", "Postgres không trả lời".
+# Nuốt hết rồi in một câu đoán là đúng thứ lớp này tồn tại để thay thế. Gọi ssh trực tiếp.
 log "6/9 Sao lưu database trên volume"
 if [ "$SSH_OK" != 1 ]; then
   skip "needs SSH"
+elif ! ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -p "$PORT" "root@$HOST" true 2>/dev/null; then
+  # ssh không tới được là lỗi hạ tầng, không phải "thiếu backup" — đừng đổ tội nhầm chỗ.
+  skip "bỏ qua — không ssh được vào pod"
 elif [ -z "$POD_VOLUME" ]; then
   # skip chứ không bad: pod không gắn volume là cấu hình hợp lệ, không phải hỏng hóc.
   skip "bỏ qua — không đặt POD_VOLUME"
-elif remote "cd ~/motion-backend && POD_VOLUME='$POD_VOLUME' bash ./setup/pod-pgdump.sh --check && POD_VOLUME='$POD_VOLUME' bash ./setup/pod-pgdump.sh --verify"; then
+elif ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -p "$PORT" "root@$HOST" \
+     "cd ~/motion-backend && POD_VOLUME='$POD_VOLUME' bash ./setup/pod-pgdump.sh --check \
+      && POD_VOLUME='$POD_VOLUME' bash ./setup/pod-pgdump.sh --verify"; then
   ok "có bản dump, và nạp lại được (đã diễn tập vào DB tạm)"
 else
-  # warn chứ không bad: thiếu backup không làm pod sai chức năng, nhưng phải nói to.
-  warn "chưa có bản dump nạp được — chạy 'make gpu-db-dump'"
+  # bad chứ không warn. POD_VOLUME ĐÃ đặt nghĩa là người dùng đã trả tiền cho một volume và
+  # đang tin rằng DB sống qua gpu-destroy nhờ nó. Không có bản dump nạp được thì niềm tin đó
+  # sai, và họ chỉ phát hiện sau khi destroy. warn để smoke vẫn in "passed" chính là lý do
+  # lớp này KHÔNG bắt được C1 — cổng lẽ ra phải bắt lỗi lại tự tắt tiếng.
+  bad "không có bản dump nạp lại được trên volume (lý do ở ngay trên) — chạy 'make gpu-db-dump'"
 fi
 
 # ── 7. A real motion job ──────────────────────────────────────────────────────
