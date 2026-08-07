@@ -354,6 +354,33 @@ D8="$(ls "$VOL"/pg/dumps/motion-*.sql.gz 2>/dev/null | head -1)"
 q 'DROP TABLE "new
 line";' >/dev/null
 
+# (4) Dòng mở đầu bằng `COPY ` mà KHÔNG PHẢI header — pg_dump chép nguyên văn thân
+#     `CREATE FUNCTION $$…$$`, nên một dòng SQL hướng dẫn nằm trong đó bắt đầu ngay ở cột 0.
+#     Đây là hình dạng THẬT (đo bằng pg_dump 18): dump chứa cả
+#         COPY public.jobs FROM /tmp/x.csv CSV;      ← trong thân function, KHÔNG phải header
+#         COPY public.jobs (id, kind) FROM stdin;    ← header thật
+#     Nhận diện header quá rộng ⇒ dòng đầu bị coi là "header không parse được" ⇒ --dump trả 1
+#     kèm thông điệp SAI SỰ THẬT (".meta THIẾU BẢNG" trong khi .meta đầy đủ, --verify sau đó xanh).
+#     Hệ quả vận hành: `make gpu-down` in "sao lưu DB thất bại" mỗi lần và `make gpu-db-dump`
+#     (Makefile:156-161, không có `|| echo`) hỏng thẳng — báo động giả thường trực trên dump tốt.
+#     Chữ ký của header VỠ DÒNG là số dấu " LẺ; dòng này có 0 dấu " nên phải được bỏ qua như cũ.
+rm -rf "$VOL/pg"; seed
+q 'CREATE FUNCTION docnote() RETURNS text LANGUAGE sql AS $fn$
+SELECT $doc$huong dan nap lai:
+COPY public.jobs FROM /tmp/x.csv CSV;
+xong$doc$::text
+$fn$;' >/dev/null
+FN_OUT="$(bash "$SCRIPT" --dump 2>&1)"; FN_RC=$?
+assert_eq "0" "$FN_RC" "dòng COPY trong thân function: --dump trả 0 (KHÔNG phải header vỡ)"
+printf '%s' "$FN_OUT" | grep -q ".meta THIẾU BẢNG" \
+  && bad "dòng COPY trong thân function: báo '.meta THIẾU BẢNG' — sai sự thật, .meta vẫn đầy đủ" \
+  || ok "dòng COPY trong thân function: không báo động giả '.meta THIẾU BẢNG'"
+M9="$(ls "$VOL"/pg/dumps/*.meta | head -1)"
+assert_eq "7" "$(grep '^jobs=' "$M9" | cut -d= -f2)" \
+  "dòng COPY trong thân function: .meta VẪN đếm đủ bảng jobs"
+assert_ok "dòng COPY trong thân function: --verify xanh" -- bash "$SCRIPT" --verify
+q 'DROP FUNCTION docnote();' >/dev/null
+
 # Bảng ở schema KHÁC public không được lọt vào .meta: _row_counts (vế `got` của verify) chỉ
 # đếm schema public, nên thêm vào là verify đỏ oan. Nhưng khối COPY của nó vẫn phải được ĐỌC
 # HẾT, nếu không các dòng dữ liệu của nó bị tính nhầm sang bảng sau.

@@ -101,6 +101,10 @@ _row_counts() {
 #     - bảng 0 CỘT: pg_dump phát `COPY public.t0  FROM stdin;` — KHÔNG có danh sách cột
 #     - tên CỘT chứa ngoặc: `COPY public.parencol ("col (x)") FROM stdin;`
 #     - bảng rỗng (khối COPY 0 dòng), bảng ở schema khác public (đọc hết khối, không in)
+#     - dòng mở đầu bằng `COPY ` nhưng KHÔNG phải header: pg_dump chép nguyên văn thân
+#       `CREATE FUNCTION $$…$$`, `COMMENT ON`, định nghĩa view, nên một dòng như
+#       `COPY public.jobs FROM '/tmp/x.csv' CSV;` xuất hiện thật ở cột 0 → BỎ QUA im lặng
+#       (số dấu " chẵn ⇒ không phải header vỡ). Tố nó là báo động giả trên một dump hoàn hảo.
 #
 #   KHÔNG xử được, và giờ BÁO LỖI TO thay vì đoán:
 #     - identifier chứa XUỐNG DÒNG (`CREATE TABLE "new<LF>line"`, hoặc cột `"c<LF>c"`). pg_dump
@@ -135,16 +139,39 @@ _dump_row_counts() {
       if ($0 == "\\.") { if (pub) printf "%s=%d\n", tbl, n; intbl = 0 } else n++
       next
     }
-    # Bắt MỌI dòng mở đầu bằng "COPY ", không chỉ dòng parse được. Dòng nào không tách nổi thành
-    # <bảng> FROM stdin; sẽ vào mảng `bad` và làm cả hàm đỏ — đó là điểm khác quan trọng nhất so
-    # với bản trước, vốn để regex không khớp rồi đi tiếp trong im lặng.
+    # Bắt MỌI dòng mở đầu bằng "COPY ", không chỉ dòng parse được — nhưng KHÔNG phải dòng nào
+    # không khớp cũng là lỗi. Xem điều kiện `bad` ngay dưới: chỉ dòng mang CHỮ KÝ của một header
+    # bị vỡ mới bị tố, phần còn lại đi tiếp trong im lặng đúng như bản trước nữa.
     /^COPY[ \t]/ {
       s = $0
       sub(/^COPY[ \t]+/, "", s)
       # ĐUÔI TRƯỚC, danh sách cột sau. Ngược lại (một regex nuốt cả `\(…\)[ \t]+FROM stdin;$`)
       # là chỗ hỏng của bản trước: bảng 0 cột không có `(…)` nên regex trượt, và tên cột chứa
       # ngoặc làm lớp `[^()]*` không nhảy qua nổi. Cả hai đều thành khoá rác.
-      if (s !~ /[ \t]FROM stdin;$/) { bad[++nbad] = $0; next }
+      #
+      # Không kết thúc bằng `FROM stdin;` thì đây KHÔNG phải header COPY của pg_dump. Hai khả năng:
+      #   (a) dòng SQL bình thường mở đầu bằng `COPY ` mà pg_dump chép nguyên văn — thân
+      #       `CREATE FUNCTION $$…$$`, `COMMENT ON`, định nghĩa view. Bình thường, phải BỎ QUA.
+      #   (b) dòng VẬT LÝ ĐẦU của một header bị vỡ vì identifier chứa xuống dòng
+      #       (`COPY public."new`). Đây mới là lỗi cần tố.
+      # Phân biệt bằng SỐ DẤU NHÁY KÉP LẺ: identifier trích dẫn bị cắt giữa chừng luôn để lại
+      # 1 + 2k dấu " trên dòng (dấu mở chưa đóng, mọi `""` bên trong đi theo cặp) ⇒ LẺ. Còn
+      # một câu COPY … FROM <file> CSV; bình thường có 0 dấu " ⇒ CHẴN ⇒ bỏ qua.
+      #
+      # Đây là hồi quy đã ĐO, không phải giả thuyết: bản trước tố mọi dòng `^COPY[ \t]`, nên một
+      # function có dòng COPY public.jobs FROM <file> CSV; trong thân làm `--dump` trả 1 với
+      # .meta ĐẦY ĐỦ (jobs=7) và `--verify` sau đó XANH — tức thông điệp "BẢN DUMP TỐT NHƯNG
+      # .meta THIẾU BẢNG" sai sự thật, `make gpu-down` in "sao lưu DB thất bại" mỗi lần, và
+      # `make gpu-db-dump` (Makefile:156-161, không có `|| echo`) hỏng thẳng.
+      #
+      # Nhận sai còn lại đã biết, cố ý chấp nhận: một dòng KHÔNG-header có số dấu " lẻ, ví dụ
+      # một câu COPY … WITH (QUOTE <một dấu nháy kép>) trong thân function — hiếm hơn nhiều so
+      # với dạng (a), và chiều hỏng của nó là ồn chứ không phải im.
+      if (s !~ /[ \t]FROM stdin;$/) {
+        chk = $0
+        if (gsub(/"/, "\"", chk) % 2 == 1) bad[++nbad] = $0
+        next
+      }
       sub(/[ \t]+FROM stdin;$/, "", s)
       # Cắt danh sách cột: dấu "(" ĐẦU TIÊN NẰM NGOÀI nháy kép. Không cắt từ dấu "(" đầu tiên
       # tuyệt đối — tên bảng có thể chứa nó (`public."weird name (x)"`); nhưng khi đó nó BẮT BUỘC
