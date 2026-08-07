@@ -215,6 +215,14 @@ assert_eq "" "$(q "SELECT 1 FROM pg_database WHERE datname='motion_verify'")" \
 rm -rf "$VOL/pg"
 assert_fail "--check đỏ khi chưa có dump nào" -- bash "$SCRIPT" --check
 
+# Dump từ một DB CHƯA CÓ BẢNG NÀO vẫn là bản dump hợp lệ, và --check phải nói đúng như vậy.
+# Đây là đường mà các test trước không chạm tới: mọi seed đều tạo sẵn bảng, nên .meta luôn có
+# dòng bảng và cái bẫy exit-code của pipeline cuối hàm không bao giờ lộ ra.
+rm -rf "$VOL/pg"
+q "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" >/dev/null   # DB rỗng, không bảng nào
+bash "$SCRIPT" --dump >/dev/null
+assert_ok "--check trả 0 với dump từ DB chưa có bảng" -- bash "$SCRIPT" --check
+
 echo
 info "$PASSED xanh · $FAILED đỏ"
 [ "$FAILED" -eq 0 ]

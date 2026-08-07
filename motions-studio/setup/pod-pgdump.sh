@@ -214,6 +214,12 @@ do_check() {
   log "số bản đang giữ: $(ls -1 "$DUMPS"/motion-*.sql.gz 2>/dev/null | wc -l | tr -d ' ')"
   log "số dòng ghi trong .meta:"
   grep -vE '^(created|pg_version|dump_bytes)=' "$meta" 2>/dev/null | sed 's/^/    /'
+
+  # return 0 TƯỜNG MINH, đừng bỏ. Không có nó thì giá trị trả về của hàm là exit status của
+  # pipeline `grep | sed` ngay trên: với pipefail, grep không khớp dòng nào (dump từ một DB
+  # chưa có bảng) trả 1, và .meta mất hẳn trả 2 — tức --check báo "không đọc được" cho một
+  # bản dump hoàn toàn hợp lệ, rồi kéo theo cả --verify vì nó dùng do_check làm cổng gác.
+  return 0
 }
 
 # Bằng chứng, không phải dấu vết: nạp thật vào một DB tạm rồi so số dòng. Không có bước này
@@ -228,6 +234,11 @@ do_verify() {
   _psql -d postgres -q -c "DROP DATABASE IF EXISTS $vdb" >/dev/null 2>&1
   _psql -d postgres -q -c "CREATE DATABASE $vdb OWNER $PG_USER" >/dev/null 2>&1 \
     || { warn "không tạo được DB tạm $vdb — role $PG_USER có quyền CREATEDB chưa?"; return 1; }
+
+  # trap: dọn DB tạm kể cả khi bị Ctrl-C hay bị kill giữa lúc nạp. Không có nó thì việc dọn
+  # phụ thuộc vào luồng chạy tới được dòng DROP cuối hàm — mà ngắt giữa chừng là chuyện thật
+  # khi gõ tay trên pod, và để lại motion_verify sẽ làm lần verify sau đỏ vì lý do khác hẳn.
+  trap '_psql -d postgres -q -c "DROP DATABASE IF EXISTS '"$vdb"'" >/dev/null 2>&1' INT TERM
 
   if gzip -dc "$target" | PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" \
        -d "$vdb" --single-transaction -v ON_ERROR_STOP=1 -q >/dev/null 2>&1; then
@@ -247,6 +258,7 @@ do_verify() {
 
   # Xoá DB tạm KỂ CẢ khi hỏng: để lại một DB rác tên motion_verify sẽ làm lần verify sau
   # đỏ vì lý do khác hẳn, và truy ra rất mất công.
+  trap - INT TERM
   _psql -d postgres -q -c "DROP DATABASE IF EXISTS $vdb" >/dev/null 2>&1
   return "$rc"
 }
