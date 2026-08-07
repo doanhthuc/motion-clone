@@ -92,6 +92,43 @@ bỏ, mà đó vừa là vế gây đua vừa là vế không nói được gì 
 Thư mục `700`, file `600`: dump chứa `api_keys`, `user_sessions.token_hash` và token của
 `social_accounts`.
 
+**Nhưng đây là ràng buộc *khi filesystem hỗ trợ*, không phải bất biến.** Nghiệm thu trên pod
+RunPod ngày 2026-08-07:
+
+```
+chmod 600 <file trên /workspace>   → stat vẫn ra 666
+chmod 600 <file trên /tmp>         → stat ra 600
+thư mục trên volume                → 777 cố định
+mount: mfs#euro-3.runpod.net:9421 on /workspace type fuse
+       (rw,nosuid,nodev,relatime,user_id=0,group_id=0,allow_other)
+```
+
+MooseFS **bỏ qua `chmod` hoàn toàn** — y như nó đã chặn `chown` (lý do PGDATA không lên volume
+được, `pod-volume.sh:179-191`). `chmod` trả 0, mode không đổi. Trên volume, mode `700`/`600` là
+**bất khả thi**, không phải "chưa làm".
+
+Nên `do_dump()` **dò rồi mới quyết**, thay vì đòi mode một cách vô điều kiện:
+
+- `_fs_honors_modes <thư mục>` tạo một file dò, `chmod 600`, đọc lại mode, xoá file.
+- **Không tôn trọng mode** → in **một dòng** thông tin, coi như bình thường, trả **0**.
+- **Có tôn trọng mode** mà mode vẫn sai → giữ nguyên cảnh báo to + exit khác 0.
+
+Vì sao không cứ để nó đỏ: khối kiểm cũ làm `make gpu-db-dump` đỏ ở **mọi** lần dump trên pod, nên
+`make gpu-down` in `!! sao lưu DB thất bại` mỗi lần dù bản dump hoàn hảo. Báo động giả thường trực
+dạy người dùng bỏ qua cảnh báo — đúng thứ ngược lại với thứ khối kiểm đó tồn tại để làm. Dò rồi
+quyết thì bỏ được báo động giả mà **giữ nguyên tín hiệu thật**.
+
+Chiều hỏng của `_fs_honors_modes` cố ý nghiêng về phía ồn: không tạo được file dò ⇒ coi như "có
+tôn trọng" ⇒ vẫn cảnh báo to. Thà ồn thừa một lần vì không đo được còn hơn im lặng nuốt mode sai.
+
+Trên volume, **bảo mật của bản dump không dựa vào mode nữa** mà dựa vào hai thứ có thật: Network
+Volume là riêng của tài khoản RunPod, và pod là đơn-người-thuê. `umask 077` vẫn giữ — nó vẫn đúng
+và vẫn có tác dụng trên mọi filesystem bình thường (`/tmp` của pod, máy dev, CI).
+
+Nhánh "filesystem bỏ qua mode" được kiểm bằng một filesystem **thật sự** bỏ qua chmod: ảnh đĩa FAT
+dựng bằng `hdiutil` trong `pgdump-test.sh` (FAT ép mode file về `700`, `chmod` không ăn). Kiểm bằng
+thư mục tạm thường thì assertion không thể đỏ.
+
 ### Khi nào dump
 
 **Không có dump định kỳ.** Đường duy nhất làm mất DB là đường tự điều khiển: `gpu-down` và lưới
@@ -229,8 +266,11 @@ mục khác.
   chọn có ý thức: không dump định kỳ.
 - **Volume đầy làm dump hỏng im lặng ở lần sau.** Volume 100GB đang giữ ~42GB model; dump metadata
   cỡ vài MB nên nguy cơ thấp, nhưng `--check` phải báo được để `gpu-smoke` bắt.
-- **Dump chứa bí mật.** Nằm trên volume riêng của tài khoản RunPod, quyền `600`. Không rời khỏi
-  volume, nhưng ai truy cập được volume thì đọc được token.
+- **Dump chứa bí mật.** Nằm trên volume riêng của tài khoản RunPod. Không rời khỏi volume, nhưng
+  ai truy cập được volume thì đọc được token. Trên MooseFS **không đặt được `600`** — `chmod` bị bỏ
+  qua (đo thật 2026-08-07, xem phần bố cục ở trên), file ra `666` và thư mục `777`. Lớp bảo vệ thật
+  ở đây là volume riêng của tài khoản + pod đơn-người-thuê, **không phải mode**. Trên filesystem có
+  hỗ trợ mode thì `umask 077` cho đúng `700`/`600` ngay từ lúc tạo file.
 
 ## Bài toán kế tiếp (spec riêng)
 

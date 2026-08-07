@@ -35,7 +35,17 @@ assert_fail() {
 docker info >/dev/null 2>&1 || { echo "docker chưa chạy — mở Docker Desktop rồi thử lại"; exit 2; }
 command -v psql >/dev/null || { echo "thiếu psql ở PATH"; exit 2; }
 
-cleanup() { docker rm -f "$CTR" >/dev/null 2>&1; [ -n "${VOL:-}" ] && rm -rf "$VOL"; }
+cleanup() {
+  docker rm -f "$CTR" >/dev/null 2>&1
+  # Gỡ ảnh FAT TRƯỚC khi xoá thư mục: còn mount mà rm -rf thì vừa không xoá được thư mục
+  # gốc, vừa để lại một disk image gắn lơ lửng cho lần chạy sau vấp phải.
+  [ -n "${FATMNT:-}" ] && hdiutil detach "$FATMNT" -force >/dev/null 2>&1
+  [ -n "${FATDMG:-}" ] && rm -f "$FATDMG"
+  [ -n "${FATDIR:-}" ] && rm -rf "$FATDIR"
+  [ -n "${SYMV:-}"   ] && rm -rf "$SYMV"
+  [ -n "${VOL:-}"    ] && rm -rf "$VOL"
+  return 0
+}
 trap cleanup EXIT
 
 info "dựng Postgres trong docker…"
@@ -394,6 +404,95 @@ E_OUT="$(bash "$SCRIPT" --restore 2>&1)"; E_RC=$?
 assert_eq "0" "$E_RC" "volume rỗng thật: --restore trả 0"
 printf '%s' "$E_OUT" | grep -q "phiên đầu" && ok "volume rỗng thật: vẫn nói 'phiên đầu'" \
                                            || bad "volume rỗng thật: mất thông điệp 'phiên đầu'"
+
+# ── Quyền dump: fs BỎ QUA chmod ≠ lỗi thật ────────────────────────────────
+# Nghiệm thu trên pod RunPod 2026-08-07: MooseFS bỏ qua chmod HOÀN TOÀN (file 666, thư mục
+# 777 cố định, chmod trả 0 nhưng không đổi gì) — y như nó đã chặn chown. Khối kiểm quyền cũ
+# vì thế ĐỎ ở MỌI lần dump trên pod, nên `make gpu-down` in "sao lưu DB thất bại" mỗi lần dù
+# bản dump hoàn hảo. Báo động giả thường trực dạy người dùng bỏ qua cảnh báo.
+# Bản vá: DÒ xem fs có tôn trọng mode không rồi mới quyết — không tôn trọng thì nói một dòng
+# và trả 0; có tôn trọng mà mode vẫn sai thì giữ nguyên cảnh báo to + khác 0.
+#
+# Nhánh "fs bỏ qua mode" là nhánh MỚI. Kiểm nó bằng một thư mục tạm bình thường thì assertion
+# KHÔNG THỂ ĐỎ (APFS luôn tôn trọng chmod), nên ở đây dựng một filesystem THẬT SỰ bỏ qua
+# chmod: ảnh đĩa FAT. Mount bằng -mountpoint vào thư mục tạm, không thả vào /Volumes, để
+# hai lần chạy song song không giành nhau cái tên.
+info "Quyền dump — phân biệt 'fs bỏ qua chmod' với lỗi thật"
+
+FATDIR="$(mktemp -d)"; FATMNT="$FATDIR/mnt"; FATDMG="$FATDIR/fat.dmg"
+mkdir -p "$FATMNT"
+FAT_OK=0
+if hdiutil create -size 20m -fs MS-DOS -volname MTCPGFAT -o "$FATDMG" >/dev/null 2>&1 \
+   && hdiutil attach -mountpoint "$FATMNT" "$FATDMG" >/dev/null 2>&1; then
+  FAT_OK=1
+else
+  FATMNT=""    # không mount được thì cleanup không được gọi detach
+fi
+
+# Gọi THẲNG _fs_honors_modes trong script thật, không chép lại logic vào test — chép lại thì
+# test chỉ kiểm bản chép. Source được là nhờ khối điều phối cuối pod-pgdump.sh có rào
+# ${BASH_SOURCE[0]} = $0. Chạy trong subshell vì script có `set -u` và `cd` ở đầu file.
+honors() { ( POD_VOLUME="$1"; export POD_VOLUME; . "$SCRIPT" >/dev/null 2>&1; _fs_honors_modes "$1" ) }
+
+if [ "$FAT_OK" = 1 ]; then
+  # TIỀN ĐỀ, phải kiểm chứ không được tin sẵn: nếu chmod lại ĂN trên ảnh FAT này (đổi phiên
+  # bản macOS, đổi driver msdos) thì cả nhóm assertion dưới xanh một cách vô nghĩa.
+  : > "$FATMNT/probe"; chmod 600 "$FATMNT/probe" 2>/dev/null
+  FATMODE="$(stat -f '%Lp' "$FATMNT/probe")"; rm -f "$FATMNT/probe"
+  [ "$FATMODE" != "600" ] \
+    && ok "tiền đề: FAT thật sự bỏ qua chmod (xin 600, nhận $FATMODE)" \
+    || bad "tiền đề KHÔNG dựng được: chmod ĂN trên ảnh FAT — nhóm assertion FAT vô nghĩa"
+
+  assert_fail "_fs_honors_modes: trên FAT trả 'KHÔNG tôn trọng mode'" -- honors "$FATMNT"
+
+  # Assertion trung tâm của bản vá. Trên code CHƯA vá, dòng này đỏ: --dump trả 1.
+  rm -rf "$FATMNT/pg"; seed
+  FAT_OUT="$(POD_VOLUME="$FATMNT" bash "$SCRIPT" --dump 2>&1)"; FAT_RC=$?
+  assert_eq "0" "$FAT_RC" "FAT (fs bỏ qua chmod): --dump trả 0 — hết báo động giả"
+  printf '%s' "$FAT_OUT" | grep -q "bỏ qua chmod" \
+    && ok "FAT: in dòng thông tin giải thích vì sao không đặt được 600" \
+    || bad "FAT: thiếu dòng thông tin — người dùng không biết vì sao mode không đúng"
+  printf '%s' "$FAT_OUT" | grep -q "QUYỀN SAI" \
+    && bad "FAT: VẪN in cảnh báo to 'QUYỀN SAI' — báo động giả chưa được gỡ" \
+    || ok "FAT: không in cảnh báo to 'QUYỀN SAI'"
+
+  # Trả 0 chưa đủ — phải chứng minh bản dump THẬT SỰ tốt, nếu không ta chỉ vừa đổi một
+  # báo động giả lấy một thành công giả.
+  FATD="$(ls "$FATMNT"/pg/dumps/motion-*.sql.gz 2>/dev/null | head -1)"
+  { [ -n "$FATD" ] && gzip -t "$FATD" 2>/dev/null; } \
+    && ok "FAT: bản dump ghi ra hợp lệ (gzip -t xanh)" \
+    || bad "FAT: không có bản dump hợp lệ — exit 0 đang che một dump hỏng"
+  assert_eq "7" "$(grep '^jobs=' "${FATD%.sql.gz}.meta" 2>/dev/null | cut -d= -f2)" \
+    "FAT: .meta vẫn đếm đúng bảng jobs"
+  assert_ok "FAT: --verify vẫn xanh" -- env POD_VOLUME="$FATMNT" bash "$SCRIPT" --verify
+else
+  # KHÔNG bỏ qua im lặng. Không dựng được fs bỏ-qua-chmod thì nhánh mới CHƯA được kiểm,
+  # và bộ test phải nói thẳng điều đó thay vì báo xanh.
+  bad "không dựng được ảnh FAT (hdiutil) — nhánh 'fs bỏ qua chmod' CHƯA ĐƯỢC KIỂM"
+fi
+
+# Vế ngược lại: fs CÓ tôn trọng mode thì tín hiệu thật phải còn nguyên.
+assert_ok "_fs_honors_modes: trên thư mục tạm (APFS) trả 'CÓ tôn trọng mode'" -- honors "$VOL"
+
+# …và khi đó mà mode vẫn sai thì phải cảnh báo to + khác 0.
+#
+# ÉP MODE SAI CHO TẤT ĐỊNH — đừng đơn giản hoá thành `chmod 666` lên file dump: file dump CŨ
+# không tới được khối kiểm, vì do_dump luôn ghi file MỚI (umask 077 → 600) rồi kiểm chính
+# file mới đó. Trên một fs tôn trọng chmod, không cách nào làm chmod của do_dump trượt.
+# Cách ép được: cho $PGDIR là một SYMLINK. `chmod 700 $PGDIR` đi XUYÊN link nên sửa thư mục
+# ĐÍCH, còn `_mode` dùng `stat` không -L nên đọc mode của chính cái LINK — trên macOS luôn
+# là 755. Dựng ra đúng trạng thái cần: fs tôn trọng chmod, nhưng khối kiểm đọc ra mode SAI.
+seed
+SYMV="$(mktemp -d)"; mkdir -p "$SYMV/pgreal"; ln -s pgreal "$SYMV/pg"
+S_OUT="$(POD_VOLUME="$SYMV" bash "$SCRIPT" --dump 2>&1)"; S_RC=$?
+assert_eq "1" "$S_RC" "fs tôn trọng mode + mode SAI: --dump vẫn trả khác 0"
+printf '%s' "$S_OUT" | grep -q "QUYỀN SAI" \
+  && ok "fs tôn trọng mode + mode SAI: vẫn in cảnh báo to 'QUYỀN SAI'" \
+  || bad "fs tôn trọng mode + mode SAI: MẤT cảnh báo to — bản vá nuốt luôn tín hiệu thật"
+printf '%s' "$S_OUT" | grep -q "bỏ qua chmod" \
+  && bad "fs tôn trọng mode: viện cớ 'bỏ qua chmod' — hàm dò trả sai chiều" \
+  || ok "fs tôn trọng mode: không viện cớ 'bỏ qua chmod'"
+rm -rf "$SYMV"; SYMV=""
 
 echo
 info "$PASSED xanh · $FAILED đỏ"

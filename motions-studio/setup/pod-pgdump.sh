@@ -157,6 +157,37 @@ _latest_dump() {
 # stat khác cú pháp giữa BSD (macOS, máy dev) và GNU (Ubuntu, pod) — thử cả hai.
 _mode() { stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1" 2>/dev/null; }
 
+# Filesystem ở thư mục này có TÔN TRỌNG chmod không? Trả 0 = có, khác 0 = không.
+#
+# Không phải câu hỏi lý thuyết. Nghiệm thu trên pod RunPod ngày 2026-08-07:
+#     chmod 600 <file trên /workspace>  → stat vẫn ra 666
+#     chmod 600 <file trên /tmp>        → stat ra 600
+#     thư mục trên volume               → 777 cố định
+#     mount: mfs#euro-3.runpod.net:9421 on /workspace type fuse
+#            (rw,nosuid,nodev,relatime,user_id=0,group_id=0,allow_other)
+# MooseFS BỎ QUA chmod hoàn toàn — y như nó đã chặn chown (pod-volume.sh:179-191).
+# Nên khối kiểm quyền cuối do_dump() ĐỎ ở MỌI lần dump trên pod, dù bản dump hoàn toàn
+# tốt: `make gpu-down` in "sao lưu DB thất bại" mỗi lần. Báo động giả thường trực dạy
+# người dùng bỏ qua cảnh báo — đúng thứ ngược lại với thứ khối kiểm đó tồn tại để làm.
+#
+# Đo thay vì đoán: mode SAI trên fs bỏ qua chmod là chuyện bình thường không sửa được;
+# mode SAI trên fs bình thường là lỗi thật. Hai chuyện khác hẳn nhau, phải xử khác nhau.
+#
+# Chiều hỏng của hàm này CỐ Ý nghiêng về phía ồn: không tạo được file dò (thư mục lạ,
+# hết chỗ) ⇒ trả 0 = "có tôn trọng" ⇒ giữ nguyên cảnh báo to. Thà cảnh báo thừa một lần
+# vì không đo được, còn hơn im lặng nuốt một mode sai thật.
+# Cũng vậy nếu fs ép sẵn file về đúng 600 khi tạo: hàm nói "có tôn trọng" → vẫn ồn.
+#
+# Tên file dò bắt đầu bằng dấu chấm nên không lọt vào glob motion-*.sql.gz của _prune.
+_fs_honors_modes() {
+  local d="$1" probe rc=1
+  probe="$(mktemp "$d/.mode-probe.XXXXXX" 2>/dev/null)" || return 0
+  chmod 600 "$probe" 2>/dev/null
+  [ "$(_mode "$probe")" = "600" ] && rc=0
+  rm -f "$probe" 2>/dev/null      # dọn KỂ CẢ khi hỏng — chạy trước mọi đường return
+  return "$rc"
+}
+
 # Tên file dạng motion-YYYYmmdd-HHMMSS nên thứ tự CHỮ CÁI trùng thứ tự THỜI GIAN —
 # sort theo tên thay vì `ls -t`, vì `ls -t` trên volume mạng đọc mtime của MooseFS và
 # parse output của ls là thứ vỡ ngay khi có tên lạ.
@@ -257,11 +288,20 @@ do_dump() {
 
   ok "dump: $(basename "$out") ($(wc -c < "$out" | tr -d ' ') bytes, $(grep -c '=' "$meta") dòng meta)"
 
+  # Mode lệch: DÒ xem filesystem có tôn trọng chmod không rồi mới quyết. Trên MooseFS của
+  # RunPod thì không, và ở đó mode lệch là chuyện bình thường không sửa được — báo động ở
+  # đấy là báo động giả, mà báo động giả thường trực làm hỏng mọi cảnh báo thật còn lại.
+  if [ -n "$bad_perm" ] && ! _fs_honors_modes "$DUMPS"; then
+    log "volume này bỏ qua chmod (đo thật: MooseFS của RunPod mount user_id=0,group_id=0), nên không đặt được 600 —$bad_perm; dump vẫn tốt. Bảo mật ở đây dựa vào volume là riêng của tài khoản và pod đơn-người-thuê, không dựa vào mode."
+    bad_perm=""
+  fi
+
   if [ -n "$bad_perm" ]; then
     warn "QUYỀN SAI trên dump —$bad_perm (cần thư mục=700, file=600)."
     warn "Dump chứa dữ liệu nhạy cảm (api_keys, user_sessions.token_hash, token social_accounts)"
     warn "và có thể đang lộ rộng hơn dự tính. KHÔNG xoá — mất hẳn backup còn tệ hơn một bản backup"
-    warn "quyền rộng. Tự kiểm tra và chmod tay, rồi tìm hiểu vì sao chmod không ăn trên volume này."
+    warn "quyền rộng. Filesystem này CÓ tôn trọng chmod (đã dò), nên đây là lỗi thật sửa được:"
+    warn "tự kiểm tra và chmod tay, rồi tìm hiểu vì sao chmod trong do_dump không ăn."
   fi
 
   # Phần đỏ của symlink, hoãn từ trên xuống. In SAU cảnh báo quyền để không nuốt mất nó khi cả
@@ -385,10 +425,17 @@ do_verify() {
   return "$rc"
 }
 
-case "${1:-}" in
-  --dump)    do_dump ;;
-  --restore) do_restore ;;
-  --check)   do_check ;;
-  --verify)  do_verify ;;
-  *) echo "dùng: $0 --dump|--restore|--check|--verify" >&2; exit 2 ;;
-esac
+# Chỉ điều phối khi file được CHẠY, không khi được `source`. Test cần gọi thẳng
+# _fs_honors_modes() để kiểm nhánh "filesystem bỏ qua chmod" như một đơn vị, chứ không
+# chỉ suy ra nó qua exit code của --dump; mà `source` file này khi vẫn còn `case` trần
+# thì nhánh `*)` sẽ `exit 2` và giết luôn shell của test.
+# Khi chạy bình thường ${BASH_SOURCE[0]} == $0 nên hành vi không đổi một chút nào.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  case "${1:-}" in
+    --dump)    do_dump ;;
+    --restore) do_restore ;;
+    --check)   do_check ;;
+    --verify)  do_verify ;;
+    *) echo "dùng: $0 --dump|--restore|--check|--verify" >&2; exit 2 ;;
+  esac
+fi

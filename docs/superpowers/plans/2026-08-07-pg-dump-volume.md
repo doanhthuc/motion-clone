@@ -17,7 +17,7 @@ Mọi task đều ngầm chịu các ràng buộc này:
 - **`VOLUME_PGDATA=0` giữ nguyên.** Không có task nào được đưa PGDATA lên volume — MooseFS chặn `chown` và container không có `/dev/loop*` (commit `d2a9ffc`).
 - **Không có cổng chặn nào.** Dump hỏng thì cảnh báo và trả exit code khác 0, nhưng `gpu-down`/`gpu-destroy` **vẫn chạy tiếp**.
 - **Không dump định kỳ.** Không thêm app PM2, không cron.
-- **Quyền:** thư mục dump `700`, file `600`.
+- **Quyền:** thư mục dump `700`, file `600` — **khi filesystem hỗ trợ mode**. Trên Network Volume của RunPod thì **không**: nghiệm thu 2026-08-07 cho thấy MooseFS bỏ qua `chmod` hoàn toàn (`chmod 600` trên `/workspace` → `stat` vẫn ra `666`; cùng lệnh trên `/tmp` → `600`; thư mục trên volume `777` cố định; mount `mfs#euro-3.runpod.net:9421 … fuse (rw,nosuid,nodev,relatime,user_id=0,group_id=0,allow_other)`) — y như nó đã chặn `chown` (`pod-volume.sh:179-191`). Nên `do_dump()` **dò** bằng `_fs_honors_modes <thư mục>` rồi mới quyết: filesystem không tôn trọng mode ⇒ in **một dòng** thông tin, coi như bình thường, trả **0**; filesystem có tôn trọng mà mode vẫn sai ⇒ cảnh báo to + exit khác 0. Bỏ báo động giả, giữ nguyên tín hiệu thật. `umask 077` giữ nguyên. Trên volume, bảo mật dump dựa vào volume riêng của tài khoản + pod đơn-người-thuê, không dựa vào mode.
 - **"DB trống" = không có bảng nào trong schema `public`** (`SELECT count(*) FROM pg_tables WHERE schemaname='public'`), không phải "có bảng nhưng 0 dòng".
 - **`--restore` phải dùng `psql --single-transaction -v ON_ERROR_STOP=1`.** Hai cờ mua hai thứ khác nhau: `--single-transaction` cho tính nguyên tử (lỗi giữa chừng thì Postgres tự biến COMMIT cuối thành ROLLBACK, không bao giờ có DB nạp nửa vời); `ON_ERROR_STOP=1` cho exit code trung thực (thiếu nó, psql thoát 0 sau một lần nạp đã hỏng và đã rollback — báo "khôi phục xong" trên một DB rỗng). Đo thật: cùng một dump lỗi, không `ON_ERROR_STOP` → exit 0 / 0 bảng; có `ON_ERROR_STOP` → exit khác 0 / 0 bảng; bỏ luôn `--single-transaction` → bảng sống sót thật.
 - **Không bao giờ xoá bản dump cuối cùng còn lại**, kể cả khi `PG_DUMP_KEEP=1`.
@@ -207,6 +207,19 @@ _table_count() { _psql -d "$PG_DB" -tAc "SELECT count(*) FROM pg_tables WHERE sc
 # stat khác cú pháp giữa BSD (macOS, máy dev) và GNU (Ubuntu, pod) — thử cả hai.
 _mode() { stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1" 2>/dev/null; }
 
+# Filesystem ở thư mục này có TÔN TRỌNG chmod không? Trả 0 = có, khác 0 = không.
+# Đo thật trên pod 2026-08-07: MooseFS bỏ qua chmod hoàn toàn (file 666, thư mục 777),
+# nên đòi 700/600 vô điều kiện là báo động giả ở MỌI lần dump. Xem Global Constraints.
+# Chiều hỏng CỐ Ý nghiêng về phía ồn: không tạo được file dò ⇒ trả 0 ⇒ vẫn cảnh báo to.
+_fs_honors_modes() {
+  local d="$1" probe rc=1
+  probe="$(mktemp "$d/.mode-probe.XXXXXX" 2>/dev/null)" || return 0
+  chmod 600 "$probe" 2>/dev/null
+  [ "$(_mode "$probe")" = "600" ] && rc=0
+  rm -f "$probe" 2>/dev/null      # dọn KỂ CẢ khi hỏng — chạy trước mọi đường return
+  return "$rc"
+}
+
 do_dump() {
   # umask 077: mọi file/thư mục sinh ra TRONG HÀM NÀY đã đúng quyền ngay từ lúc
   # syscall tạo ra nó, không đợi chmod chạy sau mới sửa. Đây mới là chỗ bịt cửa sổ
@@ -248,11 +261,9 @@ do_dump() {
   mv "$tmp" "$out" || { rm -f "$tmp" "$meta"; die "mv dump thất bại"; }
   ln -sfn "$out" "$LATEST"
 
-  # Kiểm KẾT QUẢ thật bằng stat, KHÔNG kiểm exit code của chmod ở trên. Trên pod, volume
-  # là MooseFS mount user_id=0,group_id=0 CHẶN chown kể cả khi là root (pod-volume.sh:179-191)
-  # — chưa ai đo chmod ở đó có ăn hay không. Nếu mode vốn đã đúng (nhờ umask 077 phía trên)
-  # thì chmod thất bại là vô hại, và `|| die` sẽ giết đường dump chính trên pod vì một lý do
-  # không gây hại gì. Chỉ khi mode THẬT SỰ sai mới coi là lỗi.
+  # Kiểm KẾT QUẢ thật bằng stat, KHÔNG kiểm exit code của chmod ở trên. Nếu mode vốn đã đúng
+  # (nhờ umask 077 phía trên) thì chmod thất bại là vô hại, và `|| die` sẽ giết đường dump
+  # chính trên pod vì một lý do không gây hại gì. Chỉ khi mode THẬT SỰ sai mới xét tiếp.
   local m_dir m_dumps m_out m_meta bad_perm=""
   m_dir="$(_mode "$PGDIR")";   [ "$m_dir"   = "700" ] || bad_perm="$bad_perm $PGDIR=$m_dir"
   m_dumps="$(_mode "$DUMPS")"; [ "$m_dumps" = "700" ] || bad_perm="$bad_perm $DUMPS=$m_dumps"
@@ -261,11 +272,20 @@ do_dump() {
 
   ok "dump: $(basename "$out") ($(wc -c < "$out" | tr -d ' ') bytes, $(grep -c '=' "$meta") dòng meta)"
 
+  # Mode lệch: DÒ xem filesystem có tôn trọng chmod không rồi mới quyết. Trên MooseFS của
+  # RunPod thì KHÔNG (đo thật 2026-08-07: file 666, thư mục 777, chmod trả 0 mà không đổi gì),
+  # và ở đó mode lệch là chuyện bình thường không sửa được — đỏ ở đấy là báo động giả.
+  if [ -n "$bad_perm" ] && ! _fs_honors_modes "$DUMPS"; then
+    log "volume này bỏ qua chmod (đo thật: MooseFS của RunPod mount user_id=0,group_id=0), nên không đặt được 600 —$bad_perm; dump vẫn tốt. Bảo mật ở đây dựa vào volume là riêng của tài khoản và pod đơn-người-thuê, không dựa vào mode."
+    bad_perm=""
+  fi
+
   if [ -n "$bad_perm" ]; then
     warn "QUYỀN SAI trên dump —$bad_perm (cần thư mục=700, file=600)."
     warn "Dump chứa dữ liệu nhạy cảm (api_keys, user_sessions.token_hash, token social_accounts)"
     warn "và có thể đang lộ rộng hơn dự tính. KHÔNG xoá — mất hẳn backup còn tệ hơn một bản backup"
-    warn "quyền rộng. Tự kiểm tra và chmod tay, rồi tìm hiểu vì sao chmod không ăn trên volume này."
+    warn "quyền rộng. Filesystem này CÓ tôn trọng chmod (đã dò), nên đây là lỗi thật sửa được:"
+    warn "tự kiểm tra và chmod tay, rồi tìm hiểu vì sao chmod trong do_dump không ăn."
     return 1
   fi
 }
@@ -280,6 +300,19 @@ esac
 
 Run: `chmod +x motions-studio/setup/pod-pgdump.sh && bash motions-studio/setup/tests/pgdump-test.sh`
 Expected: PASS — 7 dòng xanh, 0 đỏ.
+
+> **Sửa sau nghiệm thu (2026-08-07).** Hai assertion `thư mục dumps quyền 700` / `file dump quyền
+> 600` ở trên vẫn đúng và giữ nguyên — thư mục tạm của test nằm trên APFS, một filesystem tôn
+> trọng mode. Nhưng chúng **không** mô tả được pod: MooseFS bỏ qua `chmod` hoàn toàn, nên khối
+> kiểm quyền đỏ ở mọi lần dump và `make gpu-down` in `!! sao lưu DB thất bại` dù bản dump hoàn
+> hảo. `do_dump()` giờ dò bằng `_fs_honors_modes` rồi mới quyết (xem Global Constraints).
+>
+> Nhánh mới ấy **không kiểm được** bằng thư mục tạm — trên APFS assertion không thể đỏ. Nên
+> `pgdump-test.sh` dựng một filesystem **thật sự** bỏ qua chmod: ảnh đĩa FAT qua `hdiutil create
+> -fs MS-DOS` + `hdiutil attach -mountpoint`, có tiền đề kiểm hẳn hoi rằng chmod không ăn ở đó
+> trước khi tin nhóm assertion. Vế ngược lại (fs tôn trọng mode mà mode vẫn sai ⇒ vẫn cảnh báo
+> to + khác 0) dựng bằng cách cho `$PGDIR` là một symlink: `chmod` đi xuyên link còn `stat`
+> (không `-L`) đọc mode của chính cái link — luôn `755` trên macOS.
 
 - [ ] **Step 5: Commit**
 
