@@ -884,6 +884,17 @@ phase_pg_restore() {
   [ -n "$_vol" ] || _vol="$(get_kv POD_VOLUME)"
   [ -n "$_vol" ] || return 0
 
+  # Ghi lại vào `.env` CỦA POD — nguồn thứ hai, độc lập với biến môi trường.
+  # pod-volume.sh:309 gác cả khối ghi `.env` bằng `[ -f "$ROOT/.env" ]`, và trên pod MỚI file
+  # đó chưa tồn tại lúc nó chạy (rsync loại trừ `.env` và `.env.*`), nên POD_VOLUME không bao
+  # giờ vào được `.env`. Tới đây thì phase_dotenv đã dựng xong `.env`, nên ghi được. Nhờ vậy
+  # `make gpu-down` / `gpu-destroy` / `gpu-db-dump` / `gpu-db-check` / `pod-smoke.sh` — và cả
+  # người gõ tay `./setup/pod-pgdump.sh --dump` trên pod — đều thấy volume, kể cả khi lệnh ssh
+  # của họ quên truyền biến. KHÔNG được thay bằng cách gỡ guard ở pod-volume.sh:309: làm vậy
+  # thì pod-volume.sh tạo một `.env` cụt vài key, phase_dotenv thấy `[ ! -f .env ]` sai nên bỏ
+  # qua bước dựng `.env` đầy đủ — hỏng nặng hơn nhiều lỗi đang sửa.
+  set_kv POD_VOLUME "$_vol"
+
   say "4b/11 · Khôi phục database từ Network Volume (nếu có bản dump)"
   POD_VOLUME="$_vol" bash "$ROOT/setup/pod-pgdump.sh" --restore \
     || warn "khôi phục DB không thành công — setup vẫn chạy tiếp với DB trống."

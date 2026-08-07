@@ -248,7 +248,7 @@ if [ "$SSH_OK" != 1 ]; then
 elif [ -z "$POD_VOLUME" ]; then
   # skip chứ không bad: pod không gắn volume là cấu hình hợp lệ, không phải hỏng hóc.
   skip "bỏ qua — không đặt POD_VOLUME"
-elif remote "cd ~/motion-backend && bash ./setup/pod-pgdump.sh --check && bash ./setup/pod-pgdump.sh --verify"; then
+elif remote "cd ~/motion-backend && POD_VOLUME='$POD_VOLUME' bash ./setup/pod-pgdump.sh --check && POD_VOLUME='$POD_VOLUME' bash ./setup/pod-pgdump.sh --verify"; then
   ok "có bản dump, và nạp lại được (đã diễn tập vào DB tạm)"
 else
   # warn chứ không bad: thiếu backup không làm pod sai chức năng, nhưng phải nói to.
