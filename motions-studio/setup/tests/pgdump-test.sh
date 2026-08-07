@@ -307,8 +307,18 @@ q 'DROP TABLE "order"; DROP TABLE "weird name (x)";' >/dev/null
 #
 # Bất biến chung, quan trọng hơn cả việc đếm đúng: KHÔNG BAO GIỜ phát ra KHOÁ RÁC. Một khoá rác
 # trong .meta làm --verify ĐỎ trên một bản dump hoàn toàn tốt, tức phá đúng cái cổng bằng-chứng
-# mà cả tính năng này dựa vào. Vì thế mỗi khối dưới đây đều có một assertion "không còn khoá nào
-# dính đuôi FROM stdin;" — nó là thứ bắt được cả hai dạng hỏng cũ cùng lúc.
+# mà cả tính năng này dựa vào. Vì thế mỗi khối dưới đây đều có một assertion kiểm bất biến đó.
+#
+# Kiểm ĐÚNG BẤT BIẾN, không kiểm hình dạng rác CŨ. Bản trước dùng `grep -c 'FROM stdin;' == 0`,
+# tức neo vào đúng hai khoá rác mà hai lỗi đã sửa từng phát ra — nên nó mù với mọi hình dạng rác
+# khác. Đo bằng mutant: bỏ ` > "/dev/stderr"` ở khối END của _dump_row_counts (in dòng lỗi thẳng
+# vào stdout, mà stdout của hàm đó CHÍNH LÀ .meta — đúng thứ ba dòng comment ở pod-pgdump.sh:174
+# nói mình đang bịt) làm .meta chứa khoá rác thật, mà TOÀN BỘ 93 assertion vẫn xanh.
+# Bất biến thật đang khai là: MỌI dòng trong .meta phải là `<khoá>=<số>` — hoặc khoá hệ thống,
+# hoặc `<tên bảng>=<số dòng>`. Đếm số dòng KHÔNG khớp; phải bằng 0, bất kể rác trông ra sao.
+meta_junk() {
+  grep -cvE '^(created|pg_version|dump_bytes|meta_incomplete)=|^[^=]+=[0-9]+$' "$1" | tr -d ' '
+}
 
 # (1) Bảng 0 CỘT: pg_dump phát `COPY public.t0  FROM stdin;` — KHÔNG có danh sách cột, chỉ còn
 #     một dấu cách thừa. Regex cũ đòi `\(…\)` nên trượt → khoá `t0  FROM stdin;=2`.
@@ -321,8 +331,8 @@ assert_ok "bảng 0 cột + tên cột chứa ngoặc: --dump trả 0" -- bash "
 M7="$(ls "$VOL"/pg/dumps/*.meta | head -1)"
 assert_eq "2" "$(grep '^t0=' "$M7" | cut -d= -f2)"       "bảng 0 CỘT vào .meta với khoá TRẦN t0="
 assert_eq "2" "$(grep '^parencol=' "$M7" | cut -d= -f2)" "tên cột chứa ngoặc: khoá TRẦN parencol="
-assert_eq "0" "$(grep -c 'FROM stdin;' "$M7" | tr -d ' ')" \
-  ".meta KHÔNG còn khoá rác nào dính đuôi 'FROM stdin;'"
+assert_eq "0" "$(meta_junk "$M7")" \
+  ".meta chỉ chứa dòng <khoá>=<số> — không một dòng rác nào, dưới MỌI hình dạng"
 assert_ok "--verify xanh với bảng 0 cột và tên cột chứa ngoặc" -- bash "$SCRIPT" --verify
 q 'DROP TABLE t0; DROP TABLE parencol;' >/dev/null
 
@@ -344,8 +354,8 @@ printf '%s' "$NL_OUT" | grep -q ".meta THIẾU BẢNG" \
   && ok "identifier có xuống dòng: nói rõ hệ quả (.meta cụt ⇒ --verify sau này đỏ)" \
   || bad "identifier có xuống dòng: không giải thích hệ quả — người đọc không truy ra được"
 M8="$(ls "$VOL"/pg/dumps/*.meta | head -1)"
-assert_eq "0" "$(grep -c 'FROM stdin;' "$M8" | tr -d ' ')" \
-  "identifier có xuống dòng: .meta thiếu bảng NHƯNG không có khoá rác"
+assert_eq "0" "$(meta_junk "$M8")" \
+  "identifier có xuống dòng: .meta thiếu bảng NHƯNG mọi dòng còn lại vẫn là <khoá>=<số>"
 # Đỏ ở đây là cảnh báo về .meta, KHÔNG phải mất backup — bản dump vẫn phải ghi xong và hợp lệ.
 D8="$(ls "$VOL"/pg/dumps/motion-*.sql.gz 2>/dev/null | head -1)"
 { [ -n "$D8" ] && gzip -t "$D8" 2>/dev/null; } \
