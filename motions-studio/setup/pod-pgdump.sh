@@ -66,6 +66,21 @@ _table_count() { _psql -d "$PG_DB" -tAc "SELECT count(*) FROM pg_tables WHERE sc
 # stat khác cú pháp giữa BSD (macOS, máy dev) và GNU (Ubuntu, pod) — thử cả hai.
 _mode() { stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1" 2>/dev/null; }
 
+# Tên file dạng motion-YYYYmmdd-HHMMSS nên thứ tự CHỮ CÁI trùng thứ tự THỜI GIAN —
+# sort theo tên thay vì `ls -t`, vì `ls -t` trên volume mạng đọc mtime của MooseFS và
+# parse output của ls là thứ vỡ ngay khi có tên lạ.
+_prune() {
+  local keep="$1" all n f
+  all="$(ls -1 "$DUMPS"/motion-*.sql.gz 2>/dev/null | sort)"
+  n="$(printf '%s\n' "$all" | sed '/^$/d' | wc -l | tr -d ' ')"
+  [ "$n" -le 1 ] && return 0          # không bao giờ xoá bản cuối cùng còn lại
+  [ "$n" -le "$keep" ] && return 0
+  printf '%s\n' "$all" | head -n "$((n - keep))" | while read -r f; do
+    [ -n "$f" ] || continue
+    rm -f "$f" "${f%.sql.gz}.meta"
+  done
+}
+
 do_dump() {
   # umask 077: mọi file/thư mục sinh ra TRONG HÀM NÀY đã đúng quyền ngay từ lúc
   # syscall tạo ra nó, không đợi chmod chạy sau mới sửa. Đây mới là chỗ bịt cửa sổ
@@ -106,6 +121,7 @@ do_dump() {
   # mv trong CÙNG filesystem là nguyên tử → latest không bao giờ trỏ một file ghi dở.
   mv "$tmp" "$out" || { rm -f "$tmp" "$meta"; die "mv dump thất bại"; }
   ln -sfn "$out" "$LATEST"
+  _prune "$KEEP"
 
   # Kiểm KẾT QUẢ thật bằng stat, KHÔNG kiểm exit code của chmod ở trên. Trên pod, volume
   # là MooseFS mount user_id=0,group_id=0 CHẶN chown kể cả khi là root (pod-volume.sh:179-191)

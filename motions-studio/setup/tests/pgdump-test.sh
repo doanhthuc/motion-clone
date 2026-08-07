@@ -81,6 +81,20 @@ D2="$(readlink "$VOL/pg/latest")"
 assert_eq "600" "$(stat -f '%Lp' "$D2")" "dump vẫn 600 kể cả khi umask của caller là 000"
 assert_eq "700" "$(stat -f '%Lp' "$VOL/pg/dumps")" "thư mục vẫn 700 kể cả khi umask của caller là 000"
 
+# ── Task 2 ────────────────────────────────────────────────────────────────
+info "Task 2 — prune"
+rm -rf "$VOL/pg"; seed
+PG_DUMP_KEEP=2 bash "$SCRIPT" --dump >/dev/null; sleep 1
+PG_DUMP_KEEP=2 bash "$SCRIPT" --dump >/dev/null; sleep 1
+PG_DUMP_KEEP=2 bash "$SCRIPT" --dump >/dev/null
+assert_eq "2" "$(ls "$VOL"/pg/dumps/*.sql.gz | wc -l | tr -d ' ')" "PG_DUMP_KEEP=2 giữ đúng 2 bản"
+assert_eq "2" "$(ls "$VOL"/pg/dumps/*.meta   | wc -l | tr -d ' ')" "prune xoá .meta theo cùng"
+[ -e "$(readlink "$VOL/pg/latest")" ] && ok "latest vẫn trỏ file có thật sau prune" \
+                                      || bad "latest trỏ file đã bị prune xoá"
+# KEEP=1 mà chỉ có 1 bản: không được xoá sạch
+rm -rf "$VOL/pg"; PG_DUMP_KEEP=1 bash "$SCRIPT" --dump >/dev/null
+assert_eq "1" "$(ls "$VOL"/pg/dumps/*.sql.gz | wc -l | tr -d ' ')" "KEEP=1 vẫn giữ lại bản duy nhất"
+
 echo
 info "$PASSED xanh · $FAILED đỏ"
 [ "$FAILED" -eq 0 ]
