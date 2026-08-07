@@ -349,6 +349,15 @@ do_dump() {
     echo "pg_version=$(_psql -d "$PG_DB" -tAc 'SHOW server_version_num' | tr -d ' ')"
     echo "dump_bytes=$(wc -c < "$tmp" | tr -d ' ')"
     _dump_row_counts "$tmp" || meta_rc=1
+    # CỜ ĐI CÙNG FILE, không chỉ đi cùng lần chạy này. Cảnh báo `--dump` in ra stderr biến mất
+    # ngay khi terminal cuộn qua, nhưng hệ quả (`.meta` cụt ⇒ mọi `--verify` sau này đỏ) sống
+    # cùng bản dump. Không có cờ, ba tuần sau lớp 6 của gpu-smoke đỏ và do_verify chẩn đoán
+    # "nghi ngờ file hỏng hoặc .meta bị sửa tay" — CHỈ SAI HƯỚNG, đúng cái bẫy mà khối cảnh báo
+    # cuối do_dump() tồn tại để chặn. Ghi vào .meta thì lời giải thích đi theo đúng vật thể mà
+    # người đọc đang cầm.
+    # Dạng `<khoá>=<số>` để không phá bất biến định dạng của .meta; lọc ra ở mọi nơi liệt kê
+    # bảng (do_check, do_verify), nếu không nó bị đếm nhầm thành một bảng tên meta_incomplete.
+    [ "$meta_rc" = 0 ] || echo "meta_incomplete=1"
   } > "$meta"
   chmod 600 "$meta" 2>/dev/null || true
 
@@ -478,7 +487,13 @@ do_check() {
   ok "bản dump mới nhất: $(basename "$target") · ${age_h} giờ tuổi · $(wc -c < "$target" | tr -d ' ') bytes"
   log "số bản đang giữ: $(ls -1 "$DUMPS"/motion-*.sql.gz 2>/dev/null | wc -l | tr -d ' ')"
   log "số dòng ghi trong .meta:"
-  grep -vE '^(created|pg_version|dump_bytes)=' "$meta" 2>/dev/null | sed 's/^/    /'
+  grep -vE '^(created|pg_version|dump_bytes|meta_incomplete)=' "$meta" 2>/dev/null | sed 's/^/    /'
+
+  # Nói ngay ở --check, đừng đợi --verify đỏ rồi mới đoán: danh sách ngay trên là KHÔNG ĐẦY ĐỦ.
+  if grep -q '^meta_incomplete=1' "$meta" 2>/dev/null; then
+    warn "…và danh sách trên THIẾU BẢNG: lúc --dump có header COPY không parse được."
+    warn "Bản dump vẫn tốt và vẫn --restore được; chỉ .meta cụt, nên --verify trên bản này sẽ đỏ."
+  fi
 
   # return 0 TƯỜNG MINH, đừng bỏ. Không có nó thì giá trị trả về của hàm là exit status của
   # pipeline `grep | sed` ngay trên: với pipefail, grep không khớp dòng nào (dump từ một DB
@@ -509,7 +524,7 @@ do_verify() {
 
   if gzip -dc "$target" | PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" \
        -d "$vdb" --single-transaction -v ON_ERROR_STOP=1 -q >/dev/null 2>&1; then
-    want="$(grep -vE '^(created|pg_version|dump_bytes)=' "$meta" 2>/dev/null | sort)"
+    want="$(grep -vE '^(created|pg_version|dump_bytes|meta_incomplete)=' "$meta" 2>/dev/null | sort)"
     got="$(_row_counts "$vdb")"
     if [ "$want" = "$got" ]; then
       ok "verify: nạp lại được và số dòng khớp .meta ($(printf '%s\n' "$got" | wc -l | tr -d ' ') bảng)"
@@ -520,9 +535,20 @@ do_verify() {
       # (_dump_row_counts), không phải từ một truy vấn DB thứ hai, nên cái đua cũ — INSERT chen
       # vào giữa pg_dump và lần đếm — không còn sinh ra triệu chứng này được nữa.
       warn "Hai vế đều đọc từ CÙNG bản dump này: vế trái là số dòng ghi trong file, vế phải là"
-      warn "số dòng đếm được sau khi nạp thật file đó vào một DB tạm. Lệch nghĩa là nạp lại KHÔNG"
-      warn "ra đúng nội dung — nghi ngờ file hỏng, hoặc .meta bị sửa tay. Đây KHÔNG còn là đua"
-      warn "ghi-trong-lúc-dump; đừng bỏ qua nó như trước."
+      warn "số dòng đếm được sau khi nạp thật file đó vào một DB tạm."
+      # Đọc CỜ trước khi chẩn đoán. Có đúng một nguyên nhân đã biết làm `.meta` cụt NGAY TỪ LÚC
+      # GHI, và nó đã được ghi thẳng vào file lúc --dump. Không hỏi cờ mà đọc thẳng câu "nghi ngờ
+      # file hỏng hoặc .meta bị sửa tay" là chỉ SAI HƯỚNG đúng vào kịch bản phổ biến nhất — người
+      # đọc sẽ đi soi gzip và mtime của một bản dump hoàn toàn lành.
+      if grep -q '^meta_incomplete=1' "$meta" 2>/dev/null; then
+        warn "NGUYÊN NHÂN ĐÃ BIẾT: .meta này ĐÃ ĐƯỢC ĐÁNH DẤU KHÔNG ĐẦY ĐỦ ngay lúc --dump —"
+        warn "lúc đó có header COPY không parse được (identifier chứa ký tự XUỐNG DÒNG), nên"
+        warn ".meta thiếu hẳn bảng chứ file dump KHÔNG hỏng. Đọc phần diff trên: vế phải (nạp"
+        warn "lại thật) mới là số đúng. Đừng đi soi file dump — nó vẫn --restore được bình thường."
+      else
+        warn "Lệch nghĩa là nạp lại KHÔNG ra đúng nội dung — nghi ngờ file hỏng, hoặc .meta bị"
+        warn "sửa tay. Đây KHÔNG còn là đua ghi-trong-lúc-dump; đừng bỏ qua nó như trước."
+      fi
       rc=1
     fi
   else

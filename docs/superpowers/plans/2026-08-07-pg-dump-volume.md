@@ -40,7 +40,7 @@ Mọi task đều ngầm chịu các ràng buộc này:
     `do_verify()` dùng, và chỉ trên DB tạm đã nạp xong.
   - `_dump_row_counts(<file.sql.gz>)` (F3) → cùng định dạng, nhưng đếm từ chính nội dung file dump.
     Đây là nguồn số liệu của `.meta`.
-  - Định dạng `.meta`: các dòng `key=value`, gồm `created` (giây epoch UTC), `pg_version`, `dump_bytes`, rồi các dòng `<bảng>=<số dòng>`.
+  - Định dạng `.meta`: các dòng `key=value`, gồm `created` (giây epoch UTC), `pg_version`, `dump_bytes`, `meta_incomplete=1` (chỉ có mặt khi danh sách bảng bị cụt), rồi các dòng `<bảng>=<số dòng>`. Mọi nơi liệt kê bảng phải lọc **cả bốn** khoá hệ thống.
   - `motions-studio/setup/tests/pgdump-test.sh` → chạy toàn bộ test, exit `0` khi tất cả xanh.
 
 - [ ] **Step 1: Viết bộ khung test + test đầu tiên (sẽ đỏ)**
@@ -1302,6 +1302,17 @@ Năm chi tiết cài đặt không hiển nhiên, mỗi cái có một test riê
    mà **toàn bộ 93 assertion vẫn xanh**. Thay bằng: đếm số dòng trong `.meta` không khớp
    `^(created|pg_version|dump_bytes|meta_incomplete)=` và cũng không khớp `^[^=]+=[0-9]+$`, phải
    bằng 0 — đỏ đúng dưới mutant (92 xanh · 1 đỏ).
+
+   **(d) Thông điệp `--verify` đỏ chỉ sai hướng.** Câu "nghi ngờ file hỏng, hoặc `.meta` bị sửa
+   tay" là chẩn đoán SAI cho đúng cái case `.meta` cụt vì header không parse được — chính kịch bản
+   "ba tuần sau `gpu-smoke` lớp 6 đỏ và người đọc bị chỉ sai hướng" mà khối cảnh báo cuối
+   `do_dump()` tồn tại để chặn. Cảnh báo stderr của `--dump` biến mất khi terminal cuộn qua; hệ
+   quả thì sống cùng file. Sửa: `do_dump` ghi **cờ `meta_incomplete=1` vào chính `.meta`**, và
+   `do_verify` đọc cờ trước khi chẩn đoán — có cờ thì nói thẳng "`.meta` cụt từ lúc `--dump`, file
+   dump KHÔNG hỏng, vế phải mới là số đúng"; không có cờ thì giữ nguyên câu cũ (nhánh `else` có
+   assertion riêng canh, dựng bằng `.meta` sửa tay). Cờ phải được thêm vào **cả hai** danh sách
+   lọc (`do_check`, `do_verify`), nếu không nó bị đếm nhầm thành một bảng tên `meta_incomplete`.
+   `do_check` cũng nói luôn danh sách bảng đang cụt thay vì in một danh sách cụt trong im lặng.
 
 **Cách dựng đua cho test — chỗ dễ sai nhất.** Lần đầu viết test theo kiểu "dump xong rồi mới
 `INSERT` rồi `--verify`" và nó **xanh trên cả code vá lẫn chưa vá** (64 xanh · 0 đỏ ở cả hai bên):

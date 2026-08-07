@@ -228,6 +228,12 @@ assert_eq "" "$(q "SELECT 1 FROM pg_database WHERE datname='motion_verify'")" \
 M="$(ls "$VOL"/pg/dumps/*.meta | head -1)"
 sed -i '' 's/^jobs=7$/jobs=999/' "$M"
 assert_fail "--verify đỏ khi số dòng lệch .meta" -- bash "$SCRIPT" --verify
+# Vế NGƯỢC của chẩn đoán có điều kiện: .meta này KHÔNG mang cờ meta_incomplete (nó bị sửa tay),
+# nên chẩn đoán "file hỏng / .meta bị sửa tay" ở đây là ĐÚNG hướng và phải còn nguyên. Không có
+# assertion này thì bản vá finding 4 có thể lặng lẽ nuốt mất nhánh else mà không ai biết.
+printf '%s' "$(bash "$SCRIPT" --verify 2>&1)" | grep -q "nghi ngờ file hỏng" \
+  && ok ".meta sửa tay (không có cờ): --verify vẫn chẩn đoán 'file hỏng / .meta bị sửa tay'" \
+  || bad ".meta sửa tay: MẤT chẩn đoán đúng hướng — bản vá nuốt luôn nhánh else"
 assert_eq "" "$(q "SELECT 1 FROM pg_database WHERE datname='motion_verify'")" \
   "--verify vẫn xoá DB tạm khi hỏng"
 
@@ -365,6 +371,29 @@ D8="$(ls "$VOL"/pg/dumps/motion-*.sql.gz 2>/dev/null | head -1)"
 { [ -n "$D8" ] && gzip -t "$D8" 2>/dev/null; } \
   && ok "identifier có xuống dòng: bản dump VẪN ghi xong và hợp lệ (gzip -t xanh)" \
   || bad "identifier có xuống dòng: mất bản dump — đỏ ở .meta không được kéo theo mất backup"
+
+# …và LỜI GIẢI THÍCH phải đi theo BẢN DUMP, không chỉ theo lần chạy này. Cảnh báo stderr của
+# --dump biến mất khi terminal cuộn qua; hệ quả (.meta cụt ⇒ mọi --verify sau này đỏ) thì sống
+# cùng file. Không có cờ trong .meta, ba tuần sau lớp 6 gpu-smoke đỏ và --verify chẩn đoán
+# "nghi ngờ file hỏng, hoặc .meta bị sửa tay" — CHỈ SAI HƯỚNG: file dump hoàn toàn lành, người
+# đọc đi soi gzip/mtime vô ích. Đúng cái bẫy mà khối cảnh báo cuối do_dump tồn tại để chặn.
+assert_eq "1" "$(grep -c '^meta_incomplete=1' "$M8" | tr -d ' ')" \
+  "identifier có xuống dòng: .meta mang CỜ meta_incomplete=1 đi cùng bản dump"
+CHK8="$(bash "$SCRIPT" --check 2>&1)"
+printf '%s' "$CHK8" | grep -q 'meta_incomplete' \
+  && bad "cờ meta_incomplete lọt vào danh sách bảng của --check — bị đếm nhầm thành một bảng" \
+  || ok "cờ meta_incomplete KHÔNG lọt vào danh sách bảng của --check"
+printf '%s' "$CHK8" | grep -q "THIẾU BẢNG" \
+  && ok "--check nói thẳng danh sách bảng là KHÔNG ĐẦY ĐỦ" \
+  || bad "--check in danh sách cụt mà không nói nó cụt"
+V8="$(bash "$SCRIPT" --verify 2>&1)"; V8_RC=$?
+assert_eq "1" "$V8_RC" "identifier có xuống dòng: --verify đỏ (đúng như --dump đã báo trước)"
+printf '%s' "$V8" | grep -q "ĐÁNH DẤU KHÔNG ĐẦY ĐỦ" \
+  && ok "--verify đỏ nhắc lại LÝ DO THẬT (.meta cụt từ lúc --dump)" \
+  || bad "--verify đỏ không nhắc lý do thật — người đọc phải tự truy ngược"
+printf '%s' "$V8" | grep -q "nghi ngờ file hỏng" \
+  && bad "--verify đỏ vẫn chẩn đoán 'file hỏng / .meta bị sửa tay' — CHỈ SAI HƯỚNG" \
+  || ok "--verify đỏ KHÔNG chẩn đoán sai hướng 'file hỏng / .meta bị sửa tay'"
 q 'DROP TABLE "new
 line";' >/dev/null
 
