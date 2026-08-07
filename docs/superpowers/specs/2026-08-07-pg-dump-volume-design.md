@@ -1,6 +1,16 @@
 # Sao lưu DB sang Network Volume bằng `pg_dump` — Design
 
-**Ngày:** 07/08/2026 · **Trạng thái:** thiết kế, chưa triển khai.
+**Ngày:** 07/08/2026 · **Trạng thái:** đã triển khai, đã nghiệm thu trên pod GPU RunPod thật.
+Hai lần thuê pod RTX 5090 ở EU-RO-1, tổng ~25 phút: (1) pod 1 — `gpu-bootstrap` trên phiên đầu báo
+đúng "chưa có bản dump nào — bỏ qua", `gpu-db-dump` tạo bản 6656 bytes, `gpu-db-check` xác nhận nạp
+lại được (25 bảng), `gpu-down` dump lần nữa rồi dừng pod, `gpu-destroy` trên pod đã dừng gặp
+`Connection refused` khi cố dump lần cuối nhưng **vẫn xoá pod** đúng thiết kế "không cổng chặn"; (2)
+pod 2 dựng hoàn toàn mới sau khi pod 1 đã biến mất khỏi `runpodctl pod list` — `gpu-bootstrap` tự
+khôi phục từ bản dump của `gpu-down` ("tuổi bản dump: 0 giờ" → "✓ khôi phục xong"), `gpu-db-check`
+xanh (25 bảng, số bản đang giữ: 2), dữ liệu quay về đúng số dòng đã ghi ở pod 1
+(`users=2 · workflows=2 · workers=1 · api_keys=1 · task_cloud_auto_settings=1`). Chưa đo: lớp sao
+lưu DB mới trong `make gpu-smoke` chưa từng chạy trên pod thật. Số đo đầy đủ ở
+[gpu-pod.md §Sao lưu database](../../gpu-pod.md#pg-backup).
 
 ## Mục tiêu
 
