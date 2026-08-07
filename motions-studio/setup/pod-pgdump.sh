@@ -76,6 +76,7 @@ _prune() {
   # $LATEST đang trỏ vào — mất sạch lịch sử backup vì một ký tự gõ nhầm. Kẹp về 1 là diễn
   # giải đúng của ràng buộc: giữ ít nhất một bản, luôn luôn.
   case "$keep" in ''|*[!0-9]*) keep=1 ;; esac
+  # Dòng dưới là chốt chặn duy nhất cho KEEP=0 (case trên không bắt được "0" vì nó toàn chữ số)
   [ "$keep" -ge 1 ] || keep=1
   all="$(ls -1 "$DUMPS"/motion-*.sql.gz 2>/dev/null | sort)"
   n="$(printf '%s\n' "$all" | sed '/^$/d' | wc -l | tr -d ' ')"

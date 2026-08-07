@@ -104,13 +104,27 @@ N0="$(ls "$VOL"/pg/dumps/*.sql.gz 2>/dev/null | wc -l | tr -d ' ')"
                 || bad "KEEP=0 đã xoá SẠCH backup — còn $N0 bản"
 [ -e "$(readlink "$VOL/pg/latest")" ] && ok "KEEP=0: latest vẫn trỏ file có thật" \
                                       || bad "KEEP=0: latest thành symlink treo"
-# KEEP không phải số cũng không được xoá sạch
+# KEEP không phải số. Trên code CHƯA vá, $((n - keep)) làm bash coi "abc" là tên biến chưa đặt
+# → set -u giết script NGAY tại đó, tức trước cả đường xoá file. Vì vậy assertion "còn ít nhất
+# 1 bản" là VÔ NGHĨA ở đây: nó xanh trên cả hai bên, vì code hỏng sập trước khi kịp xoá.
+# Thứ thật sự khác nhau là EXIT CODE — sập thì khác 0, đã kẹp keep thì chạy trót lọt.
 rm -rf "$VOL/pg"; seed
-PG_DUMP_KEEP=abc bash "$SCRIPT" --dump >/dev/null; sleep 1
-PG_DUMP_KEEP=abc bash "$SCRIPT" --dump >/dev/null
+PG_DUMP_KEEP=abc bash "$SCRIPT" --dump >/dev/null 2>&1; sleep 1
+PG_DUMP_KEEP=abc bash "$SCRIPT" --dump >/dev/null 2>&1
+RC_ABC=$?
+assert_eq "0" "$RC_ABC" "KEEP=abc: --dump chạy trót lọt, không sập vì unbound variable"
 NA="$(ls "$VOL"/pg/dumps/*.sql.gz 2>/dev/null | wc -l | tr -d ' ')"
-[ "$NA" -ge 1 ] && ok "KEEP không phải số vẫn giữ lại ít nhất 1 bản" \
-                || bad "KEEP=abc đã xoá sạch backup"
+[ "$NA" -ge 1 ] && ok "KEEP=abc vẫn giữ lại ít nhất 1 bản" || bad "KEEP=abc đã xoá sạch backup"
+# KEEP âm là trường hợp XẤU NHẤT, và là trường hợp DUY NHẤT không tự lộ ra: khác "abc",
+# số âm là số nguyên hợp lệ nên không sập ở $(( )). Trên code chưa vá, head -n $((n+2))
+# lặng lẽ trả về TẤT CẢ dòng đang có → xoá sạch, không lỗi, không cảnh báo.
+rm -rf "$VOL/pg"; seed
+PG_DUMP_KEEP=-2 bash "$SCRIPT" --dump >/dev/null 2>&1; sleep 1
+PG_DUMP_KEEP=-2 bash "$SCRIPT" --dump >/dev/null 2>&1
+NN="$(ls "$VOL"/pg/dumps/*.sql.gz 2>/dev/null | wc -l | tr -d ' ')"
+[ "$NN" -ge 1 ] && ok "KEEP âm vẫn giữ lại ít nhất 1 bản" || bad "KEEP=-2 đã xoá sạch backup"
+[ -e "$(readlink "$VOL/pg/latest")" ] && ok "KEEP âm: latest vẫn trỏ file có thật" \
+                                      || bad "KEEP âm: latest thành symlink treo"
 
 echo
 info "$PASSED xanh · $FAILED đỏ"

@@ -320,6 +320,28 @@ assert_eq "2" "$(ls "$VOL"/pg/dumps/*.meta   | wc -l | tr -d ' ')" "prune xoá .
 # KEEP=1 mà chỉ có 1 bản: không được xoá sạch
 rm -rf "$VOL/pg"; PG_DUMP_KEEP=1 bash "$SCRIPT" --dump >/dev/null
 assert_eq "1" "$(ls "$VOL"/pg/dumps/*.sql.gz | wc -l | tr -d ' ')" "KEEP=1 vẫn giữ lại bản duy nhất"
+# KEEP=0 xoá sạch nếu không có guard
+rm -rf "$VOL/pg"; seed
+PG_DUMP_KEEP=0 bash "$SCRIPT" --dump >/dev/null; sleep 1
+PG_DUMP_KEEP=0 bash "$SCRIPT" --dump >/dev/null
+N0="$(ls "$VOL"/pg/dumps/*.sql.gz 2>/dev/null | wc -l | tr -d ' ')"
+[ "$N0" -ge 1 ] && ok "KEEP=0 vẫn giữ lại ít nhất 1 bản (không xoá sạch)" || bad "KEEP=0 đã xoá sạch"
+[ -e "$(readlink "$VOL/pg/latest")" ] && ok "KEEP=0: latest vẫn trỏ file có thật" || bad "KEEP=0: latest treo"
+# KEEP không phải số: kiểm exit code, vì script sập trước khi xoá
+rm -rf "$VOL/pg"; seed
+PG_DUMP_KEEP=abc bash "$SCRIPT" --dump >/dev/null 2>&1; sleep 1
+PG_DUMP_KEEP=abc bash "$SCRIPT" --dump >/dev/null 2>&1
+RC_ABC=$?
+assert_eq "0" "$RC_ABC" "KEEP=abc: --dump chạy trót lọt, không sập vì unbound variable"
+NA="$(ls "$VOL"/pg/dumps/*.sql.gz 2>/dev/null | wc -l | tr -d ' ')"
+[ "$NA" -ge 1 ] && ok "KEEP=abc vẫn giữ lại ít nhất 1 bản" || bad "KEEP=abc xoá sạch"
+# KEEP âm: nguy hiểm nhất, không sập nhưng xoá sạch
+rm -rf "$VOL/pg"; seed
+PG_DUMP_KEEP=-2 bash "$SCRIPT" --dump >/dev/null 2>&1; sleep 1
+PG_DUMP_KEEP=-2 bash "$SCRIPT" --dump >/dev/null 2>&1
+NN="$(ls "$VOL"/pg/dumps/*.sql.gz 2>/dev/null | wc -l | tr -d ' ')"
+[ "$NN" -ge 1 ] && ok "KEEP âm vẫn giữ lại ít nhất 1 bản" || bad "KEEP=-2 đã xoá sạch"
+[ -e "$(readlink "$VOL/pg/latest")" ] && ok "KEEP âm: latest vẫn trỏ file có thật" || bad "KEEP âm: latest treo"
 ```
 
 - [ ] **Step 2: Chạy để chắc chắn nó ĐỎ**
@@ -342,6 +364,7 @@ _prune() {
   # $LATEST đang trỏ vào — mất sạch lịch sử backup vì một ký tự gõ nhầm. Kẹp về 1 là diễn
   # giải đúng của ràng buộc: giữ ít nhất một bản, luôn luôn.
   case "$keep" in ''|*[!0-9]*) keep=1 ;; esac
+  # Dòng dưới là chốt chặn duy nhất cho KEEP=0 (case trên không bắt được "0" vì nó toàn chữ số)
   [ "$keep" -ge 1 ] || keep=1
   all="$(ls -1 "$DUMPS"/motion-*.sql.gz 2>/dev/null | sort)"
   n="$(printf '%s\n' "$all" | sed '/^$/d' | wc -l | tr -d ' ')"
@@ -363,7 +386,7 @@ Và thêm dòng cuối trong `do_dump()`, ngay sau `ln -sfn`:
 - [ ] **Step 4: Chạy lại để chắc chắn nó XANH**
 
 Run: `bash motions-studio/setup/tests/pgdump-test.sh`
-Expected: PASS — 12 xanh, 0 đỏ.
+Expected: PASS — 20 xanh, 0 đỏ (10 Task 1 + 10 Task 2 tests).
 
 - [ ] **Step 5: Ghi `PG_DUMP_KEEP` vào `.env.example`**
 
