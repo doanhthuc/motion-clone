@@ -103,8 +103,13 @@ _row_counts() {
 #     - bảng rỗng (khối COPY 0 dòng), bảng ở schema khác public (đọc hết khối, không in)
 #     - dòng mở đầu bằng `COPY ` nhưng KHÔNG phải header: pg_dump chép nguyên văn thân
 #       `CREATE FUNCTION $$…$$`, `COMMENT ON`, định nghĩa view, nên một dòng như
-#       `COPY public.jobs FROM '/tmp/x.csv' CSV;` xuất hiện thật ở cột 0 → BỎ QUA im lặng
-#       (số dấu " chẵn ⇒ không phải header vỡ). Tố nó là báo động giả trên một dump hoàn hảo.
+#       `COPY public.jobs FROM '/tmp/x.csv' CSV;` xuất hiện thật ở cột 0 → BỎ QUA im lặng.
+#       ĐO 2026-08-08 bằng pg_dump 18, cả ba dạng dưới đây có ĐÚNG MỘT dấu `"` (tức LẺ) nên
+#       vòng trước — chỉ đếm dấu nháy — tố oan cả ba trên một bản dump hoàn hảo:
+#           COPY jobs FROM /tmp/x.csv WITH (FORMAT csv, QUOTE ");   (thân CREATE FUNCTION)
+#           COPY jobs FROM stdin -- doi dau " o day                 (COMMENT ON nhiều dòng)
+#           COPY public.jobs FROM x " y                             (thân CREATE VIEW)
+#       Xem chữ ký PHÂN BIỆT ĐƯỢC ở khối `pend` trong _dump_row_counts.
 #
 #   CHỌN BÁO LỖI TO thay vì đoán:
 #     - identifier chứa XUỐNG DÒNG (`CREATE TABLE "new<LF>line"`, hoặc cột `"c<LF>c"`). pg_dump
@@ -141,6 +146,9 @@ _row_counts() {
 # byte không hợp lệ theo locale, và .meta sẽ cụt lặng lẽ.
 _dump_row_counts() {
   gzip -dc "$1" | LC_ALL=C awk '
+    # Đếm dấu nháy kép của một chuỗi. Bản sao cục bộ vì gsub sửa tại chỗ.
+    function qcount(s,   t) { t = s; return gsub(/"/, "\"", t) }
+
     # Đang TRONG một khối COPY thì mọi dòng là DỮ LIỆU cho tới dòng CHỈ chứa \. — kiểm điều này
     # TRƯỚC khi thử nhận diện header, nếu không một ô text chứa đúng chuỗi "COPY … FROM stdin;"
     # sẽ mở một khối giả (pg_dump sinh thật dòng dữ liệu như vậy nếu người dùng nhập chuỗi đó).
@@ -149,8 +157,41 @@ _dump_row_counts() {
       if ($0 == "\\.") { if (pub) printf "%s=%d\n", tbl, n; intbl = 0 } else n++
       next
     }
+    # ── HÀNG CHỜ: một dòng KHẢ NGHI chưa đủ để tố, phải NHÌN TIẾP ───────────────────────────
+    # Đặt SAU luật intbl (dòng dữ liệu không bao giờ chạm hàng chờ được) và TRƯỚC luật /^COPY/.
+    #
+    # CHỮ KÝ PHÂN BIỆT ĐƯỢC, đo bằng pg_dump 18 (xem khối "Giới hạn đã biết" ở trên): một header
+    # vỡ dòng LUÔN có dòng nối kết thúc bằng `FROM stdin;`, còn dòng COPY nằm trong thân
+    # function/comment/view thì không. Nên khi gặp dòng khả nghi ta KHÔNG kết luận ngay mà treo
+    # nó lại và đọc tiếp; chỉ tố khi thấy dòng nối.
+    #
+    # HAI CỔNG, phải qua CẢ HAI mới tố — một cổng thôi vẫn tố oan:
+    #   1. dòng hiện tại kết thúc `FROM stdin;`
+    #   2. TỔNG số dấu " của cả cụm (dòng khả nghi + các dòng đã nối) là CHẴN — tức identifier
+    #      bị cắt giữa chừng đã ĐÓNG lại. Đây là cổng mạnh hơn: mọi header THẬT của pg_dump có
+    #      số dấu " CHẴN, mà dòng khả nghi có số LẺ, nên "lẻ + chẵn = lẻ" ⇒ một header hợp lệ ở
+    #      phía sau KHÔNG BAO GIỜ bị nuốt làm dòng nối. Đo trên dạng view ở trên: dòng khả nghi
+    #      `COPY public.jobs FROM x " y` cách header thật `COPY public.jobs (id, kind) FROM
+    #      stdin;` đúng 10 dòng, và tổng dấu " là 1 ⇒ LẺ ⇒ không tố. Đúng như phải thế.
+    #
+    # CỬA SỔ 4 DÒNG: một header vỡ dòng trải 1 + k dòng vật lý với k = số ký tự xuống dòng trong
+    # identifier; cả bốn dạng đã đo (`"new<LF>line"`, `"a""b<LF>c"`, cột `"c<LF>c"`, bảng
+    # `"x<LF>COPY y"`) đều có k=1, tức dòng nối là dòng NGAY SAU. k>4 là bệnh lý. Giới hạn nhỏ là
+    # cổng thứ ba, độc lập với parity: càng ít dòng nhìn tiếp thì càng ít cơ hội ghép nhầm.
+    #
+    # Không khớp thì RƠI XUỐNG (không `next`): dòng đang xét vẫn phải được xử như dòng thường —
+    # nó có thể chính là một header COPY hợp lệ.
+    pend {
+      pendbuf = pendbuf "\n" $0
+      if ($0 ~ /(^|[ \t])FROM stdin;$/ && qcount(pendbuf) % 2 == 0) {
+        bad[++nbad] = pendline
+        pend = 0
+        next                                 # nuốt dòng nối: nó là ĐUÔI của header vỡ, không phải dòng riêng
+      }
+      if (++pendn >= 4) pend = 0              # hết cửa sổ ⇒ dòng khả nghi là dòng thường, KHÔNG tố
+    }
     # Bắt MỌI dòng mở đầu bằng "COPY ", không chỉ dòng parse được — nhưng KHÔNG phải dòng nào
-    # không khớp cũng là lỗi. Xem điều kiện `bad` ngay dưới: chỉ dòng mang CHỮ KÝ của một header
+    # không khớp cũng là lỗi. Xem hàng chờ ngay trên: chỉ dòng mang CHỮ KÝ của một header
     # bị vỡ mới bị tố, phần còn lại đi tiếp trong im lặng đúng như bản trước nữa.
     /^COPY[ \t]/ {
       s = $0
@@ -164,22 +205,21 @@ _dump_row_counts() {
       #       `CREATE FUNCTION $$…$$`, `COMMENT ON`, định nghĩa view. Bình thường, phải BỎ QUA.
       #   (b) dòng VẬT LÝ ĐẦU của một header bị vỡ vì identifier chứa xuống dòng
       #       (`COPY public."new`). Đây mới là lỗi cần tố.
-      # Phân biệt bằng SỐ DẤU NHÁY KÉP LẺ: identifier trích dẫn bị cắt giữa chừng luôn để lại
+      # Điều kiện CẦN của (b): số dấu " LẺ. Identifier trích dẫn bị cắt giữa chừng luôn để lại
       # 1 + 2k dấu " trên dòng (dấu mở chưa đóng, mọi `""` bên trong đi theo cặp) ⇒ LẺ. Còn
-      # một câu COPY … FROM <file> CSV; bình thường có 0 dấu " ⇒ CHẴN ⇒ bỏ qua.
+      # một câu COPY … FROM <file> CSV; bình thường có 0 dấu " ⇒ CHẴN ⇒ bỏ qua ngay.
       #
-      # Đây là hồi quy đã ĐO, không phải giả thuyết: bản trước tố mọi dòng `^COPY[ \t]`, nên một
-      # function có dòng COPY public.jobs FROM <file> CSV; trong thân làm `--dump` trả 1 với
-      # .meta ĐẦY ĐỦ (jobs=7) và `--verify` sau đó XANH — tức thông điệp "BẢN DUMP TỐT NHƯNG
-      # .meta THIẾU BẢNG" sai sự thật, `make gpu-down` in "sao lưu DB thất bại" mỗi lần, và
-      # `make gpu-db-dump` (Makefile:156-161, không có `|| echo`) hỏng thẳng.
+      # Nhưng LẺ là điều kiện CẦN chứ KHÔNG ĐỦ — vòng trước dừng ở đây và tố oan cả ba dạng đã
+      # đo bằng pg_dump thật (thân function có `QUOTE ")`, COMMENT ON nhiều dòng có một dấu ",
+      # thân view có một dấu "). Cả ba đều làm `--dump` trả 1 với .meta ĐẦY ĐỦ và `--verify` sau
+      # đó XANH — tức thông điệp "BẢN DUMP TỐT NHƯNG .meta THIẾU BẢNG" sai sự thật,
+      # `make gpu-down` in "sao lưu DB thất bại" mỗi lần, và `make gpu-db-dump`
+      # (Makefile:156-161, không có `|| echo`) hỏng thẳng.
       #
-      # Nhận sai còn lại đã biết, cố ý chấp nhận: một dòng KHÔNG-header có số dấu " lẻ, ví dụ
-      # một câu COPY … WITH (QUOTE <một dấu nháy kép>) trong thân function — hiếm hơn nhiều so
-      # với dạng (a), và chiều hỏng của nó là ồn chứ không phải im.
+      # Nên dòng lẻ chỉ được TREO vào hàng chờ, chưa tố. Việc tố do khối `pend` ở trên quyết,
+      # sau khi thấy dòng nối kết thúc `FROM stdin;`.
       if (s !~ /[ \t]FROM stdin;$/) {
-        chk = $0
-        if (gsub(/"/, "\"", chk) % 2 == 1) bad[++nbad] = $0
+        if (qcount($0) % 2 == 1) { pend = 1; pendline = $0; pendbuf = $0; pendn = 0 }
         next
       }
       sub(/[ \t]+FROM stdin;$/, "", s)
@@ -206,7 +246,11 @@ _dump_row_counts() {
       else                                      { pub = 1 }   # không có tiền tố schema
       # Bỏ trích dẫn kép để khớp _row_counts, vốn in tên TRẦN (format %L trên tablename).
       if (s ~ /^".*"$/) { s = substr(s, 2, length(s) - 2); gsub(/""/, "\"", s) }
-      tbl = s; n = 0; intbl = 1; next
+      # `pend = 0`: một header HỢP LỆ đóng hàng chờ lại. Không có dòng này thì trạng thái "đang
+      # chờ" sống xuyên qua cả khối COPY (luật intbl `next` trước khi tới hàng chờ, nên bộ đếm
+      # cửa sổ đứng im) rồi bật lại ở dòng đầu tiên sau `\.` — tức nhìn tiếp vào một chỗ cách
+      # dòng khả nghi hàng nghìn dòng. Đóng ở đây là chỗ duy nhất đúng.
+      tbl = s; n = 0; intbl = 1; pend = 0; next
     }
     # STDERR + exit 1, KHÔNG in vào stdout: stdout của hàm này chảy thẳng vào .meta, nên báo lỗi
     # ở đó cũng chính là ghi khoá rác — đúng thứ ta đang bịt. mawk 1.3.4 hỗ trợ "/dev/stderr"

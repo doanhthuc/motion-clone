@@ -397,6 +397,40 @@ printf '%s' "$V8" | grep -q "nghi ngờ file hỏng" \
 q 'DROP TABLE "new
 line";' >/dev/null
 
+# (3b) BA dạng header vỡ dòng còn lại, để việc siết điều kiện ở khối `pend` không siết QUÁ TAY.
+#      Khối (3) trên chỉ đo dạng dễ nhất; ba dạng dưới lần lượt ép thêm một yêu cầu:
+#        - `"a""b<LF>c"`  → dòng khả nghi có BA dấu " (không phải một). Cổng parity phải đếm
+#          TỔNG của cả cụm (3+1=4, chẵn), không phải "đúng 1 dấu mở".
+#        - cột `"c<LF>c"` → identifier vỡ là TÊN CỘT, nên dòng nối kết thúc `") FROM stdin;`
+#          chứ không `" (id) FROM stdin;`.
+#        - bảng `"x<LF>COPY y"` → dòng NỐI cũng bắt đầu bằng `COPY`. Hàng chờ phải nuốt nó
+#          trước khi luật /^COPY/ nhìn thấy, nếu không nó bị xử như một header riêng.
+#          (pg_dump còn rải `COPY y" (` và `COPY y" OWNER TO motion;` trong phần DDL — hai dòng
+#          không-header có dấu " lẻ, và chúng KHÔNG được tố.)
+#        - `"a<LF>b<LF>c"` → header trải BA dòng vật lý, nên dòng nối KHÔNG phải dòng ngay sau.
+#          Đây là dạng duy nhất làm CỠ CỬA SỔ trở thành số đo được: đã đo, cửa sổ = 1 bỏ lọt
+#          dạng này (rc=0, im lặng), cửa sổ = 4 bắt được. Bỏ dòng này đi là để lại một hằng số
+#          không assertion nào chạm tới.
+for spec in \
+  'quotenl|CREATE TABLE "a""b\nc" (id int); INSERT INTO "a""b\nc" VALUES (1);|DROP TABLE "a""b\nc";' \
+  'colnl|CREATE TABLE colnl ("c\nc" int); INSERT INTO colnl VALUES (5);|DROP TABLE colnl;' \
+  'xcopyy|CREATE TABLE "x\nCOPY y" (id int); INSERT INTO "x\nCOPY y" VALUES (1);|DROP TABLE "x\nCOPY y";' \
+  'nl2|CREATE TABLE "a\nb\nc" (id int); INSERT INTO "a\nb\nc" VALUES (1);|DROP TABLE "a\nb\nc";'
+do
+  nm="${spec%%|*}"; rest="${spec#*|}"; mk="${rest%%|*}"; dr="${rest#*|}"
+  rm -rf "$VOL/pg"; seed
+  q "$(printf '%b' "$mk")" >/dev/null
+  BOUT="$(bash "$SCRIPT" --dump 2>&1)"; BRC=$?
+  assert_eq "1" "$BRC" "header vỡ dòng dạng $nm: --dump vẫn trả khác 0 (siết không được nới lỏng)"
+  printf '%s' "$BOUT" | grep -q "header COPY không parse được" \
+    && ok "header vỡ dòng dạng $nm: vẫn in ĐÚNG dòng header không parse được" \
+    || bad "header vỡ dòng dạng $nm: im lặng — siết quá tay, mất đường báo lỗi to"
+  MB="$(ls "$VOL"/pg/dumps/*.meta | head -1)"
+  assert_eq "1" "$(grep -c '^meta_incomplete=1' "$MB" | tr -d ' ')" \
+    "header vỡ dòng dạng $nm: .meta vẫn mang cờ meta_incomplete=1"
+  q "$(printf '%b' "$dr")" >/dev/null
+done
+
 # (4) Dòng mở đầu bằng `COPY ` mà KHÔNG PHẢI header — pg_dump chép nguyên văn thân
 #     `CREATE FUNCTION $$…$$`, nên một dòng SQL hướng dẫn nằm trong đó bắt đầu ngay ở cột 0.
 #     Đây là hình dạng THẬT (đo bằng pg_dump 18): dump chứa cả
@@ -423,6 +457,39 @@ assert_eq "7" "$(grep '^jobs=' "$M9" | cut -d= -f2)" \
   "dòng COPY trong thân function: .meta VẪN đếm đủ bảng jobs"
 assert_ok "dòng COPY trong thân function: --verify xanh" -- bash "$SCRIPT" --verify
 q 'DROP FUNCTION docnote();' >/dev/null
+
+# (5) …và cùng chuyện đó khi dòng KHÔNG-header có số dấu " LẺ. Khối (4) trên chỉ khoá được dạng
+#     0 dấu ": chữ ký "số dấu " lẻ" một mình vẫn tố oan, và ĐO 2026-08-08 bằng pg_dump 18 ra ĐÚNG
+#     BA dạng có đúng một dấu " — cả ba đều là SQL bình thường mà pg_dump chép nguyên văn:
+#         COPY jobs FROM /tmp/x.csv WITH (FORMAT csv, QUOTE ");   ← thân CREATE FUNCTION
+#         COPY jobs FROM stdin -- doi dau " o day                 ← COMMENT ON nhiều dòng
+#         COPY public.jobs FROM x " y                             ← thân CREATE VIEW
+#     Cả ba dựng CÙNG MỘT LÚC, cố ý: dạng view nằm cách header thật của `public.jobs` đúng 10
+#     dòng trong dump, nên nó cũng là phép đo cho CỬA SỔ NHÌN TIẾP — cửa sổ quá rộng (hoặc thiếu
+#     cổng parity) sẽ nuốt header thật làm "dòng nối" và tố oan y như trước.
+#     Yêu cầu: rc=0, .meta ĐẦY ĐỦ cả hai bảng, KHÔNG có cờ meta_incomplete, --verify xanh.
+rm -rf "$VOL/pg"; seed
+q 'CREATE FUNCTION fdoc() RETURNS text LANGUAGE sql AS $fn$
+SELECT $doc$huong dan:
+COPY jobs FROM /tmp/x.csv WITH (FORMAT csv, QUOTE ");
+xong$doc$::text
+$fn$;' >/dev/null
+q $'COMMENT ON TABLE users IS \'ghi chu nhieu dong:\nCOPY jobs FROM stdin -- doi dau " o day\nhet\';' >/dev/null
+q 'CREATE VIEW vdoc AS SELECT $v$abc
+COPY public.jobs FROM x " y
+def$v$::text AS note;' >/dev/null
+LQ_OUT="$(bash "$SCRIPT" --dump 2>&1)"; LQ_RC=$?
+assert_eq "0" "$LQ_RC" 'dòng COPY không-header có SỐ DẤU " LẺ (3 dạng): --dump trả 0'
+printf '%s' "$LQ_OUT" | grep -q "header COPY không parse được" \
+  && bad 'dòng COPY không-header có dấu " lẻ: bị tố "header COPY không parse được" — tố oan' \
+  || ok 'dòng COPY không-header có dấu " lẻ: KHÔNG bị tố oan'
+M10="$(ls "$VOL"/pg/dumps/*.meta | head -1)"
+assert_eq "7" "$(grep '^jobs=' "$M10" | cut -d= -f2)" 'dấu " lẻ: .meta vẫn đếm đủ jobs'
+assert_eq "3" "$(grep '^users=' "$M10" | cut -d= -f2)" 'dấu " lẻ: .meta vẫn đếm đủ users'
+assert_eq "0" "$(grep -c '^meta_incomplete=' "$M10" | tr -d ' ')" \
+  'dấu " lẻ: KHÔNG có cờ meta_incomplete — cờ ghi vĩnh viễn vào file, tố oan là hỏng mãi mãi'
+assert_ok 'dấu " lẻ: --verify xanh' -- bash "$SCRIPT" --verify
+q 'DROP VIEW vdoc; DROP FUNCTION fdoc(); COMMENT ON TABLE users IS NULL;' >/dev/null
 
 # Bảng ở schema KHÁC public không được lọt vào .meta: _row_counts (vế `got` của verify) chỉ
 # đếm schema public, nên thêm vào là verify đỏ oan. Nhưng khối COPY của nó vẫn phải được ĐỌC
