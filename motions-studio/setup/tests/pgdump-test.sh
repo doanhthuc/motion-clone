@@ -98,7 +98,6 @@ assert_eq "1" "$(ls "$VOL"/pg/dumps/*.sql.gz | wc -l | tr -d ' ')" "KEEP=1 vẫn
 # mất một bản cũ chỉ là mất tiện; mất bản CUỐI CÙNG là mất hẳn dữ liệu.
 rm -rf "$VOL/pg"; seed
 PG_DUMP_KEEP=0 bash "$SCRIPT" --dump >/dev/null; sleep 1
-PG_DUMP_KEEP=0 bash "$SCRIPT" --dump >/dev/null; sleep 1
 PG_DUMP_KEEP=0 bash "$SCRIPT" --dump >/dev/null
 N0="$(ls "$VOL"/pg/dumps/*.sql.gz 2>/dev/null | wc -l | tr -d ' ')"
 [ "$N0" -ge 1 ] && ok "KEEP=0 vẫn giữ lại ít nhất 1 bản (không xoá sạch)" \
