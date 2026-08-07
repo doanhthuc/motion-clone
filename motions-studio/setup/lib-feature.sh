@@ -875,9 +875,17 @@ FEENV
 #     nạp dump có CREATE TABLE vào DB đã có bảng rỗng là lỗi trùng.
 # Không có volume thì đi qua như không có gì.
 phase_pg_restore() {
-  [ -n "${POD_VOLUME:-}" ] || return 0
+  # POD_VOLUME đọc theo khuôn env-trước-.env-sau (giống pod-volume.sh:188 và pod-pgdump.sh):
+  # scripts/pod-bootstrap.sh có HAI lệnh ssh, và chỉ lệnh đầu (chạy pod-volume.sh) mang
+  # POD_VOLUME theo. Lệnh thứ hai — lệnh chạy setup và dẫn tới đây — thì không. Chỉ dựa vào
+  # biến môi trường là cổng dưới đây luôn đóng, phase này lặng lẽ không chạy, và người dùng
+  # mất DB mà vẫn thấy mọi thứ xanh. pod-volume.sh đã ghi POD_VOLUME vào .env chính vì vậy.
+  local _vol="${POD_VOLUME:-}"
+  [ -n "$_vol" ] || _vol="$(get_kv POD_VOLUME)"
+  [ -n "$_vol" ] || return 0
+
   say "4b/11 · Khôi phục database từ Network Volume (nếu có bản dump)"
-  POD_VOLUME="$POD_VOLUME" bash "$ROOT/setup/pod-pgdump.sh" --restore \
+  POD_VOLUME="$_vol" bash "$ROOT/setup/pod-pgdump.sh" --restore \
     || warn "khôi phục DB không thành công — setup vẫn chạy tiếp với DB trống."
 }
 

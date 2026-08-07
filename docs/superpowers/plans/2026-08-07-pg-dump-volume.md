@@ -733,12 +733,32 @@ Trong `feature_main()` (`lib-feature.sh:868-894`), nhánh `MTC_PREBUILT=1` và n
 #     nạp dump có CREATE TABLE vào DB đã có bảng rỗng là lỗi trùng.
 # Không có volume thì đi qua như không có gì.
 phase_pg_restore() {
-  [ -n "${POD_VOLUME:-}" ] || return 0
+  # POD_VOLUME đọc theo khuôn env-trước-.env-sau (giống pod-volume.sh:188 và pod-pgdump.sh):
+  # scripts/pod-bootstrap.sh có HAI lệnh ssh, và chỉ lệnh đầu (chạy pod-volume.sh) mang
+  # POD_VOLUME theo. Lệnh thứ hai — lệnh chạy setup và dẫn tới đây — thì không. Chỉ dựa vào
+  # biến môi trường là cổng dưới đây luôn đóng, phase này lặng lẽ không chạy, và người dùng
+  # mất DB mà vẫn thấy mọi thứ xanh. pod-volume.sh đã ghi POD_VOLUME vào .env chính vì vậy.
+  local _vol="${POD_VOLUME:-}"
+  [ -n "$_vol" ] || _vol="$(get_kv POD_VOLUME)"
+  [ -n "$_vol" ] || return 0
+
   say "4b/11 · Khôi phục database từ Network Volume (nếu có bản dump)"
-  POD_VOLUME="$POD_VOLUME" bash "$ROOT/setup/pod-pgdump.sh" --restore \
+  POD_VOLUME="$_vol" bash "$ROOT/setup/pod-pgdump.sh" --restore \
     || warn "khôi phục DB không thành công — setup vẫn chạy tiếp với DB trống."
 }
 ```
+
+**Fix round 1 (nghiệm thu phát hiện, sửa ngay trong Task 5):** bản đầu cổng bằng
+`[ -n "${POD_VOLUME:-}" ]` — chỉ đọc biến môi trường. `scripts/pod-bootstrap.sh` có HAI lệnh
+ssh: lệnh đầu (chạy `pod-volume.sh`) truyền `POD_VOLUME=...`, lệnh thứ hai (chạy
+`./$SETUP_SCRIPT` → `feature_main` → `phase_pg_restore`) thì KHÔNG — và `lib-feature.sh`
+không có chỗ nào `source .env` vào shell. Kết quả: trên đường `make gpu-bootstrap` chuẩn,
+`${POD_VOLUME:-}` luôn rỗng ở đây dù `.env` trên pod đã có key đó, cổng luôn đóng,
+`phase_pg_restore` lặng lẽ no-op — tính năng không bao giờ chạy, không ai biết. Sửa bằng
+khuôn env-trước-`.env`-sau đã dùng ở `pod-volume.sh:188` và `pod-pgdump.sh`: đọc biến môi
+trường trước, rỗng thì fallback qua `get_kv POD_VOLUME` (hàm đã có sẵn trong
+`lib-feature.sh`, đọc đúng `.env` mà `pod-volume.sh` ghi — cả hai cùng tính `ROOT` bằng
+`cd "$(dirname "$0")/.."; ROOT="$(pwd)"` nên là cùng một file).
 
 Rồi trong `feature_main()`:
 
