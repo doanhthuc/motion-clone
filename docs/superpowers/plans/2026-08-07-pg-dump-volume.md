@@ -875,6 +875,10 @@ prebuilt/thường — bỏ sót một nhánh là một đường im lặng khô
 
 ### Task 6: Makefile — hai target mới, sửa `gpu-down` và `gpu-destroy`
 
+> **Đã sửa thêm sau review toàn nhánh** (xem mục "Đợt sửa sau review TOÀN NHÁNH" ngay trước Task 8):
+> cả bốn lệnh ssh giờ truyền `POD_VOLUME` (C1) và ba lệnh dump truyền `PG_DUMP_KEEP` (I4);
+> `gpu-volume*` chuyển sang `bash ./setup/…` (M9); comment `$0,99` → `$$0,99` (M10).
+
 **Files:**
 - Modify: `Makefile` (dòng 2 `.PHONY`, dòng 64-70 `gpu-down`, dòng 76-101 `gpu-destroy`, thêm hai target)
 
@@ -963,6 +967,10 @@ dừng một pod \$0,99/giờ, mà gpu-down vốn chẳng làm mất DB."
 
 ### Task 7: Lớp kiểm mới trong `pod-smoke.sh`
 
+> **Đã sửa thêm sau review toàn nhánh** (xem mục ngay trước Task 8): lớp 6 dùng `bad` thay `warn`
+> khi `POD_VOLUME` đã đặt (I3), truyền `POD_VOLUME` qua ssh (C1), và gọi `ssh` trực tiếp thay vì
+> `remote()` để không nuốt stderr của `die()` (M11). Đoạn code mẫu bên dưới là bản TRƯỚC các sửa đó.
+
 **Files:**
 - Modify: `scripts/pod-smoke.sh`
 
@@ -1034,6 +1042,85 @@ ghi nhận. Bỏ qua khi không có POD_VOLUME: pod không volume là cấu hìn
 
 ---
 
+### Đợt sửa sau review TOÀN NHÁNH (sau khi Task 1-7 xong, trước Task 8)
+
+Vòng review toàn nhánh chạy sau khi cả bảy task đã vào. Bảy finding dưới đây đã sửa; ghi lại ở
+đây để plan không mô tả một nhánh đã không còn tồn tại.
+
+**C1 (Critical) — `POD_VOLUME` không tới được bốn target Makefile và lớp smoke.** Task 5 chỉ vá
+đường `phase_pg_restore`. Bốn lệnh ssh trong `Makefile` (`gpu-down`, `gpu-destroy`,
+`gpu-db-dump`, `gpu-db-check`) và lệnh ssh của lớp 6 `pod-smoke.sh` không truyền gì, mà `.env`
+CỦA POD không có `POD_VOLUME` trên pod đầu tiên (`pod-volume.sh:309` gác khối ghi bằng
+`[ -f "$ROOT/.env" ]`, và `.env` chưa tồn tại lúc đó vì rsync loại trừ `.env` + `.env.*`). Kết
+quả: `pod-pgdump.sh:39` `die "POD_VOLUME trống…"` ở mọi điểm gọi — **cả tính năng là no-op trên
+vòng đời pod đầu tiên**, và `make gpu-down` in một câu trấn an sai. Sửa bằng **hai nguồn độc
+lập**: (1) truyền qua ssh ở cả năm chỗ, dùng đúng khuôn `$(call env,POD_VOLUME)` của ba target
+`gpu-volume*`; (2) `phase_pg_restore` ghi `set_kv POD_VOLUME "$_vol"` vào `.env` sau khi
+`phase_dotenv` đã dựng xong file — chỗ duy nhất `pod-volume.sh` không với tới được.
+**KHÔNG gỡ guard `[ -f "$ROOT/.env" ]` ở `pod-volume.sh:309`** (lý do đã ghi ở fix round 2 của
+Task 5: gỡ ra thì `phase_dotenv` bỏ qua bước dựng `.env` đầy đủ — hỏng nặng hơn).
+
+**C2 (Critical) — `ln -sfn` không được kiểm; `latest` vắng ⇒ "phiên đầu" + rc=0.** Chuỗi mất dữ
+liệu hoàn chỉnh với exit 0 ở MỌI bước: `ln -sfn` không kiểm exit code nên `do_dump` vẫn in `ok`;
+`do_restore` chỉ nhìn `$LATEST`, vắng thì nói "đây là phiên đầu" và trả **0**, nên
+`lib-feature.sh` không `warn` gì. Không phải giả định: volume là MooseFS, cùng mount đã chặn
+`chown`, chưa ai đo `symlink()` ở đó. Ba thay đổi trong `pod-pgdump.sh`:
+
+1. `ln -sfn … || die`. Dump và `.meta` đã ghi xong trước dòng đó, nên `die` **không mất backup**
+   — nó nói "latest không tin được nữa", và fallback bên dưới lo phần còn lại.
+2. `_latest_dump()`: `$LATEST` là ĐƯỜNG NHANH, không phải nguồn sự thật. Vắng hoặc treo thì quét
+   `$DUMPS`, sort theo TÊN (timestamp UTC độ dài cố định — cùng khuôn `_prune`, không phải tin
+   vào mtime của MooseFS). "Phiên đầu" chỉ được nói khi `$DUMPS` **thật sự** rỗng.
+   `do_restore` / `do_check` / `do_verify` dùng chung một đường phân giải.
+3. **Symlink TƯƠNG ĐỐI** (`dumps/motion-….sql.gz`) thay vì tuyệt đối. Lý do: `latest` và `dumps/`
+   nằm cùng một cây thư mục trên volume nên link tương đối đúng bất kể volume mount ở đâu; link
+   tuyệt đối chốt cứng `$POD_VOLUME` của pod ĐÃ TẠO RA nó, và pod sau mount ở path khác là link
+   treo ngay. Hệ quả cho test: `readlink` trần không còn dùng được, thêm helper `latest_target()`
+   thay cho năm chỗ cũ.
+
+12 assertion mới trong `pgdump-test.sh`. **Bằng chứng ĐỎ trên code chưa vá: 44 xanh · 9 đỏ**,
+gồm đúng đường "`latest` vắng nhưng `$DUMPS` còn dump hợp lệ" → `--restore` nhận `[]` thay vì
+`[7]` và in "phiên đầu". Sau khi vá: **53 xanh · 0 đỏ**.
+
+**I3 + M11 — lớp 6 của `pod-smoke.sh` không thể làm smoke đỏ.** Lớp 6 dùng `warn` nên
+`make gpu-smoke` vẫn in "passed" khi không có backup nào — đây đúng là cổng lẽ ra phải bắt C1,
+và nó tự tắt tiếng. Đổi sang `bad` khi `POD_VOLUME` **đã đặt** mà `--check`/`--verify` hỏng. Giữ
+hai đường `skip` (không có `POD_VOLUME`; không ssh được), và thêm hẳn một probe `ssh … true` để
+phân biệt "không tới được pod" với "thiếu backup". Bỏ `remote()` cho riêng lệnh này vì nó có
+`2>/dev/null` mà `pod-pgdump.sh` báo lỗi nghiêm trọng qua `die()` ra stderr.
+
+**I4 — `PG_DUMP_KEEP` là núm xoay chết.** `.env.example` ở gốc repo quảng cáo nó, nhưng
+`pod-pgdump.sh:37` đọc từ `.env` CỦA POD, không caller nào truyền qua ssh, và
+`motions-studio/.env.example` bị rsync loại trừ. Truyền ở `gpu-down` / `gpu-destroy` /
+`gpu-db-dump` (`gpu-db-check` không dump nên không cần), dạng chỉ-chèn-khi-có-giá-trị bằng hàm
+`if` của Make để không ghi đè mặc định 20 bằng chuỗi rỗng.
+
+**I5 — tài liệu chỉ người dùng ghi backup vào thư mục mà restore không thấy.**
+`docs/gpu-pod.md:613-623` hướng dẫn dump tay vào `/workspace/pg-backup`, khác hẳn
+`$POD_VOLUME/pg/dumps`. Thay bằng `make gpu-db-dump` / `gpu-db-check`, và sửa dòng bảng
+"DB sống qua `gpu-destroy` ❌ mất" cho đúng hiện trạng. Phần renumber "8/8 lớp" (`:1245`,
+`:1295`) **để nguyên cho Task 8** sửa cùng số đo thật.
+
+**M8** — `get_kv` của `pod-pgdump.sh` thêm `head -1`, khớp khuôn `pod-volume.sh:52`. Sau C1,
+`.env` là nguồn chính của `POD_VOLUME` nên giá trị nhiều dòng ở đó là lỗi cực khó truy.
+
+**M9** — ba target `gpu-volume*` chuyển sang `bash ./setup/pod-volume.sh`, thống nhất với bốn
+target mới (không phụ thuộc bit `+x`, vì `chmod +x setup/*.sh` chỉ chạy trong `pod-bootstrap.sh`).
+
+**M10** — comment ở `gpu-down` chứa `$0,99` bị Make nở thành rỗng khi `make -n`; đổi thành
+`$$0,99`. Cùng bẫy đã tái phát ngay trong đợt này: một comment mới viết `$(if …)` dạng trần làm
+`make -n gpu-down` chết với ``insufficient number of arguments (1) to function `if'`` — comment
+giờ viết `$$(if …)` và nói rõ cái bẫy.
+
+**I1 (không chặn merge, chỉ ghi chú)** — `pg_dump` chạy trước, `_row_counts` chạy sau; một INSERT
+chen giữa làm `.meta` lệch **vĩnh viễn** với nội dung file dump, nên mọi `--verify` sau đó trên
+bản dump ấy đều đỏ dù dump tốt (`gpu-down` dump khi api/worker vẫn online). **Không sửa cơ chế
+trong đợt này.** Chỉ thêm comment ở chỗ tính `.meta` mô tả cái đua + hướng sửa đúng (đọc cả hai
+từ CÙNG một snapshot), và mấy dòng ở nhánh verify-đỏ nói rõ nguyên nhân có thể là ghi xen giữa,
+kèm dấu hiệu phân biệt với dump thật sự hỏng.
+
+---
+
 ### Task 8: Nghiệm thu trên pod thật + tài liệu
 
 **Files:**
@@ -1047,7 +1134,8 @@ ghi nhận. Bỏ qua khi không có POD_VOLUME: pod không volume là cấu hìn
 - [ ] **Step 1: Chạy bộ test local lần cuối**
 
 Run: `bash motions-studio/setup/tests/pgdump-test.sh`
-Expected: PASS, 0 đỏ. Không đi tiếp nếu còn đỏ — bước sau tốn tiền thuê pod.
+Expected: **53 xanh · 0 đỏ** (41 từ Task 1-4, +12 từ đợt sửa C2). Không đi tiếp nếu còn đỏ —
+bước sau tốn tiền thuê pod.
 
 - [ ] **Step 2: Diễn tập thật một vòng đầy đủ trên pod**
 
@@ -1069,6 +1157,10 @@ make gpu-db-check           # kỳ vọng: số dòng KHỚP số đã ghi ở t
 ```
 
 - [ ] **Step 3: Ghi số đo vào `docs/gpu-pod.md`**
+
+Đợt sửa sau review đã thay đoạn "dump tay vào `/workspace/pg-backup`" (I5) bằng hướng dẫn
+`make gpu-db-dump` / `gpu-db-check` và sửa dòng bảng "DB sống qua `gpu-destroy`". Task 8 còn
+lại: **số đo thật**, và phần renumber "8/8 lớp" (`:1245`, `:1295`) mà I5 cố ý không đụng.
 
 Thêm một mục mới `### Sao lưu database (pg_dump sang volume)` với: bố cục thư mục trên volume, ba điểm dump, chỗ khôi phục trong `feature_main()`, và **bảng số đo thật** từ Step 2 (thời gian dump, kích thước dump, số bảng/số dòng, thời gian khôi phục). Viết theo đúng khuôn các mục khác — số đo thật kèm ngày, không viết "nhanh"/"nhỏ" chung chung.
 
