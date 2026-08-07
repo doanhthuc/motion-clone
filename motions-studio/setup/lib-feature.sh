@@ -475,6 +475,10 @@ phase_postgres() {
   pg psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='${PG_USER}'" | grep -q 1 \
     || pg psql -qc "CREATE ROLE ${PG_USER} LOGIN PASSWORD '${PG_PASS}'" || die "Tạo role postgres lỗi."
   pg psql -qc "ALTER ROLE ${PG_USER} WITH PASSWORD '${PG_PASS}'" >/dev/null
+  # CREATEDB để setup/pod-pgdump.sh --verify dựng được DB tạm mà diễn tập nạp lại. Role này
+  # vốn đã sở hữu toàn bộ database của app trên một pod dùng riêng, nên quyền tạo thêm một DB
+  # không mở ra gì mới — đổi lại ta có đường chứng minh backup nạp được, thay vì chỉ tin.
+  pg psql -qc "ALTER ROLE ${PG_USER} CREATEDB" >/dev/null
   pg psql -tAc "SELECT 1 FROM pg_database WHERE datname='${PG_DB}'" | grep -q 1 \
     || pg createdb -O "${PG_USER}" "${PG_DB}" || die "Tạo database lỗi."
   ok "Postgres: role=${PG_USER} db=${PG_DB} @127.0.0.1:${PG_PORT} (schema tự nạp khi api khởi động)"
@@ -864,6 +868,19 @@ FEENV
   echo
 }
 
+# Khôi phục DB từ volume — PHẢI nằm giữa phase_postgres và bất cứ thứ gì tạo schema.
+#   sau phase_postgres: dump chứa ALTER TABLE ... OWNER TO và GRANT nên role + database
+#     phải tồn tại trước.
+#   trước phase_pm2: api khởi động sẽ chạy api/src/migrate.js tạo bảng từ db/init/*.sql;
+#     nạp dump có CREATE TABLE vào DB đã có bảng rỗng là lỗi trùng.
+# Không có volume thì đi qua như không có gì.
+phase_pg_restore() {
+  [ -n "${POD_VOLUME:-}" ] || return 0
+  say "4b/11 · Khôi phục database từ Network Volume (nếu có bản dump)"
+  POD_VOLUME="$POD_VOLUME" bash "$ROOT/setup/pod-pgdump.sh" --restore \
+    || warn "khôi phục DB không thành công — setup vẫn chạy tiếp với DB trống."
+}
+
 # feature_main — chạy toàn bộ phase theo thứ tự. Script gọi: set profile rồi `feature_main`.
 feature_main() {
   : "${ROOT:?cần ROOT}"; : "${FEATURE:?cần FEATURE}"; : "${JOB_TYPE:?cần JOB_TYPE}"
@@ -876,12 +893,14 @@ feature_main() {
     # Image đã làm các bước tốn thời gian ở CI. Runtime chỉ tạo secret/DB và bật service.
     phase_dotenv
     phase_postgres
+    phase_pg_restore
     phase_prebuilt_deps
     phase_ollama
   else
     phase_apt
     phase_dotenv
     phase_postgres
+    phase_pg_restore
     phase_app_deps
     phase_ollama
     phase_comfyui

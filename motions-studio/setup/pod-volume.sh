@@ -324,6 +324,10 @@ PY
   set_kv_local COMFY_DIR "$COMFY_DIR"
   set_kv_local COMFY_MODELS_DIR "$COMFY_DIR/models"
   set_kv_local OLLAMA_MODELS "$OLLAMA"
+  # pod-pgdump.sh (chạy từ feature_main và từ Makefile) đọc key này. Không truyền qua ssh
+  # được vì pod-bootstrap.sh:160-167 không mang nó theo, và ghi vào .env thì mọi caller —
+  # setup, Makefile, chạy tay — đều thấy cùng một giá trị.
+  set_kv_local POD_VOLUME "$VOL"
   ok ".env: COMFY_DIR · COMFY_MODELS_DIR · OLLAMA_MODELS"
 fi
 
