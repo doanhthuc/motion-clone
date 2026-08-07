@@ -201,7 +201,17 @@ _row_counts() {
 
 _table_count() { _psql -d "$PG_DB" -tAc "SELECT count(*) FROM pg_tables WHERE schemaname='public'"; }
 
+# stat khác cú pháp giữa BSD (macOS, máy dev) và GNU (Ubuntu, pod) — thử cả hai.
+_mode() { stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1" 2>/dev/null; }
+
 do_dump() {
+  # umask 077: mọi file/thư mục sinh ra TRONG HÀM NÀY đã đúng quyền ngay từ lúc
+  # syscall tạo ra nó, không đợi chmod chạy sau mới sửa. Đây mới là chỗ bịt cửa sổ
+  # thời gian thật sự: suốt lúc `pg_dump | gzip` đang ghi vào file tạm, dump đã
+  # chứa api_keys, user_sessions.token_hash, token social_accounts — không thể để
+  # cửa sổ đó trần trụi theo umask mặc định của caller. Các `chmod` bên dưới chỉ
+  # còn là lớp phòng thủ thứ hai; xem kiểm KẾT QUẢ thật ở cuối hàm.
+  umask 077
   mkdir -p "$DUMPS" || die "không tạo được $DUMPS"
   chmod 700 "$PGDIR" "$DUMPS" 2>/dev/null || true
   local stamp tmp out meta
@@ -222,7 +232,10 @@ do_dump() {
 
   {
     echo "created=$(date -u +%s)"
-    echo "pg_version=$(_psql -d "$PG_DB" -tAc 'SHOW server_version' | tr -d ' ')"
+    # server_version_num, KHÔNG dùng server_version: bản Ubuntu đóng gói trả chuỗi kiểu
+    # "16.4 (Ubuntu 16.4-0ubuntu0.24.04.1)", sau tr -d ' ' dính thành một token xấu
+    # trong .meta. server_version_num là số nguyên (vd 160004), không cần parse gì thêm.
+    echo "pg_version=$(_psql -d "$PG_DB" -tAc 'SHOW server_version_num' | tr -d ' ')"
     echo "dump_bytes=$(wc -c < "$tmp" | tr -d ' ')"
     _row_counts
   } > "$meta"
@@ -231,7 +244,27 @@ do_dump() {
   # mv trong CÙNG filesystem là nguyên tử → latest không bao giờ trỏ một file ghi dở.
   mv "$tmp" "$out" || { rm -f "$tmp" "$meta"; die "mv dump thất bại"; }
   ln -sfn "$out" "$LATEST"
+
+  # Kiểm KẾT QUẢ thật bằng stat, KHÔNG kiểm exit code của chmod ở trên. Trên pod, volume
+  # là MooseFS mount user_id=0,group_id=0 CHẶN chown kể cả khi là root (pod-volume.sh:179-191)
+  # — chưa ai đo chmod ở đó có ăn hay không. Nếu mode vốn đã đúng (nhờ umask 077 phía trên)
+  # thì chmod thất bại là vô hại, và `|| die` sẽ giết đường dump chính trên pod vì một lý do
+  # không gây hại gì. Chỉ khi mode THẬT SỰ sai mới coi là lỗi.
+  local m_dir m_dumps m_out m_meta bad_perm=""
+  m_dir="$(_mode "$PGDIR")";   [ "$m_dir"   = "700" ] || bad_perm="$bad_perm $PGDIR=$m_dir"
+  m_dumps="$(_mode "$DUMPS")"; [ "$m_dumps" = "700" ] || bad_perm="$bad_perm $DUMPS=$m_dumps"
+  m_out="$(_mode "$out")";     [ "$m_out"   = "600" ] || bad_perm="$bad_perm $out=$m_out"
+  m_meta="$(_mode "$meta")";   [ "$m_meta"  = "600" ] || bad_perm="$bad_perm $meta=$m_meta"
+
   ok "dump: $(basename "$out") ($(wc -c < "$out" | tr -d ' ') bytes, $(grep -c '=' "$meta") dòng meta)"
+
+  if [ -n "$bad_perm" ]; then
+    warn "QUYỀN SAI trên dump —$bad_perm (cần thư mục=700, file=600)."
+    warn "Dump chứa dữ liệu nhạy cảm (api_keys, user_sessions.token_hash, token social_accounts)"
+    warn "và có thể đang lộ rộng hơn dự tính. KHÔNG xoá — mất hẳn backup còn tệ hơn một bản backup"
+    warn "quyền rộng. Tự kiểm tra và chmod tay, rồi tìm hiểu vì sao chmod không ăn trên volume này."
+    return 1
+  fi
 }
 
 case "${1:-}" in

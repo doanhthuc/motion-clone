@@ -74,6 +74,13 @@ assert_eq "3" "$(grep '^users=' "${DUMP%.sql.gz}.meta" | cut -d= -f2)" ".meta đ
 assert_eq "700" "$(stat -f '%Lp' "$VOL/pg/dumps")" "thư mục dumps quyền 700"
 assert_eq "600" "$(stat -f '%Lp' "$DUMP")" "file dump quyền 600"
 
+# umask rộng của caller không được rò vào quyền file dump — bịt bằng umask 077
+# trong chính do_dump(), không chỉ dựa vào chmod chạy sau khi file đã tồn tại.
+( umask 000; bash "$SCRIPT" --dump >/dev/null )
+D2="$(readlink "$VOL/pg/latest")"
+assert_eq "600" "$(stat -f '%Lp' "$D2")" "dump vẫn 600 kể cả khi umask của caller là 000"
+assert_eq "700" "$(stat -f '%Lp' "$VOL/pg/dumps")" "thư mục vẫn 700 kể cả khi umask của caller là 000"
+
 echo
 info "$PASSED xanh · $FAILED đỏ"
 [ "$FAILED" -eq 0 ]
