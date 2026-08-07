@@ -694,6 +694,11 @@ luôn xanh. DB tạm bị xoá kể cả khi hỏng, kẻo lần verify sau đ�
 **Files:**
 - Modify: `motions-studio/setup/pod-volume.sh:324-326` (thêm một dòng `set_kv_local`)
 - Modify: `motions-studio/setup/lib-feature.sh` (hàm `phase_postgres`, và `feature_main()` dòng 868-894)
+- Modify: `scripts/pod-bootstrap.sh` (lệnh ssh thứ hai, chạy `./$SETUP_SCRIPT` — thêm `POD_VOLUME`
+  vào danh sách env truyền theo, xem "Fix round 2" bên dưới. Bổ sung sau khi review độc lập phát
+  hiện: trên pod MỚI, `.env` chưa tồn tại lúc `pod-volume.sh` chạy nên khối ghi `.env` của nó bị
+  bỏ qua, và lệnh ssh chạy setup không mang `POD_VOLUME` theo — `phase_pg_restore` không có cách
+  nào thấy được giá trị này ở lần dựng pod đầu tiên nếu không sửa ở đây.)
 
 **Interfaces:**
 - Consumes: `pod-pgdump.sh --restore` từ Task 3.
@@ -780,15 +785,77 @@ Rồi trong `feature_main()`:
   fi
 ```
 
-- [ ] **Step 4: Kiểm cú pháp cả ba file**
+**Fix round 2 (review độc lập phát hiện, Critical, sửa ngay trong Task 5):** fix round 1 vẫn
+không đủ trên một pod MỚI. `pod-volume.sh:309` cổng cả khối ghi `.env` (kể cả dòng
+`set_kv_local POD_VOLUME` của Step 1) bằng `[ -f "$ROOT/.env" ]`. Trên pod MỚI, `rsync` ở
+`pod-bootstrap.sh:99-100` loại trừ `.env` VÀ `.env.*` (khớp cả `.env.example`), nên khi lệnh
+ssh đầu chạy `pod-volume.sh`, `$ROOT/.env` CHƯA TỒN TẠI → cổng `:309` sai → toàn bộ khối ghi
+`.env` bị bỏ qua, `POD_VOLUME` không được ghi. `.env` chỉ hình thành dần sau đó, ở lệnh ssh
+THỨ HAI, qua `phase_dotenv` (`cp .env.example .env` — không có nguồn vì `.env.example` cũng
+bị rsync loại trừ — rồi các lệnh `set_kv` dựng dần từng key). Đến lúc `phase_pg_restore` gọi
+`get_kv POD_VOLUME`, nó đọc rỗng và `return 0` — đúng kịch bản trung tâm của cả tính năng
+(pod mới + volume cũ có dump) lại là kịch bản im lặng bỏ khôi phục.
 
-Run: `bash -n motions-studio/setup/pod-volume.sh motions-studio/setup/lib-feature.sh motions-studio/setup/pod-pgdump.sh && echo "cú pháp OK"`
+KHÔNG sửa bằng cách bỏ guard `[ -f "$ROOT/.env" ]` ở `pod-volume.sh:309` — làm vậy thì
+`pod-volume.sh` tự tạo một `.env` chỉ có vài key, rồi `phase_dotenv` thấy `[ ! -f .env ]` sai
+nên bỏ qua bước dựng `.env` đầy đủ, hỏng nặng hơn.
+
+Sửa đúng chỗ: `scripts/pod-bootstrap.sh`, lệnh ssh thứ hai (chạy `./$SETUP_SCRIPT`) — thêm
+`POD_VOLUME` vào danh sách env truyền theo, giống cách lệnh ssh thứ nhất đã làm. Giá trị này
+đã có sẵn trong biến shell `POD_VOLUME` của `pod-bootstrap.sh` (đọc từ `.env` CỦA MÁY DEV ở
+dòng 55, không đổi giữa đó và lệnh ssh thứ hai — không hàm/vòng lặp nào ghi đè), nên đường
+env-trước hoạt động ngay từ lần bootstrap ĐẦU TIÊN, không phụ thuộc `.env` trên pod đã tồn tại
+hay chưa:
+
+```bash
+# POD_VOLUME phải có mặt ở CẢ lệnh ssh này, không chỉ lệnh chạy pod-volume.sh ở trên.
+# feature_main() → phase_pg_restore đọc nó để quyết có khôi phục DB từ volume hay không, và
+# trên một pod MỚI thì .env chưa tồn tại lúc pod-volume.sh chạy (rsync loại trừ .env và .env.*,
+# nên cả .env.example cũng không có) → khối set_kv_local của pod-volume.sh bị bỏ qua, .env
+# không có POD_VOLUME, và phase_pg_restore lặng lẽ không chạy đúng vào lần dựng pod đầu tiên —
+# tức đúng kịch bản mà tính năng này tồn tại để phục vụ.
+ssh "${SSH_OPTS[@]}" "root@$HOST" "cd ~/$REMOTE_DIR && chmod +x setup/*.sh && \
+DOMAIN='$DOMAIN' SUPER_ADMIN='$SUPER_ADMIN' GMAIL_USER='$GMAIL_USER' \
+GMAIL_APP_PASSWORD='$GMAIL_APP_PASSWORD' CF_API_TOKEN='$CF_API_TOKEN' \
+CF_TUNNEL_TOKEN='$CF_TUNNEL_TOKEN' CORS_ORIGINS='$CORS_ORIGINS' HF_TOKEN='' \
+${FE_DOMAIN:+CF_FE_DOMAIN='$FE_DOMAIN' CF_FE_PORT='$FE_PORT' FRONTEND_URL='https://$FE_DOMAIN'} \
+MTC_PREBUILT='${MTC_PREBUILT:-0}' \
+${JOB_TYPES_OVERRIDE:+JOB_TYPES_OVERRIDE='$JOB_TYPES_OVERRIDE'} \
+${POD_VOLUME:+POD_VOLUME='$POD_VOLUME'} \
+./$SETUP_SCRIPT" < /dev/null | tee "$LOG"
+```
+
+**Lưu ý khi cấy đoạn này:** cả khối `ssh "..." "..."` là MỘT chuỗi double-quote trải nhiều
+dòng, nối bằng `\` cuối dòng — đây là cú pháp `VAR=val ... lệnh` (prefix biến môi trường cho
+MỘT lệnh), nên toàn bộ phải giữ nguyên trên một "dòng logic". Đặt đoạn comment giải thích NGAY
+TRƯỚC dòng `ssh ...` (ở ngoài chuỗi, cùng chỗ với khối comment "stdin redirected..." đã có sẵn
+phía trên) — TUYỆT ĐỐI không chèn comment (`#...`) vào GIỮA các dòng bên trong chuỗi: một dòng
+`# ...` không có `\` cuối dòng sẽ giữ nguyên newline thật bên trong chuỗi, cắt lệnh thành
+nhiều statement riêng ở phía remote và làm toàn bộ `DOMAIN/SUPER_ADMIN/GMAIL_USER/...` KHÔNG
+còn được truyền cho `./$SETUP_SCRIPT` nữa — một hồi quy còn nặng hơn lỗi đang sửa. Đã kiểm
+bằng cách mô phỏng chuỗi này trong một script `bash` riêng trước khi áp dụng.
+
+Giữ nguyên fallback `get_kv` trong `phase_pg_restore` (fix round 1) — vẫn có giá trị cho lần
+bootstrap thứ hai trở đi (khi `.env` trên pod đã tồn tại) và khi chạy setup bằng tay.
+
+- [ ] **Step 4: Kiểm cú pháp cả bốn file**
+
+Run: `bash -n motions-studio/setup/pod-volume.sh motions-studio/setup/lib-feature.sh motions-studio/setup/pod-pgdump.sh scripts/pod-bootstrap.sh && echo "cú pháp OK"`
 Expected: in ra `cú pháp OK`, không có thông báo lỗi.
 
 - [ ] **Step 5: Kiểm `phase_pg_restore` được gọi ở CẢ HAI nhánh**
 
 Run: `grep -c "phase_pg_restore" motions-studio/setup/lib-feature.sh`
 Expected: `3` (một định nghĩa hàm + hai lời gọi). Nếu ra `2` thì đã quên một nhánh — đúng loại lỗi làm đường prebuilt hoặc đường thường im lặng bỏ khôi phục.
+
+- [ ] **Step 5b: Kiểm `POD_VOLUME` có mặt ở lệnh ssh chạy setup**
+
+Run: `grep -c "POD_VOLUME=" scripts/pod-bootstrap.sh`
+Expected: `5` — dòng đọc từ `.env` máy dev (1), lệnh ssh chạy `pod-volume.sh` (1), một dòng
+ví dụ trong thông báo `warn` cho `--adopt` (1, không phải lệnh ssh thật), lệnh ssh chạy
+`./$SETUP_SCRIPT` (1, MỚI thêm ở fix round 2), lệnh ssh chạy `pod-volume.sh --check` (1, đã
+có từ trước). Nếu KHÔNG thấy dòng mới ở lệnh ssh chạy `./$SETUP_SCRIPT` thì fix round 2 chưa
+vào đúng chỗ.
 
 - [ ] **Step 6: Commit**
 

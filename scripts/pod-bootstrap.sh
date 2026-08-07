@@ -157,6 +157,12 @@ LOG="/tmp/motion-clone-bootstrap-${TS}.log"
 # CF_FE_DOMAIN/CF_FE_PORT are what turn one tunnel into two public hostnames — setup-pm2.sh
 # already handles them (ingress rule, DNS CNAME, and its token preflight covers both zones).
 # FRONTEND_URL only changes the "it's ready" email into a single clickable link.
+# POD_VOLUME phải có mặt ở CẢ lệnh ssh này, không chỉ lệnh chạy pod-volume.sh ở trên.
+# feature_main() → phase_pg_restore đọc nó để quyết có khôi phục DB từ volume hay không, và
+# trên một pod MỚI thì .env chưa tồn tại lúc pod-volume.sh chạy (rsync loại trừ .env và .env.*,
+# nên cả .env.example cũng không có) → khối set_kv_local của pod-volume.sh bị bỏ qua, .env
+# không có POD_VOLUME, và phase_pg_restore lặng lẽ không chạy đúng vào lần dựng pod đầu tiên —
+# tức đúng kịch bản mà tính năng này tồn tại để phục vụ.
 ssh "${SSH_OPTS[@]}" "root@$HOST" "cd ~/$REMOTE_DIR && chmod +x setup/*.sh && \
 DOMAIN='$DOMAIN' SUPER_ADMIN='$SUPER_ADMIN' GMAIL_USER='$GMAIL_USER' \
 GMAIL_APP_PASSWORD='$GMAIL_APP_PASSWORD' CF_API_TOKEN='$CF_API_TOKEN' \
@@ -164,6 +170,7 @@ CF_TUNNEL_TOKEN='$CF_TUNNEL_TOKEN' CORS_ORIGINS='$CORS_ORIGINS' HF_TOKEN='' \
 ${FE_DOMAIN:+CF_FE_DOMAIN='$FE_DOMAIN' CF_FE_PORT='$FE_PORT' FRONTEND_URL='https://$FE_DOMAIN'} \
 MTC_PREBUILT='${MTC_PREBUILT:-0}' \
 ${JOB_TYPES_OVERRIDE:+JOB_TYPES_OVERRIDE='$JOB_TYPES_OVERRIDE'} \
+${POD_VOLUME:+POD_VOLUME='$POD_VOLUME'} \
 ./$SETUP_SCRIPT" < /dev/null | tee "$LOG"
 STATUS=${PIPESTATUS[0]}
 [ "$STATUS" -eq 0 ] || die "$SETUP_SCRIPT exited $STATUS — full log: $LOG"
