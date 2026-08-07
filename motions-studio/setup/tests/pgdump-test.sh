@@ -315,15 +315,54 @@ q 'DROP TABLE "order"; DROP TABLE "weird name (x)";' >/dev/null
 # trong .meta làm --verify ĐỎ trên một bản dump hoàn toàn tốt, tức phá đúng cái cổng bằng-chứng
 # mà cả tính năng này dựa vào. Vì thế mỗi khối dưới đây đều có một assertion kiểm bất biến đó.
 #
-# Kiểm ĐÚNG BẤT BIẾN, không kiểm hình dạng rác CŨ. Bản trước dùng `grep -c 'FROM stdin;' == 0`,
-# tức neo vào đúng hai khoá rác mà hai lỗi đã sửa từng phát ra — nên nó mù với mọi hình dạng rác
-# khác. Đo bằng mutant: bỏ ` > "/dev/stderr"` ở khối END của _dump_row_counts (in dòng lỗi thẳng
-# vào stdout, mà stdout của hàm đó CHÍNH LÀ .meta — đúng thứ ba dòng comment ở pod-pgdump.sh:174
-# nói mình đang bịt) làm .meta chứa khoá rác thật, mà TOÀN BỘ 93 assertion vẫn xanh.
-# Bất biến thật đang khai là: MỌI dòng trong .meta phải là `<khoá>=<số>` — hoặc khoá hệ thống,
-# hoặc `<tên bảng>=<số dòng>`. Đếm số dòng KHÔNG khớp; phải bằng 0, bất kể rác trông ra sao.
-meta_junk() {
-  grep -cvE '^(created|pg_version|dump_bytes|meta_incomplete)=|^[^=]+=[0-9]+$' "$1" | tr -d ' '
+# Kiểm ĐÚNG BẤT BIẾN, không kiểm hình dạng rác CŨ. Đây là lần siết THỨ HAI của assertion này:
+#
+#   v1  `grep -c 'FROM stdin;' == 0` — neo thẳng vào đúng hai khoá rác mà hai lỗi đã sửa từng
+#       phát ra, nên mù với mọi hình dạng rác khác.
+#   v2  `^[^=]+=[0-9]+$` — "mọi dòng phải là <khoá>=<số>". Nghe chặt hơn, THỰC RA vẫn mù với
+#       ĐÚNG HAI KHOÁ RÁC nó được viết ra để thay thế: `t0  FROM stdin;=2` và
+#       `parencol ("col (x)") FROM stdin;=2` đều KHỚP `^[^=]+=[0-9]+$` (khoá không chứa dấu =,
+#       giá trị là số) nên lọt sạch. Nó chỉ bắt được rác KHÔNG có `=<số>` — tức dòng lỗi awk.
+#   v3  (dưới đây) so với SỰ THẬT thay vì so với hình dạng.
+#
+# Bất biến v3: MỌI khoá bảng trong .meta phải là TÊN MỘT BẢNG THẬT trong schema public của DB
+# vừa dump. Không phải "trông giống tên bảng" — mà LÀ tên bảng, hỏi thẳng pg_tables.
+#
+# Vì sao là TẬP CON chứ không phải TRÙNG KHÍT: khối (3) dưới cố ý dựng một .meta THIẾU bảng
+# (identifier có xuống dòng ⇒ báo lỗi to, .meta cụt) và vẫn phải khai được bất biến ở đó. Chiều
+# "thiếu" đã có --verify bắt; chiều assertion này khoá là chiều "THỪA/RÁC", đúng chiều mà cả hai
+# khoá rác lịch sử đi vào.
+#
+# ĐO BẰNG MUTANT (2026-08-08) — hai mutant, mỗi cái dựng lại ĐÚNG MỘT khoá rác lịch sử, bằng
+# cách thay khối cắt-cột của _dump_row_counts bằng một biến thể của regex CŨ:
+#   A. `sub(/[ \t]*\(.*\)[ \t]+FROM stdin;$/, "", s)`      — `.*` tham nên tên cột có ngoặc CHẠY,
+#      nhưng vẫn ĐÒI có `(…)` ⇒ bảng 0 cột trượt ⇒ khoá `t0  FROM stdin;=2`
+#   B. regex CŨ nguyên văn, thêm nhánh riêng cho bảng 0 cột:
+#          if (s ~ /\)[ \t]+FROM stdin;$/) sub(/[ \t]*\([^()]*\)[ \t]+FROM stdin;$/, "", s)
+#          else                            sub(/[ \t]*FROM stdin;$/, "", s)
+#      ⇒ bảng 0 cột CHẠY, nhưng `[^()]*` không qua nổi ngoặc lồng ⇒ s giữ nguyên ⇒ khoá
+#      `parencol ("col (x)") FROM stdin;=2`
+# Kết quả: v2 đếm 0 (mù) với CẢ HAI; v3 đếm 1 với cả hai. Chi tiết trong
+# .superpowers/sdd/2026-08-07-pg-dump-volume/cleanup-3-report.md
+meta_junk() { # đếm số dòng .meta KHÔNG phải khoá hệ thống và KHÔNG phải một bảng public có thật
+  local allowf junk
+  allowf="$(mktemp)"
+  # Danh sách bảng qua FILE, không qua `awk -v`: một tên bảng chứa xuống dòng (khối (3) dựng
+  # đúng dạng đó) làm `-v allow=…` chết ngay — "awk: newline in string", đã đo. Và `echo` cuối
+  # để file KHÔNG BAO GIỜ rỗng: với file đầu rỗng, `NR == FNR` đúng cho dòng đầu của stdin và
+  # awk nuốt nó làm một khoá hợp lệ — cái bẫy kinh điển của thủ thuật hai-file.
+  { q "SELECT tablename FROM pg_tables WHERE schemaname='public'"; echo; } > "$allowf" 2>/dev/null
+  junk="$(grep -vE '^(created|pg_version|dump_bytes|meta_incomplete)=' "$1" 2>/dev/null | awk '
+    NR == FNR { if ($0 != "") real[$0] = 1; next }
+    {
+      # Giá trị là phần sau dấu = CUỐI CÙNG; tên bảng có thể chứa dấu = nên không cắt từ dấu đầu.
+      if ($0 !~ /=[0-9]+$/) { junk++; next }
+      k = $0; sub(/=[0-9]+$/, "", k)
+      if (!(k in real)) junk++
+    }
+    END { print junk + 0 }' "$allowf" -)"
+  rm -f "$allowf"
+  printf '%s' "$junk"
 }
 
 # (1) Bảng 0 CỘT: pg_dump phát `COPY public.t0  FROM stdin;` — KHÔNG có danh sách cột, chỉ còn
@@ -338,7 +377,7 @@ M7="$(ls "$VOL"/pg/dumps/*.meta | head -1)"
 assert_eq "2" "$(grep '^t0=' "$M7" | cut -d= -f2)"       "bảng 0 CỘT vào .meta với khoá TRẦN t0="
 assert_eq "2" "$(grep '^parencol=' "$M7" | cut -d= -f2)" "tên cột chứa ngoặc: khoá TRẦN parencol="
 assert_eq "0" "$(meta_junk "$M7")" \
-  ".meta chỉ chứa dòng <khoá>=<số> — không một dòng rác nào, dưới MỌI hình dạng"
+  ".meta: mọi khoá bảng là một bảng public CÓ THẬT — không khoá rác, dưới MỌI hình dạng"
 assert_ok "--verify xanh với bảng 0 cột và tên cột chứa ngoặc" -- bash "$SCRIPT" --verify
 q 'DROP TABLE t0; DROP TABLE parencol;' >/dev/null
 
@@ -365,7 +404,7 @@ printf '%s' "$NL_OUT" | grep -q ".meta THIẾU BẢNG" \
   || bad "identifier có xuống dòng: không giải thích hệ quả — người đọc không truy ra được"
 M8="$(ls "$VOL"/pg/dumps/*.meta | head -1)"
 assert_eq "0" "$(meta_junk "$M8")" \
-  "identifier có xuống dòng: .meta thiếu bảng NHƯNG mọi dòng còn lại vẫn là <khoá>=<số>"
+  "identifier có xuống dòng: .meta THIẾU bảng NHƯNG không THỪA khoá nào không phải bảng thật"
 # Đỏ ở đây là cảnh báo về .meta, KHÔNG phải mất backup — bản dump vẫn phải ghi xong và hợp lệ.
 D8="$(ls "$VOL"/pg/dumps/motion-*.sql.gz 2>/dev/null | head -1)"
 { [ -n "$D8" ] && gzip -t "$D8" 2>/dev/null; } \
