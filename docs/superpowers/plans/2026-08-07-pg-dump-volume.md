@@ -212,7 +212,10 @@ do_dump() {
 
   # pipefail đã bật ở đầu file: pg_dump hỏng giữa chừng thì cả pipeline hỏng, không
   # để lại một file .gz hợp lệ chứa nửa database.
-  if ! _pg_dump -d "$PG_DB" --no-owner=false | gzip -c > "$tmp"; then
+  # KHÔNG dùng --no-owner: dump phải GIỮ các câu ALTER TABLE ... OWNER TO, vì khôi phục
+  # chạy sau phase_postgres nên role đã tồn tại, và giữ owner đúng thì app kết nối được ngay.
+  # (Mặc định của pg_dump đã là giữ owner — chỉ cần không truyền cờ nào.)
+  if ! _pg_dump -d "$PG_DB" | gzip -c > "$tmp"; then
     rm -f "$tmp"; die "pg_dump thất bại — DB có đang chạy không? (port $PG_PORT)"
   fi
   chmod 600 "$tmp" 2>/dev/null || true
@@ -383,14 +386,21 @@ bash "$SCRIPT" --restore 2>&1 | grep -qi "tuổi" && ok "restore in tuổi bản
 rm -rf "$VOL/pg"
 assert_ok "--restore trả 0 khi chưa có dump nào" -- bash "$SCRIPT" --restore
 
-# File dump HỎNG → phải đỏ, và DB phải còn TRỐNG (rollback sạch, không nạp nửa chừng)
+# File dump HỎNG → phải đỏ, và DB phải còn TRỐNG (rollback sạch, không nạp nửa chừng).
+#
+# Làm hỏng bằng cách NỐI THÊM một câu SQL sai vào CUỐI dump, không phải cắt cụt đầu file.
+# Cắt cụt ở 400 byte đầu chỉ lấy được phần comment + SET của pg_dump — toàn statement hợp lệ,
+# psql chạy xong trả 0, và test sẽ đỏ vì lý do sai hoàn toàn. Nối lỗi vào cuối thì psql tạo
+# xong hết bảng RỒI mới gặp lỗi, nên nó kiểm đúng thứ ta cần kiểm: --single-transaction có
+# thật sự rollback những bảng đã tạo hay không.
 rm -rf "$VOL/pg"; seed; bash "$SCRIPT" --dump >/dev/null
 q "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" >/dev/null
 D="$(readlink "$VOL/pg/latest")"
-gzip -dc "$D" | head -c 400 | gzip -c > "$D.part" && mv "$D.part" "$D"   # cắt cụt giữa chừng
-assert_fail "--restore đỏ khi dump cụt" -- bash "$SCRIPT" --restore
+{ gzip -dc "$D"; echo "SELECT * FROM khong_ton_tai_bang_nay;"; } | gzip -c > "$D.part"
+mv "$D.part" "$D"
+assert_fail "--restore đỏ khi dump có statement lỗi" -- bash "$SCRIPT" --restore
 assert_eq "0" "$(q "SELECT count(*) FROM pg_tables WHERE schemaname='public'")" \
-  "dump cụt KHÔNG để lại bảng nào — rollback sạch"
+  "dump lỗi KHÔNG để lại bảng nào — chứng minh --single-transaction rollback thật"
 ```
 
 - [ ] **Step 2: Chạy để chắc chắn nó ĐỎ**
