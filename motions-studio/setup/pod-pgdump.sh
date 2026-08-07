@@ -23,7 +23,11 @@ ok()   { printf '\033[32m ✓ \033[0m%s\n' "$*"; }
 warn() { printf '\033[33m !!\033[0m %s\n' "$*"; }
 die()  { printf '\033[31m ✗ \033[0m%s\n' "$*" >&2; exit 1; }
 
-get_kv() { grep -E "^$1=" "$ROOT/.env" 2>/dev/null | cut -d= -f2- | sed -E 's/[[:space:]]*#.*$//' | tr -d '"'; }
+# `head -1` khớp khuôn pod-volume.sh:52, và không phải chuyện thẩm mỹ: `.env` trên pod giờ là
+# nguồn CHÍNH của POD_VOLUME (lib-feature.sh phase_pg_restore ghi vào đó). Một key lặp hai lần
+# — chuyện thường gặp với file người sửa tay — sẽ cho POD_VOLUME hai dòng, rồi `[ -d ... ]` đỏ
+# với một thông báo vô nghĩa. Lấy dòng đầu, y như mọi nơi khác trong repo.
+get_kv() { grep -E "^$1=" "$ROOT/.env" 2>/dev/null | head -1 | cut -d= -f2- | sed -E 's/[[:space:]]*#.*$//' | tr -d '"'; }
 # Khuôn của pod-volume.sh:188 — env trước, .env sau. Nhờ vậy chạy tay, chạy từ Makefile
 # và chạy trong test đều thấy cùng một cấu hình.
 cfg() { local v="${!1:-}"; [ -n "$v" ] && { printf '%s' "$v"; return; }; get_kv "$2"; }
@@ -138,6 +142,13 @@ do_dump() {
   fi
   chmod 600 "$tmp" 2>/dev/null || true
 
+  # ĐUA ĐÃ BIẾT, chưa sửa trong đợt này (finding I1 — không chặn merge):
+  # `pg_dump` chạy ở trên, `_row_counts` chạy ngay dưới. Một INSERT chen vào giữa hai mốc đó
+  # làm .meta ghi số dòng KHÁC với số dòng thật trong file dump — và lệch đó là VĨNH VIỄN, nên
+  # mọi `--verify` sau này trên chính bản dump ấy đều đỏ dù bản dump hoàn toàn tốt. Chuyện này
+  # có thật: `make gpu-down` dump khi api/worker vẫn đang online.
+  # Sửa đúng cách là đọc cả hai từ CÙNG một snapshot (một transaction REPEATABLE READ dùng chung,
+  # hoặc lấy số dòng từ chính nội dung dump) — việc của một đợt sau.
   {
     echo "created=$(date -u +%s)"
     # server_version_num, KHÔNG dùng server_version: bản Ubuntu đóng gói trả chuỗi kiểu
@@ -281,6 +292,11 @@ do_verify() {
     else
       warn "verify ĐỎ — số dòng lệch so với .meta:"
       diff <(printf '%s\n' "$want") <(printf '%s\n' "$got") | sed 's/^/    /'
+      # Đừng để dòng trên bị đọc thành "bản dump hỏng" — thường thì không phải.
+      warn "Lệch KHÔNG chắc là dump hỏng: .meta được đếm SAU khi pg_dump chạy xong, nên một"
+      warn "INSERT xen vào giữa hai mốc đó cũng cho ra đúng triệu chứng này (gpu-down dump khi"
+      warn "api/worker còn online). Dấu hiệu phân biệt: lệch vài dòng ở đúng các bảng đang ghi"
+      warn "= gần như chắc chắn là đua; thiếu hẳn bảng, hoặc số vênh lớn = mới đáng ngờ dump."
       rc=1
     fi
   else
