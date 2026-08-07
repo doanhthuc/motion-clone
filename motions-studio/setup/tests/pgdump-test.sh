@@ -304,12 +304,31 @@ q 'DROP TABLE "order"; DROP TABLE "weird name (x)";' >/dev/null
 # Bảng ở schema KHÁC public không được lọt vào .meta: _row_counts (vế `got` của verify) chỉ
 # đếm schema public, nên thêm vào là verify đỏ oan. Nhưng khối COPY của nó vẫn phải được ĐỌC
 # HẾT, nếu không các dòng dữ liệu của nó bị tính nhầm sang bảng sau.
+#
+# BẢNG MỘT CỘT TEXT, và dòng dữ liệu đầu là một header COPY GIẢ của `public.jobs` — cả hai
+# chi tiết đều cần thiết, đừng đơn giản hoá:
+#   - một cột: dòng dữ liệu của pg_dump là các ô nối bằng TAB, nên chuỗi bẫy chỉ nằm ở CỘT ĐẦU
+#     mới bắt đầu ở cột 0 của dòng. Bảng hai cột cho `2<TAB>COPY public.jobs …` — không khớp
+#     `/^COPY /` và cái bẫy im lặng vô hiệu.
+#   - bẫy đặt ở bảng NON-PUBLIC (không phải ở `"order"` như khối trên): hành vi cần bảo vệ là
+#     "khối non-public vẫn phải được ĐỌC HẾT". Nếu code coi khối non-public là không-vào-khối
+#     (`intbl = pub`), dòng bẫy này được nhận nhầm làm header và sinh thêm một khoá `jobs=`.
 rm -rf "$VOL/pg"; seed
-q "CREATE SCHEMA khac; CREATE TABLE khac.thing (id int); INSERT INTO khac.thing VALUES (1),(2);" >/dev/null
+q "CREATE SCHEMA khac; CREATE TABLE khac.thing (note text);
+   INSERT INTO khac.thing VALUES ('COPY public.jobs (id, kind) FROM stdin;'), ('x');" >/dev/null
 bash "$SCRIPT" --dump >/dev/null
 M6="$(ls "$VOL"/pg/dumps/*.meta | head -1)"
-assert_eq "" "$(grep '^thing=' "$M6" | cut -d= -f2)" "bảng ngoài schema public KHÔNG vào .meta"
-assert_eq "7" "$(grep '^jobs=' "$M6" | cut -d= -f2)" "bảng schema khác không làm lệch bảng kế tiếp"
+# grep theo MỌI dạng khoá có thể phát ra, không neo `^thing=`: nhánh non-public của
+# _dump_row_counts KHÔNG cắt tiền tố schema, nên khi bộ lọc `pub` hỏng nó ghi ra `khac.thing=2`
+# chứ không bao giờ ghi `thing=2` — neo `^thing=` là một assertion không thể đỏ.
+assert_eq "0" "$(grep -cE '(^|\.)thing=' "$M6" | tr -d ' ')" \
+  "bảng ngoài schema public KHÔNG vào .meta (dưới MỌI dạng khoá, kể cả khac.thing=)"
+assert_eq "7" "$(grep '^jobs=' "$M6" | cut -d= -f2)" \
+  "khối COPY non-public được ĐỌC HẾT — dòng bẫy trong nó không sinh ra khoá jobs thứ hai"
+# --verify là đường bắt thứ hai, độc lập với hai grep trên: khoá thừa (khac.thing=2) hay khoá
+# lặp (jobs=1 + jobs=7) đều làm `want` lệch `got` và verify đỏ. Không có nó thì cả khối này
+# không chạy verify lần nào, và một .meta rác vẫn lọt.
+assert_ok "--verify xanh khi có bảng ở schema khác public" -- bash "$SCRIPT" --verify
 q "DROP SCHEMA khac CASCADE;" >/dev/null
 
 # Dump từ một DB CHƯA CÓ BẢNG NÀO vẫn là bản dump hợp lệ, và --check phải nói đúng như vậy.
