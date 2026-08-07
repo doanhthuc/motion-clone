@@ -889,12 +889,16 @@ Chèn vào `Makefile` ngay trước target `gpu-smoke`:
 ```makefile
 gpu-db-dump: ## Sao lưu database sang Network Volume (pod phải đang chạy)
 	@ssh -o StrictHostKeyChecking=accept-new -p $(call env,GPU_SSH_PORT) root@$(call env,GPU_SSH_HOST) \
-		"cd ~/motion-backend && ./setup/pod-pgdump.sh --dump"
+		"cd ~/motion-backend && bash ./setup/pod-pgdump.sh --dump"
 
 gpu-db-check: ## Bản dump mới nhất bao lâu rồi, có nạp lại được không (chạy --check + --verify)
 	@ssh -o StrictHostKeyChecking=accept-new -p $(call env,GPU_SSH_PORT) root@$(call env,GPU_SSH_HOST) \
-		"cd ~/motion-backend && ./setup/pod-pgdump.sh --check && ./setup/pod-pgdump.sh --verify"
+		"cd ~/motion-backend && bash ./setup/pod-pgdump.sh --check && bash ./setup/pod-pgdump.sh --verify"
 ```
+
+Chạy qua `bash ./setup/pod-pgdump.sh` (không phải `./setup/pod-pgdump.sh` trần) để KHÔNG phụ thuộc
+bit thực thi: `chmod +x setup/*.sh` chỉ chạy trong lệnh ssh của `pod-bootstrap.sh`, còn bốn target
+Makefile này ssh riêng, không đi qua bootstrap. Có `bash` ở đầu thì file thiếu +x vẫn chạy được.
 
 Và thêm `gpu-db-dump gpu-db-check` vào dòng `.PHONY` (dòng 2).
 
@@ -907,12 +911,12 @@ gpu-down: ## Stop the pod (DO NOT FORGET — an idle pod bills by the hour)
 	@# Điểm dump CHÍNH: đây là lúc cuối cùng còn ssh được vào pod. Sau khi dừng, pod im lặng
 	@# cho tới khi bật lại, mà volume thì chỉ mount được qua pod — nên không còn đường nào
 	@# sao lưu hay kiểm tra nữa.
-	@# `|| true` là CỐ Ý: dump hỏng KHÔNG được chặn việc dừng một pod $0,99/giờ, và gpu-down
+	@# `|| echo` là CỐ Ý: dump hỏng KHÔNG được chặn việc dừng một pod $0,99/giờ, và gpu-down
 	@# vốn không làm mất DB (container disk còn nguyên). Chặn ở đây là đốt tiền thật để giữ
 	@# thứ chưa bị đe doạ.
 	@ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
 		-p $(call env,GPU_SSH_PORT) root@$(call env,GPU_SSH_HOST) \
-		"cd ~/motion-backend && ./setup/pod-pgdump.sh --dump" \
+		"cd ~/motion-backend && bash ./setup/pod-pgdump.sh --dump" \
 		|| echo "!! sao lưu DB thất bại — vẫn dừng pod. DB còn trên container disk, chỉ mất nếu gpu-destroy."
 ```
 
@@ -928,7 +932,7 @@ Chèn vào đầu target `gpu-destroy`, ngay sau dòng `@test -n "$(call env,GPU
 	@# giờ. Vẫn xoá theo đúng lựa chọn thiết kế: không có cổng chặn nào.
 	@ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
 		-p $(call env,GPU_SSH_PORT) root@$(call env,GPU_SSH_HOST) \
-		"cd ~/motion-backend && ./setup/pod-pgdump.sh --dump" 2>/dev/null \
+		"cd ~/motion-backend && bash ./setup/pod-pgdump.sh --dump" 2>/dev/null \
 		|| echo "!! không sao lưu được (pod đã dừng?) — XOÁ TIẾP. Bản dump gần nhất là lần 'make gpu-down' hoặc 'make gpu-db-dump' cuối cùng."
 ```
 
@@ -946,7 +950,7 @@ git commit -m "Makefile: gpu-db-dump/gpu-db-check, dump ở gpu-down và gpu-des
 gpu-down là điểm dump CHÍNH vì đó là lúc cuối còn ssh được: sau khi dừng, volume
 chỉ mount qua pod nên không còn đường nào sao lưu.
 
-|| true ở cả hai chỗ là cố ý, không phải cẩu thả: dump hỏng không được chặn việc
+|| echo ở cả hai chỗ là cố ý, không phải cẩu thả: dump hỏng không được chặn việc
 dừng một pod \$0,99/giờ, mà gpu-down vốn chẳng làm mất DB."
 ```
 

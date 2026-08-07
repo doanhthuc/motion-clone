@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help setup dev down clean gpu-preflight gpu-provision gpu-wait gpu-bootstrap gpu-fe gpu-up gpu-down gpu-destroy gpu-status gpu-logs
+.PHONY: help setup dev down clean gpu-preflight gpu-provision gpu-wait gpu-bootstrap gpu-fe gpu-up gpu-down gpu-destroy gpu-db-dump gpu-db-check gpu-status gpu-logs
 
 help: ## Show this help
 	@echo "motion-clone — make targets:"
@@ -62,6 +62,16 @@ endif
 	@echo " ready → https://$(call env,DOMAIN)"
 
 gpu-down: ## Stop the pod (DO NOT FORGET — an idle pod bills by the hour)
+	@# Điểm dump CHÍNH: đây là lúc cuối cùng còn ssh được vào pod. Sau khi dừng, pod im lặng
+	@# cho tới khi bật lại, mà volume thì chỉ mount được qua pod — nên không còn đường nào
+	@# sao lưu hay kiểm tra nữa.
+	@# `|| echo` là CỐ Ý: dump hỏng KHÔNG được chặn việc dừng một pod $0,99/giờ, và gpu-down
+	@# vốn không làm mất DB (container disk còn nguyên). Chặn ở đây là đốt tiền thật để giữ
+	@# thứ chưa bị đe doạ.
+	@ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
+		-p $(call env,GPU_SSH_PORT) root@$(call env,GPU_SSH_HOST) \
+		"cd ~/motion-backend && bash ./setup/pod-pgdump.sh --dump" \
+		|| echo "!! sao lưu DB thất bại — vẫn dừng pod. DB còn trên container disk, chỉ mất nếu gpu-destroy."
 ifeq ($(shell grep -E '^GPU_PROVIDER=' .env 2>/dev/null | cut -d= -f2),runpod)
 	@runpodctl pod stop $(call env,GPU_INSTANCE_ID)
 else
@@ -75,6 +85,13 @@ endif
 # only found out from the invoice.
 gpu-destroy: ## Permanently destroy the pod (frees the GPU, deletes its disk — irreversible)
 	@test -n "$(call env,GPU_INSTANCE_ID)" || { echo "GPU_INSTANCE_ID is empty in .env — nothing to destroy"; exit 1; }
+	@# Cố sao lưu lần cuối. Pod đang DỪNG thì ssh không vào được và volume cũng không đọc
+	@# được (volume chỉ mount qua pod) — lúc đó không có cách nào biết bản dump gần nhất bao
+	@# giờ. Vẫn xoá theo đúng lựa chọn thiết kế: không có cổng chặn nào.
+	@ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
+		-p $(call env,GPU_SSH_PORT) root@$(call env,GPU_SSH_HOST) \
+		"cd ~/motion-backend && bash ./setup/pod-pgdump.sh --dump" 2>/dev/null \
+		|| echo "!! không sao lưu được (pod đã dừng?) — XOÁ TIẾP. Bản dump gần nhất là lần 'make gpu-down' hoặc 'make gpu-db-dump' cuối cùng."
 ifeq ($(shell grep -E '^GPU_PROVIDER=' .env 2>/dev/null | cut -d= -f2),runpod)
 	@runpodctl pod delete $(call env,GPU_INSTANCE_ID) || true
 	@sleep 3
@@ -118,6 +135,14 @@ gpu-volume-check: ## Prove the volume is really in use (catches "green but re-do
 	@ssh -o StrictHostKeyChecking=accept-new -p $(call env,GPU_SSH_PORT) root@$(call env,GPU_SSH_HOST) \
 		"cd ~/motion-backend && POD_VOLUME=$(call env,POD_VOLUME) \
 		 MODELS_MIN_GB=$(call env,MODELS_MIN_GB) ./setup/pod-volume.sh --check"
+
+gpu-db-dump: ## Sao lưu database sang Network Volume (pod phải đang chạy)
+	@ssh -o StrictHostKeyChecking=accept-new -p $(call env,GPU_SSH_PORT) root@$(call env,GPU_SSH_HOST) \
+		"cd ~/motion-backend && bash ./setup/pod-pgdump.sh --dump"
+
+gpu-db-check: ## Bản dump mới nhất bao lâu rồi, có nạp lại được không (chạy --check + --verify)
+	@ssh -o StrictHostKeyChecking=accept-new -p $(call env,GPU_SSH_PORT) root@$(call env,GPU_SSH_HOST) \
+		"cd ~/motion-backend && bash ./setup/pod-pgdump.sh --check && bash ./setup/pod-pgdump.sh --verify"
 
 gpu-smoke: ## Prove the pod really works end-to-end (SMOKE_REF=img SMOKE_DRIVER=vid for a motion job, +SMOKE_PRODUCT=img for tryon, SMOKE_PROMPT="..." for create-image)
 	@bash scripts/pod-smoke.sh
