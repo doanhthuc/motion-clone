@@ -475,6 +475,10 @@ phase_postgres() {
   pg psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='${PG_USER}'" | grep -q 1 \
     || pg psql -qc "CREATE ROLE ${PG_USER} LOGIN PASSWORD '${PG_PASS}'" || die "Tạo role postgres lỗi."
   pg psql -qc "ALTER ROLE ${PG_USER} WITH PASSWORD '${PG_PASS}'" >/dev/null
+  # CREATEDB để setup/pod-pgdump.sh --verify dựng được DB tạm mà diễn tập nạp lại. Role này
+  # vốn đã sở hữu toàn bộ database của app trên một pod dùng riêng, nên quyền tạo thêm một DB
+  # không mở ra gì mới — đổi lại ta có đường chứng minh backup nạp được, thay vì chỉ tin.
+  pg psql -qc "ALTER ROLE ${PG_USER} CREATEDB" >/dev/null
   pg psql -tAc "SELECT 1 FROM pg_database WHERE datname='${PG_DB}'" | grep -q 1 \
     || pg createdb -O "${PG_USER}" "${PG_DB}" || die "Tạo database lỗi."
   ok "Postgres: role=${PG_USER} db=${PG_DB} @127.0.0.1:${PG_PORT} (schema tự nạp khi api khởi động)"
@@ -864,6 +868,45 @@ FEENV
   echo
 }
 
+# Khôi phục DB từ volume — PHẢI nằm giữa phase_postgres và bất cứ thứ gì tạo schema.
+#   sau phase_postgres: dump chứa ALTER TABLE ... OWNER TO và GRANT nên role + database
+#     phải tồn tại trước.
+#   trước phase_pm2: api khởi động sẽ chạy api/src/migrate.js tạo bảng từ db/init/*.sql;
+#     nạp dump có CREATE TABLE vào DB đã có bảng rỗng là lỗi trùng.
+# Không có volume thì đi qua như không có gì.
+phase_pg_restore() {
+  # POD_VOLUME đọc theo khuôn env-trước-.env-sau (giống pod-volume.sh:188 và pod-pgdump.sh).
+  # Có ĐÚNG HAI nguồn, và cần cả hai vì mỗi nguồn hụt ở một đường vào khác nhau:
+  #   1. Biến môi trường qua ssh — scripts/pod-bootstrap.sh có hai lệnh ssh và cả hai đều mang
+  #      POD_VOLUME theo (lệnh chạy pod-volume.sh, và lệnh chạy setup dẫn tới đây — :173).
+  #      Nhưng nó CHỈ có mặt khi phase này chạy từ pod-bootstrap.sh. Người gõ tay
+  #      `./setup/setup-motion-transfer.sh` trên pod, hoặc bất kỳ caller nào khác, không có nó.
+  #   2. `.env` trên pod qua get_kv — luôn có mặt, không phụ thuộc lệnh gọi. Nhưng trên pod MỚI
+  #      thì `.env` chưa tồn tại lúc pod-volume.sh chạy (rsync loại trừ .env và .env.*), nên
+  #      khối set_kv_local của nó bị bỏ qua và key này chưa vào được `.env` ở lần dựng đầu tiên.
+  # Nguồn (1) bịt đúng lỗ của nguồn (2) ở lần dựng đầu, và `set_kv` ngay dưới đây bịt lỗ của
+  # nguồn (1) cho mọi lần chạy sau. Bỏ một trong hai là phase này lặng lẽ không chạy ở đúng
+  # kịch bản nó tồn tại để phục vụ — người dùng mất DB mà vẫn thấy mọi thứ xanh.
+  local _vol="${POD_VOLUME:-}"
+  [ -n "$_vol" ] || _vol="$(get_kv POD_VOLUME)"
+  [ -n "$_vol" ] || return 0
+
+  # Ghi lại vào `.env` CỦA POD — nguồn thứ hai, độc lập với biến môi trường.
+  # pod-volume.sh:309 gác cả khối ghi `.env` bằng `[ -f "$ROOT/.env" ]`, và trên pod MỚI file
+  # đó chưa tồn tại lúc nó chạy (rsync loại trừ `.env` và `.env.*`), nên POD_VOLUME không bao
+  # giờ vào được `.env`. Tới đây thì phase_dotenv đã dựng xong `.env`, nên ghi được. Nhờ vậy
+  # `make gpu-down` / `gpu-destroy` / `gpu-db-dump` / `gpu-db-check` / `pod-smoke.sh` — và cả
+  # người gõ tay `./setup/pod-pgdump.sh --dump` trên pod — đều thấy volume, kể cả khi lệnh ssh
+  # của họ quên truyền biến. KHÔNG được thay bằng cách gỡ guard ở pod-volume.sh:309: làm vậy
+  # thì pod-volume.sh tạo một `.env` cụt vài key, phase_dotenv thấy `[ ! -f .env ]` sai nên bỏ
+  # qua bước dựng `.env` đầy đủ — hỏng nặng hơn nhiều lỗi đang sửa.
+  set_kv POD_VOLUME "$_vol"
+
+  say "4b/11 · Khôi phục database từ Network Volume (nếu có bản dump)"
+  POD_VOLUME="$_vol" bash "$ROOT/setup/pod-pgdump.sh" --restore \
+    || warn "khôi phục DB không thành công — setup vẫn chạy tiếp với DB trống."
+}
+
 # feature_main — chạy toàn bộ phase theo thứ tự. Script gọi: set profile rồi `feature_main`.
 feature_main() {
   : "${ROOT:?cần ROOT}"; : "${FEATURE:?cần FEATURE}"; : "${JOB_TYPE:?cần JOB_TYPE}"
@@ -876,12 +919,14 @@ feature_main() {
     # Image đã làm các bước tốn thời gian ở CI. Runtime chỉ tạo secret/DB và bật service.
     phase_dotenv
     phase_postgres
+    phase_pg_restore
     phase_prebuilt_deps
     phase_ollama
   else
     phase_apt
     phase_dotenv
     phase_postgres
+    phase_pg_restore
     phase_app_deps
     phase_ollama
     phase_comfyui

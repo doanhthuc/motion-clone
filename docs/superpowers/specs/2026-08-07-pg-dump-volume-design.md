@@ -1,0 +1,295 @@
+# Sao lưu DB sang Network Volume bằng `pg_dump` — Design
+
+**Ngày:** 07/08/2026 · **Trạng thái:** đã triển khai, đã nghiệm thu trên pod GPU RunPod thật.
+Hai lần thuê pod RTX 5090 ở EU-RO-1, tổng ~25 phút: (1) pod 1 — `gpu-bootstrap` trên phiên đầu báo
+đúng "chưa có bản dump nào — bỏ qua", `gpu-db-dump` tạo bản 6656 bytes, `gpu-db-check` xác nhận nạp
+lại được (25 bảng), `gpu-down` dump lần nữa rồi dừng pod, `gpu-destroy` trên pod đã dừng gặp
+`Connection refused` khi cố dump lần cuối nhưng **vẫn xoá pod** đúng thiết kế "không cổng chặn"; (2)
+pod 2 dựng hoàn toàn mới sau khi pod 1 đã biến mất khỏi `runpodctl pod list` — `gpu-bootstrap` tự
+khôi phục từ bản dump của `gpu-down` ("tuổi bản dump: 0 giờ" → "✓ khôi phục xong"), `gpu-db-check`
+xanh (25 bảng, số bản đang giữ: 2), dữ liệu quay về đúng số dòng đã ghi ở pod 1
+(`users=2 · workflows=2 · workers=1 · api_keys=1 · task_cloud_auto_settings=1`). 08/08/2026 chạy tiếp pod thứ ba: `make gpu-smoke` đầy đủ **9/9 lớp pass** (ba lớp GPU đều bật
+bằng `SMOKE_REF`/`SMOKE_DRIVER`/`SMOKE_PRODUCT`/`SMOKE_PROMPT`), lớp 6 sao lưu DB xanh, và
+`gpu-bootstrap` khôi phục được từ bản dump **17 giờ tuổi** — đường in tuổi thật mà đợt 07/08 chưa
+chạm tới. Số đo đầy đủ ở
+[gpu-pod.md §Sao lưu database](../../gpu-pod.md#pg-backup).
+
+## Mục tiêu
+
+Làm cho database sống sót qua `make gpu-destroy`.
+
+Hiện tại PGDATA nằm trên **container disk**, nên `gpu-destroy` xoá luôn database: toàn bộ `jobs`,
+`users`, `workflows`, `api_keys`, `social_accounts`. Đó là lý do `POD_MAX_HOURS` phải dùng
+`--stop-after` chứ không `--terminate-after` (`.env.example:24-26`) — lưới an toàn không được tự
+phá dữ liệu. Cái giá của ràng buộc đó là **pod dừng vẫn tính tiền container disk**
+([gpu-pod.md#costs](../../gpu-pod.md#costs)), và pod nằm dừng ~95% thời gian (nhịp dùng thật 1,19
+giờ/ngày).
+
+Spec này gỡ ràng buộc đó: khi DB dựng lại được từ volume, `gpu-destroy` thành thao tác bình thường
+thay vì thao tác phá dữ liệu.
+
+**Ngoài phạm vi:** hạ `DISK` xuống mức hợp lý. Đó là bài toán riêng, gốc rễ khác hẳn (ghi tạm của
+job, không phải PGDATA — xem §Bài toán kế tiếp), và sẽ có spec riêng. Spec này là điều kiện cần cho
+nó, vì bước thu hoạch của bài đó — dựng pod mới với `DISK` nhỏ — chính là thao tác làm mất DB hôm
+nay.
+
+## Vì sao không phải "đưa PGDATA lên volume"
+
+Đường đó đã thử và đã đóng, bằng đo thật trên pod ngày 01/08/2026 (commit `d2a9ffc`):
+
+- RunPod mount Network Volume bằng **MooseFS với `user_id=0,group_id=0` và chặn `chown` kể cả khi
+  là root** ("Operation not permitted").
+- Postgres **từ chối khởi động** nếu PGDATA không thuộc user `postgres` mode `0700`.
+- Cách vòng tiêu chuẩn — file ext4 loopback đặt trên volume — **bất khả thi: container không có
+  `/dev/loop*`**.
+
+Mọi hướng cùng họ (bindfs / FUSE remap uid) nhiều khả năng chết vì cùng một lý do: container không
+được cấp device đặc biệt. Spec này **không đào lại** hướng đó.
+
+Kết luận: `VOLUME_PGDATA=0` giữ nguyên. PGDATA ở lại container disk — nơi `chown` chạy được — còn
+tính bền đến từ một bản sao **logic** trên volume. Không đụng gì tới thứ MooseFS đang cấm, vì ghi
+file thường lên volume thì hoàn toàn bình thường; chỉ `chown` bị chặn.
+
+## Vì sao `pg_dump` chứ không WAL archiving
+
+| | `pg_dump` (chọn) | WAL archiving |
+|---|---|---|
+| RPO | mất tối đa từ lần dump cuối | gần 0 |
+| Bộ phận động | 1 script | `archive_command`, base backup, prune, promote |
+| Khoá major version | **không** — dump là bản sao logic | có: base backup PG 16 cần PG 16 |
+| Rủi ro làm đầy container disk | không | **có**: `archive_command` hỏng thì Postgres giữ WAL lại trong `PGDATA/pg_wal` và thử lại mãi |
+
+Dòng cuối là dòng quyết định. WAL archiving tạo ra một đường mà đĩa nhỏ bị lấp đầy rồi Postgres
+dừng hẳn — tức nó **đặt sàn cho `DISK`**, đúng thứ bài toán kế tiếp muốn hạ. `pg_dump` không có
+đường đó.
+
+Dòng "khoá major version" cũng đáng giá: cái bẫy `PG_VERSION` đang canh ở `pod-volume.sh:202-212`
+(pgdata tạo bởi PG 16 thì PG 17 không mở được) **không áp dụng** cho dump logic. Đổi base image lên
+Postgres mới hơn vẫn khôi phục được.
+
+**Dữ liệu hợp với cách này:** DB là metadata thuần — `jobs`, `users`, `user_sessions`, `workflows`,
+`storage_files` (chỉ trỏ vào MinIO), `api_keys`, `social_accounts`. Không có cột `bytea`. Media nằm
+trong MinIO **trên volume**, nên khi mất vài phút metadata cuối thì file vẫn còn nguyên.
+
+## Kiến trúc
+
+### Trạng thái trên volume
+
+```
+$POD_VOLUME/pg/
+  dumps/motion-<YYYYmmdd-HHMMSS>.sql.gz    bản dump
+  dumps/motion-<YYYYmmdd-HHMMSS>.meta      số dòng từng bảng + version + kích thước
+  latest -> dumps/motion-<YYYYmmdd-HHMMSS>.sql.gz
+```
+
+File `.meta` không phải trang trí. Một dump rỗng hoặc cụt vẫn qua được `gzip -t` và vẫn có kích
+thước khác 0; chỉ khi so số dòng mới phân biệt được "dump chạy xong" với "dump đúng". Đây là loại
+**thành công giả** mà cả repo đang phòng — cùng họ với cổng chặn manifest model ở
+`pod-volume.sh` §5.
+
+**Số dòng trong `.meta` đọc từ chính file dump, không từ một truy vấn DB thứ hai.**
+`_dump_row_counts()` giải nén một lần và `awk` đếm số dòng giữa `COPY … FROM stdin;` và dòng chỉ
+chứa `\.` của từng khối. Lý do là một cái đua thật: `pg_dump` chụp snapshot riêng, nên nếu `.meta`
+lấy số bằng cách hỏi DB lần nữa sau khi dump xong thì một `INSERT`/`DELETE` xen vào giữa làm `.meta`
+lệch với nội dung file — và lệch **vĩnh viễn**, vì nó nằm trong file. Mọi `--verify` sau đó trên bản
+dump ấy đều đỏ dù bản dump hoàn toàn tốt. Chuyện có thật chứ không lý thuyết: `gpu-down` dump khi
+api/worker vẫn online, và lớp 6 của `pod-smoke.sh` dùng `bad`, nên cái đua này đủ sức làm
+`make gpu-smoke` đỏ trên một pod khoẻ mạnh.
+
+Đổi như vậy **không** làm `--verify` thành vô nghĩa: nó vẫn so "số dòng file dump tự khai" với "số
+dòng thật sau khi nạp chính file đó vào Postgres", và vế thứ hai vẫn là bằng chứng thật — nó chứng
+minh file nạp lại được và nạp ra đúng nội dung. Chỉ vế "so với DB gốc tại một thời điểm khác" bị
+bỏ, mà đó vừa là vế gây đua vừa là vế không nói được gì về bản dump.
+
+Thư mục `700`, file `600`: dump chứa `api_keys`, `user_sessions.token_hash` và token của
+`social_accounts`.
+
+**Nhưng đây là ràng buộc *khi filesystem hỗ trợ*, không phải bất biến.** Nghiệm thu trên pod
+RunPod ngày 2026-08-07:
+
+```
+chmod 600 <file trên /workspace>   → stat vẫn ra 666
+chmod 600 <file trên /tmp>         → stat ra 600
+thư mục trên volume                → 777 cố định
+mount: mfs#euro-3.runpod.net:9421 on /workspace type fuse
+       (rw,nosuid,nodev,relatime,user_id=0,group_id=0,allow_other)
+```
+
+MooseFS **bỏ qua `chmod` hoàn toàn** — y như nó đã chặn `chown` (lý do PGDATA không lên volume
+được, `pod-volume.sh:179-191`). `chmod` trả 0, mode không đổi. Trên volume, mode `700`/`600` là
+**bất khả thi**, không phải "chưa làm".
+
+Nên `do_dump()` **dò rồi mới quyết**, thay vì đòi mode một cách vô điều kiện:
+
+- `_fs_honors_modes <thư mục>` tạo một file dò, `chmod 600`, đọc lại mode, xoá file.
+- **Không tôn trọng mode** → in **một dòng** thông tin, coi như bình thường, trả **0**.
+- **Có tôn trọng mode** mà mode vẫn sai → giữ nguyên cảnh báo to + exit khác 0.
+
+Vì sao không cứ để nó đỏ: khối kiểm cũ làm `make gpu-db-dump` đỏ ở **mọi** lần dump trên pod, nên
+`make gpu-down` in `!! sao lưu DB thất bại` mỗi lần dù bản dump hoàn hảo. Báo động giả thường trực
+dạy người dùng bỏ qua cảnh báo — đúng thứ ngược lại với thứ khối kiểm đó tồn tại để làm. Dò rồi
+quyết thì bỏ được báo động giả mà **giữ nguyên tín hiệu thật**.
+
+Chiều hỏng của `_fs_honors_modes` cố ý nghiêng về phía ồn: không tạo được file dò ⇒ coi như "có
+tôn trọng" ⇒ vẫn cảnh báo to. Thà ồn thừa một lần vì không đo được còn hơn im lặng nuốt mode sai.
+
+Trên volume, **bảo mật của bản dump không dựa vào mode nữa** mà dựa vào hai thứ có thật: Network
+Volume là riêng của tài khoản RunPod, và pod là đơn-người-thuê. `umask 077` vẫn giữ — nó vẫn đúng
+và vẫn có tác dụng trên mọi filesystem bình thường (`/tmp` của pod, máy dev, CI).
+
+Nhánh "filesystem bỏ qua mode" được kiểm bằng một filesystem **thật sự** bỏ qua chmod: ảnh đĩa FAT
+dựng bằng `hdiutil` trong `pgdump-test.sh` (FAT ép mode file về `700`, `chmod` không ăn). Kiểm bằng
+thư mục tạm thường thì assertion không thể đỏ.
+
+### Khi nào dump
+
+**Không có dump định kỳ.** Đường duy nhất làm mất DB là đường tự điều khiển: `gpu-down` và lưới
+`POD_MAX_HOURS` đều là **stop** (container disk còn nguyên, DB sống), chỉ `gpu-destroy` mới xoá. Và
+`pod-provision.sh` không dùng cờ spot/interruptible nào, nên không có chuyện RunPod thu hồi pod
+giữa chừng. Một tiến trình nền chạy suốt phiên để phòng một sự kiện không tồn tại là thuế vô ích.
+
+| Chỗ | Vai trò |
+|---|---|
+| `make gpu-down` | **Điểm dump chính** — thời điểm cuối cùng còn ssh được vào pod |
+| `make gpu-destroy` | Cố dump nếu pod đang chạy; pod đã dừng thì bỏ qua |
+| `make gpu-db-dump` | Thủ công, khi muốn chốt một mốc |
+
+`gpu-down` là điểm chính vì sau đó pod im lặng cho tới khi bật lại: `gpu-destroy` chạy **trên máy
+dev**, còn dump phải chạy **trên pod**, và volume chỉ mount được qua pod. Pod đã dừng thì không ssh
+được, không dump được, và cũng không đọc được volume để biết có dump hay chưa.
+
+### Khi nào khôi phục
+
+Trong `feature_main()` (`setup/lib-feature.sh:868-894`), **ngay sau `phase_postgres`**:
+
+```
+phase_postgres        role + database đã có, chưa ai tạo schema
+   │
+   ├─ pod-pgdump.sh --restore
+   │     DB trống + có dump  → nạp, IN TO tuổi bản dump
+   │     DB đã có dữ liệu    → không làm gì
+   │     chưa có dump nào    → bỏ qua, phiên đầu
+   │
+phase_pm2 → api khởi động → migrate.js chạy db/init/*.sql
+```
+
+Vị trí này bị ràng buộc hai đầu, không phải chọn cho gọn:
+
+- **Sau `phase_postgres`**: dump chứa `ALTER TABLE ... OWNER TO motion` và `GRANT`, nên role
+  `motion` và database phải tồn tại trước (`lib-feature.sh:428-430, 479`).
+- **Trước khi có gì tạo schema**: `api/src/migrate.js` chạy lúc api khởi động và tạo bảng từ
+  `db/init/*.sql`. Nếu restore chạy sau đó, nạp dump có `CREATE TABLE` vào DB đã có bảng rỗng sẽ
+  lỗi trùng.
+
+Migration chạy sau restore là vô hại vì `db/init/*.sql` đều idempotent (`CREATE TABLE IF NOT
+EXISTS` / `ON CONFLICT`) — chính `migrate.js` được viết ra để chạy được trên volume cũ.
+
+## Thành phần
+
+### Mới: `motions-studio/setup/pod-pgdump.sh`
+
+Chạy **trên pod**. Là nơi duy nhất biết bố cục thư mục dump; mọi caller chỉ truyền chế độ và đọc
+exit code.
+
+| Chế độ | Làm gì |
+|---|---|
+| `--dump` | dump → gzip → ghi `.meta` → đổi `latest` → prune giữ `PG_DUMP_KEEP` bản |
+| `--restore` | nạp `latest` **chỉ khi DB trống**; in tuổi bản dump |
+
+"DB trống" định nghĩa là **không có bảng nào trong schema `public`**, không phải "có bảng nhưng
+0 dòng". Phân biệt này quan trọng: nếu vì lý do nào đó `migrate.js` đã chạy trước, DB sẽ có đủ bảng
+rỗng — lúc đó nạp dump có `CREATE TABLE` vào sẽ lỗi trùng, và bỏ qua là hành vi đúng chứ không phải
+bỏ sót. Kiểm bằng `SELECT count(*) FROM pg_tables WHERE schemaname='public'`.
+| `--check` | báo cáo tuổi + số dòng, **không sửa gì** |
+| `--verify` | nạp thử vào DB tạm, so số dòng với `.meta`, xoá DB tạm |
+
+**Giao diện:** đọc `POD_VOLUME` và `POSTGRES_USER/PASSWORD/DB/PORT` theo đúng khuôn đang dùng ở
+`pod-volume.sh:188` — ưu tiên biến môi trường, thiếu thì `get_kv` từ `.env`. Trả `0` khi thành
+công, khác `0` kèm lý do khi hỏng.
+
+**Không làm:** không đụng PGDATA, không quản mount volume, không biết gì về MinIO hay models. Một
+mục đích.
+
+Đây là file mới chứ không phải thêm mục vào `pod-volume.sh`, vì file đó đã dài ~330 dòng và làm 5
+việc không liên quan nhau (models, hf-cache, MinIO, Ollama, PGDATA, manifest). Thêm việc thứ 6 vào
+đó thì không ai kiểm riêng được phần backup nữa.
+
+### Sửa
+
+| File | Sửa gì | Vì sao |
+|---|---|---|
+| `setup/pod-volume.sh` | thêm `set_kv_local POD_VOLUME "$VOL"` | **`POD_VOLUME` hiện không tới được `lib-feature.sh`**: nó không nằm trong danh sách env truyền qua ssh (`pod-bootstrap.sh:160-167`) và cũng không được ghi vào `.env` trên pod. `pod-volume.sh:324-326` đã ghi `COMFY_DIR`/`COMFY_MODELS_DIR`/`OLLAMA_MODELS` theo đúng cách này — chỉ thiếu mỗi key này |
+| `setup/lib-feature.sh` | gọi `--restore` sau `phase_postgres` trong `feature_main()`, sau cổng `[ -n "$POD_VOLUME" ]` | profile không có volume phải đi qua như không có gì |
+| `Makefile` | thêm `gpu-db-dump`, `gpu-db-check`; sửa `gpu-down` (dòng 64-70) và `gpu-destroy` (dòng 76-101) | ba điểm dump |
+| `scripts/pod-smoke.sh` | thêm một lớp: có `latest`, tuổi bao nhiêu, `--verify` xanh không | đặt ở nhóm lớp rẻ, không cần GPU |
+| `.env.example` | `PG_DUMP_KEEP=20` | số bản giữ lại |
+| `docs/gpu-pod.md` | mục mới, và cập nhật mục `#costs` | `gpu-destroy` không còn là thao tác phá dữ liệu |
+
+## Xử lý lỗi
+
+Nguyên tắc: **script trả exit code thật, Makefile không dừng vì nó.** Không có cổng chặn nào. Cách
+này giữ thông tin cho `gpu-smoke` và cho người đọc mà không cản đường ai.
+
+| Tình huống | Xử lý |
+|---|---|
+| `--dump`: volume không mount / hết chỗ / `pg_dump` lỗi | in lý do, exit ≠ 0. `gpu-down` và `gpu-destroy` cảnh báo rồi **vẫn chạy tiếp** |
+| `--restore`: DB đã có dữ liệu | **không phải lỗi** — bỏ qua, in rõ "DB đã có dữ liệu, không nạp đè" |
+| `--restore`: chưa có dump nào | bỏ qua, in rõ đây là phiên đầu |
+| `--restore`: file dump hỏng | cảnh báo, không nạp một phần |
+| Hai lần dump chồng nhau | ghi ra file tạm rồi `mv` trong cùng filesystem (nguyên tử) — `latest` không bao giờ trỏ file dở |
+
+**`gpu-down` không được chặn vì dump hỏng.** Pod GPU đang chạy là $0,99/giờ, mà `gpu-down` không hề
+làm mất DB (container disk còn nguyên). Chặn việc dừng để bảo vệ một bản backup là đốt tiền thật để
+giữ thứ chưa bị đe doạ.
+
+**Chỗ duy nhất phải thật cẩn thận là `--restore`**, vì nạp nửa chừng tệ hơn không nạp: bạn được một
+DB có vài bảng, app chạy lên bình thường, và không biết mình đang thiếu gì. Hai cờ
+`psql --single-transaction -v ON_ERROR_STOP=1` mua hai thứ khác nhau, cần cả hai: `--single-transaction`
+cho tính nguyên tử — lỗi ở bất kỳ statement nào thì Postgres tự biến COMMIT cuối thành ROLLBACK,
+rollback sạch về DB trống, tức quay về đúng trạng thái "chưa nạp" chứ không phải một trạng thái lai.
+`ON_ERROR_STOP=1` cho exit code trung thực — thiếu nó, psql vẫn thoát 0 sau một lần nạp đã hỏng và
+đã rollback, khiến script báo "khôi phục xong" trên một DB thật ra vẫn trống: đúng loại thành công giả.
+
+**Tuổi bản dump luôn in ra lúc restore**, cỡ chữ ngang các dòng `✓` khác. Không từ chối vì cũ —
+nhưng nạp âm thầm một bản ba tuần tuổi rồi để người dùng tưởng là dữ liệu hôm qua thì đúng là thành
+công giả.
+
+**Prune** chỉ chạy sau khi bản mới đã ghi xong và `.meta` đã khớp, và không bao giờ xoá bản cuối
+cùng còn lại — kể cả khi `PG_DUMP_KEEP=1` và bản mới lỗi.
+
+## Kiểm chứng
+
+**`--verify` là bằng chứng, phần còn lại chỉ là dấu vết.** Nó nạp `latest` vào một DB tạm, so số
+dòng từng bảng với `.meta`, rồi xoá DB tạm. Không đụng DB thật. Nó trả lời được câu "backup này có
+nạp lại được không" — câu mà một hệ thống backup không có diễn tập chỉ trả lời được lần đầu vào
+đúng lúc tệ nhất.
+
+**Lớp mới trong `make gpu-smoke`:** có `latest` không, tuổi bao nhiêu, `--verify` xanh không.
+
+**Diễn tập thật một lần, lúc nghiệm thu:** dump → `gpu-destroy` → dựng pod mới → xác nhận dữ liệu
+quay về. Tốn một vòng pod (~5 phút theo số đo prebuilt: 284 giây từ pull tới bootstrap xong). Đây
+là lần duy nhất chứng minh được toàn bộ đường dây, và số đo sẽ ghi vào `docs/gpu-pod.md` như các
+mục khác.
+
+## Rủi ro còn lại
+
+- **RPO = từ lần `gpu-down` gần nhất.** Nếu người dùng xoá pod từ web console mà không qua Makefile,
+  phần metadata sinh ra sau lần dump cuối sẽ mất. Media không mất (MinIO trên volume). Đây là lựa
+  chọn có ý thức: không dump định kỳ.
+- **Volume đầy làm dump hỏng im lặng ở lần sau.** Volume 100GB đang giữ ~42GB model; dump metadata
+  cỡ vài MB nên nguy cơ thấp, nhưng `--check` phải báo được để `gpu-smoke` bắt.
+- **Dump chứa bí mật.** Nằm trên volume riêng của tài khoản RunPod. Không rời khỏi volume, nhưng
+  ai truy cập được volume thì đọc được token. Trên MooseFS **không đặt được `600`** — `chmod` bị bỏ
+  qua (đo thật 2026-08-07, xem phần bố cục ở trên), file ra `666` và thư mục `777`. Lớp bảo vệ thật
+  ở đây là volume riêng của tài khoản + pod đơn-người-thuê, **không phải mode**. Trên filesystem có
+  hỗ trợ mode thì `umask 077` cho đúng `700`/`600` ngay từ lúc tạo file.
+
+## Bài toán kế tiếp (spec riêng)
+
+Hạ `DISK` từ 100-120 GB xuống mức có căn cứ. Lý do ghi trong code hiện tại đã lỗi thời —
+`pod-provision.sh:14` vẫn viết *"~33GB model group + OS"*, con số của thời chưa có Network Volume.
+Nghi vấn chính, cần đo trên pod thật trước khi thiết kế: `worker_runtime/linux.py` có **24 lần
+`tempfile.mkdtemp()` nhưng chỉ 1 `shutil.rmtree`** và 1 `TemporaryDirectory`, không có janitor,
+không có `rm -rf /tmp` lúc boot, không đặt `TMPDIR` ở đâu — nghĩa là thư mục tạm của gần như mọi
+job có thể đang tích luỹ vĩnh viễn. Nếu đúng, `DISK=100` đang che một con rò rỉ chứ không phản ánh
+nhu cầu thật.

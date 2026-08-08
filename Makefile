@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help setup dev down clean gpu-preflight gpu-provision gpu-wait gpu-bootstrap gpu-fe gpu-up gpu-down gpu-destroy gpu-status gpu-logs
+.PHONY: help setup dev down clean gpu-preflight gpu-provision gpu-wait gpu-bootstrap gpu-fe gpu-up gpu-down gpu-destroy gpu-db-dump gpu-db-check gpu-status gpu-logs
 
 help: ## Show this help
 	@echo "motion-clone — make targets:"
@@ -62,6 +62,29 @@ endif
 	@echo " ready → https://$(call env,DOMAIN)"
 
 gpu-down: ## Stop the pod (DO NOT FORGET — an idle pod bills by the hour)
+	@# Điểm dump CHÍNH: đây là lúc cuối cùng còn ssh được vào pod. Sau khi dừng, pod im lặng
+	@# cho tới khi bật lại, mà volume thì chỉ mount được qua pod — nên không còn đường nào
+	@# sao lưu hay kiểm tra nữa.
+	@# `|| echo` là CỐ Ý: dump hỏng KHÔNG được chặn việc dừng một pod $$0,99/giờ, và gpu-down
+	@# vốn không làm mất DB (container disk còn nguyên). Chặn ở đây là đốt tiền thật để giữ
+	@# thứ chưa bị đe doạ.
+	@# POD_VOLUME phải truyền theo: trên một pod MỚI, `.env` CỦA POD không có key đó
+	@# (pod-volume.sh:309 gác khối ghi bằng `[ -f .env ]`, mà lúc nó chạy `.env` chưa tồn tại —
+	@# rsync ở pod-bootstrap.sh:99-100 loại trừ cả `.env` lẫn `.env.*`). Thiếu nó thì
+	@# pod-pgdump.sh die("POD_VOLUME trống") và target này in một câu trấn an SAI.
+	@# Rỗng thì vô hại: pod-pgdump.sh cfg() thấy biến rỗng sẽ rơi xuống đọc `.env` của pod.
+	@# PG_DUMP_KEEP cũng phải truyền, và chỉ khi CÓ giá trị. `.env.example` ở gốc repo quảng cáo
+	@# núm này, nhưng pod-pgdump.sh đọc nó từ `.env` CỦA POD — mà `motions-studio/.env.example`
+	@# bị rsync loại trừ nên không bao giờ tới pod. Không truyền = núm xoay chết.
+	@# Dùng hàm `if` của Make (chỉ chèn khi có giá trị) để không ghi đè mặc định 20 bằng chuỗi
+	@# rỗng. Chú ý: viết `$$(if …)` chứ đừng viết dạng trần trong comment — Make nở nó thật
+	@# và chết ngay ở `make -n`, đúng bẫy mà M10 đã gặp với `$$0,99`.
+	@ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
+		-p $(call env,GPU_SSH_PORT) root@$(call env,GPU_SSH_HOST) \
+		"cd ~/motion-backend && POD_VOLUME='$(call env,POD_VOLUME)' \
+		 $(if $(call env,PG_DUMP_KEEP),PG_DUMP_KEEP='$(call env,PG_DUMP_KEEP)') \
+		 bash ./setup/pod-pgdump.sh --dump" \
+		|| echo "!! sao lưu DB thất bại — vẫn dừng pod. DB còn trên container disk, chỉ mất nếu gpu-destroy."
 ifeq ($(shell grep -E '^GPU_PROVIDER=' .env 2>/dev/null | cut -d= -f2),runpod)
 	@runpodctl pod stop $(call env,GPU_INSTANCE_ID)
 else
@@ -75,6 +98,18 @@ endif
 # only found out from the invoice.
 gpu-destroy: ## Permanently destroy the pod (frees the GPU, deletes its disk — irreversible)
 	@test -n "$(call env,GPU_INSTANCE_ID)" || { echo "GPU_INSTANCE_ID is empty in .env — nothing to destroy"; exit 1; }
+	@# Cố sao lưu lần cuối. KHÔNG nuốt stderr: pod-pgdump.sh báo lỗi nghiêm trọng qua die() ra
+	@# stderr, và đây là ngay trước một thao tác không hoàn tác được. Nếu pod đã dừng thì ssh tự
+	@# in lỗi kết nối — ồn hơn một chút, nhưng đó là tiếng ồn TRUNG THỰC. Nuốt hết rồi đoán
+	@# "pod đã dừng?" là khẳng định một nguyên nhân ta không biết, ngay lúc người dùng cần biết nhất.
+	@# POD_VOLUME / PG_DUMP_KEEP: xem chú thích ở gpu-down — không truyền POD_VOLUME thì đây là
+	@# no-op trên pod đầu tiên, tức đúng lúc trước một thao tác KHÔNG HOÀN TÁC ĐƯỢC.
+	@ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
+		-p $(call env,GPU_SSH_PORT) root@$(call env,GPU_SSH_HOST) \
+		"cd ~/motion-backend && POD_VOLUME='$(call env,POD_VOLUME)' \
+		 $(if $(call env,PG_DUMP_KEEP),PG_DUMP_KEEP='$(call env,PG_DUMP_KEEP)') \
+		 bash ./setup/pod-pgdump.sh --dump" \
+		|| echo "!! sao lưu lần cuối KHÔNG thành công (lý do ở ngay trên) — vẫn XOÁ pod theo yêu cầu."
 ifeq ($(shell grep -E '^GPU_PROVIDER=' .env 2>/dev/null | cut -d= -f2),runpod)
 	@runpodctl pod delete $(call env,GPU_INSTANCE_ID) || true
 	@sleep 3
@@ -104,20 +139,33 @@ gpu-volume: ## Wire models/PGDATA/MinIO onto the Network Volume (idempotent; gpu
 	@test -n "$(call env,POD_VOLUME)" || { echo "set POD_VOLUME in .env first (see docs/gpu-pod.md#network-volume)"; exit 1; }
 	@ssh -o StrictHostKeyChecking=accept-new -p $(call env,GPU_SSH_PORT) root@$(call env,GPU_SSH_HOST) \
 		"cd ~/motion-backend && POD_VOLUME=$(call env,POD_VOLUME) MTC_PREBUILT=$(call env,MTC_PREBUILT) \
-		 MODELS_MIN_GB=$(call env,MODELS_MIN_GB) ./setup/pod-volume.sh"
+		 MODELS_MIN_GB=$(call env,MODELS_MIN_GB) bash ./setup/pod-volume.sh"
 
 gpu-volume-adopt: ## ONE-TIME: move models/PGDATA/MinIO already on the pod ONTO the volume (keeps source as .bak)
 	@test -n "$(call env,POD_VOLUME)" || { echo "set POD_VOLUME in .env first"; exit 1; }
 	@echo "This stops nothing, copies data onto the volume, and renames the source to .bak-<timestamp>."
 	@ssh -o StrictHostKeyChecking=accept-new -p $(call env,GPU_SSH_PORT) root@$(call env,GPU_SSH_HOST) \
 		"cd ~/motion-backend && POD_VOLUME=$(call env,POD_VOLUME) MTC_PREBUILT=$(call env,MTC_PREBUILT) \
-		 MODELS_MIN_GB=$(call env,MODELS_MIN_GB) ./setup/pod-volume.sh --adopt"
+		 MODELS_MIN_GB=$(call env,MODELS_MIN_GB) bash ./setup/pod-volume.sh --adopt"
 
 gpu-volume-check: ## Prove the volume is really in use (catches "green but re-downloading 33GB")
 	@test -n "$(call env,POD_VOLUME)" || { echo "set POD_VOLUME in .env first"; exit 1; }
 	@ssh -o StrictHostKeyChecking=accept-new -p $(call env,GPU_SSH_PORT) root@$(call env,GPU_SSH_HOST) \
 		"cd ~/motion-backend && POD_VOLUME=$(call env,POD_VOLUME) \
-		 MODELS_MIN_GB=$(call env,MODELS_MIN_GB) ./setup/pod-volume.sh --check"
+		 MODELS_MIN_GB=$(call env,MODELS_MIN_GB) bash ./setup/pod-volume.sh --check"
+
+gpu-db-dump: ## Sao lưu database sang Network Volume (pod phải đang chạy)
+	@# POD_VOLUME / PG_DUMP_KEEP: xem chú thích ở gpu-down.
+	@ssh -o StrictHostKeyChecking=accept-new -p $(call env,GPU_SSH_PORT) root@$(call env,GPU_SSH_HOST) \
+		"cd ~/motion-backend && POD_VOLUME='$(call env,POD_VOLUME)' \
+		 $(if $(call env,PG_DUMP_KEEP),PG_DUMP_KEEP='$(call env,PG_DUMP_KEEP)') \
+		 bash ./setup/pod-pgdump.sh --dump"
+
+gpu-db-check: ## Bản dump mới nhất bao lâu rồi, có nạp lại được không (chạy --check + --verify)
+	@# POD_VOLUME: xem chú thích ở gpu-down.
+	@ssh -o StrictHostKeyChecking=accept-new -p $(call env,GPU_SSH_PORT) root@$(call env,GPU_SSH_HOST) \
+		"cd ~/motion-backend && POD_VOLUME='$(call env,POD_VOLUME)' bash ./setup/pod-pgdump.sh --check \
+		 && POD_VOLUME='$(call env,POD_VOLUME)' bash ./setup/pod-pgdump.sh --verify"
 
 gpu-smoke: ## Prove the pod really works end-to-end (SMOKE_REF=img SMOKE_DRIVER=vid for a motion job, +SMOKE_PRODUCT=img for tryon, SMOKE_PROMPT="..." for create-image)
 	@bash scripts/pod-smoke.sh

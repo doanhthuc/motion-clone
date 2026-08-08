@@ -323,10 +323,22 @@ Nhịp dùng thật đo 24/07 → 02/08: **1,19 giờ/ngày ≈ $35/tháng**. Nh
 chạy cả tháng là **$713** — gấp 20 lần. `POD_MAX_HOURS` (mặc định **8**) truyền `--stop-after` vào
 `runpodctl pod create`, nên một lần quên tốn **~$8** thay vì $713.
 
-**`--stop-after`, không `--terminate-after`** — và đây là lựa chọn có chủ ý. Cả hai đều dừng tiền
-GPU, nhưng `terminate` **xoá pod**, mà `VOLUME_PGDATA=0` (mặc định, vì MooseFS chặn `chown`) nghĩa
-là PGDATA nằm trên container disk → **mất database**. Một lưới an toàn không được tự phá dữ liệu.
-`stop` giữ container disk nên DB sống, và `make gpu-up` bật lại được.
+**`--stop-after`, không `--terminate-after`** — vẫn là lựa chọn có chủ ý, dù cái giá của `terminate`
+đã đổi từ 07/08/2026. Cơ chế không đổi: cả hai đều dừng tiền GPU, nhưng `terminate` **xoá pod**
+(gồm container disk), còn `stop` giữ nguyên container disk nên `make gpu-up` bật lại được ngay với
+DB còn nguyên. `VOLUME_PGDATA=0` (mặc định, vì MooseFS chặn `chown`) nghĩa là PGDATA vẫn nằm trên
+container disk đó — `terminate` vẫn xoá nó.
+
+Cái mất đã đổi. Trước đây `terminate` là mất SẠCH database, không có gì để dựng lại. Từ khi có
+[`pod-pgdump.sh`](#pg-backup), `gpu-destroy` cố dump lần cuối trước khi xoá, và pod mới dựng lên sẽ
+tự khôi phục từ bản dump gần nhất trên volume — nên cái mất tối đa giờ chỉ còn là **metadata ghi
+sau lần dump cuối cùng** (users, jobs, workflows, api keys mới tạo giữa hai lần dump). Media (ảnh,
+video output) không nằm trong dump này — MinIO cũng ở trên volume, không phụ thuộc PGDATA, nên
+không mất.
+
+Vẫn giữ `--stop-after`: mất metadata từ lần dump cuối vẫn là **mất thật**, không phải mất-nhưng-
+không-sao. Một lưới chống-quên-tắt-pod không nên đặt cược vào việc bạn đã nhớ `make gpu-db-dump`
+hay chưa trước khi để nó xoá pod.
 
 Đổi lại, và phải nhớ: **pod đã dừng vẫn tính tiền container disk.** Lưới này chặn khoản đắt (GPU
 $0,99/giờ), không chặn hết. Dọn hẳn vẫn là `make gpu-destroy`.
@@ -607,24 +619,38 @@ Nên `VOLUME_PGDATA=0` là mặc định. Hệ quả:
 | | |
 |---|---|
 | DB sống qua `gpu-down` → `gpu-up` | ✅ container disk còn |
-| DB sống qua `gpu-destroy` | ❌ **mất** |
+| PGDATA nằm trên volume | ❌ không thể (MooseFS chặn `chown`) |
+| DB sống qua `gpu-destroy` | ✅ dựng lại từ bản `pg_dump` trên volume — mất phần ghi SAU lần dump cuối |
 | Model 33GB | ✅ vẫn trên volume, vẫn không phải tải lại |
 
-Muốn giữ DB qua `destroy` thì dump ra volume **trước khi destroy** (chưa tự động hoá):
+PGDATA vẫn ở container disk và `gpu-destroy` vẫn xoá nó. Thứ sống sót là một bản sao **logic**
+(`pg_dump`) đặt trên volume — ghi file thường lên MooseFS thì bình thường, chỉ `chown` mới bị
+chặn. `setup/pod-pgdump.sh` là nơi duy nhất biết bố cục thư mục dump; đừng ghi backup vào chỗ
+khác, `--restore` sẽ không thấy.
+
+Đã tự động hoá, **không cần gõ `pg_dump` tay**:
 
 ```bash
-# trên pod, TRƯỚC make gpu-destroy
-ssh -p $GPU_SSH_PORT root@$GPU_SSH_HOST \
-  'mkdir -p /workspace/pg-backup && sudo -u postgres pg_dump motion \
-   | gzip > /workspace/pg-backup/motion-$(date +%Y%m%d-%H%M).sql.gz'
-
-# trên pod MỚI, SAU make gpu-bootstrap
-ssh -p $GPU_SSH_PORT root@$GPU_SSH_HOST \
-  'zcat $(ls -t /workspace/pg-backup/*.sql.gz | head -1) | sudo -u postgres psql motion'
+make gpu-db-dump     # sao lưu ngay bây giờ
+make gpu-db-check    # bản mới nhất bao lâu rồi + NẠP THỬ vào một DB tạm rồi so số dòng
+make gpu-down        # tự dump trước khi dừng pod
+make gpu-destroy     # cố dump lần cuối trước khi xoá
+make gpu-bootstrap   # trên pod MỚI: tự khôi phục, nhưng CHỈ khi DB đang trống
 ```
 
-Kiểm dump có toàn vẹn không trước khi tin: `gzip -t <file>`. Một bản dump hỏng còn tệ hơn không
-có, vì nó khiến bạn yên tâm destroy.
+Ba điều cần biết trước khi tin vào nó:
+
+- **Không có cổng chặn nào.** Dump hỏng thì `gpu-down`/`gpu-destroy` in cảnh báo rồi **vẫn chạy
+  tiếp** — không để một backup hỏng giữ lại một pod đang tính tiền theo giờ. Nghĩa là bạn phải
+  ĐỌC output, không chỉ nhìn nó chạy xong.
+- **`--restore` chỉ nạp khi schema `public` không có bảng nào.** DB đã có bảng thì nó bỏ qua và
+  không nạp đè. Muốn khôi phục lên một DB đang có dữ liệu thì phải tự quyết và tự làm.
+- **`make gpu-db-check` là bằng chứng, `ls` thì không.** Một file `.sql.gz` rỗng vẫn là một file.
+  `--verify` nạp thật vào DB tạm rồi so số dòng với `.meta`, nên nó chứng minh chứ không ghi nhận.
+  Chạy nó **trước** `gpu-destroy`, không phải sau.
+
+Lớp 6 của `make gpu-smoke` chạy đúng hai lệnh này và làm smoke **đỏ** nếu đã đặt `POD_VOLUME` mà
+không có bản dump nạp được.
 
 
 ### 3 · MinIO từ chối symlink làm drive
@@ -1137,7 +1163,7 @@ Hai chi phí lặp lại mỗi lần dựng pod, và cách xoá chúng:
 |---|---|---|
 | ~33GB tải model **trong app** | `lib-feature.sh` cố ý không tải model; bạn tự bấm Settings → Models AI mỗi pod mới | `POD_VOLUME` |
 | ~20-35 phút cài phần mềm | `setup-motion-transfer.sh` cài ComfyUI + torch + custom node từ đầu | `MTC_PREBUILT=1` — **đo 06/08/2026 trên pod GPU thật: còn 284 giây ≈ 4,7 phút** (pull image 16,20 GB + boot 176 giây + `make gpu-bootstrap` 108 giây, rc=0) |
-| Mất users/jobs/workflows | Postgres nằm ở `/var/lib/postgresql` trên container disk, bị dựng lại mỗi Stop/Start | `POD_VOLUME` |
+| Mất users/jobs/workflows khi `gpu-destroy` | PGDATA nằm ở `/var/lib/postgresql` trên container disk — MooseFS chặn `chown` nên **không** dời được lên volume ([bẫy #2](#runpod-gotchas)) | `POD_VOLUME` + [`pod-pgdump.sh`](#pg-backup) — dựng lại từ bản `pg_dump`, mất phần ghi sau lần dump cuối |
 
 ### Tạo volume (một lần)
 
@@ -1203,6 +1229,135 @@ cứng (exit 1) — và manifest cố ý **không** bị ghi đè lúc đó, đ�
   đọc hàng nghìn file nhỏ, mà `run_enhance` gọi `comfy_recycle` giữa mỗi chunk RIFE nên ComfyUI
   restart nhiều lần trong một job. Phần mềm để `MTC_PREBUILT=1` lo.
 
+<a id="pg-backup"></a>
+### Sao lưu database (pg_dump sang volume) — nghiệm thu 07/08/2026
+
+PGDATA vẫn ở container disk như [bẫy #2](#runpod-gotchas) giải thích — MooseFS chặn `chown` nên
+Postgres không mở được cluster đặt trên volume. Thứ sống sót qua `gpu-destroy` là một bản sao
+**logic**: `motions-studio/setup/pod-pgdump.sh` chạy `pg_dump` rồi ghi ra volume như file thường,
+thứ MooseFS không cấm.
+
+**Bố cục trên `$POD_VOLUME/pg/`:**
+
+```
+$POD_VOLUME/pg/
+├── dumps/
+│   ├── motion-20260807-083400.sql.gz
+│   ├── motion-20260807-083400.meta      # created, pg_version, dump_bytes, rồi <bảng>=<số dòng>
+│   ├── motion-20260807-083529.sql.gz
+│   └── motion-20260807-083529.meta
+└── latest -> dumps/motion-20260807-083529.sql.gz   # symlink tương đối, luôn trỏ bản mới nhất
+```
+
+Có thêm **một khoá tuỳ chọn**, chỉ xuất hiện khi cần: `meta_incomplete=1`. `--dump` ghi nó khi
+parser gặp một dòng mở đầu bằng `COPY ` mà nó không xử được, và cờ đi cùng **file** chứ không chỉ
+cùng lần chạy — cảnh báo trên terminal biến mất khi màn hình cuộn qua, hệ quả thì sống với bản
+dump. Hai nguyên nhân, và chúng khác nhau ở chỗ quan trọng nhất:
+
+| Nguyên nhân | `.meta` | `--verify` |
+|---|---|---|
+| identifier (tên bảng/cột) chứa ký tự **xuống dòng** — `pg_dump` phát header COPY vỡ làm nhiều dòng vật lý | **thiếu hẳn** bảng đó | **đỏ**, và đỏ vì `.meta` cụt chứ không phải vì file hỏng |
+| một dòng SQL `pg_dump` chép nguyên văn (thân `CREATE FUNCTION`, `COMMENT ON`, định nghĩa view) trông giống header nhưng nháy kép không cân — `COPY jobs " FROM stdin;` | **đầy đủ** | **xanh** |
+
+Nên `meta_incomplete=1` đọc là *"danh sách bảng CÓ THỂ thiếu"*, không phải *"chắc chắn thiếu"*.
+`--check` không đọc lại file dump nên nó không phân biệt được hai trường hợp và nói đúng như vậy;
+chỉ `--verify` mới trả lời dứt điểm. Cả hai trường hợp: **bản dump vẫn tốt và vẫn `--restore`
+được** — cờ này không bao giờ là lý do để xoá một bản backup.
+
+**Ba điểm gọi `--dump`, không cái nào định kỳ (không cron, không app PM2):**
+
+1. **`make gpu-down`** — điểm chính. Đây là lúc **cuối cùng** còn SSH vào pod được trước khi dừng
+   nó; mọi thay đổi sau mốc này (cho tới lần `gpu-db-dump` hoặc `gpu-down` kế tiếp) không nằm
+   trong backup nào.
+2. **`make gpu-destroy`** — cố dump lần cuối, best-effort, chỉ có tác dụng nếu pod còn sống (chưa
+   bị `gpu-down` từ trước).
+3. **`make gpu-db-dump`** — thủ công, gọi bất cứ lúc nào pod đang chạy.
+
+**Khôi phục:** `phase_pg_restore()` (`motions-studio/setup/lib-feature.sh:877`), gọi từ
+`feature_main()` ngay **sau `phase_postgres`** — dump chứa `ALTER TABLE ... OWNER TO` và `GRANT`
+nên role + database phải tồn tại trước — và **trước `phase_pm2`**, vì api khởi động sẽ tự chạy
+`migrate.js` tạo bảng rỗng; nạp dump vào DB đã có bảng là lỗi trùng. Chỉ nạp khi schema `public`
+**không có bảng nào** — có bảng (kể cả 0 dòng) thì bỏ qua, không nạp đè.
+
+**Kiểm:** `make gpu-db-check` chạy `--check` (tuổi bản dump, số bảng, số dòng trong `.meta`) rồi
+`--verify` (nạp thật vào DB tạm `${PG_DB}_verify` và so số dòng). `ls` không chứng minh được gì —
+một `.sql.gz` rỗng vẫn là một file; `--verify` là bằng chứng, không phải dấu vết.
+
+**Không có cổng chặn nào.** Dump hỏng không ngăn `gpu-down`/`gpu-destroy` chạy tiếp — cố ý: chặn
+việc dừng một pod đang tính tiền $0,99/giờ để "bảo vệ" một bản backup là đốt tiền thật, để đổi lấy
+một rủi ro nhỏ hơn nhiều (mất phần ghi từ lần dump cuối, khôi phục lại được từ bản trước đó).
+
+**Số đo thật, 07/08/2026, hai lần thuê pod RTX 5090 ở EU-RO-1, tổng ~25 phút:**
+
+| | Pod 1 (`oqjoy0ri5dlsmo`) | Pod 2 (`rrywwstiq11q97`, dựng mới sau khi pod 1 đã bị xoá) |
+|---|---|---|
+| SSH sẵn sàng | 2 phút | 2 phút |
+| `make gpu-bootstrap` | rc=0 · phase khôi phục: "chưa có bản dump nào trên volume — bỏ qua (đây là phiên đầu)" | rc=0 · "tuổi bản dump: 0 giờ (motion-20260807-083529.sql.gz)" → "✓ khôi phục xong từ motion-20260807-083529.sql.gz" |
+| `make gpu-db-dump` | tạo `motion-20260807-083400.sql.gz`, **6656 bytes** | — |
+| `make gpu-db-check` | "nạp lại được và số dòng khớp .meta (25 bảng)" | 25 bảng, verify xanh, **số bản đang giữ: 2** |
+| `make gpu-down` | dump lần nữa (`motion-20260807-083529.sql.gz`) rồi dừng pod | — |
+| `make gpu-destroy` trên pod đã dừng | `ssh: connect to host ... Connection refused` → `!! sao lưu lần cuối KHÔNG thành công (lý do ở ngay trên) — vẫn XOÁ pod theo yêu cầu.` → pod xoá, biến mất khỏi `runpodctl pod list` | — |
+| Dữ liệu sau khôi phục | — | `users=2 · workflows=2 · workers=1 · api_keys=1 · task_cloud_auto_settings=1` |
+
+Pod 2 không có gì chung với Pod 1 ngoài cùng một volume. Số dòng quay về đúng những gì Pod 1 đã ghi
+trước khi bị xoá — chứng minh cả đường dây: dump ở `gpu-down` → `gpu-destroy` (dump lần cuối thất
+bại vì pod đã dừng, vẫn xoá) → provision pod mới → `gpu-bootstrap` tự khôi phục từ bản dump mới nhất
+còn đọc được (bản của `gpu-down`, vì bản của `gpu-destroy` không tạo được).
+
+**Đã đo bổ sung, 08/08/2026 — pod thứ ba (`u8xnp8yw2n4p1w`), đường 9 lớp đầy đủ:**
+
+Lệnh chạy — cả ba lớp GPU đều bật, không lớp nào bị bỏ qua:
+
+```
+SMOKE_REF=.smoke/nhanvat.jpeg SMOKE_DRIVER=.smoke/dandong.mp4 \
+SMOKE_PRODUCT=.smoke/sanpham.jpeg SMOKE_PROMPT="a red car on a street" make gpu-smoke
+```
+
+| | |
+|---|---|
+| Kết quả | **9/9 lớp pass**, `smoke test passed`, exit 0 |
+| Lớp 6 (sao lưu DB) | `bản dump mới nhất: motion-20260807-084148.sql.gz · 17 giờ tuổi · 6755 bytes` · `số bản đang giữ: 3` · `verify: nạp lại được và số dòng khớp .meta (25 bảng)` |
+| Lớp 7 motion | Wan 2.2 Animate → mp4 286 KB |
+| Lớp 8 tryon | Qwen-Image-Edit (tryon) + bg-remover → png 1203 KB |
+| Lớp 9 create-image | Qwen-Image-Edit → png 2799 KB |
+
+Lần chạy này còn kiểm được hai đường mà đợt 07/08 không chạm tới:
+
+- **Khôi phục từ bản dump CŨ.** Pod 3 dựng mới hoàn toàn, `gpu-bootstrap` nạp bản dump 17 giờ tuổi
+  còn trên volume từ hôm trước: `tuổi bản dump: 17 giờ` → `✓ khôi phục xong`. Đợt 07/08 bản dump
+  chỉ 0 giờ tuổi nên đường in tuổi thật chưa được kiểm.
+- **`--dump` trên volume bỏ qua `chmod` KHÔNG còn báo lỗi.** Lệnh dump trong `gpu-destroy` in ra
+  dòng thông tin `… 666; dump vẫn tốt. Bảo mật ở đây dựa vào volume là riêng của tài khoản và pod
+  đơn-người-thuê, không dựa vào mode.` thay vì cảnh báo `QUYỀN SAI` như đợt 07/08 — đúng hành vi
+  mong đợi sau khi thêm phép dò `_fs_honors_modes` (xem tiểu mục ngay dưới).
+
+#### Quyền file trên volume: `600` không đặt được
+
+Đo thật 07/08/2026, trên volume `wfe86wzkpm` mount ở `/workspace`:
+
+```
+chmod 600 <file trên /workspace>  → stat vẫn 666
+chmod 600 <file trên /tmp>         → stat 600
+thư mục trên volume                → 777
+mount: mfs#euro-3.runpod.net:9421 on /workspace type fuse (rw,nosuid,nodev,relatime,user_id=0,group_id=0,allow_other)
+symlink(): CHẠY ĐƯỢC — latest -> dumps/motion-20260807-083529.sql.gz (tương đối)
+```
+
+MooseFS bỏ qua `chmod` hoàn toàn — y như nó đã chặn `chown` ([bẫy #2](#runpod-gotchas)). `chmod 600`
+trả về `0` (không báo lỗi gì) nhưng không đổi mode thật, nên chờ `stat` ra `600` sau một lệnh
+`chmod` là chờ một thứ không bao giờ tới trên volume này. `pod-pgdump.sh` dò việc này bằng
+`_fs_honors_modes()` — tạo một file dò, `chmod 600`, `stat` lại — trước khi quyết: filesystem không
+tôn trọng mode thì in **một dòng** thông tin và `--dump` vẫn trả `0`; filesystem CÓ tôn trọng mà
+mode vẫn sai thì cảnh báo to + exit khác `0`. Test ở `motions-studio/setup/tests/pgdump-test.sh`
+vẫn giữ nguyên assertion `700`/`600` — chạy trên APFS của máy dev, một filesystem tôn trọng mode,
+nên hai nhánh không nuốt lẫn nhau.
+
+Vì mode không đặt được, bảo mật của bản dump trên volume **không dựa vào quyền file** — nó dựa vào
+volume là tài sản riêng của tài khoản RunPod (không tài khoản khác mount được) và pod là
+đơn-người-thuê (không có tenant nào khác đọc chung filesystem này). Dump chứa dữ liệu nhạy cảm
+(`api_keys`, `user_sessions.token_hash`, token `social_accounts`), nên đây là một đánh đổi có ý
+thức, không phải sơ suất bỏ quên.
+
 <a id="image-dung-san"></a>
 ### Image dựng sẵn (`MTC_PREBUILT=1`)
 
@@ -1228,7 +1383,7 @@ cài-từ-đầu mà không biết.
 | **Tổng đường đi sạch** | **284 giây ≈ 4,7 phút**, so với baseline 20-35 phút |
 | torch trong image | `2.12.1+cu130` — `torch.cuda.get_device_capability()` ra `(12, 0)` trên RTX 5090 |
 | `JOB_TYPES` thật (bị `JOB_TYPES_OVERRIDE` cắt từ 21 type của profile `full` xuống, vì model chưa tải đủ — xem `.env.example`) | 16 type |
-| `make gpu-smoke` | 8/8 lớp pass (lớp 6 motion, lớp 7 tryon, lớp 8 create-image — trigger bằng `SMOKE_PRODUCT`/`SMOKE_PROMPT`, xem [§Kiểm chứng](#smoke)) |
+| `make gpu-smoke` | 8/8 lớp pass — đo TRƯỚC khi thêm lớp sao lưu DB (khi đó tổng 8 lớp: motion/tryon/create-image là lớp 6/7/8 lúc đó). Sau khi Lớp 6 sao lưu DB chen vào, numbering hiện tại là **motion=7, tryon=8, create-image=9** (trigger bằng `SMOKE_PRODUCT`/`SMOKE_PROMPT`, xem [§Kiểm chứng](#smoke)); tổng đường 9 lớp **đã chạy đầy đủ 08/08/2026: 9/9 pass** (xem [§Sao lưu database](#pg-backup)) |
 
 Hai điều tưởng đúng lúc thiết kế nhưng đo thật thì sai:
 
@@ -1250,7 +1405,7 @@ Hai điều tưởng đúng lúc thiết kế nhưng đo thật thì sai:
 node, hoặc `models/` là thư mục rỗng trên container disk. Lỗi đắt tiền nhất ở đây không ồn ào mà
 là **thành công giả**: mọi thứ xanh, và app lặng lẽ tải lại 33GB.
 
-`make gpu-smoke` kiểm tám lớp, rẻ trước đắt sau, mỗi lớp in ra nó **chứng minh** điều gì:
+`make gpu-smoke` kiểm chín lớp, rẻ trước đắt sau, mỗi lớp in ra nó **chứng minh** điều gì:
 
 | Lớp | Kiểm | Chứng minh |
 |---|---|---|
@@ -1259,28 +1414,34 @@ là **thành công giả**: mọi thứ xanh, và app lặng lẽ tải lại 33
 | 3 | `pm2 jlist` | mọi app online, không app nào crash-loop |
 | 4 | `/object_info/WanVideoModelLoader` | custom node đã nạp thật; thiếu là job motion chết với 400 *"node type not found"* |
 | 5 | `pod-volume.sh --check` | volume thật sự đang được dùng, số file model không giảm |
-| 6 | một job motion thật | năm lớp trên chứng minh từng mảnh đúng; chỉ job thật chứng minh chúng **ghép lại** đúng |
-| 7 | một job tryon thật | `qwen2.5vl:7b` auto-detect trang phục + venv `bg-remover` bake trong image — chỉ profile `full` mới có, chưa lớp nào trên chạm tới |
-| 8 | một job create-image thật | Qwen-Image-Edit chạy chỉ-bằng-prompt (không cần ảnh) |
+| 6 | `pod-pgdump.sh --check && --verify` | có bản dump trên volume, và nó **nạp lại được** — diễn tập vào một DB tạm, không chỉ kiểm "có file" (xem [§Sao lưu database](#pg-backup)) |
+| 7 | một job motion thật | sáu lớp trên chứng minh từng mảnh đúng; chỉ job thật chứng minh chúng **ghép lại** đúng |
+| 8 | một job tryon thật | `qwen2.5vl:7b` auto-detect trang phục + venv `bg-remover` bake trong image — chỉ profile `full` mới có, chưa lớp nào trên chạm tới |
+| 9 | một job create-image thật | Qwen-Image-Edit chạy chỉ-bằng-prompt (không cần ảnh) |
 
-Lớp 6-8 opt-in, mỗi lớp một biến trigger riêng — repo không có sẵn media mẫu, và lớp 8 cố ý
+Lớp 7-9 opt-in, mỗi lớp một biến trigger riêng — repo không có sẵn media mẫu, và lớp 9 cố ý
 **không** chạy cùng `SMOKE_REF`/`SMOKE_DRIVER` để `make gpu-smoke` trần giữ đúng cam kết "chỉ kiểm
-readiness, không tốn GPU" khi không đặt biến:
+readiness, không tốn GPU" khi không đặt biến. Lớp 6 (sao lưu DB) **không** opt-in — nó chạy cùng
+nhóm rẻ 1-5 mỗi lần, vì `--check`/`--verify` không tốn GPU:
 
 ```bash
-SMOKE_REF=nhanvat.jpg SMOKE_DRIVER=dandong.mp4 make gpu-smoke   # + lớp 6: motion
-SMOKE_REF=nhanvat.jpg SMOKE_PRODUCT=aoso.jpg make gpu-smoke     # + lớp 7: tryon
-SMOKE_PROMPT="a red car" make gpu-smoke                          # + lớp 8: create-image
+SMOKE_REF=nhanvat.jpg SMOKE_DRIVER=dandong.mp4 make gpu-smoke   # + lớp 7: motion
+SMOKE_REF=nhanvat.jpg SMOKE_PRODUCT=aoso.jpg make gpu-smoke     # + lớp 8: tryon
+SMOKE_PROMPT="a red car" make gpu-smoke                          # + lớp 9: create-image
 ```
 
-Lớp 6 gửi job nhỏ nhất mà vẫn đi hết đường ống (540p, 33 frame), poll tới khi `done`, rồi tải
+Lớp 7 gửi job nhỏ nhất mà vẫn đi hết đường ống (540p, 33 frame), poll tới khi `done`, rồi tải
 output về `/tmp/smoke-out.mp4` và kiểm dung lượng. Đường đi: Postgres → worker claim → ComfyUI nạp
-Wan Animate **từ volume** → DWPose → sampling → VAE decode → MinIO → API trả URL. Lớp 7-8 cùng cơ
+Wan Animate **từ volume** → DWPose → sampling → VAE decode → MinIO → API trả URL. Lớp 8-9 cùng cơ
 chế, tải về `/tmp/smoke-out-tryon.png` và `/tmp/smoke-out-create.png`.
 
-Đo thật 06/08/2026: 8/8 lớp pass — motion 286 KB mp4, tryon 1378 KB png, create-image 1785 KB png.
+Đo thật 06/08/2026 (**trước khi thêm lớp 6 sao lưu DB** — khi đó tổng chỉ 8 lớp, và motion/tryon/
+create-image là lớp 6/7/8 lúc bấy giờ): 8/8 lớp pass — motion 286 KB mp4, tryon 1378 KB png,
+create-image 1785 KB png. Lớp 6 sao lưu DB (numbering hiện tại) được thêm sau đó và **chưa từng
+chạy qua `make gpu-smoke` trên pod thật** — nghiệm thu 07/08/2026 gọi thẳng `make gpu-db-check`
+thay vì full smoke, xem [§Sao lưu database](#pg-backup).
 
-Thiếu `GPU_SSH_HOST`/`GPU_SSH_PORT` trong `.env` thì lớp 3-5 tự bỏ qua kèm thông báo rõ, không
+Thiếu `GPU_SSH_HOST`/`GPU_SSH_PORT` trong `.env` thì lớp 3-6 tự bỏ qua kèm thông báo rõ, không
 im lặng báo pass.
 
 ## Không còn lấy bản mới từ upstream
