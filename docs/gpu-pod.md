@@ -165,10 +165,14 @@ giờ tiền đĩa. Nó cũng **tự dump trước khi dừng**, nên không m�
 ### Giai đoạn 3 — dọn
 
 ```bash
-make gpu-destroy    # xoá pod, verify nó chết thật, rồi nhắc dọn .env
+make gpu-destroy    # xoá pod, verify nó chết thật, rồi TỰ dọn .env
 ```
 
-Rồi xoá tay 3 dòng trong `.env`: `GPU_INSTANCE_ID`, `GPU_SSH_HOST`, `GPU_SSH_PORT`.
+Ba khoá `GPU_INSTANCE_ID` / `GPU_SSH_HOST` / `GPU_SSH_PORT` được `scripts/env-clear-pod.sh` xoá
+**tự động**, và chỉ ở nhánh đã verify pod biến mất thật. Script giữ nguyên dòng `KEY=` (xoá cả
+dòng sẽ làm `gpu-preflight` báo "thiếu khoá" thay vì "chưa có pod"), giữ nguyên quyền file, ghi
+qua file tạm rồi `mv` nguyên tử, và **từ chối ghi đè** nếu kết quả lệch số dòng so với bản gốc —
+`.env` giữ `POSTGRES_PASSWORD` và `API_KEY`, một lần ghi hỏng ở đây đắt hơn nhiều so với xoá tay.
 
 Cái **không** bị xoá, và không nên xoá: Network Volume (giữ model + database, vẫn tính tiền
 tháng), Cloudflare Tunnel + DNS (miễn phí, lần dựng sau tái dùng đúng tunnel đó vì tên tunnel

@@ -119,7 +119,7 @@ ifeq ($(shell grep -E '^GPU_PROVIDER=' .env 2>/dev/null | cut -d= -f2),runpod)
 		exit 1; \
 	else \
 		echo "destroyed — verified gone from 'runpodctl pod list'"; \
-		echo "now clear GPU_INSTANCE_ID / GPU_SSH_HOST / GPU_SSH_PORT in .env"; \
+		bash scripts/env-clear-pod.sh; \
 		echo "NOTE: the Network Volume still exists and still bills monthly — that is deliberate."; \
 	fi
 else
@@ -131,7 +131,7 @@ else
 		exit 1; \
 	else \
 		echo "destroyed — verified gone from 'vastai show instances'"; \
-		echo "now clear GPU_INSTANCE_ID / GPU_SSH_HOST / GPU_SSH_PORT in .env"; \
+		bash scripts/env-clear-pod.sh; \
 	fi
 endif
 
