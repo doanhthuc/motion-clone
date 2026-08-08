@@ -61,7 +61,7 @@ endif
 	@until curl -sf https://$(call env,DOMAIN)/health >/dev/null 2>&1; do printf "."; sleep 5; done
 	@echo " ready → https://$(call env,DOMAIN)"
 
-gpu-down: ## Stop the pod (DO NOT FORGET — an idle pod bills by the hour)
+gpu-down: ## Pause the pod for a short break (container disk keeps billing — prefer gpu-destroy when done)
 	@# Điểm dump CHÍNH: đây là lúc cuối cùng còn ssh được vào pod. Sau khi dừng, pod im lặng
 	@# cho tới khi bật lại, mà volume thì chỉ mount được qua pod — nên không còn đường nào
 	@# sao lưu hay kiểm tra nữa.
@@ -96,7 +96,7 @@ endif
 # skipping a safety check: typing `make gpu-destroy` IS the confirmation. What matters is the
 # verify below. Without it the target printed "GPU pod destroyed" over an aborted destroy, and you
 # only found out from the invoice.
-gpu-destroy: ## Permanently destroy the pod (frees the GPU, deletes its disk — irreversible)
+gpu-destroy: ## DEFAULT when done — destroy the pod (DB is restored from the volume next time, ~5 min)
 	@test -n "$(call env,GPU_INSTANCE_ID)" || { echo "GPU_INSTANCE_ID is empty in .env — nothing to destroy"; exit 1; }
 	@# Cố sao lưu lần cuối. KHÔNG nuốt stderr: pod-pgdump.sh báo lỗi nghiêm trọng qua die() ra
 	@# stderr, và đây là ngay trước một thao tác không hoàn tác được. Nếu pod đã dừng thì ssh tự

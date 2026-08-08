@@ -128,16 +128,37 @@ màu xanh, chạy một job thật.
 
 | Việc | Lệnh |
 |---|---|
-| Bật pod đã có | `make gpu-up` |
-| **Tắt pod khi xong** | `make gpu-down` |
+| **Xong việc** | `make gpu-destroy` — xoá hẳn, dừng mọi đồng hồ trừ volume |
+| Dựng lại phiên sau | `make gpu-provision` → `gpu-wait` → `gpu-bootstrap` (~5 phút) |
+| Nghỉ ngắn, còn quay lại trong ngày | `make gpu-down` rồi `make gpu-up` |
 | Backend còn sống không | `make gpu-status` |
 | Xem log | `make gpu-logs` · `LOG=worker make gpu-logs` |
 | Sửa code FE → đẩy lên pod | `make gpu-fe` (~2 phút) |
 | Sửa code BE → đẩy lên pod | `make gpu-bootstrap` (idempotent, chạy lại an toàn) |
 | Code FE ở máy mình | `make dev` → `localhost:2030` |
 
-`make gpu-down` **không** xoá pod: container disk vẫn tính tiền theo giờ suốt thời gian pod tồn
-tại. Nghỉ vài ngày thì `make gpu-destroy` rẻ hơn — volume giữ lại model và database.
+<a id="destroy-first"></a>
+**Vì sao `gpu-destroy` là mặc định, không phải `gpu-down`.** Ba khoản làm cho việc dựng lại pod
+từng đắt đã bị xoá lần lượt, và khoản cuối vừa xong:
+
+| Chi phí mỗi lần dựng pod | Cách xoá |
+|---|---|
+| ~33 GB tải model | `POD_VOLUME` — model nằm trên Network Volume |
+| ~20-35 phút cài phần mềm | `MTC_PREBUILT=1` — image dựng sẵn ở CI |
+| Build frontend trên pod | `FE_BUILD=ci` — artifact từ GitHub Actions |
+| **Mất database** | **[`pod-pgdump.sh`](#pg-backup)** — dựng lại từ bản `pg_dump` trên volume |
+
+Còn lại đúng **~5 phút** dựng lại (đo thật: pull image + boot 176 giây, `gpu-bootstrap` 108 giây).
+Đổi lại, `gpu-destroy` dừng mọi đồng hồ trừ volume, còn `gpu-down` thì container disk **vẫn tính
+tiền suốt thời gian pod tồn tại**.
+
+Số đo hoá đơn (`runpodctl billing pods`, 4 lần thuê 02-07/08/2026): giá trọn gói **~$1,003-1,006
+mỗi giờ** cho RTX 5090 + container disk 100 GB. Trừ đi $0,99 GPU khai trong `.env`, phần đĩa còn
+**~$0,013-0,016/giờ** — nhỏ khi pod đang chạy, nhưng nó chạy **24/24 suốt thời gian pod tồn tại**,
+kể cả lúc dừng. Với nhịp dùng 1,19 giờ/ngày thì đó là khoản trả cho 22,8 giờ không dùng mỗi ngày.
+
+`gpu-down` vẫn còn chỗ dùng: nghỉ ngắn trong ngày và sẽ quay lại, khi 5 phút dựng lại đắt hơn vài
+giờ tiền đĩa. Nó cũng **tự dump trước khi dừng**, nên không mất gì.
 
 ---
 
@@ -315,6 +336,21 @@ kiểu chợ.
 
 Nghĩa là volume 100GB tốn ~$7,1/tháng và `make gpu-destroy` KHÔNG dừng đồng hồ đó — cố ý, vì nó
 đang giữ 42GB model.
+
+**Số từ HOÁ ĐƠN, không phải `currentSpendPerHr`** (`runpodctl billing pods`, 4 lần thuê 02-07/08/2026):
+
+| Ngày | Thời gian | Tiền | $/giờ trọn gói |
+|---|---|---|---|
+| 02/08 | 89,2 phút | $1,4915 | 1,003 |
+| 06/08 | 36,5 phút | $0,6102 | 1,003 |
+| 07/08 | 12,8 phút | $0,2145 | 1,006 |
+
+Trừ $0,99 GPU khai trong `.env`, phần container disk 100 GB còn **~$0,013-0,016/giờ**. Nhỏ khi
+đang chạy — nhưng nó tính **suốt thời gian pod TỒN TẠI**, kể cả lúc dừng, còn GPU thì không. Đó là
+toàn bộ lý do [`gpu-destroy` là mặc định khi xong việc](#destroy-first), không phải `gpu-down`.
+
+Lưu ý cách đọc: hai con số trên là hoá đơn thật chia cho thời gian; phần tách riêng cho đĩa là
+**suy ra** bằng cách trừ giá GPU, không phải một dòng riêng trong hoá đơn.
 
 <a id="pod-max-hours"></a>
 ### Lưới chống quên tắt pod: `POD_MAX_HOURS`
