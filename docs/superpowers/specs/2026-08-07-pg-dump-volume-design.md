@@ -8,8 +8,10 @@ lại được (25 bảng), `gpu-down` dump lần nữa rồi dừng pod, `gpu-d
 pod 2 dựng hoàn toàn mới sau khi pod 1 đã biến mất khỏi `runpodctl pod list` — `gpu-bootstrap` tự
 khôi phục từ bản dump của `gpu-down` ("tuổi bản dump: 0 giờ" → "✓ khôi phục xong"), `gpu-db-check`
 xanh (25 bảng, số bản đang giữ: 2), dữ liệu quay về đúng số dòng đã ghi ở pod 1
-(`users=2 · workflows=2 · workers=1 · api_keys=1 · task_cloud_auto_settings=1`). Chưa đo: lớp sao
-lưu DB mới trong `make gpu-smoke` chưa từng chạy trên pod thật. Số đo đầy đủ ở
+(`users=2 · workflows=2 · workers=1 · api_keys=1 · task_cloud_auto_settings=1`). 08/08/2026 chạy tiếp pod thứ ba: `make gpu-smoke` đầy đủ **9/9 lớp pass** (ba lớp GPU đều bật
+bằng `SMOKE_REF`/`SMOKE_DRIVER`/`SMOKE_PRODUCT`/`SMOKE_PROMPT`), lớp 6 sao lưu DB xanh, và
+`gpu-bootstrap` khôi phục được từ bản dump **17 giờ tuổi** — đường in tuổi thật mà đợt 07/08 chưa
+chạm tới. Số đo đầy đủ ở
 [gpu-pod.md §Sao lưu database](../../gpu-pod.md#pg-backup).
 
 ## Mục tiêu

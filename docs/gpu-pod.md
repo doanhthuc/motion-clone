@@ -1304,9 +1304,32 @@ trước khi bị xoá — chứng minh cả đường dây: dump ở `gpu-down`
 bại vì pod đã dừng, vẫn xoá) → provision pod mới → `gpu-bootstrap` tự khôi phục từ bản dump mới nhất
 còn đọc được (bản của `gpu-down`, vì bản của `gpu-destroy` không tạo được).
 
-**Chưa đo:** lớp 6 mới trong `make gpu-smoke` (`pod-pgdump.sh --check && --verify`, xem
-[§Kiểm chứng](#smoke)) chưa từng chạy trên pod thật — đợt nghiệm thu này gọi thẳng
-`make gpu-db-check`, không chạy full `gpu-smoke`.
+**Đã đo bổ sung, 08/08/2026 — pod thứ ba (`u8xnp8yw2n4p1w`), đường 9 lớp đầy đủ:**
+
+Lệnh chạy — cả ba lớp GPU đều bật, không lớp nào bị bỏ qua:
+
+```
+SMOKE_REF=.smoke/nhanvat.jpeg SMOKE_DRIVER=.smoke/dandong.mp4 \
+SMOKE_PRODUCT=.smoke/sanpham.jpeg SMOKE_PROMPT="a red car on a street" make gpu-smoke
+```
+
+| | |
+|---|---|
+| Kết quả | **9/9 lớp pass**, `smoke test passed`, exit 0 |
+| Lớp 6 (sao lưu DB) | `bản dump mới nhất: motion-20260807-084148.sql.gz · 17 giờ tuổi · 6755 bytes` · `số bản đang giữ: 3` · `verify: nạp lại được và số dòng khớp .meta (25 bảng)` |
+| Lớp 7 motion | Wan 2.2 Animate → mp4 286 KB |
+| Lớp 8 tryon | Qwen-Image-Edit (tryon) + bg-remover → png 1203 KB |
+| Lớp 9 create-image | Qwen-Image-Edit → png 2799 KB |
+
+Lần chạy này còn kiểm được hai đường mà đợt 07/08 không chạm tới:
+
+- **Khôi phục từ bản dump CŨ.** Pod 3 dựng mới hoàn toàn, `gpu-bootstrap` nạp bản dump 17 giờ tuổi
+  còn trên volume từ hôm trước: `tuổi bản dump: 17 giờ` → `✓ khôi phục xong`. Đợt 07/08 bản dump
+  chỉ 0 giờ tuổi nên đường in tuổi thật chưa được kiểm.
+- **`--dump` trên volume bỏ qua `chmod` KHÔNG còn báo lỗi.** Lệnh dump trong `gpu-destroy` in ra
+  dòng thông tin `… 666; dump vẫn tốt. Bảo mật ở đây dựa vào volume là riêng của tài khoản và pod
+  đơn-người-thuê, không dựa vào mode.` thay vì cảnh báo `QUYỀN SAI` như đợt 07/08 — đúng hành vi
+  mong đợi sau khi thêm phép dò `_fs_honors_modes` (xem tiểu mục ngay dưới).
 
 #### Quyền file trên volume: `600` không đặt được
 
@@ -1360,7 +1383,7 @@ cài-từ-đầu mà không biết.
 | **Tổng đường đi sạch** | **284 giây ≈ 4,7 phút**, so với baseline 20-35 phút |
 | torch trong image | `2.12.1+cu130` — `torch.cuda.get_device_capability()` ra `(12, 0)` trên RTX 5090 |
 | `JOB_TYPES` thật (bị `JOB_TYPES_OVERRIDE` cắt từ 21 type của profile `full` xuống, vì model chưa tải đủ — xem `.env.example`) | 16 type |
-| `make gpu-smoke` | 8/8 lớp pass — đo TRƯỚC khi thêm lớp sao lưu DB (khi đó tổng 8 lớp: motion/tryon/create-image là lớp 6/7/8 lúc đó). Sau khi Lớp 6 sao lưu DB chen vào, numbering hiện tại là **motion=7, tryon=8, create-image=9** (trigger bằng `SMOKE_PRODUCT`/`SMOKE_PROMPT`, xem [§Kiểm chứng](#smoke)); tổng đường 9 lớp chưa được chạy lại trên pod thật |
+| `make gpu-smoke` | 8/8 lớp pass — đo TRƯỚC khi thêm lớp sao lưu DB (khi đó tổng 8 lớp: motion/tryon/create-image là lớp 6/7/8 lúc đó). Sau khi Lớp 6 sao lưu DB chen vào, numbering hiện tại là **motion=7, tryon=8, create-image=9** (trigger bằng `SMOKE_PRODUCT`/`SMOKE_PROMPT`, xem [§Kiểm chứng](#smoke)); tổng đường 9 lớp **đã chạy đầy đủ 08/08/2026: 9/9 pass** (xem [§Sao lưu database](#pg-backup)) |
 
 Hai điều tưởng đúng lúc thiết kế nhưng đo thật thì sai:
 
