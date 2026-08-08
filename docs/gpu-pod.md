@@ -152,10 +152,11 @@ Còn lại đúng **~5 phút** dựng lại (đo thật: pull image + boot 176 g
 Đổi lại, `gpu-destroy` dừng mọi đồng hồ trừ volume, còn `gpu-down` thì container disk **vẫn tính
 tiền suốt thời gian pod tồn tại**.
 
-Số đo hoá đơn (`runpodctl billing pods`, 4 lần thuê 02-07/08/2026): giá trọn gói **~$1,003-1,006
-mỗi giờ** cho RTX 5090 + container disk 100 GB. Trừ đi $0,99 GPU khai trong `.env`, phần đĩa còn
-**~$0,013-0,016/giờ** — nhỏ khi pod đang chạy, nhưng nó chạy **24/24 suốt thời gian pod tồn tại**,
-kể cả lúc dừng. Với nhịp dùng 1,19 giờ/ngày thì đó là khoản trả cho 22,8 giờ không dùng mỗi ngày.
+Số đo hoá đơn (`runpodctl billing pods`, 3 phiên RTX 5090 trong 02-07/08/2026): giá trọn gói
+**~$1,003-1,006 mỗi giờ** cho RTX 5090 + container disk 100 GB. Trừ đi $0,99 GPU khai trong `.env`,
+phần đĩa còn **~$0,013-0,016/giờ** — nhỏ khi pod đang chạy, nhưng nó chạy **24/24 suốt thời gian
+pod tồn tại**, kể cả lúc dừng. Với nhịp dùng 0,85 giờ/ngày thì đó là khoản trả cho 23,2 giờ không
+dùng mỗi ngày.
 
 `gpu-down` vẫn còn chỗ dùng: nghỉ ngắn trong ngày và sẽ quay lại, khi 5 phút dựng lại đắt hơn vài
 giờ tiền đĩa. Nó cũng **tự dump trước khi dừng**, nên không mất gì.
@@ -341,7 +342,7 @@ kiểu chợ.
 Nghĩa là volume 100GB tốn ~$7,1/tháng và `make gpu-destroy` KHÔNG dừng đồng hồ đó — cố ý, vì nó
 đang giữ 42GB model.
 
-**Số từ HOÁ ĐƠN, không phải `currentSpendPerHr`** (`runpodctl billing pods`, 4 lần thuê 02-07/08/2026):
+**Số từ HOÁ ĐƠN, không phải `currentSpendPerHr`** (`runpodctl billing pods`, 3 phiên RTX 5090 trong 02-07/08/2026):
 
 | Ngày | Thời gian | Tiền | $/giờ trọn gói |
 |---|---|---|---|
@@ -359,8 +360,8 @@ Lưu ý cách đọc: hai con số trên là hoá đơn thật chia cho thời g
 <a id="pod-max-hours"></a>
 ### Lưới chống quên tắt pod: `POD_MAX_HOURS`
 
-Nhịp dùng thật đo 24/07 → 02/08: **1,19 giờ/ngày ≈ $35/tháng**. Nhưng **một** lần quên tắt để pod
-chạy cả tháng là **$713** — gấp 20 lần. `POD_MAX_HOURS` (mặc định **8**) truyền `--stop-after` vào
+Nhịp dùng thật đo 24/07 → 07/08 (15 ngày): **0,85 giờ/ngày ≈ $25/tháng**. Nhưng **một** lần quên tắt để pod
+chạy cả tháng là **$713** — gấp 28 lần. `POD_MAX_HOURS` (mặc định **8**) truyền `--stop-after` vào
 `runpodctl pod create`, nên một lần quên tốn **~$8** thay vì $713.
 
 **`--stop-after`, không `--terminate-after`** — vẫn là lựa chọn có chủ ý, dù cái giá của `terminate`
@@ -398,9 +399,14 @@ với hoá đơn (`runpodctl billing pods` · `billing serverless` · `billing n
 
 | Khoản | Hoá đơn thật |
 |---|---|
-| 7 phiên pod GPU, 24/07 → 02/08 | **$11,79** cho 11,9 giờ (~$1,00/giờ, ổn định) |
+| 9 dòng hoá đơn pod, 24/07 → 07/08 | **$12,62** cho 12,70 giờ — riêng RTX 5090: $12,51 / 12,46 h = **$1,004/giờ**, ổn định |
 | Serverless, cả ngày chạy thử 02/08 | **$0,3894** cho **884 giây** được tính |
 | Volume 100GB | $0,00972/giờ → **~$7,10/tháng** |
+| **Tổng đã tiêu** (pod + serverless + volume) | **$14,61** |
+
+Cập nhật 08/08/2026. Serverless **vẫn chỉ có đúng một dòng hoá đơn** (02/08) — không chạy thêm lần
+nào từ đó, nên mọi con số serverless dưới đây vẫn đứng trên nền mẫu 884 giây. Bảng này chốt ở các
+ngày **đã đóng**; hoá đơn 08/08 còn đang chạy nên không tính vào.
 
 > **Con số $0,0116 trước đây ở đây là SAI**, và nó là con số chống lưng cho toàn bộ lập luận chi
 > phí của đường serverless. Nó tính theo 25,3 giây *execution* của 5 job. RunPod tính **884 giây** —
@@ -425,14 +431,18 @@ lớn triệt tiêu, và tỉ lệ bền qua mọi giả định:
 
 | Đơn giá đĩa giả định | Pod $/giờ | Serverless $/giờ | Tỉ lệ |
 |---|---|---|---|
-| 0 (**all-in — số phòng thủ được nhất**) | 1,003 | 1,586 | **1,58×** |
-| $0,0000108/GB-h | 0,990 | 1,559 | 1,57× |
-| $0,0000972/GB-h (đơn giá volume đo được) | 0,886 | 1,348 | 1,52× |
-| $0,000300/GB-h | 0,640 | 0,853 | 1,33× |
+| 0 (**all-in — số phòng thủ được nhất**) | 1,004 | 1,586 | **1,58×** |
+| $0,0000108/GB-h | 0,991 | 1,559 | 1,57× |
+| $0,0000972/GB-h (đơn giá volume đo được) | 0,888 | 1,348 | 1,52× |
+| $0,000300/GB-h | 0,648 | 0,853 | 1,32× |
 
-**Serverless đắt hơn pod 1,33–1,58× cho mỗi giây GPU.** Mỏ neo độc lập: hoá đơn pod all-in
-**$1,003/giờ** khớp giá niêm yết **$0,99** (`gpuTypes.securePrice` cho RTX 5090) cộng chút đĩa — nên
+**Serverless đắt hơn pod 1,32–1,58× cho mỗi giây GPU.** Mỏ neo độc lập: hoá đơn pod all-in
+**$1,004/giờ** khớp giá niêm yết **$0,99** (`gpuTypes.securePrice` cho RTX 5090) cộng chút đĩa — nên
 cách đọc hoá đơn đúng, không phải đọc nhầm cột.
+
+Cột pod tính trên **7 dòng 5090** (24/07 → 07/08); cột serverless vẫn là một dòng 02/08. Thêm 5 giờ
+pod so với lần đo trước không làm tỉ lệ nhúc nhích (1,580× → 1,580×) — đó là dấu hiệu đơn giá pod đã
+hội tụ, còn phía serverless thì chưa có dữ liệu mới để hội tụ.
 
 **Vì sao đắt hơn:** bạn mua **quyền có 0 worker**. Nhà cung cấp vẫn phải giữ năng lực sẵn và chịu
 rủi ro máy nằm không; phần chênh là tiền trả cho việc đó. Serverless không bán GPU rẻ hơn — nó bán
@@ -843,8 +853,8 @@ serverless, cho cùng một khối công việc. Xem [§Hoá đơn thật](#hoa-
 
 ### Câu hỏi quyết định không phải "bao nhiêu job", mà "GPU có rỗi không"
 
-Đơn giá all-in serverless **$1,586/giờ** so với pod **$1,003/giờ** — serverless đắt hơn
-**1,33–1,58×** cho mỗi giây GPU tuỳ cách tách tiền đĩa ([bảng độ bền](#premium-serverless)). Nó
+Đơn giá all-in serverless **$1,586/giờ** so với pod **$1,004/giờ** — serverless đắt hơn
+**1,32–1,58×** cho mỗi giây GPU tuỳ cách tách tiền đĩa ([bảng độ bền](#premium-serverless)). Nó
 không rẻ hơn về đơn giá; nó chỉ tính $0 khi rỗi.
 
 Với job thật **~9 phút** (motion + enhance, clip 15-20s — quan sát 04/08, kiểm chéo với 0,85 s/frame

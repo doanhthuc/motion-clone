@@ -113,7 +113,7 @@ resolve_deploy_shape() {
   fi
   # Ngược lại thì chỉ là tiền, không phải lỗi — nhưng là tiền thật, nên phải nói ra.
   if [ "$COMPUTE_TYPE" = "gpu" ] && [ "$WORKER_SOURCE" = "serverless" ]; then
-    DEPLOY_SHAPE_WARNINGS+=("Box CÓ GPU nhưng job đẩy sang serverless: GPU vừa thuê nằm không, và serverless đắt hơn pod 1,33-1,58× mỗi giây GPU. Chỉ hợp lý khi đang TEST đường serverless. Xem docs/gpu-pod.md#deploy-shapes.")
+    DEPLOY_SHAPE_WARNINGS+=("Box CÓ GPU nhưng job đẩy sang serverless: GPU vừa thuê nằm không, và serverless đắt hơn pod 1,32-1,58× mỗi giây GPU. Chỉ hợp lý khi đang TEST đường serverless. Xem docs/gpu-pod.md#deploy-shapes.")
   fi
   # Profile cpu-box cài đúng cho box không GPU (bỏ comfyui/worker/task-cloud-auto). Ghép lệch với
   # COMPUTE_TYPE là hai kiểu hỏng khác nhau, cả hai đều im lặng.

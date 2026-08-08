@@ -52,7 +52,7 @@ Hoá đơn thật (`runpodctl billing`), không phải `currentSpendPerHr`:
 
 | Khoản | Đo được |
 |---|---|
-| 7 phiên pod GPU, 24/07 → 02/08 | **$11,79** cho 11,9 giờ (~$1,00/giờ) |
+| 9 dòng hoá đơn pod, 24/07 → 07/08 | **$12,62** cho 12,70 giờ — riêng RTX 5090 $1,004/giờ (cập nhật 08/08; lúc viết spec: $11,79 / 11,9 giờ tới 02/08) |
 | Pod GPU nếu bật 24/7 | **~$720/tháng** |
 | Serverless, cả ngày chạy thử 02/08 | **$0,3894** (884 giây được tính) |
 | Volume 100GB | ~**$7,10/tháng**, không tránh được ở mọi hình dạng |
@@ -151,10 +151,10 @@ Hai nguồn độc lập khớp nhau, nên lấy **9 phút/job** làm mốc tín
 
 ### Hệ quả: serverless thắng hay thua phụ thuộc CÁCH DÙNG, không phụ thuộc số job
 
-Đơn giá **all-in** serverless $1,586/giờ so với pod $1,003/giờ — serverless đắt hơn **1,33–1,58×**
+Đơn giá **all-in** serverless $1,586/giờ so với pod $1,004/giờ — serverless đắt hơn **1,32–1,58×**
 cho mỗi giây GPU, tuỳ cách tách `diskSpaceBilledGB` ra khỏi `amount` (cả hai dòng hoá đơn đều gộp
 tiền đĩa; tiền đĩa áp cho cả hai nên phần lớn triệt tiêu — [bảng độ
-bền](../../gpu-pod.md#premium-serverless)). Mỏ neo: hoá đơn pod all-in $1,003 khớp giá niêm yết
+bền](../../gpu-pod.md#premium-serverless)). Mỏ neo: hoá đơn pod all-in $1,004 khớp giá niêm yết
 $0,99. Bảng dưới dùng **all-in cho cả hai** ($1,586 và $1,00) — cùng một cách tính, không thiên vị
 bên nào. Trừ tiền đĩa ở cả hai thì hai cột cùng co lại và ngưỡng đảo chiều nhích từ 87 lên 89
 job/ngày; **không kết luận nào đổi.**
@@ -162,7 +162,7 @@ job/ngày; **không kết luận nào đổi.**
 Serverless không rẻ hơn về đơn giá; nó chỉ tính $0 khi rỗi — bạn đang mua **quyền có 0 worker**.
 Nên phép so thật là: *bạn có đang trả tiền cho thời gian rỗi hay không.*
 
-**Kiểu B — bật khi làm việc, job chạy nối nhau** (kiểu đang dùng: 11,9 giờ trong 10 ngày):
+**Kiểu B — bật khi làm việc, job chạy nối nhau** (kiểu đang dùng: 12,70 giờ trong 15 ngày, 24/07 → 07/08):
 
 | Giờ/ngày | Job/ngày | Pod GPU | Box CPU + serverless (c=$0,10) |
 |---|---|---|---|

@@ -10,7 +10,7 @@
 # đúng những việc đó, và job render đi qua RunPod Serverless — trả theo giây, $0 khi rỗi.
 #
 # CHỈ đúng khi app cần bật 24/7 và tải dưới ~79 job/ngày (đo giá box thật $0,184/giờ 04/08/2026). Nếu bạn chỉ bật máy lúc ngồi làm và job
-# chạy nối nhau thì pod GPU + WORKER_SOURCE=local RẺ HƠN, vì serverless đắt hơn pod 1,33-1,58× cho
+# chạy nối nhau thì pod GPU + WORKER_SOURCE=local RẺ HƠN, vì serverless đắt hơn pod 1,32-1,58× cho
 # mỗi giây GPU và không có thời gian rỗi nào để nó tiết kiệm.
 # Xem docs/gpu-pod.md#deploy-shapes và specs/2026-08-04-box-cpu-serverless-design.md.
 #

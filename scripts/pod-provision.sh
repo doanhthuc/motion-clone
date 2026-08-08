@@ -51,8 +51,9 @@ case "$COMPUTE_TYPE" in
 esac
 
 # ── Lưới an toàn: tự DỪNG pod sau POD_MAX_HOURS giờ ───────────────────────────
-# Vì sao cần: pod GPU $0,99/giờ. Nhịp dùng thật đo được 1,19 giờ/ngày ≈ $35/tháng, nhưng MỘT lần
-# quên tắt để chạy cả tháng là $713 — gấp 20 lần. Lưới này biến một lần quên thành $8 thay vì $713.
+# Vì sao cần: pod GPU $0,99/giờ. Nhịp dùng thật đo được 0,85 giờ/ngày ≈ $25/tháng (hoá đơn 24/07 →
+# 07/08), nhưng MỘT lần quên tắt để chạy cả tháng là $713 — gấp 28 lần. Lưới này biến một lần quên
+# thành $8 thay vì $713.
 #
 # Dùng --stop-after, KHÔNG --terminate-after. Cả hai đều dừng tiền GPU, nhưng terminate XOÁ pod và
 # với VOLUME_PGDATA=0 (mặc định, vì MooseFS chặn chown) thì PGDATA nằm trên container disk → mất
