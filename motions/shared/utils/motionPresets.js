@@ -13,7 +13,12 @@ export const MOTION_PRESETS = [
   { id: 'drv-10s', label: '10s', resolution: '544x960', steps: 4, driverNative: true, eta: 'theo fps driver', fps: 0, note: 'fps & khung 1:1 theo driver' },
   { id: 'drv-15s', label: '15s', resolution: '544x960', steps: 4, driverNative: true, eta: 'theo fps driver', fps: 0, note: 'Mặc định · fps & khung 1:1 theo driver' },
   { id: 'drv-20s', label: '20s', resolution: '544x960', steps: 4, driverNative: true, eta: 'theo fps driver', fps: 0, note: 'Dài — worker có thể tự hạ fps theo RAM box' },
-  // { id: 'drv-30s', label: '30s', resolution: '544x960', steps: 4, driverNative: true, eta: 'theo fps driver', fps: 0, minRamGb: 128, note: 'rất dài — tự hạ fps để vừa RAM box · cần RAM ≥128GB' },
+  // ALD 10/08/2026 - MỞ LẠI drv-30s và BỎ minRamGb:128. Gate theo RAM chỉ là proxy cho "601 frame nặng
+  // quá"; từ khi trần frame đọc đúng trần cgroup (worker_runtime/box_ram.py) thì chính trần đó đã chặn
+  // trực tiếp — vượt ngân sách là worker hạ fps chứ KHÔNG cắt thời lượng, nên preset dài không còn tự nó
+  // gây OOM. Giữ gate cũ chỉ khiến preset bị ẩn vĩnh viễn (pod báo 56GB sau khi sửa, không bao giờ ≥128).
+  // 30s = "lấy trọn clip": user chỉ upload ảnh + video rồi Chạy, không phải đoán số giây.
+  { id: 'drv-30s', label: '30s', resolution: '544x960', steps: 4, driverNative: true, eta: 'theo fps driver', fps: 0, note: 'Lấy trọn clip (tối đa 30s) · clip dài thì tự hạ fps cho vừa RAM box' },
 ]
 
 // preset id → params cụ thể cho worker (width/height/frames/steps + lora_relight nếu preset HQ).

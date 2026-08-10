@@ -23,6 +23,9 @@ except Exception:
 from concurrent.futures import ThreadPoolExecutor
 import requests
 from worker_runtime.runner import run_worker_loop
+# ALD 10/08/2026 - RAM box đọc từ trần cgroup, KHÔNG từ /proc/meminfo của host (RunPod cho container
+# thấy RAM host). Dùng cho trần frame preset drv-Ns bên dưới. Xem worker_runtime/box_ram.py.
+from worker_runtime.box_ram import box_ram_gb, host_ram_bytes
 # ALD 05/06/2026 - websocket-client để nghe progress sampling realtime từ ComfyUI (/ws). Guarded:
 # nếu image chưa cài lib (chưa rebuild) → _ws=None → comfy_poll tự fallback về poll /history như cũ.
 try:
@@ -1818,6 +1821,40 @@ def _wan_cover_frames(seconds, fps):
     except (TypeError, ValueError):
         samples = 1
     return max(17, int(math.ceil((max(17, samples) - 1) / 4.0)) * 4 + 1)
+
+# #region ALD 10/08/2026 - Ngân sách frame của preset drv-Ns, tách khỏi run_motion để test được.
+# Đây là thứ làm preset drv-Ns "tự động": preset chỉ là TRẦN THỜI LƯỢNG, còn RAM do ngân sách frame
+# lo. Vượt ngân sách thì HẠ FPS, KHÔNG cắt thời lượng — nên user chỉ cần upload ảnh + video là xong.
+def _motion_frame_cap():
+    """Trần frame cho preset drv-Ns, theo RAM THẬT của box (trần cgroup, không phải RAM host).
+
+    os.sysconf đọc /proc/meminfo mà RunPod cho container thấy của HOST (123 GiB) chứ không phải trần
+    thật của container (55,9 GiB) → nhánh 601f luôn trúng dù box không gánh nổi. Job motion 453 frame
+    đã bị cgroup OOM-kill hai lần vì đúng nhóm nguyên nhân này (82c9e58). Xem worker_runtime/box_ram.py.
+    """
+    return int(os.environ.get("MOTION_DRV_MAX_FRAMES", "601" if box_ram_gb() >= 120 else "481"))
+
+
+def _motion_ram_note():
+    """Chuỗi log RAM — nói rõ đang dùng trần cgroup khi nó khác RAM host, để không ai phải đoán."""
+    ram_gb = box_ram_gb()
+    host_gb = host_ram_bytes() / (1024 ** 3)
+    if host_gb - ram_gb > 1:
+        return f"RAM box {ram_gb:.0f}GB — trần cgroup, RAM host {host_gb:.0f}GB KHÔNG dùng"
+    return f"RAM box {ram_gb:.0f}GB"
+
+
+def _motion_fit_frame_budget(target_sec, fps, frame_cap):
+    """→ (fps, frames, drop|None). Ép số frame vào ngân sách bằng cách HẠ FPS, GIỮ NGUYÊN thời lượng.
+
+    `drop` là None khi vừa ngân sách; ngược lại là {'from_fps', 'from_frames'} để caller log.
+    """
+    frames = _wan_cover_frames(target_sec, fps)
+    if frames <= frame_cap:
+        return fps, frames, None
+    lowered = max(12, int((frame_cap - 1) // max(1.0, target_sec)))
+    return lowered, _wan_cover_frames(target_sec, lowered), {"from_fps": fps, "from_frames": frames}
+# #endregion
 
 def _wan_static_final_overlap(latent_frames, context_latents, overlap_latents):
     """Overlap thật giữa 2 context cuối của static_standard (đơn vị latent frame)."""
@@ -4087,17 +4124,12 @@ def run_motion(job):
         else:
             _eff = _want_sec
         _target_output_sec = _eff / _motion_speed_factor
-        try:
-            _ram_gb = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / (1024 ** 3)
-        except (ValueError, OSError, AttributeError):
-            _ram_gb = 0
-        _fcap = int(os.environ.get("MOTION_DRV_MAX_FRAMES", "601" if _ram_gb >= 120 else "481"))
-        _F_drv = _wan_cover_frames(_target_output_sec, _rfps_drv)
-        if _F_drv > _fcap:
-            _rfps_new = max(12, int((_fcap - 1) // max(1.0, _target_output_sec)))
-            api_log(job_id, f"Theo driver: {_eff:.0f}s × {_rfps_drv}fps = {_F_drv}f VƯỢT trần {_fcap}f (RAM box {_ram_gb:.0f}GB) → tự hạ {_rfps_new}fps", "warn")
-            _rfps_drv = _rfps_new
-            _F_drv = _wan_cover_frames(_target_output_sec, _rfps_drv)
+        _fcap = _motion_frame_cap()
+        _rfps_drv, _F_drv, _drop = _motion_fit_frame_budget(_target_output_sec, _rfps_drv, _fcap)
+        if _drop:
+            api_log(job_id, f"Theo driver: {_eff:.0f}s × {_drop['from_fps']}fps = {_drop['from_frames']}f "
+                            f"VƯỢT trần {_fcap}f ({_motion_ram_note()}) → tự hạ {_rfps_drv}fps "
+                            f"(GIỮ NGUYÊN {_target_output_sec:.1f}s, không cắt)", "warn")
         params["render_fps"] = _rfps_drv
         params["frames"] = _F_drv
         if not params.get("steps"):

@@ -24,6 +24,17 @@ Template seed cho worker Linux/CUDA.',
     true
   ),
   (
+    'linux-motion-control',
+    'Motion Control',
+    'Chuyển động từ video mẫu sang nhân vật trong ảnh: Ảnh nhân vật + Video motion -> Motion Transfer (Wan 2.2 Animate) -> Nâng nét 1080p -> video kết quả.
+
+Chỉ cần upload 2 file rồi Chạy, KHÔNG phải chọn số giây. Preset drv-30s là TRẦN chứ không phải mục tiêu: driver ngắn hơn thì worker lấy đúng độ dài thật của nó, dài hơn ngân sách frame thì worker hạ fps chứ không cắt thời lượng. Clip 8s ra 8s, 20s ra 20s, 30s ra 30s.
+
+Template seed cho worker Linux/CUDA.',
+    '{"edges":[{"id":"e1","data":{},"source":"input-character","target":"motion-main","targetHandle":"image"},{"id":"e2","data":{},"source":"input-driver","target":"motion-main","targetHandle":"motion"},{"id":"e3","data":{},"source":"motion-main","target":"enhance-main"},{"id":"e4","data":{},"source":"enhance-main","target":"output-main"}],"nodes":[{"id":"input-character","data":{"config":{"url":"","field":"characterImage","label":"Ảnh nhân vật","source":"session","purpose":"generic","libraryId":"","staticUrl":"","staticData":"","staticMime":"","staticName":"","staticPath":"","staticSize":0,"staticText":"","contentType":"image","staticBucket":""}},"type":"input","position":{"x":16,"y":-80}},{"id":"input-driver","data":{"config":{"url":"","field":"motionVideo","label":"Video motion","source":"session","purpose":"generic","libraryId":"","staticUrl":"","staticData":"","staticMime":"","staticName":"","staticPath":"","staticSize":0,"staticText":"","contentType":"video","staticBucket":""}},"type":"input","position":{"x":16,"y":400}},{"id":"motion-main","data":{"config":{"hq":false,"fps":30,"mode":"transfer","preset":"drv-30s","warmth":0,"quality":"","matchRef":false,"provider":"qwen","audioMode":"original","brightCap":1,"faceSource":"driver","aspectRatio":"9:16","driverHands":true,"loraRelight":0,"clipStrength":1.2,"driverDurSec":0,"faceStrength":0.6,"poseStrength":0.8,"extraPositive":"soft even matte lighting with retained detail in bright areas, natural matte skin with visible pores and realistic texture, stable natural mouth and lips, steady well-formed bare hands with five clearly separated fingers, natural fingertips, clean short natural fingernails","motionSpeedup":0,"renderProfile":"fast","deliveryPreset":"tiktok","driverStartSec":0,"matchRefMethod":"reinhard","render_profile":"fast","skipFirstFrames":0,"audioPassthrough":true,"matchRefStrength":0}},"type":"motion","position":{"x":512,"y":160}},{"id":"enhance-main","data":{"config":{"mode":"video","label":"Nâng nét 1080p","engine":"lanczos","fpsInterp":"","targetRes":"1080p","faceRestore":false}},"type":"enhance","position":{"x":880,"y":160}},{"id":"output-main","data":{"config":{"format":"video"}},"type":"output","position":{"x":1200,"y":160}}]}'::jsonb,
+    true
+  ),
+  (
     'linux-thay-do-mau',
     ' Transfer Image',
     'Mặc sản phẩm lên người mẫu: Ảnh mẫu + Ảnh sản phẩm -> Try-On (Qwen-Image-Edit) -> giải phóng GPU -> ảnh kết quả.
