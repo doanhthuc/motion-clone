@@ -45,16 +45,24 @@ check() {
 echo "Pod rental"
 check GPU_PROVIDER required "vast | runpod — picks the CLI make gpu-provision/gpu-up/gpu-down use" 1
 check GPU          required "card filter — vast uses RTX_5090, RunPod uses 'NVIDIA GeForce RTX 5090'. Needs >=24GB VRAM" 1
+# Không blocking: để trống là một lựa chọn hợp lệ. Nhưng phải NÓI ra — stock 5090 ở EU-RO-1 đã tụt
+# Low (đo 10/08) và volume không dời được datacenter, nên hết máy là đứng cả phiên. Xem docs#gpu-4090.
+check GPU_FALLBACK recommended "card thuê khi GPU chính hết máy. Trống = provision dừng luôn. 4090 đã đo chạy được (docs/gpu-pod.md#gpu-4090)" 1
 check DISK          required "GB — DEPLOY.md minimum for the motion-transfer box is 120" 1
 check MAX_DPH       required "\$/hour ceiling so a search never surprises you" 1
 # Lưới chống quên tắt. In ra ở đây vì đây là khối "tiền", và vì im lặng về nó nghĩa là người dùng
 # không biết mình có lưới hay không — mà đó đúng là thứ chỉ phát hiện được khi đã mất $700.
 pmh="$(get POD_MAX_HOURS)"; pmh="${pmh:-8}"
+# ALD 10/08/2026 - Giá lấy từ GPU_HOURLY, KHÔNG in cứng $0,99 nữa: đổi GPU=4090 ($0,74) mà preflight
+# vẫn khoe $0,99 thì cổng kiểm đang nói sai về đúng thứ nó tồn tại để canh. Rỗng → 0,99 (card đắt
+# nhất đang dùng): cảnh báo tiền được phép nói QUÁ, không được phép nói THIẾU.
+rate="$(get GPU_HOURLY)"; rate="${rate:-0.99}"
+month="$(awk -v r="$rate" 'BEGIN{printf "%.0f", r*24*30}')"
 if [ "$pmh" = "0" ]; then
-  printf "  ${Y}!${X} %-22s ${Y}0 = KHÔNG có lưới${X} ${D}— quên tắt pod là \$0,99/giờ chạy tiếp (~\$713/tháng)${X}\n" "POD_MAX_HOURS"
+  printf "  ${Y}!${X} %-22s ${Y}0 = KHÔNG có lưới${X} ${D}— quên tắt pod là \$%s/giờ chạy tiếp (~\$%s/tháng)${X}\n" "POD_MAX_HOURS" "$rate" "$month"
 else
-  printf "  ${G}✓${X} %-22s ${D}%s giờ → pod tự DỪNG (giữ DB); một lần quên tốn ~\$%.0f thay vì ~\$713${X}\n" \
-    "POD_MAX_HOURS" "$pmh" "$(awk -v h="$pmh" 'BEGIN{printf "%.0f", h*0.99}')"
+  printf "  ${G}✓${X} %-22s ${D}%s giờ → pod tự DỪNG (giữ DB); một lần quên tốn ~\$%.0f thay vì ~\$%s${X}\n" \
+    "POD_MAX_HOURS" "$pmh" "$(awk -v h="$pmh" -v r="$rate" 'BEGIN{printf "%.0f", h*r}')" "$month"
   [ "$(get COMPUTE_TYPE)" = "cpu" ] && printf "    %-20s ${D}%s${X}\n" "" "không áp được cho box CPU — REST không có field auto-stop"
 fi
 
@@ -113,7 +121,7 @@ resolve_deploy_shape
 
 case "$COMPUTE_TYPE" in
   cpu) ct_effect="box KHÔNG GPU (\$0,06/giờ ở 2 vCPU) — GPU do serverless lo, trả theo giây" ;;
-  *)   ct_effect="box CÓ GPU ($(get GPU)) — \$0,99/giờ, dùng được cho worker local" ;;
+  *)   ct_effect="box CÓ GPU ($(get GPU)) — \$$rate/giờ, dùng được cho worker local$( [ -n "$(get GPU_FALLBACK)" ] && printf ' · dự phòng %s' "$(get GPU_FALLBACK)" )" ;;
 esac
 printf "  ${G}✓${X} %-22s ${D}%s${X}\n" "COMPUTE_TYPE" "$COMPUTE_TYPE"
 printf "    %-20s ${D}%s${X}\n" "" "$ct_effect"

@@ -27,6 +27,11 @@ CPU_VCPU="${CPU_VCPU:-$(env_get CPU_VCPU)}"; CPU_VCPU="${CPU_VCPU:-4}"
 # Lưới an toàn cho việc quên tắt pod. 0 = tắt hẳn lưới.
 POD_MAX_HOURS="${POD_MAX_HOURS:-$(env_get POD_MAX_HOURS)}"; POD_MAX_HOURS="${POD_MAX_HOURS:-8}"
 GPU="${GPU:-$(env_get GPU)}"; GPU="${GPU:-RTX_4090}"
+GPU_FALLBACK="${GPU_FALLBACK:-$(env_get GPU_FALLBACK)}"
+# ALD 10/08/2026 - Giá CHỈ để hiển thị (cảnh báo quên tắt pod). Trước đây in cứng $0,99 nên đổi
+# GPU=4090 mà vẫn thấy $0,99 — sai theo chiều nguy hiểm nhất là khi giá thật CAO hơn. Rỗng thì lấy
+# 0,99 (5090, đắt nhất đang dùng) chứ không lấy 0: cảnh báo tiền không được phép nói ít hơn sự thật.
+GPU_HOURLY="${GPU_HOURLY:-$(env_get GPU_HOURLY)}"; GPU_HOURLY="${GPU_HOURLY:-0.99}"
 DISK="${DISK:-$(env_get DISK)}"; DISK="${DISK:-120}"
 MAX_DPH="${MAX_DPH:-$(env_get MAX_DPH)}"; MAX_DPH="${MAX_DPH:-0.60}"
 RELIABILITY="${RELIABILITY:-$(env_get RELIABILITY)}"; RELIABILITY="${RELIABILITY:-0.95}"
@@ -415,7 +420,7 @@ $( [ -n "${GPU_FALLBACK:-}" ] \
   stop that meter, and is not supposed to. See docs/gpu-pod.md#costs.
 $( [ ${#STOP_AFTER_ARG[@]} -gt 0 ] \
    && printf '  Lưới an toàn: pod TỰ DỪNG lúc %s (POD_MAX_HOURS=%s).\n  Dừng chỉ chặn tiền GPU — container disk vẫn tính. Dọn hẳn: make gpu-destroy.' "$STOP_AT" "$POD_MAX_HOURS" \
-   || printf '  KHÔNG có lưới an toàn (POD_MAX_HOURS=0) — quên tắt là $0,99/giờ chạy tiếp.' )
+   || printf '  KHÔNG có lưới an toàn (POD_MAX_HOURS=0) — quên tắt là $%s/giờ chạy tiếp (~$%.0f/tháng).' "$GPU_HOURLY" "$(awk -v r="$GPU_HOURLY" 'BEGIN{printf "%.0f", r*24*30}')" )
 EOF
     exit 0
   fi
