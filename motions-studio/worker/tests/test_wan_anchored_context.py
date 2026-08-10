@@ -220,6 +220,46 @@ class WanAnchoredContextTests(unittest.TestCase):
         self.assertEqual(wf["90"]["inputs"]["scheduler"], "dpm++_sde")
         self.assertEqual(wf["40"]["inputs"]["strength_1"], 1.0)
 
+    def test_moi_alias_khai_tu_deu_bi_ep_ve_fast(self):
+        """Alias legacy = giá trị nằm sẵn trong workflow CŨ, không phải yêu cầu chủ ý của user.
+
+        build_wan_workflow `_retired_natural` vẫn hạ đúng những chuỗi này về Fast, nên
+        _normalize_motion_params không được hiểu chúng theo nghĩa ngược lại.
+        """
+        for alias in ("natural", "quality", "official", "hq", "NATURAL", " Hq "):
+            with self.subTest(alias=alias):
+                normalized = _normalize_motion_params({"renderProfile": alias})
+                self.assertEqual(normalized["renderProfile"], "fast")
+                self.assertEqual(normalized["steps"], 4)
+                self.assertEqual(normalized["scheduler"], "dpm++_sde")
+                self.assertEqual(normalized["lora_lightx2v"], 1.0)
+
+    def test_opt_in_chu_y_bang_max_van_mo_duoc_duong_20_buoc(self):
+        """Cửa A/B 21/07 phải còn sống — fix không được bịt luôn nó."""
+        normalized = _normalize_motion_params({"renderProfile": "max", "hq_steps": 24})
+        self.assertEqual(normalized["renderProfile"], "max20")
+        self.assertEqual(normalized["steps"], 24)
+        self.assertEqual(normalized["scheduler"], "unipc")
+        self.assertEqual(normalized["lora_lightx2v"], 0.0)
+
+    def test_max20_idempotent_khi_normalize_lai(self):
+        """run_motion và nhánh 6785 cùng gọi normalize; chạy hai lần không được rơi về fast."""
+        once = _normalize_motion_params({"renderProfile": "max"})
+        twice = _normalize_motion_params(dict(once))
+        self.assertEqual(twice["renderProfile"], "max20")
+        self.assertEqual(twice["steps"], once["steps"])
+
+    @patch.dict(os.environ, {"MOTION_FORCE_QUALITY": "1"})
+    def test_env_force_quality_van_bat_duoc_ca_box(self):
+        normalized = _normalize_motion_params({"renderProfile": "fast"})
+        self.assertEqual(normalized["renderProfile"], "max20")
+        self.assertEqual(normalized["steps"], 20)
+
+    def test_khong_co_tin_hieu_gi_thi_mac_dinh_fast(self):
+        normalized = _normalize_motion_params({})
+        self.assertEqual(normalized["renderProfile"], "fast")
+        self.assertEqual(normalized["steps"], 4)
+
     def test_shared_builder_keeps_non_motion_fast_tuning(self):
         wf = build_wan_workflow("ref.png", "driver.mp4", self._params(
             renderProfile="fast",

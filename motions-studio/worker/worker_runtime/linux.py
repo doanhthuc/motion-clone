@@ -2004,8 +2004,14 @@ def _normalize_motion_params(p):
     # conditioning mặt yếu → miệng rơi về prior. Opt-in: param renderProfile=natural/max HOẶC env
     # MOTION_FORCE_QUALITY=1 (A/B cả box không cần FE). Bộ số phục hồi NGUYÊN VĂN thời kỳ trước 34fb1e7
     # (13/07, không chu mỏ): steps≥20 · cfg 1.0 · unipc · shift 5.0 · lightx2v 0.0. Mặc định vẫn FAST.
-    _want_natural = (str(p.get("renderProfile", p.get("render_profile", ""))).strip().lower()
-                     in ("natural", "quality", "official", "hq", "max")
+    # ALD 10/08/2026 - CHỈ nhận tín hiệu CHỦ Ý. Trước đây list này gồm cả alias đã khai tử
+    # ("natural"/"quality"/"official"/"hq") — đúng những chuỗi mà build_wan_workflow `_retired_natural`
+    # (dưới đây, 13/07) vẫn đang hạ về Fast, và mà cả 6 layer FE/API scrub sạch trước khi tới worker.
+    # Cùng một chuỗi mang hai nghĩa ngược nhau trong cùng file: workflow CŨ đã lưu renderProfile=natural
+    # tự bật lại đường non-distill 20 bước đã gỡ 13/07, trái hẳn ý đồ "không thể kích hoạt lại" ghi ở
+    # handlers.js:789 và routes/jobs.js:36. A/B vẫn nguyên: env MOTION_FORCE_QUALITY, hoặc gõ tay "max".
+    _profile_req = str(p.get("renderProfile", p.get("render_profile", ""))).strip().lower()
+    _want_natural = (_profile_req in ("max", "max20")
                      or str(os.environ.get("MOTION_FORCE_QUALITY", "")).strip().lower() in ("1", "true", "yes", "on"))
     if _want_natural:
         # Tên profile "max20" CHỦ Ý khác list alias legacy ("natural"/"quality"/...) — build_wan_workflow hạ cấp
