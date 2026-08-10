@@ -520,6 +520,103 @@ vastai show instances --raw | python3 -c "import json,sys;d=json.load(sys.stdin)
 vastai show user --raw | python3 -c "import json,sys;print('credit \$%s'%json.load(sys.stdin)['credit'])"
 ```
 
+<a id="gpu-4090"></a>
+## Đổi GPU: 4090 dùng được, A40 không — đo 10/08/2026
+
+Câu hỏi là "5090 có phải lựa chọn duy nhất không". Trả lời bằng phép đo trên pod thật, không suy luận.
+
+### Ràng buộc quyết định trước cả VRAM: volume khoá EU-RO-1
+
+Volume `motion` nằm ở EU-RO-1 và **datacenter không dời được**. Pod khác datacenter thì không mount
+được → GPU nào không có mặt ở EU-RO-1 là loại, bất kể nó tốt đến đâu.
+
+```bash
+runpodctl gpu list -o json | python3 -c 'import sys,json
+for g in json.load(sys.stdin):
+    if g["gpuId"] in ("NVIDIA GeForce RTX 5090","NVIDIA GeForce RTX 4090","NVIDIA A40"):
+        d = {x["dataCenterId"]: x["stockStatus"] for x in g.get("dataCenterAvailability") or []}
+        print(g["gpuId"], g["memoryInGb"], "GB —", d.get("EU-RO-1","KHÔNG CÓ MẶT"))'
+```
+
+Đo 10/08/2026:
+
+| | EU-RO-1 | $/giờ secure | VRAM |
+|---|---|---|---|
+| RTX 5090 | **Low** (01/08 còn Medium) | $0,99 | 32 GB |
+| RTX 4090 | **High** | $0,74 | 24 GB |
+| A40 | **không có mặt** (chỉ EU-SE-1 High, CA-MTL-1 Low) | $0,44 | 48 GB |
+
+**A40 loại**, hai lý do độc lập: không có ở EU-RO-1, **và** Ampere không có fp8 native nên model
+`Wan2_2-Animate-14B_fp8_e4m3fn_scaled` + `base_precision=fp16_fast` phải dequant sang fp16. Lý do
+thứ hai đúng kể cả khi bạn tạo volume mới ở EU-SE-1.
+
+### 4090 24GB: đo thật, chạy được, thừa 40% VRAM
+
+Chạy đúng job đã dùng để đo 5090 (dựng từ `build_wan_workflow`, 544×960 / 453 frame /
+`block_swap=30` / `offload_device`):
+
+| | 5090 (32 GB) | 4090 (24 GB) |
+|---|---|---|
+| **VRAM đỉnh** | chưa đo | **14 390 / 24 081 MiB = 60%** (trống 9,7 GB) |
+| cgroup RAM | 55,9 GiB (v2) | **56,8 GiB (v1)** |
+| `anon` đỉnh | 17,8 GiB | 24 GiB |
+| Giây/cửa sổ | 48 s (12,10 s/it) | **71 s (17,86 s/it)** |
+| **Cả job** | **443,75 s** | **656 s = 1,48×** |
+| `memory.failcnt` | — | **0** |
+| Video ra | có | có |
+
+Hai điều phép đo bắt được mà suy luận sai:
+
+- **`minMemory` của API không phải RAM bạn nhận.** API báo 4090 EU-RO-1 `minMemory: 46` → tưởng
+  cgroup 42,8 GiB. Máy thật cấp **56,8 GiB**, nhiều hơn cả 5090. `minMemory` là mức thấp nhất trong
+  các offer. Cách duy nhất biết chắc là `cat /sys/fs/cgroup/memory/memory.limit_in_bytes` trên pod.
+- **VAE decode KHÔNG phải đỉnh VRAM.** Tưởng decode 453 frame là chỗ vọt; thực tế VRAM tụt từ
+  14,3 GB xuống 2 GB ngay khi decode chạy. Đỉnh nằm ở sampling.
+
+Pod 4090 này dùng **cgroup v1** (`/sys/fs/cgroup/memory/memory.limit_in_bytes`) còn pod 5090 là v2
+(`/sys/fs/cgroup/memory.max`) — nên nhánh fallback v1 của `scripts/pysite/sitecustomize.py`
+([#cgroup-comfyui](#cgroup-comfyui)) đã được kiểm trên phần cứng thật. Đừng giả định layout cgroup
+theo provider; đọc cả hai đường.
+
+### Cái bẫy: 24GB chạy tốt clip DÀI, OOM clip NGẮN
+
+Nghịch lý, và dễ hiểu sai thành "4090 không chạy được Wan". `_vram_ok` trong `build_wan_workflow`
+chọn đường **chỉ theo resolution + số frame**, không biết card có bao nhiêu VRAM:
+
+```python
+_vram_ok = (max(W,H) <= MOTION_VRAM_MAX_EDGE and _fr <= MOTION_VRAM_MAX_FRAMES)
+(_def_bs, _def_ld) = (0,"main_device") if _vram_ok else (30,"offload_device")
+```
+
+Ngưỡng mặc định (968 / 250 frame) đo trên 5090: 544×960/241f = đỉnh 29,9/32 GB. Trên 24 GB thì:
+
+- clip **dài** (>250 frame) → tự đi offload → **chạy tốt** (số đo ở trên)
+- clip **ngắn** (≤250 frame) → chọn `main_device` → cần 29,9 GB → **CUDA OOM**
+
+Nên `motion_autoset_vram_gate()` trong `setup/lib-gpu.sh` chốt việc này một lần lúc setup, theo
+`nvidia-smi` chứ không theo bảng cứng: VRAM < 31 GB thì `set_kv MOTION_VRAM_MAX_FRAMES 0` (ép offload
+mọi clip), ≥ 31 GB thì trả về 250. Ghi tường minh **cả hai chiều** để pod từng bị ép 0 mà nay đổi
+sang card to thì tự lấy lại đường nhanh. Ghi đè tay: đặt `MOTION_VRAM_MAX_FRAMES` trong `.env` gốc.
+
+> ⚠ Trường hợp clip-ngắn-trên-24GB là **suy ra** từ số 29,9 GB đã đo, **chưa chạy thử**. Chênh 6 GB
+> nên gần như chắc chắn OOM, nhưng nếu bạn thấy nó chạy được thì hạ `MOTION_VRAM_MODEL_ON_GPU_MIB`.
+
+### Tiền: rẻ hơn 25%/giờ nhưng đắt hơn 10%/job — ngưỡng là 70%
+
+- Mỗi job: 5090 = $0,99 × 443,75/3600 = **$0,1220** · 4090 = $0,74 × 656/3600 = **$0,1349**
+- Gọi `f` = tỉ lệ thời gian thuê mà GPU thật sự chạy job. Phiên 5090 dài `T`, phiên 4090 dài
+  `T(1 + 0,48f)` vì job chậm 1,48×. Rẻ hơn khi `0,74(1 + 0,48f) < 0,99`:
+
+> **f < 70% → 4090 rẻ hơn. f > 70% → 5090 rẻ hơn.**
+
+Nhịp dùng thật (0,85 giờ/ngày, và pod GPU được chọn chính vì "job chạy ngay" tức GPU rỗi nhiều) cho
+`f` khoảng 0,3-0,5 → 4090 rẻ hơn 7-14%, tức **$2-4/tháng**. Không đáng đổi vì tiền.
+
+**Kết luận: giữ 5090 làm chính, 4090 làm dự phòng.** Lý do là *stock*, không phải giá — mất 3,5 phút
+mỗi video để tiết kiệm $3/tháng thì không đáng, nhưng khi EU-RO-1 hết 5090 thì đã biết chắc 4090
+chạy được. `GPU_FALLBACK` trong `.env` làm việc xoay đó tự động, và **chỉ** xoay khi RunPod báo hết
+máy — mọi lỗi create khác vẫn nổi lên nguyên vẹn.
+
 <a id="reusing-an-existing-tunnel-token"></a>
 ## Reusing an existing tunnel token
 

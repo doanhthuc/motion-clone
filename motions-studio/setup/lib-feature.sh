@@ -691,6 +691,7 @@ phase_comfyui() {
     [ -z "$(get_kv PYTORCH_ALLOC_CONF)" ] && set_kv PYTORCH_ALLOC_CONF "expandable_segments:True"
     [ -z "$(get_kv CUDA_MODULE_LOADING)" ] && set_kv CUDA_MODULE_LOADING "LAZY"
     [ -z "$(get_kv MOTION_TORCH_COMPILE)" ] && set_kv MOTION_TORCH_COMPILE "0"
+    motion_autoset_vram_gate   # cổng model-on-VRAM theo VRAM thật (lib-gpu.sh) — card 24GB phải ép offload
     # Feature motion/I2V dùng cùng SageAttention với fullstack; GPU cũ tự giữ sdpa.
     if "$CPIP" install -q sageattention >/dev/null 2>&1 \
       && "$COMFY_DIR/venv/bin/python" -c 'import sageattention, torch; cc=torch.cuda.get_device_capability(0); raise SystemExit(0 if cc[0] >= 8 else 1)' >/dev/null 2>&1; then
