@@ -73,3 +73,46 @@ PY
   fi
 }
 #endregion
+
+# #region ALD 10/08/2026 - Cổng model-on-VRAM tự chốt theo VRAM THẬT của card
+# build_wan_workflow() chọn giữa hai đường bằng _vram_ok, mà _vram_ok CHỈ xét resolution + số frame:
+#
+#     _vram_ok = (max(W,H) <= MOTION_VRAM_MAX_EDGE and _fr <= MOTION_VRAM_MAX_FRAMES)
+#     (_def_bs, _def_ld) = (0,"main_device") if _vram_ok else (30,"offload_device")
+#
+# Nó KHÔNG biết card có bao nhiêu VRAM. Ngưỡng mặc định (968 / 250 frame) được đo trên 5090 32GB:
+# 544×960/241f = đỉnh 29,9/32GB. Trên card 24GB con số đó không vừa → clip NGẮN sẽ chọn main_device
+# rồi CUDA OOM, trong khi clip DÀI (>250f) lại chạy tốt vì tự đi đường offload. Nghịch lý dễ hiểu sai
+# thành "4090 không chạy được Wan" — nên chốt ở đây, một lần, theo nvidia-smi.
+#
+# Đo 10/08/2026 trên 4090 24GB, ép offload: job 453 frame chạy XONG, VRAM đỉnh 14390/24081 MiB (60%),
+# RAM anon đỉnh 24/56,8 GiB, memory.failcnt=0. Tức 24GB thừa sức — miễn là ĐI ĐÚNG đường offload.
+#
+# Ghi đè tay: đặt MOTION_VRAM_MAX_FRAMES trong .env gốc (pod-bootstrap.sh forward sang đây).
+motion_autoset_vram_gate() {
+  local need_mib="${MOTION_VRAM_MODEL_ON_GPU_MIB:-31000}" total
+
+  if [ -n "${MOTION_VRAM_MAX_FRAMES:-}" ]; then
+    set_kv MOTION_VRAM_MAX_FRAMES "$MOTION_VRAM_MAX_FRAMES"
+    ok "MOTION_VRAM_MAX_FRAMES=$MOTION_VRAM_MAX_FRAMES (ép tay từ .env gốc, không tự dò)."
+    return 0
+  fi
+
+  total="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -dc '0-9')"
+  if [ -z "$total" ]; then
+    warn "không đọc được VRAM qua nvidia-smi → giữ MOTION_VRAM_MAX_FRAMES mặc định (250)."
+    return 0
+  fi
+
+  # Ghi tường minh cả hai chiều, KHÔNG chỉ khi nhỏ: pod cũ từng bị ép 0 mà nay đổi sang card to thì
+  # phải tự trả về 250, không thì mất đường nhanh mà không ai biết vì sao.
+  if [ "$total" -lt "$need_mib" ]; then
+    set_kv MOTION_VRAM_MAX_FRAMES 0
+    warn "VRAM ${total}MiB < ${need_mib}MiB → MOTION_VRAM_MAX_FRAMES=0: MỌI clip đi đường offload."
+    warn "  Đúng cho card 24GB (đường model-on-VRAM đo 29,9GB, không vừa). Đổi lại: clip ngắn chậm hơn."
+  else
+    set_kv MOTION_VRAM_MAX_FRAMES 250
+    ok "VRAM ${total}MiB ≥ ${need_mib}MiB → MOTION_VRAM_MAX_FRAMES=250 (clip ngắn dùng model-on-VRAM)."
+  fi
+}
+# #endregion

@@ -753,6 +753,7 @@ if [ "$GPU_OK" = "1" ]; then
   [ -z "$(get_kv PYTORCH_ALLOC_CONF)" ] && set_kv PYTORCH_ALLOC_CONF "expandable_segments:True"
   [ -z "$(get_kv CUDA_MODULE_LOADING)" ] && set_kv CUDA_MODULE_LOADING "LAZY"
   [ -z "$(get_kv MOTION_TORCH_COMPILE)" ] && set_kv MOTION_TORCH_COMPILE "0"
+  motion_autoset_vram_gate   # cổng model-on-VRAM theo VRAM thật (lib-gpu.sh) — card 24GB phải ép offload
 
   # ── SageAttention (attention INT8 gần-lossless — Wan sampling nhanh hơn ~15-25%, VRAM attention thấp hơn) ──
   # ALD 02/07/2026 - cài bản triton từ PyPI (không compile CUDA, torch/triton đã có ở trên). CHỈ bật
