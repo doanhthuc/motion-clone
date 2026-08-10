@@ -53,4 +53,25 @@ for _nvlib in "$COMFY_DIR"/venv/lib/python*/site-packages/nvidia/*/lib; do
 done
 export LD_LIBRARY_PATH
 
-exec python main.py --listen 127.0.0.1 --port "$PORT" --disable-smart-memory
+# ALD 10/08/2026 - CHỐNG cgroup OOM-kill (ComfyUI "tự khởi động lại" giữa job, không traceback).
+# RunPod cho container thấy RAM host (123 GiB) chứ không thấy trần cgroup (55,9 GiB), nên ComfyUI
+# tự cấp cho mình gấp đôi RAM thật. Hai mũi chữa, cùng lý do:
+#
+#  1. pysite/sitecustomize.py — kẹp psutil.virtual_memory() theo cgroup. Chữa TẬN GỐC: trần pinned
+#     memory, ngưỡng cache, và RAM-pressure-cache đều tính từ psutil. Đọc header file đó để biết
+#     số đo. Nạp qua PYTHONPATH nên CHỈ ComfyUI dính, không đụng python khác trên pod.
+#  2. --cache-none — ComfyUI mặc định giữ output MỌI node giữa các lần chạy. Với box này gần như
+#     vô dụng: đây là WORKER, mỗi job là prompt mới với video khác nên cache chẳng bao giờ trúng,
+#     chỉ ôm ~15 GB tensor ảnh (453 frame × 3 nhánh DWPose + face crop). Model VẪN nằm nguyên
+#     trong RAM/VRAM (cache model là cơ chế khác) → không phát sinh nạp lại model.
+#     Đổi chiến lược cache khi cần A/B: COMFY_CACHE_ARGS="--cache-ram 4 24" trong .env.
+_SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -f "$_SELF_DIR/pysite/sitecustomize.py" ]; then
+  export PYTHONPATH="$_SELF_DIR/pysite${PYTHONPATH:+:$PYTHONPATH}"
+else
+  echo "[comfy] ⚠ thiếu $_SELF_DIR/pysite/sitecustomize.py — ComfyUI sẽ đọc RAM host, có nguy cơ OOM-kill." >&2
+fi
+
+# shellcheck disable=SC2086  # cố ý tách từ: COMFY_CACHE_ARGS chứa nhiều tham số
+exec python main.py --listen 127.0.0.1 --port "$PORT" --disable-smart-memory \
+  ${COMFY_CACHE_ARGS-"--cache-none"}
