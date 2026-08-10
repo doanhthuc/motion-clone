@@ -216,6 +216,10 @@ if ((E.COMFY_LOCAL || "") === "1") {
       COMFY_DIR,
       PYTORCH_ALLOC_CONF: E.PYTORCH_ALLOC_CONF || E.PYTORCH_CUDA_ALLOC_CONF || "expandable_segments:True",
       CUDA_MODULE_LOADING: E.CUDA_MODULE_LOADING || "LAZY",
+      // ALD 10/08/2026 - Chiến lược cache node của ComfyUI. Mặc định --cache-none vì đây là WORKER:
+      // mỗi job là prompt mới nên cache gần như không trúng, chỉ ôm tensor ảnh tới lúc bị cgroup
+      // OOM-kill. Để A/B: COMFY_CACHE_ARGS="--cache-ram 4 24" (hoặc rỗng = mặc định ComfyUI).
+      ...(E.COMFY_CACHE_ARGS === undefined ? {} : { COMFY_CACHE_ARGS: E.COMFY_CACHE_ARGS }),
     },
   })
 }

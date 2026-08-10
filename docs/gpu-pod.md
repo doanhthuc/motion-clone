@@ -959,6 +959,93 @@ heap phình tới hàng chục GB rồi bị OOM-killer của cgroup giết. Tri
 không stack trace, không dòng nào nhắc tới RAM. Nhờ chốt này, box 4 GB (heap 2896 MB) **có thể** đủ —
 nhưng chưa ai thử.
 
+<a id="cgroup-comfyui"></a>
+#### Cùng cái bẫy đó cắn ComfyUI — 10/08/2026
+
+Đúng cơ chế trên, lần này ở pod GPU. Job motion 453 frame (544×960) chết **hai lần liên tiếp**, cách
+nhau 12 phút, **cùng một điểm**: 16-17 giây sau khi bước sampling đầu bắt đầu.
+
+```
+03:38:33  Frames 0-81:  0%|  | 0/4     03:50:43  Frames 0-81:  0%|  | 0/4
+03:38:50  ComfyUI boot lại từ đầu      03:50:59  ComfyUI boot lại từ đầu
+```
+
+**Không traceback, không "CUDA out of memory".** Python crash luôn để lại traceback — im lặng tuyệt
+đối nghĩa là `SIGKILL` từ ngoài. Bằng chứng nằm ở cgroup, không nằm trong log ComfyUI:
+
+```
+/sys/fs/cgroup/memory.max     59999997952   trần THẬT của container: 55,9 GiB
+/sys/fs/cgroup/memory.peak    60000010240   đỉnh chạm ĐÚNG trần
+/sys/fs/cgroup/memory.events  max 18494  oom_kill 1     (rồi lên 2 sau lần chạy lại)
+/proc/meminfo MemTotal        129429860 kB  RAM của HOST: 123 GiB
+```
+
+ComfyUI đọc RAM qua `psutil`, và `psutil` đọc `/proc/meminfo` = RAM host. Nó tự cấp cho mình gấp đôi:
+
+| Chỗ | Công thức | Tưởng có | Thật sự có |
+|---|---|---|---|
+| Trần pinned memory | `model_management.py` `ram * 0.90` | 111 GiB | 50 GiB |
+| Ngưỡng cache inactive | `main.py` `min(128, total_ram)` | 123 GiB | 56 GiB |
+| RAM pressure cache | `caching.py` so `virtual_memory().available` | host còn 108 GiB rảnh | cgroup đã sát trần |
+
+Hàng thứ ba là hàng giết: **RAM pressure cache không bao giờ kích hoạt** vì nó nhìn host chứ không
+nhìn cgroup. Nó giữ nguyên umt5 encoder (11,4 GB), CLIP-vision, và tensor ảnh 453 frame của mọi node
+(`VHS_LoadVideo` + 3 nhánh DWPose + face crop ≈ 15 GB), cộng 12,17 GB block-swap nằm **pinned**
+(page-locked — kernel KHÔNG đòi lại được). Vượt 56 GB thì bị giết, không có bước cảnh báo nào.
+
+Cấu hình block swap **không sai**: gate ở `linux.py` chọn offload vì 453 frame > 250, đúng như A/B
+22/06. Vấn đề nằm ở phía RAM chứ không phải VRAM — lúc chết GPU mới dùng 4,8/32 GB.
+
+**Chữa** — hai mũi, cùng một lý do, đều trong `comfy-start-native.sh`:
+
+1. `scripts/pysite/sitecustomize.py` kẹp `psutil.virtual_memory()` theo cgroup, nạp qua `PYTHONPATH`
+   (chỉ ComfyUI dính). Chữa tận gốc: cả ba hàng trong bảng trên đều tính từ `psutil`.
+2. `--cache-none`. ComfyUI mặc định giữ output **mọi node** giữa các lần chạy — với box này gần như
+   vô dụng vì đây là *worker*, mỗi job là prompt mới với video khác nên cache chẳng bao giờ trúng,
+   chỉ ôm tensor. Model vẫn nằm nguyên trong RAM/VRAM (cache model là cơ chế khác) nên không phát
+   sinh nạp lại model. A/B bằng `COMFY_CACHE_ARGS` trong `.env`.
+
+Nhận ra ngay lần sau bằng ba dòng này lúc ComfyUI khởi động:
+
+```
+[sitecustomize] RAM kẹp theo cgroup: 55.9 GiB (RAM host 123.4 GiB — KHÔNG dùng)
+[INFO] Total VRAM 32109 MB, total RAM 57220 MB        ← KHÔNG còn 126396
+[INFO] Enabled pinned memory 51498.0                  ← KHÔNG còn 113756
+[INFO] Disabling intermediate node cache.             ← KHÔNG còn "Using RAM pressure cache."
+```
+
+Còn nghi OOM-kill thì đọc `memory.events`, đừng đọc log ComfyUI: `oom_kill` tăng là chắc chắn.
+Lưu ý `memory.peak` **không reset được** trong container RunPod (`Permission denied`), nên muốn đo
+đỉnh của một lần chạy phải tự lấy mẫu `memory.current`.
+
+**Nghiệm thu 10/08/2026** — chạy lại ĐÚNG job đã chết hai lần (544×960, 453 frame, `block_swap=30`,
+`offload_device`, dựng bằng chính `build_wan_workflow`):
+
+| | Trước | Sau |
+|---|---|---|
+| Cửa sổ sampling | chết ở cửa sổ 1 sau 16-17 giây | **6/6 xong**, 48 giây/cửa sổ |
+| Kết quả | không có gì | `Prompt executed in 443.75 seconds` + video ra file |
+| `oom_kill` | 1 → 2 (mỗi lần chạy +1) | **đứng nguyên ở 2** |
+| `anon` (RAM không thu hồi được) | phình tới khi bị giết | **17,8 GiB** suốt lượt chạy |
+
+<a id="cgroup-99pct"></a>
+**Đừng hoảng khi thấy `memory.current` = 99% trần.** Lúc chạy nó dính 55/55,9 GiB, nhưng phân rã
+`memory.stat` cho thấy phần lớn là page cache **thu hồi được**, không phải RAM thật:
+
+```
+anon           17,8 GiB   ← chỉ chỗ này mới là RAM không đòi lại được
+file           37,3 GiB   ┐ page cache đọc file model 18,4 GB —
+inactive_file  19,6 GiB   ┘ kernel lấy lại bất cứ lúc nào
+```
+
+Linux giữ page cache tới khi cần chỗ; 99% với 19,6 GiB `inactive_file` là bình thường. Muốn biết
+thật sự còn bao nhiêu margin thì đọc `anon`, đừng đọc `memory.current`.
+
+**Sau khi job xong ComfyUI vẫn restart một lần — đó là CHỦ Ý, không phải hỏng.** Worker có watchdog
+riêng: `ComfyUI idle ôm RAM 31GB ≥ 22GB → recycle`, SIGKILL rồi để PM2 dựng lại (~12 giây). Nhìn
+`pm2.log` sẽ thấy `exited with code [0] via signal [SIGKILL]` — phân biệt với OOM-kill bằng
+`memory.events`: recycle thì `oom_kill` KHÔNG tăng.
+
 <a id="fe-build-ci"></a>
 #### Build FE ở CI — đã làm, và nó xoá hẳn câu hỏi RAM
 
