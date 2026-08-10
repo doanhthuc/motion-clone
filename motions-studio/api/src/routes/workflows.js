@@ -101,12 +101,15 @@ router.get("/workflows", async (req, res) => {
 // #region ALD 09/07/2026 - Capabilities của BOX (API + worker chạy CÙNG máy): FE dùng để ẨN preset nặng
 // (vd motion 20s·30fps = 601f cần RAM ≥128GB — minRamGb trong MOTION_PRESETS). Đặt TRƯỚC /workflows/:id kẻo bị nuốt.
 // ALD 20/07/2026 - Thêm gpuVramGb + ngưỡng Wan-Dancer để FE GATE node "Vũ đạo theo nhạc" (khóa mờ khi < 90GB).
+// ALD 10/08/2026 - totalRamGb lấy TRẦN CGROUP (box-ram.js) chứ không os.totalmem(): trên pod RunPod
+// os.totalmem() trả RAM host 123 GiB trong khi container chỉ 55,9 GiB, nên gate preset đang mở nhầm
+// những preset mà box không gánh nổi. Cùng con bug pod-fe.sh + sitecustomize.py đã trị.
 router.get("/workflows/capabilities", sessionAuth, async (_req, res) => {
-  const os = await import("node:os")
+  const { boxRamGb } = await import("../box-ram.js")
   const { detectGpuVramGb, WAN_DANCER_MIN_VRAM_GB } = await import("../gpu-vram.js")
   const gpuVramGb = await detectGpuVramGb().catch(() => 0)
   res.json({
-    totalRamGb: Math.round(os.totalmem() / (1024 ** 3)),
+    totalRamGb: boxRamGb(),
     gpuVramGb,
     wanDancerMinVramGb: WAN_DANCER_MIN_VRAM_GB,
   })
