@@ -1592,7 +1592,10 @@ def build_wan_workflow(ref_name, motion_name, p, prefix="motion-out"):
         "33": {"class_type": "RepeatImageBatch", "inputs": {"image": ["34", 0], "amount": F}},
         "40": {"class_type": "WanVideoLoraSelectMulti", "inputs": {
             "lora_0": "WanAnimate_relight_lora_fp16.safetensors", "strength_0": _motion_float(p, "lora_relight", "loraRelight", default=0.0),
-            "lora_1": "lightx2v_I2V_14B_480p_cfg_step_distill_rank32_bf16.safetensors", "strength_1": lx2v,
+            # ALD 17/08/2026 - MOTION_LX2V_FILE: đổi bản rank của LoRA distill (A/B bộ số Kijai: rank64;
+            # example chính thức dùng rank64 @ 1.2). Default rank32 = baseline cũ, không đổi hành vi.
+            "lora_1": os.environ.get("MOTION_LX2V_FILE", "lightx2v_I2V_14B_480p_cfg_step_distill_rank32_bf16.safetensors"),
+            "strength_1": lx2v,
             "lora_2": "none", "strength_2": 1.0, "lora_3": "none", "strength_3": 1.0,
             "lora_4": "none", "strength_4": 1.0, "low_mem_load": False, "merge_loras": True}},
         "41": {"class_type": "WanVideoBlockSwap", "inputs": {
@@ -2026,15 +2029,21 @@ def _normalize_motion_params(p):
         p["loraLightx2v"] = 0.0
     else:
         # #endregion
+        # #region ALD 17/08/2026 - Knob env cho baseline Fast (A/B "bộ số Kijai" trị biểu cảm mặt hai cực):
+        # example chính thức wanvideo_WanAnimate_example_01.json chạy 6 bước + distill rank64 @ 1.2 (repo: 4 bước
+        # + rank32 @ 1.0). API scrub steps/loraLightx2v của payload nên đường A/B duy nhất là env worker — giống
+        # MOTION_FORCE_QUALITY. Default giữ NGUYÊN baseline cũ; chỉ phiên A/B mới set env.
         p["render_profile"] = "fast"
         p["renderProfile"] = "fast"
         p["hq"] = False
         p.pop("hq_steps", None)
-        p["steps"] = 4
+        p["steps"] = int(os.environ.get("MOTION_FAST_STEPS", "4") or "4")
         p["cfg"] = 1.0
         p["scheduler"] = "dpm++_sde"
-        p["lora_lightx2v"] = 1.0
-        p["loraLightx2v"] = 1.0
+        _lx2v_s = float(os.environ.get("MOTION_LX2V_STRENGTH", "1.0") or "1.0")
+        p["lora_lightx2v"] = _lx2v_s
+        p["loraLightx2v"] = _lx2v_s
+        # #endregion
     # ALD 27/06/2026 - RAW COLOR DEFAULT: node cũ còn lưu bộ chỉnh màu thì tự lành về tắt, tránh flash/đổi màu.
     _legacy_face = str(p.get("face_source", p.get("faceSource", ""))).lower().strip()
     _legacy_method = str(p.get("match_ref_method", p.get("matchRefMethod", ""))).lower().strip()
