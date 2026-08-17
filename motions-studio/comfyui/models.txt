@@ -19,6 +19,10 @@ text_encoders    | umt5-xxl-enc-bf16.safetensors                                
 clip_vision      | clip_vision_h.safetensors                                      | https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/clip_vision/clip_vision_h.safetensors
 loras            | WanAnimate_relight_lora_fp16.safetensors                       | https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/LoRAs/Wan22_relight/WanAnimate_relight_lora_fp16.safetensors
 loras            | lightx2v_I2V_14B_480p_cfg_step_distill_rank32_bf16.safetensors | https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Lightx2v/lightx2v_I2V_14B_480p_cfg_step_distill_rank32_bf16.safetensors
+# ALD 17/08/2026 - 2 onnx cho WanAnimatePreprocess (crop mặt ViTPose chuẩn kijai). Node KHÔNG tự tải chúng;
+# thiếu là mọi job motion âm thầm fallback DWPose pad128 (phát hiện 17/08 khi A/B trên RunPod). URL verify 200 17/08.
+detection        | vitpose-l-wholebody.onnx                                       | https://huggingface.co/JunkyByte/easy_ViTPose/resolve/main/onnx/wholebody/vitpose-l-wholebody.onnx
+detection        | yolov10m.onnx                                                  | https://huggingface.co/Wan-AI/Wan2.2-Animate-14B/resolve/main/process_checkpoint/det/yolov10m.onnx
 
 # --- Wan TEXT→VIDEO (node "Text → Video": CHỈ prompt, KHÔNG ảnh) — ALD 14/06/2026 ---
 # Graph text-only đã verify từ example WanVideoWrapper trên box (wanvideo_2_1_14B_T2V_example_03.json) +

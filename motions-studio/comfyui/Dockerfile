@@ -30,7 +30,12 @@ RUN git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes.git \
  && git clone --depth 1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git \
  && git clone --depth 1 https://github.com/city96/ComfyUI-GGUF.git \
  && git clone --depth 1 https://github.com/Fannovel16/comfyui_controlnet_aux.git \
- && git clone --depth 1 https://github.com/Lightricks/ComfyUI-LTXVideo.git
+ && git clone --depth 1 https://github.com/Lightricks/ComfyUI-LTXVideo.git \
+ && git clone --depth 1 https://github.com/kijai/ComfyUI-WanAnimatePreprocess.git
+# ALD 17/08/2026 - WanAnimatePreprocess: crop mặt ViTPose chuẩn kijai cho Wan Animate (fix "chu mỏ" 21/07).
+# Thiếu node này thì mọi job motion fallback DWPose pad128 (phát hiện 17/08: cả 2 phiên A/B lẫn job thật trên
+# RunPod đều fallback mà không ai biết). Deps (onnx, onnxruntime-gpu, opencv) do vòng for phía dưới cài.
+# 2 model onnx (vitpose-l-wholebody + yolov10m) KHÔNG tự tải — khai trong catalog-motion-transfer.json → volume.
 # Cài deps của từng custom node (best-effort, không fail build nếu 1 node thiếu)
 RUN for d in */ ; do [ -f "$d/requirements.txt" ] && pip install --no-cache-dir -r "$d/requirements.txt" || true ; done
 
