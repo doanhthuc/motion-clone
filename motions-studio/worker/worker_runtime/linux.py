@@ -3148,7 +3148,9 @@ def _tryon_denoise(gt):
         return float(os.environ.get("TRYON_DENOISE_SHOES", "0.65"))
     if g in GARMENT_DRESS or g in GARMENT_MULTI or g in GARMENT_REVEAL or g in ("auto", "generic"):
         return float(os.environ.get("TRYON_DENOISE_HEAVY", "0.92"))
-    return float(os.environ.get("TRYON_DENOISE_LIGHT", "0.82"))
+    # ALD 16/08/2026 - 0.82 → 0.90: đo trên cặp ảnh fail thật của user (áo trắng ↔ blouse trắng, seed 42) —
+    # 0.82 neo ảnh gốc quá chặt, KHÔNG thay nổi món lẻ; 0.90 thay đúng mà vẫn giữ tỉ lệ/dáng (mục đích img2img).
+    return float(os.environ.get("TRYON_DENOISE_LIGHT", "0.90"))
 
 def _img_size(path):
     """(W,H) ảnh qua ffprobe (png/jpeg/webp) — None nếu lỗi (caller fallback an toàn)."""
@@ -3267,76 +3269,61 @@ def _qwen_tryon_prompts(gt, extra=None):
                f"Match the new garment's color, pattern, fabric, and cut from image 2 exactly. "
                f"Photorealistic, natural draping and shadows, no style change.")
         neg = "different person, distorted face, wrong color, wrong pattern, missing details, blurry, lowres, deformed, extra limbs, watermark, text, signature"
-    # ALD 15/06/2026 - FIX "output đổi kiểu tóc": Qwen-Edit hay tự restyle tóc người mẫu khi tryon (câu
-    # "preserve ... hair" nằm giữa prompt bị image-conditioning của ảnh sản phẩm đè). Thêm lệnh KHOÁ TÓC
-    # mệnh lệnh đặt TRÊN CÙNG + negative tóc → giữ NGUYÊN tóc model. Áp cho MỌI loại garment....
-    _HAIR_LOCK = ("CRITICAL HAIR LOCK — keep the hair of the person in image 1 EXACTLY as it is: identical "
-                  "hairstyle, hair length, parting, hairline, hair texture and hair color. Do NOT restyle, curl, "
-                  "wave, straighten, lengthen, shorten, add volume to or recolor the hair in any way. ")
+    # ALD 15/06/2026 - FIX "output đổi kiểu tóc": negative tóc (khối POS "HAIR LOCK" cũ đã gộp vào _COMPACT_LOCK
+    # bên dưới — xem region 16/08/2026).
     _HAIR_NEG = ("different hairstyle, changed hair, restyled hair, new haircut, curled hair, wavy hair, "
                  "straightened hair, longer hair, shorter hair, added hair volume, different hair parting, "
                  "different hair color, hair extensions")
-    # ALD 21/06/2026 - FIX "set/Bộ tỉ lệ không đồng nhất": EmptyLatent+denoise 1.0 → Qwen vẽ lại người; với set
-    # (ảnh SP là người full-body khác) Qwen HÚT tỉ lệ/dáng/khung của người-mặc-sản-phẩm vào output → đầu nhỏ/thân
-    # kéo dài, lệch so với model. Khóa TỈ LỆ + bắt image2 CHỈ là nguồn quần áo (giống cơ chế _HAIR_LOCK). Áp MỌI loại
-    # (single-garment vốn đã giữ dáng → vô hại)....
-    _PROP_LOCK = ("CRITICAL PROPORTION LOCK — keep the person's body proportions, height, build, head-to-body ratio "
-                  "and their scale within the frame EXACTLY as in image 1. Image 2 is ONLY the source of the clothing "
-                  "design — do NOT copy the body, pose, height, proportions, camera angle, framing or crop from image 2. "
-                  "Do not stretch, elongate, shrink or distort the body to fit the outfit. ")
+    # ALD 21/06/2026 - FIX "set/Bộ tỉ lệ không đồng nhất": negative tỉ lệ (khối POS "PROPORTION LOCK" cũ đã gộp
+    # vào _COMPACT_LOCK). ALD 20/07/2026 - bổ sung negative đầu-nhỏ/chân-dài (PROP mạnh).
     _PROP_NEG = ("distorted body proportions, elongated body, stretched body, shrunken head, oversized head, "
                  "body copied from product image, pose copied from product image, different body scale, "
-                 "mismatched proportions, warped anatomy, unnatural body length")
-    # ALD 04/07/2026 - FIX "tryon (Auto) ĐỔI MẶT người mẫu" — TỐI KỊ theo user. Cùng bệnh với bug tóc 15/06 và
-    # tỉ lệ 21/06: câu "preserve ... face" nằm GIỮA prompt bị conditioning đè khi denoise 1.0 vẽ lại cả ảnh.
-    # Trị bằng đúng pattern đã kiểm chứng: KHÓA MẶT mệnh lệnh đặt TRÊN CÙNG (trước cả HAIR/PROP) + negative mặt.
-    _FACE_LOCK = ("CRITICAL FACE LOCK — the face of the person in image 1 is UNTOUCHABLE: keep the exact same face, "
-                  "facial identity, facial structure, eyes, eyebrows, nose, lips, jawline, chin, cheekbones, skin "
-                  "tone, makeup and facial expression, identical to image 1. Do NOT beautify, slim, reshape, "
-                  "rejuvenate, swap or regenerate the face; the output must be the SAME person, instantly "
-                  # ALD 12/07/2026 - user báo "mặt bị mờ": mặt là vùng nhỏ trong full-body → Qwen render soft.
-                  # Ép độ NÉT vùng mặt + negative mặt-mờ (đỡ một phần; nét thật sự cần Enhance/CodeFormer sau tryon).
-                  "recognizable as in image 1. Render the face SHARP and IN FOCUS with crisp, high-detail facial "
-                  "features — clear open eyes, defined eyelashes and eyebrows, crisp lips — as detailed as the rest "
-                  "of the photo, never soft, hazy or lower-resolution than the body. ")
+                 "mismatched proportions, warped anatomy, unnatural body length, "
+                 "tiny head, small head, doll-like proportions, long legs, "
+                 "elongated legs, stretched torso, lengthened body, fashion-illustration proportions, 9-head figure")
+    # ALD 04/07/2026 - FIX "tryon (Auto) ĐỔI MẶT" + 12/07 "mặt bị mờ": negative mặt (khối POS "FACE LOCK" cũ đã
+    # gộp vào _COMPACT_LOCK).
     _FACE_NEG = ("different face, changed face, new face, face swap, regenerated face, beautified face, slimmer face, "
                  "reshaped jawline, changed eyes, changed nose, changed lips, changed makeup, changed facial "
                  "expression, younger face, older face, altered identity, "
                  "blurry face, soft face, hazy face, out-of-focus face, low-detail face, smudged facial features, "
                  "unclear eyes, half-closed eyes not in image 1")
-    # ALD 06/07/2026 - FIX "tryon ĐỔI MÀU TÓC + sản phẩm KHÔNG GIỐNG": khi ảnh SP là NGƯỜI/model mặc (không phải
-    # ảnh phẳng), Qwen hút TÓC/mặt/da của người-mẫu-sản-phẩm vào output (đè _HAIR/_FACE_LOCK) + tái tạo lại đồ theo
-    # dáng-mặc nên lệch pattern. _PROP_LOCK chỉ chặn body/pose, CHƯA chặn tóc/mặt của người mặc trong image2.
-    # Khoá: image2/3 = CHỈ nguồn MÓN ĐỒ, bỏ hẳn người mặc trong đó (đặt TRÊN CÙNG + negative)....
-    _SRC_LOCK = ("CRITICAL PRODUCT-SOURCE — image 2 (and image 3) is ONLY a reference for the product itself. "
-                 "If a person, model or mannequin is wearing the product in image 2, IGNORE that wearer entirely: "
-                 "do NOT copy their hair, hairstyle, hair color, face, skin tone, body or pose from image 2. "
-                 "Take ONLY the garment and reproduce its EXACT color, print, pattern, fabric, lace and cut; "
-                 "everything about the PERSON must come from image 1, nothing about the wearer from image 2. ")
+    # ALD 06/07/2026 - FIX "ĐỔI MÀU TÓC + sản phẩm KHÔNG GIỐNG" khi ảnh SP là người mặc: negative nguồn-sản-phẩm
+    # (khối POS "PRODUCT-SOURCE" cũ đã gộp vào _COMPACT_LOCK).
     _SRC_NEG = ("hair from product image, hair color from image 2, wearer's hairstyle, product model's hair, "
                 "face from image 2, wearer's face, skin tone from image 2, different floral pattern, invented pattern")
-    # ALD 20/07/2026 - PROP_LOCK MẠNH (mặc định): thêm mốc head-height cụ thể + negative đầu-nhỏ/chân-dài, và đưa
-    # PROP_LOCK lên vị trí 2 (ngay sau FACE, trước HAIR) vì ở full-regen denoise=1.0 câu ở giữa bị conditioning đè
-    # (bài học 21/06/04/07). Giảm bớt "đầu/thân lệch" khi vẽ lại nguyên bộ. Test .165: cải thiện nhẹ, zero-risk.
-    _PROP_LOCK = ("CRITICAL PROPORTION LOCK — keep the person's body proportions, height, build and head-to-body "
-                  "ratio EXACTLY as in image 1. The person is a normally-proportioned adult, roughly 7 to 7.5 "
-                  "head-heights tall; the head must stay the SAME size relative to the body as image 1 and must "
-                  "NOT be made small; do NOT elongate the torso or legs, do NOT slim or stretch the body. Image 2 "
-                  "is ONLY the source of the clothing design — never copy body, pose, height, proportions, camera "
-                  "angle, framing or crop from image 2. ")
-    _PROP_NEG = (_PROP_NEG + ", tiny head, small head, doll-like proportions, oversized head, long legs, "
-                 "elongated legs, stretched torso, lengthened body, fashion-illustration proportions, 9-head figure")
-    pos = _FACE_LOCK + _PROP_LOCK + _HAIR_LOCK + _SRC_LOCK + _tryon_extra_clause(extra) + pos
+    # #region ALD 16/08/2026 - FIX "toàn không thay đồ được" (user báo, tái hiện được bằng ảnh thật + seed 42):
+    # 4 khối CRITICAL LOCK dồn TRƯỚC lệnh thay đồ đẩy tổng prompt lên ~2.400 ký tự toàn mệnh lệnh "giữ nguyên
+    # hệt ảnh 1" — lệnh thay đồ bị dí xuống cuối nên Qwen tái tạo lại gần nguyên ảnh 1 (đồ gốc giữ nguyên).
+    # A/B trên pod (cùng ảnh + seed): locks-trước = KHÔNG thay; lệnh-trước = thay đúng sản phẩm, mặt/tóc/tỉ lệ
+    # vẫn giữ. Đây cũng đúng bài học 20/07 "prompt dài → LOÃNG LỆNH": các bản vá cũ (FACE/HAIR/PROP/SRC 15/06→
+    # 06/07) chữa identity bằng cách dồn lock lên đầu nhưng chính điều đó giết lệnh chính. Kiến trúc mới:
+    # (1) LỆNH THAY ĐỒ theo loại đồ đứng ĐẦU, (2) ghi chú user ngay sau, (3) MỘT khối lock GỌN (mặt/tóc/tỉ lệ/
+    # bỏ-người-mặc-trong-ảnh-SP) đứng CUỐI. Negative giữ NGUYÊN toàn bộ (vẫn mã hoá mọi failure mode cũ).
+    _COMPACT_LOCK = ("CRITICAL: the output must show the SAME person as image 1 — identical face (rendered sharp "
+                     "and in focus), identical hairstyle, hair length and hair color, identical body proportions, "
+                     "height and scale within the frame, same skin tone, same pose and expression. "
+                     "If a person, model or mannequin is wearing the product in image 2, ignore that wearer "
+                     "entirely and take ONLY the garments — never copy their hair, face, body, pose or framing.")
+    pos = pos + " " + _tryon_extra_clause(extra) + _COMPACT_LOCK
+    # #endregion
     neg = neg + ", " + _FACE_NEG + ", " + _HAIR_NEG + ", " + _PROP_NEG + ", " + _SRC_NEG
     return pos, neg
 
 def build_qwen_tryon_workflow(model_name, product_name, garment_type, prefix, target_wh=None, extra_prompt=None):
-    # ALD 20/07/2026 - Try-On tối giản: image1=model, image2=1 ảnh sản phẩm (bỏ đa-góc image3).
-    product_names = [product_name] if isinstance(product_name, str) else list(product_name or [])[:1]
+    # ALD 16/08/2026 - KHÔI PHỤC đa-góc (đảo "tối giản" 20/07 theo yêu cầu user): image1=model, image2=ảnh SP
+    # chính, image3 (nếu có)=CÙNG sản phẩm góc khác (mặt sau/bên hông) — TextEncodeQwenImageEditPlus nhận tối đa 3 slot.
+    product_names = [product_name] if isinstance(product_name, str) else list(product_name or [])[:2]
     if not product_names:
         raise RuntimeError("tryon: thiếu ảnh sản phẩm")
     gt = str(garment_type or "upper").lower().strip()
     pos, neg = _qwen_tryon_prompts(gt, extra=extra_prompt)
+    if len(product_names) > 1:
+        # Nói RÕ image3 là góc khác của CÙNG món đồ (thường ảnh 2 = mặt trước, ảnh 3 = mặt sau) —
+        # không nói thì Qwen dễ hiểu nhầm là món THÊM và mặc chồng 2 lớp.
+        pos += (" Image 2 and image 3 show the SAME single product from two angles — typically image 2 is the "
+                "front and image 3 is the back of the product. Use both views only to render that ONE product "
+                "accurately from the person's current viewpoint; image 3 is NOT an additional garment to add.")
     seed = abs(hash(prefix)) % (2 ** 31)
     model_mp = _tryon_mp(gt)   # giày → 2MP (rõ bàn chân); còn lại 1MP
     # #region ALD 20/07/2026 - GIỮ TỈ LỆ ẢNH GỐC (TRYON_IMG2IMG, mặc định BẬT). Thay vì denoise=1.0 + EmptyLatent
@@ -3384,6 +3371,12 @@ def build_qwen_tryon_workflow(model_name, product_name, garment_type, prefix, ta
         "60": {"class_type": "VAEDecode", "inputs": {"samples": ["50", 0], "vae": ["32", 0]}},
         "100": {"class_type": "SaveImage", "inputs": {"images": ["60", 0], "filename_prefix": prefix}},
     }
+    # ALD 16/08/2026 - Góc SP thứ 2 → image3 trên CẢ 2 encoder (pos/neg cùng nhận ref, như image1/2).
+    if len(product_names) > 1:
+        wf["12"] = {"class_type": "LoadImage", "inputs": {"image": product_names[1]}}
+        wf["22"] = {"class_type": "ImageScaleToTotalPixels", "inputs": {"image": ["12", 0], "upscale_method": "lanczos", "megapixels": 1.0, "resolution_steps": 1}}
+        wf["40"]["inputs"]["image3"] = ["22", 0]
+        wf["41"]["inputs"]["image3"] = ["22", 0]
     return wf
 
 # ───────────────────────── Feet detailer (giày/dép) ─────────────────────────
@@ -4689,20 +4682,64 @@ def _tryon_postprocess(out, params, job_id):
         api_log(job_id, f"hậu kỳ tryon lỗi → giữ ảnh gốc: {e}", "warn")
     return out
 
+# #region ALD 16/08/2026 - GHÉP NỀN try-on (pass 2). FE toggle "Ghép nền" (InspectorTryon) mở cổng 'Nền' →
+# engine gửi inputs.background, và FlowNode.vue hứa "worker ghép người vào bối cảnh (Qwen pass 2)" — nhưng
+# run_tryon trước giờ KHÔNG đọc input này: user nối ảnh nền mà output vẫn giữ nguyên nền gốc (bug user báo
+# 16/08). Pass 2 tái dùng build_qwen_create_workflow — đường ghép người-vào-cảnh ĐÃ chạy thật ở teaser
+# TẦNG 2A (scene reference). image1 = người ĐÃ thay đồ, image2 = ảnh bối cảnh; realism=False để prompt
+# compose không bị câu ép-realism đè (bài học prompt-loãng 20/07).
+_TRYON_BG_POS = (
+    "Take the person from image 1 and place them into the environment shown in image 2. "
+    "CRITICAL — keep the person EXACTLY as in image 1: same face, same hair, same body proportions, same pose, "
+    "and the SAME OUTFIT with its exact colors, patterns, fabrics and details; do not restyle, recolor or change "
+    "any garment, shoe or accessory. "
+    "The background must be the location from image 2: reproduce its setting, architecture, furniture, plants and "
+    "depth faithfully — do NOT keep any part of the original background from image 1. "
+    "Blend the person in naturally: match the lighting direction, color temperature, perspective and camera height "
+    "of image 2, and add natural contact shadows under the person. "
+    "Photorealistic, seamless composite, no cut-out edges.")
+_TRYON_BG_NEG = (
+    "changed outfit, different clothes, restyled garment, wrong garment color, missing accessories, "
+    "changed face, different person, changed hair, changed pose, distorted body, "
+    "original background kept, background from image 1, different location than image 2, invented background, "
+    "pasted cutout, sticker edges, floating person, mismatched lighting, mismatched perspective, wrong scale, "
+    "blurry, lowres, deformed, watermark, text, signature")
+
+def _tryon_compose_background(job_id, person_path, bg_path, prefix):
+    """Pass 2 'Ghép nền': đặt người (đã thay đồ, ảnh 1) vào bối cảnh (ảnh 2) bằng Qwen-Image-Edit.
+    Trả path ảnh ghép. RAISE khi ComfyUI không trả ảnh — user đã chủ động nối cổng Nền, âm thầm giữ
+    nền cũ chính là bug đang sửa; job lỗi rõ ràng còn hơn output sai."""
+    pid = comfy_submit(build_qwen_create_workflow(
+        [comfy_upload(person_path), comfy_upload(bg_path)], _TRYON_BG_POS, prefix + "-bg",
+        realism=False, negative_prompt=_TRYON_BG_NEG, target_mp=TRYON_MP))
+    outp = comfy_fetch_output(
+        comfy_poll(pid, job_id, deadline_sec=600, prog_lo=0.82, prog_hi=0.93, prog_step="ghép nền (pass 2)"),
+        exts=IMG_EXTS)
+    if not outp:
+        raise RuntimeError("Ghép nền: ComfyUI không trả ảnh (pass 2)")
+    return outp
+# #endregion
+
 def run_tryon(job):
     job_id = job["id"]; inputs = job.get("inputs", {}); params = job.get("params", {})
     model_key = inputs.get("model") or inputs.get("ref") or inputs.get("image")
     product_key = inputs.get("product") or inputs.get("garment")
-    # ALD 20/07/2026 - Try-On tối giản: 1 Image Ref (model) + 1 Product Ref. Bỏ clean-only, bỏ đa-góc-sản-phẩm.
-    if not model_key or not product_key:
+    # ALD 16/08/2026 - KHÔI PHỤC cleanOnly: 20/07 "Try-On tối giản" bỏ nhánh này ở worker nhưng FE vẫn có toggle
+    # "Chỉ làm sạch ảnh" VÀ template Singer đa-outfit dựng node tryon cleanOnly làm bước làm sạch trước Motion —
+    # các flow đó chết với "tryon cần inputs.product". cleanOnly chỉ cần ảnh model, không cần sản phẩm.
+    clean_only = str(params.get("cleanOnly") or params.get("clean_only") or "").lower().strip() in ("1", "true", "yes", "on")
+    if not model_key or (not product_key and not clean_only):
         raise RuntimeError("tryon cần inputs.model (người) + inputs.product (trang phục)")
-    product_keys = [product_key]
+    # ALD 16/08/2026 - KHÔI PHỤC đa-góc sản phẩm (theo yêu cầu user, đảo quyết định "tối giản" 20/07): FE vẫn có
+    # UI "2 ảnh (đa góc)" + cổng Ảnh SP 2 → inputs.product2 = CÙNG sản phẩm chụp mặt sau/bên hông → Qwen image3.
+    product2_key = inputs.get("product2") or inputs.get("garment2")
+    product_keys = [k for k in (product_key, product2_key) if k]
     tmp = tempfile.mkdtemp(prefix=f"tryon-{job_id[:8]}-")
     api_progress(job_id, 0.05, "tải input")
     m_local = api_download(model_key, os.path.join(tmp, "model" + os.path.splitext(model_key)[1]))
     p_locals = [api_download(k, os.path.join(tmp, f"product{i}" + os.path.splitext(k)[1]))
                 for i, k in enumerate(product_keys)]
-    p_local = p_locals[0]
+    p_local = p_locals[0] if p_locals else None
     # ALD 11/06/2026 - Crop SÁT sản phẩm (bg-remover, model=object) → món đồ lấp đầy khung → Qwen/Gemini áp ĐÚNG
     # tỉ lệ lên người (fix "sản phẩm quá nhỏ, mẫu quá to" do đồ nằm bé giữa nền rộng). Lỗi/timeout → giữ ảnh gốc.
     if TRYON_PRODUCT_AUTOCROP:
@@ -4713,7 +4750,14 @@ def run_tryon(job):
                 p_locals[i] = cropped
             except Exception as e:
                 api_log(job_id, f"crop sản phẩm {i} lỗi → dùng ảnh gốc: {e}", "warn")
-        p_local = p_locals[0]
+        p_local = p_locals[0] if p_locals else None
+    # ALD 16/08/2026 - GHÉP NỀN: cổng 'Nền' (FE useBackground) → inputs.background. Tải sớm để mọi nhánh
+    # provider dùng chung; thiếu ảnh nền dù user bật toggle → không sao (toggle bật nhưng chưa nối dây).
+    bg_key = inputs.get("background") or inputs.get("bg") or inputs.get("scene")
+    bg_local = None
+    if bg_key:
+        bg_local = api_download(bg_key, os.path.join(tmp, "background" + (os.path.splitext(bg_key)[1] or ".png")))
+        api_log(job_id, "Có ảnh Nền — sau khi thay đồ sẽ chạy pass 2 ghép người vào bối cảnh", "info")
     # ALD 11/06/2026 - đọc provider SỚM: gemini/huggingface là API call thuần — KHÔNG upload ComfyUI (box GPU
     # bận/chết vẫn chạy được; trước đây gemini vẫn upload phí và phụ thuộc ComfyUI vô cớ).
     provider = str(params.get("provider") or "qwen").lower().strip()
@@ -4722,7 +4766,30 @@ def run_tryon(job):
         api_progress(job_id, 0.15, "upload vào ComfyUI")
         m_name = comfy_upload(m_local)
         p_names = [comfy_upload(p) for p in p_locals]
-        p_name = p_names[0]
+        p_name = p_names[0] if p_names else None
+    # ALD 16/08/2026 - Nhánh cleanOnly (không thay đồ): img2img Qwen denoise THẤP trên chính ảnh model — neo bố
+    # cục/người/đồ, chỉ làm sạch + nét (bài học "tryon clean denoise 0.30"). Luôn chạy ComfyUI self-host, đặt
+    # TRƯỚC nhánh gemini/HF (các nhánh đó là prompt thay-đồ, không áp dụng cho làm sạch).
+    if clean_only:
+        api_progress(job_id, 0.3, "Làm sạch ảnh (Qwen img2img)")
+        prompt_c = str(params.get("prompt") or "").strip() or (
+            "Clean and refine this photo of the person. Keep the same person, outfit, face, hair, pose, "
+            "full-body framing and background; remove artifacts and noise, even out the lighting, sharpen details. "
+            "Photorealistic, natural skin texture.")
+        den = float(os.environ.get("TRYON_CLEAN_DENOISE", "0.3"))
+        pid = comfy_submit(build_qwen_create_workflow(
+            [m_name or comfy_upload(m_local)], prompt_c, f"tryon-clean-{job_id[:8]}",
+            realism=True, denoise=den, target_mp=TRYON_MP))
+        out = comfy_fetch_output(comfy_poll(pid, job_id, deadline_sec=600), exts=IMG_EXTS)
+        if not out:
+            raise RuntimeError("ComfyUI không trả ảnh clean")
+        if bg_local:
+            api_progress(job_id, 0.82, "ghép nền (Qwen pass 2)")
+            out = _tryon_compose_background(job_id, out, bg_local, f"tryon-{job_id[:8]}")
+        out = _tryon_postprocess(out, params, job_id)
+        api_progress(job_id, 0.95, "upload output")
+        api_upload_output(job_id, out, content_type="image/png")
+        return out
     # ALD 21/06/2026 - BỎ auto-analyze Ollama vision khỏi TryOn (theo yêu cầu): user TỰ CHỌN loại đồ ở node.
     # KHÔNG gọi Ollama nữa → tryon không nạp vision model, không tranh VRAM với ComfyUI, nhanh hơn (bỏ ~2-90s).
     # ALD 28/06/2026 - Rỗng/'auto' → nhánh AUTO (generic): thay NGUYÊN bộ từ ảnh sản phẩm, KHÔNG cần chọn loại
@@ -4755,8 +4822,23 @@ def run_tryon(job):
             with open(p, "rb") as f: parts.append((f.read(), _mime(p)))
         out = os.path.join(tmp, "gemini_tryon.png")
         prompt_g = _gemini_tryon_prompt(garment, extra=extra_en)
+        # ALD 16/08/2026 - khôi phục đa-góc: p_locals có thể là 2 ảnh CÙNG sản phẩm (parts đã gửi hết bên trên).
+        if len(p_locals) > 1:
+            prompt_g += (" The two product images show the SAME single product from two angles — typically the "
+                         "front and the back. Use both views only to render that ONE product accurately; "
+                         "the second product image is NOT an additional garment to add.")
         _gemini_edit(parts, prompt_g, gem_key, out,
                      aspect_ratio=_gemini_aspect(_img_size(m_local)))
+        # ALD 16/08/2026 - Ghép nền pass 2 (Gemini): ảnh 1 = kết quả thay đồ, ảnh 2 = bối cảnh. Tách pass riêng
+        # (không nhét nền vào pass thay đồ) để mỗi lệnh 1 việc — cùng triết lý pass 2 của nhánh Qwen.
+        if bg_local:
+            api_progress(job_id, 0.8, "ghép nền (Gemini pass 2)")
+            with open(out, "rb") as f: ob = f.read()
+            with open(bg_local, "rb") as f: bb = f.read()
+            out2 = os.path.join(tmp, "gemini_tryon_bg.png")
+            _gemini_edit([(ob, "image/png"), (bb, _mime(bg_local))], _TRYON_BG_POS, gem_key, out2,
+                         aspect_ratio=_gemini_aspect(_img_size(out)))
+            out = out2
         out = _tryon_postprocess(out, params, job_id)
         api_progress(job_id, 0.95, "upload output")
         api_upload_output(job_id, out, content_type="image/png")
@@ -4769,8 +4851,13 @@ def run_tryon(job):
         api_progress(job_id, 0.3, f"HF image-edit ({hf_id})")
         # ALD 11/06/2026 (fix theo test thật): prompt Gemini làm 2511 KHÔNG áp sản phẩm → dùng chung bộ prompt
         # Qwen self-host (_qwen_tryon_prompts, có negative); image_size cap /8 theo ảnh model → hết mặt to sai tỉ lệ.
-        uris = [_hf_data_uri(m_local)] + [_hf_data_uri(p) for p in p_locals[:1]]
+        # ALD 16/08/2026 - khôi phục đa-góc: gửi tối đa 2 ảnh SP (image_urls[1]=chính, [2]=góc khác).
+        uris = [_hf_data_uri(m_local)] + [_hf_data_uri(p) for p in p_locals[:2]]
         pos_t, neg_t = _qwen_tryon_prompts(garment, extra=extra_en)
+        if len(p_locals) > 1:
+            pos_t += (" Image 2 and image 3 show the SAME single product from two angles — typically image 2 is "
+                      "the front and image 3 is the back. Use both views only to render that ONE product "
+                      "accurately; image 3 is NOT an additional garment to add.")
         payload = {"prompt": pos_t, "negative_prompt": neg_t, "image_url": uris[0], "image_urls": uris}
         isz = _hf_image_size(_img_size(m_local))
         if isz:
@@ -4778,6 +4865,17 @@ def run_tryon(job):
         res = _hf_call(fal_id, payload, hf_key, q, job_id, 600, 0.3, 0.9, "HF tryon")
         out = os.path.join(tmp, "hf_tryon.png")
         _hf_fetch(_hf_first_image(res), out)
+        # ALD 16/08/2026 - Ghép nền pass 2 qua fal-ai (cùng họ Qwen-Edit nên dùng chung prompt _TRYON_BG_*).
+        if bg_local:
+            api_progress(job_id, 0.82, "ghép nền (HF pass 2)")
+            uris2 = [_hf_data_uri(out), _hf_data_uri(bg_local)]
+            payload2 = {"prompt": _TRYON_BG_POS, "negative_prompt": _TRYON_BG_NEG, "image_url": uris2[0], "image_urls": uris2}
+            isz2 = _hf_image_size(_img_size(out))
+            if isz2:
+                payload2["image_size"] = isz2
+            res2 = _hf_call(fal_id, payload2, hf_key, q, job_id, 600, 0.82, 0.93, "HF ghép nền")
+            out = os.path.join(tmp, "hf_tryon_bg.png")
+            _hf_fetch(_hf_first_image(res2), out)
         out = _tryon_postprocess(out, params, job_id)
         api_progress(job_id, 0.95, "upload output")
         api_upload_output(job_id, out, content_type="image/png")
@@ -4790,6 +4888,8 @@ def run_tryon(job):
             comp = _run_shoes_detailer(job_id, m_local, p_name, garment, f"tryon-{job_id[:8]}", tmp,
                                        frac=params.get("feetCrop") or params.get("feet_crop"))
             if comp:
+                if bg_local:
+                    comp = _tryon_compose_background(job_id, comp, bg_local, f"tryon-{job_id[:8]}")
                 comp = _tryon_postprocess(comp, params, job_id)
                 api_progress(job_id, 0.95, "upload output")
                 api_upload_output(job_id, comp, content_type="image/png")
@@ -4808,6 +4908,9 @@ def run_tryon(job):
     api_progress(job_id, 0.9, "tải kết quả")
     out = comfy_fetch_output(outputs, exts=IMG_EXTS)
     if not out: raise RuntimeError("ComfyUI không trả ảnh tryon")
+    if bg_local:
+        api_progress(job_id, 0.82, "ghép nền (Qwen pass 2)")
+        out = _tryon_compose_background(job_id, out, bg_local, f"tryon-{job_id[:8]}")
     out = _tryon_postprocess(out, params, job_id)
     api_progress(job_id, 0.95, "upload output")
     api_upload_output(job_id, out, content_type="image/png")
