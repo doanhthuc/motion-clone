@@ -2871,8 +2871,17 @@ def main(argv: list[str]) -> int:
     if not preflight(settings, allow_start=not args.no_start):
         return 1
 
+    # KHÔNG gọi batch_id_now() vô điều kiện ở đây. Bản đầu của kế hoạch làm thế và
+    # --resume HỎNG IM LẶNG: mỗi lần gọi đẻ một out_dir mới, nên run_one kiểm
+    # dest.is_file() trong thư mục CHƯA TỪNG tải gì về. Run đã xong thì out_dir mới
+    # rỗng (run_batch chỉ `continue` qua nó, không hardlink lại vào _final/), còn run
+    # dở thì chạy lại TỪ ĐẦU — đúng hai lần tiền GPU mà --resume tồn tại để tránh.
+    # resolve_batch_id() ở trên xử lý ba nhánh và IN RA nó chọn gì.
+    quyet_dinh = resolve_batch_id(Path(args.file), resume=args.resume)
+    print(f"  {quyet_dinh.note}")
     result = run_batch(settings=settings, manifest=manifest, out_root=ROOT / "out",
-                       batch_id=batch_id_now(), resume=args.resume, fail_fast=args.fail_fast)
+                       batch_id=quyet_dinh.batch_id, resume=args.resume,
+                       fail_fast=args.fail_fast)
 
     minutes = result.gpu_seconds / 60
     print(f"\n  Lô {result.batch_id}: {len(result.done)} xong · {len(result.failed)} hỏng "
