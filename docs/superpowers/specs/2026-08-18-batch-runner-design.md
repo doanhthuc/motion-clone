@@ -1,6 +1,6 @@
 # Chạy lô material từ máy local → video trên pod GPU — Design
 
-**Ngày:** 18/08/2026 · **Trạng thái:** đã triển khai và **đã nghiệm thu trên pod RTX 5090 thật**
+**Ngày:** 18/08/2026 · **Trạng thái:** đã triển khai — CLI và MCP đều **đã nghiệm thu trên pod RTX 5090 thật**
 (RunPod EU-RO-1, ~55 phút, $0.99/giờ). Số đo, không phải lời hứa:
 
 | | |
@@ -72,9 +72,41 @@ nó đã lừa được một lần.
 | Đường dẫn tương đối trong `.mcp.json` có ổn không? | **Ổn** — `batch_status` trả `log_file: batch/example.mcp.log`, tức Claude Code khởi động server với cwd = gốc repo |
 | Parity với CLI | `batch_validate` và `make batch-validate` ra cùng kết quả, cùng câu chữ (đã đối chiếu cả lúc manifest sai: cùng hai dòng lỗi) |
 
-**Chưa chạy một lô thật QUA MCP** — `batch_run` chỉ được kiểm bằng runner giả (tách session, log,
-mã thoát đều là hành vi thật), còn đoạn từ tool tới pod thì chưa ai đi qua: pod đang tắt lúc làm.
-Đây là chỗ ghi ra để không ai tưởng nó đã được chứng minh.
+**LÔ THẬT QUA MCP ĐÃ CHẠY** (18/08/2026, pod thứ tư `g8y1u6yk189uur`, RTX 5090 EU-RO-1, $0,99/giờ).
+Gọi bằng tool `batch_run` từ trong chat, không gõ `make` — lô `2026-08-18-2105`, `ma_thoat: 0`,
+**2 xong · 0 hỏng · 973s ≈ 16,2 phút GPU**:
+
+| Run | Chặng | Giây | KB | job_id |
+|---|---|---:|---:|---|
+| `vidu-day-du` (tryon-motion-enhance) | tryon | 351 | 1 846 | `aefe54c1` |
+| | motion | 247 | 1 404 | `60703d2c` |
+| | enhance | 114 | 7 476 | `61ce8f20` |
+| `vidu-chi-motion` (motion-enhance) | motion | 160 | 866 | `f557d050` |
+| | enhance | 101 | 5 874 | `ba4418a4` |
+
+Kiểm bằng `ffprobe` trên file thật, không tin journal:
+
+| Kiểm | Kết quả |
+|---|---|
+| `_final/` | đúng 2 video · cả hai **1088×1920** |
+| **Override từng run có tác dụng?** | **Có** — `vidu-day-du` ra **60fps** (298 frame, 4,97s) theo `defaults`, `vidu-chi-motion` ra **48fps** (241 frame, 5,02s) theo `enhance.fpsInterp` ghi đè |
+| Hardlink, không nhân đôi đĩa | `stat` báo **2 link** mỗi file |
+| Layout §6 | đủ `01-tryon.png` · `02-motion.mp4` · `03-enhance.mp4` · `run.json` · `run.log` · `_index.tsv` · `manifest.yaml` |
+| `params_sent` là param API đã nắn? | Có — manifest gửi `{preset: drv-5s, quality: 540p}`, API ghi `{cfg: 1, detailUpscale: false, fitDriver: false, deliveryPreset: source, …}` |
+| Nền có được ghép? | Có — `run.log` của run 1 ghi `ghép nền` / `Qwen pass 2` |
+| ViTPose hay fallback DWPose? | **ViTPose** — log job của **cả hai** job motion ghi `face_crop=vitpose`, không job nào có dòng `fallback DWPose pad128` |
+
+> Một báo động giả đáng ghi lại để lần sau đừng mất thời gian: `comfyui-*.log` có 481 dòng khớp
+> `DWPose` (kể cả `DWPose: Bbox 7.42ms` đúng trong khung giờ job motion) và **không** dòng nào khớp
+> `vitpose` — nhìn qua rất giống fallback đã quay lại. Không phải: DWPose lo **pose thân người**
+> (node 20), ViTPose chỉ lo **face crop**, hai cái vốn chạy cùng nhau. Và `face_crop=` được ghi bằng
+> `api_log` (`linux.py:3962`) nên nó nằm trong **log job qua API**, không nằm trong stdout của pm2 —
+> `grep` vào `~/.pm2/logs/worker-out.log` sẽ luôn trắng tay. Nguồn đúng là `GET /jobs/:id/logs`.
+
+Bẫy buffering ở bảng trên cũng **quan sát được trực tiếp trên lô này**: suốt 16 phút, trường `log`
+của `batch_status` chỉ có dòng header, rồi đầy đủ ngay khi process thoát — vì server MCP trong phiên
+đó khởi động trước bản sửa `-u` (xem mục VẬN HÀNH bên dưới). Tiến độ vẫn theo được vì nó đọc
+**journal**, không đọc log.
 
 Năm chỗ bản giao làm KHÁC spec một cách có chủ ý được ghi thẳng vào đúng mục liên quan, dạng trích
 dẫn "ĐỔI CÓ CHỦ Ý": `MODE=folders` (§2), `DESTROY_WHEN_DONE` (§5/§8), tên file chặng cuối (§6),
