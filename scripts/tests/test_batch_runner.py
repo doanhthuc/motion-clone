@@ -183,14 +183,34 @@ class TestResume(unittest.TestCase):
 
 
 class TestIndex(unittest.TestCase):
-    def test_index_tsv_co_header_va_mot_dong_moi_run(self):
+    def test_index_tsv_co_header_va_mot_dong_moi_chang(self):
+        # Một dòng mỗi CHẶNG chứ không phải mỗi run: 2 run x 2 chặng (motion, enhance)
+        # = 4 dòng + header. Đếm dòng không thôi thì một bộ 4 dòng SAI (vd 2 run x 2
+        # dòng rác nào đó) vẫn qua được test — nên còn phải kiểm cả hai tên chặng
+        # thật sự xuất hiện dưới CÙNG một run id.
         with tempfile.TemporaryDirectory() as d:
             tmp = Path(d)
             _run(tmp, FakePod())
             lines = (tmp / "out" / "2026-08-18-1430" / "_index.tsv").read_text(
                 encoding="utf-8").strip().splitlines()
             self.assertTrue(lines[0].startswith("run\t"))
-            self.assertEqual(len(lines), 3)
+            self.assertEqual(len(lines), 5)
+            rows = [line.split("\t") for line in lines[1:]]
+            runA_stages = {r[2] for r in rows if r[0] == "runA"}
+            self.assertEqual(runA_stages, {"motion", "enhance"})
+
+    def test_index_tsv_giu_dong_chang_hong_cua_run_loi(self):
+        # Run lỗi vẫn phải để lại đúng dòng của chặng đã làm nó dừng — đây là cách
+        # người đọc _index.tsv biết run hỏng ở chặng nào mà không cần mở run.json.
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            _run(tmp, FakePod(fail_on={"job-1"}))  # job-1 = chặng motion của runA
+            lines = (tmp / "out" / "2026-08-18-1430" / "_index.tsv").read_text(
+                encoding="utf-8").strip().splitlines()
+            rows = [line.split("\t") for line in lines[1:]]
+            runA_rows = [r for r in rows if r[0] == "runA"]
+            self.assertEqual([r[2] for r in runA_rows], ["motion"])
+            self.assertEqual(runA_rows[0][1], "error")
 
 
 if __name__ == "__main__":

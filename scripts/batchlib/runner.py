@@ -136,22 +136,28 @@ def run_one(*, settings: Settings, run: Run, out_dir: Path, state: dict,
 
 
 def write_index(out_dir: Path, state: dict) -> None:
-    """Một dòng mỗi run — chi tiết từng chặng đã có trong run.json rồi.
+    """Một dòng mỗi CHẶNG, không phải mỗi run — giống hệt ab-results/run1/manifest.tsv
+    mà người dùng đã tự tay dựng cho một phiên A/B thật (label/job_id/status/elapsed_sec/params).
+    _index.tsv là bản tổng quát hoá của đúng file đó.
 
-    Cột "stage"/"job_id"/... lấy từ chặng CUỐI CÙNG được ghi vào (dict giữ thứ tự
-    chèn): run xong thì đó là chặng cuối của pipeline; run lỗi thì đó đúng là
-    chặng đã làm nó dừng lại — không cần chọn gì thêm.
+    Không gộp về một dòng mỗi run: params_sent là lý do cột này tồn tại — nó ghi lại
+    param THẬT đã gửi cho từng chặng (sau khi API viết lại), và với pipeline nhiều
+    chặng (vd tryon-motion-enhance), chặng người dùng thực sự chỉnh tay là motion —
+    gộp về một dòng mỗi run chỉ giữ được chặng cuối (enhance) và param motion biến mất.
+
+    Thứ tự chèn của dict `stages` vẫn hữu ích: với run lỗi, dòng cuối cùng thuộc về
+    run đó chính là chặng đã làm nó dừng lại — không cần chọn gì thêm để biết run
+    hỏng ở đâu.
     """
     lines = ["run\tstatus\tstage\tjob_id\telapsed_sec\tbytes\tparams_sent"]
     for run_id, entry in state["runs"].items():
-        stages = entry.get("stages") or {}
-        stage_name, s = next(reversed(stages.items()), ("", {}))
-        lines.append("\t".join([
-            run_id, str(entry.get("status", "")), stage_name,
-            str(s.get("job_id", "")), str(s.get("elapsed_sec", "")),
-            str(s.get("bytes", "")),
-            json.dumps(s.get("params_sent") or {}, ensure_ascii=False),
-        ]))
+        for stage_name, s in (entry.get("stages") or {}).items():
+            lines.append("\t".join([
+                run_id, str(entry.get("status", "")), stage_name,
+                str(s.get("job_id", "")), str(s.get("elapsed_sec", "")),
+                str(s.get("bytes", "")),
+                json.dumps(s.get("params_sent") or {}, ensure_ascii=False),
+            ]))
     (out_dir / "_index.tsv").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
