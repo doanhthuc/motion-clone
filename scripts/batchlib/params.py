@@ -32,7 +32,12 @@ class ParamInfo:
     name: str
     default: object
     line: int
-    source: str          # "ast" | "curated"
+    source: str
+    # "ast"   — worker đọc trực tiếp (params.get("ten")), thấy được qua AST.
+    # "extra" — worker đọc ĐỘNG (vd. next((k for k in (...) if k in params))), AST mù,
+    #           nên phải khai tay trong batch-params.json.
+    # "api"   — worker KHÔNG BAO GIỜ đọc; api/src/routes/jobs.js tiêu thụ hoặc dịch
+    #           param này trước khi ghi DB (vd. "quality" → width/height).
 
 
 def _job_type(func_name: str) -> str:

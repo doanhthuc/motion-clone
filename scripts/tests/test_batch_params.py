@@ -1,9 +1,12 @@
+import contextlib
+import io
 import sys, tempfile, unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batchlib.params import (check_drift, dynamic_param_names, extract_from_ast,
                              known_params, load_curated, validate_params)
+import batch_params
 
 REPO = Path(__file__).resolve().parents[2]
 LINUX_PY = REPO / "motions-studio" / "worker" / "worker_runtime" / "linux.py"
@@ -142,6 +145,19 @@ class TestCongChongTroi(unittest.TestCase):
                 encoding="utf-8")
             errs = check_drift(p, c)
             self.assertTrue(any("frames" in e for e in errs))
+
+
+class TestCliJobTypeSai(unittest.TestCase):
+    def test_job_type_sai_thi_liet_ke_job_type_that(self):
+        # Không chỉ đòi exit code khác 0 — phải đòi message liệt kê được job type
+        # thật, nếu không thì regression về message cụt (chỉ báo lỗi, không nói
+        # tiếp phải làm gì) sẽ lọt qua test này.
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = batch_params.main(["moiton"])
+        self.assertEqual(code, 1)
+        output = err.getvalue()
+        self.assertIn("motion", output)
 
 
 if __name__ == "__main__":

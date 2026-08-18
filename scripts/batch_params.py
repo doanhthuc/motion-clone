@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import difflib
 import sys
 from pathlib import Path
 
@@ -20,6 +21,12 @@ CURATED = ROOT / "scripts" / "batch-params.json"
 def main(argv: list[str]) -> int:
     if not LINUX_PY.is_file():
         print(f"✗ không thấy {LINUX_PY.relative_to(ROOT)}", file=sys.stderr)
+        print(
+            "  Hoặc bạn đang chạy lệnh này từ ngoài thư mục repo (cd vào "
+            f"{ROOT} rồi chạy lại), hoặc motions-studio/ chưa được checkout/rsync "
+            "về máy này — kéo submodule/thư mục đó về trước.",
+            file=sys.stderr,
+        )
         return 1
 
     if "--check" in argv:
@@ -40,7 +47,11 @@ def main(argv: list[str]) -> int:
         print("Dùng: make batch-params TYPE=motion")
         return 0
     if job_type not in ast_params and job_type not in curated:
-        print(f"✗ không có job type {job_type!r}", file=sys.stderr)
+        available = sorted(set(ast_params) | set(curated))
+        near = difflib.get_close_matches(job_type, available, n=3, cutoff=0.6)
+        hint = f" — ý bạn là {', '.join(near)}?" if near else ""
+        print(f"✗ không có job type {job_type!r}{hint}", file=sys.stderr)
+        print(f"  Job type có param: {', '.join(available)}", file=sys.stderr)
         return 1
 
     known = known_params(job_type, ast_params=ast_params, curated=curated)
