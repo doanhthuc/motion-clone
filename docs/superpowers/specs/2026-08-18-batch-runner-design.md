@@ -63,10 +63,18 @@ Node giờ nằm ở cả bốn danh sách thật (`worker-image/Dockerfile` + c
 nó đã lừa được một lần.
 
 **MCP server (§9, giai đoạn 2) đã làm xong** — `scripts/batch_mcp.py` + `batchlib/rpc.py` +
-`batchlib/mcp_tools.py`, bốn tool, **0 dependency mới**, 48 test không cần pod. Đã bắt tay thật qua
-stdio (`make batch-mcp-check` in đủ bốn tool) và đã đăng ký ở `.mcp.json`. Chưa chạy một lô thật
-QUA MCP — phần đó phải đợi lần thuê pod tới, và đây là chỗ ghi ra để không ai tưởng nó đã được
-chứng minh.
+`batchlib/mcp_tools.py`, bốn tool, **0 dependency mới**, 48 test không cần pod.
+
+| Kiểm | Kết quả |
+|---|---|
+| Bắt tay qua stdio | `make batch-mcp-check` in đủ bốn tool |
+| Gọi thật **qua Claude Code** (18/08/2026, sau khi duyệt `.mcp.json`) | `batch_validate` → `ok: true, so_run: 2` · `batch_status` → `con_lai: 2` |
+| Đường dẫn tương đối trong `.mcp.json` có ổn không? | **Ổn** — `batch_status` trả `log_file: batch/example.mcp.log`, tức Claude Code khởi động server với cwd = gốc repo |
+| Parity với CLI | `batch_validate` và `make batch-validate` ra cùng kết quả, cùng câu chữ (đã đối chiếu cả lúc manifest sai: cùng hai dòng lỗi) |
+
+**Chưa chạy một lô thật QUA MCP** — `batch_run` chỉ được kiểm bằng runner giả (tách session, log,
+mã thoát đều là hành vi thật), còn đoạn từ tool tới pod thì chưa ai đi qua: pod đang tắt lúc làm.
+Đây là chỗ ghi ra để không ai tưởng nó đã được chứng minh.
 
 Năm chỗ bản giao làm KHÁC spec một cách có chủ ý được ghi thẳng vào đúng mục liên quan, dạng trích
 dẫn "ĐỔI CÓ CHỦ Ý": `MODE=folders` (§2), `DESTROY_WHEN_DONE` (§5/§8), tên file chặng cuối (§6),
