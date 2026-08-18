@@ -15,7 +15,26 @@
 **Một lỗi CHẶN TOÀN BỘ chỉ pod thật tìm ra:** Cloudflare chặn User-Agent mặc định của urllib
 (§1). 143 test xanh không thấy nó, `pod-smoke.sh` không thấy nó vì dùng `curl`.
 
-**ViTPose đã được bake vào image (18/08/2026, sau nghiệm thu).** Không còn phải clone tay.
+**ViTPose đã bake vào image và ĐÃ KIỂM TRÊN POD MỚI (18/08/2026).** Không còn phải clone tay.
+Thuê một pod thứ hai với `sha-0cbe433` chỉ để chứng minh, rồi destroy (~8 phút):
+
+```
+TRƯỚC bootstrap, chưa thao tác gì tay:
+  custom_nodes/                  đủ 10 node, có ComfyUI-WanAnimatePreprocess
+  sha của node                   0e0b6a2  (đúng sha ghim)
+  deps trong VENV của ComfyUI    onnx 1.22.0 · onnxruntime 1.29.0 · cv2 5.0.0
+  import bằng venv python        NODE_CLASS_MAPPINGS đủ 5 class
+
+SAU bootstrap, vẫn không thao tác gì tay:
+  /object_info/PoseAndFaceDetection      ✓   (class linux.py:1657 dựng)
+  /object_info/OnnxDetectionModelLoader  ✓   } ba tên mà bộ phát hiện fallback
+  /object_info/DrawViTPose               ✓   } ở linux.py:4366 tìm
+  node vẫn ở 0e0b6a2                     ✓   (bootstrap không xoá nó)
+```
+
+Và có cổng chặn tái diễn: `make check-comfy-nodes` giữ bốn danh sách node khớp nhau, kể cả
+cổng tự kiểm bên trong `worker-image/Dockerfile` (chỗ đã trôi mà không ai biết). Cả năm phép
+kiểm của cổng đều được mutation-test.
 
 Lúc nghiệm thu thì phải: image ghim `sha-14ae224` thiếu `ComfyUI-WanAnimatePreprocess` nên mọi job
 motion âm thầm fallback DWPose pad128. Truy nguyên thì fix `3bb2246` (17/08) thêm node vào
