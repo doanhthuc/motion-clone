@@ -3256,7 +3256,7 @@ git commit -m "batch: nghiệm thu trên pod thật — số đo, không phải 
 | §7 `batch-params`, lỗ của extractor, cổng chống trôi | 3 |
 | §7 validate chặn key lạ, chạy trước job đầu tiên | 3, 4, 7 (`--validate-only` trước `preflight`) |
 | §8 bảng sai sót | 6 (poll/download), 7 (fail-fast, resume) |
-| §9 MCP | **cố ý ngoài phạm vi** — spec §9 xếp nó giai đoạn 2, sau khi CLI chạy thật một lô |
+| §9 MCP | **đã làm** (18/08/2026, sau khi CLI chạy thật lô nhiều run) — `scripts/batch_mcp.py` + `batchlib/rpc.py` + `batchlib/mcp_tools.py`, 48 test, 0 dependency mới. Xem §9 của spec |
 | §10 test không cần pod, smoke thật, cổng | 1–8 (unittest), 9 (smoke), 3+8 (cổng) |
 
 **Placeholder scan** — không có "TBD"/"tương tự Task N"/"thêm xử lý lỗi phù hợp"; mọi step code đều có code thật.

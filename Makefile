@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: batch-coverage check-comfy-nodes help setup dev down clean gpu-preflight gpu-provision gpu-wait gpu-bootstrap gpu-fe gpu-up gpu-down gpu-destroy gpu-db-dump gpu-db-check gpu-status gpu-logs batch-test batch-params check-batch-params batch-scan batch-validate batch batch-clean
+.PHONY: batch-mcp-check batch-coverage check-comfy-nodes help setup dev down clean gpu-preflight gpu-provision gpu-wait gpu-bootstrap gpu-fe gpu-up gpu-down gpu-destroy gpu-db-dump gpu-db-check gpu-status gpu-logs batch-test batch-params check-batch-params batch-scan batch-validate batch batch-clean
 
 help: ## Show this help
 	@echo "motion-clone — make targets:"
@@ -64,6 +64,13 @@ batch: ## Chạy một lô (FILE=batch/….yaml, RESUME=1 để chạy tiếp l�
 
 batch-clean: ## Xoá file trung gian của lô cũ, giữ _final (KEEP=3 mặc định, DRY=1 để xem trước)
 	@python3 scripts/batch_clean.py --keep $${KEEP:-3} $${DRY:+--dry-run}
+
+batch-mcp-check: ## Bắt tay thật với MCP server rồi in 4 tool nó khai (không tiêu GPU)
+	@printf '%s\n' \
+	  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+	  '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+	  | python3 scripts/batch_mcp.py \
+	  | python3 -c 'import json,sys; [print("  ✓", t["name"]) for l in sys.stdin if (d:=json.loads(l)).get("id")==2 for t in d["result"]["tools"]]'
 
 gpu-preflight: ## Check root .env is complete BEFORE you spend money on a pod
 	@bash scripts/gpu-preflight.sh

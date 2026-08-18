@@ -78,7 +78,32 @@ Dọn đĩa sau vài lô: `make batch-clean` (mặc định giữ 3 lô gần nh
 giờ bị đụng tới. `make batch-clean KEEP=1 DRY=1` để xem trước sẽ xoá gì mà
 chưa xoá thật.
 
-Thiết kế và các đánh đổi: `docs/superpowers/specs/2026-08-18-batch-runner-design.md`.
+### Điều khiển lô từ Claude Code (MCP)
+
+Repo khai sẵn một MCP server ở `.mcp.json`; mở Claude Code trong thư mục này rồi duyệt server
+`batch` một lần là dùng được, không cài thêm gói nào. Bốn tool, bọc mỏng chính các lệnh trên:
+
+| Tool | Tương đương |
+|---|---|
+| `batch_validate` | `make batch-validate` |
+| `batch_run` | `make batch` — nhưng **chạy nền**, trả pid, sống qua phiên chat |
+| `batch_status` | đọc `batch/<tên>.state.json` + mấy dòng cuối log |
+| `batch_rerun` | *không có bản CLI* — chạy lại một run **đã xong** (video ra xấu) |
+
+Khác CLI ở đúng một chỗ về tiền: pod đang dừng thì tool **không tự** `make gpu-up`, nó báo lỗi và
+bảo bạn gõ lệnh đó. Muốn nó tự bật thì phải gọi kèm `allow_start=true`. Bật pod là bắt đầu tính
+tiền, nên đó là quyết định của bạn chứ không của một tool call.
+
+Kiểm server còn sống mà không tốn gì: `make batch-mcp-check`.
+
+**Sửa code MCP thì phải khởi động lại server.** Claude Code giữ một process
+`scripts/batch_mcp.py` sống suốt phiên, nên nó nạp module cũ trong bộ nhớ — sửa
+`batchlib/mcp_tools.py` mà không thoát/mở lại `claude` thì tool vẫn chạy code cũ,
+im lặng. Cách nhận ra: `ps -o pid,lstart -p $(pgrep -f batch_mcp.py)` cho thời điểm
+khởi động; nó cũ hơn lần sửa của bạn là đúng cái bẫy này. `make batch-mcp-check`
+KHÔNG bắt được — nó chạy một process mới nên luôn thấy code mới.
+
+Thiết kế và các đánh đổi: `docs/superpowers/specs/2026-08-18-batch-runner-design.md` (MCP ở §9).
 
 ## Nguồn gốc code
 

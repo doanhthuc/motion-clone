@@ -9,6 +9,11 @@
 # Trên máy đã chạy gpu-smoke thì có sẵn; trên một bản clone mới thì chưa, và
 # batch-validate sẽ báo "không thấy file". Đó là đúng: validate tồn tại để nói ra
 # điều đó trước khi tiêu GPU. Thay bằng đường dẫn của bạn, hoặc dùng make batch-scan.
+#
+# Vì .smoke/ không vào git nên KHÔNG có cổng nào giữ tên file ở đây khớp với tên file
+# thật — đổi tên media một lần là file mẫu này hỏng im lặng, và nó đã hỏng đúng như vậy
+# một lần (trỏ `nhanvat.jpeg` trong khi đĩa có `nhanvat-1/-2.jpeg`). Thấy "không thấy
+# file" thì `ls .smoke/` trước khi đi tìm lỗi ở chỗ khác.
 
 defaults:
   enhance: { targetRes: 1080p, fpsInterp: "60" }
@@ -17,8 +22,9 @@ runs:
   - id: vidu-day-du
     pipeline: tryon-motion-enhance
     inputs:
-      character:  ../.smoke/nhanvat.jpeg
+      character:  ../.smoke/nhanvat-1.jpeg
       outfit:     ../.smoke/sanpham.jpeg
+      background: ../.smoke/anhnen-1.jpeg
       driver:     ../.smoke/dandong.mp4
     # quality CHỈ có tác dụng khi có preset drv-* (enforceMotionResolution return sớm nếu
     # không — motion-resolution.js:20). Bản mẫu cũ dạy `{ quality: 540p, frames: 33 }`
@@ -30,6 +36,6 @@ runs:
   - id: vidu-chi-motion
     pipeline: motion-enhance
     inputs:
-      character: ../.smoke/nhanvat.jpeg
+      character: ../.smoke/nhanvat-2.jpeg
       driver:    ../.smoke/dandong.mp4
     enhance: { fpsInterp: "48" }

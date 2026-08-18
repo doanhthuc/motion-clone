@@ -1,6 +1,6 @@
 # Chạy lô material từ máy local → video trên pod GPU — Design
 
-**Ngày:** 18/08/2026 · **Trạng thái:** đã triển khai và **đã nghiệm thu trên pod RTX 5090 thật**
+**Ngày:** 18/08/2026 · **Trạng thái:** đã triển khai — CLI và MCP đều **đã nghiệm thu trên pod RTX 5090 thật**
 (RunPod EU-RO-1, ~55 phút, $0.99/giờ). Số đo, không phải lời hứa:
 
 | | |
@@ -62,11 +62,56 @@ Node giờ nằm ở cả bốn danh sách thật (`worker-image/Dockerfile` + c
 `0e0b6a2`, và image đã rebuild: `sha-0cbe433`. `comfyui/Dockerfile` đã dán cảnh báo ở đầu file vì
 nó đã lừa được một lần.
 
-Ba chỗ bản giao làm KHÁC spec một cách có chủ ý được ghi thẳng vào đúng mục liên quan.
+**MCP server (§9, giai đoạn 2) đã làm xong** — `scripts/batch_mcp.py` + `batchlib/rpc.py` +
+`batchlib/mcp_tools.py`, bốn tool, **0 dependency mới**, 48 test không cần pod.
 
-Ba chỗ bản giao làm KHÁC spec một cách có chủ ý được ghi thẳng vào đúng mục liên quan, dạng trích
-dẫn "ĐỔI CÓ CHỦ Ý": `MODE=folders` (§2), `DESTROY_WHEN_DONE` (§5/§8), tên file chặng cuối (§6). Spec
-là tài liệu ràng buộc, nên nó không được phép nói ngược với tool đang chạy.
+| Kiểm | Kết quả |
+|---|---|
+| Bắt tay qua stdio | `make batch-mcp-check` in đủ bốn tool |
+| Gọi thật **qua Claude Code** (18/08/2026, sau khi duyệt `.mcp.json`) | `batch_validate` → `ok: true, so_run: 2` · `batch_status` → `con_lai: 2` |
+| Đường dẫn tương đối trong `.mcp.json` có ổn không? | **Ổn** — `batch_status` trả `log_file: batch/example.mcp.log`, tức Claude Code khởi động server với cwd = gốc repo |
+| Parity với CLI | `batch_validate` và `make batch-validate` ra cùng kết quả, cùng câu chữ (đã đối chiếu cả lúc manifest sai: cùng hai dòng lỗi) |
+
+**LÔ THẬT QUA MCP ĐÃ CHẠY** (18/08/2026, pod thứ tư `g8y1u6yk189uur`, RTX 5090 EU-RO-1, $0,99/giờ).
+Gọi bằng tool `batch_run` từ trong chat, không gõ `make` — lô `2026-08-18-2105`, `ma_thoat: 0`,
+**2 xong · 0 hỏng · 973s ≈ 16,2 phút GPU**:
+
+| Run | Chặng | Giây | KB | job_id |
+|---|---|---:|---:|---|
+| `vidu-day-du` (tryon-motion-enhance) | tryon | 351 | 1 846 | `aefe54c1` |
+| | motion | 247 | 1 404 | `60703d2c` |
+| | enhance | 114 | 7 476 | `61ce8f20` |
+| `vidu-chi-motion` (motion-enhance) | motion | 160 | 866 | `f557d050` |
+| | enhance | 101 | 5 874 | `ba4418a4` |
+
+Kiểm bằng `ffprobe` trên file thật, không tin journal:
+
+| Kiểm | Kết quả |
+|---|---|
+| `_final/` | đúng 2 video · cả hai **1088×1920** |
+| **Override từng run có tác dụng?** | **Có** — `vidu-day-du` ra **60fps** (298 frame, 4,97s) theo `defaults`, `vidu-chi-motion` ra **48fps** (241 frame, 5,02s) theo `enhance.fpsInterp` ghi đè |
+| Hardlink, không nhân đôi đĩa | `stat` báo **2 link** mỗi file |
+| Layout §6 | đủ `01-tryon.png` · `02-motion.mp4` · `03-enhance.mp4` · `run.json` · `run.log` · `_index.tsv` · `manifest.yaml` |
+| `params_sent` là param API đã nắn? | Có — manifest gửi `{preset: drv-5s, quality: 540p}`, API ghi `{cfg: 1, detailUpscale: false, fitDriver: false, deliveryPreset: source, …}` |
+| Nền có được ghép? | Có — `run.log` của run 1 ghi `ghép nền` / `Qwen pass 2` |
+| ViTPose hay fallback DWPose? | **ViTPose** — log job của **cả hai** job motion ghi `face_crop=vitpose`, không job nào có dòng `fallback DWPose pad128` |
+
+> Một báo động giả đáng ghi lại để lần sau đừng mất thời gian: `comfyui-*.log` có 481 dòng khớp
+> `DWPose` (kể cả `DWPose: Bbox 7.42ms` đúng trong khung giờ job motion) và **không** dòng nào khớp
+> `vitpose` — nhìn qua rất giống fallback đã quay lại. Không phải: DWPose lo **pose thân người**
+> (node 20), ViTPose chỉ lo **face crop**, hai cái vốn chạy cùng nhau. Và `face_crop=` được ghi bằng
+> `api_log` (`linux.py:3962`) nên nó nằm trong **log job qua API**, không nằm trong stdout của pm2 —
+> `grep` vào `~/.pm2/logs/worker-out.log` sẽ luôn trắng tay. Nguồn đúng là `GET /jobs/:id/logs`.
+
+Bẫy buffering ở bảng trên cũng **quan sát được trực tiếp trên lô này**: suốt 16 phút, trường `log`
+của `batch_status` chỉ có dòng header, rồi đầy đủ ngay khi process thoát — vì server MCP trong phiên
+đó khởi động trước bản sửa `-u` (xem mục VẬN HÀNH bên dưới). Tiến độ vẫn theo được vì nó đọc
+**journal**, không đọc log.
+
+Năm chỗ bản giao làm KHÁC spec một cách có chủ ý được ghi thẳng vào đúng mục liên quan, dạng trích
+dẫn "ĐỔI CÓ CHỦ Ý": `MODE=folders` (§2), `DESTROY_WHEN_DONE` (§5/§8), tên file chặng cuối (§6),
+định danh bằng đường dẫn manifest thay vì run id (§9), MCP không tự bật pod (§9). Spec là tài liệu
+ràng buộc, nên nó không được phép nói ngược với tool đang chạy.
 
 ## Mục tiêu
 
@@ -85,7 +130,8 @@ canh để bấm job kế. Spec này biến phiên đó thành: thả material v
 việc khác.
 
 **Ngoài phạm vi:** thuê pod (`gpu-provision` vẫn là thao tác riêng, có xác nhận, vì nó tiêu tiền);
-sửa API trên pod; thêm job type mới; và MCP server (§9 — giai đoạn 2, sau khi CLI đã chạy thật).
+sửa API trên pod; thêm job type mới. MCP server (§9) là giai đoạn 2 và **đã làm xong** sau khi CLI
+chạy thật một lô nhiều run trên pod.
 
 ## Vì sao không dùng workflow engine có sẵn trên pod
 
@@ -125,6 +171,10 @@ nào đi lọt — một mặt tiếp xúc không được kiểm soát bởi te
 | `scripts/batch_run.py` | preflight → validate → chạy tuần tự → journal → tổng kết | manifest, `.env` |
 | `scripts/batch_params.py` | Rút param từ `linux.py` bằng AST + file khai tay | `linux.py` |
 | `scripts/batch-params.json` | Khai tay phần AST không thấy + giá trị hợp lệ | — |
+| `scripts/batch_mcp.py` | Entry MCP: nối giao thức với tool (§9) | hai file dưới |
+| `scripts/batchlib/rpc.py` | JSON-RPC/stdio. Biết giao thức, **không biết batch** | — |
+| `scripts/batchlib/mcp_tools.py` | Bốn tool. Biết batch, **không biết giao thức** | manifest, `batch_run.py` |
+| `batch/<tên>.mcp.json` `.log` `.rc` | Dữ liệu **của máy**: pid/argv/log/mã thoát của lượt chạy nền | — |
 
 > **RÀNG BUỘC ĐO ĐƯỢC (18/08/2026, pod thật): mọi request PHẢI đặt User-Agent.**
 > Pod nằm sau Cloudflare Tunnel — đó là cả kiến trúc của repo ([gpu-pod.md](../../gpu-pod.md)) —
@@ -368,13 +418,88 @@ lô — không phải trước từng job. Manifest sai ở run thứ 9 phải n
 Journal ghi **sau mỗi chặng**, không phải cuối run. Một run ba chặng đứt ở chặng ba thì resume chỉ
 chạy lại chặng ba.
 
-## 9. MCP (giai đoạn 2)
+## 9. MCP (giai đoạn 2) — **đã triển khai**
 
 `scripts/batch_mcp.py` bọc mỏng CLI, không tự cài đặt logic:
-`batch_validate` · `batch_run` (chạy nền, trả run id) · `batch_status` · `batch_rerun`.
+`batch_validate` · `batch_run` (chạy nền) · `batch_status` · `batch_rerun`.
 
 Làm sau khi CLI đã chạy thật ít nhất một lô. Lý do: lô chạy 30–60 phút, nếu logic nằm trong MCP thì
 nó chết theo phiên chat, và debug qua một lớp giao thức khó hơn hẳn đọc một file log.
+
+```
+Claude Code ──JSON-RPC/stdio──► scripts/batch_mcp.py ──Popen(setsid)──► batch_run.py
+                                        │                                    │ (30-60 phút,
+                                        └─ đọc batch/<tên>.state.json ◄──────┘  sống qua phiên chat)
+```
+
+Server **không giữ trạng thái nào của riêng nó**. Nguồn sự thật vẫn là journal runner ghi sau mỗi
+chặng (§6), nên phiên chat chết / server chết thì lô vẫn chạy và lần sau hỏi lại vẫn đúng. Ba file,
+ranh giới cứng: `batchlib/rpc.py` biết giao thức mà không biết batch; `batchlib/mcp_tools.py` biết
+batch mà không biết giao thức; `batch_mcp.py` chỉ nối hai cái.
+
+Không thêm dependency nào: tự cầm JSON-RPC (`initialize`/`ping`/`tools/list`/`tools/call`, newline-
+delimited). Cùng lý do §1 chọn Python — root repo không có `package.json`, và một cây
+`pydantic/anyio/httpx` chỉ để đọc bốn method là cái giá không đáng.
+
+> **ĐỔI CÓ CHỦ Ý (18/08/2026): định danh là ĐƯỜNG DẪN MANIFEST, không phải run id** — spec viết
+> `batch_run` "trả run id", bản giao trả `pid` + đường dẫn log, và mọi tool nhận `file`. Lý do:
+> batch id do `run_batch` mint tại thời điểm chạy (`runner.py: batch_id_now`), MCP không biết trước
+> được nó; bịa một id ở đây buộc phải thêm cờ `--batch-id` vào một CLI **đã nghiệm thu trên pod
+> thật**. Journal vốn đã khoá theo đường dẫn manifest (`state_path_for`), nên dùng đúng khoá đó là
+> nhất quán với phần còn lại. `batch_status(file)` trả `lo` = batch id thật ngay khi runner ghi nó.
+
+> **ĐỔI CÓ CHỦ Ý (18/08/2026): MCP KHÔNG tự `make gpu-up`, CLI thì có** — §5 cho preflight tự bật
+> pod vì "bật là thao tác đảo được". Qua MCP thì mặc định `--no-start`, phải gọi kèm
+> `allow_start=true` mới bật. Đây là chỗ duy nhất hai đường cố ý xử sự khác nhau: CLI là bạn gõ,
+> MCP là một model gọi, và bật pod bắt đầu tính tiền ngay. Mô tả của `batch_run`/`batch_rerun` nói
+> thẳng "TIÊU TIỀN GPU" vì mô tả tool là thứ duy nhất model đọc trước khi quyết định gọi.
+
+**`batch_rerun` là tool duy nhất không có bản CLI**, và đó là lý do nó tồn tại: `RESUME=1` cố ý bỏ
+qua run `status == "done"` (§8), nên khi job chạy xong mà **video nhìn xấu** — không lỗi, chỉ là
+không dùng được — CLI không có đường nào bắt nó làm lại. Cách làm: xoá đúng entry của run đó khỏi
+journal rồi chạy `--resume`; các run khác giữ nguyên `done` nên không ai bị làm lại. Từ chối trước
+khi đụng journal nếu đang có lô chạy, và validate trước khi xoá — xoá xong mới phát hiện manifest
+sai là mất bản ghi của một run đã chạy xong, đổi lấy không gì cả.
+
+Hai cửa chặn, cùng một lý do §5 ("pod có một GPU"): **manifest sai thì không spawn process nào**, và
+**đang có lô chạy cho cùng manifest thì từ chối lô thứ hai** — hai runner cùng ghi một `state.json`
+là hỏng journal, và hai job chồng nhau phá đúng giả định "lúc này GPU chỉ có mình tôi" mà
+`comfy_recycle` dựa vào.
+
+### Ba cái bẫy chỉ lộ ra khi viết
+
+| Bẫy | Hậu quả nếu không trị | Ghim bằng |
+|---|---|---|
+| Một dòng không-JSON lọt lên stdout | **rụng cả kết nối MCP**, không phải một dòng log thừa | `test_khong_mot_byte_rac_nao_tren_stdout` chạy entry point thật rồi parse từng dòng |
+| stdout của Python là **block-buffered khi đổ vào FILE** (chỉ line-buffered khi là tty) | dòng tiến độ của một lô 40 phút nằm trong buffer 8KB chứ không trên đĩa: `batch_status` không có gì để báo suốt cả lô, máy ngủ / Ctrl-C là mất sạch, và thứ tự lệch vì stderr không buffer | `python3 -u` trong `_spawn`; test cho runner giả in mà KHÔNG flush rồi đòi thấy dòng đó trên đĩa trong 3s |
+| Runner là **con** của server → thoát mà không ai `wait()` là thành **zombie**, `os.kill(pid,0)` báo "còn sống" vĩnh viễn | kill lô rồi hỏi lại thì được trả lời sai, mãi mãi | `_con_song` reap bằng `WNOHANG` trước; test kill thật rồi đòi trạng thái đổi trong 3s |
+| pid biến mất giống hệt nhau dù lô xong sạch hay ngã ở run đầu | không trả lời được "lô kết thúc thế nào" | bọc `sh -c '…; echo $? > <.rc>'`, `batch_status` trả `ma_thoat` |
+
+Lỗi **tool** trả `isError` + câu nói làm gì tiếp; chỉ lỗi **giao thức** mới là JSON-RPC `error`.
+Trộn hai cái nghĩa là một dòng YAML sai cũng làm rụng kết nối, và người dùng phải khởi động lại
+phiên chat để sửa nó.
+
+### Kiểm chứng
+
+48 test, không cần pod, không tốn đồng nào (`make batch-test`, đã tự vào cổng vì khớp
+`test_batch_*.py`). Spawn nền test được bằng cách **tiêm đường dẫn runner** (`Ctx.runner`) trỏ vào
+một script giả — nhờ vậy kiểm được cả ba thứ khó: con có thật sự tách session không
+(`os.getpgid`), log có chảy ra file không, mã thoát có đọc lại được sau khi con đã chết không.
+Bốn nhánh lỗi được viết trước test đã **mutation-test** để chứng minh test không mù.
+
+`make batch-mcp-check` bắt tay thật với server rồi in bốn tool nó khai — cổng rẻ nhất cho câu
+"server còn chạy được không".
+
+> **VẬN HÀNH: sửa code MCP xong phải khởi động lại server.** Claude Code giữ một process
+> `batch_mcp.py` sống suốt phiên, nạp module vào bộ nhớ một lần. Sửa `mcp_tools.py` mà không
+> thoát/mở lại `claude` thì tool chạy code CŨ, **im lặng, không báo gì**. Đã dính đúng một lần
+> (18/08/2026): bản sửa `-u` ở trên xanh trong unit test nhưng lô gọi qua MCP vẫn in sai thứ tự,
+> vì server khởi động lúc 20:48 còn bản sửa lúc 20:55. Cách nhận ra:
+> `ps -o pid,lstart -p $(pgrep -f batch_mcp.py)`. `make batch-mcp-check` KHÔNG bắt được — nó
+> spawn process mới nên luôn thấy code mới.
+
+Ngoài phạm vi, cố ý: `batch_scan` qua MCP; `gpu-provision`/`gpu-destroy` qua MCP (một cái tiêu tiền,
+một cái không đảo được — cả hai phải là người gõ ở terminal).
 
 ## 10. Kiểm chứng
 
