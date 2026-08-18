@@ -169,6 +169,32 @@ class TestLoadSettings(unittest.TestCase):
             self.assertIn(".env", str(cm.exception))
             self.assertIn("khoảng trắng", str(cm.exception))
 
+    def test_thong_bao_loi_KHONG_lo_api_key(self):
+        # Thông báo này sinh ra để người dùng đọc trên terminal — tức đúng người hay dán
+        # nó lên chat hay issue. Test "chỉ cần raise ConfigError" sẽ để một lần sửa sau
+        # này đưa key trở lại mà không ai biết.
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            _write(root, "DOMAIN=api.example.test\n", "NUXT_MOTION_API_KEY=mk_secret123   \n")
+            with self.assertRaises(ConfigError) as cm:
+                load_settings(root)
+            msg = str(cm.exception)
+            self.assertNotIn("mk_secret123", msg)   # bí mật KHÔNG lọt ra
+            self.assertIn("•", msg)                 # nhưng vẫn thấy được khoảng trắng
+            self.assertIn("motions/.env", msg)
+
+    def test_thong_bao_loi_DOMAIN_van_in_gia_tri_that(self):
+        # DOMAIN không phải bí mật, và thấy giá trị thật là cách nhanh nhất để hiểu.
+        # Hai nhánh CỐ Ý khác nhau nên cả hai đều phải bị ghim.
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            _write(root, "DOMAIN=api.example.test   \n", "NUXT_MOTION_API_KEY=mk_x\n")
+            with self.assertRaises(ConfigError) as cm:
+                load_settings(root)
+            self.assertIn("api.example.test", str(cm.exception))
+
     def test_key_khai_hai_lan_bi_chan(self):
         # Makefile:30 nối hai dòng trùng khoá bằng dấu cách → giá trị có khoảng trắng.
         import tempfile
@@ -263,16 +289,24 @@ class Settings:
         return f"https://{self.domain}"
 
 
-def _reject_whitespace(value: str, key: str, where: str) -> None:
+def _reject_whitespace(value: str, key: str, where: str, *, secret: bool = False) -> None:
     """env_get bám sát Make nên nó TRẢ LẠI cả rác. Đây là chỗ chặn rác, và chặn to.
 
     Không có lớp này thì một dấu cách thừa cuối dòng DOMAIN biến thành
     "backend không trả lời" — người dùng đi kiểm pod, kiểm tunnel, kiểm Cloudflare,
     trong khi lỗi là một ký tự trong .env mà `make gpu-up` cũng đang hỏng vì nó.
+
+    secret=True: che mọi ký tự KHÔNG phải khoảng trắng bằng '•', giữ nguyên khoảng
+    trắng. Phải in ra cái gì đó thì người dùng mới THẤY được dấu cách thừa — nhưng in
+    nguyên API key vào một thông báo lỗi là in nó vào đúng cái người ta hay dán lên
+    chat hay issue. Che kiểu này giữ được thông tin cần và bỏ được thông tin nguy hiểm:
+        'mk_abcdef  '  →  '•••••••••  '
+        'mk_a mk_b'    →  '•••• •••••'
     """
     if any(c.isspace() for c in value):
+        shown = "".join(c if c.isspace() else "•" for c in value) if secret else value
         raise ConfigError(
-            f"{key} trong {where} có khoảng trắng: {value!r}\n"
+            f"{key} trong {where} có khoảng trắng: {shown!r}\n"
             f"  Thường do một trong hai: khoảng trắng thừa cuối dòng, hoặc {key} bị khai\n"
             f"  HAI LẦN (Makefile:30 nối các dòng trùng khoá bằng dấu cách, nên `make gpu-up`\n"
             f"  cũng đang hỏng vì đúng lý do này).\n"
@@ -294,7 +328,7 @@ def load_settings(root: Path = ROOT) -> Settings:
             "Thiếu NUXT_MOTION_API_KEY trong motions/.env.\n"
             "  Chạy: make gpu-bootstrap   (nó tự dán key của pod vào file đó)"
         )
-    _reject_whitespace(api_key, "NUXT_MOTION_API_KEY", "motions/.env")
+    _reject_whitespace(api_key, "NUXT_MOTION_API_KEY", "motions/.env", secret=True)
     return Settings(
         domain=domain,
         api_key=api_key,
@@ -305,7 +339,7 @@ def load_settings(root: Path = ROOT) -> Settings:
 - [ ] **Step 4: Chạy test để xác nhận nó xanh**
 
 Run: `python3 -m unittest discover -s scripts/tests -p 'test_batch_config.py' -v`
-Expected: PASS — 9 test
+Expected: PASS — 11 test
 
 - [ ] **Step 5: Commit**
 
@@ -1837,6 +1871,11 @@ Tạo `batch/example.yaml` (dùng đường dẫn giả, KHÔNG dùng `~/` thậ
 #     make batch FILE=batch/example.yaml
 #
 # Chỉ 'inputs' là bắt buộc. Param tra bằng: make batch-params TYPE=motion
+#
+# LƯU Ý: file này trỏ vào ../.smoke/ — thư mục ĐÃ gitignore (media cá nhân, repo public).
+# Trên máy đã chạy gpu-smoke thì có sẵn; trên một bản clone mới thì chưa, và
+# batch-validate sẽ báo "không thấy file". Đó là đúng: validate tồn tại để nói ra
+# điều đó trước khi tiêu GPU. Thay bằng đường dẫn của bạn, hoặc dùng make batch-scan.
 
 defaults:
   enhance: { targetRes: 1080p, fpsInterp: "60" }
