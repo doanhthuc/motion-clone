@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help setup dev down clean gpu-preflight gpu-provision gpu-wait gpu-bootstrap gpu-fe gpu-up gpu-down gpu-destroy gpu-db-dump gpu-db-check gpu-status gpu-logs batch-test batch-params check-batch-params batch-scan batch-validate batch batch-clean
+.PHONY: check-comfy-nodes help setup dev down clean gpu-preflight gpu-provision gpu-wait gpu-bootstrap gpu-fe gpu-up gpu-down gpu-destroy gpu-db-dump gpu-db-check gpu-status gpu-logs batch-test batch-params check-batch-params batch-scan batch-validate batch batch-clean
 
 help: ## Show this help
 	@echo "motion-clone — make targets:"
@@ -34,6 +34,9 @@ scrub-check: ## Gate: fail if any third-party credential or personal email is tr
 
 check-job-types: ## Gate: job type lists (image, setup profiles, dispatcher) must agree
 	@node scripts/check-job-types.mjs
+
+check-comfy-nodes: ## Gate: bốn danh sách custom node ComfyUI (2 image + 2 setup profile) phải khớp
+	@node scripts/check-comfy-nodes.mjs
 
 batch-test: ## Gate: unit test của batch runner (không cần pod, không tốn tiền)
 	@python3 -m unittest discover -s scripts/tests -p 'test_batch_*.py'
