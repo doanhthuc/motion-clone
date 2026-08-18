@@ -181,8 +181,24 @@ class TestLoadSettings(unittest.TestCase):
                 load_settings(root)
             msg = str(cm.exception)
             self.assertNotIn("mk_secret123", msg)   # bí mật KHÔNG lọt ra
-            self.assertIn("•", msg)                 # nhưng vẫn thấy được khoảng trắng
             self.assertIn("motions/.env", msg)
+            # Ghim ĐÚNG chuỗi đã che: 12 dấu • rồi 3 khoảng trắng. KHÔNG dùng
+            # assertIn("   ") — ba khoảng trắng đó cũng có trong thụt lề của chính
+            # thông báo, nên assertion ấy vẫn xanh khi phần che đánh rơi hết khoảng
+            # trắng. Ghim cả bề rộng mặt nạ lẫn khoảng trắng thì mới bắt được hồi quy.
+            self.assertIn("'••••••••••••   '", msg)
+
+    def test_gia_tri_co_dau_ngoac_nhon_khong_lam_sap_duong_bao_loi(self):
+        # `.format()` trên chuỗi đã nội suy sẽ đọc `{oops}` như một trường format và
+        # ném KeyError — tức đường báo lỗi tự sập, đưa ra traceback vô nghĩa thay cho
+        # đúng cái chẩn đoán mà cả lớp này sinh ra để đưa. Dùng f-string toàn bộ.
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            _write(root, "DOMAIN=api.example.test {oops}  \n", "NUXT_MOTION_API_KEY=mk_x\n")
+            with self.assertRaises(ConfigError) as cm:
+                load_settings(root)
+            self.assertIn("{oops}", str(cm.exception))
 
     def test_thong_bao_loi_DOMAIN_van_in_gia_tri_that(self):
         # DOMAIN không phải bí mật, và thấy giá trị thật là cách nhanh nhất để hiểu.
