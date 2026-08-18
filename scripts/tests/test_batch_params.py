@@ -2,6 +2,7 @@ import contextlib
 import io
 import sys, tempfile, unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batchlib.params import (check_drift, dynamic_param_names, extract_from_ast,
@@ -308,6 +309,100 @@ class TestCliJobTypeSai(unittest.TestCase):
         self.assertEqual(code, 1)
         output = err.getvalue()
         self.assertIn("motion", output)
+
+    def test_job_type_sai_phai_co_ca_goi_y_gan_dung_lan_danh_sach_that(self):
+        # Mở rộng test trên: một message chỉ nói "không có job type X" mà KHÔNG gợi ý
+        # gần đúng, và KHÔNG liệt kê job type thật, vẫn qua được assertIn("motion",...)
+        # một mình (vì "moiton" gần "motion" tới mức goi ý luôn chứa "motion"). Test
+        # này khoá riêng hai phần message mà assertion trên không phân biệt được.
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            code = batch_params.main(["moiton"])
+        self.assertEqual(code, 1)
+        msg = err.getvalue()
+        self.assertIn("ý bạn là", msg)
+        self.assertIn("Job type có param:", msg)
+        self.assertIn("tryon", msg)
+        self.assertIn("enhance", msg)
+
+
+class TestCliKhongThamSo(unittest.TestCase):
+    def test_khong_doi_so_thi_liet_ke_job_type_va_tra_ve_0(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = batch_params.main([])
+        self.assertEqual(code, 0)
+        text = out.getvalue()
+        self.assertIn("motion", text)
+        self.assertIn("tryon", text)
+        self.assertIn("enhance", text)
+        self.assertIn("make batch-params TYPE=motion", text)
+
+
+class TestCliListParamMotJobType(unittest.TestCase):
+    def test_liet_ke_param_mot_job_type_that(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = batch_params.main(["motion"])
+        self.assertEqual(code, 0)
+        text = out.getvalue()
+        self.assertIn("motion —", text)
+        self.assertIn("preset", text)
+        self.assertIn("frames", text)
+        # quality là param TẦNG API (worker không đọc, AST mù) — bảng vẫn phải in nó,
+        # kèm đúng khối giải thích "API ÉP GIÁ TRỊ"/"CHỈ CÓ TÁC DỤNG KHI".
+        self.assertIn("quality", text)
+        self.assertIn("tầng API", text)
+        self.assertIn("API ÉP GIÁ TRỊ", text)
+        self.assertIn("CHỈ CÓ TÁC DỤNG KHI", text)
+
+    def test_liet_ke_enhance_in_dung_nhan_doc_dong_cho_param_extra(self):
+        # enhance có param đọc động thật (fpsInterp — khai ở batch-params.json vì AST
+        # mù, xem dynamic_param_names). Dòng in ra cho loại param này phải mang đúng
+        # nhãn "(đọc động)" — khác dòng "ast"/"tầng API" ở trên — nếu không, người đọc
+        # bảng không phân biệt được param nào worker THẬT SỰ đọc được qua AST.
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = batch_params.main(["enhance"])
+        self.assertEqual(code, 0)
+        text = out.getvalue()
+        self.assertIn("fpsInterp", text)
+        self.assertIn("(đọc động)", text)
+
+
+class TestCliCheck(unittest.TestCase):
+    def test_check_sach_tren_repo_that_tra_ve_0(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = batch_params.main(["--check"])
+        self.assertEqual(code, 0)
+        self.assertIn("khớp linux.py", out.getvalue())
+
+    def test_check_troi_thi_bao_loi_that_va_tra_ve_1(self):
+        # curated.json rỗng: bỏ hết "extra" của mọi job type -> check_drift() phải bắt
+        # đúng lớp bug repo này từng có (param đọc động, AST mù, không ai khai tay).
+        with tempfile.TemporaryDirectory() as d:
+            fake_curated = Path(d) / "curated.json"
+            fake_curated.write_text("{}", encoding="utf-8")
+            err = io.StringIO()
+            with mock.patch.object(batch_params, "CURATED", fake_curated), \
+                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                code = batch_params.main(["--check"])
+            self.assertEqual(code, 1)
+            msg = err.getvalue()
+            self.assertIn("đã trôi khỏi linux.py", msg)
+            self.assertIn("fpsInterp", msg)
+
+
+class TestCliThieuLinuxPy(unittest.TestCase):
+    def test_thieu_linux_py_thi_bao_va_tra_ve_1_khong_traceback(self):
+        with tempfile.TemporaryDirectory() as d:
+            err = io.StringIO()
+            with mock.patch.object(batch_params, "LINUX_PY", Path(d) / "khong-co" / "linux.py"), \
+                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                code = batch_params.main(["motion"])
+            self.assertEqual(code, 1)
+            self.assertIn("linux.py", err.getvalue())
 
 
 if __name__ == "__main__":
