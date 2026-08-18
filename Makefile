@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help setup dev down clean gpu-preflight gpu-provision gpu-wait gpu-bootstrap gpu-fe gpu-up gpu-down gpu-destroy gpu-db-dump gpu-db-check gpu-status gpu-logs
+.PHONY: help setup dev down clean gpu-preflight gpu-provision gpu-wait gpu-bootstrap gpu-fe gpu-up gpu-down gpu-destroy gpu-db-dump gpu-db-check gpu-status gpu-logs batch-test batch-params check-batch-params
 
 help: ## Show this help
 	@echo "motion-clone — make targets:"
@@ -34,6 +34,15 @@ scrub-check: ## Gate: fail if any third-party credential or personal email is tr
 
 check-job-types: ## Gate: job type lists (image, setup profiles, dispatcher) must agree
 	@node scripts/check-job-types.mjs
+
+batch-test: ## Gate: unit test của batch runner (không cần pod, không tốn tiền)
+	@python3 -m unittest discover -s scripts/tests -p 'test_batch_*.py'
+
+batch-params: ## Liệt kê param một job type nhận (TYPE=motion|tryon|enhance)
+	@python3 scripts/batch_params.py $${TYPE:-}
+
+check-batch-params: ## Gate: scripts/batch-params.json phải khớp linux.py
+	@python3 scripts/batch_params.py --check
 
 gpu-preflight: ## Check root .env is complete BEFORE you spend money on a pod
 	@bash scripts/gpu-preflight.sh

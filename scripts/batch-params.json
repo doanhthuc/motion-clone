@@ -1,0 +1,40 @@
+{
+  "_note": "Khai TAY ba thứ AST của linux.py không thấy. 'extra' = param worker đọc ĐỘNG (không phải params.get('ten')) — nếu AST đã thấy thì cổng báo thừa. 'api' = param TẦNG API: worker không bao giờ đọc, api/src/routes/jobs.js tiêu thụ hoặc dịch nó trước khi ghi DB — cổng KHÔNG đòi các key này xuất hiện trong AST. 'allowed' = giá trị hợp lệ, key phải nằm trong AST ∪ extra ∪ api.",
+  "motion": {
+    "extra": {},
+    "api": {
+      "quality": {
+        "where": "motions-studio/api/src/motion-resolution.js:23",
+        "why": "worker KHÔNG đọc params.get(\"quality\") — enforceMotionResolution (jobs.js:105) dịch nó thành width/height/resolution trước khi ghi DB. Đo bằng AST 18/08/2026: 'quality' không nằm trong 39 key của run_motion. pod-smoke.sh:292 và FE đều gửi param này, nên chặn nó là chặn nhầm."
+      }
+    },
+    "allowed": {
+      "quality": ["540p", "720p"],
+      "render_profile": ["fast", "max"]
+    }
+  },
+  "tryon": {
+    "extra": {},
+    "api": {},
+    "allowed": {
+      "provider": ["qwen", "gemini"]
+    }
+  },
+  "enhance": {
+    "api": {},
+    "extra": {
+      "fpsInterp": {
+        "line": 9569,
+        "why": "đọc động qua next((k for k in (\"fpsInterp\",\"fps_interp\",\"fpsTarget\") if k in params)) nên AST không thấy — mà đây đúng là param quan trọng nhất của quy trình này (48/60fps)"
+      },
+      "fps_interp": { "line": 9569, "why": "biến thể snake_case của fpsInterp" },
+      "fpsTarget": { "line": 9569, "why": "biến thể thứ ba của fpsInterp" }
+    },
+    "allowed": {
+      "fpsInterp": ["", "30", "48", "60"],
+      "targetRes": ["1080p", "2k"],
+      "engine": ["flashvsr", "seedvr2"],
+      "mode": ["auto", "image", "video"]
+    }
+  }
+}
