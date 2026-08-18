@@ -1027,9 +1027,9 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 import difflib
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from batchlib.params import check_drift, extract_from_ast, known_params, load_curated
 
 ROOT = Path(__file__).resolve().parents[1]
