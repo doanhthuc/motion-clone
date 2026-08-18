@@ -9,8 +9,8 @@ Hợp đồng API (motions-studio/api/src/routes/jobs.js):
   GET  /jobs/<id>/download   → bytes
 Xác thực: header x-api-key ở cả ba.
 
-Mã lỗi CÓ NGHĨA, không phải "chưa xong": 404 = hàng job không còn (jobs.js:154 — pod
-dựng lại thì DB mới) · 401/403 = key sai (auth.js:7). Poll tiếp hai mã đó chỉ nhận lại
+Mã lỗi CÓ NGHĨA, không phải "chưa xong": 404 = hàng job không còn (jobs.js:160 — pod
+dựng lại thì DB mới) · 401/403 = key sai (auth/session.js:45). Poll tiếp hai mã đó chỉ nhận lại
 đúng nó, trong khi pod vẫn tính tiền — nên chúng là lỗi CHẾT NGAY, xem poll_job.
 """
 from __future__ import annotations
@@ -63,7 +63,7 @@ class JobFailed(JobError):
 class JobGone(JobError):
     """GET /jobs/<id> trả 404: hàng job không còn tồn tại.
 
-    Xảy ra thật khi pod được dựng lại (DB mới, jobs.js:154 trả "Không tìm thấy").
+    Xảy ra thật khi pod được dựng lại (DB mới, jobs.js:160 trả "Không tìm thấy").
     Cũng thuộc nhóm "gửi lại là đúng" như JobFailed, nhưng vì lý do khác — và khác
     hẳn 401/403 (key sai: poll tiếp hay gửi lại đều chỉ nhận đúng mã đó).
     """

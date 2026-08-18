@@ -132,7 +132,11 @@ class TestValidate(unittest.TestCase):
         errs = validate_params("motion", {"render_profile": "max"},
                                ast_params=self.ast, curated=self.curated)
         self.assertEqual(len(errs), 1)
-        self.assertIn("jobs.js:33-34", errs[0])
+        # Đo lại 18/08/2026: assignment thật ở jobs.js:36-37, không phải 33-34 như bản
+        # đầu ghi. Ghim số dòng trong test là con dao hai lưỡi — nó bắt được thay đổi
+        # (chính test này bắt tôi lúc sửa citation), nhưng cũng khoá luôn số SAI nếu
+        # không ai đi đo. Sửa citation thì sửa cả đây.
+        self.assertIn("jobs.js:36-37", errs[0])
         self.assertIn("MOTION_FORCE_QUALITY", errs[0])
 
     def test_render_profile_fast_khong_bi_chan(self):
@@ -156,6 +160,62 @@ class TestValidate(unittest.TestCase):
                 self.assertEqual(
                     validate_params(stage, merged, ast_params=self.ast, curated=self.curated),
                     [], f"{entry['id']} · {stage}")
+
+
+class TestGhiDeCoDieuKien(unittest.TestCase):
+    """Quan hệ thứ ba, khác cả `requires` lẫn `overridden` không điều kiện.
+
+    preset drv-Ns là TRẦN THỜI LƯỢNG: worker ffprobe driver rồi gán
+    params["frames"]/["render_fps"] (linux.py:4141-4142), ghi đè bất kể manifest viết gì.
+    Đo 18/08/2026 với driver 30fps: `preset: drv-5s` + `frames: 33` thật ra chạy ~151
+    frame — gấp 4,6 lần, tức gấp 4,6 lần tiền GPU so với con số người dùng tưởng.
+    Validate KHÔNG bắt được nếu thiếu luật này, vì `frames` là param CÓ THẬT của worker
+    nên nó qua cổng rồi mới bị vứt.
+    """
+
+    def setUp(self):
+        self.ast = extract_from_ast(LINUX_PY)
+        self.curated = load_curated(CURATED)
+
+    def _v(self, params):
+        return validate_params("motion", params, ast_params=self.ast, curated=self.curated)
+
+    def test_co_preset_drv_thi_frames_va_render_fps_bi_chan(self):
+        errs = self._v({"preset": "drv-5s", "frames": 33, "render_fps": 16})
+        self.assertEqual(len(errs), 2, errs)
+        joined = "\n".join(errs)
+        self.assertIn("frames", joined)
+        self.assertIn("render_fps", joined)
+        # Thông báo phải chỉ ra ĐƯỜNG RA, không chỉ nói "sẽ bị ghi đè" rồi thôi.
+        self.assertIn("Bỏ preset drv-*", joined)
+
+    def test_khong_preset_thi_frames_duoc_ton_trong(self):
+        # Đây là hình dạng pod-smoke.sh:293 dùng thật — chặn nó là chặn nhầm.
+        self.assertEqual(self._v({"frames": 33, "render_fps": 16}), [])
+
+    def test_preset_drv_mot_minh_khong_bi_chan(self):
+        # Không khai frames thì không có gì bị ghi đè để mà cảnh báo.
+        self.assertEqual(self._v({"preset": "drv-30s"}), [])
+
+    def test_ghi_de_KHONG_dieu_kien_van_chan_nhu_cu(self):
+        # render_profile không có "when" → phải chặn bất kể có preset hay không.
+        self.assertEqual(len(self._v({"render_profile": "max"})), 1)
+        self.assertEqual(len(self._v({"preset": "drv-5s", "render_profile": "max"})), 1)
+
+    def test_cong_chan_when_khai_nua_voi(self):
+        # "when" thiếu param/values = luật im lặng: đọc file tưởng có luật, chạy thì không.
+        with tempfile.TemporaryDirectory() as d:
+            fake = Path(d) / "fake.py"
+            fake.write_text(FAKE, encoding="utf-8")
+            cur = Path(d) / "curated.json"
+            cur.write_text(
+                '{"motion": {"extra": {}, "api": {}, "allowed": {},'
+                ' "overridden": {"frames": {"forced": "x", "when": {"param": "preset"}}}},'
+                ' "enhance": {"extra": {"fpsInterp": {"why": "x"}, "fps_interp": {"why": "x"},'
+                ' "fpsTarget": {"why": "x"}}, "api": {}, "allowed": {}}}',
+                encoding="utf-8")
+            errs = check_drift(fake, cur)
+            self.assertTrue(any("when" in e and "frames" in e for e in errs), errs)
 
 
 class TestCongChongTroi(unittest.TestCase):

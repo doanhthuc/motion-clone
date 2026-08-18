@@ -203,14 +203,34 @@ def validate_params(job_type: str, params: dict, *, ast_params: dict, curated: d
             )
 
         forced = overridden.get(key) or {}
-        if forced and str(value) != str(forced.get("forced")):
-            errors.append(
-                f"{job_type}.{key}: {value!r} sẽ bị API ép thành "
-                f"{str(forced.get('forced'))!r} VÔ ĐIỀU KIỆN "
-                f"({forced.get('where') or 'tầng API'}) — validate xong là mất, job vẫn "
-                f"chạy và vẫn tính tiền với giá trị bị ép.\n"
-                f"      {forced.get('escape') or 'Không có đường nào khác qua API.'}"
-            )
+        if forced:
+            # "when" (tùy chọn) = ghi đè CÓ ĐIỀU KIỆN. Cần nhánh riêng vì đây là quan hệ
+            # thứ ba, khác cả `requires` lẫn `overridden` không điều kiện:
+            #   requires    X chỉ có tác dụng KHI Y ∈ values      (thiếu Y → X bị bỏ)
+            #   overridden  X luôn bị ép thành một giá trị cố định
+            #   + when      X bị ghi đè KHI Y ∈ values, được tôn trọng khi không
+            # frames/render_fps thuộc loại thứ ba: preset drv-* làm worker ffprobe driver
+            # rồi tự tính, còn không có preset thì giá trị của người dùng được dùng thật.
+            when = forced.get("when") or {}
+            when_key = str(when.get("param") or "")
+            when_values = [str(v) for v in (when.get("values") or [])]
+            if when_key:
+                if str((params or {}).get(when_key, "")) in when_values:
+                    shown = " | ".join(when_values)
+                    errors.append(
+                        f"{job_type}.{key}: {value!r} sẽ bị GHI ĐÈ vì {when_key} đang là "
+                        f"{str((params or {}).get(when_key))!r} — với {when_key} ∈ {shown} thì "
+                        f"{key} là {forced.get('forced')} ({forced.get('where') or 'tầng API'}).\n"
+                        f"      {forced.get('escape') or 'Không có đường nào khác.'}"
+                    )
+            elif str(value) != str(forced.get("forced")):
+                errors.append(
+                    f"{job_type}.{key}: {value!r} sẽ bị API ép thành "
+                    f"{str(forced.get('forced'))!r} VÔ ĐIỀU KIỆN "
+                    f"({forced.get('where') or 'tầng API'}) — validate xong là mất, job vẫn "
+                    f"chạy và vẫn tính tiền với giá trị bị ép.\n"
+                    f"      {forced.get('escape') or 'Không có đường nào khác qua API.'}"
+                )
     return errors
 
 
@@ -263,5 +283,14 @@ def check_drift(linux_py: Path, curated_path: Path) -> list[str]:
                 errors.append(
                     f"{job_type}: .overridden[{name!r}] thiếu \"forced\" (giá trị API ép thành) → "
                     f"validate không biết so với cái gì. Khai đủ hoặc gỡ đi."
+                )
+            # "when" tùy chọn, nhưng khai nửa vời thì luật im lặng: nhánh có điều kiện chỉ
+            # chạy khi có "param", nên thiếu nó là biến một luật thành không luật.
+            when = (rule or {}).get("when")
+            if when is not None and (not (when or {}).get("param") or not (when or {}).get("values")):
+                errors.append(
+                    f"{job_type}: .overridden[{name!r}].when thiếu \"param\" hoặc \"values\" → "
+                    f"luật ghi đè có điều kiện này không chặn được gì, mà đọc file thì tưởng có. "
+                    f"Khai đủ hoặc gỡ \"when\" đi."
                 )
     return errors
