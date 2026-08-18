@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "batch": {
+      "command": "python3",
+      "args": ["scripts/batch_mcp.py"]
+    }
+  }
+}
