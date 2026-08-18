@@ -77,6 +77,7 @@ def _roles(pipeline: str, want_optional: bool) -> set[str]:
         for source in stage.inputs.values():
             for alt in source.split("|"):
                 # "prev" chỉ là material ở chặng ĐẦU (chưa có gì đứng trước nó).
+                # Quy tắc: "prev" phải đứng đầu trong "|"-chain (test_prev_phai_dung_dau...)
                 if alt == "prev" and index > 0:
                     break
                 if not alt.startswith("material:"):
