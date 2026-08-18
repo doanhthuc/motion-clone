@@ -40,19 +40,32 @@ def prune(out_root: Path, keep: int, dry_run: bool = False) -> list[Path]:
 
 
 def main(argv: list[str]) -> int:
+    # --keep nhận str, tự parse int ở đây (không để argparse type=int làm) — vì
+    # lỗi của argparse thoát bằng SystemExit(2) và in tiếng Anh, tránh mất luôn
+    # khối try/except ValueError bên dưới cùng thông điệp tiếng Việt.
     ap = argparse.ArgumentParser(description="Xoá file trung gian của lô cũ")
-    ap.add_argument("--keep", type=int, default=3)
+    ap.add_argument("--keep", default="3")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
 
     try:
-        removed = prune(ROOT / "out", args.keep, args.dry_run)
+        keep = int(args.keep)
+    except ValueError:
+        print(
+            f"✗ KEEP='{args.keep}' không phải số nguyên — cần một số ≥ 1, "
+            f"ví dụ: make batch-clean KEEP=3",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        removed = prune(ROOT / "out", keep, args.dry_run)
     except ValueError as exc:
         print(f"✗ {exc}", file=sys.stderr)
         return 1
     verb = "sẽ xoá" if args.dry_run else "đã xoá"
     if not removed:
-        print(f"  Không có gì để dọn (giữ {args.keep} lô gần nhất)")
+        print(f"  Không có gì để dọn (giữ {keep} lô gần nhất)")
         return 0
     for path in removed:
         print(f"  {verb}: {path.relative_to(ROOT)}")

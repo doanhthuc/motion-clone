@@ -44,6 +44,15 @@ class TestPrune(unittest.TestCase):
             _batches(root, ["2026-08-01-1000"])
             self.assertEqual(prune(root, keep=3), [])
 
+    def test_dung_bang_keep_thi_khong_xoa_gi(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            names = ["2026-08-01-1000", "2026-08-02-1000", "2026-08-03-1000"]
+            _batches(root, names)
+            self.assertEqual(prune(root, keep=3), [])
+            for name in names:
+                self.assertTrue((root / name / "runs").exists())
+
     def test_keep_0_bi_chan(self):
         with tempfile.TemporaryDirectory() as d:
             with self.assertRaises(ValueError):

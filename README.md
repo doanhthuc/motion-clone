@@ -45,11 +45,19 @@ Toàn bộ quy trình theo thứ tự — dựng lần đầu, dùng hằng ngà
 
 ## Chạy lô material (khỏi bấm UI)
 
-Thả material vào bốn ngăn rồi gõ một lệnh:
+Thả material vào bốn ngăn:
+
+```
+~/materials/
+├── characters/
+├── outfits/
+├── backgrounds/
+└── drivers/
+```
+
+Rồi gõ:
 
 ```bash
-~/materials/characters/  outfits/  backgrounds/  drivers/
-
 make batch-scan DIR=~/materials MODE=pair    # đẻ batch/<hôm nay>.yaml — SOÁT rồi mới chạy
 make batch-validate FILE=batch/2026-08-18.yaml   # kiểm, không tiêu GPU
 make batch FILE=batch/2026-08-18.yaml
@@ -58,6 +66,11 @@ make batch FILE=batch/2026-08-18.yaml RESUME=1   # chạy tiếp lô dở
 
 Kết quả ở `out/latest/_final/`. Param của từng chặng tra bằng
 `make batch-params TYPE=motion` (hoặc `tryon` / `enhance`) — bỏ trống thì chạy mặc định.
+
+Dọn đĩa sau vài lô: `make batch-clean` (mặc định giữ 3 lô gần nhất) chỉ xoá
+`runs/` — file trung gian của từng chặng. `_final/` (video đã xong) không bao
+giờ bị đụng tới. `make batch-clean KEEP=1 DRY=1` để xem trước sẽ xoá gì mà
+chưa xoá thật.
 
 Thiết kế và các đánh đổi: `docs/superpowers/specs/2026-08-18-batch-runner-design.md`.
 
