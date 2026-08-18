@@ -429,9 +429,29 @@ class TestRoles(unittest.TestCase):
         self.assertEqual(required_roles("motion-enhance"), {"character", "driver"})
         self.assertEqual(optional_roles("motion-enhance"), set())
 
-    def test_prev_khong_bi_tinh_la_material(self):
-        # enhance chỉ ăn output chặng trước — không được đòi thêm material nào.
-        self.assertNotIn("input", required_roles("motion-enhance"))
+    def test_prev_o_chang_sau_KHONG_doi_material_du_phong(self):
+        # motion khai "prev|material:character": ở chặng ĐẦU phải đòi character, ở chặng
+        # SAU phải lấy output chặng trước và KHÔNG đòi character nữa.
+        #
+        # Phải dựng pipeline riêng mới thấy được nhánh đó. Trong tryon-motion-enhance thì
+        # tryon đã cấp character rồi, nên motion đòi thêm cũng không đổi TẬP HỢP — đo thật
+        # 18/08/2026: bỏ hẳn nhánh prev mà CẢ HAI pipeline có sẵn đều ra kết quả y hệt.
+        # Nói cách khác, không có pipeline thật nào quan sát được nhánh này.
+        from batchlib import pipelines as P
+        P.PIPELINES["_test_enhance_motion"] = ["enhance", "motion"]
+        try:
+            self.assertEqual(required_roles("_test_enhance_motion"), {"driver"})
+        finally:
+            del P.PIPELINES["_test_enhance_motion"]
+
+    def test_prev_phai_dung_dau_trong_moi_khai_bao_nhieu_nguon(self):
+        # _roles() thoát ngay khi gặp "prev", nên "material:x|prev" sẽ âm thầm đòi x bất
+        # kể chặng nằm ở đâu. Quy tắc đó không viết ở đâu cả — test này là chỗ viết nó.
+        for stage in STAGES.values():
+            for field, source in stage.inputs.items():
+                if "|" in source:
+                    self.assertTrue(source.startswith("prev|"),
+                                    f"{stage.name}.{field} = {source!r}: 'prev' phải đứng đầu")
 
     def test_pipeline_la_bao_loi_kem_danh_sach_co_that(self):
         with self.assertRaises(PipelineError) as cm:
@@ -531,6 +551,9 @@ def _roles(pipeline: str, want_optional: bool) -> set[str]:
         for source in stage.inputs.values():
             for alt in source.split("|"):
                 # "prev" chỉ là material ở chặng ĐẦU (chưa có gì đứng trước nó).
+                # `break` này đòi "prev" phải đứng ĐẦU chuỗi nguồn — quy tắc đó được
+                # test_prev_phai_dung_dau_trong_moi_khai_bao_nhieu_nguon giữ, vì không
+                # có chỗ nào khác trong code ép được nó.
                 if alt == "prev" and index > 0:
                     break
                 if not alt.startswith("material:"):
