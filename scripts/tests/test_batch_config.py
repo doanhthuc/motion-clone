@@ -15,20 +15,32 @@ class TestEnvGet(unittest.TestCase):
     def test_khop_hanh_vi_cua_makefile(self):
         # Makefile:30 — cắt từ '#' đầu tiên, xoá MỌI dấu ". Lệch là hai giá trị khác nhau
         # cho cùng một .env ở `make` và ở runner.
+        # Các giá trị dưới được đo trên GNU Make thực tế ngày 18/08/2026. Nếu thay đổi
+        # Makefile:30, phải cập nhật cả hai chỗ.
         import tempfile
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / ".env"
             p.write_text(
-                'DOMAIN=api.example.test   # ghi chú\n'
+                'A=  co-space-truoc\n'
+                'B=co-space-sau   \n'
+                'C=binh-thuong  # ghi chu\n'
+                'D=first\n'
+                'D=second\n'
                 'QUOTED="giu-nguyen"\n'
                 'EMPTY=\n'
                 'NOTME=khong-lay\n',
                 encoding="utf-8",
             )
-            self.assertEqual(env_get(p, "DOMAIN"), "api.example.test")
-            self.assertEqual(env_get(p, "QUOTED"), "giu-nguyen")
-            self.assertEqual(env_get(p, "EMPTY"), "")
-            self.assertEqual(env_get(p, "VANG_MAT"), "")
+            # Các trường hợp từ oracle (GNU Make 18/08/2026)
+            self.assertEqual(env_get(p, "A"), "  co-space-truoc")  # khoảng trắng đầu giữ
+            self.assertEqual(env_get(p, "B"), "co-space-sau   ")   # khoảng trắng cuối giữ
+            self.assertEqual(env_get(p, "C"), "binh-thuong")       # comment cắt đi
+            self.assertEqual(env_get(p, "D"), "first second")      # khóa lặp nối bằng dấu cách
+            # Các trường hợp hiện có vẫn đúng
+            self.assertEqual(env_get(p, "DOMAIN"), "")             # khóa không có
+            self.assertEqual(env_get(p, "QUOTED"), "giu-nguyen")   # dấu nháy xoá
+            self.assertEqual(env_get(p, "EMPTY"), "")              # giá trị rỗng
+            self.assertEqual(env_get(p, "VANG_MAT"), "")           # khóa không tồn tại
 
     def test_file_khong_ton_tai_tra_rong_khong_no(self):
         self.assertEqual(env_get(Path("/khong/co/that/.env"), "DOMAIN"), "")
@@ -72,6 +84,28 @@ class TestLoadSettings(unittest.TestCase):
             root = Path(d)
             _write(root, "DOMAIN=api.example.test\n", "NUXT_MOTION_API_KEY=mk_x\n")
             self.assertEqual(load_settings(root).instance_id, "")
+
+    def test_domain_co_khoang_trang_bi_cham_dung(self):
+        # DOMAIN có khoảng trắng (cuối dòng hoặc lặp khoá) → reject
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            _write(root, "DOMAIN=api.example.test  \n", "NUXT_MOTION_API_KEY=mk_x\n")
+            with self.assertRaises(ConfigError) as cm:
+                load_settings(root)
+            self.assertIn(".env", str(cm.exception))
+            self.assertIn("khoảng trắng", str(cm.exception))
+
+    def test_api_key_co_khoang_trang_bi_cham_dung(self):
+        # NUXT_MOTION_API_KEY có khoảng trắng → reject
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            _write(root, "DOMAIN=api.example.test\n", "NUXT_MOTION_API_KEY=mk_x  \n")
+            with self.assertRaises(ConfigError) as cm:
+                load_settings(root)
+            self.assertIn("motions/.env", str(cm.exception))
+            self.assertIn("khoảng trắng", str(cm.exception))
 
 
 if __name__ == "__main__":
