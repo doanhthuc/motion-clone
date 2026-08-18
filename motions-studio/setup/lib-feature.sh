@@ -684,7 +684,10 @@ phase_comfyui() {
       "$CPIP" install -q einops safetensors tqdm pillow huggingface_hub psutil "opencv-python>=4.8.1.78" pyyaml \
         >/dev/null 2>&1 || warn "cài dependency runtime FlashVSR có cảnh báo."
     fi
-    # ALD 11/07/2026 - WanAnimatePreprocess (retarget) ĐÃ GỠ theo chốt của user.
+    # ALD 18/08/2026 - QUAY LẠI: node này ĐÃ CẦN. Chốt gỡ 11/07 bị vượt bởi fix
+    # "chu mỏ" 21/07 — worker_runtime/linux.py:1657 dựng node 26 PoseAndFaceDetection,
+    # nên thiếu nó là mọi job motion âm thầm fallback DWPose pad128 (đo 17/08 + 18/08).
+    # Node đã vào COMFY_NODES của cả hai setup profile, nên vòng cài node lo deps.
     # Bộ dep ComfyUI tương thích (transformers/diffusers mới — diffusers cũ dùng cached_download đã bị HF bỏ → Wan/Qwen gãy).
     "$CPIP" install -q -U "transformers>=4.50,<4.57" "diffusers>=0.31" >/dev/null 2>&1 || warn "nâng transformers/diffusers có cảnh báo."
     motion_install_best_pytorch "$COMFY_DIR" || warn "GPU stack hậu cài đặt không đạt baseline."

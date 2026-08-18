@@ -55,6 +55,7 @@ RUN set -eux; \
       "https://github.com/Fannovel16/comfyui_controlnet_aux.git e8b689a" \
       "https://github.com/Fannovel16/ComfyUI-Frame-Interpolation.git 26545cc" \
       "https://github.com/naxci1/ComfyUI-FlashVSR_Stable.git f7f55ba" \
+      "https://github.com/kijai/ComfyUI-WanAnimatePreprocess.git 0e0b6a2" \
     ; \
     case "$PROFILE" in \
       motion) ;; \

@@ -747,7 +747,10 @@ if [ "$GPU_OK" = "1" ]; then
         '    if not hasattr(_kp, "pad"): _kp.pad = _F.pad' \
         'except Exception: pass'; cat "$LTXI"; } > "$LTXI.tmp" && mv "$LTXI.tmp" "$LTXI" && ok "vá LTXVideo (kornia pad shim)"
   fi
-  # ALD 11/07/2026 - WanAnimatePreprocess (pose retargeting) ĐÃ GỠ theo chốt của user — không cài, không vá.
+  # ALD 18/08/2026 - QUAY LẠI: node này ĐÃ CẦN. Chốt gỡ 11/07 bị vượt bởi fix
+  # "chu mỏ" 21/07 — worker_runtime/linux.py:1657 dựng node 26 PoseAndFaceDetection,
+  # nên thiếu nó là mọi job motion âm thầm fallback DWPose pad128 (đo 17/08 + 18/08).
+  # Node đã vào COMFY_NODES của cả hai setup profile, nên vòng cài node lo deps.
   # Custom-node requirements có thể đổi torch sau bước đầu; chốt lại baseline trước khi cài kernel attention.
   motion_install_best_pytorch "$COMFY_DIR" || warn "GPU stack hậu cài đặt không đạt baseline."
   [ -z "$(get_kv PYTORCH_ALLOC_CONF)" ] && set_kv PYTORCH_ALLOC_CONF "expandable_segments:True"

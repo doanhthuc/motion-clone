@@ -1,3 +1,19 @@
+# ╔══════════════════════════════════════════════════════════════════════════════════════╗
+# ║ KHÔNG WORKFLOW NÀO BUILD FILE NÀY. Sửa ở đây KHÔNG tới được pod nào.                ║
+# ╚══════════════════════════════════════════════════════════════════════════════════════╝
+# Hai image thật, và đây không phải cái nào:
+#   worker-image/Dockerfile        → ghcr.io/<owner>/motion-prebuilt  (.github/workflows/build-prebuilt-image.yml:63)
+#   worker/runpod/Dockerfile.selfhosted → image serverless            (.github/workflows/build-serverless-image.yml:73)
+# Đường không-prebuilt thì clone node theo COMFY_NODES của setup/setup-full.sh:62 và
+# setup/setup-motion-transfer.sh:46 — cũng không đọc file này.
+#
+# ALD 18/08/2026 - File này ĐÃ LỪA ĐƯỢC MỘT LẦN, tốn một phiên nghiệm thu để phát hiện:
+# commit 3bb2246 (17/08) thêm ComfyUI-WanAnimatePreprocess vào ĐÂY để trị lỗi "mọi job motion
+# âm thầm fallback DWPose pad128". Nó đọc như một bản sửa hoàn chỉnh — có cả comment giải thích —
+# nhưng vì không ai build file này, mọi pod RunPod dựng sau đó vẫn thiếu node. Đo trên pod thật
+# 18/08: node vắng mặt, phải clone tay rồi restart comfyui mới có ViTPose.
+# Thêm node/dep thì thêm vào BỐN chỗ ở trên, không phải ở đây.
+
 # ComfyUI + custom nodes cho pipeline Wan 2.2 Animate. Models tải lúc entrypoint (skip nếu đã có).
 # ALD 13/07/2026 - PyTorch 2.12.1 + CUDA 13.0 là baseline stable chính thức cho Blackwell/RTX 5090.
 FROM pytorch/pytorch:2.12.1-cuda13.0-cudnn9-runtime

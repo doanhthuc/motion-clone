@@ -59,7 +59,7 @@ PM2_APPS="minio,api,wf-worker,worker,comfyui,task-cloud-auto,bg-remover"
 
 # Bộ 9 node = hợp của cả ba profile chuyên, cộng LTXVideo + SeedVR2 cho nhóm video/text-to-video/ss.
 # Giống hệt danh sách setup-pm2.sh:713-721 trừ ComfyUI-Manager.
-COMFY_NODES="https://github.com/kijai/ComfyUI-KJNodes https://github.com/kijai/ComfyUI-WanVideoWrapper https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite https://github.com/city96/ComfyUI-GGUF https://github.com/Fannovel16/comfyui_controlnet_aux https://github.com/Fannovel16/ComfyUI-Frame-Interpolation https://github.com/Lightricks/ComfyUI-LTXVideo https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler https://github.com/naxci1/ComfyUI-FlashVSR_Stable"
+COMFY_NODES="https://github.com/kijai/ComfyUI-KJNodes https://github.com/kijai/ComfyUI-WanVideoWrapper https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite https://github.com/city96/ComfyUI-GGUF https://github.com/Fannovel16/comfyui_controlnet_aux https://github.com/Fannovel16/ComfyUI-Frame-Interpolation https://github.com/Lightricks/ComfyUI-LTXVideo https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler https://github.com/naxci1/ComfyUI-FlashVSR_Stable https://github.com/kijai/ComfyUI-WanAnimatePreprocess"
 
 source "$ROOT/setup/lib-feature.sh"
 feature_main

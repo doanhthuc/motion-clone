@@ -43,7 +43,7 @@ DEFAULT_DOMAIN="${DOMAIN:-motion-transfer.datools.info}"
 NEED_OLLAMA=0                                   # motion-transfer không cần LLM
 PM2_APPS="minio,api,wf-worker,worker,comfyui,task-cloud-auto"   # KHÔNG bg-remover
 # #endregion
-COMFY_NODES="https://github.com/kijai/ComfyUI-WanVideoWrapper https://github.com/kijai/ComfyUI-KJNodes https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite https://github.com/Fannovel16/comfyui_controlnet_aux https://github.com/Fannovel16/ComfyUI-Frame-Interpolation https://github.com/naxci1/ComfyUI-FlashVSR_Stable"
+COMFY_NODES="https://github.com/kijai/ComfyUI-WanVideoWrapper https://github.com/kijai/ComfyUI-KJNodes https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite https://github.com/Fannovel16/comfyui_controlnet_aux https://github.com/Fannovel16/ComfyUI-Frame-Interpolation https://github.com/naxci1/ComfyUI-FlashVSR_Stable https://github.com/kijai/ComfyUI-WanAnimatePreprocess"
 
 source "$ROOT/setup/lib-feature.sh"
 feature_main
