@@ -64,6 +64,19 @@ nào đi lọt — một mặt tiếp xúc không được kiểm soát bởi te
 | `scripts/batch_params.py` | Rút param từ `linux.py` bằng AST + file khai tay | `linux.py` |
 | `scripts/batch-params.json` | Khai tay phần AST không thấy + giá trị hợp lệ | — |
 
+> **RÀNG BUỘC ĐO ĐƯỢC (18/08/2026, pod thật): mọi request PHẢI đặt User-Agent.**
+> Pod nằm sau Cloudflare Tunnel — đó là cả kiến trúc của repo ([gpu-pod.md](../../gpu-pod.md)) —
+> và Cloudflare CHẶN User-Agent mặc định của urllib. Cùng một URL `/health`, cùng lúc:
+> ```
+> curl                     → HTTP 200
+> urllib (UA mặc định)     → HTTP 403  "error code: 1010"
+> urllib + UA bất kỳ khác  → HTTP 200
+> ```
+> Bỏ header đó thì runner KHÔNG nói được với pod chút nào: preflight, submit, poll, download đều
+> 403. Đây là lỗi **chỉ pod thật phơi ra được** — toàn bộ 143 test vẫn xanh vì chúng bắn vào
+> `http.server` giả trên `127.0.0.1`, nơi không có Cloudflare. `pod-smoke.sh` không bao giờ gặp nó
+> vì nó dùng `curl`. Ghim bằng `TestUserAgent` trong `test_batch_client.py`.
+
 Viết bằng **Python 3**: PyYAML 6.0.3 đã có sẵn trên máy dev (đo 18/08/2026), `scripts/` đã có tiền
 lệ Python (`omni-flash-motion-test.py`, `pysite/`), và AST extractor ở §7 buộc phải là Python. Root
 repo không có `package.json` nên hướng Node sẽ phải đẻ thêm một cây `node_modules` chỉ để đọc YAML.

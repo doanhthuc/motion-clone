@@ -11,6 +11,7 @@ from batchlib.client import (JobError, JobFailed, JobGone, download_output, enco
 from batchlib.config import Settings
 
 STATE = {"poll_calls": 0, "statuses": [], "last_post": None, "output": b"", "health": 200,
+         "last_ua": "",
          "download_status": 200, "garbage_polls": 0, "always_garbage": False,
          "poll_status": 200, "poll_body": b""}
 
@@ -28,6 +29,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        STATE["last_ua"] = self.headers.get("user-agent", "")
         if self.path == "/health":
             self.send_response(STATE["health"]); self.send_header("content-length", "0"); self.end_headers()
         elif self.path.endswith("/download"):
@@ -62,6 +64,7 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(int(self.headers["content-length"]))
         STATE["last_post"] = (self.headers.get("content-type", ""), raw,
                               self.headers.get("x-api-key", ""))
+        STATE["last_ua"] = self.headers.get("user-agent", "")
         self._json(202, {"id": "job-1", "status": "queued"})
 
 
@@ -85,7 +88,7 @@ class ServerCase(unittest.TestCase):
         cls.server.server_close()  # đóng hẳn socket lắng nghe, tránh ResourceWarning rò rỉ
 
     def setUp(self):
-        STATE.update(poll_calls=0, statuses=[], last_post=None, output=b"", health=200,
+        STATE.update(poll_calls=0, statuses=[], last_post=None, output=b"", health=200, last_ua="",
                      download_status=200, garbage_polls=0, always_garbage=False,
                      poll_status=200, poll_body=b"")
 
@@ -108,6 +111,37 @@ class TestMultipart(unittest.TestCase):
         b1 = encode_multipart({"a": "1"}, {})[1]
         b2 = encode_multipart({"a": "1"}, {})[1]
         self.assertNotEqual(b1, b2)
+
+
+class TestUserAgent(ServerCase):
+    """UA mặc định của urllib bị Cloudflare CHẶN — pod nằm sau Cloudflare Tunnel.
+
+    Đo trên pod thật 18/08/2026, cùng URL /health cùng lúc:
+        curl                    → HTTP 200
+        urllib (UA mặc định)    → HTTP 403  "error code: 1010"
+        urllib + UA khác        → HTTP 200
+    Bỏ header này thì runner KHÔNG nói được với pod chút nào. Suite 143 test vẫn xanh
+    lúc đó vì chúng bắn vào http.server giả trên 127.0.0.1, nơi không có Cloudflare —
+    nên test này là chỗ duy nhất ghim được nó mà không cần thuê máy.
+    """
+
+    def test_moi_request_gui_user_agent_khong_phai_cua_urllib(self):
+        from batchlib.client import USER_AGENT
+        health_ok(self.settings)
+        self.assertEqual(STATE["last_ua"], USER_AGENT)
+        # Chuỗi Cloudflare chặn. Ghim cả chiều ÂM: đổi USER_AGENT thành "Python-urllib/3.14"
+        # sẽ làm test đỏ, còn assertEqual ở trên thì không.
+        self.assertNotIn("Python-urllib", STATE["last_ua"])
+
+    def test_POST_cung_gui_user_agent(self):
+        import tempfile
+        from batchlib.client import USER_AGENT
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "ref.jpg"
+            f.write_bytes(b"x" * 10)
+            submit_job(self.settings, "motion", {}, {"ref": f})
+        self.assertEqual(STATE["last_ua"], USER_AGENT)
+        self.assertNotIn("Python-urllib", STATE["last_ua"])
 
 
 class TestHealth(ServerCase):

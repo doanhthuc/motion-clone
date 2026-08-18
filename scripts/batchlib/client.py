@@ -31,6 +31,20 @@ POLL_SECONDS = 10
 # tha được — job trên pod không chết vì Wi-Fi của máy local.
 MAX_POLL_MISSES = 30
 
+# BẮT BUỘC đặt User-Agent. Không đặt thì urllib gửi "Python-urllib/3.x" và Cloudflare
+# CHẶN nó: pod nằm sau Cloudflare Tunnel (cả kiến trúc của repo, docs/gpu-pod.md), và
+# Cloudflare trả 403 kèm "error code: 1010" — chặn theo signature client.
+#
+# Đo thật trên pod 18/08/2026, cùng một URL /health cùng lúc:
+#     curl                        → HTTP 200
+#     urllib (UA mặc định)        → HTTP 403  error code: 1010
+#     urllib + UA bất kỳ khác     → HTTP 200
+#
+# Hậu quả nếu bỏ dòng này: runner KHÔNG nói được với pod chút nào — preflight, submit,
+# poll, download đều 403. Toàn bộ 143 test vẫn xanh vì chúng bắn vào http.server giả
+# trên 127.0.0.1, nơi không có Cloudflare. Đây là lỗi chỉ pod thật phơi ra được.
+USER_AGENT = "motion-batch-runner/1.0"
+
 
 class JobError(Exception):
     """Job hỏng, quá hạn, hoặc output không dùng được."""
@@ -80,6 +94,7 @@ def _request(s: Settings, path: str, *, data: bytes | None = None,
              content_type: str = "", timeout: int = 60) -> tuple[int, bytes]:
     req = urllib.request.Request(f"{s.base_url}{path}", data=data)
     req.add_header("x-api-key", s.api_key)
+    req.add_header("user-agent", USER_AGENT)   # KHÔNG bỏ — xem USER_AGENT phía trên
     if content_type:
         req.add_header("content-type", content_type)
     try:
