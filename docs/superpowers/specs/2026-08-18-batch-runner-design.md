@@ -53,7 +53,8 @@ nào đi lọt — một mặt tiếp xúc không được kiểm soát bởi te
 
 | Đơn vị | Việc | Phụ thuộc |
 |---|---|---|
-| `batch/<tên>.yaml` | Dữ liệu. Khai run + param. Runner ghi ngược kết quả vào chính nó. | — |
+| `batch/<tên>.yaml` | Dữ liệu **của bạn**. Khai run + param. Runner không bao giờ ghi vào file này. | — |
+| `batch/<tên>.state.json` | Dữ liệu **của máy**. Journal: job id, trạng thái, file từng chặng. | manifest |
 | `scripts/batch_scan.py` | Đọc 4 thư mục vai trò → đẻ manifest nháp | — |
 | `scripts/batch_run.py` | preflight → validate → chạy tuần tự → journal → tổng kết | manifest, `.env` |
 | `scripts/batch_params.py` | Rút param từ `linux.py` bằng AST + file khai tay | `linux.py` |
@@ -207,8 +208,14 @@ out/
   `jobs.js:110-113` ép `detailUpscale=false` cho mọi job motion bất kể client gửi gì;
   `enforceMotionResolution` và `enforceTaskCloudEnhancePolicy` cũng nắn params trước khi ghi DB.
   Ghi lại cái thật là cách duy nhất để sáu tuần sau còn giải thích được vì sao hai lô khác nhau.
-- **`manifest.yaml` là bản sao** đã dùng, có kết quả ghi ngược. File gốc trong `batch/` cũng được
-  cập nhật để `--resume` chạy được.
+- **`manifest.yaml` là bản sao đông cứng** của manifest đã dùng, chép nguyên văn (kể cả comment) tại
+  thời điểm chạy — để sáu tuần sau còn biết lô đó chạy bằng manifest nào.
+
+**Journal nằm ở file riêng, không ghi ngược vào manifest.** `batch/<tên>.state.json` giữ job id,
+trạng thái và đường dẫn file của từng chặng; `--resume` đọc nó. Lý do tách: PyYAML `safe_dump` xoá
+sạch comment, mà comment chính là chỗ bạn ghi "preset này cho khách A, đừng đổi". Runner ghi đè
+manifest một lần là mất hết, không lấy lại được. Ranh giới: **`.yaml` là của bạn, `.state.json` là
+của máy** — máy không bao giờ ghi vào file của bạn.
 
 Đĩa: `make batch-clean KEEP=3` xoá `runs/` của các lô cũ hơn 3 lô gần nhất. `_final/` không bao giờ
 động tới. `out/` vào `.gitignore`.
