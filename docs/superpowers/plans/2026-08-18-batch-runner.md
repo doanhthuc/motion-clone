@@ -355,7 +355,12 @@ def load_settings(root: Path = ROOT) -> Settings:
 - [ ] **Step 4: Chạy test để xác nhận nó xanh**
 
 Run: `python3 -m unittest discover -s scripts/tests -p 'test_batch_config.py' -v`
-Expected: PASS — 11 test
+Expected: PASS — 9 test
+
+Danh sách test ở Step 1 viết mỗi tính chất một hàm cho dễ đọc. Gộp vài hàm lại là được, miễn
+mọi assertion còn nguyên — bản đã giao gộp bảng oracle vào `test_khop_hanh_vi_cua_makefile`
+và gộp "thông báo DOMAIN in giá trị thật" vào `test_domain_co_khoang_trang_bi_cham_dung`,
+ra 9 hàm. Con số đếm được là 9, không phải 11.
 
 - [ ] **Step 5: Commit**
 
