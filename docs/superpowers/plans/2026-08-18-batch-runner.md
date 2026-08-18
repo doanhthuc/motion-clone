@@ -1118,7 +1118,7 @@ check-batch-params: ## Gate: scripts/batch-params.json phải khớp linux.py
 - [ ] **Step 7: Chạy test để xác nhận nó xanh**
 
 Run: `python3 -m unittest discover -s scripts/tests -p 'test_batch_params.py' -v`
-Expected: PASS — 15 test
+Expected: PASS — 16 test
 
 Nếu `test_repo_hien_tai_khong_troi` đỏ: đọc thông báo, nó nói đúng key nào thiếu/thừa trong `batch-params.json`. Sửa file JSON, không sửa test — đó chính là việc cổng này tồn tại để làm.
 
