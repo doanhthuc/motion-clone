@@ -450,7 +450,15 @@ và nó phát hiện sau khi job đã vào hàng đợi và đánh thức GPU."
 - Consumes: —
 - Produces: `@dataclass(frozen=True) ParamInfo(name: str, default: object, line: int, source: str)`; `extract_from_ast(linux_py: Path) -> dict[str, dict[str, ParamInfo]]`; `dynamic_param_names(linux_py: Path) -> dict[str, set[str]]`; `load_curated(path: Path) -> dict`; `known_params(job_type: str, ...) -> dict[str, ParamInfo]`; `validate_params(job_type, params: dict, ...) -> list[str]`; `check_drift(...) -> list[str]`.
 
-`source` là `"ast"` hoặc `"curated"`.
+`source` là `"ast"` (worker đọc trực tiếp), `"extra"` (worker đọc động, AST mù) hoặc `"api"`
+(worker KHÔNG đọc — `api/src/routes/jobs.js` tiêu thụ/dịch trước khi ghi DB).
+
+**Bề mặt param có hai tầng, và đây là chỗ dễ sai nhất của cả kế hoạch.** `quality` là ví dụ:
+`run_motion` không hề gọi `params.get("quality")` — `enforceMotionResolution`
+(`api/src/motion-resolution.js:23-38`, gọi từ `jobs.js:105`) dịch nó thành width/height trước khi
+job vào DB. Nhưng `pod-smoke.sh:292`, FE và `batch/example.yaml` đều gửi nó. Nếu `known_params()`
+chỉ lấy từ AST của worker thì runner sẽ **từ chối một param mà chính repo đang dùng**. Khối `api`
+tồn tại cho đúng lớp đó.
 
 - [ ] **Step 1: Viết test thất bại**
 
@@ -540,6 +548,24 @@ class TestValidate(unittest.TestCase):
     def test_fpsInterp_duoc_chap_nhan_du_AST_khong_thay(self):
         self.assertIn("fpsInterp", known_params("enhance", ast_params=self.ast, curated=self.curated))
 
+    def test_quality_duoc_chap_nhan_du_worker_khong_doc_no(self):
+        # quality là param TẦNG API: run_motion không gọi params.get("quality"),
+        # enforceMotionResolution (motion-resolution.js:23) dịch nó thành width/height.
+        # pod-smoke.sh:292 và batch/example.yaml đều gửi nó — chặn nó là chặn nhầm.
+        self.assertNotIn("quality", self.ast.get("motion", {}))
+        known = known_params("motion", ast_params=self.ast, curated=self.curated)
+        self.assertIn("quality", known)
+        self.assertEqual(known["quality"].source, "api")
+        self.assertEqual(
+            validate_params("motion", {"quality": "540p", "frames": 33},
+                            ast_params=self.ast, curated=self.curated), [])
+
+    def test_quality_sai_gia_tri_van_bi_chan(self):
+        errs = validate_params("motion", {"quality": "4k"},
+                               ast_params=self.ast, curated=self.curated)
+        self.assertEqual(len(errs), 1)
+        self.assertIn("720p", errs[0])
+
 
 class TestCongChongTroi(unittest.TestCase):
     def test_repo_hien_tai_khong_troi(self):
@@ -553,6 +579,21 @@ class TestCongChongTroi(unittest.TestCase):
             c.write_text('{"enhance": {"extra": {}, "allowed": {}}}', encoding="utf-8")
             errs = check_drift(p, c)
             self.assertTrue(any("fpsInterp" in e for e in errs))
+
+    def test_api_khong_bi_doi_phai_co_trong_AST(self):
+        # Key ở .api KHÔNG BAO GIỜ xuất hiện trong AST của worker — đó là định nghĩa
+        # của nó. Cổng đòi điều đó là đòi một điều không bao giờ đúng.
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "fake.py"
+            p.write_text(FAKE, encoding="utf-8")
+            c = Path(d) / "curated.json"
+            c.write_text(
+                '{"motion": {"extra": {}, "api": {"quality": {"where": "x.js:1"}},'
+                ' "allowed": {"quality": ["540p"]}},'
+                ' "enhance": {"extra": {"fpsInterp": {"why": "x"}, "fps_interp": {"why": "x"},'
+                ' "fpsTarget": {"why": "x"}}, "api": {}, "allowed": {}}}',
+                encoding="utf-8")
+            self.assertEqual(check_drift(p, c), [])
 
     def test_khai_tay_thua_thi_do(self):
         # Key đã hiện ra trong AST mà vẫn nằm ở "extra" = khai tay đã cũ, phải gỡ.
@@ -582,9 +623,15 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'batchlib.params'`
 
 ```json
 {
-  "_note": "Khai TAY phần extractor AST không thấy, cộng danh sách giá trị hợp lệ. Cổng `make check-batch-params` giữ file này khớp với linux.py. Thêm mục vào 'extra' chỉ khi param được đọc động (không phải params.get('ten')); nếu AST đã thấy nó thì cổng sẽ báo thừa.",
+  "_note": "Khai TAY ba thứ AST của linux.py không thấy. 'extra' = param worker đọc ĐỘNG (không phải params.get('ten')) — nếu AST đã thấy thì cổng báo thừa. 'api' = param TẦNG API: worker không bao giờ đọc, api/src/routes/jobs.js tiêu thụ hoặc dịch nó trước khi ghi DB — cổng KHÔNG đòi các key này xuất hiện trong AST. 'allowed' = giá trị hợp lệ, key phải nằm trong AST ∪ extra ∪ api.",
   "motion": {
     "extra": {},
+    "api": {
+      "quality": {
+        "where": "motions-studio/api/src/motion-resolution.js:23",
+        "why": "worker KHÔNG đọc params.get(\"quality\") — enforceMotionResolution (jobs.js:105) dịch nó thành width/height/resolution trước khi ghi DB. Đo bằng AST 18/08/2026: 'quality' không nằm trong 39 key của run_motion. pod-smoke.sh:292 và FE đều gửi param này, nên chặn nó là chặn nhầm."
+      }
+    },
     "allowed": {
       "quality": ["540p", "720p"],
       "render_profile": ["fast", "max"]
@@ -592,11 +639,13 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'batchlib.params'`
   },
   "tryon": {
     "extra": {},
+    "api": {},
     "allowed": {
       "provider": ["qwen", "gemini"]
     }
   },
   "enhance": {
+    "api": {},
     "extra": {
       "fpsInterp": {
         "line": 9569,
@@ -735,9 +784,19 @@ def load_curated(path: Path) -> dict:
 
 
 def known_params(job_type: str, *, ast_params: dict, curated: dict) -> dict[str, ParamInfo]:
+    """AST ∪ extra ∪ api.
+
+    'api' là tầng thứ hai mà AST của worker không bao giờ nhìn thấy: param do
+    api/src/routes/jobs.js tiêu thụ hoặc dịch trước khi ghi DB. Ví dụ 'quality'
+    — run_motion không hề gọi params.get("quality"); enforceMotionResolution
+    (motion-resolution.js:23) đổi nó thành width/height. Bỏ tầng này thì runner
+    chặn đúng những param mà chính repo đang gửi (pod-smoke.sh:292).
+    """
+    block = curated.get(job_type, {})
     out = dict(ast_params.get(job_type, {}))
-    for name, meta in (curated.get(job_type, {}).get("extra", {}) or {}).items():
-        out.setdefault(name, ParamInfo(name, None, int(meta.get("line") or 0), "curated"))
+    for source in ("extra", "api"):
+        for name, meta in (block.get(source, {}) or {}).items():
+            out.setdefault(name, ParamInfo(name, None, int(meta.get("line") or 0), source))
     return out
 
 
@@ -782,10 +841,14 @@ def check_drift(linux_py: Path, curated_path: Path) -> list[str]:
                 f"{job_type}: {name!r} khai tay ở .extra nhưng AST ĐÃ thấy nó → "
                 f"khai báo thừa, gỡ khỏi batch-params.json."
             )
-        known = seen_by_ast | set(block.get("extra", {}) or {})
+        # .api CỐ Ý không bị kiểm theo AST: worker không bao giờ đọc những key đó
+        # (jobs.js dịch/tiêu thụ chúng trước), nên đòi chúng xuất hiện trong AST là
+        # đòi một điều không bao giờ đúng. Chúng được kiểm bằng trường "where" trỏ
+        # tới dòng code API thật, và bằng mắt người khi thêm.
+        known = seen_by_ast | set(block.get("extra", {}) or {}) | set(block.get("api", {}) or {})
         for name in sorted(set(block.get("allowed", {}) or {}) - known):
             errors.append(
-                f"{job_type}: .allowed có {name!r} nhưng linux.py không đọc param đó "
+                f"{job_type}: .allowed có {name!r} nhưng không nằm trong AST, .extra hay .api "
                 f"→ khai báo cũ, gỡ đi."
             )
     return errors
@@ -844,12 +907,20 @@ def main(argv: list[str]) -> int:
     print(f"{job_type} — {len(known)} param\n")
     print(f"  {'param':28} {'mặc định':18} {'giá trị hợp lệ':26} nguồn")
     print(f"  {'-' * 28} {'-' * 18} {'-' * 26} -----")
+    api_block = curated.get(job_type, {}).get("api", {}) or {}
     for name in sorted(known):
         info = known[name]
         values = "/".join(str(v) if v != "" else "(rỗng)" for v in allowed.get(name, [])) or "—"
-        where = f"linux.py:{info.line}" if info.source == "ast" else f"khai tay:{info.line}"
+        if info.source == "ast":
+            where = f"linux.py:{info.line}"
+        elif info.source == "api":
+            where = str(api_block.get(name, {}).get("where") or "tầng API")
+        else:
+            where = f"linux.py:{info.line} (đọc động)"
         print(f"  {name:28} {str(info.default):18} {values:26} {where}")
     print("\n  Đọc comment gốc ở đúng dòng trên — repo này comment dày, đó là tài liệu thật.")
+    if api_block:
+        print("  Dòng 'tầng API' là param worker KHÔNG đọc: jobs.js dịch/tiêu thụ nó trước khi ghi DB.")
     return 0
 
 
@@ -877,7 +948,7 @@ check-batch-params: ## Gate: scripts/batch-params.json phải khớp linux.py
 - [ ] **Step 7: Chạy test để xác nhận nó xanh**
 
 Run: `python3 -m unittest discover -s scripts/tests -p 'test_batch_params.py' -v`
-Expected: PASS — 10 test
+Expected: PASS — 13 test
 
 Nếu `test_repo_hien_tai_khong_troi` đỏ: đọc thông báo, nó nói đúng key nào thiếu/thừa trong `batch-params.json`. Sửa file JSON, không sửa test — đó chính là việc cổng này tồn tại để làm.
 
@@ -983,6 +1054,26 @@ class TestLoad(unittest.TestCase):
             self.assertEqual(m.runs[0].stage_params["enhance"]["targetRes"], "1080p")
             self.assertEqual(m.runs[1].stage_params["enhance"]["fpsInterp"], "48")
             self.assertEqual(m.runs[1].stage_params["enhance"]["targetRes"], "1080p")
+
+    def test_defaults_khong_lan_sang_pipeline_khong_chay_chang_do(self):
+        # defaults cho tryon KHÔNG được dính vào run motion-enhance, nếu không validate
+        # sẽ báo sai "có param cho chặng tryon" cho một mặc định hoàn toàn vô hại.
+        with tempfile.TemporaryDirectory() as d:
+            text = GOOD.replace("defaults:\n", "defaults:\n  tryon: { provider: qwen }\n")
+            m = load_manifest(_fixture(Path(d), text))
+            self.assertIn("tryon", m.runs[0].stage_params)          # tryon-motion-enhance
+            self.assertNotIn("tryon", m.runs[1].stage_params)       # motion-enhance
+            self.assertEqual(validate_manifest(m, ast_params=AST, curated=CURATED), [])
+
+    def test_param_ghi_thang_cho_chang_khong_chay_van_bi_bat(self):
+        # Khác với defaults: viết thẳng `tryon:` vào một run motion-enhance là lỗi cố ý,
+        # và im lặng bỏ qua nó nghĩa là người dùng tưởng mình đã chỉnh được cái gì đó.
+        with tempfile.TemporaryDirectory() as d:
+            text = GOOD.replace("    enhance: { fpsInterp: \"48\" }",
+                                "    enhance: { fpsInterp: \"48\" }\n    tryon: { provider: qwen }")
+            errs = validate_manifest(load_manifest(_fixture(Path(d), text)),
+                                     ast_params=AST, curated=CURATED)
+            self.assertTrue(any("tryon" in e for e in errs))
 
     def test_trung_id_bi_chan(self):
         with tempfile.TemporaryDirectory() as d:
@@ -1174,14 +1265,23 @@ def load_manifest(path: Path) -> Manifest:
             expanded = Path(str(value)).expanduser()
             inputs[str(role)] = expanded if expanded.is_absolute() else (base / expanded).resolve()
 
+        pipeline = str(entry.get("pipeline") or "")
+        # defaults CHỈ áp cho chặng mà pipeline của run thật sự chạy. Merge cho mọi chặng
+        # thì đặt `defaults: { tryon: {...} }` sẽ làm MỌI run motion-enhance bị validate
+        # báo sai "có param cho chặng tryon nhưng pipeline không chạy chặng đó" — người
+        # dùng đặt một mặc định vô hại và cả lô bị chặn với lý do khó hiểu.
+        # Param ghi THẲNG trong run thì vẫn merge bất kể pipeline: đó là lỗi cố ý của
+        # người dùng và validate phải nói ra, khác hẳn với một default vô tình lan sang.
+        # Pipeline lạ → merge hết; validate sẽ bắt chính cái pipeline đó trước.
+        applicable = set(PIPELINES.get(pipeline, STAGE_KEYS))
         stage_params: dict[str, dict] = {}
         for stage in STAGE_KEYS:
-            merged = dict(defaults.get(stage) or {})
+            merged = dict(defaults.get(stage) or {}) if stage in applicable else {}
             merged.update(entry.get(stage) or {})
             if merged:
                 stage_params[stage] = merged
 
-        runs.append(Run(id=run_id, pipeline=str(entry.get("pipeline") or ""),
+        runs.append(Run(id=run_id, pipeline=pipeline,
                         inputs=inputs, stage_params=stage_params))
     return Manifest(path=path, runs=runs)
 
@@ -1261,7 +1361,7 @@ def save_state(path: Path, state: dict) -> None:
 - [ ] **Step 4: Chạy test để xác nhận nó xanh**
 
 Run: `python3 -m unittest discover -s scripts/tests -p 'test_batch_manifest.py' -v`
-Expected: PASS — 15 test
+Expected: PASS — 17 test
 
 - [ ] **Step 5: Commit**
 
@@ -1720,7 +1820,10 @@ sinh tách khỏi bước chạy. Đoán sai tốn một lần liếc mắt, kh�
 
 **Interfaces:**
 - Consumes: `config.Settings`
-- Produces: `class JobError(Exception)`; `encode_multipart(fields: dict[str, str], files: dict[str, Path]) -> tuple[bytes, str]`; `health_ok(s: Settings, timeout: int = 15) -> bool`; `submit_job(s: Settings, job_type: str, params: dict, files: dict[str, Path]) -> str`; `poll_job(s, job_id, timeout_min, on_progress=None, sleep=time.sleep) -> dict`; `download_output(s, job_id, dest: Path, min_bytes: int) -> int`.
+- Produces: `class JobError(Exception)`; `encode_multipart(fields: dict[str, str], files: dict[str, Path]) -> tuple[bytes, str]`; `health_ok(s: Settings, timeout: int = 15) -> bool`; `submit_job(s: Settings, job_type: str, params: dict, files: dict[str, Path]) -> str`; `poll_job(s, job_id, timeout_min, on_progress=None, sleep=time.sleep, now=time.time) -> dict`; `download_output(s, job_id, dest: Path, min_bytes: int) -> int`.
+
+`sleep` và `now` là cổng tiêm cho test — không có chúng thì mỗi test poll phải chờ thật 10 giây,
+và test timeout phải chờ thật một phút.
 
 Test dựng một `http.server.HTTPServer` giả trong thread — không cần pod, không cần mạng ra ngoài.
 
@@ -1779,10 +1882,15 @@ class ServerCase(unittest.TestCase):
         threading.Thread(target=cls.server.serve_forever, daemon=True).start()
         host, port = cls.server.server_address
         cls.settings = Settings(domain=f"{host}:{port}", api_key="mk_test", instance_id="i-1")
-        cls.settings.__class__.base_url = property(lambda s: f"http://{s.domain}")
+        # Server giả không có TLS nên base_url phải là http://. Đây là vá ở cấp LỚP, nên
+        # PHẢI khôi phục ở tearDownClass: `unittest discover` chạy mọi module trong CÙNG
+        # một tiến trình, và một base_url rò rỉ biến cả suite thành phụ thuộc thứ tự chạy.
+        cls._base_url_goc = Settings.base_url
+        Settings.base_url = property(lambda s: f"http://{s.domain}")
 
     @classmethod
     def tearDownClass(cls):
+        Settings.base_url = cls._base_url_goc
         cls.server.shutdown()
 
     def setUp(self):
@@ -2951,4 +3059,21 @@ git commit -m "batch: nghiệm thu trên pod thật — số đo, không phải 
 
 **Type consistency** — đã đối chiếu: `Run`/`Manifest` (Task 4) dùng nguyên ở Task 5 và 7; `Stage.inputs` (Task 2) được `_resolve_files` (Task 7) giải đúng cú pháp `prev|material:x?`; `ParamInfo.source` (Task 3) dùng ở `batch_params.py`; `Settings.base_url` (Task 1) dùng ở `client.py` (Task 6) và bị test Task 6 vá thành `http://` để chạy server giả; `state_path_for`/`load_state`/`save_state` (Task 4) dùng ở Task 7 với đúng hình dạng `{"version","batch","runs"}`.
 
-**Một chỗ lệch cố ý, ghi ra để người triển khai không tưởng là lỗi:** `Task 6` test vá `Settings.base_url` sang `http://` vì server giả không có TLS. Nếu sau này `base_url` đổi thành thuộc tính thường (không phải `property`), test đó sẽ hỏng — sửa test, không sửa `config.py`.
+**Một chỗ lệch cố ý, ghi ra để người triển khai không tưởng là lỗi:** `Task 6` test vá `Settings.base_url` sang `http://` vì server giả không có TLS, rồi khôi phục ở `tearDownClass` — bắt buộc, vì `unittest discover` chạy mọi module trong cùng một tiến trình. Nếu sau này `base_url` đổi thành thuộc tính thường (không phải `property`), test đó sẽ hỏng — sửa test, không sửa `config.py`.
+
+## Sửa sau pre-flight scan (18/08/2026)
+
+Bốn thay đổi so với bản commit `a6291b0`, đầy đủ lý do trong ledger
+`.superpowers/sdd/2026-08-18-batch-runner/progress.md`:
+
+- **R7 (load-bearing):** bề mặt param có **hai tầng**. `quality` không phải param của worker —
+  `run_motion` không hề gọi `params.get("quality")` (đo bằng AST); `enforceMotionResolution`
+  (`api/src/motion-resolution.js:23-38`) dịch nó thành width/height trước khi ghi DB. Bản đầu khai
+  `quality` trong `motion.allowed` sẽ làm cổng `check_drift` **đỏ vĩnh viễn** và làm validate **từ
+  chối** đúng cái param mà `pod-smoke.sh:292`, `batch/example.yaml` và smoke Task 9 đều dùng. Thêm
+  khối `api` vào `batch-params.json`; `known_params()` = AST ∪ extra ∪ api.
+- **R4:** `defaults` chỉ áp cho chặng thuộc pipeline của run. Bản đầu merge cho mọi chặng, nên một
+  `defaults: { tryon: … }` vô hại sẽ làm mọi run `motion-enhance` bị validate báo sai.
+- **R3:** Task 6 phải khôi phục `Settings.base_url` ở `tearDownClass`. Bản đầu vá ở cấp lớp mà
+  không trả lại → rò sang mọi test module chạy sau.
+- **R2:** dòng Interfaces của Task 6 thiếu tham số `now` của `poll_job` (code và test đều có).
