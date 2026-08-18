@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: check-comfy-nodes help setup dev down clean gpu-preflight gpu-provision gpu-wait gpu-bootstrap gpu-fe gpu-up gpu-down gpu-destroy gpu-db-dump gpu-db-check gpu-status gpu-logs batch-test batch-params check-batch-params batch-scan batch-validate batch batch-clean
+.PHONY: batch-coverage check-comfy-nodes help setup dev down clean gpu-preflight gpu-provision gpu-wait gpu-bootstrap gpu-fe gpu-up gpu-down gpu-destroy gpu-db-dump gpu-db-check gpu-status gpu-logs batch-test batch-params check-batch-params batch-scan batch-validate batch batch-clean
 
 help: ## Show this help
 	@echo "motion-clone — make targets:"
@@ -40,6 +40,9 @@ check-comfy-nodes: ## Gate: bốn danh sách custom node ComfyUI (2 image + 2 se
 
 batch-test: ## Gate: unit test của batch runner (không cần pod, không tốn tiền)
 	@python3 -m unittest discover -s scripts/tests -p 'test_batch_*.py'
+
+batch-coverage: ## Dòng nào của batch runner KHÔNG test nào chạm tới (FULL=1 để xem hết)
+	@python3 scripts/batch_coverage.py $${FULL:+--full}
 
 batch-params: ## Liệt kê param một job type nhận (TYPE=motion|tryon|enhance)
 	@python3 scripts/batch_params.py $${TYPE:-}
