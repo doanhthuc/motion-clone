@@ -122,7 +122,10 @@ def poll_job(s: Settings, job_id: str, timeout_min: int,
 def download_output(s: Settings, job_id: str, dest: Path, min_bytes: int) -> int:
     code, raw = _request(s, f"/jobs/{job_id}/download", timeout=600)
     if code != 200:
-        raise JobError(f"tải output job {job_id} → {code}")
+        raise JobError(
+            f"tải output job {job_id} → {code}: {raw[:300].decode('utf-8', 'replace')} — "
+            f"kiểm tra GET /jobs/{job_id} xem job đã thực sự ra output chưa trước khi thử lại"
+        )
     if len(raw) < min_bytes:
         # Bẫy pod-smoke.sh dựng sàn để bắt: job báo done nhưng MinIO trả về gần rỗng.
         raise JobError(

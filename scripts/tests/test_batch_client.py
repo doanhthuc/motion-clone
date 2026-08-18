@@ -7,7 +7,8 @@ from batchlib.client import (JobError, download_output, encode_multipart, health
                              poll_job, submit_job)
 from batchlib.config import Settings
 
-STATE = {"poll_calls": 0, "statuses": [], "last_post": None, "output": b"", "health": 200}
+STATE = {"poll_calls": 0, "statuses": [], "last_post": None, "output": b"", "health": 200,
+         "download_status": 200, "garbage_polls": 0, "always_garbage": False}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -26,12 +27,22 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self.send_response(STATE["health"]); self.send_header("content-length", "0"); self.end_headers()
         elif self.path.endswith("/download"):
-            self.send_response(200)
-            self.send_header("content-length", str(len(STATE["output"])))
+            code = STATE["download_status"]
+            body = STATE["output"]
+            self.send_response(code)
+            self.send_header("content-length", str(len(body)))
             self.end_headers()
-            self.wfile.write(STATE["output"])
+            self.wfile.write(body)
+        elif STATE["always_garbage"] or STATE["poll_calls"] < STATE["garbage_polls"]:
+            # Giả lập rớt mạng / trả lời không phải JSON — để test nhánh except của poll_job.
+            STATE["poll_calls"] += 1
+            body = b"khong-phai-json"
+            self.send_response(200)
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         else:
-            i = min(STATE["poll_calls"], len(STATE["statuses"]) - 1)
+            i = min(STATE["poll_calls"] - STATE["garbage_polls"], len(STATE["statuses"]) - 1)
             STATE["poll_calls"] += 1
             self._json(200, STATE["statuses"][i])
 
@@ -62,7 +73,8 @@ class ServerCase(unittest.TestCase):
         cls.server.server_close()  # đóng hẳn socket lắng nghe, tránh ResourceWarning rò rỉ
 
     def setUp(self):
-        STATE.update(poll_calls=0, statuses=[], last_post=None, output=b"", health=200)
+        STATE.update(poll_calls=0, statuses=[], last_post=None, output=b"", health=200,
+                     download_status=200, garbage_polls=0, always_garbage=False)
 
 
 class TestMultipart(unittest.TestCase):
@@ -131,12 +143,38 @@ class TestPoll(ServerCase):
             poll_job(self.settings, "job-1", timeout_min=5, sleep=lambda _s: None)
 
     def test_qua_han_thi_nem_kem_job_id_de_resume(self):
+        # deadline = now()(=0) + 60. Đồng hồ cho phép 3 vòng lặp thật (10, 20, 30 < 60)
+        # rồi mới vượt hạn (9999) — khác bản cũ, nơi giá trị thứ hai (10_000) đã vượt
+        # hạn ngay từ vòng đầu nên while không chạy thân vòng lặp lần nào, sleep()
+        # không được gọi và server không hề bị polling — không chứng minh được gì
+        # về hành vi SAU khi đã polling thật.
         STATE["statuses"] = [{"status": "running", "progress": 0.5}]
-        clock = iter([0, 10_000, 20_000])
+        clock = iter([0, 10, 20, 30, 9_999])
+        sleep_calls = []
         with self.assertRaises(JobError) as cm:
             poll_job(self.settings, "job-1", timeout_min=1,
-                     sleep=lambda _s: None, now=lambda: next(clock))
+                     sleep=lambda s: sleep_calls.append(s), now=lambda: next(clock))
         self.assertIn("job-1", str(cm.exception))
+        self.assertEqual(len(sleep_calls), 3)
+
+    def test_hoi_phuc_sau_vai_lan_roi_moi_ket_noi_lai(self):
+        # Vài lần poll đầu trả về rác (không phải JSON) — mô phỏng rớt mạng thoáng qua.
+        # poll_job KHÔNG được coi đó là job hỏng: job vẫn đang chạy thật trên pod.
+        STATE["garbage_polls"] = 2
+        STATE["statuses"] = [{"status": "done", "progress": 1}]
+        result = poll_job(self.settings, "job-1", timeout_min=5, sleep=lambda _s: None)
+        self.assertEqual(result["status"], "done")
+
+    def test_rot_mang_lien_tuc_bi_chan_boi_tran_thu_lai(self):
+        # Server luôn trả rác — số lần thử lại phải có TRẦN (misses > 30), không phải
+        # vòng lặp vô hạn chỉ dừng khi hết thời gian chờ (timeout_min=60 thật lớn để
+        # chứng minh chính trần thử lại, chứ không phải deadline, là thứ chặn vòng lặp).
+        STATE["always_garbage"] = True
+        with self.assertRaises(JobError) as cm:
+            poll_job(self.settings, "job-1", timeout_min=60, sleep=lambda _s: None)
+        msg = str(cm.exception)
+        self.assertIn("RESUME=1", msg)
+        self.assertEqual(STATE["poll_calls"], 31)
 
 
 class TestDownload(ServerCase):
@@ -155,6 +193,21 @@ class TestDownload(ServerCase):
             with self.assertRaises(JobError) as cm:
                 download_output(self.settings, "job-1", dest, 100_000)
             self.assertIn("10", str(cm.exception))
+            self.assertFalse(dest.exists())
+
+    def test_khong_200_thi_giu_lai_ly_do_cua_server(self):
+        # Chỉ assert mã lỗi thì test này pass ngay cả TRƯỚC khi sửa Finding A — phải
+        # khoá cả đoạn thân trả lời từ server, vì 404 "chưa có output" và 404/500
+        # "lỗi khác" là hai vấn đề khác nhau, đòi hỏi hai bước tiếp theo khác nhau.
+        STATE["download_status"] = 404
+        STATE["output"] = b"Chua co output cho job nay"
+        with tempfile.TemporaryDirectory() as d:
+            dest = Path(d) / "out.mp4"
+            with self.assertRaises(JobError) as cm:
+                download_output(self.settings, "job-1", dest, 100)
+            msg = str(cm.exception)
+            self.assertIn("404", msg)
+            self.assertIn("Chua co output cho job nay", msg)
             self.assertFalse(dest.exists())
 
 
