@@ -858,7 +858,10 @@ class ParamInfo:
     name: str
     default: object
     line: int
-    source: str          # "ast" | "curated"
+    # "ast"    worker đọc thẳng bằng params.get("tên")
+    # "extra"  worker đọc ĐỘNG nên AST mù (vd fpsInterp)
+    # "api"    worker KHÔNG đọc; jobs.js tiêu thụ hoặc dịch nó trước (vd quality)
+    source: str
 
 
 def _job_type(func_name: str) -> str:
@@ -1025,6 +1028,8 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import difflib
+
 from batchlib.params import check_drift, extract_from_ast, known_params, load_curated
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1034,7 +1039,10 @@ CURATED = ROOT / "scripts" / "batch-params.json"
 
 def main(argv: list[str]) -> int:
     if not LINUX_PY.is_file():
-        print(f"✗ không thấy {LINUX_PY.relative_to(ROOT)}", file=sys.stderr)
+        print(f"✗ không thấy {LINUX_PY.relative_to(ROOT)}\n"
+              f"  Chạy lệnh từ gốc repo motion-clone. Nếu đang ở đúng chỗ thì thư mục\n"
+              f"  motions-studio/ chưa được checkout đầy đủ — git status sẽ nói rõ.",
+              file=sys.stderr)
         return 1
 
     if "--check" in argv:
@@ -1055,7 +1063,13 @@ def main(argv: list[str]) -> int:
         print("Dùng: make batch-params TYPE=motion")
         return 0
     if job_type not in ast_params and job_type not in curated:
-        print(f"✗ không có job type {job_type!r}", file=sys.stderr)
+        # Nhánh không-đối-số ngay trên đã biết danh sách. Trả về "không có" rồi im lặng
+        # là bắt người gõ nhầm đi tra thứ chương trình đang cầm sẵn trong tay.
+        moi = sorted(set(ast_params) | set(curated))
+        gan = difflib.get_close_matches(job_type, moi, n=3, cutoff=0.6)
+        goi_y = f" — ý bạn là {', '.join(gan)}?" if gan else ""
+        print(f"✗ không có job type {job_type!r}{goi_y}\n"
+              f"  Có: {', '.join(moi)}", file=sys.stderr)
         return 1
 
     known = known_params(job_type, ast_params=ast_params, curated=curated)
