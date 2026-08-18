@@ -89,6 +89,42 @@ class TestLoad(unittest.TestCase):
             with self.assertRaises(ManifestError):
                 load_manifest(p)
 
+    def test_defaults_khong_phai_mapping_bao_loi_ro_khong_crash(self):
+        # `defaults: [a]` (list) từng làm defaults.get(stage) ném thẳng
+        # AttributeError: 'list' object has no attribute 'get' — không nói file/khoá nào.
+        with tempfile.TemporaryDirectory() as d:
+            text = GOOD.replace(
+                'defaults:\n  enhance: { targetRes: 1080p, fpsInterp: "60" }\n',
+                "defaults: [a]\n",
+            )
+            with self.assertRaises(ManifestError) as cm:
+                load_manifest(_fixture(Path(d), text))
+            self.assertIn("defaults", str(cm.exception))
+
+    def test_inputs_khong_phai_mapping_bao_loi_ro_khong_crash(self):
+        # `inputs: c.jpg` (chuỗi) từng làm .items() ném AttributeError: 'str' object
+        # has no attribute 'items' — không nói run nào, khoá nào.
+        with tempfile.TemporaryDirectory() as d:
+            text = GOOD.replace(
+                "    inputs:\n      character: char.jpg\n      outfit: vay.jpg\n"
+                "      background: bg.jpg\n      driver: drv.mp4\n",
+                "    inputs: c.jpg\n",
+            )
+            with self.assertRaises(ManifestError) as cm:
+                load_manifest(_fixture(Path(d), text))
+            self.assertIn("inputs", str(cm.exception))
+            self.assertIn("runs[0]", str(cm.exception))
+
+    def test_chang_khong_phai_mapping_bao_loi_ro_khong_crash(self):
+        # `enhance: 60` (số) từng làm merged.update(60) ném TypeError:
+        # 'int' object is not iterable — không nói file/run/khoá nào.
+        with tempfile.TemporaryDirectory() as d:
+            text = GOOD.replace("motion: { preset: drv-30s }", "motion: 60")
+            with self.assertRaises(ManifestError) as cm:
+                load_manifest(_fixture(Path(d), text))
+            self.assertIn("motion", str(cm.exception))
+            self.assertIn("runs[0]", str(cm.exception))
+
 
 class TestValidate(unittest.TestCase):
     def test_manifest_tot_thi_khong_loi(self):
@@ -175,6 +211,21 @@ class TestDumpRuns(unittest.TestCase):
             again = load_manifest(out)
             self.assertEqual([r.id for r in again.runs], ["mauA", "mauB"])
             self.assertEqual(again.runs[1].stage_params["enhance"]["fpsInterp"], "48")
+
+    def test_thu_tu_chang_theo_pipeline_khong_theo_hash_cua_set(self):
+        # STAGE_KEYS là set — nếu load_manifest lặp thẳng qua nó, thứ tự chèn vào
+        # stage_params (và do đó thứ tự dump_runs in ra) đổi theo hash string ngẫu
+        # nhiên của từng process: cùng một manifest, scan hai lần ra hai bản khác
+        # nhau, không ai biết bản nào là bản đã chạy thật.
+        with tempfile.TemporaryDirectory() as d:
+            text = GOOD.replace("defaults:\n", "defaults:\n  tryon: { provider: qwen }\n")
+            m = load_manifest(_fixture(Path(d), text))
+            run_a = next(r for r in m.runs if r.id == "mauA")
+            self.assertEqual(list(run_a.stage_params), ["tryon", "motion", "enhance"])
+
+            out = dump_runs(m.runs)
+            positions = [out.index(f"\n  {stage}:") for stage in ("tryon", "motion", "enhance")]
+            self.assertEqual(positions, sorted(positions))
 
 
 if __name__ == "__main__":

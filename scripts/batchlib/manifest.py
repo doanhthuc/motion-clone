@@ -26,6 +26,29 @@ class ManifestError(Exception):
     """Manifest không đọc được. Khác với 'đọc được nhưng sai' — cái đó là validate."""
 
 
+def _require_mapping(value: object, *, path: Path, where: str, key: str, hint: str) -> dict:
+    """Chặn sớm khi một khối phải là mapping ("khoá: giá trị") nhưng không phải.
+
+    Không chặn ở đây thì lỗi rơi xuống chỗ merge/iterate bên dưới, ra
+    TypeError/AttributeError trần trụi của Python (vd. `dict.update(60)` →
+    "'int' object is not iterable", `"c.jpg".items()` → "'str' object has no
+    attribute 'items'") — không nói file nào, run nào, khoá nào, và viết lại
+    thế nào. Cùng loại lỗi cấu trúc với YAML hỏng/run không phải mapping/thiếu
+    id đã bắt riêng; đây là ba chỗ còn sót: defaults, inputs, khối tham số
+    từng chặng.
+    """
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    raise ManifestError(
+        f"{path}: {where}{key} phải là mapping \"khoá: giá trị\", không phải "
+        f"{type(value).__name__}.\n"
+        f"  Bạn viết:  {key}: {value!r}\n"
+        f"{hint}"
+    )
+
+
 @dataclass
 class Run:
     id: str
@@ -52,7 +75,11 @@ def load_manifest(path: Path) -> Manifest:
     if not isinstance(entries, list) or not entries:
         raise ManifestError(f"{path}: không có 'runs:' nào — chạy make batch-scan để đẻ ra")
 
-    defaults = raw.get("defaults") or {}
+    defaults = _require_mapping(
+        raw.get("defaults"), path=path, where="", key="defaults",
+        hint=('  Ý bạn là:  defaults: { enhance: { fpsInterp: "60" } }\n'
+              '  Tra tên param: make batch-params TYPE=<chặng>'),
+    )
     base = path.parent.resolve()
     runs: list[Run] = []
     seen: set[str] = set()
@@ -68,10 +95,16 @@ def load_manifest(path: Path) -> Manifest:
             )
         seen.add(run_id)
 
+        run_where = f"runs[{index}]."
+        inputs_raw = _require_mapping(
+            entry.get("inputs"), path=path, where=run_where, key="inputs",
+            hint='  Ý bạn là:  inputs: { character: char.jpg, driver: drv.mp4 }',
+        )
         inputs: dict[str, Path] = {}
-        for role, value in (entry.get("inputs") or {}).items():
+        for role, value in inputs_raw.items():
             expanded = Path(str(value)).expanduser()
-            inputs[str(role)] = expanded if expanded.is_absolute() else (base / expanded).resolve()
+            resolved = expanded if expanded.is_absolute() else (base / expanded)
+            inputs[str(role)] = resolved.resolve()
 
         pipeline = str(entry.get("pipeline") or "")
         # defaults CHỈ áp cho chặng mà pipeline của run thật sự chạy. Merge cho mọi chặng
@@ -82,10 +115,26 @@ def load_manifest(path: Path) -> Manifest:
         # người dùng và validate phải nói ra, khác hẳn với một default vô tình lan sang.
         # Pipeline lạ → merge hết; validate sẽ bắt chính cái pipeline đó trước.
         applicable = set(PIPELINES.get(pipeline, STAGE_KEYS))
+        # Thứ tự chặng phải ổn định giữa các lần chạy: STAGE_KEYS là set, mà Python
+        # random hash string theo từng process, nên `for stage in STAGE_KEYS` từng
+        # cho ra thứ tự khác nhau mỗi lần — dump_runs() rồi sinh YAML khác nhau trên
+        # CÙNG một input, và không ai biết bản nào mới là bản đã chạy thật. Ưu tiên
+        # thứ tự pipeline thực thi (đọc dễ hơn), phần còn lại (chặng ghi tay ngoài
+        # pipeline) xếp theo alphabet cho có quy tắc.
+        if pipeline in PIPELINES:
+            stage_order = list(PIPELINES[pipeline]) + sorted(STAGE_KEYS - set(PIPELINES[pipeline]))
+        else:
+            stage_order = sorted(STAGE_KEYS)
+
         stage_params: dict[str, dict] = {}
-        for stage in STAGE_KEYS:
+        for stage in stage_order:
+            stage_raw = _require_mapping(
+                entry.get(stage), path=path, where=run_where, key=stage,
+                hint=(f'  Ý bạn là:  {stage}: {{ ... }}\n'
+                      f'  Tra tên param: make batch-params TYPE={stage}'),
+            )
             merged = dict(defaults.get(stage) or {}) if stage in applicable else {}
-            merged.update(entry.get(stage) or {})
+            merged.update(stage_raw)
             if merged:
                 stage_params[stage] = merged
 
