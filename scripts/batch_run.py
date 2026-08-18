@@ -8,21 +8,67 @@
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
 import subprocess
 import sys
 import urllib.error
+from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from batchlib.client import health_ok
 from batchlib.config import ConfigError, load_settings
-from batchlib.manifest import ManifestError, load_manifest, validate_manifest
+from batchlib.manifest import ManifestError, load_manifest, load_state, state_path_for, validate_manifest
 from batchlib.params import extract_from_ast, load_curated
 from batchlib.runner import batch_id_now, run_batch
 
 ROOT = Path(__file__).resolve().parents[1]
 LINUX_PY = ROOT / "motions-studio" / "worker" / "worker_runtime" / "linux.py"
 CURATED = ROOT / "scripts" / "batch-params.json"
+
+
+@dataclass(frozen=True)
+class BatchIdDecision:
+    batch_id: str
+    resumed: bool   # True nếu đang tiếp tục một lô có thật đã tồn tại trong state
+    note: str       # câu in ra cho người dùng biết quyết định này, trước khi tốn GPU
+
+
+def resolve_batch_id(manifest_path: Path, *, resume: bool,
+                      now: _dt.datetime | None = None) -> BatchIdDecision:
+    """--resume phải chạy TIẾP vào out_dir CŨ, không phải mint một out_dir mới.
+
+    Bug đã xảy ra: main() từng gọi batch_id_now() vô điều kiện, kể cả khi resume.
+    run_batch tự ghi batch id đã dùng vào state["batch"] (runner.py) — không đọc
+    lại nó thì mỗi lần --resume lại có một thư mục MỚI, rỗng: run đã xong không
+    được hardlink vào _final/ mới (run_batch chỉ 'continue' qua nó, không gọi lại
+    run_one để tạo hardlink), và run dở thì các chặng đã xong bị coi là "chưa có
+    file nào ở đây" nên chạy lại TỪ ĐẦU — đúng hai lần tiền GPU mà --resume tồn
+    tại để tránh.
+
+    Ba nhánh, tường minh:
+      - resume + state có batch id → dùng lại nguyên id đó.
+      - resume + không có state (hoặc state không có khoá "batch") → đây là lần
+        chạy ĐẦU, không có gì để tiếp — lô mới, và phải NÓI RÕ điều đó thay vì
+        im lặng coi như đang resume một thứ không tồn tại.
+      - resume + state có id, nhưng thư mục out/<id>/ đã bị xoá tay (vd
+        `make batch-clean` chỉ xoá runs/ và giữ _final/) → VẪN dùng lại đúng id
+        đó, không bịa id mới. Chặng nào mất file thì run_one tự phát hiện qua
+        dest.is_file() và chạy lại chặng đó; bịa id mới ở đây sẽ mồ côi _final/
+        cũ đang tồn tại thật.
+    """
+    if not resume:
+        return BatchIdDecision(batch_id_now(now), resumed=False, note="lô mới")
+
+    state = load_state(state_path_for(manifest_path))
+    batch_id = state.get("batch")
+    if not batch_id:
+        fresh = batch_id_now(now)
+        return BatchIdDecision(
+            fresh, resumed=False,
+            note=f"RESUME=1 nhưng chưa có lô nào ghi lại để tiếp — chạy như lô MỚI: {fresh}",
+        )
+    return BatchIdDecision(batch_id, resumed=True, note=f"tiếp tục lô {batch_id} (RESUME=1)")
 
 
 def preflight(settings, *, allow_start: bool) -> bool:
@@ -78,6 +124,14 @@ def main(argv: list[str]) -> int:
     if not preflight(settings, allow_start=not args.no_start):
         return 1
 
+    # --resume PHẢI chạy tiếp vào out_dir CŨ (xem resolve_batch_id) — mint id mới ở đây
+    # từng là bug: run đã xong không được hardlink vào _final/ mới, run dở thì chạy lại
+    # từ đầu. In ra quyết định khi resume để người dùng thấy nó không bắt đầu lại từ đầu
+    # (hoặc biết rõ vì sao nó lại bắt đầu từ đầu, nếu quả thật chưa có gì để tiếp).
+    decision = resolve_batch_id(manifest.path, resume=args.resume)
+    if args.resume:
+        print(f"  {decision.note}")
+
     # submit_job/download_output (batchlib/client.py) CỐ Ý để URLError/OSError rơi thẳng
     # ra ngoài — chỉ poll_job tự bắt rớt mạng. Ở đây là nơi cuối cùng bắt nó: rớt Wi-Fi
     # giữa lô KHÔNG được biến thành traceback trần trụi, và job vừa gửi có thể vẫn đang
@@ -85,7 +139,7 @@ def main(argv: list[str]) -> int:
     # hai lần cho cùng một việc.
     try:
         result = run_batch(settings=settings, manifest=manifest, out_root=ROOT / "out",
-                           batch_id=batch_id_now(), resume=args.resume, fail_fast=args.fail_fast)
+                           batch_id=decision.batch_id, resume=args.resume, fail_fast=args.fail_fast)
     except (urllib.error.URLError, OSError) as exc:
         print(f"\n✗ Mất kết nối tới pod giữa chừng: {exc}", file=sys.stderr)
         print("  Job vừa gửi có thể VẪN đang chạy trên pod — đừng chạy lại từ đầu (tốn tiền GPU hai lần).",

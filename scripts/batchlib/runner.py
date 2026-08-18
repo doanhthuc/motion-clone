@@ -56,9 +56,14 @@ def _resolve_files(run: Run, stage_name: str, prev_output: Path | None) -> dict[
             if optional:
                 break
         else:
+            roles = [alt[len("material:"):].rstrip("?") for alt in source.split("|")
+                      if alt.startswith("material:")]
+            role_hint = " hoặc ".join(roles) if roles else api_field
             raise JobError(
                 f"run {run.id!r} chặng {stage_name}: không có nguồn nào cho field {api_field!r} "
-                f"(khai: {source})"
+                f"(khai: {source}).\n"
+                f"  Thêm {role_hint!r} vào inputs: của run {run.id!r} trong manifest.\n"
+                f"  make batch-validate bắt lỗi này TRƯỚC khi tốn GPU — chạy nó trước khi make batch."
             )
     return files
 
@@ -148,6 +153,12 @@ def write_index(out_dir: Path, state: dict) -> None:
     Thứ tự chèn của dict `stages` vẫn hữu ích: với run lỗi, dòng cuối cùng thuộc về
     run đó chính là chặng đã làm nó dừng lại — không cần chọn gì thêm để biết run
     hỏng ở đâu.
+
+    NGOẠI LỆ đã biết: nếu _resolve_files ném JobError vì thiếu material (chặng chưa
+    kịp gửi job, nên entry["stages"][stage_name] chưa từng được tạo), run đó không để
+    lại dòng chặng nào ở đây — chỉ "status": "error" ở run.json/state phản ánh lỗi.
+    Đây là lỗi cấu hình manifest mà `make batch-validate` đã bắt được TRƯỚC khi tốn
+    GPU, nên chấp nhận được là _index.tsv thiếu một dòng cho đúng trường hợp này.
     """
     lines = ["run\tstatus\tstage\tjob_id\telapsed_sec\tbytes\tparams_sent"]
     for run_id, entry in state["runs"].items():

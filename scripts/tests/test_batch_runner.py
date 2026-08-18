@@ -5,7 +5,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batchlib.client import JobError
 from batchlib.config import Settings
-from batchlib.manifest import load_manifest, load_state, state_path_for
+from batchlib.manifest import load_manifest, load_state, save_state, state_path_for
 from batchlib.runner import batch_id_now, run_batch, write_index
 
 SETTINGS = Settings(domain="x.test", api_key="mk_test", instance_id="i-1")
@@ -18,6 +18,16 @@ runs:
       character: char.jpg
       driver: drv.mp4
   - id: runB
+    pipeline: motion-enhance
+    inputs:
+      character: char.jpg
+      driver: drv.mp4
+"""
+
+
+MANIFEST_MOT_RUN = """
+runs:
+  - id: runA
     pipeline: motion-enhance
     inputs:
       character: char.jpg
@@ -159,6 +169,10 @@ class TestHong(unittest.TestCase):
 
 class TestResume(unittest.TestCase):
     def test_resume_bo_qua_run_da_done(self):
+        # Cả hai run đã "done" ở mức RUN — đây là skip NGOÀI (run_batch's outer loop),
+        # run_one không hề được gọi. Test này KHÔNG chứng minh gì về skip TRONG (per-
+        # stage, bên trong run_one) — xem test_resume_bo_qua_chang_da_xong_o_run_chua_done
+        # cho việc đó.
         with tempfile.TemporaryDirectory() as d:
             tmp = Path(d)
             p = _fixture(tmp)
@@ -174,8 +188,53 @@ class TestResume(unittest.TestCase):
             _run(tmp, FakePod(fail_on={"job-2"}), manifest_path=p)   # motion xong, enhance hỏng
             pod2 = FakePod()
             _run(tmp, pod2, manifest_path=p, resume=True)
+            # assertTrue(all(...)) một mình là vacuously true trên list rỗng — một mutation
+            # bỏ qua luôn cả chặng enhance đang hỏng (tức không resume gì hết) vẫn qua được.
+            # Chốt thêm: đúng MỘT job phải được gửi lại (enhance của runA).
+            self.assertEqual(len(pod2.submitted), 1)
             self.assertTrue(all(c[0] == "enhance" for c in pod2.submitted),
                             f"chỉ được chạy lại enhance, nhưng chạy: {[c[0] for c in pod2.submitted]}")
+
+    def test_resume_bo_qua_chang_da_xong_o_run_chua_done(self):
+        # Cô lập skip TRONG (per-stage, trong run_one) khỏi skip NGOÀI (run-level):
+        # manifest chỉ có MỘT run, nên không có run nào khác để "ẩn nấp" đằng sau —
+        # nếu skip trong bị gãy thì motion (đã xong, file còn nguyên) sẽ bị gửi lại,
+        # lộ ngay trong danh sách submit của pod2 mà không có run thứ hai che khuất.
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            p = _fixture(tmp, text=MANIFEST_MOT_RUN)
+            _run(tmp, FakePod(fail_on={"job-2"}), manifest_path=p)   # motion xong, enhance hỏng
+            state = load_state(state_path_for(p))
+            self.assertEqual(state["runs"]["runA"]["status"], "error")  # KHÔNG "done" -> không bị skip ngoài che
+            pod2 = FakePod()
+            _run(tmp, pod2, manifest_path=p, resume=True)
+            self.assertEqual([c[0] for c in pod2.submitted], ["enhance"])
+
+    def test_resume_chang_done_trong_journal_nhung_mat_file_thi_chay_lai(self):
+        # Điều kiện skip trong là HAI vế: journal nói "done" VÀ file còn trên đĩa
+        # (runner.py: `resume and recorded.get("status") == "done" and dest.is_file()`).
+        # Test này khoá riêng vế thứ hai: xoá file chặng motion khỏi đĩa (mô phỏng
+        # make batch-clean lỡ tay, hay đĩa hỏng) trong khi journal vẫn nói "done" —
+        # chặng đó PHẢI chạy lại, không được tin journal suông.
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            p = _fixture(tmp)
+            _run(tmp, FakePod(), manifest_path=p)   # cả hai run xong xuôi
+
+            out = tmp / "out" / "2026-08-18-1430"
+            (out / "runs" / "runA" / "01-motion.mp4").unlink()
+
+            state_file = state_path_for(p)
+            state = load_state(state_file)
+            # Đặt lại status run về khác "done" để không bị skip NGOÀI che — mô phỏng
+            # đúng tình huống thật: batch coi run là dở (vd sau một crash), không phải
+            # coi cả run là xong trong khi file đã mất.
+            state["runs"]["runA"]["status"] = "running"
+            save_state(state_file, state)
+
+            pod2 = FakePod()
+            _run(tmp, pod2, manifest_path=p, resume=True)
+            self.assertEqual([c[0] for c in pod2.submitted], ["motion"])
 
     def test_khong_resume_thi_chay_lai_tu_dau(self):
         with tempfile.TemporaryDirectory() as d:
