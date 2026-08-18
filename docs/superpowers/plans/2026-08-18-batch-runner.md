@@ -2543,14 +2543,34 @@ class TestResume(unittest.TestCase):
 
 
 class TestIndex(unittest.TestCase):
-    def test_index_tsv_co_header_va_mot_dong_moi_run(self):
+    def test_index_tsv_mot_dong_moi_CHANG_chu_khong_phai_moi_run(self):
+        # Một dòng mỗi CHẶNG, theo đúng hình dạng ab-results/run1/manifest.tsv mà user đã
+        # tự dựng tay cho phiên A/B thật. Lý do không gộp về mỗi run một dòng: cột
+        # params_sent là lý do bảng này tồn tại, mà một dòng/run chỉ chở được param của
+        # MỘT chặng — với run đã xong thì đó là enhance, nên param motion (thứ người ta
+        # thật sự chỉnh) biến mất.
         with tempfile.TemporaryDirectory() as d:
             tmp = Path(d)
             _run(tmp, FakePod())
             lines = (tmp / "out" / "2026-08-18-1430" / "_index.tsv").read_text(
                 encoding="utf-8").strip().splitlines()
             self.assertTrue(lines[0].startswith("run\t"))
-            self.assertEqual(len(lines), 3)
+            # 2 run × 2 chặng (motion-enhance) = 4 dòng + header
+            self.assertEqual(len(lines), 5)
+            # Đếm dòng thôi thì một thay đổi sinh ra 4 dòng KHÁC vẫn xanh — phải ghim
+            # rằng cùng một run có mặt ở CẢ HAI chặng.
+            cot_stage = {(l.split("\t")[0], l.split("\t")[2]) for l in lines[1:]}
+            self.assertIn(("runA", "motion"), cot_stage)
+            self.assertIn(("runA", "enhance"), cot_stage)
+
+    def test_index_tsv_giu_lai_chang_lam_run_that_bai(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            _run(tmp, FakePod(fail_on={"job-1"}))
+            lines = (tmp / "out" / "2026-08-18-1430" / "_index.tsv").read_text(
+                encoding="utf-8").strip().splitlines()
+            cot_stage = {(l.split("\t")[0], l.split("\t")[2]) for l in lines[1:]}
+            self.assertIn(("runA", "motion"), cot_stage)
 
 
 if __name__ == "__main__":
