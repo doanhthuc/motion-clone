@@ -201,6 +201,10 @@ Lần dựng pod tiếp theo: quay lại **giai đoạn 1**, bỏ qua bước 7 
 | Job chạy chậm bất thường | rơi xuống nhánh cu128 | [CUDA 13](#cuda-13) |
 | `https://$FE_DOMAIN` trả 404 | tunnel chưa có ingress cho FE | chạy `make gpu-bootstrap` một lần |
 
+Chạy nhiều job một lượt thay vì bấm UI từng cái: xem §"Chạy lô material" trong `README.md`.
+Runner tự `make gpu-up` nếu pod đang dừng, nhưng **không bao giờ tự `gpu-destroy`** —
+và đặc biệt không destroy khi có run hỏng, vì đó đúng là lúc cần pod để đọc `pm2 logs worker`.
+
 ## Frontend on the pod
 
 Mặc định FE chạy local, nghĩa là **tắt máy bạn là không ai vào được app**. Muốn đưa cho người

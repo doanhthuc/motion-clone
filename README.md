@@ -43,6 +43,24 @@ Toàn bộ quy trình theo thứ tự — dựng lần đầu, dùng hằng ngà
 `docs/gpu-pod.md` mục **Runbook**. Đọc nó trước lần thuê đầu tiên, đặc biệt phần chi phí:
 **pod dừng vẫn tính tiền ổ đĩa**, và Network Volume tính tiền cả khi không có pod nào.
 
+## Chạy lô material (khỏi bấm UI)
+
+Thả material vào bốn ngăn rồi gõ một lệnh:
+
+```bash
+~/materials/characters/  outfits/  backgrounds/  drivers/
+
+make batch-scan DIR=~/materials MODE=pair    # đẻ batch/<hôm nay>.yaml — SOÁT rồi mới chạy
+make batch-validate FILE=batch/2026-08-18.yaml   # kiểm, không tiêu GPU
+make batch FILE=batch/2026-08-18.yaml
+make batch FILE=batch/2026-08-18.yaml RESUME=1   # chạy tiếp lô dở
+```
+
+Kết quả ở `out/latest/_final/`. Param của từng chặng tra bằng
+`make batch-params TYPE=motion` (hoặc `tryon` / `enhance`) — bỏ trống thì chạy mặc định.
+
+Thiết kế và các đánh đổi: `docs/superpowers/specs/2026-08-18-batch-runner-design.md`.
+
 ## Nguồn gốc code
 
 `motions/` và `motions-studio/` khởi nguồn từ `ALD-Project` (source đã mua). **Từ 02/08/2026 repo
