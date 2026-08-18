@@ -12,6 +12,24 @@
 | `params_sent` là param API đã nắn? | Có — dòng motion có `{"hq": false, "cfg": 1, "steps": 4, "fitDriver"…}`, không cái nào manifest gửi |
 | ViTPose hay fallback DWPose? | ViTPose — log job ghi `face_crop=vitpose`, không có dòng fallback nào |
 
+**Lô NHIỀU RUN đã chạy thật (18/08/2026, pod thứ ba).** Trước đó mọi lần chạy đều là `[1/1]` —
+cả sản phẩm tên là batch runner mà vòng lặp nhiều run chưa từng chạy trên pod. Đã bịt:
+
+| Kiểm | Kết quả |
+|---|---|
+| Vòng lặp nhiều run | `[1/3] [2/3] [3/3]` · `2 xong · 1 hỏng · ~7 phút GPU` |
+| Một run hỏng KHÔNG giết lô | run B hỏng (mp4 rác), run C vẫn chạy và xong |
+| `_index.tsv` nhiều run | 5 dòng/3 run, **giữ cả dòng chặng đã làm B dừng** |
+| `_final/` | đúng 2 video (A, C), không có B · cả hai 1088×1920@48fps |
+| `--fail-fast` | dừng ngay sau B, `[3/3] C` không bao giờ chạy |
+| Reattach job HỎNG THẬT | log: "job cũ … đã chạy và HỎNG THẬT — gửi job MỚI" (JobFailed → submit mới, không che lỗi) |
+| Nền **xoay vòng** | kiểm MIỄN PHÍ từ manifest: 3 run / 2 nền → `nen-1, nen-2, nen-1` |
+
+Một chi tiết trung thực đáng ghi: `params_sent` của run HỎNG là param của **manifest**, không phải
+param API đã nắn — vì job chết trước khi có DTO để đọc. Run xong thì có param thật
+(`{"hq": false, "cfg": 1, "steps": 4, …}`). Và thư mục run hỏng chỉ có `run.log`, không có
+`run.json` — đúng mục deferred đã ghi ở final review, giờ quan sát được.
+
 **Một lỗi CHẶN TOÀN BỘ chỉ pod thật tìm ra:** Cloudflare chặn User-Agent mặc định của urllib
 (§1). 143 test xanh không thấy nó, `pod-smoke.sh` không thấy nó vì dùng `curl`.
 
