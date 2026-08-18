@@ -11,18 +11,20 @@ main() cũng test được, không cần pod: patch load_settings/health_ok/run_
 import contextlib
 import datetime
 import io
+import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from batchlib.config import Settings
+from batchlib.config import ConfigError, Settings
 from batchlib.manifest import save_state, state_path_for
 from batchlib.runner import BatchResult
 import batch_run
-from batch_run import resolve_batch_id
+from batch_run import preflight, resolve_batch_id
 
 NOW = datetime.datetime(2026, 8, 18, 14, 30)
 
@@ -198,6 +200,262 @@ class TestThieuNguonBangParam(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertIn("git checkout --", msg)
             self.assertNotIn("rsync", msg)
+
+
+class TestValidateOnly(unittest.TestCase):
+    """--validate-only phải nổ TRƯỚC khi tốn GPU — tức là TRƯỚC cả load_settings()."""
+
+    def test_manifest_tot_thi_tra_ve_0_va_khong_dung_toi_settings(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            p = _manifest_chay_duoc(tmp)
+            out = io.StringIO()
+            with mock.patch("batch_run.load_settings") as m_settings, \
+                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                code = batch_run.main(["--file", str(p), "--validate-only"])
+            self.assertEqual(code, 0)
+            self.assertIn("hợp lệ", out.getvalue())
+            m_settings.assert_not_called()
+
+    def test_manifest_sai_thi_tra_ve_1_va_khong_dung_toi_settings(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            p = tmp / "b.yaml"
+            p.write_text(
+                "runs:\n  - id: runA\n    pipeline: khong-co-that\n    inputs: {}\n",
+                encoding="utf-8",
+            )
+            err = io.StringIO()
+            with mock.patch("batch_run.load_settings") as m_settings, \
+                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                code = batch_run.main(["--file", str(p), "--validate-only"])
+            self.assertEqual(code, 1)
+            msg = err.getvalue()
+            self.assertIn("lỗi", msg)
+            self.assertIn("pipeline không có thật", msg)
+            m_settings.assert_not_called()
+
+
+class TestManifestYamlHong(unittest.TestCase):
+    def test_yaml_sai_cu_phap_thi_bao_va_tra_ve_1(self):
+        # Khác hẳn "pipeline không có thật" (manifest ĐỌC được, chỉ validate sai) —
+        # đây là file .yaml không parse nổi, bắt ở load_manifest() TRƯỚC validate.
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            p = tmp / "b.yaml"
+            p.write_text("runs: [ { id: x, pipeline: [broken\n", encoding="utf-8")
+            err = io.StringIO()
+            with mock.patch("batch_run.load_settings") as m_settings, \
+                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                code = batch_run.main(["--file", str(p)])
+            self.assertEqual(code, 1)
+            self.assertIn("YAML hỏng", err.getvalue())
+            m_settings.assert_not_called()
+
+
+class TestConfigErrorTuLoadSettings(unittest.TestCase):
+    def test_thieu_env_thi_bao_dung_loi_that_va_tra_ve_1(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            p = _manifest_chay_duoc(tmp)
+            err = io.StringIO()
+            with mock.patch("batch_run.load_settings",
+                            side_effect=ConfigError("Thiếu DOMAIN trong .env.")), \
+                 mock.patch("batch_run.health_ok") as m_health, \
+                 mock.patch("batch_run.run_batch") as m_run_batch, \
+                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                code = batch_run.main(["--file", str(p)])
+            self.assertEqual(code, 1)
+            self.assertIn("Thiếu DOMAIN", err.getvalue())
+            m_health.assert_not_called()
+            m_run_batch.assert_not_called()
+
+
+class TestKetThucCoRunHong(unittest.TestCase):
+    def test_co_run_hong_thi_tra_ve_1_va_goi_y_resume(self):
+        # Lô CHẠY XONG (run_batch không ném gì) nhưng có run hỏng — nhánh đuôi của
+        # main() phải nói rõ pod vẫn chạy, chỉ lệnh xem log, VÀ đúng lệnh RESUME=1
+        # (chỉ chạy lại phần thiếu — không phải trả tiền GPU lại từ đầu).
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            p = _manifest_chay_duoc(tmp)
+            fake_result = BatchResult(
+                batch_id="2026-08-18-1430", out_dir=tmp / "out" / "2026-08-18-1430",
+                done=[], failed={"runA": "job hỏng: ComfyUI 400"}, gpu_seconds=120,
+            )
+            out = io.StringIO()
+            with mock.patch("batch_run.load_settings",
+                            return_value=Settings(domain="pod.test", api_key="mk_test",
+                                                  instance_id="i-1")), \
+                 mock.patch("batch_run.health_ok", return_value=True), \
+                 mock.patch("batch_run.run_batch", return_value=fake_result), \
+                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                code = batch_run.main(["--file", str(p)])
+            self.assertEqual(code, 1)
+            text = out.getvalue()
+            self.assertIn("runA", text)
+            self.assertIn("job hỏng: ComfyUI 400", text)
+            self.assertIn("make gpu-logs LOG=worker", text)
+            self.assertIn(f"make batch FILE={p} RESUME=1", text)
+
+
+class TestPreflightHam(unittest.TestCase):
+    """preflight() thuần — không qua argv/main(), năm nhánh của nó."""
+
+    @staticmethod
+    def _settings(instance_id: str) -> Settings:
+        return Settings(domain="pod.test", api_key="mk_test", instance_id=instance_id)
+
+    def test_pod_dang_chay_thi_qua_ngay_khong_dung_toi_gpu_up(self):
+        with mock.patch("batch_run.health_ok", return_value=True), \
+             mock.patch("batch_run.subprocess.run") as m_run, \
+             contextlib.redirect_stdout(io.StringIO()):
+            ok = preflight(self._settings("i-1"), allow_start=True)
+        self.assertTrue(ok)
+        m_run.assert_not_called()
+
+    def test_khong_co_instance_id_thi_tu_choi_va_neu_gpu_provision(self):
+        err = io.StringIO()
+        with mock.patch("batch_run.health_ok", return_value=False), \
+             mock.patch("batch_run.subprocess.run") as m_run, \
+             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            ok = preflight(self._settings(""), allow_start=True)
+        self.assertFalse(ok)
+        self.assertIn("gpu-provision", err.getvalue())
+        m_run.assert_not_called()
+
+    def test_co_instance_id_nhung_no_start_thi_tu_choi_khong_tu_bat(self):
+        err = io.StringIO()
+        with mock.patch("batch_run.health_ok", return_value=False), \
+             mock.patch("batch_run.subprocess.run") as m_run, \
+             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            ok = preflight(self._settings("i-1"), allow_start=False)
+        self.assertFalse(ok)
+        self.assertIn("gpu-up", err.getvalue())
+        m_run.assert_not_called()
+
+    def test_allow_start_va_gpu_up_thanh_cong_thi_kiem_tra_lai_va_qua(self):
+        calls: list = []
+
+        def fake_health(_settings):
+            calls.append("health")
+            return len(calls) > 1   # lần đầu False (pod đang dừng), sau gpu-up thì True
+
+        def fake_run(cmd, **_kwargs):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0)
+
+        with mock.patch("batch_run.health_ok", fake_health), \
+             mock.patch("batch_run.subprocess.run", fake_run), \
+             contextlib.redirect_stdout(io.StringIO()):
+            ok = preflight(self._settings("i-1"), allow_start=True)
+        self.assertTrue(ok)
+        self.assertIn(["make", "gpu-up"], calls)
+
+    def test_gpu_up_that_bai_thi_tra_ve_false(self):
+        def fake_run(cmd, **_kwargs):
+            return subprocess.CompletedProcess(cmd, 1)
+
+        err = io.StringIO()
+        with mock.patch("batch_run.health_ok", return_value=False), \
+             mock.patch("batch_run.subprocess.run", fake_run), \
+             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            ok = preflight(self._settings("i-1"), allow_start=True)
+        self.assertFalse(ok)
+        self.assertIn("gpu-up thất bại", err.getvalue())
+
+
+class TestMainPreflightKhongCoPod(unittest.TestCase):
+    def test_khong_co_pod_qua_main_thi_tu_choi_va_khong_goi_run_batch(self):
+        # Đây đúng là nhánh spec đòi: không có pod nào tồn tại -> refuse, nêu tên
+        # make gpu-provision, và TUYỆT ĐỐI không được đụng tới run_batch (không job
+        # nào được submit).
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            p = _manifest_chay_duoc(tmp)
+            err = io.StringIO()
+            with mock.patch("batch_run.load_settings",
+                            return_value=Settings(domain="pod.test", api_key="mk_test",
+                                                  instance_id="")), \
+                 mock.patch("batch_run.health_ok", return_value=False), \
+                 mock.patch("batch_run.run_batch") as m_run_batch, \
+                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                code = batch_run.main(["--file", str(p)])
+            self.assertEqual(code, 1)
+            self.assertIn("gpu-provision", err.getvalue())
+            m_run_batch.assert_not_called()
+
+
+class TestNoStartTruyenXuongPreflight(unittest.TestCase):
+    def _goi(self, argv: list[str], tmp: Path):
+        captured: dict = {}
+
+        def fake_preflight(_settings, *, allow_start):
+            captured["allow_start"] = allow_start
+            return False   # dừng sớm — test này chỉ kiểm tra wiring của cờ, không hơn
+
+        p = _manifest_chay_duoc(tmp)
+        with mock.patch("batch_run.load_settings",
+                        return_value=Settings(domain="pod.test", api_key="mk_test",
+                                              instance_id="i-1")), \
+             mock.patch("batch_run.preflight", fake_preflight), \
+             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = batch_run.main(argv + ["--file", str(p)])
+        return code, captured
+
+    def test_co_no_start_thi_allow_start_false(self):
+        with tempfile.TemporaryDirectory() as d:
+            code, captured = self._goi(["--no-start"], Path(d))
+            self.assertEqual(code, 1)
+            self.assertFalse(captured["allow_start"])
+
+    def test_khong_co_no_start_thi_allow_start_true(self):
+        with tempfile.TemporaryDirectory() as d:
+            code, captured = self._goi([], Path(d))
+            self.assertEqual(code, 1)
+            self.assertTrue(captured["allow_start"])
+
+
+class TestMatKetNoiGiuaChungLopCloudflare(unittest.TestCase):
+    """URLError/OSError bọc quanh run_batch (batch_run.py) — nhánh CHƯA từng chạy.
+
+    Đây là đúng lớp bug 403/Cloudflare đã phơi ra trên pod thật: 143 test cũ xanh vì
+    chỉ bắn vào http.server giả trên 127.0.0.1. Job vừa gửi có thể VẪN đang chạy trên
+    pod, nên thông báo phải cấm gửi lại và chỉ đúng một đường: RESUME=1.
+    """
+
+    def _goi(self, exc: Exception, tmp: Path):
+        p = _manifest_chay_duoc(tmp)
+
+        def boom(**_kwargs):
+            raise exc
+
+        err = io.StringIO()
+        with mock.patch("batch_run.load_settings",
+                        return_value=Settings(domain="pod.test", api_key="mk_test",
+                                              instance_id="i-1")), \
+             mock.patch("batch_run.health_ok", return_value=True), \
+             mock.patch("batch_run.run_batch", boom), \
+             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            code = batch_run.main(["--file", str(p)])
+        return code, err.getvalue(), p
+
+    def test_urlerror_bao_dung_va_cam_gui_lai(self):
+        with tempfile.TemporaryDirectory() as d:
+            code, msg, p = self._goi(urllib.error.URLError("mang rot giua chung"), Path(d))
+            self.assertEqual(code, 1)
+            self.assertIn("Mất kết nối", msg)
+            self.assertIn("VẪN đang chạy", msg)
+            self.assertIn("đừng chạy lại từ đầu", msg)
+            self.assertIn("RESUME=1", msg)
+            self.assertIn(str(p), msg)   # gợi ý lệnh phải chỉ đúng FILE này
+
+    def test_oserror_cung_duoc_bat_giong_urlerror(self):
+        with tempfile.TemporaryDirectory() as d:
+            code, msg, _p = self._goi(OSError("socket dut"), Path(d))
+            self.assertEqual(code, 1)
+            self.assertIn("Mất kết nối", msg)
+            self.assertIn("RESUME=1", msg)
 
 
 if __name__ == "__main__":
