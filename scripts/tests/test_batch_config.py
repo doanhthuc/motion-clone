@@ -87,25 +87,37 @@ class TestLoadSettings(unittest.TestCase):
 
     def test_domain_co_khoang_trang_bi_cham_dung(self):
         # DOMAIN có khoảng trắng (cuối dòng hoặc lặp khoá) → reject
+        # DOMAIN không phải secret — hiển thị giá trị thực
         import tempfile
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             _write(root, "DOMAIN=api.example.test  \n", "NUXT_MOTION_API_KEY=mk_x\n")
             with self.assertRaises(ConfigError) as cm:
                 load_settings(root)
-            self.assertIn(".env", str(cm.exception))
-            self.assertIn("khoảng trắng", str(cm.exception))
+            msg = str(cm.exception)
+            self.assertIn("api.example.test  ", msg)  # giá trị thực hiển thị
+            self.assertIn(".env", msg)
+            self.assertIn("khoảng trắng", msg)
 
     def test_api_key_co_khoang_trang_bi_cham_dung(self):
-        # NUXT_MOTION_API_KEY có khoảng trắng → reject
+        # NUXT_MOTION_API_KEY có khoảng trắng → reject với che giấu
+        # API key là secret — che giấu ký tự nhưng giữ khoảng trắng
         import tempfile
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
-            _write(root, "DOMAIN=api.example.test\n", "NUXT_MOTION_API_KEY=mk_x  \n")
+            _write(root, "DOMAIN=api.example.test\n", "NUXT_MOTION_API_KEY=mk_secret123   \n")
             with self.assertRaises(ConfigError) as cm:
                 load_settings(root)
-            self.assertIn("motions/.env", str(cm.exception))
-            self.assertIn("khoảng trắng", str(cm.exception))
+            msg = str(cm.exception)
+            # Không chứa key thực
+            self.assertNotIn("mk_secret123", msg)
+            # Chứa dấu che giấu (•)
+            self.assertIn("•", msg)
+            # Vẫn hiển thị khoảng trắng (3 khoảng trắng cuối)
+            self.assertIn("   ", msg)
+            # Tên file đúng
+            self.assertIn("motions/.env", msg)
+            self.assertIn("khoảng trắng", msg)
 
 
 if __name__ == "__main__":

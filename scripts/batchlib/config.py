@@ -25,6 +25,41 @@ class ConfigError(Exception):
     """Cấu hình thiếu hoặc sai. Thông báo phải nói làm gì tiếp theo."""
 
 
+def _reject_whitespace(value: str, key: str, where: str, *, secret: bool = False) -> None:
+    """Kiểm tra giá trị có khoảng trắng, reject nếu có.
+
+    env_get() CỐ Ý sao chép hành vi Make (kể cả nhược điểm), nên nó trả về
+    giá trị malformed nguyên vẹn. Lớp này là chỗ chặn chúng — nếu không có,
+    một dấu cách cuối dòng sẽ nổi lên thành "backend không trả lời" và người
+    dùng sẽ tìm kiếm trong pod, tunnel, Cloudflare tìm một lỗi một ký tự.
+
+    Args:
+        value: Giá trị từ .env
+        key: Tên khóa (DOMAIN, NUXT_MOTION_API_KEY, ...)
+        where: Đường dẫn file (.env, motions/.env, ...)
+        secret: Nếu True, che giấu giá trị nhưng giữ khoảng trắng hiển thị
+    """
+    if not any(c.isspace() for c in value):
+        return
+
+    if secret:
+        # Che giấu các ký tự không khoảng trắng bằng '•', giữ khoảng trắng
+        masked = "".join("•" if not c.isspace() else c for c in value)
+        display_value = repr(masked)
+    else:
+        # Không phải secret — hiển thị giá trị thực
+        display_value = repr(value)
+
+    raise ConfigError(
+        f"{key} trong {where} có khoảng trắng: {display_value}\n"
+        "  Thường do một trong hai: khoảng trắng thừa cuối dòng, hoặc {key} bị khai hai lần.\n"
+        "  (Makefile:30 nối các dòng trùng khoá bằng dấu cách, nên `make gpu-up` cũng đang hỏng\n"
+        "   vì đúng lý do này.)\n"
+        "  Sửa {where} rồi chạy lại."
+        .format(key=key, where=where)
+    )
+
+
 def env_get(path: Path, key: str) -> str:
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -59,28 +94,16 @@ def load_settings(root: Path = ROOT) -> Settings:
             "Thiếu DOMAIN trong .env.\n"
             "  Chạy: make gpu-preflight   (nó liệt kê mọi biến còn thiếu)"
         )
-    if any(c.isspace() for c in domain):
-        raise ConfigError(
-            f"DOMAIN trong .env có khoảng trắng: {repr(domain)}\n"
-            "  Thường do một trong hai: khoảng trắng thừa cuối dòng, hoặc DOMAIN bị khai hai lần.\n"
-            "  (Makefile:30 nối các dòng trùng khoá bằng dấu cách, nên `make gpu-up` cũng đang hỏng\n"
-            "   vì đúng lý do này.)\n"
-            "  Sửa .env rồi chạy lại."
-        )
+    _reject_whitespace(domain, "DOMAIN", ".env", secret=False)
+
     api_key = env_get(root / "motions" / ".env", "NUXT_MOTION_API_KEY")
     if not api_key:
         raise ConfigError(
             "Thiếu NUXT_MOTION_API_KEY trong motions/.env.\n"
             "  Chạy: make gpu-bootstrap   (nó tự dán key của pod vào file đó)"
         )
-    if any(c.isspace() for c in api_key):
-        raise ConfigError(
-            f"NUXT_MOTION_API_KEY trong motions/.env có khoảng trắng: {repr(api_key)}\n"
-            "  Thường do một trong hai: khoảng trắng thừa cuối dòng, hoặc NUXT_MOTION_API_KEY bị khai hai lần.\n"
-            "  (Makefile:30 nối các dòng trùng khoá bằng dấu cách, nên `make gpu-up` cũng đang hỏng\n"
-            "   vì đúng lý do này.)\n"
-            "  Sửa motions/.env rồi chạy lại."
-        )
+    _reject_whitespace(api_key, "NUXT_MOTION_API_KEY", "motions/.env", secret=True)
+
     return Settings(
         domain=domain,
         api_key=api_key,
