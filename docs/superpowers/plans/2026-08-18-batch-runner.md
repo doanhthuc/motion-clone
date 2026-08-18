@@ -2316,7 +2316,7 @@ def download_output(s: Settings, job_id: str, dest: Path, min_bytes: int) -> int
 - [ ] **Step 4: Chạy test để xác nhận nó xanh**
 
 Run: `python3 -m unittest discover -s scripts/tests -p 'test_batch_client.py' -v`
-Expected: PASS — 11 test
+Expected: PASS — 14 test (11 + 3 thêm ở vòng fix: non-200 download, hồi phục sau rớt mạng, trần thử lại)
 
 - [ ] **Step 5: Commit**
 
