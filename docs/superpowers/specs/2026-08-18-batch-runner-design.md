@@ -15,11 +15,15 @@
 **Một lỗi CHẶN TOÀN BỘ chỉ pod thật tìm ra:** Cloudflare chặn User-Agent mặc định của urllib
 (§1). 143 test xanh không thấy nó, `pod-smoke.sh` không thấy nó vì dùng `curl`.
 
-**Việc phải làm tay trước khi chạy pod mới:** image ghim `sha-14ae224` **cũ hơn** fix `3bb2246`
-nên thiếu node `ComfyUI-WanAnimatePreprocess` → mọi job motion âm thầm fallback DWPose pad128.
-Cách trị: clone node vào `/opt/mtc-prebuilt/ComfyUI/custom_nodes`, `pip install` requirements của
-nó (`PIP_BREAK_SYSTEM_PACKAGES=1`), `pm2 restart comfyui`. Hai onnx đã nằm sẵn trên Network Volume.
-Rebuild image là cách trị gốc.
+**ViTPose đã được bake vào image (18/08/2026, sau nghiệm thu).** Không còn phải clone tay.
+
+Lúc nghiệm thu thì phải: image ghim `sha-14ae224` thiếu `ComfyUI-WanAnimatePreprocess` nên mọi job
+motion âm thầm fallback DWPose pad128. Truy nguyên thì fix `3bb2246` (17/08) thêm node vào
+`motions-studio/comfyui/Dockerfile` — **file không workflow nào build** — nên nó vô hiệu 100% từ đầu.
+Node giờ nằm ở cả bốn danh sách thật (`worker-image/Dockerfile` + cổng tự kiểm của nó,
+`worker/runpod/Dockerfile.selfhosted`, `setup-full.sh:62`, `setup-motion-transfer.sh:46`), ghim
+`0e0b6a2`, và image đã rebuild: `sha-0cbe433`. `comfyui/Dockerfile` đã dán cảnh báo ở đầu file vì
+nó đã lừa được một lần.
 
 Ba chỗ bản giao làm KHÁC spec một cách có chủ ý được ghi thẳng vào đúng mục liên quan.
 
