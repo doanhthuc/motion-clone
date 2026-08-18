@@ -65,7 +65,13 @@ make batch FILE=batch/2026-08-18.yaml RESUME=1   # chạy tiếp lô dở
 ```
 
 Kết quả ở `out/latest/_final/`. Param của từng chặng tra bằng
-`make batch-params TYPE=motion` (hoặc `tryon` / `enhance`) — bỏ trống thì chạy mặc định.
+`make batch-params TYPE=motion` (hoặc `tryon` / `enhance`) — bỏ trống thì chạy mặc định. Bảng đó nói
+luôn param nào API **ép giá trị** hoặc **bỏ qua** dù bạn gõ đúng chính tả.
+
+`RESUME=1` trước tiên **bắt lại đúng job cũ** bằng `job_id` trong `batch/<tên>.state.json`: chặng đứt
+ở phút 39 của một job 40 phút không phải chạy lại từ đầu. Chỉ khi job đó đã hỏng thật, hoặc không còn
+trên pod (pod đã dựng lại), nó mới gửi job mới. Toàn bộ diễn biến của từng run còn lại ở
+`out/latest/runs/<run-id>/run.log` — đóng terminal không mất.
 
 Dọn đĩa sau vài lô: `make batch-clean` (mặc định giữ 3 lô gần nhất) chỉ xoá
 `runs/` — file trung gian của từng chặng. `_final/` (video đã xong) không bao
