@@ -1,5 +1,5 @@
 {
-  "_note": "Khai TAY ba thứ AST của linux.py không thấy. 'extra' = param worker đọc ĐỘNG (không phải params.get('ten')) — nếu AST đã thấy thì cổng báo thừa. 'api' = param TẦNG API: worker không bao giờ đọc, api/src/routes/jobs.js tiêu thụ hoặc dịch nó trước khi ghi DB — cổng KHÔNG đòi các key này xuất hiện trong AST. 'allowed' = giá trị hợp lệ, key phải nằm trong AST ∪ extra ∪ api.",
+  "_note": "Khai TAY năm thứ AST của linux.py không thấy. 'extra' = param worker đọc ĐỘNG (không phải params.get('ten')) — nếu AST đã thấy thì cổng báo thừa. 'api' = param TẦNG API: worker không bao giờ đọc, api/src/routes/jobs.js tiêu thụ hoặc dịch nó trước khi ghi DB — cổng KHÔNG đòi các key này xuất hiện trong AST. 'allowed' = giá trị hợp lệ. 'requires' = param CHỈ có tác dụng khi một param khác mang giá trị nhất định (không thì API bỏ qua âm thầm). 'overridden' = param API ép giá trị VÔ ĐIỀU KIỆN, gửi gì cũng mất — validate phải nói ra thay vì để nó validate xong rồi biến mất. Key của cả bốn khối phải nằm trong AST ∪ extra ∪ api.",
   "motion": {
     "extra": {},
     "api": {
@@ -11,6 +11,22 @@
     "allowed": {
       "quality": ["540p", "720p"],
       "render_profile": ["fast", "max"]
+    },
+    "requires": {
+      "quality": {
+        "param": "preset",
+        "values": ["drv-5s", "drv-10s", "drv-15s", "drv-20s", "drv-30s"],
+        "where": "motions-studio/api/src/motion-resolution.js:20",
+        "why": "enforceMotionResolution return SỚM nếu preset không nằm trong DRIVER_PRESETS, và worker không hề đọc quality → không có preset drv-* thì quality biến mất, không lỗi, không log. Vô hại ở 540p (đúng mặc định), nhưng ai gõ 720p sẽ nhận 540p mà không có cách nào biết. batch/example.yaml từng dạy chính cái dạng vô hiệu đó."
+      }
+    },
+    "overridden": {
+      "render_profile": {
+        "forced": "fast",
+        "where": "motions-studio/api/src/routes/jobs.js:33-34",
+        "why": "normalizeMotionDriverSegment ép out.render_profile = out.renderProfile = \"fast\" VÔ ĐIỀU KIỆN cho mọi job motion, trước cả mọi early-return. Worker CÓ hiểu 'max'/'max20' (linux.py:2016-2023) nhưng chuỗi đó không bao giờ sống sót qua POST /jobs.",
+        "escape": "Đường duy nhất tới 20 step thật: đặt MOTION_FORCE_QUALITY=1 trong env của worker trên pod rồi chạy lại lô. Nó áp cho MỌI job motion sau đó, nên tắt lại ngay khi A/B xong."
+      }
     }
   },
   "tryon": {

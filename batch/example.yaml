@@ -20,7 +20,12 @@ runs:
       character:  ../.smoke/nhanvat.jpeg
       outfit:     ../.smoke/sanpham.jpeg
       driver:     ../.smoke/dandong.mp4
-    motion: { quality: 540p, frames: 33 }
+    # quality CHỈ có tác dụng khi có preset drv-* (enforceMotionResolution return sớm nếu
+    # không — motion-resolution.js:20). Bản mẫu cũ dạy `{ quality: 540p, frames: 33 }`
+    # không kèm preset: quality bị bỏ qua âm thầm, và 720p sẽ ra 540p mà không ai biết.
+    # Nay make batch-validate chặn đúng dạng đó. KHÔNG gõ frames cùng preset drv-*:
+    # worker đo độ dài driver rồi tự đặt frames (linux.py:4142), số bạn gõ cũng mất.
+    motion: { preset: drv-5s, quality: 540p }
 
   - id: vidu-chi-motion
     pipeline: motion-enhance

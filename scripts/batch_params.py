@@ -70,6 +70,25 @@ def main(argv: list[str]) -> int:
         else:
             where = f"linux.py:{info.line} (đọc động)"
         print(f"  {name:28} {str(info.default):18} {values:26} {where}")
+    # Hai khối dưới đây là phần bảng param KHÔNG nói được: param hợp lệ, giá trị hợp lệ,
+    # nhưng API vẫn bỏ qua hoặc ép lại. In thẳng ra đây để không ai phải đi đọc jobs.js
+    # mới biết knob mình vừa gõ có tác dụng hay không.
+    overridden = curated.get(job_type, {}).get("overridden", {}) or {}
+    if overridden:
+        print("\n  API ÉP GIÁ TRỊ — gõ gì cũng mất:")
+        for name, meta in sorted(overridden.items()):
+            print(f"    {name} → luôn {str(meta.get('forced'))!r}   ({meta.get('where') or 'tầng API'})")
+            print(f"      {meta.get('why') or ''}")
+            print(f"      Đường khác: {meta.get('escape') or 'không có'}")
+    requires = curated.get(job_type, {}).get("requires", {}) or {}
+    if requires:
+        print("\n  CHỈ CÓ TÁC DỤNG KHI:")
+        for name, meta in sorted(requires.items()):
+            values = " | ".join(str(v) for v in (meta.get("values") or []))
+            print(f"    {name} cần {meta.get('param')} là {values}   "
+                  f"({meta.get('where') or 'tầng API'})")
+            print(f"      {meta.get('why') or ''}")
+
     print("\n  Đọc comment gốc ở đúng dòng trên — repo này comment dày, đó là tài liệu thật.")
     if api_block:
         print("  Dòng 'tầng API' là param worker KHÔNG đọc: jobs.js dịch/tiêu thụ nó trước khi ghi DB.")

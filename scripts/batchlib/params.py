@@ -140,8 +140,21 @@ def known_params(job_type: str, *, ast_params: dict, curated: dict) -> dict[str,
 
 
 def validate_params(job_type: str, params: dict, *, ast_params: dict, curated: dict) -> list[str]:
+    """Chặn param không có thật, giá trị ngoài danh sách, VÀ param sẽ bị bỏ qua âm thầm.
+
+    Nhóm thứ ba là loại tệ nhất, vì nó qua được mọi cổng khác: param hợp lệ, giá trị
+    hợp lệ, job chạy, tính tiền, ra kết quả của giá trị KHÁC. Hai ca thật đang có:
+      - `quality` không kèm preset drv-* → enforceMotionResolution return sớm (xem
+        khối "requires" trong batch-params.json).
+      - `render_profile: max` → jobs.js ép về "fast" trước khi ghi DB (khối
+        "overridden"). Muốn 20 step thật thì phải qua env của worker.
+    Cả hai đều lấy từ file khai tay, không hardcode ở đây: sửa API thì sửa một chỗ.
+    """
     known = known_params(job_type, ast_params=ast_params, curated=curated)
-    allowed = curated.get(job_type, {}).get("allowed", {}) or {}
+    block = curated.get(job_type, {})
+    allowed = block.get("allowed", {}) or {}
+    requires = block.get("requires", {}) or {}
+    overridden = block.get("overridden", {}) or {}
     errors: list[str] = []
     for key, value in (params or {}).items():
         if key not in known:
@@ -153,6 +166,29 @@ def validate_params(job_type: str, params: dict, *, ast_params: dict, curated: d
         if key in allowed and str(value) not in [str(v) for v in allowed[key]]:
             shown = ", ".join(repr(v) for v in allowed[key])
             errors.append(f"{job_type}.{key}: {value!r} không hợp lệ — chỉ nhận {shown}")
+            continue
+
+        rule = requires.get(key) or {}
+        need_key = str(rule.get("param") or "")
+        need_values = [str(v) for v in (rule.get("values") or [])]
+        if need_key and str((params or {}).get(need_key, "")) not in need_values:
+            shown = " | ".join(need_values)
+            errors.append(
+                f"{job_type}.{key}: {value!r} sẽ bị API BỎ QUA âm thầm — nó chỉ có tác dụng "
+                f"khi {need_key} là {shown} ({rule.get('where') or 'tầng API'}).\n"
+                f"      Thêm `{need_key}: {need_values[0] if need_values else '?'}` vào khối "
+                f"{job_type} của run này, hoặc bỏ {key} đi cho khỏi tưởng nó có tác dụng."
+            )
+
+        forced = overridden.get(key) or {}
+        if forced and str(value) != str(forced.get("forced")):
+            errors.append(
+                f"{job_type}.{key}: {value!r} sẽ bị API ép thành "
+                f"{str(forced.get('forced'))!r} VÔ ĐIỀU KIỆN "
+                f"({forced.get('where') or 'tầng API'}) — validate xong là mất, job vẫn "
+                f"chạy và vẫn tính tiền với giá trị bị ép.\n"
+                f"      {forced.get('escape') or 'Không có đường nào khác qua API.'}"
+            )
     return errors
 
 
@@ -185,9 +221,25 @@ def check_drift(linux_py: Path, curated_path: Path) -> list[str]:
         # đòi một điều không bao giờ đúng. Chúng được kiểm bằng trường "where" trỏ
         # tới dòng code API thật, và bằng mắt người khi thêm.
         known = seen_by_ast | set(block.get("extra", {}) or {}) | set(block.get("api", {}) or {})
-        for name in sorted(set(block.get("allowed", {}) or {}) - known):
-            errors.append(
-                f"{job_type}: .allowed có {name!r} nhưng không nằm trong AST, .extra hay .api "
-                f"→ khai báo cũ, gỡ đi."
-            )
+        # .allowed/.requires/.overridden đều nói về một param CÓ THẬT. Key mồ côi ở đây
+        # nghĩa là luật im lặng: validate không bao giờ chạm tới nó, mà đọc file thì
+        # tưởng đã có luật. Cùng lý do với .allowed từ đầu.
+        for source in ("allowed", "requires", "overridden"):
+            for name in sorted(set(block.get(source, {}) or {}) - known):
+                errors.append(
+                    f"{job_type}: .{source} có {name!r} nhưng không nằm trong AST, .extra hay .api "
+                    f"→ khai báo cũ, gỡ đi."
+                )
+        for name, rule in sorted((block.get("requires", {}) or {}).items()):
+            if not (rule or {}).get("param") or not (rule or {}).get("values"):
+                errors.append(
+                    f"{job_type}: .requires[{name!r}] thiếu \"param\" hoặc \"values\" → luật này "
+                    f"không chặn được gì, mà đọc file thì tưởng có. Khai đủ hoặc gỡ đi."
+                )
+        for name, rule in sorted((block.get("overridden", {}) or {}).items()):
+            if "forced" not in (rule or {}):
+                errors.append(
+                    f"{job_type}: .overridden[{name!r}] thiếu \"forced\" (giá trị API ép thành) → "
+                    f"validate không biết so với cái gì. Khai đủ hoặc gỡ đi."
+                )
     return errors
