@@ -117,6 +117,28 @@ def dynamic_param_names(linux_py: Path) -> dict[str, set[str]]:
     return out
 
 
+def missing_source_hint(path: Path, root: Path) -> str:
+    """Câu nói khi một file NGUỒN của bảng param không có trên đĩa.
+
+    Dùng chung cho batch_params.py và batch_run.py: cả hai đều gọi
+    extract_from_ast(LINUX_PY) + load_curated(CURATED), và cả hai chết bằng
+    FileNotFoundError trần nếu thiếu — mà nguyên nhân thật gần như luôn là một
+    trong hai điều dưới đây, không phải "file này biến mất bí ẩn".
+    """
+    try:
+        rel: Path | str = path.relative_to(root)
+    except ValueError:
+        rel = path
+    if "motions-studio" in str(rel):
+        cause = ("hoặc motions-studio/ chưa được checkout/rsync về máy này — kéo "
+                 "submodule/thư mục đó về trước.")
+    else:
+        cause = f"hoặc file đó đã bị xoá/đổi tên — khôi phục bằng: git checkout -- {rel}"
+    return (f"không thấy {rel}\n"
+            f"  Hoặc bạn đang chạy lệnh này từ ngoài thư mục repo (cd vào {root} rồi "
+            f"chạy lại), {cause}")
+
+
 def load_curated(path: Path) -> dict:
     data = json.loads(path.read_text(encoding="utf-8"))
     return {k: v for k, v in data.items() if not k.startswith("_")}

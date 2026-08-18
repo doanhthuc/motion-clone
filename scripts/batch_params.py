@@ -11,7 +11,8 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from batchlib.params import check_drift, extract_from_ast, known_params, load_curated
+from batchlib.params import (check_drift, extract_from_ast, known_params, load_curated,
+                             missing_source_hint)
 
 ROOT = Path(__file__).resolve().parents[1]
 LINUX_PY = ROOT / "motions-studio" / "worker" / "worker_runtime" / "linux.py"
@@ -20,13 +21,7 @@ CURATED = ROOT / "scripts" / "batch-params.json"
 
 def main(argv: list[str]) -> int:
     if not LINUX_PY.is_file():
-        print(f"✗ không thấy {LINUX_PY.relative_to(ROOT)}", file=sys.stderr)
-        print(
-            "  Hoặc bạn đang chạy lệnh này từ ngoài thư mục repo (cd vào "
-            f"{ROOT} rồi chạy lại), hoặc motions-studio/ chưa được checkout/rsync "
-            "về máy này — kéo submodule/thư mục đó về trước.",
-            file=sys.stderr,
-        )
+        print(f"✗ {missing_source_hint(LINUX_PY, ROOT)}", file=sys.stderr)
         return 1
 
     if "--check" in argv:

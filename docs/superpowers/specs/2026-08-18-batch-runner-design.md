@@ -1,6 +1,10 @@
 # Chạy lô material từ máy local → video trên pod GPU — Design
 
-**Ngày:** 18/08/2026 · **Trạng thái:** thiết kế, chưa triển khai.
+**Ngày:** 18/08/2026 · **Trạng thái:** đã triển khai (nhánh `batch-runner`), chưa chạy trên pod thật.
+
+Ba chỗ bản giao làm KHÁC spec một cách có chủ ý được ghi thẳng vào đúng mục liên quan, dạng trích
+dẫn "ĐỔI CÓ CHỦ Ý": `MODE=folders` (§2), `DESTROY_WHEN_DONE` (§5/§8), tên file chặng cuối (§6). Spec
+là tài liệu ràng buộc, nên nó không được phép nói ngược với tool đang chạy.
 
 ## Mục tiêu
 
@@ -96,6 +100,11 @@ Pipeline suy ra từ material có mặt: có `outfits/` → `tryon-motion-enhanc
 (`character.*` / `outfit.*` / `background.*` / `driver.*`), cho trường hợp material đã gom sẵn theo
 run. Không phải cách chính.
 
+> **ĐỔI CÓ CHỦ Ý (18/08/2026): `MODE=folders` KHÔNG được triển khai** — bản giao chỉ có
+> `MODES = ("pair", "cross")` (`scripts/batchlib/scan.py:30`). Lý do: material đã gom sẵn theo run
+> thì viết thẳng `inputs:` trong manifest cũng chỉ mất mấy dòng, mà thêm một chế độ nạp là thêm một
+> mặt tiếp xúc phải test và phải giải thích. Mở lại khi có ai thật sự cần.
+
 ## 3. Manifest
 
 ```yaml
@@ -176,6 +185,13 @@ Bật là thao tác đảo được, xoá thì không — nên bật thì tự l
 `pm2 logs worker`. Job và MinIO vẫn sống trên Network Volume sau destroy, nhưng phải dựng lại pod
 ~5 phút mới xem được.
 
+> **ĐỔI CÓ CHỦ Ý (18/08/2026): `DESTROY_WHEN_DONE=yes` KHÔNG được triển khai** — runner không bao
+> giờ tự `gpu-destroy`, kể cả khi mọi run đều xong ([gpu-pod.md](../../gpu-pod.md) đã ghi đúng hành
+> vi này: "Runner tự `make gpu-up` nếu pod đang dừng, nhưng **không bao giờ tự `gpu-destroy`**").
+> Lý do: destroy là thao tác KHÔNG đảo được, còn "mọi run done" không có nghĩa là
+> video dùng được — người dùng còn phải xem đã. Runner in sẵn `make gpu-destroy` để dán, và đó là
+> hướng an toàn hơn; spec là chỗ nói dối, không phải code.
+
 Chạy tuần tự, không song song: pod có một GPU, và `run_enhance` gọi `comfy_recycle` để xả RAM/VRAM
 của Wan trước mỗi pha nặng (`linux.py:9586` lanczos, `9650` SeedVR2, `9691` FlashVSR, `9740` RIFE) —
 hai job chồng nhau sẽ phá đúng giả định "lúc này GPU chỉ có mình tôi" mà các lời gọi đó dựa vào.
@@ -195,10 +211,15 @@ out/
       mauA__vay-do__dandong/
         01-tryon.png
         02-motion.mp4
-        03-final.mp4          hardlink với _final/…
+        03-enhance.mp4        hardlink với _final/…
         run.json
         run.log
 ```
+
+> **ĐỔI CÓ CHỦ Ý (18/08/2026): file cuối tên `03-enhance.mp4`, không phải `03-final.mp4`** — quy tắc
+> `NN-<tên chặng>` áp cho MỌI chặng, kể cả chặng cuối, nên đọc tên file là biết chặng nào sinh ra nó
+> (và pipeline không có enhance thì tên vẫn đúng). Bản "final" đã có ở `_final/<run-id>.mp4`. Đổi
+> spec chứ không đổi code.
 
 - **`_final/` tách khỏi `runs/`**: giao việc thì chỉ cần bản cuối, debug thì cần cả chuỗi. Hardlink
   nên không nhân đôi dung lượng.
@@ -267,7 +288,7 @@ lô — không phải trước từng job. Manifest sai ở run thứ 9 phải n
 | Chặng chạy quá lâu | Timeout riêng từng chặng (enhance 60fps lâu hơn motion nhiều) |
 | Rớt mạng lúc poll | Retry có backoff; job vẫn chạy trên pod |
 | Máy ngủ / Ctrl-C giữa lô | `--resume` bắt lại bằng `job_id` đã ghi trong journal |
-| Lô xong nhưng có run fail | Không tự destroy dù `DESTROY_WHEN_DONE=yes` |
+| Lô xong nhưng có run fail | Không tự destroy dù `DESTROY_WHEN_DONE=yes` (xem §5: cờ này không được triển khai — runner KHÔNG BAO GIỜ tự destroy) |
 
 Journal ghi **sau mỗi chặng**, không phải cuối run. Một run ba chặng đứt ở chặng ba thì resume chỉ
 chạy lại chặng ba.

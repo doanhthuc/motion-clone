@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from batchlib.client import health_ok
 from batchlib.config import ConfigError, load_settings
 from batchlib.manifest import ManifestError, load_manifest, load_state, state_path_for, validate_manifest
-from batchlib.params import extract_from_ast, load_curated
+from batchlib.params import extract_from_ast, load_curated, missing_source_hint
 from batchlib.runner import batch_id_now, run_batch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -105,6 +105,16 @@ def main(argv: list[str]) -> int:
         print(f"✗ {exc}", file=sys.stderr)
         return 1
 
+    # Hai nguồn của bảng param. Không chặn ở đây thì extract_from_ast/load_curated ném
+    # FileNotFoundError trần — không nói repo thiếu gì, cũng không nói làm gì tiếp.
+    # batch_params.py đã có đúng câu đó cho đúng tình huống này; dùng lại nó.
+    for source in (LINUX_PY, CURATED):
+        if not source.is_file():
+            print(f"✗ {missing_source_hint(source, ROOT)}", file=sys.stderr)
+            print("  Không tra được bảng param thì không validate được manifest — mà validate "
+                  "chính là thứ chặn lỗi TRƯỚC khi tiêu GPU.", file=sys.stderr)
+            return 1
+
     errors = validate_manifest(manifest, ast_params=extract_from_ast(LINUX_PY),
                                curated=load_curated(CURATED))
     if errors:
@@ -138,8 +148,16 @@ def main(argv: list[str]) -> int:
     # chạy trên pod — tuyệt đối không được khuyên gửi lại, vì gửi lại là trả tiền GPU
     # hai lần cho cùng một việc.
     try:
+        # resume=decision.resumed, KHÔNG phải args.resume: hai giá trị đó lệch nhau ở đúng
+        # nhánh "RESUME=1 nhưng chưa có lô nào để tiếp" (resolve_batch_id nhánh 2). Ở đó
+        # batch_id là id MỚI, nên truyền resume=True lại là dựng lô mới bằng journal cũ:
+        # run đã "done" từ lô trước bị bỏ qua, không được hardlink vào _final/ mới, và
+        # chặng đã xong bị coi là mất file nên chạy lại — đúng bug đã sửa một lần rồi.
+        # Nó chưa nổ được chỉ vì run_batch luôn ghi state["batch"], tức một invariant ở
+        # FILE KHÁC, không phải một rào chắn ở đây.
         result = run_batch(settings=settings, manifest=manifest, out_root=ROOT / "out",
-                           batch_id=decision.batch_id, resume=args.resume, fail_fast=args.fail_fast)
+                           batch_id=decision.batch_id, resume=decision.resumed,
+                           fail_fast=args.fail_fast)
     except (urllib.error.URLError, OSError) as exc:
         print(f"\n✗ Mất kết nối tới pod giữa chừng: {exc}", file=sys.stderr)
         print("  Job vừa gửi có thể VẪN đang chạy trên pod — đừng chạy lại từ đầu (tốn tiền GPU hai lần).",
