@@ -1,6 +1,27 @@
 # Chạy lô material từ máy local → video trên pod GPU — Design
 
-**Ngày:** 18/08/2026 · **Trạng thái:** đã triển khai (nhánh `batch-runner`), chưa chạy trên pod thật.
+**Ngày:** 18/08/2026 · **Trạng thái:** đã triển khai và **đã nghiệm thu trên pod RTX 5090 thật**
+(RunPod EU-RO-1, ~55 phút, $0.99/giờ). Số đo, không phải lời hứa:
+
+| | |
+|---|---|
+| Lô đầy đủ `character+outfit+background+driver` | tryon 349s (1688 KB) → motion 144s (480 KB) → enhance 79s (3224 KB) |
+| Nền có được ghép thật? | Có — job tryon chạy pass "ghép nền (Qwen pass 2)" |
+| Enhance đúng đích? | 544×960@16fps → **1088×1920@48fps**, 97 frame, giữ đúng 2,02s |
+| `--resume` bắt lại job cũ? | Có — ngắt giữa motion, resume in `✓ BẮT LẠI được job cũ fddb9ec7…`, API xác nhận **chỉ 2 job motion**, không job trùng |
+| `params_sent` là param API đã nắn? | Có — dòng motion có `{"hq": false, "cfg": 1, "steps": 4, "fitDriver"…}`, không cái nào manifest gửi |
+| ViTPose hay fallback DWPose? | ViTPose — log job ghi `face_crop=vitpose`, không có dòng fallback nào |
+
+**Một lỗi CHẶN TOÀN BỘ chỉ pod thật tìm ra:** Cloudflare chặn User-Agent mặc định của urllib
+(§1). 143 test xanh không thấy nó, `pod-smoke.sh` không thấy nó vì dùng `curl`.
+
+**Việc phải làm tay trước khi chạy pod mới:** image ghim `sha-14ae224` **cũ hơn** fix `3bb2246`
+nên thiếu node `ComfyUI-WanAnimatePreprocess` → mọi job motion âm thầm fallback DWPose pad128.
+Cách trị: clone node vào `/opt/mtc-prebuilt/ComfyUI/custom_nodes`, `pip install` requirements của
+nó (`PIP_BREAK_SYSTEM_PACKAGES=1`), `pm2 restart comfyui`. Hai onnx đã nằm sẵn trên Network Volume.
+Rebuild image là cách trị gốc.
+
+Ba chỗ bản giao làm KHÁC spec một cách có chủ ý được ghi thẳng vào đúng mục liên quan.
 
 Ba chỗ bản giao làm KHÁC spec một cách có chủ ý được ghi thẳng vào đúng mục liên quan, dạng trích
 dẫn "ĐỔI CÓ CHỦ Ý": `MODE=folders` (§2), `DESTROY_WHEN_DONE` (§5/§8), tên file chặng cuối (§6). Spec
