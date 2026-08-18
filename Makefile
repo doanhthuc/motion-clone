@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help setup dev down clean gpu-preflight gpu-provision gpu-wait gpu-bootstrap gpu-fe gpu-up gpu-down gpu-destroy gpu-db-dump gpu-db-check gpu-status gpu-logs batch-test batch-params check-batch-params
+.PHONY: help setup dev down clean gpu-preflight gpu-provision gpu-wait gpu-bootstrap gpu-fe gpu-up gpu-down gpu-destroy gpu-db-dump gpu-db-check gpu-status gpu-logs batch-test batch-params check-batch-params batch-scan
 
 help: ## Show this help
 	@echo "motion-clone — make targets:"
@@ -43,6 +43,10 @@ batch-params: ## Liệt kê param một job type nhận (TYPE=motion|tryon|enhan
 
 check-batch-params: ## Gate: scripts/batch-params.json phải khớp linux.py
 	@python3 scripts/batch_params.py --check
+
+batch-scan: ## Quét thư mục material → manifest nháp (DIR=~/materials MODE=pair|cross)
+	@test -n "$(DIR)" || { echo "cần DIR=~/materials (4 ngăn: characters outfits backgrounds drivers)"; exit 1; }
+	@python3 scripts/batch_scan.py --dir "$(DIR)" --mode "$${MODE:-pair}" $${OUT:+--out "$$OUT"} $${FORCE:+--force}
 
 gpu-preflight: ## Check root .env is complete BEFORE you spend money on a pod
 	@bash scripts/gpu-preflight.sh
