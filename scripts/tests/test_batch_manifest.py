@@ -125,6 +125,21 @@ class TestLoad(unittest.TestCase):
             self.assertIn("motion", str(cm.exception))
             self.assertIn("runs[0]", str(cm.exception))
 
+    def test_defaults_chang_khong_phai_mapping_bao_loi_ro_khong_crash(self):
+        # `defaults: { enhance: 60 }` — mapping ở ngoài hợp lệ, nhưng giá trị BÊN
+        # TRONG (defaults.enhance) là số. batch/example.yaml dạy đúng dạng
+        # `enhance: { fpsInterp: "60" }`; ai đơn giản hoá thành `enhance: 60` từng
+        # rơi thẳng vào dict(60) → TypeError: 'int' object is not iterable.
+        with tempfile.TemporaryDirectory() as d:
+            text = GOOD.replace(
+                'enhance: { targetRes: 1080p, fpsInterp: "60" }', "enhance: 60"
+            )
+            with self.assertRaises(ManifestError) as cm:
+                load_manifest(_fixture(Path(d), text))
+            # Phải chỉ đúng khối "defaults.enhance", không phải "runs[0].enhance" —
+            # sai khối là refactor tương lai đã lẫn giữa default và param ghi tay.
+            self.assertIn("defaults.enhance", str(cm.exception))
+
 
 class TestValidate(unittest.TestCase):
     def test_manifest_tot_thi_khong_loi(self):

@@ -80,6 +80,17 @@ def load_manifest(path: Path) -> Manifest:
         hint=('  Ý bạn là:  defaults: { enhance: { fpsInterp: "60" } }\n'
               '  Tra tên param: make batch-params TYPE=<chặng>'),
     )
+    # defaults hợp lệ là mapping ở NGOÀI, nhưng từng khối bên trong (defaults.enhance,
+    # defaults.tryon, …) cũng phải là mapping — batch/example.yaml (task 5) dạy đúng
+    # dạng `defaults: { enhance: { fpsInterp: "60" } }`, và ai đơn giản hoá thành
+    # `enhance: 60` rơi thẳng vào dict(60) → TypeError trần trụi ở chỗ merge bên dưới
+    # nếu không chặn ở đây.
+    for _stage_key, _stage_val in list(defaults.items()):
+        _require_mapping(
+            _stage_val, path=path, where="defaults.", key=_stage_key,
+            hint=(f'  Ý bạn là:  {_stage_key}: {{ ... }}\n'
+                  f'  Tra tên param: make batch-params TYPE={_stage_key}'),
+        )
     base = path.parent.resolve()
     runs: list[Run] = []
     seen: set[str] = set()
