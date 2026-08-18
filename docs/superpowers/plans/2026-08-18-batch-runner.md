@@ -1531,7 +1531,7 @@ def save_state(path: Path, state: dict) -> None:
 - [ ] **Step 4: Chạy test để xác nhận nó xanh**
 
 Run: `python3 -m unittest discover -s scripts/tests -p 'test_batch_manifest.py' -v`
-Expected: PASS — 17 test
+Expected: PASS — 18 test
 
 - [ ] **Step 5: Commit**
 
