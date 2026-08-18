@@ -50,6 +50,13 @@ if NGU:
 raise SystemExit({ma_thoat})
 """
 
+# Runner giả KHÔNG flush — để lộ chuyện stdout bị block-buffer khi đổ vào file.
+FAKE_RUNNER_KHONG_FLUSH = """\
+import sys, time
+print("toi in dong nay ngay tu dau")
+time.sleep({ngu})
+"""
+
 
 class Base(unittest.TestCase):
     def setUp(self):
@@ -78,6 +85,11 @@ class Base(unittest.TestCase):
     def ctx(self, *, ngu=0, ma_thoat=0) -> Ctx:
         runner = self.dir / "runner_gia.py"
         runner.write_text(FAKE_RUNNER.format(ngu=ngu, ma_thoat=ma_thoat), encoding="utf-8")
+        return Ctx(root=self.dir, runner=runner)
+
+    def ctx_khong_flush(self, *, ngu) -> Ctx:
+        runner = self.dir / "runner_gia.py"
+        runner.write_text(FAKE_RUNNER_KHONG_FLUSH.format(ngu=ngu), encoding="utf-8")
         return Ctx(root=self.dir, runner=runner)
 
     def chay(self, ctx, **kw) -> dict:
@@ -171,6 +183,22 @@ class TestRun(Base):
         self.doi_ket_thuc()
         log = Path(json.loads(mcp_path_for(self.manifest).read_text(encoding="utf-8"))["log"])
         self.assertIn("dòng một", log.read_text(encoding="utf-8"))
+
+    def test_log_hien_ra_NGAY_chu_khong_doi_lo_ket_thuc(self):
+        """stdout của con bị block-buffer khi đổ vào file, nên dòng tiến độ nằm trong
+        buffer 8KB thay vì trên đĩa. Hai hậu quả, cả hai đều thấy trên pod thật:
+        batch_status không có gì để báo suốt cả lô, và máy ngủ / bị kill là mất sạch
+        những dòng cần nhất. Đo trên đường thật: log của lô đầu tiên qua MCP in
+        stderr TRƯỚC stdout dù code in stdout trước.
+        """
+        self.chay(self.ctx_khong_flush(ngu=5))
+        log = self.dir / "batch" / "lo.mcp.log"
+        han = time.time() + 3.0
+        while time.time() < han:
+            if "toi in dong nay ngay tu dau" in log.read_text(encoding="utf-8"):
+                return
+            time.sleep(0.05)
+        self.fail("3 giây rồi log vẫn rỗng dù con đã in — stdout đang bị buffer")
 
     def test_dang_co_lo_chay_thi_TU_CHOI_khong_spawn_cai_thu_hai(self):
         """Hai runner cùng ghi một state.json là hỏng journal, và hai job chồng nhau

@@ -174,7 +174,13 @@ def _spawn(ctx: Ctx, manifest_path: Path, argv: list[str]) -> dict:
     log, rc = _log_path(manifest_path), _rc_path(manifest_path)
     rc.unlink(missing_ok=True)      # mã thoát của lô TRƯỚC không được trả lời cho lô này
 
-    lenh = shlex.join([ctx.python, str(ctx.runner), *argv])
+    # -u BẮT BUỘC: stdout của Python là block-buffered khi đổ vào FILE (chỉ
+    # line-buffered khi là tty). Không có nó thì dòng tiến độ của một lô 40 phút nằm
+    # trong buffer 8KB chứ không trên đĩa — batch_status không có gì để báo suốt cả
+    # lô, và máy ngủ / Ctrl-C là mất sạch đúng những dòng cần nhất. Còn làm lệch cả
+    # thứ tự: stderr không buffer nên lỗi hiện TRƯỚC dòng stdout in trước nó. Cả ba
+    # đều quan sát được ở lô đầu tiên chạy qua MCP (18/08/2026), không phải suy luận.
+    lenh = shlex.join([ctx.python, "-u", str(ctx.runner), *argv])
     boc = f"{lenh} >> {shlex.quote(str(log))} 2>&1; echo $? > {shlex.quote(str(rc))}"
 
     # Ghi thêm, không ghi đè — cùng lý do run.log ghi thêm (runner.py): lượt trước

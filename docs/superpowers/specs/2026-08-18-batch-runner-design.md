@@ -439,6 +439,7 @@ là hỏng journal, và hai job chồng nhau phá đúng giả định "lúc nà
 | Bẫy | Hậu quả nếu không trị | Ghim bằng |
 |---|---|---|
 | Một dòng không-JSON lọt lên stdout | **rụng cả kết nối MCP**, không phải một dòng log thừa | `test_khong_mot_byte_rac_nao_tren_stdout` chạy entry point thật rồi parse từng dòng |
+| stdout của Python là **block-buffered khi đổ vào FILE** (chỉ line-buffered khi là tty) | dòng tiến độ của một lô 40 phút nằm trong buffer 8KB chứ không trên đĩa: `batch_status` không có gì để báo suốt cả lô, máy ngủ / Ctrl-C là mất sạch, và thứ tự lệch vì stderr không buffer | `python3 -u` trong `_spawn`; test cho runner giả in mà KHÔNG flush rồi đòi thấy dòng đó trên đĩa trong 3s |
 | Runner là **con** của server → thoát mà không ai `wait()` là thành **zombie**, `os.kill(pid,0)` báo "còn sống" vĩnh viễn | kill lô rồi hỏi lại thì được trả lời sai, mãi mãi | `_con_song` reap bằng `WNOHANG` trước; test kill thật rồi đòi trạng thái đổi trong 3s |
 | pid biến mất giống hệt nhau dù lô xong sạch hay ngã ở run đầu | không trả lời được "lô kết thúc thế nào" | bọc `sh -c '…; echo $? > <.rc>'`, `batch_status` trả `ma_thoat` |
 
@@ -456,6 +457,14 @@ Bốn nhánh lỗi được viết trước test đã **mutation-test** để ch
 
 `make batch-mcp-check` bắt tay thật với server rồi in bốn tool nó khai — cổng rẻ nhất cho câu
 "server còn chạy được không".
+
+> **VẬN HÀNH: sửa code MCP xong phải khởi động lại server.** Claude Code giữ một process
+> `batch_mcp.py` sống suốt phiên, nạp module vào bộ nhớ một lần. Sửa `mcp_tools.py` mà không
+> thoát/mở lại `claude` thì tool chạy code CŨ, **im lặng, không báo gì**. Đã dính đúng một lần
+> (18/08/2026): bản sửa `-u` ở trên xanh trong unit test nhưng lô gọi qua MCP vẫn in sai thứ tự,
+> vì server khởi động lúc 20:48 còn bản sửa lúc 20:55. Cách nhận ra:
+> `ps -o pid,lstart -p $(pgrep -f batch_mcp.py)`. `make batch-mcp-check` KHÔNG bắt được — nó
+> spawn process mới nên luôn thấy code mới.
 
 Ngoài phạm vi, cố ý: `batch_scan` qua MCP; `gpu-provision`/`gpu-destroy` qua MCP (một cái tiêu tiền,
 một cái không đảo được — cả hai phải là người gõ ở terminal).

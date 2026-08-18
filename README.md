@@ -96,6 +96,13 @@ tiền, nên đó là quyết định của bạn chứ không của một tool 
 
 Kiểm server còn sống mà không tốn gì: `make batch-mcp-check`.
 
+**Sửa code MCP thì phải khởi động lại server.** Claude Code giữ một process
+`scripts/batch_mcp.py` sống suốt phiên, nên nó nạp module cũ trong bộ nhớ — sửa
+`batchlib/mcp_tools.py` mà không thoát/mở lại `claude` thì tool vẫn chạy code cũ,
+im lặng. Cách nhận ra: `ps -o pid,lstart -p $(pgrep -f batch_mcp.py)` cho thời điểm
+khởi động; nó cũ hơn lần sửa của bạn là đúng cái bẫy này. `make batch-mcp-check`
+KHÔNG bắt được — nó chạy một process mới nên luôn thấy code mới.
+
 Thiết kế và các đánh đổi: `docs/superpowers/specs/2026-08-18-batch-runner-design.md` (MCP ở §9).
 
 ## Nguồn gốc code
