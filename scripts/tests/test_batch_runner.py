@@ -57,6 +57,11 @@ class FakePod:
 
 def _run(tmp: Path, pod: FakePod, **kwargs):
     manifest_path = kwargs.pop("manifest_path", None) or _fixture(tmp)
+    # log mặc định của run_batch/run_one là print() — đúng cho production (đó là thứ
+    # duy nhất người dùng thấy suốt một lô 40 phút), nhưng làm ngợp stdout của test
+    # suite. Test không assert trên log nào, nên câm nó ở đây — chỉ ở đây, KHÔNG đổi
+    # default trong runner.py.
+    kwargs.setdefault("log", lambda _msg: None)
     with mock.patch("batchlib.runner.submit_job", pod.submit), \
          mock.patch("batchlib.runner.poll_job", pod.poll), \
          mock.patch("batchlib.runner.download_output", pod.download):
