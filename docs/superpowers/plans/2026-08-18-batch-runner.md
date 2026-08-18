@@ -101,6 +101,27 @@ class TestEnvGet(unittest.TestCase):
             self.assertEqual(env_get(p, "EMPTY"), "")
             self.assertEqual(env_get(p, "VANG_MAT"), "")
 
+    def test_khop_bang_so_do_tu_GNU_Make_that(self):
+        # ORACLE: chạy thật `$(call env,K)` của Makefile:30 trên GNU Make, 18/08/2026.
+        # Hai hành vi dưới đây trông như bug và ĐÚNG LÀ bug — nhưng là bug của Makefile,
+        # và env_get phải sao chép nguyên vẹn. Sửa Makefile:30 thì phải sửa bảng này
+        # và env_get cùng lúc, nếu không cùng một .env sẽ có hai nghĩa.
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / ".env"
+            p.write_text(
+                "A=  co-space-truoc\n"
+                "B=co-space-sau   \n"
+                "C=binh-thuong  # ghi chu\n"
+                "D=first\n"
+                "D=second\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(env_get(p, "A"), "  co-space-truoc")   # đầu dòng GIỮ
+            self.assertEqual(env_get(p, "B"), "co-space-sau   ")    # cuối dòng GIỮ
+            self.assertEqual(env_get(p, "C"), "binh-thuong")
+            self.assertEqual(env_get(p, "D"), "first second")       # $(shell) nối bằng dấu cách
+
     def test_file_khong_ton_tai_tra_rong_khong_no(self):
         self.assertEqual(env_get(Path("/khong/co/that/.env"), "DOMAIN"), "")
 
@@ -135,6 +156,29 @@ class TestLoadSettings(unittest.TestCase):
             with self.assertRaises(ConfigError) as cm:
                 load_settings(root)
             self.assertIn("gpu-bootstrap", str(cm.exception))
+
+    def test_domain_co_khoang_trang_bi_chan_to_va_ro(self):
+        # env_get bám Make nên nó trả về cả rác. Không chặn ở đây thì một dấu cách thừa
+        # biến thành "backend không trả lời" và người dùng đi kiểm pod, tunnel, Cloudflare.
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            _write(root, "DOMAIN=api.example.test   \n", "NUXT_MOTION_API_KEY=mk_x\n")
+            with self.assertRaises(ConfigError) as cm:
+                load_settings(root)
+            self.assertIn(".env", str(cm.exception))
+            self.assertIn("khoảng trắng", str(cm.exception))
+
+    def test_key_khai_hai_lan_bi_chan(self):
+        # Makefile:30 nối hai dòng trùng khoá bằng dấu cách → giá trị có khoảng trắng.
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            _write(root, "DOMAIN=api.example.test\n",
+                   "NUXT_MOTION_API_KEY=mk_a\nNUXT_MOTION_API_KEY=mk_b\n")
+            with self.assertRaises(ConfigError) as cm:
+                load_settings(root)
+            self.assertIn("motions/.env", str(cm.exception))
 
     def test_instance_id_rong_van_load_duoc(self):
         # Chưa thuê pod là trạng thái hợp lệ — preflight mới là chỗ chặn, không phải load.
@@ -180,17 +224,32 @@ class ConfigError(Exception):
 
 
 def env_get(path: Path, key: str) -> str:
+    """Y HỆT `$(call env,KEY)` ở Makefile:30, kể cả hai chỗ khó chịu của nó.
+
+    Đo trên GNU Make thật ngày 18/08/2026 với .env:
+        A=  co-space-truoc     → "  co-space-truoc"   (khoảng trắng đầu GIỮ NGUYÊN)
+        B=co-space-sau         → "co-space-sau   "    (khoảng trắng cuối GIỮ NGUYÊN)
+        C=binh-thuong  # ghi chu → "binh-thuong"
+        D=first / D=second     → "first second"       ($(shell) nối nhiều dòng bằng dấu cách)
+
+    KHÔNG .strip() và KHÔNG dừng ở dòng khớp đầu tiên. Sửa hai chỗ đó cho "đẹp hơn"
+    nghĩa là cùng một .env cho hai giá trị khác nhau ở `make` và ở runner — đúng loại
+    lệch âm thầm mà scripts/check-job-types.mjs tồn tại để chặn. Chỗ bắt .env hỏng là
+    load_settings() bên dưới, không phải ở đây.
+
+    Đổi Makefile:30 thì PHẢI đổi hàm này và bảng số đo trong test cùng lúc.
+    """
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return ""
+    parts = []
     for line in text.splitlines():
         if not line.startswith(f"{key}="):
             continue
-        value = line.split("=", 1)[1]
-        value = re.sub(r"\s*#.*$", "", value)
-        return value.replace('"', "").strip()
-    return ""
+        value = re.sub(r"\s*#.*$", "", line.split("=", 1)[1])
+        parts.append(value.replace('"', ""))
+    return " ".join(parts)
 
 
 @dataclass(frozen=True)
@@ -204,6 +263,23 @@ class Settings:
         return f"https://{self.domain}"
 
 
+def _reject_whitespace(value: str, key: str, where: str) -> None:
+    """env_get bám sát Make nên nó TRẢ LẠI cả rác. Đây là chỗ chặn rác, và chặn to.
+
+    Không có lớp này thì một dấu cách thừa cuối dòng DOMAIN biến thành
+    "backend không trả lời" — người dùng đi kiểm pod, kiểm tunnel, kiểm Cloudflare,
+    trong khi lỗi là một ký tự trong .env mà `make gpu-up` cũng đang hỏng vì nó.
+    """
+    if any(c.isspace() for c in value):
+        raise ConfigError(
+            f"{key} trong {where} có khoảng trắng: {value!r}\n"
+            f"  Thường do một trong hai: khoảng trắng thừa cuối dòng, hoặc {key} bị khai\n"
+            f"  HAI LẦN (Makefile:30 nối các dòng trùng khoá bằng dấu cách, nên `make gpu-up`\n"
+            f"  cũng đang hỏng vì đúng lý do này).\n"
+            f"  Sửa {where} rồi chạy lại."
+        )
+
+
 def load_settings(root: Path = ROOT) -> Settings:
     domain = env_get(root / ".env", "DOMAIN")
     if not domain:
@@ -211,12 +287,14 @@ def load_settings(root: Path = ROOT) -> Settings:
             "Thiếu DOMAIN trong .env.\n"
             "  Chạy: make gpu-preflight   (nó liệt kê mọi biến còn thiếu)"
         )
+    _reject_whitespace(domain, "DOMAIN", ".env")
     api_key = env_get(root / "motions" / ".env", "NUXT_MOTION_API_KEY")
     if not api_key:
         raise ConfigError(
             "Thiếu NUXT_MOTION_API_KEY trong motions/.env.\n"
             "  Chạy: make gpu-bootstrap   (nó tự dán key của pod vào file đó)"
         )
+    _reject_whitespace(api_key, "NUXT_MOTION_API_KEY", "motions/.env")
     return Settings(
         domain=domain,
         api_key=api_key,
@@ -227,7 +305,7 @@ def load_settings(root: Path = ROOT) -> Settings:
 - [ ] **Step 4: Chạy test để xác nhận nó xanh**
 
 Run: `python3 -m unittest discover -s scripts/tests -p 'test_batch_config.py' -v`
-Expected: PASS — 6 test
+Expected: PASS — 9 test
 
 - [ ] **Step 5: Commit**
 
