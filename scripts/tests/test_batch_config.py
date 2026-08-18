@@ -113,10 +113,27 @@ class TestLoadSettings(unittest.TestCase):
             self.assertNotIn("mk_secret123", msg)
             # Chứa dấu che giấu (•)
             self.assertIn("•", msg)
-            # Vẫn hiển thị khoảng trắng (3 khoảng trắng cuối)
-            self.assertIn("   ", msg)
+            # Hiển thị token che giấu chính xác: '••••••••••••   ' (12 ký tự gốc → 12 •, 3 khoảng trắng giữ)
+            # assertIn("   ") là tệ vì "   " cũng xuất hiện trong boilerplate indent ở config.py,
+            # nên assertion đó không phân biệt được giữa "khoảng trắng được giữ" và "không".
+            self.assertIn("'••••••••••••   '", msg)
             # Tên file đúng
             self.assertIn("motions/.env", msg)
+            self.assertIn("khoảng trắng", msg)
+
+    def test_domain_co_braces_khong_crash(self):
+        # Regression: DOMAIN có ký tự { hoặc } không gây KeyError trong error message
+        # env_get() trả về giá trị malformed nguyên vẹn, _reject_whitespace() phải handle chúng
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            _write(root, "DOMAIN=api.example.test {oops}  \n", "NUXT_MOTION_API_KEY=mk_x\n")
+            # Phải raise ConfigError, không phải KeyError hay ValueError
+            with self.assertRaises(ConfigError) as cm:
+                load_settings(root)
+            msg = str(cm.exception)
+            # Message phải chứa giá trị thực để user thấy được lỗi
+            self.assertIn("{oops}", msg)
             self.assertIn("khoảng trắng", msg)
 
 

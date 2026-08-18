@@ -52,11 +52,10 @@ def _reject_whitespace(value: str, key: str, where: str, *, secret: bool = False
 
     raise ConfigError(
         f"{key} trong {where} có khoảng trắng: {display_value}\n"
-        "  Thường do một trong hai: khoảng trắng thừa cuối dòng, hoặc {key} bị khai hai lần.\n"
-        "  (Makefile:30 nối các dòng trùng khoá bằng dấu cách, nên `make gpu-up` cũng đang hỏng\n"
-        "   vì đúng lý do này.)\n"
-        "  Sửa {where} rồi chạy lại."
-        .format(key=key, where=where)
+        f"  Thường do một trong hai: khoảng trắng thừa cuối dòng, hoặc {key} bị khai hai lần.\n"
+        f"  (Makefile:30 nối các dòng trùng khoá bằng dấu cách, nên `make gpu-up` cũng đang hỏng\n"
+        f"   vì đúng lý do này.)\n"
+        f"  Sửa {where} rồi chạy lại."
     )
 
 
