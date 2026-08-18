@@ -1,0 +1,35 @@
+# Manifest mẫu. Chép đi rồi sửa, hoặc để make batch-scan đẻ ra bản của bạn.
+#
+#     make batch-validate FILE=batch/example.yaml
+#     make batch FILE=batch/example.yaml
+#
+# Chỉ 'inputs' là bắt buộc. Param tra bằng: make batch-params TYPE=motion
+#
+# LƯU Ý: file này trỏ vào ../.smoke/ — thư mục ĐÃ gitignore (media cá nhân, repo public).
+# Trên máy đã chạy gpu-smoke thì có sẵn; trên một bản clone mới thì chưa, và
+# batch-validate sẽ báo "không thấy file". Đó là đúng: validate tồn tại để nói ra
+# điều đó trước khi tiêu GPU. Thay bằng đường dẫn của bạn, hoặc dùng make batch-scan.
+
+defaults:
+  enhance: { targetRes: 1080p, fpsInterp: "60" }
+
+runs:
+  - id: vidu-day-du
+    pipeline: tryon-motion-enhance
+    inputs:
+      character:  ../.smoke/nhanvat.jpeg
+      outfit:     ../.smoke/sanpham.jpeg
+      driver:     ../.smoke/dandong.mp4
+    # quality CHỈ có tác dụng khi có preset drv-* (enforceMotionResolution return sớm nếu
+    # không — motion-resolution.js:20). Bản mẫu cũ dạy `{ quality: 540p, frames: 33 }`
+    # không kèm preset: quality bị bỏ qua âm thầm, và 720p sẽ ra 540p mà không ai biết.
+    # Nay make batch-validate chặn đúng dạng đó. KHÔNG gõ frames cùng preset drv-*:
+    # worker đo độ dài driver rồi tự đặt frames (linux.py:4142), số bạn gõ cũng mất.
+    motion: { preset: drv-5s, quality: 540p }
+
+  - id: vidu-chi-motion
+    pipeline: motion-enhance
+    inputs:
+      character: ../.smoke/nhanvat.jpeg
+      driver:    ../.smoke/dandong.mp4
+    enhance: { fpsInterp: "48" }

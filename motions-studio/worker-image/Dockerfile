@@ -59,7 +59,13 @@ RUN /opt/mtc-prebuilt/ComfyUI/venv/bin/pip install --no-cache-dir \
 RUN /opt/mtc-prebuilt/ComfyUI/venv/bin/pip install --no-cache-dir \
       -r /opt/mtc-prebuilt/ComfyUI/requirements.txt
 
-# 9 node = đúng COMFY_NODES của setup/setup-full.sh:62, và trùng PROFILE=full của
+# ALD 18/08/2026 - ComfyUI-WanAnimatePreprocess (ViTPose face-crop, node 26
+# PoseAndFaceDetection ở worker_runtime/linux.py:1657). THÊM Ở ĐÂY mới có tác dụng:
+# fix 3bb2246 (17/08) thêm nó vào comfyui/Dockerfile — file KHÔNG workflow nào build —
+# nên mọi pod RunPod vẫn âm thầm fallback DWPose pad128. Đo trên pod thật 18/08: node
+# vắng mặt, phải clone tay. Hai onnx (vitpose-l-wholebody, yolov10m) KHÔNG do node tải,
+# đã khai ở comfyui/models.txt + catalog-motion-transfer.json → nằm trên Network Volume.
+# 10 node = đúng COMFY_NODES của setup/setup-full.sh:62, và trùng PROFILE=full của
 # worker/runpod/Dockerfile.selfhosted:52-64. Hai image ghim CÙNG commit là cố ý: lệch nhau thì
 # một bên chạy được mà bên kia không, và không có gì để so.
 WORKDIR /opt/mtc-prebuilt/ComfyUI/custom_nodes
@@ -74,6 +80,7 @@ RUN set -eux; \
       "https://github.com/city96/ComfyUI-GGUF.git 6ea2651" \
       "https://github.com/Lightricks/ComfyUI-LTXVideo.git 3b9c5cd" \
       "https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler.git 4490bd1" \
+      "https://github.com/kijai/ComfyUI-WanAnimatePreprocess.git 0e0b6a2" \
     ; \
     for spec in "$@"; do \
       url="${spec% *}"; sha="${spec#* }"; d="$(basename "$url" .git)"; \
@@ -261,7 +268,8 @@ RUN set -eux; \
       || { echo "LỖI: thiếu /opt/mtc-prebuilt/comfy-models-seed — RUN mv models sau git clone ComfyUI đã bị xoá/đổi tên." >&2; exit 1; }; \
     for d in ComfyUI-WanVideoWrapper ComfyUI-KJNodes ComfyUI-VideoHelperSuite \
              comfyui_controlnet_aux ComfyUI-Frame-Interpolation ComfyUI-FlashVSR_Stable \
-             ComfyUI-GGUF ComfyUI-LTXVideo ComfyUI-SeedVR2_VideoUpscaler; do \
+             ComfyUI-GGUF ComfyUI-LTXVideo ComfyUI-SeedVR2_VideoUpscaler \
+             ComfyUI-WanAnimatePreprocess; do \
       test -d "/opt/mtc-prebuilt/ComfyUI/custom_nodes/$d" \
         || { echo "thiếu custom node: $d" >&2; exit 1; }; \
     done; \

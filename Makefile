@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help setup dev down clean gpu-preflight gpu-provision gpu-wait gpu-bootstrap gpu-fe gpu-up gpu-down gpu-destroy gpu-db-dump gpu-db-check gpu-status gpu-logs
+.PHONY: batch-coverage check-comfy-nodes help setup dev down clean gpu-preflight gpu-provision gpu-wait gpu-bootstrap gpu-fe gpu-up gpu-down gpu-destroy gpu-db-dump gpu-db-check gpu-status gpu-logs batch-test batch-params check-batch-params batch-scan batch-validate batch batch-clean
 
 help: ## Show this help
 	@echo "motion-clone — make targets:"
@@ -34,6 +34,36 @@ scrub-check: ## Gate: fail if any third-party credential or personal email is tr
 
 check-job-types: ## Gate: job type lists (image, setup profiles, dispatcher) must agree
 	@node scripts/check-job-types.mjs
+
+check-comfy-nodes: ## Gate: bốn danh sách custom node ComfyUI (2 image + 2 setup profile) phải khớp
+	@node scripts/check-comfy-nodes.mjs
+
+batch-test: ## Gate: unit test của batch runner (không cần pod, không tốn tiền)
+	@python3 -m unittest discover -s scripts/tests -p 'test_batch_*.py'
+
+batch-coverage: ## Dòng nào của batch runner KHÔNG test nào chạm tới (FULL=1 để xem hết)
+	@python3 scripts/batch_coverage.py $${FULL:+--full}
+
+batch-params: ## Liệt kê param một job type nhận (TYPE=motion|tryon|enhance)
+	@python3 scripts/batch_params.py $${TYPE:-}
+
+check-batch-params: ## Gate: scripts/batch-params.json phải khớp linux.py
+	@python3 scripts/batch_params.py --check
+
+batch-scan: ## Quét thư mục material → manifest nháp (DIR=~/materials MODE=pair|cross)
+	@test -n "$(DIR)" || { echo "cần DIR=~/materials (4 ngăn: characters outfits backgrounds drivers)"; exit 1; }
+	@python3 scripts/batch_scan.py --dir "$(DIR)" --mode "$${MODE:-pair}" $${OUT:+--out "$$OUT"} $${FORCE:+--force}
+
+batch-validate: ## Kiểm manifest mà KHÔNG tiêu GPU (FILE=batch/….yaml)
+	@test -n "$(FILE)" || { echo "cần FILE=batch/….yaml"; exit 1; }
+	@python3 scripts/batch_run.py --file "$(FILE)" --validate-only
+
+batch: ## Chạy một lô (FILE=batch/….yaml, RESUME=1 để chạy tiếp lô dở)
+	@test -n "$(FILE)" || { echo "cần FILE=batch/….yaml"; exit 1; }
+	@python3 scripts/batch_run.py --file "$(FILE)" $${RESUME:+--resume} $${FAIL_FAST:+--fail-fast}
+
+batch-clean: ## Xoá file trung gian của lô cũ, giữ _final (KEEP=3 mặc định, DRY=1 để xem trước)
+	@python3 scripts/batch_clean.py --keep $${KEEP:-3} $${DRY:+--dry-run}
 
 gpu-preflight: ## Check root .env is complete BEFORE you spend money on a pod
 	@bash scripts/gpu-preflight.sh

@@ -18,3 +18,9 @@ motions-upstream/
 # macOS junk
 .DS_Store
 ab-results/
+
+# batch runner — material và kết quả là dữ liệu cá nhân, không vào repo public
+out/
+batch/*.yaml
+!batch/example.yaml
+batch/*.state.json
