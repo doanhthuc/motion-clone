@@ -1,0 +1,197 @@
+import json, sys, tempfile, unittest
+from pathlib import Path
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from batchlib.client import JobError
+from batchlib.config import Settings
+from batchlib.manifest import load_manifest, load_state, state_path_for
+from batchlib.runner import batch_id_now, run_batch, write_index
+
+SETTINGS = Settings(domain="x.test", api_key="mk_test", instance_id="i-1")
+
+MANIFEST = """
+runs:
+  - id: runA
+    pipeline: motion-enhance
+    inputs:
+      character: char.jpg
+      driver: drv.mp4
+  - id: runB
+    pipeline: motion-enhance
+    inputs:
+      character: char.jpg
+      driver: drv.mp4
+"""
+
+
+def _fixture(tmp: Path, text: str = MANIFEST) -> Path:
+    (tmp / "char.jpg").write_bytes(b"x")
+    (tmp / "drv.mp4").write_bytes(b"x")
+    p = tmp / "b.yaml"
+    p.write_text(text, encoding="utf-8")
+    return p
+
+
+class FakePod:
+    """Pod giả: mỗi job xong ngay, output là byte đủ lớn."""
+
+    def __init__(self, fail_on: set[str] | None = None):
+        self.fail_on = fail_on or set()
+        self.submitted: list[tuple[str, dict, dict]] = []
+
+    def submit(self, _s, job_type, params, files):
+        self.submitted.append((job_type, params, {k: v.name for k, v in files.items()}))
+        return f"job-{len(self.submitted)}"
+
+    def poll(self, _s, job_id, *_a, **_k):
+        if job_id in self.fail_on:
+            raise JobError(f"job {job_id} error: pod giả cố ý hỏng")
+        return {"status": "done", "progress": 1}
+
+    def download(self, _s, _job_id, dest: Path, _min_bytes):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"v" * 200_000)
+        return 200_000
+
+
+def _run(tmp: Path, pod: FakePod, **kwargs):
+    manifest_path = kwargs.pop("manifest_path", None) or _fixture(tmp)
+    with mock.patch("batchlib.runner.submit_job", pod.submit), \
+         mock.patch("batchlib.runner.poll_job", pod.poll), \
+         mock.patch("batchlib.runner.download_output", pod.download):
+        return run_batch(
+            settings=SETTINGS,
+            manifest=load_manifest(manifest_path),
+            out_root=tmp / "out",
+            batch_id="2026-08-18-1430",
+            **kwargs,
+        )
+
+
+class TestBatchId(unittest.TestCase):
+    def test_dinh_dang_sap_xep_duoc_theo_thu_tu_chu(self):
+        import datetime
+        self.assertEqual(batch_id_now(datetime.datetime(2026, 8, 18, 14, 30)), "2026-08-18-1430")
+
+
+class TestChayThanhCong(unittest.TestCase):
+    def test_chay_het_va_de_ra_bo_cuc_dung(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            result = _run(tmp, FakePod())
+            out = tmp / "out" / "2026-08-18-1430"
+            self.assertEqual(result.done, ["runA", "runB"])
+            self.assertEqual(result.failed, {})
+            self.assertTrue((out / "_final" / "runA.mp4").is_file())
+            self.assertTrue((out / "_final" / "runB.mp4").is_file())
+            self.assertTrue((out / "_index.tsv").is_file())
+            self.assertTrue((out / "manifest.yaml").is_file())
+            self.assertTrue((out / "runs" / "runA" / "01-motion.mp4").is_file())
+            self.assertTrue((out / "runs" / "runA" / "02-enhance.mp4").is_file())
+            self.assertTrue((out / "runs" / "runA" / "run.json").is_file())
+
+    def test_final_la_hardlink_khong_ton_them_dia(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            _run(tmp, FakePod())
+            out = tmp / "out" / "2026-08-18-1430"
+            self.assertEqual((out / "_final" / "runA.mp4").stat().st_ino,
+                             (out / "runs" / "runA" / "02-enhance.mp4").stat().st_ino)
+
+    def test_output_chang_truoc_thanh_input_chang_sau(self):
+        with tempfile.TemporaryDirectory() as d:
+            pod = FakePod()
+            _run(Path(d), pod)
+            enhance_calls = [c for c in pod.submitted if c[0] == "enhance"]
+            self.assertTrue(enhance_calls)
+            self.assertEqual(list(enhance_calls[0][2]), ["input"])
+            self.assertTrue(enhance_calls[0][2]["input"].startswith("01-motion"))
+
+    def test_manifest_goc_khong_bi_sua(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            p = _fixture(tmp)
+            before = p.read_text(encoding="utf-8")
+            _run(tmp, FakePod(), manifest_path=p)
+            self.assertEqual(p.read_text(encoding="utf-8"), before)
+
+    def test_run_json_ghi_param_that_da_gui(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            _run(tmp, FakePod())
+            data = json.loads((tmp / "out" / "2026-08-18-1430" / "runs" / "runA" / "run.json")
+                              .read_text(encoding="utf-8"))
+            self.assertIn("motion", data["stages"])
+            self.assertIn("params_sent", data["stages"]["motion"])
+            self.assertIn("job_id", data["stages"]["motion"])
+
+
+class TestHong(unittest.TestCase):
+    def test_mot_run_hong_khong_giet_ca_lo(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            result = _run(tmp, FakePod(fail_on={"job-1"}))
+            self.assertEqual(result.done, ["runB"])
+            self.assertIn("runA", result.failed)
+
+    def test_fail_fast_thi_dung_ngay(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            result = _run(tmp, FakePod(fail_on={"job-1"}), fail_fast=True)
+            self.assertEqual(result.done, [])
+            self.assertEqual(list(result.failed), ["runA"])
+
+    def test_hong_van_ghi_state_de_resume(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            p = _fixture(tmp)
+            _run(tmp, FakePod(fail_on={"job-1"}), manifest_path=p)
+            state = load_state(state_path_for(p))
+            self.assertEqual(state["runs"]["runA"]["status"], "error")
+            self.assertEqual(state["runs"]["runB"]["status"], "done")
+
+
+class TestResume(unittest.TestCase):
+    def test_resume_bo_qua_run_da_done(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            p = _fixture(tmp)
+            _run(tmp, FakePod(), manifest_path=p)
+            pod2 = FakePod()
+            _run(tmp, pod2, manifest_path=p, resume=True)
+            self.assertEqual(pod2.submitted, [])
+
+    def test_resume_chi_chay_lai_chang_con_thieu(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            p = _fixture(tmp)
+            _run(tmp, FakePod(fail_on={"job-2"}), manifest_path=p)   # motion xong, enhance hỏng
+            pod2 = FakePod()
+            _run(tmp, pod2, manifest_path=p, resume=True)
+            self.assertTrue(all(c[0] == "enhance" for c in pod2.submitted),
+                            f"chỉ được chạy lại enhance, nhưng chạy: {[c[0] for c in pod2.submitted]}")
+
+    def test_khong_resume_thi_chay_lai_tu_dau(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            p = _fixture(tmp)
+            _run(tmp, FakePod(), manifest_path=p)
+            pod2 = FakePod()
+            _run(tmp, pod2, manifest_path=p, resume=False)
+            self.assertEqual(len(pod2.submitted), 4)
+
+
+class TestIndex(unittest.TestCase):
+    def test_index_tsv_co_header_va_mot_dong_moi_run(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            _run(tmp, FakePod())
+            lines = (tmp / "out" / "2026-08-18-1430" / "_index.tsv").read_text(
+                encoding="utf-8").strip().splitlines()
+            self.assertTrue(lines[0].startswith("run\t"))
+            self.assertEqual(len(lines), 3)
+
+
+if __name__ == "__main__":
+    unittest.main()

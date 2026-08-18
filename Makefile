@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help setup dev down clean gpu-preflight gpu-provision gpu-wait gpu-bootstrap gpu-fe gpu-up gpu-down gpu-destroy gpu-db-dump gpu-db-check gpu-status gpu-logs batch-test batch-params check-batch-params batch-scan
+.PHONY: help setup dev down clean gpu-preflight gpu-provision gpu-wait gpu-bootstrap gpu-fe gpu-up gpu-down gpu-destroy gpu-db-dump gpu-db-check gpu-status gpu-logs batch-test batch-params check-batch-params batch-scan batch-validate batch
 
 help: ## Show this help
 	@echo "motion-clone — make targets:"
@@ -47,6 +47,14 @@ check-batch-params: ## Gate: scripts/batch-params.json phải khớp linux.py
 batch-scan: ## Quét thư mục material → manifest nháp (DIR=~/materials MODE=pair|cross)
 	@test -n "$(DIR)" || { echo "cần DIR=~/materials (4 ngăn: characters outfits backgrounds drivers)"; exit 1; }
 	@python3 scripts/batch_scan.py --dir "$(DIR)" --mode "$${MODE:-pair}" $${OUT:+--out "$$OUT"} $${FORCE:+--force}
+
+batch-validate: ## Kiểm manifest mà KHÔNG tiêu GPU (FILE=batch/….yaml)
+	@test -n "$(FILE)" || { echo "cần FILE=batch/….yaml"; exit 1; }
+	@python3 scripts/batch_run.py --file "$(FILE)" --validate-only
+
+batch: ## Chạy một lô (FILE=batch/….yaml, RESUME=1 để chạy tiếp lô dở)
+	@test -n "$(FILE)" || { echo "cần FILE=batch/….yaml"; exit 1; }
+	@python3 scripts/batch_run.py --file "$(FILE)" $${RESUME:+--resume} $${FAIL_FAST:+--fail-fast}
 
 gpu-preflight: ## Check root .env is complete BEFORE you spend money on a pod
 	@bash scripts/gpu-preflight.sh
