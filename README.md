@@ -103,6 +103,9 @@ im lặng. Cách nhận ra: `ps -o pid,lstart -p $(pgrep -f batch_mcp.py)` cho t
 khởi động; nó cũ hơn lần sửa của bạn là đúng cái bẫy này. `make batch-mcp-check`
 KHÔNG bắt được — nó chạy một process mới nên luôn thấy code mới.
 
+**Hướng dẫn dùng đầy đủ — cả CLI và MCP, kèm bảng param và bốn cái bẫy im lặng:
+[`docs/batch-runner.md`](docs/batch-runner.md).**
+
 Thiết kế và các đánh đổi: `docs/superpowers/specs/2026-08-18-batch-runner-design.md` (MCP ở §9).
 
 ## Nguồn gốc code
