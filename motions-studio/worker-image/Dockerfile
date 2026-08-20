@@ -88,6 +88,20 @@ RUN set -eux; \
       git -C "$d" checkout "$sha"; \
     done
 
+# Vá LTXVideo: shim kornia 'pad' (kornia mới bỏ 'pad' khỏi geometry.transform.pyramid →
+# pyramid_blending import lỗi làm CẢ pack LTXVideo không nạp, ComfyUI chỉ log WARNING rồi bỏ
+# qua node — job không dùng LTXVideo vẫn chạy bình thường, nhưng Teaser motionMode='ltx' âm
+# thầm fallback Ken Burns vì thiếu node thật (linux.py:2463). Cùng shim với setup/setup-pm2.sh:744-748,
+# ghim vào image thay vì chỉ vá lúc pod tự cài để prebuilt image không mang bug này nữa.
+RUN d=ComfyUI-LTXVideo/__init__.py; \
+    { printf '%s\n' \
+        '# ALD kornia pad shim (14/06/2026) - kornia moi bo pad khoi geometry.transform.pyramid' \
+        'try:' \
+        '    import kornia.geometry.transform.pyramid as _kp, torch.nn.functional as _F' \
+        '    if not hasattr(_kp, "pad"): _kp.pad = _F.pad' \
+        'except Exception: pass'; \
+      cat "$d"; } > "$d.tmp" && mv "$d.tmp" "$d"
+
 # KHÔNG `|| true`: lỗi pip PHẢI làm vỡ build. Image thiếu deps mà build vẫn xanh còn tệ hơn build đỏ.
 # Hai bẫy đã biết, cả hai đã trả giá bằng một vòng chạy (Dockerfile.selfhosted:72-85):
 #   - ComfyUI-FlashVSR_Stable (f7f55ba): requirements.txt có dòng

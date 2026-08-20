@@ -70,6 +70,21 @@ RUN set -eux; \
       git clone --filter=blob:none "$url" "$d"; \
       git -C "$d" checkout "$sha"; \
     done
+
+# Vá LTXVideo (chỉ PROFILE=full mới có thư mục): shim kornia 'pad' — kornia mới bỏ 'pad' khỏi
+# geometry.transform.pyramid → pyramid_blending import lỗi làm CẢ pack LTXVideo không nạp (ComfyUI
+# chỉ WARNING rồi bỏ qua node). Cùng shim với setup/setup-pm2.sh:744-748 và worker-image/Dockerfile —
+# ghim vào image cho khớp, đừng để một image có vá một image không.
+RUN d=ComfyUI-LTXVideo/__init__.py; \
+    if [ -f "$d" ]; then \
+      { printf '%s\n' \
+          '# ALD kornia pad shim (14/06/2026) - kornia moi bo pad khoi geometry.transform.pyramid' \
+          'try:' \
+          '    import kornia.geometry.transform.pyramid as _kp, torch.nn.functional as _F' \
+          '    if not hasattr(_kp, "pad"): _kp.pad = _F.pad' \
+          'except Exception: pass'; \
+        cat "$d"; } > "$d.tmp" && mv "$d.tmp" "$d"; \
+    fi
 # KHÔNG `|| true` ở đây nữa: lỗi pip PHẢI làm vỡ build — image thiếu deps mà build vẫn xanh còn tệ hơn
 # một build đỏ (đã dính đúng 2 node dưới đây, verify qua GitHub API commit đúng ghim ở trên 01/08/2026):
 #
