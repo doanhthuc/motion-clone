@@ -228,7 +228,9 @@ def translate_vn_to_en(text: str, key: str, base_url: str = GEMINI_API_BASE) -> 
             "systemInstruction": {"parts": [{"text": sys_msg}]},
             "generationConfig": {"temperature": 0.1},
         }, 60)
-    except JobError:
+    except Exception:
+        # Never raise: ANY error (JobError, json.JSONDecodeError, AttributeError on malformed
+        # response, etc.) returns original text. Matches fail-safe contract of linux.py:88-115.
         return text
     for cand in (data.get("candidates") or []):
         for part in ((cand.get("content") or {}).get("parts") or []):

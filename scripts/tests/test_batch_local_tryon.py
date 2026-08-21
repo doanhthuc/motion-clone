@@ -30,6 +30,15 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if mode == "malformed_json":
+            # Return 200 with non-JSON body — tests robustness of error handling
+            self.send_response(200)
+            body = b"not json at all"
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if mode == "no_candidates":
             payload = {"candidates": []}
         elif mode == "image":
@@ -111,6 +120,13 @@ class TestTranslateVnToEn(GeminiServerCase):
 
     def test_loi_mang_thi_tra_nguyen_van_khong_raise(self):
         GEMINI_STATE["mode"] = "http_error"
+        out = lt.translate_vn_to_en("giữ nguyên vòng cổ", "AIzafake", base_url=self.base_url)
+        self.assertEqual(out, "giữ nguyên vòng cổ")
+
+    def test_malformed_json_tra_nguyen_van_khong_raise(self):
+        # Regression test for Critical issue: 200 response with non-JSON body must
+        # NOT raise json.JSONDecodeError; translate_vn_to_en contract is "never raise"
+        GEMINI_STATE["mode"] = "malformed_json"
         out = lt.translate_vn_to_en("giữ nguyên vòng cổ", "AIzafake", base_url=self.base_url)
         self.assertEqual(out, "giữ nguyên vòng cổ")
 
