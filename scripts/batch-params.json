@@ -83,6 +83,16 @@
       ]
     }
   },
+  "character-swap": {
+    "extra": {},
+    "api": {},
+    "allowed": {
+      "engine": [
+        "wananimate",
+        "scail2"
+      ]
+    }
+  },
   "enhance": {
     "api": {},
     "extra": {

@@ -8,6 +8,7 @@ Tên field phải khớp đúng cái worker thật đọc — đã đối chiế
              inputs.get("background") or bg or scene
   motion   scripts/pod-smoke.sh:294-295        -F ref=@… -F motion=@…
   enhance  linux.py:9544                       inputs.get("input") or video or motion or image
+  character-swap  linux.py run_character_swap    inputs.ref (ảnh người mẫu) + inputs.video (video nguồn)
 
 Gõ sai tên field ở đây KHÔNG gây lỗi HTTP: api/src/routes/jobs.js:118-129 nhận
 mọi fieldname và cứ thế ghi vào inputs. Worker mới là chỗ phát hiện thiếu, và nó
@@ -48,6 +49,12 @@ STAGES: dict[str, Stage] = {
                 "motion": "material:driver"},
         output_ext=".mp4", min_bytes=100_000, timeout_min=60,
     ),
+    "character-swap": Stage(
+        name="character-swap", job_type="character-swap",
+        inputs={"ref": "prev|material:character",
+                "video": "material:driver"},
+        output_ext=".mp4", min_bytes=100_000, timeout_min=60,
+    ),
     # enhance 1080p60 nội suy RIFE ×4 rồi encode lại — luôn lâu hơn motion sinh ra nó.
     "enhance": Stage(
         name="enhance", job_type="enhance",
@@ -59,6 +66,8 @@ STAGES: dict[str, Stage] = {
 PIPELINES: dict[str, list[str]] = {
     "motion-enhance": ["motion", "enhance"],
     "tryon-motion-enhance": ["tryon", "motion", "enhance"],
+    "character-swap-enhance": ["character-swap", "enhance"],
+    "tryon-character-swap-enhance": ["tryon", "character-swap", "enhance"],
 }
 
 

@@ -22,6 +22,12 @@ class TestKhaiBao(unittest.TestCase):
         self.assertEqual(STAGES["motion"].job_type, "motion")
         self.assertEqual(STAGES["enhance"].job_type, "enhance")
 
+    def test_character_swap_stage_fieldnames(self):
+        # linux.py run_character_swap: inputs.ref (ảnh) + inputs.video (video nguồn)
+        stage = STAGES["character-swap"]
+        self.assertEqual(stage.job_type, "character-swap")
+        self.assertEqual(set(stage.inputs), {"ref", "video"})
+
 
 class TestRoles(unittest.TestCase):
     def test_tryon_motion_enhance_can_character_outfit_driver(self):
@@ -59,6 +65,13 @@ class TestRoles(unittest.TestCase):
         with self.assertRaises(PipelineError) as cm:
             required_roles("khong-co-that")
         self.assertIn("motion-enhance", str(cm.exception))
+
+    def test_character_swap_enhance_roles(self):
+        self.assertEqual(required_roles("character-swap-enhance"), {"character", "driver"})
+
+    def test_tryon_character_swap_enhance_roles(self):
+        self.assertEqual(required_roles("tryon-character-swap-enhance"),
+                          {"character", "outfit", "driver"})
 
 
 if __name__ == "__main__":
