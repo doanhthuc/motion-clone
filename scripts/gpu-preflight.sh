@@ -45,9 +45,8 @@ check() {
 echo "Pod rental"
 check GPU_PROVIDER required "vast | runpod — picks the CLI make gpu-provision/gpu-up/gpu-down use" 1
 check GPU          required "card filter — vast uses RTX_5090, RunPod uses 'NVIDIA GeForce RTX 5090'. Needs >=24GB VRAM" 1
-# Không blocking: để trống là một lựa chọn hợp lệ. Nhưng phải NÓI ra — stock 5090 ở EU-RO-1 đã tụt
-# Low (đo 10/08) và volume không dời được datacenter, nên hết máy là đứng cả phiên. Xem docs#gpu-4090.
-check GPU_FALLBACK recommended "card thuê khi GPU chính hết máy. Trống = provision dừng luôn. 4090 đã đo chạy được (docs/gpu-pod.md#gpu-4090)" 1
+# stock 5090 ở EU-RO-1 đã tụt Low (đo 10/08) và volume không dời được datacenter, nên hết máy là
+# đứng cả phiên — không còn card dự phòng tự động (đã bỏ GPU_FALLBACK), phải đổi GPU trong .env tay.
 check DISK          required "GB — DEPLOY.md minimum for the motion-transfer box is 120" 1
 check MAX_DPH       required "\$/hour ceiling so a search never surprises you" 1
 # Lưới chống quên tắt. In ra ở đây vì đây là khối "tiền", và vì im lặng về nó nghĩa là người dùng
@@ -121,7 +120,7 @@ resolve_deploy_shape
 
 case "$COMPUTE_TYPE" in
   cpu) ct_effect="box KHÔNG GPU (\$0,06/giờ ở 2 vCPU) — GPU do serverless lo, trả theo giây" ;;
-  *)   ct_effect="box CÓ GPU ($(get GPU)) — \$$rate/giờ, dùng được cho worker local$( [ -n "$(get GPU_FALLBACK)" ] && printf ' · dự phòng %s' "$(get GPU_FALLBACK)" )" ;;
+  *)   ct_effect="box CÓ GPU ($(get GPU)) — \$$rate/giờ, dùng được cho worker local" ;;
 esac
 printf "  ${G}✓${X} %-22s ${D}%s${X}\n" "COMPUTE_TYPE" "$COMPUTE_TYPE"
 printf "    %-20s ${D}%s${X}\n" "" "$ct_effect"

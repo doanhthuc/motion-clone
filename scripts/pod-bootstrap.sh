@@ -58,6 +58,10 @@ MODELS_MIN_GB="$(env_get MODELS_MIN_GB)"
 # ALD 05/08/2026 - Khoá JOB_TYPES hẹp hơn profile khai. Profile nói phần mềm chạy được gì;
 # biến này nói VOLUME NÀY có model cho gì. Bỏ trống = dùng nguyên JOB_TYPE của profile.
 JOB_TYPES_OVERRIDE="$(env_get JOB_TYPES_OVERRIDE)"
+# ALD 20/08/2026 - fallback key/model Gemini (try-on provider='gemini') — khỏi SSH tay mỗi lần dựng
+# pod mới. Cả hai optional: trống thì lib-feature.sh không ghi dòng vào .env trên pod.
+GEMINI_API_KEY="$(env_get GEMINI_API_KEY)"
+GEMINI_IMAGE_MODEL="$(env_get GEMINI_IMAGE_MODEL)"
 
 # ── Hình dạng deploy: cài gì, và ai chạy job ─────────────────────────────────
 # Hai câu hỏi độc lập, hai biến. Cách suy ra nằm ở scripts/lib-deploy-shape.sh vì
@@ -172,6 +176,8 @@ MTC_PREBUILT='${MTC_PREBUILT:-0}' \
 ${JOB_TYPES_OVERRIDE:+JOB_TYPES_OVERRIDE='$JOB_TYPES_OVERRIDE'} \
 ${POD_VOLUME:+POD_VOLUME='$POD_VOLUME'} \
 ${MOTION_VRAM_MAX_FRAMES:+MOTION_VRAM_MAX_FRAMES='$MOTION_VRAM_MAX_FRAMES'} \
+${GEMINI_API_KEY:+GEMINI_API_KEY='$GEMINI_API_KEY'} \
+${GEMINI_IMAGE_MODEL:+GEMINI_IMAGE_MODEL='$GEMINI_IMAGE_MODEL'} \
 ./$SETUP_SCRIPT" < /dev/null | tee "$LOG"
 STATUS=${PIPESTATUS[0]}
 [ "$STATUS" -eq 0 ] || die "$SETUP_SCRIPT exited $STATUS — full log: $LOG"

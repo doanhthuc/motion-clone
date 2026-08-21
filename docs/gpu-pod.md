@@ -616,10 +616,14 @@ sang card to thì tự lấy lại đường nhanh. Ghi đè tay: đặt `MOTION
 Nhịp dùng thật (0,85 giờ/ngày, và pod GPU được chọn chính vì "job chạy ngay" tức GPU rỗi nhiều) cho
 `f` khoảng 0,3-0,5 → 4090 rẻ hơn 7-14%, tức **$2-4/tháng**. Không đáng đổi vì tiền.
 
-**Kết luận: giữ 5090 làm chính, 4090 làm dự phòng.** Lý do là *stock*, không phải giá — mất 3,5 phút
-mỗi video để tiết kiệm $3/tháng thì không đáng, nhưng khi EU-RO-1 hết 5090 thì đã biết chắc 4090
-chạy được. `GPU_FALLBACK` trong `.env` làm việc xoay đó tự động, và **chỉ** xoay khi RunPod báo hết
-máy — mọi lỗi create khác vẫn nổi lên nguyên vẹn.
+**Kết luận: giữ 5090 làm chính, 4090 là lựa chọn đã đo chạy được khi cần đổi tay.** Lý do là *stock*,
+không phải giá — mất 3,5 phút mỗi video để tiết kiệm $3/tháng thì không đáng, nhưng khi EU-RO-1 hết
+5090 thì đã biết chắc 4090 chạy được.
+
+`pod-provision.sh` **không còn tự xoay GPU** (đã bỏ `GPU_FALLBACK`) — hết máy `$GPU` là dừng luôn,
+không âm thầm đổi card. Muốn dùng 4090 thì tự đặt `GPU=NVIDIA GeForce RTX 4090` trong `.env` rồi
+chạy lại `make gpu-provision`; nhớ card <31GB cần `MOTION_VRAM_MAX_FRAMES=0` (setup tự dò qua
+`nvidia-smi`, xem phần trên).
 
 <a id="reusing-an-existing-tunnel-token"></a>
 ## Reusing an existing tunnel token
