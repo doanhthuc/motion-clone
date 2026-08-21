@@ -1640,6 +1640,48 @@ Hai điều tưởng đúng lúc thiết kế nhưng đo thật thì sai:
 ---
 
 <a id="smoke"></a>
+## Character swap — đo thật trên RTX 5090, 21-22/08/2026
+
+Phiên nghiệm thu job type `character-swap` (thay nhân vật trong video bằng người mẫu trong ảnh,
+GIỮ background của video). Pod 5090 32GB tại EU-RO-1, image prebuilt, model đã preload sẵn.
+
+| Engine | Preset | Khung | Frame | Độ dài ra | Thời gian render |
+|---|---|---|---|---|---|
+| `wananimate` (Wan2.2-Animate Mix) | drv-5s | 544×960 | 150 @30fps | **5.0s** | ~2 phút |
+| `wananimate` | drv-15s | 544×960 | 450 @30fps | **15.0s** | ~7 phút |
+| `scail2` (SCAIL-2 fp8_scaled) | drv-5s | 544×960 | 81 @30fps | **2.7s** | ~3,5 phút |
+
+VRAM đỉnh đo bằng `nvidia-smi` lúc sampling: **25,3/31,4 GB** (wananimate 5s, 544×960/150f — SAM3
+1,7GB nạp trước rồi nhả, không cộng dồn với Wan). Clip 15s (450f > trần 250f) rơi vào nhánh
+offload của VRAM-gate: model xuống RAM, block_swap=30, VRAM chỉ còn **14,1 GB** — chậm hơn nhưng
+an toàn. SCAIL-2 fp8_scaled nạp 16,8GB staged, vừa 32GB.
+
+Clip 15s chạy 6 window (`Frames 0-81`, `80-161`, `160-241`, …), mỗi window ~40 giây. Kiểm frame
+430/450 (14,3 giây): identity, trang phục và background **không trôi** — windowing autoregressive
+của Wan giữ ổn định suốt clip.
+
+**Trần 81 frame của scail2 là thật và thấy ngay ở output**: `WanSCAILToVideo` train theo chunk
+81 frame, `build_scail2_swap_workflow` cap cứng ở đó, nên ở 30fps mọi clip đều ra đúng 2,7 giây
+bất kể driver dài bao nhiêu. Muốn dài hơn phải nối segment (Base + Extend, overlap 5 frame) —
+chưa làm. Vì vậy **wananimate là engine mặc định cho clip dài**; scail2 chỉ để A/B chất lượng.
+
+Chất lượng (3 cặp ảnh×driver, xem bằng mắt): cả hai giữ đúng background + camera của video và
+thay đúng identity/trang phục của ảnh mẫu. Khác biệt: wananimate **bịa thêm vật thể** trong tay
+nhân vật ở một clip (bó hoa không có trong cả hai input) — nghi do `BlockifyMask` 32px nới mask
+quá rộng quanh bàn tay; scail2 không dính lỗi này và nét mặt sạch hơn.
+
+Cạm bẫy đã trả giá trong phiên này (đã vá, xem commit `b0b33bc`):
+
+- **`ecosystem.config.cjs` là danh sách JOB_TYPES thứ SÁU** và `scripts/check-job-types.mjs` không
+  đọc nó. Năm danh sách kia xanh hết mà worker vẫn dựng với list cũ → job `character-swap` nằm
+  `queued` im lặng, không log, không lỗi. PM2 gắn cứng dòng đó và **cố ý không đọc `.env`**, nên
+  sửa `JOB_TYPES` trong `.env` trên pod cũng vô ích. Nay gate đã nhìn cả file này.
+- **rsync của `make gpu-bootstrap` treo cứng** khi upload từ máy dev về EU-RO-1 chậm (đo thật:
+  ~28 KB/s, 15 phút đẩy được 1,2MB rồi đứng hẳn). Đường vòng nhanh hơn nhiều: push nhánh lên
+  GitHub rồi `git clone` TRÊN POD (tải phía pod nhanh — cùng đường mà preload kéo 25GB trong 3
+  phút), copy `motions-studio/.` vào `~/motion-backend/`, rồi chạy lại `make gpu-bootstrap` (rsync
+  lúc đó không còn gì để truyền nên đi thẳng sang pod-volume + setup).
+
 ## Kiểm chứng sau khi dựng: `make gpu-smoke`
 
 `make gpu-status` chỉ curl `/health`. Mà `/health` là một handler tĩnh
