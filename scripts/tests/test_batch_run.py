@@ -458,5 +458,83 @@ class TestMatKetNoiGiuaChungLopCloudflare(unittest.TestCase):
             self.assertIn("RESUME=1", msg)
 
 
+MANIFEST_TRYON_GEMINI = """
+runs:
+  - id: runA
+    pipeline: tryon-motion-enhance
+    inputs:
+      character: char.jpg
+      outfit: outfit.jpg
+      driver: drv.mp4
+    tryon: { provider: gemini }
+"""
+
+
+def _manifest_tryon_gemini(tmp: Path) -> Path:
+    (tmp / "char.jpg").write_bytes(b"x")
+    (tmp / "outfit.jpg").write_bytes(b"x")
+    (tmp / "drv.mp4").write_bytes(b"x")
+    p = tmp / "b.yaml"
+    p.write_text(MANIFEST_TRYON_GEMINI, encoding="utf-8")
+    return p
+
+
+class TestMainPhaA(unittest.TestCase):
+    """Try-on local chạy TRƯỚC preflight — và pod chưa sẵn sàng thì báo rõ đã xong Pha A."""
+
+    def test_khong_co_pod_sau_khi_xong_pha_a_thi_bao_ro_va_khong_goi_run_batch(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            p = _manifest_tryon_gemini(tmp)
+
+            def fake_run_local_tryon(run, params, settings_, out_path):
+                out_path.write_bytes(b"fake")
+                return 2, out_path.stat().st_size
+
+            err = io.StringIO()
+            with mock.patch("batch_run.load_settings",
+                            return_value=Settings(domain="pod.test", api_key="mk_test",
+                                                  instance_id="", gemini_api_key="AIza" + "x" * 35)), \
+                 mock.patch("batch_run.health_ok", return_value=False), \
+                 mock.patch("batchlib.runner.run_local_tryon", fake_run_local_tryon), \
+                 mock.patch("batch_run.run_batch") as m_run_batch, \
+                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                code = batch_run.main(["--file", str(p)])
+            self.assertEqual(code, 1)
+            self.assertIn("gpu-provision", err.getvalue())
+            self.assertIn("RESUME=1", err.getvalue())
+            m_run_batch.assert_not_called()
+
+    def test_pod_san_sang_thi_chay_tiep_ca_pha_b_voi_state_da_chuan_bi(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            p = _manifest_tryon_gemini(tmp)
+
+            def fake_run_local_tryon(run, params, settings_, out_path):
+                out_path.write_bytes(b"fake")
+                return 2, out_path.stat().st_size
+
+            captured: dict = {}
+
+            def fake_run_batch(**kwargs):
+                captured.update(kwargs)
+                return BatchResult(batch_id=kwargs["batch_id"],
+                                   out_dir=kwargs.get("prepared", (tmp / "out" / kwargs["batch_id"],))[0],
+                                   done=["runA"])
+
+            with mock.patch("batch_run.load_settings",
+                            return_value=Settings(domain="pod.test", api_key="mk_test",
+                                                  instance_id="i-1", gemini_api_key="AIza" + "x" * 35)), \
+                 mock.patch("batch_run.health_ok", return_value=True), \
+                 mock.patch("batchlib.runner.run_local_tryon", fake_run_local_tryon), \
+                 mock.patch("batch_run.run_batch", fake_run_batch), \
+                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                code = batch_run.main(["--file", str(p)])
+            self.assertEqual(code, 0)
+            self.assertIn("prepared", captured)
+            out_dir, state, _state_file = captured["prepared"]
+            self.assertEqual(state["runs"]["runA"]["stages"]["tryon"]["status"], "done")
+
+
 if __name__ == "__main__":
     unittest.main()
