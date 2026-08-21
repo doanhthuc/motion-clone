@@ -1715,6 +1715,42 @@ def build_wan_workflow(ref_name, motion_name, p, prefix="motion-out"):
         wf["110"]["inputs"]["images"] = ["105", 0]
     return wf
 
+
+def _apply_swap_to_wan_workflow(wf, p):
+    """Character-swap engine wananimate: chuyển graph animation → replacement (Mix) mode.
+
+    Mix mode giữ background CỦA VIDEO: bg_images = frame driver tô đen vùng người, mask = vùng
+    người. Chuỗi mask theo example kijai wanvideo_WanAnimate_example_01.json (Grow 10 → Blockify 32),
+    thay SAM2+PointsEditor interactive bằng SAM3 core text-prompt để chạy headless.
+    Chỉ thêm node 200-206 + 2 input của node 81; pose/face/sampler của motion giữ nguyên.
+    """
+    sam3_prompt = str(p.get("sam3Prompt") or p.get("sam3_prompt") or "person").strip() or "person"
+    wf["200"] = {"class_type": "CheckpointLoaderSimple", "inputs": {
+        "ckpt_name": "sam3.1_multiplex_fp16.safetensors"}}
+    wf["201"] = {"class_type": "CLIPTextEncode", "inputs": {"clip": ["200", 1], "text": sam3_prompt}}
+    wf["202"] = {"class_type": "SAM3_VideoTrack", "inputs": {
+        "images": ["12", 0], "model": ["200", 0], "conditioning": ["201", 0],
+        "detection_threshold": _motion_float(p, "sam3Threshold", "sam3_threshold", default=0.5),
+        "max_objects": _motion_int(p, "sam3MaxObjects", "sam3_max_objects", default=4),
+        "detect_interval": _motion_int(p, "sam3DetectInterval", "sam3_detect_interval", default=1)}}
+    wf["203"] = {"class_type": "SAM3_TrackToMask", "inputs": {
+        "track_data": ["202", 0],
+        # rỗng = union mọi người trong video; "0" = chỉ người đầu (chọn khi video đông người)
+        "object_indices": str(p.get("maskIndices") or p.get("mask_indices") or "")}}
+    wf["204"] = {"class_type": "GrowMaskWithBlur", "inputs": {
+        "mask": ["203", 0],
+        "expand": _motion_int(p, "maskGrow", "mask_grow", default=10),
+        "incremental_expandrate": 0.0, "tapered_corners": True, "flip_input": False,
+        "blur_radius": 0.0, "lerp_alpha": 1.0, "decay_factor": 1.0, "fill_holes": False}}
+    wf["205"] = {"class_type": "BlockifyMask", "inputs": {
+        "masks": ["204", 0],
+        "block_size": _motion_int(p, "maskBlockify", "mask_blockify", default=32)}}
+    wf["206"] = {"class_type": "DrawMaskOnImage", "inputs": {
+        "image": ["12", 0], "mask": ["205", 0], "color": "0, 0, 0"}}
+    wf["81"]["inputs"]["bg_images"] = ["206", 0]
+    wf["81"]["inputs"]["mask"] = ["205", 0]
+    return wf
+
 # ───────────────────────── Motion: normalize params (workflow) + RIFE 60fps ─────────────────────────
 # ALD 05/06/2026 - Luồng WORKFLOW gửi config THÔ (preset/camelCase/aspectRatio/quality) — KHÁC luồng tool
 # standalone (server proxy đã expand preset→params). Nếu không normalize ở đây, run_motion rơi hết về default
