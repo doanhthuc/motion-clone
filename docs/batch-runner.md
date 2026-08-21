@@ -299,6 +299,18 @@ mất, không tốn Gemini lần hai khi `RESUME=1`.
 `provider: qwen` (tự host, GPU thật) không đổi gì — vẫn cần pod như trước, chạy chung lô được với
 run dùng `provider: gemini`.
 
+**Ngoại lệ:** `cleanOnly` (hay `clean_only`) bật thì run đó **vẫn cần pod**, dù `provider: gemini` —
+đó là "làm sạch ảnh, KHÔNG thay đồ", pod luôn làm bằng Qwen img2img chứ không đụng tới provider.
+
+**Khác biệt đã biết — local KHÔNG autocrop ảnh sản phẩm.** Trên pod, ảnh outfit được tách nền + cắt
+sát món đồ trước khi gọi Gemini (`TRYON_PRODUCT_AUTOCROP`, mặc định **bật**) để sửa ca "sản phẩm quá
+nhỏ, mẫu quá to". Đường local gửi ảnh outfit **nguyên bản**: dịch vụ tách nền chỉ có trên pod, không
+gọi được từ máy bạn. Hệ quả: **cùng một manifest có thể ra ảnh khác nhau** (bố cục có thể xấu hơn)
+tuỳ chạy local hay chạy trên pod — rõ nhất khi món đồ nhỏ so với khung ảnh. Cách né: crop sẵn ảnh
+outfit cho món đồ lấp đầy khung trước khi đưa vào lô.
+
+`LOCAL_TRYON_WORKERS` (env, mặc định `4`): số job Gemini bay cùng lúc. Hạ xuống nếu ăn 429.
+
 Lý do thiết kế: [`superpowers/specs/2026-08-21-batch-local-tryon-design.md`](superpowers/specs/2026-08-21-batch-local-tryon-design.md).
 
 ---

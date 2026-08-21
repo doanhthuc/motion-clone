@@ -362,7 +362,9 @@ def build_tools(*, ctx: Ctx | None = None) -> dict[str, Tool]:
              description="Chạy cả lô trên pod, nền (sống qua phiên chat), trả pid + file log. "
                          "TIÊU TIỀN GPU — mỗi run mất vài phút GPU. Validate trước, sai thì không "
                          "chạy gì. Pod đang dừng thì báo lỗi chứ không tự bật, trừ khi "
-                         "allow_start=true (bật pod là bắt đầu tính tiền).",
+                         "allow_start=true (bật pod là bắt đầu tính tiền). "
+                         "Run nào dùng try-on provider gemini thì TIÊU QUOTA API GEMINI NGAY, "
+                         "trước cả khi pod được kiểm — allow_start=false không chặn được phần đó.",
              schema={"type": "object", "properties": {
                  "file": _FILE,
                  "resume": {"type": "boolean",

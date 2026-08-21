@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import os
 import subprocess
 import sys
 import urllib.error
@@ -138,10 +139,19 @@ def main(argv: list[str]) -> int:
     if args.resume:
         print(f"  {decision.note}")
 
+    # LOCAL_TRYON_WORKERS (spec §4): số job Gemini bay cùng lúc ở Pha A — tham số VẬN
+    # HÀNH phía client, không phải của manifest. Hạ xuống khi mạng yếu hoặc key bị bóp
+    # quota (429), nâng lên khi chạy lô lớn trên đường truyền tốt.
+    try:
+        pool_size = max(1, int(os.environ.get("LOCAL_TRYON_WORKERS", "4")))
+    except ValueError:
+        print("✗ LOCAL_TRYON_WORKERS phải là số nguyên (mặc định 4)", file=sys.stderr)
+        return 1
+
     try:
         local_result = run_local_phase(settings=settings, manifest=manifest, out_root=ROOT / "out",
                                        batch_id=decision.batch_id, resume=decision.resumed,
-                                       fail_fast=args.fail_fast)
+                                       fail_fast=args.fail_fast, pool_size=pool_size)
     except ConfigError as exc:
         print(f"✗ {exc}", file=sys.stderr)
         return 1
@@ -151,6 +161,16 @@ def main(argv: list[str]) -> int:
               f"(pod chưa đụng tới — {local_result.out_dir / 'runs'})")
     for run_id, why in local_result.failed.items():
         print(f"    ✗ {run_id} (try-on local): {why}", file=sys.stderr)
+
+    # --fail-fast là "dừng CẢ LÔ ngay khi một run hỏng" — dừng ở đây, TRƯỚC preflight.
+    # Đi tiếp thì run vừa hỏng ở Pha A có stage-status "error" (không phải "done") nên
+    # run_one gửi lại chính chặng try-on đó LÊN POD, và mọi run còn lại cũng chạy: đúng
+    # trái nghĩa của cờ này, và tiêu tiền GPU thật cho một lô người dùng đã bảo hãy dừng.
+    if args.fail_fast and local_result.failed:
+        print("\n✗ --fail-fast: try-on local có run hỏng — DỪNG, không đụng tới pod.",
+              file=sys.stderr)
+        print(f"  Sửa xong chạy tiếp: make batch FILE={args.file} RESUME=1", file=sys.stderr)
+        return 1
 
     if needs_pod(manifest):
         if not preflight(settings, allow_start=not args.no_start):
