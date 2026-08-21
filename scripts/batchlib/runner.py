@@ -16,13 +16,17 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import shutil
+import threading
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor
+from concurrent.futures import wait as cf_wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
 from .client import JobError, JobFailed, JobGone, download_output, poll_job, submit_job
-from .config import Settings
+from .config import ConfigError, Settings
+from .local_tryon import is_local_provider, run_local_tryon
 from .manifest import Manifest, Run, load_state, save_state, state_path_for
 from .pipelines import PIPELINES, STAGES, Stage
 
@@ -130,6 +134,13 @@ def _try_reattach(*, settings: Settings, stage: Stage, job_id: str, recorded_sta
     return dto
 
 
+def stage_dest(run: Run, run_dir: Path, stage_name: str) -> Path:
+    """Đường dẫn NN-<chặng>.ext — DÙNG CHUNG giữa run_one (Pha B) và run_local_phase
+    (Pha A), để không lệch nhau khi Pha A ghi file trước, Pha B kiểm tra sau."""
+    index = PIPELINES[run.pipeline].index(stage_name) + 1
+    return run_dir / f"{index:02d}-{stage_name}{STAGES[stage_name].output_ext}"
+
+
 def run_one(*, settings: Settings, run: Run, out_dir: Path, state: dict,
             state_file: Path, resume: bool,
             log: Callable[[str], None], now: Callable[[], float] = time.time) -> Path:
@@ -147,13 +158,18 @@ def run_one(*, settings: Settings, run: Run, out_dir: Path, state: dict,
     log = _tee(log, log_file)
 
     prev_output: Path | None = None
-    for index, stage_name in enumerate(PIPELINES[run.pipeline], start=1):
+    for stage_name in PIPELINES[run.pipeline]:
         stage = STAGES[stage_name]
-        dest = run_dir / f"{index:02d}-{stage_name}{stage.output_ext}"
+        dest = stage_dest(run, run_dir, stage_name)
         recorded = entry["stages"].get(stage_name) or {}
         params = run.stage_params.get(stage_name, {})
 
-        if resume and recorded.get("status") == "done" and dest.is_file():
+        # Chặng đã "done" VÀ còn file trên đĩa thì bỏ qua — KHÔNG gate theo `resume`.
+        # Một lô THẬT SỰ mới (resume=False) luôn khởi tạo state["runs"] rỗng
+        # (run_batch/prepare_batch), nên "done" ở đây chỉ có thể đến từ Pha A
+        # (run_local_phase) đã ghi trong CHÍNH lần gọi `make batch` này — bỏ qua đúng
+        # là hành vi cần, không phải một lỗ hổng bỏ sót --resume.
+        if recorded.get("status") == "done" and dest.is_file():
             log(f"    {stage_name}: bỏ qua (đã xong, {dest.name})")
             prev_output = dest
             continue
@@ -226,6 +242,11 @@ def run_one(*, settings: Settings, run: Run, out_dir: Path, state: dict,
         shutil.copy2(prev_output, final)
 
     entry["status"] = "done"
+    # Xoá lý do hỏng của LƯỢT TRƯỚC: Pha A gọi Gemini hỏng thì đặt entry["error"], và
+    # nếu Pha B chạy lại đúng chặng đó thành công, cái chuỗi cũ vẫn nằm nguyên trong
+    # journal — batch_status (mcp_tools.py) đọc thẳng nó ra thành "loi" cho một run đã
+    # xong. status="done" và error="…" không được phép cùng tồn tại.
+    entry.pop("error", None)
     save_state(state_file, state)
     (run_dir / "run.json").write_text(
         json.dumps({"id": run.id, "pipeline": run.pipeline,
@@ -278,20 +299,35 @@ def write_index(out_dir: Path, state: dict) -> None:
     (out_dir / "_index.tsv").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def run_batch(*, settings: Settings, manifest: Manifest, out_root: Path,
-              batch_id: str | None = None, resume: bool = False, fail_fast: bool = False,
-              log: Callable[[str], None] = print,
-              now: Callable[[], float] = time.time) -> BatchResult:
-    batch_id = batch_id or batch_id_now()
+def prepare_batch(*, manifest: Manifest, out_root: Path, batch_id: str,
+                  resume: bool) -> tuple[Path, dict, Path]:
+    """Tạo out_dir + nạp/khởi tạo state — tách khỏi run_batch() để Pha A
+    (run_local_phase, batch_run.py) và Pha B (run_batch, dưới đây) trong CÙNG một lần
+    gọi `make batch` thấy đúng MỘT state: Pha A ghi trước, Pha B đọc lại đúng cái Pha A
+    vừa ghi thay vì bị `resume=False` xoá sạch (run_batch cũ luôn ép state rỗng khi
+    resume=False — đúng cho lô KHÔNG có Pha A, sai nếu Pha A đã chạy trong cùng lần gọi).
+    """
     out_dir = out_root / batch_id
     out_dir.mkdir(parents=True, exist_ok=True)
-
     # Chép NGUYÊN VĂN, không qua PyYAML — comment của người dùng phải sống sót.
     shutil.copyfile(manifest.path, out_dir / "manifest.yaml")
-
     state_file = state_path_for(manifest.path)
     state = load_state(state_file) if resume else {"version": 1, "runs": {}}
     state["batch"] = batch_id
+    return out_dir, state, state_file
+
+
+def run_batch(*, settings: Settings, manifest: Manifest, out_root: Path,
+              batch_id: str | None = None, resume: bool = False, fail_fast: bool = False,
+              log: Callable[[str], None] = print,
+              now: Callable[[], float] = time.time,
+              prepared: tuple[Path, dict, Path] | None = None) -> BatchResult:
+    batch_id = batch_id or batch_id_now()
+    if prepared is not None:
+        out_dir, state, state_file = prepared
+    else:
+        out_dir, state, state_file = prepare_batch(manifest=manifest, out_root=out_root,
+                                                    batch_id=batch_id, resume=resume)
 
     result = BatchResult(batch_id=batch_id, out_dir=out_dir)
     for position, run in enumerate(manifest.runs, start=1):
@@ -323,4 +359,203 @@ def run_batch(*, settings: Settings, manifest: Manifest, out_root: Path,
     if latest.is_symlink() or latest.exists():
         latest.unlink()
     latest.symlink_to(out_dir.name)
+    return result
+
+
+def _local_tryon_eligible(run: Run) -> bool:
+    """MỘT câu trả lời duy nhất cho "run này chạy try-on ở Pha A được không".
+
+    needs_pod() và run_local_phase() PHẢI đồng ý với nhau từng chữ: lệch nhau nghĩa là
+    hoặc Pha A gọi Gemini cho một run mà needs_pod đã hứa là của pod, hoặc lô dừng lại
+    chờ pod cho một run Pha A đã làm xong.
+
+    cleanOnly kiểm TRƯỚC provider, đúng thứ tự của pod: run_tryon
+    (linux.py:4791-4813) đọc cleanOnly rồi đi thẳng nhánh Qwen img2img "làm sạch, KHÔNG
+    thay đồ" — BẤT KỂ provider. Chạy một manifest như thế ở Pha A là gọi Gemini thay đồ:
+    manifest hợp lệ, không ai báo lỗi, chỉ có ảnh ra sai. Nhận CẢ hai cách viết
+    (cleanOnly/clean_only) theo đúng quy ước sẵn có của repo — chính linux.py:4751 cũng
+    đọc cả hai, và params.py ghi nhận cả hai là param hợp lệ.
+    """
+    if "tryon" not in PIPELINES.get(run.pipeline, []):
+        return False
+    params = run.stage_params.get("tryon", {})
+    clean_only = str(params.get("cleanOnly") or params.get("clean_only")
+                     or "").lower().strip() in ("1", "true", "yes", "on")
+    if clean_only:
+        return False
+    return is_local_provider(str(params.get("provider") or ""))
+
+
+def needs_pod(manifest: Manifest) -> bool:
+    """True nếu còn ít nhất một chặng KHÔNG THỂ chạy local trong toàn bộ manifest.
+
+    Dựa trên ĐỊNH NGHĨA pipeline (tĩnh), không dựa trên state runtime: motion/enhance
+    không bao giờ local-eligible, nên với hai pipeline hiện có (PIPELINES) hàm này
+    luôn True — nhưng viết tường minh để không âm thầm sai nếu sau này có pipeline
+    chỉ gồm try-on.
+    """
+    for run in manifest.runs:
+        for stage_name in PIPELINES.get(run.pipeline, []):
+            if stage_name != "tryon":
+                return True
+            if not _local_tryon_eligible(run):
+                return True
+    return False
+
+
+@dataclass
+class LocalPhaseResult:
+    ran: bool
+    out_dir: Path | None = None
+    state: dict | None = None
+    state_file: Path | None = None
+    done: list[str] = field(default_factory=list)
+    failed: dict[str, str] = field(default_factory=dict)
+
+
+def run_local_phase(*, settings: Settings, manifest: Manifest, out_root: Path, batch_id: str,
+                    resume: bool, fail_fast: bool = False, log: Callable[[str], None] = print,
+                    pool_size: int = 4) -> LocalPhaseResult:
+    """Pha A: try-on qua API (provider local-eligible) chạy TRƯỚC khi đụng pod, qua một
+    pool đồng thời có giới hạn — không tốn GPU nên chạy song song không có cái giá
+    "hai job chồng nhau trên một GPU" mà run_one/run_batch phải tránh (xem docstring
+    đầu file). KHÔNG tạo out_dir/state nếu manifest không có run nào cần Pha A — giữ
+    hành vi HỆT NHƯ TRƯỚC bản sửa này cho mọi manifest không dùng try-on local.
+
+    Giới hạn pool là thật chứ không phải trang trí: mỗi job là một request ảnh tới
+    Gemini, và bơm cả 12 run của một lô cùng lúc là cách chắc chắn nhất ăn 429.
+    """
+    # CÙNG một hàm với needs_pod — xem docstring của _local_tryon_eligible: hai chỗ này
+    # trả lời khác nhau là lô hoặc gọi Gemini sai run, hoặc đứng chờ pod vô cớ.
+    jobs: list[tuple[Run, dict]] = [(run, run.stage_params.get("tryon", {}))
+                                    for run in manifest.runs if _local_tryon_eligible(run)]
+
+    if not jobs:
+        return LocalPhaseResult(ran=False)
+
+    if not settings.gemini_api_key:
+        raise ConfigError(
+            "Thiếu GEMINI_API_KEY trong .env — cần để chạy try-on local (provider: gemini).\n"
+            "  Lấy key ở https://aistudio.google.com/apikey rồi thêm GEMINI_API_KEY=... vào .env."
+        )
+
+    out_dir, state, state_file = prepare_batch(manifest=manifest, out_root=out_root,
+                                               batch_id=batch_id, resume=resume)
+    # Ghi NGAY, trước khi gửi job đầu tiên: `state["batch"]` vừa đổi sang lô mới, và
+    # `batch_status` (mcp_tools.py) đọc journal thẳng từ đĩa. Đợi tới lúc _one() đầu tiên
+    # gọi save_state nghĩa là suốt cả cuộc gọi Gemini đầu (vài chục giây) ai hỏi tiến độ
+    # cũng nhận batch id của lô TRƯỚC — trỏ nhầm cả thư mục kết quả.
+    save_state(state_file, state)
+    result = LocalPhaseResult(ran=True, out_dir=out_dir, state=state, state_file=state_file)
+    # MỘT khoá cho MỌI lần chạm `state`/`entry`/`save_state`. Không phải để bảo vệ dict
+    # của Python (GIL đã lo) mà để bảo vệ cặp "sửa state" + "ghi state xuống đĩa": hai
+    # thread ghi save_state đan xen nhau có thể để lại journal thiếu đúng cái vừa xong.
+    #
+    # Một chỗ ĐỌC nằm ngoài khoá — `recorded.get("status")` — và nó an toàn nhờ đúng một
+    # bất biến: manifest.py TỪ CHỐI run id trùng lúc nạp manifest, nên mỗi `entry` chỉ có
+    # DUY NHẤT một thread đọc/ghi. Không có bất biến đó thì hai worker cùng đua trên một
+    # entry và dòng này thành race thật.
+    lock = threading.Lock()
+
+    def _one(run: Run, params: dict) -> tuple[bool, str | None]:
+        """Chạy một run trong thread của pool. Trả (có_chạy_mới, lỗi).
+
+        "có_chạy_mới" tách riêng khỏi "không lỗi" vì chặng đã xong từ lượt trước cũng
+        trả về không lỗi — nhưng nó KHÔNG thuộc `done` của lần này: `done` là danh sách
+        việc lần chạy này thật sự làm, người đọc log dùng nó để biết đã tiêu bao nhiêu
+        quota Gemini.
+        """
+        with lock:
+            entry = state["runs"].setdefault(run.id, {"status": "pending", "stages": {}})
+            recorded = entry["stages"].get("tryon") or {}
+        run_dir = out_dir / "runs" / run.id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        log_file = run_dir / "run.log"
+        dest = stage_dest(run, run_dir, "tryon")
+        # Hai vế, giống hệt run_one: journal nói "done" VÀ file còn trên đĩa. Tin journal
+        # suông thì Pha B nhận một đường dẫn không tồn tại ở chặng motion.
+        if recorded.get("status") == "done" and dest.is_file():
+            log(f"    {run.id}/tryon: bỏ qua (đã xong local, {dest.name})")
+            return False, None
+        started = time.time()
+
+        def _ghi_hong(exc: BaseException) -> tuple[bool, str]:
+            # repr() dự phòng: `RuntimeError()` trần có str() rỗng, mà một journal ghi
+            # "error" với lý do rỗng còn khó đọc hơn không ghi gì.
+            loi = str(exc) or repr(exc)
+            with lock:
+                entry["stages"]["tryon"] = {"status": "error",
+                                            "elapsed_sec": int(time.time() - started),
+                                            "params_manifest": dict(params)}
+                # Mức run, không chỉ mức chặng — đúng giao ước của run_batch. Để nguyên
+                # "pending" thì journal nói dối: run hỏng ở Pha A trông y hệt run chưa
+                # chạy. Không chặn tự chữa ở Pha B: vòng lặp của run_batch chỉ bỏ qua khi
+                # status == "done", còn run_one đặt lại "running" ngay khi vào.
+                entry["status"] = "error"
+                entry["error"] = loi
+                save_state(state_file, state)
+            # Journal VÀ run.log (spec §4), giống hệt run_one: stdout là thứ mất khi đóng
+            # terminal, mà đây là dòng cần nhất của một lô chạy không người trông.
+            _log_line(log_file, f"✗ tryon (local): {loi}")
+            log(f"    ✗ {run.id}/tryon (local): {loi}")
+            return False, loi
+
+        try:
+            elapsed, size = run_local_tryon(run, params, settings, dest)
+        except JobError as exc:
+            return _ghi_hong(exc)
+        except Exception as exc:   # noqa: BLE001 — cố ý bắt rộng, xem dưới
+            # Phòng thủ nhiều lớp. Bắt mỗi JobError là đủ CHO ĐÚNG hôm nay và chỉ vì
+            # local_tryon.py bọc mọi lỗi mạng lại; bất kỳ thứ gì khác (TimeoutError lọt
+            # lưới, provider mới như qwen-max ném exception riêng, bug lập trình) sẽ bay
+            # qua done_future.result() lên tận main() và giết CẢ Pha A vì MỘT run — các
+            # run khác mất trắng, và run này kẹt "pending" trong journal thay vì "error".
+            return _ghi_hong(exc)
+        # params_sent == params_manifest ở đây KHÔNG phải copy-paste: hai cột đó lệch nhau
+        # được là vì API nắn param trước khi ghi DB (xem docstring write_index). Pha A
+        # không đi qua API nào cả — nó gọi thẳng Gemini với đúng param của manifest, nên
+        # "xin gì" và "được gì" thật sự là một.
+        with lock:
+            entry["stages"]["tryon"] = {
+                "status": "done", "elapsed_sec": elapsed, "file": str(dest), "bytes": size,
+                "params_sent": dict(params), "params_manifest": dict(params)}
+            save_state(state_file, state)
+        xong = f"tryon (local): xong {elapsed}s · {size // 1024} KB → {dest.name}"
+        # Cả hai kết cục vào run.log, không chỉ lỗi — run_one cũng ghi cả hai, và "chặng
+        # này đã chạy ở Pha A lúc mấy giờ" là nửa còn lại của câu chuyện khi đọc lại sau.
+        _log_line(log_file, xong)
+        log(f"    {run.id}/{xong}")
+        return True, None
+
+    pending = list(jobs)
+    aborted = False
+    # Cửa sổ trượt: luôn giữ đúng `pool_size` job đang bay, nạp thêm một cái mỗi khi một
+    # cái xong. Chỉ THREAD CHÍNH đụng `pending`/`futures` (mọi lời gọi _submit_next đều ở
+    # đây), nên hai cấu trúc đó không cần khoá.
+    with ThreadPoolExecutor(max_workers=pool_size) as pool:
+        futures: dict = {}
+
+        def _submit_next() -> None:
+            if pending and not aborted:
+                run, params = pending.pop(0)
+                futures[pool.submit(_one, run, params)] = run.id
+
+        for _ in range(min(pool_size, len(pending))):
+            _submit_next()
+        while futures:
+            # wait(..., FIRST_COMPLETED) — chờ ÍT NHẤT một future xong rồi xử lý cả lô,
+            # không phải vòng lặp bận (busy-wait) kiểu tự dò .done() trên từng future.
+            done_set, _ = cf_wait(list(futures), return_when=FIRST_COMPLETED)
+            for done_future in done_set:
+                run_id = futures.pop(done_future)
+                ran_moi, err = done_future.result()
+                if err is not None:
+                    result.failed[run_id] = err
+                    # fail_fast: không nạp thêm việc MỚI. Job đang bay vẫn phải chờ xong —
+                    # một request HTTP đã gửi thì huỷ cũng không lấy lại được tiền/quota.
+                    if fail_fast:
+                        aborted = True
+                elif ran_moi:
+                    result.done.append(run_id)
+                _submit_next()
     return result

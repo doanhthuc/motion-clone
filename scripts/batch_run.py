@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import os
 import subprocess
 import sys
 import urllib.error
@@ -20,7 +21,7 @@ from batchlib.client import health_ok
 from batchlib.config import ConfigError, load_settings
 from batchlib.manifest import ManifestError, load_manifest, load_state, state_path_for, validate_manifest
 from batchlib.params import extract_from_ast, load_curated, missing_source_hint
-from batchlib.runner import batch_id_now, run_batch
+from batchlib.runner import batch_id_now, needs_pod, run_batch, run_local_phase
 
 ROOT = Path(__file__).resolve().parents[1]
 LINUX_PY = ROOT / "motions-studio" / "worker" / "worker_runtime" / "linux.py"
@@ -131,16 +132,61 @@ def main(argv: list[str]) -> int:
     except ConfigError as exc:
         print(f"✗ {exc}", file=sys.stderr)
         return 1
-    if not preflight(settings, allow_start=not args.no_start):
-        return 1
 
-    # --resume PHẢI chạy tiếp vào out_dir CŨ (xem resolve_batch_id) — mint id mới ở đây
-    # từng là bug: run đã xong không được hardlink vào _final/ mới, run dở thì chạy lại
-    # từ đầu. In ra quyết định khi resume để người dùng thấy nó không bắt đầu lại từ đầu
-    # (hoặc biết rõ vì sao nó lại bắt đầu từ đầu, nếu quả thật chưa có gì để tiếp).
+    # --resume PHẢI chạy tiếp vào out_dir CŨ (xem resolve_batch_id) — dời lên TRƯỚC Pha A vì
+    # Pha A cần biết out_dir/batch_id trước khi chạm tới pod.
     decision = resolve_batch_id(manifest.path, resume=args.resume)
     if args.resume:
         print(f"  {decision.note}")
+
+    # LOCAL_TRYON_WORKERS (spec §4): số job Gemini bay cùng lúc ở Pha A — tham số VẬN
+    # HÀNH phía client, không phải của manifest. Hạ xuống khi mạng yếu hoặc key bị bóp
+    # quota (429), nâng lên khi chạy lô lớn trên đường truyền tốt.
+    try:
+        pool_size = max(1, int(os.environ.get("LOCAL_TRYON_WORKERS", "4")))
+    except ValueError:
+        print("✗ LOCAL_TRYON_WORKERS phải là số nguyên (mặc định 4)", file=sys.stderr)
+        return 1
+
+    try:
+        local_result = run_local_phase(settings=settings, manifest=manifest, out_root=ROOT / "out",
+                                       batch_id=decision.batch_id, resume=decision.resumed,
+                                       fail_fast=args.fail_fast, pool_size=pool_size)
+    except ConfigError as exc:
+        print(f"✗ {exc}", file=sys.stderr)
+        return 1
+
+    if local_result.ran and local_result.done:
+        print(f"  ✓ try-on local xong {len(local_result.done)} run "
+              f"(pod chưa đụng tới — {local_result.out_dir / 'runs'})")
+    for run_id, why in local_result.failed.items():
+        print(f"    ✗ {run_id} (try-on local): {why}", file=sys.stderr)
+
+    # --fail-fast là "dừng CẢ LÔ ngay khi một run hỏng" — dừng ở đây, TRƯỚC preflight.
+    # Đi tiếp thì run vừa hỏng ở Pha A có stage-status "error" (không phải "done") nên
+    # run_one gửi lại chính chặng try-on đó LÊN POD, và mọi run còn lại cũng chạy: đúng
+    # trái nghĩa của cờ này, và tiêu tiền GPU thật cho một lô người dùng đã bảo hãy dừng.
+    if args.fail_fast and local_result.failed:
+        print("\n✗ --fail-fast: try-on local có run hỏng — DỪNG, không đụng tới pod.",
+              file=sys.stderr)
+        print(f"  Sửa xong chạy tiếp: make batch FILE={args.file} RESUME=1", file=sys.stderr)
+        return 1
+
+    if needs_pod(manifest):
+        if not preflight(settings, allow_start=not args.no_start):
+            if local_result.ran and local_result.done:
+                print(f"\n  Đã xong try-on local — ảnh đã lưu, KHÔNG mất khi thuê pod xong.",
+                      file=sys.stderr)
+                print(f"  Thuê/bật pod rồi chạy tiếp: make batch FILE={args.file} RESUME=1",
+                      file=sys.stderr)
+            return 1
+
+    run_batch_kwargs = dict(settings=settings, manifest=manifest, out_root=ROOT / "out",
+                            batch_id=decision.batch_id, resume=decision.resumed,
+                            fail_fast=args.fail_fast)
+    if local_result.ran:
+        run_batch_kwargs["prepared"] = (local_result.out_dir, local_result.state,
+                                        local_result.state_file)
 
     # submit_job/download_output (batchlib/client.py) CỐ Ý để URLError/OSError rơi thẳng
     # ra ngoài — chỉ poll_job tự bắt rớt mạng. Ở đây là nơi cuối cùng bắt nó: rớt Wi-Fi
@@ -155,9 +201,7 @@ def main(argv: list[str]) -> int:
         # chặng đã xong bị coi là mất file nên chạy lại — đúng bug đã sửa một lần rồi.
         # Nó chưa nổ được chỉ vì run_batch luôn ghi state["batch"], tức một invariant ở
         # FILE KHÁC, không phải một rào chắn ở đây.
-        result = run_batch(settings=settings, manifest=manifest, out_root=ROOT / "out",
-                           batch_id=decision.batch_id, resume=decision.resumed,
-                           fail_fast=args.fail_fast)
+        result = run_batch(**run_batch_kwargs)
     except (urllib.error.URLError, OSError) as exc:
         print(f"\n✗ Mất kết nối tới pod giữa chừng: {exc}", file=sys.stderr)
         print("  Job vừa gửi có thể VẪN đang chạy trên pod — đừng chạy lại từ đầu (tốn tiền GPU hai lần).",

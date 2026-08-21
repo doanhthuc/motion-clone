@@ -136,6 +136,24 @@ class TestLoadSettings(unittest.TestCase):
             self.assertIn("{oops}", msg)
             self.assertIn("khoảng trắng", msg)
 
+    def test_gemini_api_key_co_thi_doc_duoc(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            _write(root, "DOMAIN=api.example.test\nGEMINI_API_KEY=AIzaFakeKeyFakeKeyFakeKeyFake\n",
+                   "NUXT_MOTION_API_KEY=mk_x\n")
+            s = load_settings(root)
+            self.assertEqual(s.gemini_api_key, "AIzaFakeKeyFakeKeyFakeKeyFake")
+
+    def test_thieu_gemini_api_key_van_load_duoc(self):
+        # KHÔNG bắt buộc — không phải batch nào cũng cần try-on local (provider gemini).
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            _write(root, "DOMAIN=api.example.test\n", "NUXT_MOTION_API_KEY=mk_x\n")
+            s = load_settings(root)
+            self.assertEqual(s.gemini_api_key, "")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -80,6 +80,7 @@ class Settings:
     domain: str
     api_key: str
     instance_id: str
+    gemini_api_key: str = ""
 
     @property
     def base_url(self) -> str:
@@ -107,4 +108,5 @@ def load_settings(root: Path = ROOT) -> Settings:
         domain=domain,
         api_key=api_key,
         instance_id=env_get(root / ".env", "GPU_INSTANCE_ID"),
+        gemini_api_key=env_get(root / ".env", "GEMINI_API_KEY"),
     )

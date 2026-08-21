@@ -11,6 +11,7 @@ main() cũng test được, không cần pod: patch load_settings/health_ok/run_
 import contextlib
 import datetime
 import io
+import os
 import subprocess
 import sys
 import tempfile
@@ -20,9 +21,10 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from batchlib.client import JobError
 from batchlib.config import ConfigError, Settings
 from batchlib.manifest import save_state, state_path_for
-from batchlib.runner import BatchResult
+from batchlib.runner import BatchResult, LocalPhaseResult
 import batch_run
 from batch_run import preflight, resolve_batch_id
 
@@ -456,6 +458,189 @@ class TestMatKetNoiGiuaChungLopCloudflare(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertIn("Mất kết nối", msg)
             self.assertIn("RESUME=1", msg)
+
+
+MANIFEST_TRYON_GEMINI = """
+runs:
+  - id: runA
+    pipeline: tryon-motion-enhance
+    inputs:
+      character: char.jpg
+      outfit: outfit.jpg
+      driver: drv.mp4
+    tryon: { provider: gemini }
+"""
+
+
+def _manifest_tryon_gemini(tmp: Path) -> Path:
+    (tmp / "char.jpg").write_bytes(b"x")
+    (tmp / "outfit.jpg").write_bytes(b"x")
+    (tmp / "drv.mp4").write_bytes(b"x")
+    p = tmp / "b.yaml"
+    p.write_text(MANIFEST_TRYON_GEMINI, encoding="utf-8")
+    return p
+
+
+class TestMainPhaA(unittest.TestCase):
+    """Try-on local chạy TRƯỚC preflight — và pod chưa sẵn sàng thì báo rõ đã xong Pha A."""
+
+    def test_khong_co_pod_sau_khi_xong_pha_a_thi_bao_ro_va_khong_goi_run_batch(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            p = _manifest_tryon_gemini(tmp)
+
+            def fake_run_local_tryon(run, params, settings_, out_path):
+                out_path.write_bytes(b"fake")
+                return 2, out_path.stat().st_size
+
+            err = io.StringIO()
+            with mock.patch("batch_run.load_settings",
+                            return_value=Settings(domain="pod.test", api_key="mk_test",
+                                                  instance_id="", gemini_api_key="AIza" + "x" * 35)), \
+                 mock.patch("batch_run.health_ok", return_value=False), \
+                 mock.patch("batchlib.runner.run_local_tryon", fake_run_local_tryon), \
+                 mock.patch("batch_run.run_batch") as m_run_batch, \
+                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                code = batch_run.main(["--file", str(p)])
+            self.assertEqual(code, 1)
+            self.assertIn("gpu-provision", err.getvalue())
+            self.assertIn("RESUME=1", err.getvalue())
+            m_run_batch.assert_not_called()
+
+    def test_pod_san_sang_thi_chay_tiep_ca_pha_b_voi_state_da_chuan_bi(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            p = _manifest_tryon_gemini(tmp)
+
+            def fake_run_local_tryon(run, params, settings_, out_path):
+                out_path.write_bytes(b"fake")
+                return 2, out_path.stat().st_size
+
+            captured: dict = {}
+
+            def fake_run_batch(**kwargs):
+                captured.update(kwargs)
+                return BatchResult(batch_id=kwargs["batch_id"],
+                                   out_dir=kwargs.get("prepared", (tmp / "out" / kwargs["batch_id"],))[0],
+                                   done=["runA"])
+
+            with mock.patch("batch_run.load_settings",
+                            return_value=Settings(domain="pod.test", api_key="mk_test",
+                                                  instance_id="i-1", gemini_api_key="AIza" + "x" * 35)), \
+                 mock.patch("batch_run.health_ok", return_value=True), \
+                 mock.patch("batchlib.runner.run_local_tryon", fake_run_local_tryon), \
+                 mock.patch("batch_run.run_batch", fake_run_batch), \
+                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                code = batch_run.main(["--file", str(p)])
+            self.assertEqual(code, 0)
+            self.assertIn("prepared", captured)
+            out_dir, state, _state_file = captured["prepared"]
+            self.assertEqual(state["runs"]["runA"]["stages"]["tryon"]["status"], "done")
+
+    def test_fail_fast_pha_a_hong_thi_dung_han_khong_dung_pod(self):
+        # --fail-fast = "dừng cả lô ngay khi một run hỏng". Đi tiếp sau khi Pha A hỏng
+        # nghĩa là run_one gửi LẠI chính chặng try-on đó lên pod (journal ghi "error",
+        # không phải "done") — tiêu tiền GPU cho đúng lô người dùng bảo hãy dừng.
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            p = _manifest_tryon_gemini(tmp)
+
+            def fake_run_local_tryon(run, params, settings_, out_path):
+                raise JobError("gemini 429 het quota")
+
+            err = io.StringIO()
+            with mock.patch("batch_run.load_settings",
+                            return_value=Settings(domain="pod.test", api_key="mk_test",
+                                                  instance_id="i-1",
+                                                  gemini_api_key="AIza" + "x" * 35)), \
+                 mock.patch("batch_run.health_ok", return_value=True), \
+                 mock.patch("batch_run.preflight") as m_preflight, \
+                 mock.patch("batchlib.runner.run_local_tryon", fake_run_local_tryon), \
+                 mock.patch("batch_run.run_batch") as m_run_batch, \
+                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                code = batch_run.main(["--file", str(p), "--fail-fast"])
+            self.assertEqual(code, 1)
+            m_run_batch.assert_not_called()
+            m_preflight.assert_not_called()   # không cả HỎI pod, chứ đừng nói bật nó
+            self.assertIn("fail-fast", err.getvalue())
+
+    def test_khong_fail_fast_thi_pha_a_hong_van_chay_tiep_len_pod(self):
+        # Mặt còn lại của cùng một cổng: KHÔNG có cờ thì hành vi cũ giữ nguyên — Pha A
+        # hỏng một run vẫn đi tiếp để pod tự chữa (đó chính là lý do run_local_phase
+        # không chặn tự chữa ở Pha B).
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            p = _manifest_tryon_gemini(tmp)
+
+            def fake_run_local_tryon(run, params, settings_, out_path):
+                raise JobError("gemini 429 het quota")
+
+            with mock.patch("batch_run.load_settings",
+                            return_value=Settings(domain="pod.test", api_key="mk_test",
+                                                  instance_id="i-1",
+                                                  gemini_api_key="AIza" + "x" * 35)), \
+                 mock.patch("batch_run.health_ok", return_value=True), \
+                 mock.patch("batch_run.run_batch",
+                            return_value=BatchResult(batch_id="b", out_dir=tmp / "out",
+                                                     done=["runA"])) as m_run_batch, \
+                 mock.patch("batchlib.runner.run_local_tryon", fake_run_local_tryon), \
+                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                code = batch_run.main(["--file", str(p)])
+            self.assertEqual(code, 0)
+            m_run_batch.assert_called_once()
+
+
+class TestLocalTryonWorkers(unittest.TestCase):
+    """LOCAL_TRYON_WORKERS (spec §4): số job Gemini bay cùng lúc, chỉnh từ env."""
+
+    def _goi(self, env: dict, tmp: Path):
+        captured: dict = {}
+
+        def fake_run_local_phase(**kwargs):
+            captured.update(kwargs)
+            return LocalPhaseResult(ran=False)
+
+        p = _manifest_tryon_gemini(tmp)
+        with mock.patch.dict(os.environ, env, clear=False), \
+             mock.patch("batch_run.load_settings",
+                        return_value=Settings(domain="pod.test", api_key="mk_test",
+                                              instance_id="i-1",
+                                              gemini_api_key="AIza" + "x" * 35)), \
+             mock.patch("batch_run.run_local_phase", fake_run_local_phase), \
+             mock.patch("batch_run.health_ok", return_value=False), \
+             mock.patch("batch_run.run_batch") as m_run_batch, \
+             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = batch_run.main(["--file", str(p), "--no-start"])
+        return code, captured, m_run_batch
+
+    def test_doc_env_va_truyen_xuong_pool_size(self):
+        with tempfile.TemporaryDirectory() as d:
+            _code, captured, _ = self._goi({"LOCAL_TRYON_WORKERS": "7"}, Path(d))
+            self.assertEqual(captured["pool_size"], 7)
+
+    def test_khong_dat_env_thi_mac_dinh_4(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = {k: v for k, v in os.environ.items() if k != "LOCAL_TRYON_WORKERS"}
+            with mock.patch.dict(os.environ, env, clear=True):
+                _code, captured, _ = self._goi({}, Path(d))
+            self.assertEqual(captured["pool_size"], 4)
+
+    def test_env_khong_phai_so_thi_bao_loi_chu_khong_traceback(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            p = _manifest_tryon_gemini(tmp)
+            err = io.StringIO()
+            with mock.patch.dict(os.environ, {"LOCAL_TRYON_WORKERS": "nhieu"}), \
+                 mock.patch("batch_run.load_settings",
+                            return_value=Settings(domain="pod.test", api_key="mk_test",
+                                                  instance_id="i-1",
+                                                  gemini_api_key="AIza" + "x" * 35)), \
+                 mock.patch("batch_run.run_batch") as m_run_batch, \
+                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                code = batch_run.main(["--file", str(p)])
+            self.assertEqual(code, 1)
+            self.assertIn("LOCAL_TRYON_WORKERS", err.getvalue())
+            m_run_batch.assert_not_called()
 
 
 if __name__ == "__main__":

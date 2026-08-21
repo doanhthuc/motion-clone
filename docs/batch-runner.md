@@ -45,9 +45,10 @@ Cả bốn dạng file của máy đều đã `.gitignore` — material và kế
 1. **Validate trước, tiêu tiền sau.** Manifest sai ở run thứ 9 phải nổ *trước khi* run thứ nhất chạm GPU.
 2. **Sinh manifest tách khỏi chạy manifest.** `batch-scan` đẻ ra *bản nháp để soát*, không phải lệnh
    chạy. Đoán sai chỉ tốn một lần liếc mắt, không tốn tiền GPU.
-3. **Tuần tự, không song song.** Pod có một GPU, và `run_enhance` gọi `comfy_recycle` để xả RAM/VRAM
-   của Wan trước mỗi pha nặng — hai job chồng nhau phá đúng giả định "lúc này GPU chỉ có mình tôi"
-   mà các lời gọi đó dựa vào.
+3. **Tuần tự, không song song — trên pod.** Pod có một GPU, và `run_enhance` gọi `comfy_recycle`
+   để xả RAM/VRAM của Wan trước mỗi pha nặng — hai job chồng nhau phá đúng giả định "lúc này GPU
+   chỉ có mình tôi" mà các lời gọi đó dựa vào. Try-on local (`provider: gemini`, §2.9) không đụng
+   pod nên chạy đồng thời được, không vi phạm nguyên tắc này.
 
 ---
 
@@ -275,6 +276,42 @@ make batch-clean KEEP=3           # xoá runs/ của lô cũ hơn 3 lô gần nh
 ```
 
 Chỉ xoá `runs/` (file trung gian). **`_final/` không bao giờ bị đụng tới.**
+
+### 2.9 Try-on chạy local trước (`provider: gemini`)
+
+Try-on dùng `provider: gemini` là một API call thuần (không cần GPU) — nên nó chạy THẲNG TỪ MÁY
+BẠN, TRƯỚC KHI đụng tới pod, không tính vào giờ GPU. Không cần làm gì khác: `make batch` tự nhận ra
+run nào dùng `provider: gemini` và chạy try-on cho TẤT CẢ run đó trước, rồi mới kiểm pod.
+
+Cần `GEMINI_API_KEY` trong `.env` gốc (lấy ở https://aistudio.google.com/apikey) — chỉ bắt buộc nếu
+manifest thật sự có run `provider: gemini`.
+
+Hai kịch bản:
+
+| Tình huống | Việc runner làm |
+|---|---|
+| Pod đã sẵn (đang chạy) | Try-on local xong → chảy thẳng sang `motion`/`enhance` như bình thường, một lệnh |
+| Pod chưa thuê/chưa bật | Try-on local xong → DỪNG, báo `make gpu-provision` (hoặc `gpu-up`) → chạy tiếp bằng `make batch FILE=... RESUME=1` |
+
+Ảnh try-on đã lưu ở `out/<lô>/runs/<run>/01-tryon.png` ngay cả khi lô dừng ở bước kiểm pod — không
+mất, không tốn Gemini lần hai khi `RESUME=1`.
+
+`provider: qwen` (tự host, GPU thật) không đổi gì — vẫn cần pod như trước, chạy chung lô được với
+run dùng `provider: gemini`.
+
+**Ngoại lệ:** `cleanOnly` (hay `clean_only`) bật thì run đó **vẫn cần pod**, dù `provider: gemini` —
+đó là "làm sạch ảnh, KHÔNG thay đồ", pod luôn làm bằng Qwen img2img chứ không đụng tới provider.
+
+**Khác biệt đã biết — local KHÔNG autocrop ảnh sản phẩm.** Trên pod, ảnh outfit được tách nền + cắt
+sát món đồ trước khi gọi Gemini (`TRYON_PRODUCT_AUTOCROP`, mặc định **bật**) để sửa ca "sản phẩm quá
+nhỏ, mẫu quá to". Đường local gửi ảnh outfit **nguyên bản**: dịch vụ tách nền chỉ có trên pod, không
+gọi được từ máy bạn. Hệ quả: **cùng một manifest có thể ra ảnh khác nhau** (bố cục có thể xấu hơn)
+tuỳ chạy local hay chạy trên pod — rõ nhất khi món đồ nhỏ so với khung ảnh. Cách né: crop sẵn ảnh
+outfit cho món đồ lấp đầy khung trước khi đưa vào lô.
+
+`LOCAL_TRYON_WORKERS` (env, mặc định `4`): số job Gemini bay cùng lúc. Hạ xuống nếu ăn 429.
+
+Lý do thiết kế: [`superpowers/specs/2026-08-21-batch-local-tryon-design.md`](superpowers/specs/2026-08-21-batch-local-tryon-design.md).
 
 ---
 
