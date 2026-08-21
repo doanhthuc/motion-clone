@@ -60,6 +60,25 @@ runs:
 """
 
 
+# cleanOnly: trên pod, run_tryon kiểm cleanOnly TRƯỚC nhánh provider (linux.py:4794) và
+# luôn làm sạch bằng Qwen img2img — KHÔNG thay đồ. Manifest này hợp lệ (cleanOnly là param
+# thật của chặng tryon), nên Pha A phải nhường nó cho pod chứ không chạy Gemini thay đồ.
+MANIFEST_TRYON_GEMINI_CLEANONLY = """
+runs:
+  - id: runA
+    pipeline: tryon-motion-enhance
+    inputs:
+      character: char.jpg
+      outfit: outfit.jpg
+      driver: drv.mp4
+    tryon: { provider: gemini, cleanOnly: "1" }
+"""
+
+
+MANIFEST_TRYON_GEMINI_CLEAN_ONLY_SNAKE = MANIFEST_TRYON_GEMINI_CLEANONLY.replace(
+    "cleanOnly", "clean_only")
+
+
 MANIFEST_HAI_RUN_GEMINI = """
 runs:
   - id: runA
@@ -619,6 +638,33 @@ class TestBoQuaChangDaXongKhongCanResume(unittest.TestCase):
             self.assertEqual(dest.read_bytes(), b"da-co-san-tu-pha-A")   # file không bị ghi đè
 
 
+class TestXoaLoiCuKhiChayLaiThanhCong(unittest.TestCase):
+    """Pha A hỏng → entry["error"]. Pha B chạy lại chặng đó xong → chuỗi lỗi cũ PHẢI biến
+    mất, nếu không batch_status (mcp_tools.py) báo "loi" cho một run đã chạy xong."""
+
+    def test_run_xong_thi_khong_con_error_cu(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            manifest = load_manifest(_fixture(tmp, MANIFEST_MOT_RUN))
+            run = manifest.runs[0]
+            state = {"version": 1, "runs": {run.id: {
+                "status": "error", "error": "gemini 429 het quota (Pha A lượt trước)",
+                "stages": {}}}}
+            state_file = tmp / "b.state.json"
+
+            pod = FakePod()
+            with mock.patch("batchlib.runner.submit_job", pod.submit), \
+                 mock.patch("batchlib.runner.poll_job", pod.poll), \
+                 mock.patch("batchlib.runner.download_output", pod.download):
+                run_one(settings=SETTINGS, run=run, out_dir=tmp / "out", state=state,
+                        state_file=state_file, resume=False, log=lambda *_: None)
+
+            entry = state["runs"][run.id]
+            self.assertEqual(entry["status"], "done")
+            self.assertNotIn("error", entry)
+            self.assertNotIn("error", load_state(state_file)["runs"][run.id])
+
+
 class TestPrepareBatch(unittest.TestCase):
     def test_lo_moi_state_rong(self):
         with tempfile.TemporaryDirectory() as d:
@@ -695,6 +741,30 @@ class TestNeedsPod(unittest.TestCase):
         # tự trả lời đúng, không cần ai nhớ quay lại sửa needs_pod.
         with tempfile.TemporaryDirectory() as d:
             text = MANIFEST_TRYON_GEMINI.replace("tryon-motion-enhance", "chi-tryon")
+            with mock.patch.dict(PIPELINES, {"chi-tryon": ["tryon"]}):
+                manifest = load_manifest(_fixture_tryon(Path(d), text))
+                self.assertFalse(needs_pod(manifest))
+
+    def test_cleanonly_van_can_pod_du_provider_gemini(self):
+        # cleanOnly = "làm sạch, KHÔNG thay đồ" và trên pod nó luôn đi nhánh Qwen img2img
+        # (linux.py:4794, kiểm TRƯỚC provider). Chạy nó ở Pha A là thay đồ bằng Gemini —
+        # output sai âm thầm. Dùng pipeline chỉ-tryon để câu trả lời không trivially True
+        # vì motion/enhance.
+        for text in (MANIFEST_TRYON_GEMINI_CLEANONLY, MANIFEST_TRYON_GEMINI_CLEAN_ONLY_SNAKE):
+            with self.subTest(text=text.splitlines()[-1].strip()):
+                with tempfile.TemporaryDirectory() as d:
+                    chi_tryon = text.replace("tryon-motion-enhance", "chi-tryon")
+                    with mock.patch.dict(PIPELINES, {"chi-tryon": ["tryon"]}):
+                        manifest = load_manifest(_fixture_tryon(Path(d), chi_tryon))
+                        self.assertTrue(needs_pod(manifest))
+
+    def test_cleanonly_gia_tri_tat_thi_van_local_duoc(self):
+        # "0"/false không phải cleanOnly — không được vin vào việc CÓ MẶT khoá đó để đẩy
+        # cả run về pod.
+        with tempfile.TemporaryDirectory() as d:
+            text = (MANIFEST_TRYON_GEMINI_CLEANONLY
+                    .replace("tryon-motion-enhance", "chi-tryon")
+                    .replace('cleanOnly: "1"', 'cleanOnly: "0"'))
             with mock.patch.dict(PIPELINES, {"chi-tryon": ["tryon"]}):
                 manifest = load_manifest(_fixture_tryon(Path(d), text))
                 self.assertFalse(needs_pod(manifest))
@@ -968,6 +1038,119 @@ class TestRunLocalPhase(unittest.TestCase):
                                      out_root=tmp / "out", batch_id="2026-08-21-0900",
                                      resume=False, log=lambda _m: None)
             self.assertEqual(result, LocalPhaseResult(ran=False))
+
+    def test_cleanonly_khong_thuoc_pha_a(self):
+        # provider gemini NHƯNG cleanOnly bật: pod làm sạch bằng Qwen img2img, không thay
+        # đồ (linux.py:4794). Pha A gọi Gemini ở đây = thay đồ, tức output SAI mà không
+        # ai báo. Không được gọi Gemini, và cũng không được đòi GEMINI_API_KEY.
+        for text in (MANIFEST_TRYON_GEMINI_CLEANONLY, MANIFEST_TRYON_GEMINI_CLEAN_ONLY_SNAKE):
+            with self.subTest(text=text.splitlines()[-1].strip()):
+                with tempfile.TemporaryDirectory() as d:
+                    tmp = Path(d)
+                    manifest = load_manifest(_fixture_tryon(tmp, text))
+                    settings_khong_key = Settings(domain="x.test", api_key="mk_test",
+                                                  instance_id="i-1")
+                    with mock.patch("batchlib.runner.run_local_tryon") as m_local:
+                        result = run_local_phase(settings=settings_khong_key, manifest=manifest,
+                                                 out_root=tmp / "out",
+                                                 batch_id="2026-08-21-0900",
+                                                 resume=False, log=lambda _m: None)
+                    m_local.assert_not_called()
+                    self.assertEqual(result, LocalPhaseResult(ran=False))
+
+    def test_cleanonly_chi_loai_dung_run_do_khong_loai_ca_lo(self):
+        # Lô trộn: runA cleanOnly (để cho pod), runB gemini thường (chạy local). Cắt nhầm
+        # cả lô là mất hết lợi ích của Pha A vì một run.
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            tron = MANIFEST_HAI_RUN_GEMINI.replace(
+                "    tryon: { provider: gemini }\n  - id: runB",
+                '    tryon: { provider: gemini, cleanOnly: "1" }\n  - id: runB', 1)
+            manifest = load_manifest(_fixture_tryon(tmp, tron))
+
+            def fake_run_local_tryon(run, params, settings_, out_path):
+                out_path.write_bytes(b"ok")
+                return 1, 2
+
+            with mock.patch("batchlib.runner.run_local_tryon", fake_run_local_tryon):
+                result = run_local_phase(settings=GEMINI_SETTINGS, manifest=manifest,
+                                         out_root=tmp / "out", batch_id="2026-08-21-0900",
+                                         resume=False, log=lambda _m: None)
+            self.assertTrue(result.ran)
+            self.assertEqual(result.done, ["runB"])
+            self.assertEqual(list(result.state["runs"]), ["runB"])
+
+    def test_loi_khong_phai_joberror_cung_khong_giet_ca_pha(self):
+        # Phòng thủ nhiều lớp: _post_json giờ đã bọc TimeoutError thành JobError, nhưng
+        # _one() vẫn phải chịu được MỌI exception — provider mới (vd qwen-max) có thể ném
+        # thứ khác, và một run hỏng không được kéo theo cả lô.
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            manifest = load_manifest(_fixture_tryon(tmp, MANIFEST_HAI_RUN_GEMINI))
+
+            def fake_run_local_tryon(run, params, settings_, out_path):
+                if run.id == "runA":
+                    raise RuntimeError("boom khong phai JobError")
+                out_path.write_bytes(b"ok")
+                return 3, out_path.stat().st_size
+
+            with mock.patch("batchlib.runner.run_local_tryon", fake_run_local_tryon):
+                result = run_local_phase(settings=GEMINI_SETTINGS, manifest=manifest,
+                                         out_root=tmp / "out", batch_id="2026-08-21-0900",
+                                         resume=False, pool_size=2, log=lambda _m: None)
+
+            self.assertEqual(result.done, ["runB"])
+            self.assertIn("runA", result.failed)
+            self.assertIn("boom khong phai JobError", result.failed["runA"])
+            tren_dia = load_state(result.state_file)["runs"]
+            self.assertEqual(tren_dia["runA"]["status"], "error")
+            self.assertEqual(tren_dia["runA"]["stages"]["tryon"]["status"], "error")
+            self.assertIn("boom khong phai JobError", tren_dia["runA"]["error"])
+            self.assertEqual(tren_dia["runB"]["stages"]["tryon"]["status"], "done")
+
+    def test_ghi_ca_run_log_khong_chi_journal(self):
+        # spec §4: hỏng ở Pha A phải vào journal VÀ run.log. stdout là thứ mất khi đóng
+        # terminal — run.log là bản ghi còn lại, giống hệt giao ước của run_one.
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            manifest = load_manifest(_fixture_tryon(tmp, MANIFEST_HAI_RUN_GEMINI))
+
+            def fake_run_local_tryon(run, params, settings_, out_path):
+                if run.id == "runA":
+                    raise JobError("gemini 429 het quota")
+                out_path.write_bytes(b"ok")
+                return 3, out_path.stat().st_size
+
+            with mock.patch("batchlib.runner.run_local_tryon", fake_run_local_tryon):
+                result = run_local_phase(settings=GEMINI_SETTINGS, manifest=manifest,
+                                         out_root=tmp / "out", batch_id="2026-08-21-0900",
+                                         resume=False, pool_size=2, log=lambda _m: None)
+
+            log_hong = (result.out_dir / "runs" / "runA" / "run.log").read_text(encoding="utf-8")
+            self.assertIn("gemini 429 het quota", log_hong)
+            log_xong = (result.out_dir / "runs" / "runB" / "run.log").read_text(encoding="utf-8")
+            self.assertIn("tryon", log_xong)
+
+    def test_batch_id_xuong_dia_ngay_truoc_khi_goi_gemini(self):
+        # batch_status (MCP) đọc journal THẲNG TỪ ĐĨA. Chờ tới lúc run đầu xong mới ghi
+        # nghĩa là suốt cả cuộc gọi Gemini đầu tiên, ai hỏi tiến độ cũng thấy batch id của
+        # lô TRƯỚC.
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            manifest = load_manifest(_fixture_tryon(tmp, MANIFEST_TRYON_GEMINI))
+            state_file = state_path_for(manifest.path)
+            thay: list = []
+
+            def fake_run_local_tryon(run, params, settings_, out_path):
+                thay.append(load_state(state_file).get("batch"))
+                out_path.write_bytes(b"ok")
+                return 1, 2
+
+            with mock.patch("batchlib.runner.run_local_tryon", fake_run_local_tryon):
+                run_local_phase(settings=GEMINI_SETTINGS, manifest=manifest,
+                                out_root=tmp / "out", batch_id="2026-08-21-0900",
+                                resume=False, log=lambda _m: None)
+            self.assertEqual(thay, ["2026-08-21-0900"])
 
 
 if __name__ == "__main__":
