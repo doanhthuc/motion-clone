@@ -238,3 +238,105 @@ def translate_vn_to_en(text: str, key: str, base_url: str = GEMINI_API_BASE) -> 
             if out:
                 return out
     return text
+
+
+import subprocess
+import tempfile
+import time
+
+from .config import Settings
+from .manifest import Run
+
+_RES_LONGEDGE = {"1080p": 1080, "2k": 1440}
+
+
+def postprocess(out_path: Path, params: dict) -> Path:
+    """Thay linux.py:_tryon_postprocess (4674-4704): brightness/saturation/resize qua
+    ffmpeg. KHÔNG dùng api_log — lỗi bị nuốt về ảnh gốc, giống hệt hành vi worker gốc."""
+    try:
+        bright = max(-0.5, min(float(params.get("brightness") or 0), 0.5))
+    except (TypeError, ValueError):
+        bright = 0.0
+    try:
+        sat = max(0.5, min(float(params.get("saturation") or 1.0), 2.0))
+    except (TypeError, ValueError):
+        sat = 1.0
+    res = str(params.get("outputRes") or params.get("resolution") or "").lower().strip()
+    target = _RES_LONGEDGE.get(res)
+    vf = []
+    if abs(bright) > 0.005 or abs(sat - 1.0) > 0.01:
+        vf.append(f"eq=brightness={bright:.3f}:saturation={sat:.3f}")
+    if target:
+        vf.append(f"scale='if(gte(iw,ih),{target},-2)':'if(gte(iw,ih),-2,{target})':flags=lanczos")
+    if not vf:
+        return out_path
+    dst = out_path.with_suffix(".pp.png")
+    try:
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(out_path), "-vf", ",".join(vf),
+                        str(dst)], check=True, timeout=300)
+        if dst.is_file() and dst.stat().st_size > 1024:
+            return dst
+    except Exception:
+        pass
+    return out_path
+
+
+def run_local_tryon(run: Run, params: dict, settings: Settings, out_path: Path) -> tuple[int, int]:
+    """Điểm vào Pha A cho MỘT run. Trả (elapsed_sec, bytes). Ném JobError khi hỏng cấu
+    hình/mạng, NotImplementedError khi provider chưa có endpoint thật (vd qwen-max)."""
+    started = time.time()
+    provider = str(params.get("provider") or "").lower().strip()
+    if provider != "gemini":
+        raise NotImplementedError(
+            f"provider {provider!r}: chưa có endpoint/key thật cho try-on local — điền vào "
+            "local_tryon.py khi có chi tiết API (vd DashScope cho qwen-max)")
+
+    key = str(params.get("apiKey") or params.get("geminiApiKey")
+             or settings.gemini_api_key or "").strip()
+    if not key:
+        raise JobError(
+            f"run {run.id!r}: try-on local (provider gemini) cần API key — thêm GEMINI_API_KEY "
+            "vào .env, hoặc apiKey/geminiApiKey trong tryon: của run này")
+    if not valid_gemini_key(key):
+        raise JobError(
+            f"run {run.id!r}: GEMINI_API_KEY không đúng định dạng (phải 'AIza…', ~39 ký tự, "
+            "không khoảng trắng)")
+
+    model_path = run.inputs.get("character")
+    product_path = run.inputs.get("outfit")
+    background_path = run.inputs.get("background")
+    if model_path is None or product_path is None:
+        raise JobError(f"run {run.id!r}: try-on local cần inputs.character và inputs.outfit")
+
+    garment = (str(params.get("garment_type") or params.get("garmentType") or "").lower().strip()
+              or "auto")
+    extra_raw = str(params.get("extraPrompt") or params.get("extra_prompt")
+                    or params.get("keepNote") or "").strip()
+    # base_url=GEMINI_API_BASE truyền TƯỜNG MINH ở mọi lệnh gọi dưới đây: đây là biến
+    # global, đọc lại giá trị hiện tại mỗi lần hàm chạy — nếu để gemini_edit/
+    # translate_vn_to_en tự dùng default parameter của chúng thì giá trị đó bị chốt
+    # CỐ ĐỊNH lúc định nghĩa hàm (module load), nên test patch module-level
+    # GEMINI_API_BASE (mock.patch.object(lt, "GEMINI_API_BASE", ...)) sẽ không có tác
+    # dụng và code gọi thẳng ra Google thật thay vì fake HTTP server của test.
+    extra_en = translate_vn_to_en(extra_raw, key, base_url=GEMINI_API_BASE) if extra_raw else ""
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        images = [(model_path.read_bytes(), mime_of(model_path)),
+                  (product_path.read_bytes(), mime_of(product_path))]
+        prompt = gemini_tryon_prompt(garment, extra=extra_en)
+        edited = gemini_edit(images, prompt, key, tmp_dir / "pass1.png",
+                             aspect_ratio=gemini_aspect(img_size(model_path)),
+                             base_url=GEMINI_API_BASE)
+
+        if background_path is not None:
+            edited = gemini_edit(
+                [(edited.read_bytes(), "image/png"),
+                 (background_path.read_bytes(), mime_of(background_path))],
+                TRYON_BG_POS, key, tmp_dir / "pass2.png",
+                aspect_ratio=gemini_aspect(img_size(edited)), base_url=GEMINI_API_BASE)
+
+        final = postprocess(edited, params)
+        out_path.write_bytes(final.read_bytes())
+
+    return int(time.time() - started), out_path.stat().st_size

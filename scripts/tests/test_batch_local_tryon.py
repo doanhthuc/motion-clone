@@ -222,5 +222,114 @@ class TestGeminiTryonPrompt(unittest.TestCase):
         self.assertLess(p.index("ADDITIONAL USER INSTRUCTION"), len(p))
 
 
+from unittest import mock
+
+from batchlib.config import Settings
+from batchlib.manifest import Run
+
+
+class TestPostprocess(unittest.TestCase):
+    def test_khong_co_tham_so_thi_giu_nguyen_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "in.png"
+            p.write_bytes(b"x")
+            self.assertEqual(lt.postprocess(p, {}), p)
+
+    def test_co_brightness_thi_goi_ffmpeg(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "in.png"
+            p.write_bytes(b"x")
+            dst = p.with_suffix(".pp.png")
+
+            def fake_run(cmd, **kwargs):
+                dst.write_bytes(b"processed" * 200)   # > 1024 byte để qua ngưỡng
+                return mock.Mock(returncode=0)
+
+            with mock.patch("subprocess.run", fake_run):
+                out = lt.postprocess(p, {"brightness": 0.2})
+            self.assertEqual(out, dst)
+
+    def test_ffmpeg_loi_thi_giu_anh_goc(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "in.png"
+            p.write_bytes(b"x")
+            with mock.patch("subprocess.run", side_effect=OSError("khong co ffmpeg")):
+                out = lt.postprocess(p, {"brightness": 0.2})
+            self.assertEqual(out, p)
+
+
+def _run_gemini(tmp: Path, background: bool = False) -> Run:
+    (tmp / "char.jpg").write_bytes(b"char-bytes")
+    (tmp / "outfit.jpg").write_bytes(b"outfit-bytes")
+    inputs = {"character": tmp / "char.jpg", "outfit": tmp / "outfit.jpg"}
+    if background:
+        (tmp / "bg.jpg").write_bytes(b"bg-bytes")
+        inputs["background"] = tmp / "bg.jpg"
+    return Run(id="runA", pipeline="tryon-motion-enhance", inputs=inputs,
+              stage_params={"tryon": {"provider": "gemini"}})
+
+
+class TestRunLocalTryon(GeminiServerCase):
+    def _settings(self, key="AIza" + "x" * 35):
+        return Settings(domain="x.test", api_key="mk_test", instance_id="i-1",
+                        gemini_api_key=key)
+
+    def test_thanh_cong_ghi_ra_out_path(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            run = _run_gemini(tmp)
+            out = tmp / "01-tryon.png"
+            with mock.patch.object(lt, "GEMINI_API_BASE", self.base_url), \
+                 mock.patch.object(lt, "img_size", return_value=(1080, 1920)):
+                elapsed, size = lt.run_local_tryon(run, run.stage_params["tryon"],
+                                                   self._settings(), out)
+            self.assertGreaterEqual(elapsed, 0)
+            self.assertEqual(size, out.stat().st_size)
+            self.assertTrue(out.is_file())
+
+    def test_co_background_thi_goi_pass_2(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            run = _run_gemini(tmp, background=True)
+            out = tmp / "01-tryon.png"
+            with mock.patch.object(lt, "GEMINI_API_BASE", self.base_url), \
+                 mock.patch.object(lt, "img_size", return_value=None):
+                lt.run_local_tryon(run, run.stage_params["tryon"], self._settings(), out)
+            self.assertEqual(GEMINI_STATE["calls"], 2)   # pass 1 (thay đồ) + pass 2 (ghép nền)
+
+    def test_thieu_key_raise_joberror(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            run = _run_gemini(tmp)
+            with self.assertRaises(JobError):
+                lt.run_local_tryon(run, run.stage_params["tryon"], self._settings(key=""),
+                                   tmp / "out.png")
+
+    def test_key_sai_dinh_dang_raise_joberror(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            run = _run_gemini(tmp)
+            with self.assertRaises(JobError):
+                lt.run_local_tryon(run, run.stage_params["tryon"], self._settings(key="sk-not-gemini"),
+                                   tmp / "out.png")
+
+    def test_provider_chua_ho_tro_raise_not_implemented(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            run = _run_gemini(tmp)
+            with self.assertRaises(NotImplementedError):
+                lt.run_local_tryon(run, {"provider": "qwen-max"}, self._settings(), tmp / "out.png")
+
+    def test_thieu_input_bat_buoc_raise_joberror(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            run = Run(id="runA", pipeline="tryon-motion-enhance",
+                     inputs={"character": tmp / "char.jpg"},   # thiếu outfit
+                     stage_params={"tryon": {"provider": "gemini"}})
+            (tmp / "char.jpg").write_bytes(b"x")
+            with self.assertRaises(JobError):
+                lt.run_local_tryon(run, run.stage_params["tryon"], self._settings(), tmp / "out.png")
+
+
 if __name__ == "__main__":
     unittest.main()
