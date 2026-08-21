@@ -20,9 +20,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         GEMINI_STATE["calls"] += 1
+        call_idx = GEMINI_STATE["calls"] - 1  # 0-based index for this request
         length = int(self.headers["content-length"])
         self.rfile.read(length)
-        mode = GEMINI_STATE["mode"]
+        # Support per-call modes via "modes" dict (key = 0-based call index)
+        # for tests that need different response types on different calls
+        mode = GEMINI_STATE.get("modes", {}).get(call_idx) or GEMINI_STATE["mode"]
         if mode == "http_error":
             self.send_response(400)
             body = b'{"error":"bad request"}'
@@ -73,6 +76,8 @@ class GeminiServerCase(unittest.TestCase):
     def setUp(self):
         GEMINI_STATE["mode"] = "image"
         GEMINI_STATE["calls"] = 0
+        GEMINI_STATE.pop("modes", None)
+        GEMINI_STATE.pop("text_reply", None)
 
 
 class TestGeminiEdit(GeminiServerCase):
@@ -329,6 +334,32 @@ class TestRunLocalTryon(GeminiServerCase):
             (tmp / "char.jpg").write_bytes(b"x")
             with self.assertRaises(JobError):
                 lt.run_local_tryon(run, run.stage_params["tryon"], self._settings(), tmp / "out.png")
+
+    def test_extraPrompt_vietnamese_thi_goi_translate(self):
+        # Regression test: translate_vn_to_en call site in run_local_tryon must pass
+        # base_url=GEMINI_API_BASE explicitly so mocking works. This test exercises that
+        # call path to ensure it's not accidentally lost in future edits.
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            run = _run_gemini(tmp)
+            # Set Vietnamese extraPrompt with diacritics to trigger translate call
+            run.stage_params["tryon"]["extraPrompt"] = "giữ nguyên vòng cổ"
+            out = tmp / "01-tryon.png"
+
+            # Set up handler: call 0 = translate (text), call 1 = pass-1 edit (image)
+            GEMINI_STATE["modes"] = {0: "text", 1: "image"}
+            GEMINI_STATE["text_reply"] = "keep the necklace"
+
+            with mock.patch.object(lt, "GEMINI_API_BASE", self.base_url), \
+                 mock.patch.object(lt, "img_size", return_value=(1080, 1920)):
+                elapsed, size = lt.run_local_tryon(run, run.stage_params["tryon"],
+                                                   self._settings(), out)
+
+            # Verify both translate and pass-1 edit were called
+            self.assertEqual(GEMINI_STATE["calls"], 2)
+            self.assertGreaterEqual(elapsed, 0)
+            self.assertEqual(size, out.stat().st_size)
+            self.assertTrue(out.is_file())
 
 
 if __name__ == "__main__":
