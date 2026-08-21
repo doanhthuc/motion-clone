@@ -6,7 +6,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batchlib.client import JobError, JobFailed, JobGone
 from batchlib.config import Settings
 from batchlib.manifest import load_manifest, load_state, save_state, state_path_for
-from batchlib.runner import batch_id_now, run_batch, write_index
+from batchlib.runner import batch_id_now, run_batch, run_one, stage_dest, write_index
 
 SETTINGS = Settings(domain="x.test", api_key="mk_test", instance_id="i-1")
 
@@ -519,6 +519,47 @@ class TestIndex(unittest.TestCase):
             runA_rows = [r for r in rows if r[0] == "runA"]
             self.assertEqual([r[2] for r in runA_rows], ["motion"])
             self.assertEqual(runA_rows[0][1], "error")
+
+
+class TestStageDest(unittest.TestCase):
+    def test_duong_dan_dung_cong_thuc_NN_ten_chang(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = load_manifest(_fixture(Path(d), MANIFEST_MOT_RUN)).runs[0]
+            run_dir = Path(d) / "runs" / run.id
+            self.assertEqual(stage_dest(run, run_dir, "motion"), run_dir / "01-motion.mp4")
+            self.assertEqual(stage_dest(run, run_dir, "enhance"), run_dir / "02-enhance.mp4")
+
+
+class TestBoQuaChangDaXongKhongCanResume(unittest.TestCase):
+    """Pha A (Task 7) ghi 'done' vào journal TRƯỚC khi gọi run_one, trong CÙNG một lần
+    chạy `make batch` (resume=False, vì đây là lô mới). run_one phải nhận ra chặng đã
+    xong và bỏ qua, KHÔNG được đòi resume=True mới chịu bỏ qua."""
+
+    def test_chang_da_done_va_co_file_thi_bo_qua_du_khong_resume(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            manifest = load_manifest(_fixture(tmp, MANIFEST_MOT_RUN))
+            run = manifest.runs[0]
+            out_dir = tmp / "out"
+            run_dir = out_dir / "runs" / run.id
+            run_dir.mkdir(parents=True)
+            dest = stage_dest(run, run_dir, "motion")
+            dest.write_bytes(b"da-co-san-tu-pha-A")
+            state = {"version": 1, "runs": {run.id: {"status": "pending", "stages": {
+                "motion": {"status": "done", "file": str(dest), "bytes": dest.stat().st_size}}}}}
+            state_file = tmp / "b.state.json"
+
+            pod = FakePod()   # chỉ chặng enhance mới được phép chạm tới pod
+            with mock.patch("batchlib.runner.submit_job", pod.submit), \
+                 mock.patch("batchlib.runner.poll_job", pod.poll), \
+                 mock.patch("batchlib.runner.download_output", pod.download):
+                run_one(settings=SETTINGS, run=run, out_dir=out_dir, state=state,
+                       state_file=state_file, resume=False, log=lambda *_: None)
+
+            # motion KHÔNG được submit lại — chỉ enhance chạy trên pod giả. `pod.submitted` là
+            # list[tuple[job_type, params, files]] (đã có sẵn trong FakePod, xem __init__).
+            self.assertEqual([jt for jt, _, _ in pod.submitted], ["enhance"])
+            self.assertEqual(dest.read_bytes(), b"da-co-san-tu-pha-A")   # file không bị ghi đè
 
 
 if __name__ == "__main__":

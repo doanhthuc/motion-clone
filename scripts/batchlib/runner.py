@@ -130,6 +130,13 @@ def _try_reattach(*, settings: Settings, stage: Stage, job_id: str, recorded_sta
     return dto
 
 
+def stage_dest(run: Run, run_dir: Path, stage_name: str) -> Path:
+    """Đường dẫn NN-<chặng>.ext — DÙNG CHUNG giữa run_one (Pha B) và run_local_phase
+    (Pha A), để không lệch nhau khi Pha A ghi file trước, Pha B kiểm tra sau."""
+    index = PIPELINES[run.pipeline].index(stage_name) + 1
+    return run_dir / f"{index:02d}-{stage_name}{STAGES[stage_name].output_ext}"
+
+
 def run_one(*, settings: Settings, run: Run, out_dir: Path, state: dict,
             state_file: Path, resume: bool,
             log: Callable[[str], None], now: Callable[[], float] = time.time) -> Path:
@@ -147,13 +154,18 @@ def run_one(*, settings: Settings, run: Run, out_dir: Path, state: dict,
     log = _tee(log, log_file)
 
     prev_output: Path | None = None
-    for index, stage_name in enumerate(PIPELINES[run.pipeline], start=1):
+    for stage_name in PIPELINES[run.pipeline]:
         stage = STAGES[stage_name]
-        dest = run_dir / f"{index:02d}-{stage_name}{stage.output_ext}"
+        dest = stage_dest(run, run_dir, stage_name)
         recorded = entry["stages"].get(stage_name) or {}
         params = run.stage_params.get(stage_name, {})
 
-        if resume and recorded.get("status") == "done" and dest.is_file():
+        # Chặng đã "done" VÀ còn file trên đĩa thì bỏ qua — KHÔNG gate theo `resume`.
+        # Một lô THẬT SỰ mới (resume=False) luôn khởi tạo state["runs"] rỗng
+        # (run_batch/prepare_batch), nên "done" ở đây chỉ có thể đến từ Pha A
+        # (run_local_phase) đã ghi trong CHÍNH lần gọi `make batch` này — bỏ qua đúng
+        # là hành vi cần, không phải một lỗ hổng bỏ sót --resume.
+        if recorded.get("status") == "done" and dest.is_file():
             log(f"    {stage_name}: bỏ qua (đã xong, {dest.name})")
             prev_output = dest
             continue
