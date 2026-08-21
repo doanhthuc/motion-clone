@@ -158,8 +158,8 @@ ENV MOTION_FRESH_COMFY=0 \
 # Bản full = đúng JOB_TYPE của setup/setup-full.sh (registry PIPELINES trừ wan-dancer, 21 type).
 RUN set -eux; mkdir -p /etc/motion; \
     case "$PROFILE" in \
-      full) printf '%s' "motion,bds,tryon,create-image,edit-image,product-overlay,teaser,video,text-to-video,wan-i2v,teen-flycam,trend-tiktok,ss,talk,face-motion,concat,reveal,voiceover,story-film,subtitle,enhance" > /etc/motion/job-types ;; \
-      *)    printf '%s' "motion,teen-flycam,trend-tiktok,enhance" > /etc/motion/job-types ;; \
+      full) printf '%s' "motion,bds,tryon,create-image,edit-image,product-overlay,teaser,video,text-to-video,wan-i2v,teen-flycam,trend-tiktok,ss,talk,face-motion,concat,reveal,voiceover,story-film,subtitle,enhance,character-swap" > /etc/motion/job-types ;; \
+      *)    printf '%s' "motion,teen-flycam,trend-tiktok,enhance,character-swap" > /etc/motion/job-types ;; \
     esac; \
     echo "PROFILE=$PROFILE → JOB_TYPES=$(cat /etc/motion/job-types)"
 

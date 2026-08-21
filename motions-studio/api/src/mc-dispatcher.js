@@ -22,7 +22,7 @@ const MAX_INFLIGHT = Math.max(1, Number(process.env.DISPATCH_MAX_INFLIGHT || 3))
 //   - Dispatcher KHÔNG liệt kê type mà endpoint claim được → job đó chờ dispatcher đánh thức nhưng
 //     không bao giờ được bắn /run, chỉ chạy khi tình cờ có job type khác đánh thức worker.
 // Đổi một bên (Dockerfile.selfhosted hoặc JOB_TYPES của Endpoint) thì PHẢI đổi DISPATCH_JOB_TYPES ở đây.
-const DEFAULT_JOB_TYPES = "motion,teen-flycam,trend-tiktok,enhance"
+const DEFAULT_JOB_TYPES = "motion,teen-flycam,trend-tiktok,enhance,character-swap"
 const JOB_TYPES = (process.env.DISPATCH_JOB_TYPES || DEFAULT_JOB_TYPES)
   .split(",")
   .map((s) => s.trim())
