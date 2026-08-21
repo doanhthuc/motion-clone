@@ -53,6 +53,25 @@ class ApplySwapToWanWorkflowTests(unittest.TestCase):
         self.assertEqual(wf["204"]["inputs"]["expand"], 20)
         self.assertEqual(wf["205"]["inputs"]["block_size"], 16)
 
+    def test_blockify_mac_dinh_16_khong_phai_32(self):
+        # Đo thật 21/08: mask blockify 32 nới vùng vẽ lại rộng hơn hẳn dáng người → Wan có đất
+        # bịa vật thể (bó hoa) khi keypoint tay mơ hồ. 16 bám sát người hơn mà vẫn thẳng lưới latent.
+        self.assertEqual(self._wf()["205"]["inputs"]["block_size"], 16)
+
+    def test_negative_prompt_chan_bia_vat_the(self):
+        neg = self._wf()["60"]["inputs"]["negative_prompt"]
+        self.assertIn("bouquet", neg)
+        self.assertIn("holding objects", neg)
+        # NỐI THÊM, không thay: negative gốc lo da bóng/cháy sáng, mất là hỏng thứ khác.
+        self.assertIn("过曝", neg)
+
+    def test_negative_extra_ghi_de_va_tat_duoc(self):
+        self.assertIn("no handbag", self._wf({"swapNegativeExtra": "no handbag"})["60"]["inputs"]["negative_prompt"])
+        # Rỗng = TẮT hẳn: mẫu cầm sản phẩm (túi xách) là kịch bản thật của tool thời trang.
+        neg_off = self._wf({"swapNegativeExtra": ""})["60"]["inputs"]["negative_prompt"]
+        self.assertNotIn("bouquet", neg_off)
+        self.assertIn("过曝", neg_off)
+
     def test_khong_dung_vao_graph_motion_goc(self):
         params = {"width": 544, "height": 960, "frames": 81, "steps": 4}
         wf = build_wan_workflow("ref.png", "drv.mp4", params)

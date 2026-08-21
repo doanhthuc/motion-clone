@@ -1716,6 +1716,12 @@ def build_wan_workflow(ref_name, motion_name, p, prefix="motion-out"):
     return wf
 
 
+# ALD 22/08/2026 - Cụm negative CHỈ dùng cho character-swap (motion không đụng tới). Tách hằng số ra
+# đây để sửa một chỗ, và để test khẳng định được nội dung thay vì so chuỗi dài trong thân hàm.
+SWAP_NEGATIVE_EXTRA = ("bouquet, flowers, holding objects, hands holding items, "
+                       "extra objects, props, floating objects")
+
+
 def _apply_swap_to_wan_workflow(wf, p):
     """Character-swap engine wananimate: chuyển graph animation → replacement (Mix) mode.
 
@@ -1742,13 +1748,29 @@ def _apply_swap_to_wan_workflow(wf, p):
         "expand": _motion_int(p, "maskGrow", "mask_grow", default=10),
         "incremental_expandrate": 0.0, "tapered_corners": True, "flip_input": False,
         "blur_radius": 0.0, "lerp_alpha": 1.0, "decay_factor": 1.0, "fill_holes": False}}
+    # ALD 22/08/2026 - MẶC ĐỊNH 32→16 sau khi đo thật trên pod 21/08. Blockify lấy bounding box của
+    # mask rồi tô ĐẦY mọi ô có dính mask, nên ô càng to vùng vẽ lại càng phình ra ngoài dáng người —
+    # 32px cho Wan cả một khoảng trống trước bụng để bịa vật thể. 16 vẫn thẳng lưới latent (VAE ×8,
+    # patch 2 → bội 16) mà bám sát người hơn. Muốn về hành vi cũ: maskBlockify=32.
     wf["205"] = {"class_type": "BlockifyMask", "inputs": {
         "masks": ["204", 0],
-        "block_size": _motion_int(p, "maskBlockify", "mask_blockify", default=32)}}
+        "block_size": _motion_int(p, "maskBlockify", "mask_blockify", default=16)}}
     wf["206"] = {"class_type": "DrawMaskOnImage", "inputs": {
         "image": ["12", 0], "mask": ["205", 0], "color": "0, 0, 0"}}
     wf["81"]["inputs"]["bg_images"] = ["206", 0]
     wf["81"]["inputs"]["mask"] = ["205", 0]
+    # #region ALD 22/08/2026 - CHẶN BỊA VẬT THỂ. Đo thật 21/08 (nhanvat-1 + dandong-2): driver chắp
+    # tay sau lưng → DWPose đặt keypoint bàn tay mơ hồ ra phía trước → Wan "giải thích" tư thế bằng
+    # cách vẽ BÓ HOA vào tay, bám từ ~frame 60 tới hết clip (frame 0 còn sạch). Cùng họ với bệnh
+    # "ngón tay kéo dài" đã ghi ở build_wan_workflow: keypoint tay hỏng thì Wan tự sáng tác.
+    # NỐI THÊM vào negative có sẵn chứ không thay — chuỗi gốc còn lo da bóng/cháy sáng.
+    # swapNegativeExtra="" TẮT hẳn: mẫu cầm sản phẩm (túi xách, hộp mỹ phẩm) là kịch bản THẬT của
+    # tool thời trang, cấm "holding objects" lúc đó là tự bắn vào chân.
+    _neg_extra = str(p.get("swapNegativeExtra", p.get("swap_negative_extra", SWAP_NEGATIVE_EXTRA))).strip()
+    if _neg_extra and "60" in wf:
+        _neg = str(wf["60"]["inputs"].get("negative_prompt") or "").strip().rstrip(",")
+        wf["60"]["inputs"]["negative_prompt"] = f"{_neg}, {_neg_extra}" if _neg else _neg_extra
+    # #endregion
     return wf
 
 def build_scail2_swap_workflow(ref_name, motion_name, p, prefix="swap-out"):

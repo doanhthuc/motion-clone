@@ -102,8 +102,8 @@
         "why": "_apply_swap_to_wan_workflow:1742 — GrowMaskWithBlur.expand (nới mask trước Blockify), đọc qua _motion_int()."
       },
       "maskBlockify": {
-        "line": 1747,
-        "why": "_apply_swap_to_wan_workflow:1747 — BlockifyMask.block_size, đọc qua _motion_int()."
+        "line": 1757,
+        "why": "_apply_swap_to_wan_workflow:1757 — BlockifyMask.block_size, đọc qua _motion_int(). Mặc định 16 (đo 21/08: 32 nới mask quá rộng → Wan bịa vật thể vào tay)."
       },
       "maskIndices": {
         "line": 1739,
@@ -172,6 +172,10 @@
       "preset": {
         "line": 2084,
         "why": "_normalize_motion_params:2084 đọc preset để tra MOTION_PRESETS (fps/frame/resolution); run_character_swap:4753 chỉ setdefault('preset','drv-5s'), không .get() nên AST không thấy cho job type character-swap."
+      },
+      "swapNegativeExtra": {
+        "line": 1769,
+        "why": "_apply_swap_to_wan_workflow:1769 — cụm negative CHỈ của swap, nối thêm vào negative gốc để chặn bịa vật thể. Chuỗi rỗng = TẮT (khi cần mẫu cầm sản phẩm thật)."
       }
     },
     "api": {},
