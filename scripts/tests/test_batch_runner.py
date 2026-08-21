@@ -796,9 +796,16 @@ class TestRunLocalPhase(unittest.TestCase):
             self.assertEqual(result.done, ["runB"])
             self.assertIn("runA", result.failed)
             self.assertEqual(result.state["runs"]["runA"]["stages"]["tryon"]["status"], "error")
+            # Mức RUN, không chỉ mức chặng — giống giao ước của run_batch. Chỉ đánh dấu
+            # chặng thì run hỏng vẫn nằm "pending" trong journal, không phân biệt được
+            # với run chưa chạy; ai đọc journal sau Pha A sẽ hiểu sai.
+            self.assertEqual(result.state["runs"]["runA"]["status"], "error")
+            self.assertIn("gemini 429 het quota", result.state["runs"]["runA"]["error"])
             # Journal của run HỎNG cũng phải nằm trên đĩa, không chỉ trong bộ nhớ.
             tren_dia = load_state(result.state_file)["runs"]
             self.assertEqual(tren_dia["runA"]["stages"]["tryon"]["status"], "error")
+            self.assertEqual(tren_dia["runA"]["status"], "error")
+            self.assertIn("gemini 429 het quota", tren_dia["runA"]["error"])
             self.assertEqual(tren_dia["runB"]["stages"]["tryon"]["status"], "done")
 
     def test_pool_chay_song_song_nhung_khong_qua_pool_size(self):

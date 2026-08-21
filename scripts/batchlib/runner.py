@@ -450,6 +450,12 @@ def run_local_phase(*, settings: Settings, manifest: Manifest, out_root: Path, b
                 entry["stages"]["tryon"] = {"status": "error",
                                             "elapsed_sec": int(time.time() - started),
                                             "params_manifest": dict(params)}
+                # Mức run, không chỉ mức chặng — đúng giao ước của run_batch. Để nguyên
+                # "pending" thì journal nói dối: run hỏng ở Pha A trông y hệt run chưa
+                # chạy. Không chặn tự chữa ở Pha B: vòng lặp của run_batch chỉ bỏ qua khi
+                # status == "done", còn run_one đặt lại "running" ngay khi vào.
+                entry["status"] = "error"
+                entry["error"] = str(exc)
                 save_state(state_file, state)
             log(f"    ✗ {run.id}/tryon (local): {exc}")
             return False, str(exc)
