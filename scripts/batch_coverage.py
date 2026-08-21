@@ -34,6 +34,7 @@ import collections
 import io
 import os
 import sys
+import threading
 import trace
 import unittest
 from pathlib import Path
@@ -60,7 +61,15 @@ def run_suite_traced() -> dict[str, set[int]]:
         suite = unittest.TestLoader().discover(str(ROOT / "scripts" / "tests"), pattern="test_batch_*.py")
         unittest.TextTestRunner(stream=io.StringIO(), verbosity=0).run(suite)
 
-    tracer.runfunc(go)
+    # trace.Trace chỉ cài hook cho THREAD GỌI NÓ. Từ khi runner.run_local_phase chạy
+    # try-on local trong một ThreadPoolExecutor, toàn bộ thân hàm chạy-trong-thread bị
+    # báo "chưa chạy" dù test đã phủ kín — tức bảng này chỉ thẳng người đọc vào một
+    # vùng trắng KHÔNG có thật. threading.settrace cài hook cho mọi thread đẻ sau đó.
+    threading.settrace(tracer.globaltrace)
+    try:
+        tracer.runfunc(go)
+    finally:
+        threading.settrace(None)
     hit: dict[str, set[int]] = collections.defaultdict(set)
     for filename, lineno in tracer.results().counts:
         hit[os.path.realpath(filename)].add(lineno)

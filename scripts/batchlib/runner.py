@@ -16,13 +16,17 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import shutil
+import threading
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor
+from concurrent.futures import wait as cf_wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
 from .client import JobError, JobFailed, JobGone, download_output, poll_job, submit_job
-from .config import Settings
+from .config import ConfigError, Settings
+from .local_tryon import is_local_provider, run_local_tryon
 from .manifest import Manifest, Run, load_state, save_state, state_path_for
 from .pipelines import PIPELINES, STAGES, Stage
 
@@ -350,4 +354,146 @@ def run_batch(*, settings: Settings, manifest: Manifest, out_root: Path,
     if latest.is_symlink() or latest.exists():
         latest.unlink()
     latest.symlink_to(out_dir.name)
+    return result
+
+
+def needs_pod(manifest: Manifest) -> bool:
+    """True nếu còn ít nhất một chặng KHÔNG THỂ chạy local trong toàn bộ manifest.
+
+    Dựa trên ĐỊNH NGHĨA pipeline (tĩnh), không dựa trên state runtime: motion/enhance
+    không bao giờ local-eligible, nên với hai pipeline hiện có (PIPELINES) hàm này
+    luôn True — nhưng viết tường minh để không âm thầm sai nếu sau này có pipeline
+    chỉ gồm try-on.
+    """
+    for run in manifest.runs:
+        for stage_name in PIPELINES.get(run.pipeline, []):
+            if stage_name != "tryon":
+                return True
+            provider = str(run.stage_params.get("tryon", {}).get("provider") or "").lower().strip()
+            if not is_local_provider(provider):
+                return True
+    return False
+
+
+@dataclass
+class LocalPhaseResult:
+    ran: bool
+    out_dir: Path | None = None
+    state: dict | None = None
+    state_file: Path | None = None
+    done: list[str] = field(default_factory=list)
+    failed: dict[str, str] = field(default_factory=dict)
+
+
+def run_local_phase(*, settings: Settings, manifest: Manifest, out_root: Path, batch_id: str,
+                    resume: bool, fail_fast: bool = False, log: Callable[[str], None] = print,
+                    pool_size: int = 4) -> LocalPhaseResult:
+    """Pha A: try-on qua API (provider local-eligible) chạy TRƯỚC khi đụng pod, qua một
+    pool đồng thời có giới hạn — không tốn GPU nên chạy song song không có cái giá
+    "hai job chồng nhau trên một GPU" mà run_one/run_batch phải tránh (xem docstring
+    đầu file). KHÔNG tạo out_dir/state nếu manifest không có run nào cần Pha A — giữ
+    hành vi HỆT NHƯ TRƯỚC bản sửa này cho mọi manifest không dùng try-on local.
+
+    Giới hạn pool là thật chứ không phải trang trí: mỗi job là một request ảnh tới
+    Gemini, và bơm cả 12 run của một lô cùng lúc là cách chắc chắn nhất ăn 429.
+    """
+    jobs: list[tuple[Run, dict]] = []
+    for run in manifest.runs:
+        if "tryon" not in PIPELINES.get(run.pipeline, []):
+            continue
+        params = run.stage_params.get("tryon", {})
+        provider = str(params.get("provider") or "").lower().strip()
+        if is_local_provider(provider):
+            jobs.append((run, params))
+
+    if not jobs:
+        return LocalPhaseResult(ran=False)
+
+    if not settings.gemini_api_key:
+        raise ConfigError(
+            "Thiếu GEMINI_API_KEY trong .env — cần để chạy try-on local (provider: gemini).\n"
+            "  Lấy key ở https://aistudio.google.com/apikey rồi thêm GEMINI_API_KEY=... vào .env."
+        )
+
+    out_dir, state, state_file = prepare_batch(manifest=manifest, out_root=out_root,
+                                               batch_id=batch_id, resume=resume)
+    result = LocalPhaseResult(ran=True, out_dir=out_dir, state=state, state_file=state_file)
+    # MỘT khoá cho MỌI lần chạm `state`/`entry`/`save_state`. Không phải để bảo vệ dict
+    # của Python (GIL đã lo) mà để bảo vệ cặp "sửa state" + "ghi state xuống đĩa": hai
+    # thread ghi save_state đan xen nhau có thể để lại journal thiếu đúng cái vừa xong.
+    lock = threading.Lock()
+
+    def _one(run: Run, params: dict) -> tuple[bool, str | None]:
+        """Chạy một run trong thread của pool. Trả (có_chạy_mới, lỗi).
+
+        "có_chạy_mới" tách riêng khỏi "không lỗi" vì chặng đã xong từ lượt trước cũng
+        trả về không lỗi — nhưng nó KHÔNG thuộc `done` của lần này: `done` là danh sách
+        việc lần chạy này thật sự làm, người đọc log dùng nó để biết đã tiêu bao nhiêu
+        quota Gemini.
+        """
+        with lock:
+            entry = state["runs"].setdefault(run.id, {"status": "pending", "stages": {}})
+            recorded = entry["stages"].get("tryon") or {}
+        run_dir = out_dir / "runs" / run.id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        dest = stage_dest(run, run_dir, "tryon")
+        # Hai vế, giống hệt run_one: journal nói "done" VÀ file còn trên đĩa. Tin journal
+        # suông thì Pha B nhận một đường dẫn không tồn tại ở chặng motion.
+        if recorded.get("status") == "done" and dest.is_file():
+            log(f"    {run.id}/tryon: bỏ qua (đã xong local, {dest.name})")
+            return False, None
+        started = time.time()
+        try:
+            elapsed, size = run_local_tryon(run, params, settings, dest)
+        except JobError as exc:
+            with lock:
+                entry["stages"]["tryon"] = {"status": "error",
+                                            "elapsed_sec": int(time.time() - started),
+                                            "params_manifest": dict(params)}
+                save_state(state_file, state)
+            log(f"    ✗ {run.id}/tryon (local): {exc}")
+            return False, str(exc)
+        # params_sent == params_manifest ở đây KHÔNG phải copy-paste: hai cột đó lệch nhau
+        # được là vì API nắn param trước khi ghi DB (xem docstring write_index). Pha A
+        # không đi qua API nào cả — nó gọi thẳng Gemini với đúng param của manifest, nên
+        # "xin gì" và "được gì" thật sự là một.
+        with lock:
+            entry["stages"]["tryon"] = {
+                "status": "done", "elapsed_sec": elapsed, "file": str(dest), "bytes": size,
+                "params_sent": dict(params), "params_manifest": dict(params)}
+            save_state(state_file, state)
+        log(f"    {run.id}/tryon (local): xong {elapsed}s · {size // 1024} KB → {dest.name}")
+        return True, None
+
+    pending = list(jobs)
+    aborted = False
+    # Cửa sổ trượt: luôn giữ đúng `pool_size` job đang bay, nạp thêm một cái mỗi khi một
+    # cái xong. Chỉ THREAD CHÍNH đụng `pending`/`futures` (mọi lời gọi _submit_next đều ở
+    # đây), nên hai cấu trúc đó không cần khoá.
+    with ThreadPoolExecutor(max_workers=pool_size) as pool:
+        futures: dict = {}
+
+        def _submit_next() -> None:
+            if pending and not aborted:
+                run, params = pending.pop(0)
+                futures[pool.submit(_one, run, params)] = run.id
+
+        for _ in range(min(pool_size, len(pending))):
+            _submit_next()
+        while futures:
+            # wait(..., FIRST_COMPLETED) — chờ ÍT NHẤT một future xong rồi xử lý cả lô,
+            # không phải vòng lặp bận (busy-wait) kiểu tự dò .done() trên từng future.
+            done_set, _ = cf_wait(list(futures), return_when=FIRST_COMPLETED)
+            for done_future in done_set:
+                run_id = futures.pop(done_future)
+                ran_moi, err = done_future.result()
+                if err is not None:
+                    result.failed[run_id] = err
+                    # fail_fast: không nạp thêm việc MỚI. Job đang bay vẫn phải chờ xong —
+                    # một request HTTP đã gửi thì huỷ cũng không lấy lại được tiền/quota.
+                    if fail_fast:
+                        aborted = True
+                elif ran_moi:
+                    result.done.append(run_id)
+                _submit_next()
     return result
