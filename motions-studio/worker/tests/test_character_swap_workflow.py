@@ -1,6 +1,7 @@
 import sys
 import types
 import unittest
+from unittest.mock import patch
 
 # linux.py chỉ cần requests khi worker thật gọi API — stub như test_wan_anchored_context.py
 try:
@@ -13,6 +14,7 @@ except ModuleNotFoundError:
     )
     sys.modules["requests"] = requests_stub
 
+from worker_runtime import linux  # noqa: E402
 from worker_runtime.linux import (  # noqa: E402
     _apply_swap_to_wan_workflow,
     build_scail2_swap_workflow,
@@ -89,6 +91,40 @@ class BuildScail2SwapWorkflowTests(unittest.TestCase):
         self.assertEqual(wf["90"]["inputs"]["cfg"], 1.0)
         self.assertEqual(wf["32"]["inputs"]["strength_model"], 0.8)   # lightx2v rank64
         self.assertEqual(wf["31"]["inputs"]["strength_model"], 1.0)   # DPO
+
+
+class RunCharacterSwapTests(unittest.TestCase):
+    def test_dang_ky_pipeline(self):
+        self.assertIn("character-swap", linux.PIPELINES)
+        self.assertIs(linux.PIPELINES["character-swap"], linux.run_character_swap)
+
+    def test_map_video_sang_motion_va_default_wananimate(self):
+        job = {"id": "j1", "inputs": {"ref": "a/ref.png", "video": "a/drv.mp4"}, "params": {}}
+        with patch.object(linux, "run_motion") as rm:
+            linux.run_character_swap(job)
+        rm.assert_called_once_with(job)
+        self.assertEqual(job["inputs"]["motion"], "a/drv.mp4")
+        p = job["params"]
+        self.assertEqual(p["_swapEngine"], "wananimate")
+        self.assertEqual(p["lora_relight"], 1.0)      # relight LoRA sinh ra cho Mix mode
+        self.assertEqual(p["pose_strength"], 1.0)     # bộ số theo example kijai replacement
+        self.assertEqual(p["face_strength"], 1.0)
+        self.assertEqual(p["preset"], "drv-5s")
+
+    def test_engine_scail2_va_engine_la(self):
+        job = {"id": "j2", "inputs": {"ref": "r.png", "video": "d.mp4"},
+               "params": {"engine": "scail2"}}
+        with patch.object(linux, "run_motion"):
+            linux.run_character_swap(job)
+        self.assertEqual(job["params"]["_swapEngine"], "scail2")
+        bad = {"id": "j3", "inputs": {"ref": "r.png", "video": "d.mp4"},
+               "params": {"engine": "xyz"}}
+        with self.assertRaises(RuntimeError):
+            linux.run_character_swap(bad)
+
+    def test_thieu_input_bao_ro(self):
+        with self.assertRaises(RuntimeError):
+            linux.run_character_swap({"id": "j4", "inputs": {"ref": "r.png"}, "params": {}})
 
 
 if __name__ == "__main__":

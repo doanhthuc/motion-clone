@@ -4491,7 +4491,22 @@ def run_motion(job):
     else:
         api_log(job_id, f"Window mode: autoregressive · {est_windows} window × {_wsz}f", "info")
     wan_prefix = f"motion-{job_id[:8]}"
-    workflow = build_wan_workflow(ref_name, motion_name, params, prefix=wan_prefix)
+    # ALD 21/08/2026 - character-swap đi chung run_motion (tái dùng toàn bộ driver-processing),
+    # chỉ rẽ nhánh Ở ĐÂY theo _swapEngine. Chuỗi rỗng = motion cũ nguyên vẹn.
+    _swap_engine = str(params.get("_swapEngine") or "").strip().lower()
+    def _build_motion_workflow(_p):
+        if _swap_engine == "scail2":
+            return build_scail2_swap_workflow(ref_name, motion_name, _p, prefix=wan_prefix)
+        _wf = build_wan_workflow(ref_name, motion_name, _p, prefix=wan_prefix)
+        if _swap_engine == "wananimate":
+            _wf = _apply_swap_to_wan_workflow(_wf, _p)
+        return _wf
+    if _swap_engine == "scail2" and _F > 81:
+        api_log(job_id, f"scail2: 1 segment tối đa 81 frame (extend chaining làm sau) → cắt {_F}→81f", "warn")
+        _F = 81; params["frames"] = 81
+        params["_target_output_sec"] = min(float(params.get("_target_output_sec") or 0) or (81.0 / rfps), 81.0 / rfps)
+        window_plan = _wan_window_plan(params, _F); est_windows = 1
+    workflow = _build_motion_workflow(params)
     try:
         pid = comfy_submit(workflow)
     except Exception as _submit_error:
@@ -4506,7 +4521,7 @@ def run_motion(job):
             # faceCropMode=dwpose → _vitpose_face=False → _pose_retarget cũng tự tắt (pose về DWPose node 20).
             params = {**params, "faceCropMode": "dwpose", "face_crop_mode": "dwpose",
                       "poseRetarget": "0", "pose_retarget": "0"}
-            pid = comfy_submit(build_wan_workflow(ref_name, motion_name, params, prefix=wan_prefix))
+            pid = comfy_submit(_build_motion_workflow(params))
         else:
             _context_incompatible = any(x in _msg for x in ("WanVideoContextOptions", "WANVIDCONTEXT", "context_options"))
             if not window_plan["anchored"] or not _context_incompatible:
@@ -4514,9 +4529,7 @@ def run_motion(job):
             api_log(job_id, f"Wan wrapper chưa hỗ trợ anchored-context; fallback autoregressive: {_msg[:240]}", "warn")
             params = {**params, "window_mode": "autoregressive", "windowMode": "autoregressive"}
             window_plan = _wan_window_plan(params, _F)
-            pid = comfy_submit(build_wan_workflow(
-                ref_name, motion_name, params, prefix=wan_prefix
-            ))
+            pid = comfy_submit(_build_motion_workflow(params))
     outputs = comfy_poll(pid, job_id, deadline_sec=1800,
                          prog_lo=0.25, prog_hi=0.9, prog_step="Wan 2.2 Animate",
                          windows=1 if window_plan["anchored"] else est_windows,
@@ -4700,13 +4713,50 @@ def run_motion(job):
             api_log(job_id, f"{_fps_target}fps lỗi (giữ bản gốc fps): {e}", "warn")
 
     # ALD 27/07 - Cân màu chống ngả tông TRƯỚC ESRGAN: sửa cast trên master gốc để pass làm nét không khuếch đại nó
-    out_mp4 = _apply_motion_drift_fix(out_mp4, ref_local, tmp, params, job_id)
+    if not _swap_engine:
+        # drift-fix grade màu THEO ẢNH REF — đúng cho motion (background từ ảnh), SAI cho swap
+        # (background từ video): sẽ kéo tông video về tông ảnh mẫu.
+        out_mp4 = _apply_motion_drift_fix(out_mp4, ref_local, tmp, params, job_id)
     out_mp4 = _apply_motion_detail_upscale(out_mp4, tmp, params, job_id)  # ALD 17/07 - ESRGAN làm nét TRƯỚC delivery (trị lớp blur)
     api_progress(job_id, 0.94, "chuẩn hoá đầu ra phát hành")
     out_mp4, _delivery_applied = _apply_motion_delivery(out_mp4, tmp, params, job_id)
     api_progress(job_id, 0.98, "upload output")
     _output_label = _motion_delivery_label(params, _delivery_applied)
     api_upload_output(job_id, out_mp4, label=_output_label)  # API tự set status=done + Storage dùng label làm tên
+
+
+def run_character_swap(job):
+    """Thay nhân vật trong video bằng người mẫu từ ảnh — GIỮ background + camera CỦA VIDEO.
+
+    Ngược với motion (background từ ảnh ref). Tái dùng run_motion cho toàn bộ driver-processing;
+    rẽ nhánh build workflow theo params['_swapEngine'] (hook trong run_motion).
+    Spec: docs/superpowers/specs/2026-08-21-character-swap-design.md
+    """
+    inputs = job.get("inputs") or {}
+    params = job.get("params") or {}
+    # API/batch gửi field 'video' (video nguồn cần thay người); run_motion đọc inputs['motion']
+    if inputs.get("video") and not inputs.get("motion"):
+        inputs["motion"] = inputs["video"]
+    if not (inputs.get("ref") or inputs.get("image")) or not inputs.get("motion"):
+        raise RuntimeError("character-swap cần inputs.ref (ảnh người mẫu) + inputs.video (video nguồn)")
+    engine = str(params.get("engine") or "wananimate").strip().lower()
+    if engine not in ("wananimate", "scail2"):
+        raise RuntimeError(f"character-swap: engine không hỗ trợ: {engine!r} (chọn wananimate | scail2)")
+    params["_swapEngine"] = engine
+    params.setdefault("preset", "drv-5s")            # fps/frame/tỉ lệ theo driver 1:1 như motion
+    if engine == "wananimate":
+        # Bộ số theo example WanAnimate replacement của kijai (KHÁC tuning animation-mode của motion:
+        # 0.7/0.8 bên đó trị "driver cấp vóc dáng" — swap thì người trong video là khung sẵn).
+        params.setdefault("lora_relight", 1.0)       # relight LoRA sinh ra riêng cho Mix mode
+        params.setdefault("pose_strength", 1.0)
+        params.setdefault("face_strength", 1.0)
+        params.setdefault("bodyProportionLock", "0")
+    else:
+        params.setdefault("steps", 6)                # turbo scail2 (template chính thức)
+    job["inputs"] = inputs
+    job["params"] = params
+    return run_motion(job)
+
 
 # ALD 01/06/2026 - Vision auto-detect loại đồ từ ẢNH SẢN PHẨM (khi user để 'auto').
 # Gọi Ollama vision (OLLAMA_URL + VISION_MODEL), trả 1 trong 10 loại. FAIL-SAFE: trả None khi
@@ -10035,6 +10085,7 @@ PIPELINES = {
     "story-film": run_story_film,  # KỊCH BẢN → AI director tách cảnh/nhân vật/thoại → phim nhân vật (lip-sync) ghép sẵn
     "subtitle": run_subtitle,  # ALD 15/06/2026 - 1 video → ASR (OmniVoice /asr) + dịch (Ollama) → CHÁY phụ đề (hardsub), giữ tiếng gốc
     "enhance": run_enhance,  # ALD 28/06/2026 - upscale video hậu Wan bằng ffmpeg lanczos → 1080p/2K (RAM phẳng, bỏ 4K) + RIFE fps tùy chọn
+    "character-swap": run_character_swap,  # ALD 21/08/2026 - thay nhân vật trong video bằng người mẫu từ ảnh (giữ background VIDEO); engine wananimate (Mix) | scail2
 }
 
 def _startup():
