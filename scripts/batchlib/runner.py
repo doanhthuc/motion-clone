@@ -290,20 +290,35 @@ def write_index(out_dir: Path, state: dict) -> None:
     (out_dir / "_index.tsv").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def run_batch(*, settings: Settings, manifest: Manifest, out_root: Path,
-              batch_id: str | None = None, resume: bool = False, fail_fast: bool = False,
-              log: Callable[[str], None] = print,
-              now: Callable[[], float] = time.time) -> BatchResult:
-    batch_id = batch_id or batch_id_now()
+def prepare_batch(*, manifest: Manifest, out_root: Path, batch_id: str,
+                  resume: bool) -> tuple[Path, dict, Path]:
+    """Tạo out_dir + nạp/khởi tạo state — tách khỏi run_batch() để Pha A
+    (run_local_phase, batch_run.py) và Pha B (run_batch, dưới đây) trong CÙNG một lần
+    gọi `make batch` thấy đúng MỘT state: Pha A ghi trước, Pha B đọc lại đúng cái Pha A
+    vừa ghi thay vì bị `resume=False` xoá sạch (run_batch cũ luôn ép state rỗng khi
+    resume=False — đúng cho lô KHÔNG có Pha A, sai nếu Pha A đã chạy trong cùng lần gọi).
+    """
     out_dir = out_root / batch_id
     out_dir.mkdir(parents=True, exist_ok=True)
-
     # Chép NGUYÊN VĂN, không qua PyYAML — comment của người dùng phải sống sót.
     shutil.copyfile(manifest.path, out_dir / "manifest.yaml")
-
     state_file = state_path_for(manifest.path)
     state = load_state(state_file) if resume else {"version": 1, "runs": {}}
     state["batch"] = batch_id
+    return out_dir, state, state_file
+
+
+def run_batch(*, settings: Settings, manifest: Manifest, out_root: Path,
+              batch_id: str | None = None, resume: bool = False, fail_fast: bool = False,
+              log: Callable[[str], None] = print,
+              now: Callable[[], float] = time.time,
+              prepared: tuple[Path, dict, Path] | None = None) -> BatchResult:
+    batch_id = batch_id or batch_id_now()
+    if prepared is not None:
+        out_dir, state, state_file = prepared
+    else:
+        out_dir, state, state_file = prepare_batch(manifest=manifest, out_root=out_root,
+                                                    batch_id=batch_id, resume=resume)
 
     result = BatchResult(batch_id=batch_id, out_dir=out_dir)
     for position, run in enumerate(manifest.runs, start=1):

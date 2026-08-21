@@ -6,7 +6,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batchlib.client import JobError, JobFailed, JobGone
 from batchlib.config import Settings
 from batchlib.manifest import load_manifest, load_state, save_state, state_path_for
-from batchlib.runner import batch_id_now, run_batch, run_one, stage_dest, write_index
+from batchlib.runner import (batch_id_now, prepare_batch, run_batch, run_one, stage_dest,
+                              write_index)
 
 SETTINGS = Settings(domain="x.test", api_key="mk_test", instance_id="i-1")
 
@@ -560,6 +561,59 @@ class TestBoQuaChangDaXongKhongCanResume(unittest.TestCase):
             # list[tuple[job_type, params, files]] (đã có sẵn trong FakePod, xem __init__).
             self.assertEqual([jt for jt, _, _ in pod.submitted], ["enhance"])
             self.assertEqual(dest.read_bytes(), b"da-co-san-tu-pha-A")   # file không bị ghi đè
+
+
+class TestPrepareBatch(unittest.TestCase):
+    def test_lo_moi_state_rong(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            manifest = load_manifest(_fixture(tmp))
+            out_dir, state, state_file = prepare_batch(
+                manifest=manifest, out_root=tmp / "out", batch_id="2026-08-21-0900", resume=False)
+            self.assertTrue((out_dir / "manifest.yaml").is_file())
+            self.assertEqual(state, {"version": 1, "runs": {}, "batch": "2026-08-21-0900"})
+            self.assertEqual(state_file, state_path_for(manifest.path))
+
+    def test_resume_doc_lai_state_cu(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            manifest = load_manifest(_fixture(tmp))
+            state_file = state_path_for(manifest.path)
+            save_state(state_file, {"version": 1, "batch": "2026-08-20-0000",
+                                    "runs": {"runA": {"status": "done", "stages": {}}}})
+            out_dir, state, _ = prepare_batch(
+                manifest=manifest, out_root=tmp / "out", batch_id="2026-08-20-0000", resume=True)
+            self.assertEqual(state["runs"]["runA"]["status"], "done")
+
+
+class TestRunBatchNhanPrepared(unittest.TestCase):
+    def test_dung_state_da_chuan_bi_san_khong_tu_tao_lai(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            manifest = load_manifest(_fixture(tmp, MANIFEST_MOT_RUN))
+            run = manifest.runs[0]
+            batch_id = "2026-08-21-0900"
+            out_dir, state, state_file = prepare_batch(
+                manifest=manifest, out_root=tmp / "out", batch_id=batch_id, resume=False)
+            # Giả lập Pha A đã ghi xong chặng "motion" TRƯỚC khi run_batch được gọi.
+            run_dir = out_dir / "runs" / run.id
+            run_dir.mkdir(parents=True)
+            dest = stage_dest(run, run_dir, "motion")
+            dest.write_bytes(b"tu-pha-A")
+            state["runs"][run.id] = {"status": "pending",
+                                     "stages": {"motion": {"status": "done", "file": str(dest),
+                                                           "bytes": dest.stat().st_size}}}
+
+            pod = FakePod()
+            with mock.patch("batchlib.runner.submit_job", pod.submit), \
+                 mock.patch("batchlib.runner.poll_job", pod.poll), \
+                 mock.patch("batchlib.runner.download_output", pod.download):
+                result = run_batch(settings=SETTINGS, manifest=manifest, out_root=tmp / "out",
+                                   batch_id=batch_id, resume=False,
+                                   prepared=(out_dir, state, state_file))
+
+            self.assertEqual([jt for jt, _, _ in pod.submitted], ["enhance"])   # motion KHÔNG submit lại
+            self.assertEqual(result.done, [run.id])
 
 
 if __name__ == "__main__":
