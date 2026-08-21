@@ -6,6 +6,15 @@ scripts/batchlib/pipelines.py đã dùng cho tên field.
 
 KHÔNG dùng `requests`: máy dev không có thư viện đó (batchlib/client.py:1-4 đã ghi lại
 lý do này) — mọi HTTP call ở module này đi qua `urllib`, giống client.py.
+
+KHÁC BIỆT ĐÃ BIẾT so với pod — KHÔNG có autocrop ảnh sản phẩm: trên pod, run_tryon chạy
+`_bg_remove_file(..., model="object", crop=True)` cho ảnh sản phẩm/outfit trước khi gọi
+Gemini (linux.py:4766-4774), và cờ TRYON_PRODUCT_AUTOCROP mặc định BẬT (linux.py:2578) —
+nó cắt sát món đồ để sửa đúng ca "sản phẩm quá nhỏ, mẫu quá to" trong ảnh nguồn. Đường
+local ở đây gửi NGUYÊN byte ảnh outfit, không tiền xử lý gì: `_bg_remove_file` gọi dịch
+vụ tách nền BG_REMOVER_URL chỉ tồn tại trên pod, không port được về máy local. Hệ quả:
+CÙNG một manifest có thể ra ảnh try-on khác nhau (bố cục có thể xấu hơn) tuỳ chạy local
+hay chạy trên pod — rõ nhất với ảnh outfit mà món đồ nhỏ so với khung.
 """
 from __future__ import annotations
 
@@ -46,7 +55,6 @@ def mime_of(path: Path) -> str:
 def img_size(path: Path) -> tuple[int, int] | None:
     # linux.py:3176-3185 — (W,H) qua ffprobe, None nếu lỗi (caller fallback an toàn:
     # gemini_aspect(None) trả None, gemini_edit khi đó không ép aspect ratio).
-    import subprocess
     try:
         r = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -177,9 +185,16 @@ def _post_json(url: str, query: dict, payload: dict, timeout: int) -> dict:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as exc:
+        # PHẢI đứng TRƯỚC nhánh OSError: HTTPError là con của URLError, mà URLError là con
+        # của OSError — để sau thì mọi lỗi HTTP đều rơi vào nhánh dưới và mất mã 4xx/5xx.
         body = exc.read()[:300].decode("utf-8", "replace")
         raise JobError(f"Gemini API {exc.code}: {body}") from exc
-    except urllib.error.URLError as exc:
+    except OSError as exc:
+        # OSError chứ không chỉ URLError: urllib CHỈ bọc lỗi socket thành URLError ở khâu
+        # gửi request. Hết giờ đọc response (TimeoutError) hay rớt kết nối giữa chừng
+        # (ConnectionError) bay thẳng ra ngoài — không bắt ở đây thì nó không phải JobError,
+        # nên run_local_phase._one() (chỉ bắt JobError) để nó nổ ra tận main(): CẢ Pha A
+        # chết vì một run hết giờ, và run đó kẹt "pending" trong journal thay vì "error".
         raise JobError(f"Gemini API không phản hồi: {exc}") from exc
 
 
@@ -294,9 +309,12 @@ def run_local_tryon(run: Run, params: dict, settings: Settings, out_path: Path) 
     key = str(params.get("apiKey") or params.get("geminiApiKey")
              or settings.gemini_api_key or "").strip()
     if not key:
+        # CHỈ nhắc .env: apiKey/geminiApiKey KHÔNG nằm trong bảng param hợp lệ của chặng
+        # tryon (params.py đọc từ linux.py), nên manifest có hai key đó bị validate_manifest
+        # chặn TRƯỚC khi Pha A chạy — khuyên dùng chúng là khuyên một đường không đi được.
         raise JobError(
-            f"run {run.id!r}: try-on local (provider gemini) cần API key — thêm GEMINI_API_KEY "
-            "vào .env, hoặc apiKey/geminiApiKey trong tryon: của run này")
+            f"run {run.id!r}: try-on local (provider gemini) cần API key — thêm "
+            "GEMINI_API_KEY vào .env")
     if not valid_gemini_key(key):
         raise JobError(
             f"run {run.id!r}: GEMINI_API_KEY không đúng định dạng (phải 'AIza…', ~39 ký tự, "

@@ -3,6 +3,7 @@ import json
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -32,6 +33,13 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_header("content-length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            return
+        if mode == "hang":
+            # Không trả lời gì cả, chỉ ngủ rồi đóng — mô phỏng Gemini treo: client hết giờ
+            # đọc response. KHÔNG ghi byte nào sau khi ngủ: client đã bỏ đi, ghi vào đó là
+            # BrokenPipeError trong thread server → socketserver in traceback bẩn cả suite.
+            time.sleep(GEMINI_STATE.get("hang_sec", 0.6))
+            self.close_connection = True
             return
         if mode == "malformed_json":
             # Return 200 with non-JSON body — tests robustness of error handling
@@ -72,12 +80,14 @@ class GeminiServerCase(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.server.shutdown()
+        cls.server.server_close()  # đóng hẳn socket lắng nghe, tránh ResourceWarning rò rỉ
 
     def setUp(self):
         GEMINI_STATE["mode"] = "image"
         GEMINI_STATE["calls"] = 0
         GEMINI_STATE.pop("modes", None)
         GEMINI_STATE.pop("text_reply", None)
+        GEMINI_STATE.pop("hang_sec", None)
 
 
 class TestGeminiEdit(GeminiServerCase):
@@ -103,6 +113,39 @@ class TestGeminiEdit(GeminiServerCase):
             with self.assertRaises(JobError):
                 lt.gemini_edit([(b"x", "image/png")], "p", "AIzafake", Path(d) / "o.png",
                                base_url=self.base_url)
+
+
+class TestPostJsonLoiMang(GeminiServerCase):
+    """urllib CHỈ bọc lỗi socket thành URLError ở khâu GỬI request.
+
+    Hết giờ khi ĐỌC response ném TimeoutError trần — không phải URLError. Trước bản sửa,
+    `_post_json` chỉ bắt URLError nên nó bay thẳng qua run_local_tryon, qua
+    run_local_phase._one() (chỉ bắt JobError) và giết CẢ Pha A vì một run hết giờ.
+    """
+
+    def test_het_gio_doc_response_raise_joberror_khong_phai_timeouterror(self):
+        GEMINI_STATE["mode"] = "hang"
+        GEMINI_STATE["hang_sec"] = 0.6
+        with self.assertRaises(JobError) as cm:
+            lt._post_json(f"{self.base_url}/v1beta/models/m:generateContent",
+                          {"key": "AIzafake"}, {"contents": []}, timeout=0.15)
+        self.assertIn("không phản hồi", str(cm.exception))
+
+    def test_oserror_bat_ky_thanh_joberror(self):
+        # Phòng thủ theo LỚP lỗi, không theo từng loại: ConnectionResetError, socket drop,
+        # DNS hỏng… đều là OSError. Bắt đúng lớp cha là bắt hết một lần.
+        with mock.patch("urllib.request.urlopen",
+                        side_effect=ConnectionResetError("connection reset by peer")):
+            with self.assertRaises(JobError):
+                lt._post_json("http://127.0.0.1:1/x", {"key": "k"}, {}, timeout=1)
+
+    def test_gemini_edit_het_gio_cung_ra_joberror(self):
+        # Cùng lỗ hổng nhìn từ điểm vào thật sự của Pha A, không chỉ hàm nội bộ.
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch("urllib.request.urlopen", side_effect=TimeoutError("timed out")):
+                with self.assertRaises(JobError):
+                    lt.gemini_edit([(b"x", "image/png")], "p", "AIzafake", Path(d) / "o.png",
+                                   base_url=self.base_url)
 
 
 class TestTranslateVnToEn(GeminiServerCase):
