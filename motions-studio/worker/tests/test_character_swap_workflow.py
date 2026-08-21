@@ -127,5 +127,34 @@ class RunCharacterSwapTests(unittest.TestCase):
             linux.run_character_swap({"id": "j4", "inputs": {"ref": "r.png"}, "params": {}})
 
 
+class NormalizePathIntegrationTests(unittest.TestCase):
+    """Test đi ĐÚNG đường thật (không chạy run_motion): run_character_swap set default →
+    _normalize_motion_params mutate → build_*_workflow đọc. Đây là chỗ thiếu khiến review trước
+    lọt 2 bug: scail2 bị ép về 4 bước (preset drv-5s + fast-profile branch cùng ghi đè steps),
+    và bodyProportionLock chỉ setdefault ở nhánh wananimate nên scail2 bị khóa 'vóc dáng theo ref'
+    kéo pose_strength xuống 0.7. Không patch _normalize_motion_params/build_* — chỉ patch run_motion
+    để callable dừng lại đúng lúc, phần còn lại chạy y hệt runtime thật."""
+
+    def _normalized_params(self, engine):
+        job = {"id": "jn", "inputs": {"ref": "r.png", "video": "d.mp4"},
+               "params": {"engine": engine}}
+        with patch.object(linux, "run_motion"):
+            linux.run_character_swap(job)
+        return linux._normalize_motion_params(dict(job["params"]))
+
+    def test_scail2_giu_6_buoc_va_pose_strength_1(self):
+        p = self._normalized_params("scail2")
+        wf = build_scail2_swap_workflow("ref.png", "drv.mp4", p)
+        self.assertEqual(wf["81"]["inputs"]["steps"], 6)               # BasicScheduler
+        self.assertEqual(wf["70"]["inputs"]["pose_strength"], 1.0)     # WanSCAILToVideo
+
+    def test_wananimate_giu_relight_pose_face_1(self):
+        p = self._normalized_params("wananimate")
+        wf = _apply_swap_to_wan_workflow(build_wan_workflow("ref.png", "drv.mp4", p), p)
+        self.assertEqual(wf["40"]["inputs"]["strength_0"], 1.0)        # relight LoRA
+        self.assertEqual(wf["81"]["inputs"]["pose_strength"], 1.0)     # WanVideoAnimateEmbeds
+        self.assertEqual(wf["81"]["inputs"]["face_strength"], 1.0)
+
+
 if __name__ == "__main__":
     unittest.main()

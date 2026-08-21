@@ -22,7 +22,7 @@ Hai engine, chung một pipeline handler `run_character_swap` trong `worker_runt
 | `wananimate` (mặc định) | Wan2.2-Animate-14B fp8 (ĐÃ có trên volume) | Mix/replacement mode của Wan-Animate: cấp `bg_images` (frame video gốc) + `mask` (mask người) vào `WanVideoAnimateEmbeds` | Không — wrapper pin `088128b` đã có 2 input này (đã xác minh trên source) |
 | `scail2` | SCAIL-2 fp8_scaled 17.7GB (tải mới) | Node core native `WanSCAILToVideo` với `replacement_mode=true` + `SCAIL2ColoredMask` | Không — core pin v0.29.2 (`3221224`) đã chứa `comfy_extras/nodes_scail.py` + `nodes_sam3.py` (đã xác minh) |
 
-**Segmentation dùng chung**: SAM3 core node (`SAM3_VideoTrack` cho video, `SAM3_Detect` cho ảnh ref), prompt bằng **text conditioning "person"** → chạy headless không cần click điểm. Model `sam3.1_multiplex_fp16.safetensors` (1.7GB, thư mục `models/sam3`).
+**Segmentation dùng chung**: SAM3 core node (`SAM3_VideoTrack` cho cả video nguồn LẪN ảnh ref — ảnh ref cũng chạy qua `SAM3_VideoTrack`, không dùng `SAM3_Detect`), prompt bằng **text conditioning "person"** → chạy headless không cần click điểm. Model `sam3.1_multiplex_fp16.safetensors` (1.7GB, thư mục `models/checkpoints`).
 
 ## 4. Inputs / params
 
@@ -35,11 +35,15 @@ Inputs (multipart fieldname = key trong `inputs`):
 Params (`params` jsonb, camelCase, đọc qua `_motion_*` helpers dùng chung):
 
 - `engine`: `wananimate` | `scail2` (mặc định `wananimate`)
-- `prompt`, `seed`, `steps` (mặc định: wananimate 4 bước lightx2v, scail2 8 bước lightx2v)
-- `relightStrength` (wananimate: LoRA `WanAnimate_relight_lora_fp16` đã có sẵn, hiện gắn strength 0 trong graph motion → swap bật mặc định 1.0; scail2: relight LoRA riêng nếu A/B cần)
-- `maskGrow` (px, mặc định ~16), `maskFeather` (mặc định ~8) — nới + làm mềm mask người trước khi đưa vào graph (che tóc/áo bay ra ngoài mask)
+- `prompt`/`positive_prompt`, `negative_prompt`, `seed`, `steps` (mặc định: wananimate 4 bước lightx2v — baseline Fast của Motion Transfer; scail2 6 bước turbo theo template chính thức — `run_character_swap` setdefault, `_normalize_motion_params` cố ý KHÔNG ép về 4 bước cho scail2)
+- `lora_relight` / `loraRelight` (wananimate: LoRA `WanAnimate_relight_lora_fp16` đã có sẵn, hiện gắn strength 0 trong graph motion → swap bật mặc định 1.0; scail2 không dùng param này — xem `dpoLora`/`distillLora`)
+- `pose_strength` / `poseStrength`, `face_strength` / `faceStrength` (wananimate, mặc định 1.0 cả hai theo example replacement của kijai — `bodyProportionLock` bị tắt mặc định cho CẢ 2 engine để khỏi bị `_normalize_motion_params` ép `pose_strength` xuống 0.7)
+- `dpoLora`, `distillLora` (scail2: strength của LoRA DPO và lightx2v distill rank64)
+- `maskGrow` (px, mặc định 10), `maskBlockify` (block size, mặc định 32), `maskIndices` (rỗng = union mọi người, `"0"` = chỉ người đầu) — nới rồi block-hoá mask người trước khi đưa vào graph, đúng chuỗi kijai `GrowMaskWithBlur` → `BlockifyMask`. Không có `maskFeather`: Blockify nhị phân hoá mask thành các ô vuông cứng cạnh, blur/feather trước đó vô nghĩa (đã bỏ khỏi thiết kế)
+- `sam3Prompt` (dùng chung wananimate + fallback scail2), `sam3VideoPrompt`/`sam3ImagePrompt` (scail2, tách riêng prompt track video vs segment ảnh ref), `sam3Threshold`, `sam3MaxObjects`, `sam3DetectInterval` — điều khiển `SAM3_VideoTrack`
 - `driverStartSec` / `driverDurSec` — tái dùng `_cut_motion_driver_segment`
 - Độ phân giải: theo aspect video nguồn (logic FIT DRIVER hiện có), cạnh dài mặc định 704, chịu VRAM gate `MOTION_VRAM_MAX_EDGE/FRAMES` như motion
+- Toàn bộ param mask/SAM3/lora/prompt kể trên là public param — khai trong `scripts/batch-params.json` khối `character-swap.extra` (gate `make check-batch-params`), vì `run_character_swap` chỉ `setdefault(...)` (AST không thấy), giá trị thật được các builder graph `.get()` trực tiếp.
 
 ## 5. Graph chi tiết
 
@@ -49,7 +53,7 @@ Thêm tham số `swap_mode` vào `build_wan_workflow(ref_name, motion_name, p, p
 
 1. Thêm nhánh mask: `VHS_LoadVideo`(12) → `CLIPTextEncode`("person") + `SAM3ModelLoader` → `SAM3_VideoTrack` → mask union → `GrowMask`/blur (KJNodes có sẵn) → input `mask` của node 81.
 2. `bg_images` của node 81 = output frame của node 12 (video gốc, resize cùng W×H).
-3. LoRA relight strength từ 0 → `relightStrength` (node 40 giữ nguyên cấu trúc `WanVideoLoraSelectMulti`).
+3. LoRA relight strength từ 0 → `lora_relight`/`loraRelight` (node 40 giữ nguyên cấu trúc `WanVideoLoraSelectMulti`).
 4. Pose retarget (node 27) giữ **tắt** — replacement mode không hỗ trợ retarget.
 5. Phần còn lại (DWPose, ViTPose face-crop, sampler 4-step dpm++_sde cfg 1, decode tiled, VHS_VideoCombine mux audio driver) giữ nguyên.
 
@@ -59,11 +63,11 @@ VRAM: cùng model + thêm SAM3 1.7GB — dùng `_ensure_vram_for_motion` + `comf
 
 Theo template chính thức `video_wan21_scail2_character_replacement.json` (Comfy-Org/workflow_templates):
 
-1. Video nguồn → `SAM3_VideoTrack` (text "person") → `track_data` → `SCAIL2ColoredMask` (nền trắng cho replacement) → `pose_video_mask`.
-2. Ảnh ref → `SAM3_Detect` (text "person") → `reference_image_mask` màu tương ứng identity.
+1. Video nguồn → `SAM3_VideoTrack` (text "person"/`sam3VideoPrompt`) → `track_data` → `SCAIL2ColoredMask` (nền trắng cho replacement) → `pose_video_mask`.
+2. Ảnh ref → cũng `SAM3_VideoTrack` (text "person"/`sam3ImagePrompt`, cùng checkpoint) → `reference_image_mask` màu tương ứng identity.
 3. `WanSCAILToVideo`: `pose_video` = frame video nguồn, `replacement_mode=true`, `reference_image` + mask.
 4. Loader core: `UNETLoader` (`wan2.1_14B_SCAIL_2_fp8_scaled.safetensors`), `CLIPLoader` (`umt5_xxl_fp8_e4m3fn_scaled.safetensors`), VAE `Wan2_1_VAE_bf16.safetensors` (đã có), `clip_vision_h.safetensors` (đã có), LoRA lightx2v rank64 + DPO.
-5. Sampler core (`KSampler`/UniPC) 8 bước, 81 frame/segment; clip dài dùng cấu trúc Base + Extend (overlap 5 frame) — phase 1 giới hạn ≤81 frame/lần render rồi mới thêm Extend nếu cần.
+5. Sampler core (`SamplerCustom`, euler/simple) **6 bước turbo** (nhánh turbo của template chính thức: cfg 1, shift 5, LoRA DPO 1.0 + lightx2v rank64 0.8), 81 frame/segment; clip dài dùng cấu trúc Base + Extend (overlap 5 frame) — phase 1 giới hạn ≤81 frame/lần render rồi mới thêm Extend nếu cần.
 
 Builder viết theo đúng graph của template chính thức (đọc file JSON template làm nguồn chân lý khi implement, không phỏng đoán tên input).
 
@@ -77,7 +81,7 @@ Thêm vào `motions-studio/comfyui/catalog-motion-transfer.json`, `comfyui/model
 
 | File | Thư mục | Cỡ | Nguồn |
 |---|---|---|---|
-| `sam3.1_multiplex_fp16.safetensors` | `models/sam3` | 1.7GB | Comfy-Org/sam3.1 |
+| `sam3.1_multiplex_fp16.safetensors` | `models/checkpoints` | 1.7GB | Comfy-Org/sam3.1 |
 | `wan2.1_14B_SCAIL_2_fp8_scaled.safetensors` | `models/diffusion_models` | 17.7GB | Comfy-Org/SCAIL-2 |
 | `umt5_xxl_fp8_e4m3fn_scaled.safetensors` | `models/text_encoders` | ~6.7GB | Comfy-Org/Wan_2.1_ComfyUI_repackaged |
 | `lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors` | `models/loras` | ~0.7GB | Kijai/WanVideo_comfy |
@@ -102,12 +106,12 @@ Không thêm node ComfyUI mới → `check-comfy-nodes` không đổi. API `rout
 
 1. Gate tĩnh: `make check-job-types`, `make check-batch-params` pass.
 2. Smoke trên pod: 1 ảnh mẫu + 1 clip ~5s, chạy tuần tự `engine=wananimate` rồi `engine=scail2`, kiểm output.mp4 tồn tại, đúng số frame/aspect, background là của video nguồn (khác biệt then chốt so với motion).
-3. A/B chất lượng bằng mắt: identity mặt + quần áo, độ khớp ánh sáng (bật/tắt relight LoRA), viền mask (chỉnh maskGrow/Feather).
+3. A/B chất lượng bằng mắt: identity mặt + quần áo, độ khớp ánh sáng (bật/tắt relight LoRA), viền mask (chỉnh maskGrow/maskBlockify).
 4. Đo VRAM đỉnh từng engine trên 5090 32GB, ghi vào docs/gpu-pod.md như các đo đạc trước.
 
 ## 9. Rủi ro & đối sách
 
-- **SAM3 bắt nhầm/miss người khi nhiều người trong video**: mặc định union mọi mask "person"; nếu cần chọn 1 người → param `maskIndex` sau (YAGNI đợt này).
+- **SAM3 bắt nhầm/miss người khi nhiều người trong video**: mặc định union mọi mask "person"; nếu cần chọn 1 người → param `maskIndices` (đã có, vd `"0"` = chỉ người đầu).
 - **SCAIL-2 fp16 chi tiết mặt hạn chế (theo paper)**: đã có sẵn đường faceLock (inswapper) làm hậu kỳ tùy chọn.
 - **Wrapper `mask` semantics** (mask = vùng người hay vùng giữ?): xác minh bằng example workflow `wanvideo_WanAnimate_example_01.json` của kijai tại commit pin trước khi code.
 - **VRAM cộng dồn SAM3 + Wan trên 32GB**: recycle ComfyUI giữa bước segmentation và render nếu đo thấy sát trần.

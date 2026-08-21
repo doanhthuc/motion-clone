@@ -2092,6 +2092,10 @@ def _normalize_motion_params(p):
                 if p.get("loraRelight") is None and p.get("lora_relight") is None:
                     p["lora_relight"] = _v
                 continue
+            # ALD 21/08/2026 - SCAIL-2 dùng template turbo riêng (steps=6 do run_character_swap setdefault);
+            # preset "drv-*" chỉ định nghĩa steps=4 cho baseline Wan-Animate, KHÔNG áp cho scail2.
+            if _k == "steps" and p.get("_swapEngine") == "scail2":
+                continue
             p[_k] = _v
     for _dead in ("bgAnchor", "bg_anchor", "bgAnchorMaskExpand", "bg_anchor_mask_expand", "bgAnchorMaskBlur", "bg_anchor_mask_blur"):
         p.pop(_dead, None)
@@ -2162,7 +2166,10 @@ def _normalize_motion_params(p):
         p["renderProfile"] = "fast"
         p["hq"] = False
         p.pop("hq_steps", None)
-        p["steps"] = int(os.environ.get("MOTION_FAST_STEPS", "4") or "4")
+        # ALD 21/08/2026 - SCAIL-2 dùng template turbo riêng (steps=6 do run_character_swap setdefault);
+        # KHÔNG ép về MOTION_FAST_STEPS (4) — số đó là tuning riêng của Wan-Animate + lightx2v, sai template scail2.
+        if p.get("_swapEngine") != "scail2":
+            p["steps"] = int(os.environ.get("MOTION_FAST_STEPS", "4") or "4")
         p["cfg"] = 1.0
         p["scheduler"] = "dpm++_sde"
         _lx2v_s = float(os.environ.get("MOTION_LX2V_STRENGTH", "1.0") or "1.0")
@@ -4744,13 +4751,18 @@ def run_character_swap(job):
         raise RuntimeError(f"character-swap: engine không hỗ trợ: {engine!r} (chọn wananimate | scail2)")
     params["_swapEngine"] = engine
     params.setdefault("preset", "drv-5s")            # fps/frame/tỉ lệ theo driver 1:1 như motion
+    # ALD 21/08/2026 - Áp dụng CHUNG cho cả 2 engine: khóa "vóc dáng theo ref" của Motion Transfer mặc định
+    # BẬT sẽ ép pose_strength xuống 0.7 trong _normalize_motion_params, sai bộ số cả wananimate lẫn scail2
+    # (scail2 không dùng clip_strength nên tắt khóa vô hại).
+    params.setdefault("bodyProportionLock", "0")
     if engine == "wananimate":
         # Bộ số theo example WanAnimate replacement của kijai (KHÁC tuning animation-mode của motion:
         # 0.7/0.8 bên đó trị "driver cấp vóc dáng" — swap thì người trong video là khung sẵn).
         params.setdefault("lora_relight", 1.0)       # relight LoRA sinh ra riêng cho Mix mode
         params.setdefault("pose_strength", 1.0)
         params.setdefault("face_strength", 1.0)
-        params.setdefault("bodyProportionLock", "0")
+        # ALD 21/08/2026 - Replacement mode không hỗ trợ pose-retarget; chặn cả env MOTION_POSE_RETARGET=1 sót lại.
+        params.setdefault("poseRetarget", "0")
     else:
         params.setdefault("steps", 6)                # turbo scail2 (template chính thức)
     job["inputs"] = inputs
