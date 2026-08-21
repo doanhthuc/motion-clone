@@ -1,8 +1,118 @@
-import sys, unittest
+import base64
+import json
+import sys
+import tempfile
+import threading
+import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batchlib import local_tryon as lt
+from batchlib.client import JobError
+
+GEMINI_STATE = {"mode": "image", "calls": 0}
+
+
+class GeminiHandler(BaseHTTPRequestHandler):
+    def log_message(self, *_a):
+        pass
+
+    def do_POST(self):
+        GEMINI_STATE["calls"] += 1
+        length = int(self.headers["content-length"])
+        self.rfile.read(length)
+        mode = GEMINI_STATE["mode"]
+        if mode == "http_error":
+            self.send_response(400)
+            body = b'{"error":"bad request"}'
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if mode == "no_candidates":
+            payload = {"candidates": []}
+        elif mode == "image":
+            fake_png = base64.b64encode(b"fake-png-bytes").decode()
+            payload = {"candidates": [{"content": {"parts": [
+                {"inlineData": {"mimeType": "image/png", "data": fake_png}}]}}]}
+        elif mode == "text":
+            payload = {"candidates": [{"content": {"parts": [
+                {"text": GEMINI_STATE.get("text_reply", "A cat in a garden.")}]}}]}
+        else:
+            raise AssertionError(f"mode không rõ: {mode}")
+        body = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class GeminiServerCase(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.server = HTTPServer(("127.0.0.1", 0), GeminiHandler)
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        host, port = cls.server.server_address
+        cls.base_url = f"http://{host}:{port}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+
+    def setUp(self):
+        GEMINI_STATE["mode"] = "image"
+        GEMINI_STATE["calls"] = 0
+
+
+class TestGeminiEdit(GeminiServerCase):
+    def test_thanh_cong_ghi_ra_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "out.png"
+            result = lt.gemini_edit([(b"model-bytes", "image/jpeg")], "edit prompt", "AIzafake",
+                                    out, base_url=self.base_url)
+            self.assertEqual(result, out)
+            self.assertEqual(out.read_bytes(), b"fake-png-bytes")
+
+    def test_http_loi_raise_joberror(self):
+        GEMINI_STATE["mode"] = "http_error"
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(JobError) as cm:
+                lt.gemini_edit([(b"x", "image/png")], "p", "AIzafake", Path(d) / "o.png",
+                               base_url=self.base_url)
+            self.assertIn("400", str(cm.exception))
+
+    def test_khong_tra_anh_raise_joberror(self):
+        GEMINI_STATE["mode"] = "no_candidates"
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(JobError):
+                lt.gemini_edit([(b"x", "image/png")], "p", "AIzafake", Path(d) / "o.png",
+                               base_url=self.base_url)
+
+
+class TestTranslateVnToEn(GeminiServerCase):
+    def test_khong_co_dau_tieng_viet_thi_khong_goi_mang(self):
+        out = lt.translate_vn_to_en("keep the hat", "AIzafake", base_url=self.base_url)
+        self.assertEqual(out, "keep the hat")
+        self.assertEqual(GEMINI_STATE["calls"], 0)
+
+    def test_rong_thi_khong_goi_mang(self):
+        out = lt.translate_vn_to_en("", "AIzafake", base_url=self.base_url)
+        self.assertEqual(out, "")
+        self.assertEqual(GEMINI_STATE["calls"], 0)
+
+    def test_co_dau_tieng_viet_thi_dich(self):
+        GEMINI_STATE["mode"] = "text"
+        GEMINI_STATE["text_reply"] = "keep the necklace"
+        out = lt.translate_vn_to_en("giữ nguyên vòng cổ", "AIzafake", base_url=self.base_url)
+        self.assertEqual(out, "keep the necklace")
+        self.assertEqual(GEMINI_STATE["calls"], 1)
+
+    def test_loi_mang_thi_tra_nguyen_van_khong_raise(self):
+        GEMINI_STATE["mode"] = "http_error"
+        out = lt.translate_vn_to_en("giữ nguyên vòng cổ", "AIzafake", base_url=self.base_url)
+        self.assertEqual(out, "giữ nguyên vòng cổ")
 
 
 class TestIsLocalProvider(unittest.TestCase):

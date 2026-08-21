@@ -149,3 +149,90 @@ TRYON_BG_POS = (
     "from image 1. Blend the person in naturally: match the lighting direction, color "
     "temperature, perspective and camera height of image 2, and add natural contact shadows "
     "under the person. Photorealistic, seamless composite, no cut-out edges.")
+
+
+import base64
+import json
+import os
+import urllib.error
+import urllib.parse
+import urllib.request
+
+from .client import JobError
+
+GEMINI_API_BASE = "https://generativelanguage.googleapis.com"
+# linux.py:2598 — cùng default. Đổi qua env nếu cần model rẻ hơn.
+GEMINI_IMAGE_MODEL = os.environ.get("GEMINI_IMAGE_MODEL", "gemini-3-pro-image")
+# Không có model text-only nào có sẵn trong linux.py (bản gốc dùng Ollama, xem
+# translate_vn_to_en) — chọn một model Gemini text rẻ, ổn định làm mặc định.
+GEMINI_TEXT_MODEL = os.environ.get("GEMINI_TEXT_MODEL", "gemini-2.5-flash")
+
+
+def _post_json(url: str, query: dict, payload: dict, timeout: int) -> dict:
+    full_url = f"{url}?{urllib.parse.urlencode(query)}"
+    req = urllib.request.Request(
+        full_url, data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        body = exc.read()[:300].decode("utf-8", "replace")
+        raise JobError(f"Gemini API {exc.code}: {body}") from exc
+    except urllib.error.URLError as exc:
+        raise JobError(f"Gemini API không phản hồi: {exc}") from exc
+
+
+def gemini_edit(images: list[tuple[bytes, str]], prompt: str, key: str, out_path: Path,
+                aspect_ratio: str | None = None, model: str | None = None,
+                base_url: str = GEMINI_API_BASE) -> Path:
+    """Cổng urllib của linux.py:_gemini_edit (3455-3478, bản gốc dùng requests.post)."""
+    parts = [{"text": prompt}]
+    for data, mime in images:
+        parts.append({"inlineData": {"mimeType": mime, "data": base64.b64encode(data).decode()}})
+    gcfg = {"responseModalities": ["IMAGE"]}
+    if aspect_ratio:
+        gcfg["imageConfig"] = {"aspectRatio": aspect_ratio}
+    url = f"{base_url}/v1beta/models/{model or GEMINI_IMAGE_MODEL}:generateContent"
+    data = _post_json(url, {"key": key},
+                      {"contents": [{"parts": parts}], "generationConfig": gcfg}, 300)
+    for cand in (data.get("candidates") or []):
+        for part in ((cand.get("content") or {}).get("parts") or []):
+            blob = part.get("inlineData") or part.get("inline_data")
+            if blob and blob.get("data"):
+                out_path.write_bytes(base64.b64decode(blob["data"]))
+                return out_path
+    raise JobError(f"Gemini không trả ảnh: {json.dumps(data)[:300]}")
+
+
+_VN_CHARS = "ăâđêôơưàáảãạằắẳẵặầấẩẫậèéẻẽẹềếểễệìíỉĩịòóỏõọồốổỗộờớởỡợùúủũụừứửữựỳýỷỹỵ"
+
+
+def translate_vn_to_en(text: str, key: str, base_url: str = GEMINI_API_BASE) -> str:
+    """Thay linux.py:_translate_prompt_en (88-115): bản gốc gọi Ollama TRÊN POD
+    (qwen2.5:7b-instruct qua TRANSLATE_URL) — không gọi được từ máy local. Dùng Gemini
+    text-generation (đã cần key cho chính bước try-on), cùng system prompt, cùng
+    fail-safe: lỗi / không có dấu tiếng Việt → trả nguyên văn, KHÔNG BAO GIỜ raise."""
+    t = (text or "").strip()
+    if not t or not any(c in t.lower() for c in _VN_CHARS):
+        return text
+    sys_msg = ("You are a translator for an image-generation prompt. Translate the user's text "
+               "into ONE natural English image prompt. Preserve EVERY detail exactly — "
+               "scene/location, lighting, outfit, pose, camera angle, accessories, mood — and do "
+               "NOT add, remove or invent anything. Output ONLY the English prompt, no quotes, "
+               "no explanation.")
+    url = f"{base_url}/v1beta/models/{GEMINI_TEXT_MODEL}:generateContent"
+    try:
+        data = _post_json(url, {"key": key}, {
+            "contents": [{"parts": [{"text": t}]}],
+            "systemInstruction": {"parts": [{"text": sys_msg}]},
+            "generationConfig": {"temperature": 0.1},
+        }, 60)
+    except JobError:
+        return text
+    for cand in (data.get("candidates") or []):
+        for part in ((cand.get("content") or {}).get("parts") or []):
+            out = (part.get("text") or "").strip().strip('"').strip()
+            if out:
+                return out
+    return text
