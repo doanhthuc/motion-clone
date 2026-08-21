@@ -50,6 +50,13 @@ const sources = {
   dispatcher: split(
     grab("motions-studio/api/src/mc-dispatcher.js", /DEFAULT_JOB_TYPES = "([^"]+)"/, "DEFAULT_JOB_TYPES"),
   ),
+  // ALD 21/08/2026 - Danh sách THỨ SÁU, phát hiện trên pod thật khi thêm character-swap: PM2 gắn cứng
+  // JOB_TYPES ở đây và CỐ Ý không đọc .env (comment tại chỗ đó nói rõ). Bốn nguồn dưới kia xanh hết mà
+  // dòng này cũ thì worker dựng lên với list cũ và job type mới nằm queued im lặng — đúng thứ cổng này
+  // sinh ra để chặn, chỉ khác là nó chưa nhìn tới file đó. Nay nhìn.
+  "ecosystem.config.cjs": split(
+    grab("motions-studio/ecosystem.config.cjs", /JOB_TYPES: "([^"]+)"/, "JOB_TYPES của PM2"),
+  ),
 }
 
 const errors = []

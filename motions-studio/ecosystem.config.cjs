@@ -172,7 +172,11 @@ apps.push({
     // ALD 20/07 - wan-dancer (Wan-Dancer-14B music-to-dance): AN TOÀN để trong list chung — API hard-block VRAM≥90GB
     // nên box <90GB (vd .165) KHÔNG BAO GIỜ tạo được job wan-dancer ⇒ worker box đó chẳng có gì để claim. Trên VPS
     // full-stack ≥90GB thì API cho tạo + worker claim. Cần weights DiffSynth (worker/wan_dancer/download_models.sh) + WAN_DANCER_MODEL.
-    JOB_TYPES: "motion,bds,tryon,create-image,edit-image,product-overlay,teaser,video,text-to-video,ss,talk,face-motion,concat,story-film,subtitle,voiceover,wan-i2v,teen-flycam,enhance,trend-tiktok,reveal,wan-dancer",  // ALD 08/07 - reveal (đè lộ) ffmpeg nhẹ
+    // ALD 21/08/2026 - character-swap: BẮT ĐƯỢC TRÊN POD THẬT, không phải suy đoán. Task 5 đã thêm type mới
+    // vào 5 danh sách mà scripts/check-job-types.mjs khoá, nhưng DÒNG NÀY là danh sách thứ SÁU và gate KHÔNG
+    // đọc nó → worker dựng lên với list cũ, job character-swap nằm queued im lặng (đúng bệnh gate sinh ra để
+    // chặn). Đã thêm ecosystem.config.cjs vào gate cùng lúc với sửa này.
+    JOB_TYPES: "motion,bds,tryon,create-image,edit-image,product-overlay,teaser,video,text-to-video,ss,talk,face-motion,concat,story-film,subtitle,voiceover,wan-i2v,teen-flycam,enhance,trend-tiktok,reveal,wan-dancer,character-swap",  // ALD 08/07 - reveal (đè lộ) ffmpeg nhẹ
     // ALD 20/07 - Wan-Dancer (DiffSynth raw, KHÔNG ComfyUI). Trống = node khóa/không chạy. Set trong .env trên VPS ≥90GB.
     WAN_DANCER_MODEL: E.WAN_DANCER_MODEL || "",  // thư mục weights Wan-Dancer-14B (global+local+encoder+VAE)
     WAN_DANCER_PY: E.WAN_DANCER_PY || "",        // python env có DiffSynth-Studio (rỗng = dùng python worker)
