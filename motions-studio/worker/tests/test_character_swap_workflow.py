@@ -15,6 +15,7 @@ except ModuleNotFoundError:
 
 from worker_runtime.linux import (  # noqa: E402
     _apply_swap_to_wan_workflow,
+    build_scail2_swap_workflow,
     build_wan_workflow,
 )
 
@@ -55,6 +56,39 @@ class ApplySwapToWanWorkflowTests(unittest.TestCase):
         wf = build_wan_workflow("ref.png", "drv.mp4", params)
         self.assertNotIn("bg_images", wf["81"]["inputs"])
         self.assertNotIn("200", wf)
+
+
+class BuildScail2SwapWorkflowTests(unittest.TestCase):
+    def _params(self, **overrides):
+        return {"width": 544, "height": 960, "frames": 81, "render_fps": 16, **overrides}
+
+    def test_kich_thuoc_boi_32_va_cap_81_frame(self):
+        wf = build_scail2_swap_workflow("ref.png", "drv.mp4", self._params(width=550, height=970, frames=161))
+        n70 = wf["70"]["inputs"]
+        self.assertEqual(n70["width"] % 32, 0)
+        self.assertEqual(n70["height"] % 32, 0)
+        self.assertEqual(n70["length"], 81)
+
+    def test_wiring_theo_template_chinh_thuc(self):
+        wf = build_scail2_swap_workflow("ref.png", "drv.mp4", self._params())
+        n70 = wf["70"]["inputs"]
+        self.assertEqual(wf["70"]["class_type"], "WanSCAILToVideo")
+        self.assertIs(n70["replacement_mode"], True)
+        self.assertEqual(n70["pose_video"], ["12", 0])          # frame driver
+        self.assertEqual(n70["pose_video_mask"], ["25", 0])     # SCAIL2ColoredMask output 0
+        self.assertEqual(n70["reference_image_mask"], ["25", 1])
+        self.assertIs(wf["25"]["inputs"]["replacement_mode"], True)
+        self.assertEqual(wf["30"]["inputs"]["unet_name"], "wan2.1_14B_SCAIL_2_fp8_scaled.safetensors")
+        self.assertEqual(wf["90"]["inputs"]["sigmas"], ["81", 0])
+        self.assertEqual(wf["100"]["inputs"]["samples"], ["90", 1])   # denoised output
+        self.assertEqual(wf["110"]["inputs"]["audio"], ["12", 2])     # giữ audio driver
+
+    def test_turbo_defaults(self):
+        wf = build_scail2_swap_workflow("ref.png", "drv.mp4", self._params())
+        self.assertEqual(wf["81"]["inputs"]["steps"], 6)
+        self.assertEqual(wf["90"]["inputs"]["cfg"], 1.0)
+        self.assertEqual(wf["32"]["inputs"]["strength_model"], 0.8)   # lightx2v rank64
+        self.assertEqual(wf["31"]["inputs"]["strength_model"], 1.0)   # DPO
 
 
 if __name__ == "__main__":

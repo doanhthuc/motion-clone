@@ -1751,6 +1751,95 @@ def _apply_swap_to_wan_workflow(wf, p):
     wf["81"]["inputs"]["mask"] = ["205", 0]
     return wf
 
+def build_scail2_swap_workflow(ref_name, motion_name, p, prefix="swap-out"):
+    """Character-swap engine scail2 — node CORE native (comfy_extras/nodes_scail.py + nodes_sam3.py).
+
+    Graph bám subgraph Base của template chính thức Comfy-Org video_wan21_scail2_character_replacement
+    (nhánh turbo: 6 bước, cfg 1, euler/simple, shift 5, LoRA DPO 1.0 + lightx2v rank64 0.8).
+    Khác template: VHS_LoadVideo/VHS_VideoCombine (đồng bộ toolchain + mux audio driver), unet
+    fp8_scaled (fp16 32.8GB không vừa 5090 32GB), 1 segment ≤81 frame (extend chaining làm sau).
+    """
+    W = (int(p.get("width", 544)) // 32) * 32       # WanSCAILToVideo đòi bội 32 (io.Int step=32)
+    H = (int(p.get("height", 960)) // 32) * 32
+    F = min(int(p.get("frames", 81) or 81), 81)     # SCAIL-2 train theo chunk 81 frame
+    rfps = int(p.get("render_fps", 16) or 16)
+    sam3_vid = str(p.get("sam3VideoPrompt") or p.get("sam3Prompt") or "human").strip() or "human"
+    sam3_img = str(p.get("sam3ImagePrompt") or p.get("sam3Prompt") or "human").strip() or "human"
+    pos = str(p.get("positive_prompt") or p.get("prompt") or
+              "a person moving naturally, high quality, detailed clothing and face").strip()
+    neg = str(p.get("negative_prompt") or "").strip()
+    return {
+        "10": {"class_type": "LoadImage", "inputs": {"image": ref_name}},
+        "11": {"class_type": "ImageResizeKJv2", "inputs": {
+            "image": ["10", 0], "width": W, "height": H, "upscale_method": "lanczos",
+            "keep_proportion": "crop", "pad_color": "0, 0, 0", "crop_position": "center",
+            "divisible_by": 32, "device": "cpu"}},
+        "12": {"class_type": "VHS_LoadVideo", "inputs": {
+            "video": motion_name, "force_rate": rfps, "custom_width": W, "custom_height": H,
+            "frame_load_cap": F, "skip_first_frames": 0, "select_every_nth": 1, "format": "AnimateDiff"}},
+        # ── SAM3: track người trong driver + segment người trong ảnh ref, cùng 1 checkpoint ──
+        "20": {"class_type": "CheckpointLoaderSimple", "inputs": {
+            "ckpt_name": "sam3.1_multiplex_fp16.safetensors"}},
+        "21": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["20", 1], "text": sam3_vid}},
+        "22": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["20", 1], "text": sam3_img}},
+        "23": {"class_type": "SAM3_VideoTrack", "inputs": {
+            "images": ["12", 0], "model": ["20", 0], "conditioning": ["21", 0],
+            "detection_threshold": _motion_float(p, "sam3Threshold", "sam3_threshold", default=0.5),
+            "max_objects": _motion_int(p, "sam3MaxObjects", "sam3_max_objects", default=4),
+            "detect_interval": 1}},
+        "24": {"class_type": "SAM3_VideoTrack", "inputs": {
+            "images": ["11", 0], "model": ["20", 0], "conditioning": ["22", 0],
+            "detection_threshold": 0.5, "max_objects": 4, "detect_interval": 1}},
+        "25": {"class_type": "SCAIL2ColoredMask", "inputs": {
+            "driving_track_data": ["23", 0], "ref_track_data": ["24", 0],
+            "object_indices": str(p.get("maskIndices") or p.get("mask_indices") or ""),
+            "sort_by": "left_to_right", "replacement_mode": True}},
+        # ── model + LoRA (thứ tự template: unet → DPO → lightx2v → shift) ──
+        "30": {"class_type": "UNETLoader", "inputs": {
+            "unet_name": os.environ.get("SCAIL2_UNET", "wan2.1_14B_SCAIL_2_fp8_scaled.safetensors"),
+            "weight_dtype": "default"}},
+        "31": {"class_type": "LoraLoaderModelOnly", "inputs": {
+            "model": ["30", 0], "lora_name": "wan2.1_SCAIL_2_DPO_lora_bf16.safetensors",
+            "strength_model": _motion_float(p, "dpoLora", "dpo_lora", default=1.0)}},
+        "32": {"class_type": "LoraLoaderModelOnly", "inputs": {
+            "model": ["31", 0], "lora_name": "lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors",
+            "strength_model": _motion_float(p, "distillLora", "distill_lora", default=0.8)}},
+        "33": {"class_type": "ModelSamplingSD3", "inputs": {
+            "model": ["32", 0], "shift": _motion_float(p, "shift", default=5.0)}},
+        "40": {"class_type": "CLIPLoader", "inputs": {
+            "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors", "type": "wan", "device": "default"}},
+        "41": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["40", 0], "text": pos}},
+        "42": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["40", 0], "text": neg}},
+        "50": {"class_type": "VAELoader", "inputs": {"vae_name": "Wan2_1_VAE_bf16.safetensors"}},
+        "60": {"class_type": "CLIPVisionLoader", "inputs": {"clip_name": "clip_vision_h.safetensors"}},
+        "61": {"class_type": "CLIPVisionEncode", "inputs": {
+            "clip_vision": ["60", 0], "image": ["11", 0], "crop": "none"}},
+        # ── conditioning + sampler ──
+        "70": {"class_type": "WanSCAILToVideo", "inputs": {
+            "positive": ["41", 0], "negative": ["42", 0], "vae": ["50", 0],
+            "width": W, "height": H, "length": F, "batch_size": 1,
+            "pose_video": ["12", 0], "pose_video_mask": ["25", 0], "replacement_mode": True,
+            "pose_strength": _motion_float(p, "pose_strength", "poseStrength", default=1.0),
+            "pose_start": 0.0, "pose_end": 1.0,
+            "reference_image": ["11", 0], "reference_image_mask": ["25", 1],
+            "clip_vision_output": ["61", 0],
+            "video_frame_offset": 0, "previous_frame_count": 5}},
+        "80": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}},
+        "81": {"class_type": "BasicScheduler", "inputs": {
+            "model": ["33", 0], "scheduler": "simple",
+            "steps": int(p.get("steps", 6) or 6), "denoise": 1.0}},
+        "90": {"class_type": "SamplerCustom", "inputs": {
+            "model": ["33", 0], "add_noise": True,
+            "noise_seed": _motion_int(p, "seed", default=42),
+            "cfg": _motion_float(p, "cfg", default=1.0),
+            "positive": ["70", 0], "negative": ["70", 1],
+            "sampler": ["80", 0], "sigmas": ["81", 0], "latent_image": ["70", 2]}},
+        "100": {"class_type": "VAEDecode", "inputs": {"samples": ["90", 1], "vae": ["50", 0]}},
+        "110": {"class_type": "VHS_VideoCombine", "inputs": {
+            "images": ["100", 0], "frame_rate": rfps, "loop_count": 0, "filename_prefix": prefix,
+            "format": "video/h264-mp4", "pingpong": False, "save_output": True, "audio": ["12", 2]}},
+    }
+
 # ───────────────────────── Motion: normalize params (workflow) + RIFE 60fps ─────────────────────────
 # ALD 05/06/2026 - Luồng WORKFLOW gửi config THÔ (preset/camelCase/aspectRatio/quality) — KHÁC luồng tool
 # standalone (server proxy đã expand preset→params). Nếu không normalize ở đây, run_motion rơi hết về default
