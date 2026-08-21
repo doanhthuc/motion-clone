@@ -2593,7 +2593,9 @@ def _bg_remove_file(src, dst, model="human", crop=False):
 # ALD 02/06/2026 - Mặc định Nano Banana PRO (gemini-3-pro-image). 2.5-flash-image (cũ) KHÔNG sửa nổi
 # vật nhỏ (giày trong ảnh full-body) + tự re-frame dọc→ngang cắt mất chân. Đã test pro: giữ khung + thay
 # giày đúng (= kết quả web AI Studio). Đổi qua env GEMINI_IMAGE_MODEL (vd gemini-3.1-flash-image rẻ hơn).
-GEMINI_IMAGE_MODEL = os.environ.get("GEMINI_IMAGE_MODEL", "gemini-3-pro-image-preview")
+# ALD 20/08/2026 - "-preview" bị Google khai tử 25/06/2026 (GA gemini-3-pro-image ra 28/05/2026, cùng tên
+# comment trên đã ghi nhưng code cũ sót "-preview" chưa dọn) → nhánh Gemini tryon lỗi từ giữa tháng 6. Fix.
+GEMINI_IMAGE_MODEL = os.environ.get("GEMINI_IMAGE_MODEL", "gemini-3-pro-image")
 # ALD 05/06/2026 - BỎ key Gemini HỆ THỐNG (fallback): mỗi user/admin PHẢI nhập key Gemini RIÊNG ở node
 # (quota/billing riêng). ALD 11/06/2026 - BỎ HẲN cơ chế env GEMINI_API_KEY (user yêu cầu): key CHỈ đến từ
 # node API Key (nối cổng / tự phân bổ) hoặc field trong node. Chỉ self-host không cần key.
@@ -2698,6 +2700,16 @@ def _valid_gemini_key(k):
     dòng báo lỗi vào ô key) → báo rõ thay vì để Google trả 400 API_KEY_INVALID khó hiểu."""
     k = (k or "").strip()
     return k.startswith("AIza") and 30 <= len(k) <= 60 and not any(c.isspace() for c in k)
+
+# ALD 11/06/2026 - BỎ HẲN cơ chế env GEMINI_API_KEY (user yêu cầu tách quota/billing từng user).
+# ALD 20/08/2026 - KHÔI PHỤC làm fallback theo yêu cầu mới (dùng nhanh, khỏi nhập tay mỗi node) — node/param
+# key vẫn ưu tiên tuyệt đối, env chỉ áp dụng khi node KHÔNG nối/không điền key. Một số nơi (teaser dòng
+# ALD cũ) đã ghi comment "gem_key từ node hoặc env" từ trước dù code chưa từng đọc env — giờ khớp thật.
+GEMINI_API_KEY_ENV = os.environ.get("GEMINI_API_KEY", "").strip()
+
+def _gemini_key(d):
+    """Lấy key Gemini: ưu tiên node (apiKey/geminiApiKey trong params), rỗng thì fallback env GEMINI_API_KEY."""
+    return (d.get("apiKey") or d.get("geminiApiKey") or GEMINI_API_KEY_ENV or "").strip()
 
 # #region ALD 11/06/2026 - HuggingFace Inference Providers (router → fal-ai). Cùng node media, đổi backend:
 # provider 'huggingface' chạy model trên HF (token hf_… của user, billing theo credit HF của họ) thay vì GPU
@@ -4817,7 +4829,7 @@ def run_tryon(job):
     # provider='gemini' → Gemini image-edit (Nano Banana): thay vật nhỏ (giày) chính xác hơn Qwen, API call
     # (không cần GPU). ALD 11/06/2026 - key CHỈ từ node API Key (nối cổng) / field node — env đã bỏ hẳn.
     if provider == "gemini":
-        gem_key = (params.get("apiKey") or params.get("geminiApiKey") or "").strip()
+        gem_key = _gemini_key(params)
         if not gem_key:
             raise RuntimeError("Gemini try-on cần API key — nối node API Key (Type: Gemini) vào cổng API key của node, hoặc đổi Provider = Self-host (không cần key).")
         if not _valid_gemini_key(gem_key):
@@ -5336,7 +5348,7 @@ def run_create_image(job):
     # Gemini mà chạy Qwen + lỗi tay). Chất lượng/tay/chi tiết tốt hơn Qwen, gọi API (không cần GPU). Key chỉ từ
     # node API Key / field (env đã bỏ). 0 ref = text-to-image; ≥1 ref = image-edit (ghép). aspect ép giữ khung.
     if provider == "gemini":
-        gem_key = (params.get("apiKey") or params.get("geminiApiKey") or "").strip()
+        gem_key = _gemini_key(params)
         if not gem_key:
             raise RuntimeError("create-image provider Gemini cần API key — nối node API Key (Type: Gemini) vào cổng "
                                "API key của node, hoặc đổi Provider = Qwen (self-host, không cần key).")
@@ -5581,7 +5593,7 @@ def run_edit_image(job):
         user_neg = _translate_prompt_en(user_neg, job_id) or user_neg
     neg_merged = user_neg or None   # edit: KHÔNG ép PHOTO_REALISM_NEGATIVE (giữ trung thực với instruction)
 
-    gem_key = (params.get("apiKey") or params.get("geminiApiKey") or "").strip()
+    gem_key = _gemini_key(params)
     gem_model = {"nano-banana": "gemini-2.5-flash-image-preview",
                  "nano-banana-pro": "gemini-3-pro-image-preview"}.get(
         str(params.get("geminiModel") or "").lower().strip(), GEMINI_IMAGE_MODEL)
@@ -6716,7 +6728,7 @@ def run_voiceover(job):
     voice = os.path.join(tmp, "voice.mp3")
     api_progress(job_id, 0.25, "TTS voiceover")
     _tts(script, voice, params.get("voice") or params.get("voiceId") or DEFAULT_VOICE,
-         gem_key=(params.get("geminiApiKey") or params.get("apiKey") or "").strip(),
+         gem_key=_gemini_key(params),
          emotion=params.get("emotion"), pace=params.get("pace"), gender=params.get("voiceGender") or params.get("gender"))
     out = os.path.join(tmp, "voiceover.mp4")
     mix = str(params.get("mix") or "replace").lower().strip()
@@ -7224,7 +7236,7 @@ def run_subtitle(job):
     font_size = int(params.get("fontSize") or 18)
     position = str(params.get("position") or "bottom")
     voice = (params.get("voice") or "").strip()  # "" = Tự động: chọn giọng theo target
-    gem_key = (params.get("geminiApiKey") or params.get("apiKey") or "").strip() or None
+    gem_key = _gemini_key(params) or None
     tmp = tempfile.mkdtemp(prefix=f"sub-{job_id[:8]}-")
     try:
         api_progress(job_id, 0.04, "tải video")
@@ -7359,7 +7371,7 @@ def run_talk(job):
     if not img_key: raise RuntimeError("talk cần inputs.image (ảnh nhân vật)")
     if not line: raise RuntimeError("talk cần params.line (câu thoại)")
     voice = params.get("voice") or None
-    gem_key = (params.get("apiKey") or params.get("geminiApiKey") or "").strip()
+    gem_key = _gemini_key(params)
     tmp = tempfile.mkdtemp(prefix=f"talk-{job_id[:8]}-")
     api_progress(job_id, 0.08, "tải ảnh nhân vật")
     loc = api_download(img_key, os.path.join(tmp, "char" + (os.path.splitext(img_key)[1] or ".png")))
@@ -7467,7 +7479,7 @@ def run_face_motion(job):
 
     # Đa đoạn: mỗi đoạn 1 HÀNH ĐỘNG riêng → render clip ngắn → ghép. Model ComfyUI nạp 1 lần rồi giữ ấm qua các đoạn.
     voice = p.get("voice") or FACE_MOTION_VOICE
-    gem_key = (p.get("apiKey") or p.get("geminiApiKey") or "").strip()
+    gem_key = _gemini_key(p)
     fps = int(p.get("fps") or TALK_FPS)
     tmp = tempfile.mkdtemp(prefix=f"facemo-{job_id[:8]}-")
     api_progress(job_id, 0.05, "tải ảnh người mẫu")
@@ -7845,7 +7857,7 @@ def run_story_film(job):
     chars = params.get("characters") or []
     shots = params.get("shots") or []
     if not shots: raise RuntimeError("story-film: AI director chưa trả cảnh nào (kịch bản rỗng/không phân tích được)")
-    gem_key = (params.get("apiKey") or params.get("geminiApiKey") or "").strip()
+    gem_key = _gemini_key(params)
     fps = int(params.get("fps") or TALK_FPS)
     tmp = tempfile.mkdtemp(prefix=f"film-{job_id[:8]}-"); pid8 = job_id[:8]
 
@@ -8389,7 +8401,7 @@ def run_teaser(job):
     garment = str(params.get("garmentType") or params.get("garment_type") or "auto").lower().strip()
     # provider try-on cho teaser: 'qwen' (mặc định) | 'gemini' (giỏi giày). gem_key từ node hoặc env.
     provider = str(params.get("provider") or "qwen").lower().strip()
-    gem_key = (params.get("apiKey") or params.get("geminiApiKey") or "").strip()
+    gem_key = _gemini_key(params)
     # Key Gemini sai định dạng (vd dán nhầm) → bỏ qua Gemini, dùng Qwen (KHÔNG crash cả teaser).
     if provider == "gemini" and gem_key and not _valid_gemini_key(gem_key):
         api_log(job_id, "Key Gemini không đúng định dạng → bỏ Gemini, dùng Qwen.", "warn"); gem_key = ""

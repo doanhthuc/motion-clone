@@ -415,6 +415,11 @@ phase_dotenv() {
   if [ "${NEED_OLLAMA:-0}" = "1" ]; then set_kv OLLAMA_URL "http://127.0.0.1:11434"; else set_kv OLLAMA_URL ""; fi
   [ -n "${CORS_ORIGINS:-}" ] && set_kv CORS_ORIGINS "$CORS_ORIGINS"
   [ -n "${HF_TOKEN:-}" ] && set_kv HF_TOKEN "$HF_TOKEN"
+  # ALD 20/08/2026 - fallback key/model Gemini (try-on provider='gemini' + teaser/TTS) — node vẫn ưu
+  # tiên tuyệt đối, đây chỉ để khỏi nhập tay key mỗi node. Trống = không ghi dòng (worker dùng default
+  # GEMINI_IMAGE_MODEL hard-code trong linux.py; thiếu GEMINI_API_KEY thì bắt buộc key ở node).
+  [ -n "${GEMINI_API_KEY:-}" ] && set_kv GEMINI_API_KEY "$GEMINI_API_KEY"
+  [ -n "${GEMINI_IMAGE_MODEL:-}" ] && set_kv GEMINI_IMAGE_MODEL "$GEMINI_IMAGE_MODEL"
   set_kv SUPER_ADMIN "$SUPER_ADMIN"
   if [ -n "${GMAIL_USER:-}" ]; then
     set_kv IS_USED_GMAIL "true"; set_kv GMAIL_USER "$GMAIL_USER"
@@ -680,6 +685,18 @@ phase_comfyui() {
       # (không có requirements.txt thuần; RIFE không cần cupy). rife47.pth node tự tải lần đầu.
       [ -f "$d/requirements-no-cupy.txt" ] && "$CPIP" install -q -r "$d/requirements-no-cupy.txt" >/dev/null 2>&1 || true
     done
+    # ── Vá LTXVideo: shim kornia 'pad' (kornia mới bỏ 'pad' khỏi geometry.transform.pyramid → pyramid_blending
+    #    import lỗi làm CẢ pack LTXVideo không nạp → Teaser motionMode='ltx' âm thầm fallback Ken Burns).
+    #    Cùng shim với setup-pm2.sh:739-749, idempotent (grep trước khi chèn) — feature "full" mới có node này.
+    LTXI="$CN/ComfyUI-LTXVideo/__init__.py"
+    if [ -f "$LTXI" ] && ! grep -q "ALD kornia pad shim" "$LTXI"; then
+      { printf '%s\n' \
+          '# ALD kornia pad shim (14/06/2026) - kornia moi bo pad khoi geometry.transform.pyramid' \
+          'try:' \
+          '    import kornia.geometry.transform.pyramid as _kp, torch.nn.functional as _F' \
+          '    if not hasattr(_kp, "pad"): _kp.pad = _F.pad' \
+          'except Exception: pass'; cat "$LTXI"; } > "$LTXI.tmp" && mv "$LTXI.tmp" "$LTXI" && ok "vá LTXVideo (kornia pad shim)"
+    fi
     if [ -d "$CN/ComfyUI-FlashVSR_Stable" ]; then
       "$CPIP" install -q einops safetensors tqdm pillow huggingface_hub psutil "opencv-python>=4.8.1.78" pyyaml \
         >/dev/null 2>&1 || warn "cài dependency runtime FlashVSR có cảnh báo."

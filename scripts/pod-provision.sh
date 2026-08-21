@@ -27,7 +27,6 @@ CPU_VCPU="${CPU_VCPU:-$(env_get CPU_VCPU)}"; CPU_VCPU="${CPU_VCPU:-4}"
 # Lưới an toàn cho việc quên tắt pod. 0 = tắt hẳn lưới.
 POD_MAX_HOURS="${POD_MAX_HOURS:-$(env_get POD_MAX_HOURS)}"; POD_MAX_HOURS="${POD_MAX_HOURS:-8}"
 GPU="${GPU:-$(env_get GPU)}"; GPU="${GPU:-RTX_4090}"
-GPU_FALLBACK="${GPU_FALLBACK:-$(env_get GPU_FALLBACK)}"
 # ALD 10/08/2026 - Giá CHỈ để hiển thị (cảnh báo quên tắt pod). Trước đây in cứng $0,99 nên đổi
 # GPU=4090 mà vẫn thấy $0,99 — sai theo chiều nguy hiểm nhất là khi giá thật CAO hơn. Rỗng thì lấy
 # 0,99 (5090, đắt nhất đang dùng) chứ không lấy 0: cảnh báo tiền không được phép nói ít hơn sự thật.
@@ -407,9 +406,7 @@ $(warn "Dry run — nothing rented.")
 
   GPU='$GPU' must be a RunPod gpu id — check it against:  runpodctl gpu list
   Read the command above, then:   CONFIRM=yes bash scripts/pod-provision.sh
-$( [ -n "${GPU_FALLBACK:-}" ] \
-   && printf "  Dự phòng: hết máy '%s' thì thử '%s' (đã đo 10/08, xem docs/gpu-pod.md#gpu-4090).\n" "$GPU" "$GPU_FALLBACK" \
-   || printf "  KHÔNG có dự phòng (GPU_FALLBACK trống) — hết máy là dừng ở đây.\n" )
+  Hết máy '$GPU' là dừng ở đây — không tự xoay sang card khác. Đổi GPU trong .env rồi chạy lại.
 
   After it rents (GPU_INSTANCE_ID is saved to .env for you automatically):
     1. make gpu-wait          # polls runpodctl, writes GPU_SSH_HOST/GPU_SSH_PORT into .env
@@ -426,32 +423,14 @@ EOF
   fi
 
   log "renting via runpodctl…"
-  # ALD 10/08/2026 - GPU_FALLBACK: EU-RO-1 là datacenter DUY NHẤT volume mount được (volume không dời
-  # được), và stock 5090 ở đó đã tụt Medium→Low (đo 01/08 → 10/08). Hết máy là cả phiên làm việc đứng.
-  # 4090 ở EU-RO-1 là High và ĐÃ ĐO chạy được job 453 frame: VRAM đỉnh 14390/24081 MiB (60%), cùng
-  # kết quả, chậm 1,48×. Xem docs/gpu-pod.md#gpu-4090.
-  # CHỈ xoay khi RunPod nói hết máy — mọi lỗi khác phải nổi lên, không được che bằng cách đổi GPU.
-  RENT_GPUS=("$GPU"); [ -n "${GPU_FALLBACK:-}" ] && [ "${GPU_FALLBACK:-}" != "$GPU" ] && RENT_GPUS+=("$GPU_FALLBACK")
-  RAW=""; RENTED_GPU=""
-  for _g in "${RENT_GPUS[@]}"; do
-    [ "$_g" = "$GPU" ] || log "hết máy '$GPU' → thử dự phòng '$_g'…"
-    build_create "$_g"
-    if RAW="$("${CREATE[@]}" 2>&1)"; then RENTED_GPU="$_g"; break; fi
+  RAW="$("${CREATE[@]}" 2>&1)" || {
     if printf '%s' "$RAW" | grep -qiE "no instances available|no longer any instances|out of (stock|capacity)|insufficient capacity"; then
-      warn "'$_g': RunPod báo hết máy."
-      continue
+      die "hết máy '$GPU' tại datacenter của volume — không tự xoay sang card khác.
+  Đổi GPU trong .env rồi chạy lại, hoặc chờ. Xem còn con nào:  runpodctl gpu list -o json | grep -A3 EU-RO-1"
     fi
-    die "runpodctl pod create failed ('$_g'):
+    die "runpodctl pod create failed ('$GPU'):
 $RAW"
-  done
-  [ -n "$RENTED_GPU" ] || die "hết máy ở MỌI GPU đã thử (${RENT_GPUS[*]}) tại datacenter của volume.
-  Volume không dời được datacenter, nên cách duy nhất là chờ, hoặc thêm/đổi GPU_FALLBACK trong .env.
-  Xem còn con nào:  runpodctl gpu list -o json | grep -A3 EU-RO-1"
-  if [ "$RENTED_GPU" != "$GPU" ]; then
-    warn "đã thuê DỰ PHÒNG '$RENTED_GPU' (không phải '$GPU')."
-    warn "  setup trên pod sẽ tự đặt MOTION_VRAM_MAX_FRAMES=0 nếu VRAM < 31GB (ép offload mọi clip)"
-    warn "  vì đường model-on-VRAM đo được đỉnh 29,9GB — không vừa card 24GB. Job chậm hơn ~1,5×."
-  fi
+  }
   NEW_ID="$(printf '%s' "$RAW" | rp_pick id,podId)"
   if [ -n "$NEW_ID" ]; then
     env_set GPU_INSTANCE_ID "$NEW_ID"

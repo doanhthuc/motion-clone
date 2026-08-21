@@ -177,6 +177,12 @@ apps.push({
     WAN_DANCER_MODEL: E.WAN_DANCER_MODEL || "",  // thư mục weights Wan-Dancer-14B (global+local+encoder+VAE)
     WAN_DANCER_PY: E.WAN_DANCER_PY || "",        // python env có DiffSynth-Studio (rỗng = dùng python worker)
     VISION_MODEL: E.VISION_MODEL || "qwen2.5vl:7b",
+    // ALD 20/08/2026 - forward override cho GEMINI_IMAGE_MODEL — thiếu dòng này thì đặt biến trong
+    // .env là no-op im lặng, xem cảnh báo cùng dạng ở pod-bootstrap.sh cho DISPATCH_*. Chỉ set khi
+    // .env có giá trị thật (giống COMFY_CACHE_ARGS bên dưới): default "gemini-3-pro-image" đã sống
+    // một chỗ duy nhất trong linux.py, KHÔNG lặp lại ở đây — os.environ.get(key, default) chỉ dùng
+    // default khi biến VẮNG MẶT, còn "" (present-but-empty) sẽ đè default thành rỗng và gọi Gemini fail.
+    ...(E.GEMINI_IMAGE_MODEL === undefined ? {} : { GEMINI_IMAGE_MODEL: E.GEMINI_IMAGE_MODEL }),
     TRYON_SHOES_MP: E.TRYON_SHOES_MP || "2.0",
     TRYON_PRODUCT_AUTOCROP: E.TRYON_PRODUCT_AUTOCROP || "1",
     // ALD 15/06/2026 - TTS/ASR services (native trên GPU box). OMNIVOICE_URL trống = tắt (về viXTTS/Gemini).
