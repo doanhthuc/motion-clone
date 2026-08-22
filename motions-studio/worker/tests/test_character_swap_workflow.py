@@ -17,6 +17,7 @@ except ModuleNotFoundError:
 from worker_runtime import linux  # noqa: E402
 from worker_runtime.linux import (  # noqa: E402
     _apply_swap_to_wan_workflow,
+    _fit_driver_wh,
     build_scail2_swap_workflow,
     build_wan_workflow,
 )
@@ -110,6 +111,33 @@ class BuildScail2SwapWorkflowTests(unittest.TestCase):
         self.assertEqual(wf["90"]["inputs"]["cfg"], 1.0)
         self.assertEqual(wf["32"]["inputs"]["strength_model"], 0.8)   # lightx2v rank64
         self.assertEqual(wf["31"]["inputs"]["strength_model"], 1.0)   # DPO
+
+
+class FitDriverMultipleTests(unittest.TestCase):
+    """Khung render đi theo TỈ LỆ DRIVER (không theo ảnh ref). Bội của khung khác nhau theo engine:
+    Wan bội 16, còn WanSCAILToVideo khai io.Int step=32 nên builder scail2 floor về bội 32 — nếu
+    FIT DRIVER trả bội 16 lẻ thì driver 3:4 rơi 720→704 và VHS kéo dẹt khung ~2.2%."""
+
+    def test_wananimate_giu_boi_16(self):
+        self.assertEqual(_fit_driver_wh(1080, 1920, 544, 968, 16), (544, 960))   # 9:16
+        self.assertEqual(_fit_driver_wh(1080, 1440, 544, 968, 16), (544, 720))   # 3:4
+        self.assertEqual(_fit_driver_wh(1000, 1000, 544, 968, 16), (544, 544))   # 1:1
+
+    def test_scail2_boi_32_builder_khong_con_floor(self):
+        w, h = _fit_driver_wh(1080, 1440, 544, 968, 32)     # 3:4 — ca duy nhất trước đây bị dẹt
+        self.assertEqual((w, h), (544, 736))
+        wf = build_scail2_swap_workflow("ref.png", "drv.mp4",
+                                        {"width": w, "height": h, "frames": 81, "render_fps": 16})
+        self.assertEqual((wf["70"]["inputs"]["width"], wf["70"]["inputs"]["height"]), (w, h))
+
+    def test_ngang_thi_canh_dai_la_chieu_rong(self):
+        self.assertEqual(_fit_driver_wh(1920, 1080, 544, 968, 32), (960, 544))
+
+    def test_lam_tron_len_khong_duoc_vuot_tran_vram(self):
+        # Trần lẻ (990) + làm tròn lên 32 sẽ ra 992 — phải lùi một bậc chứ không phá ngân sách VRAM.
+        w, h = _fit_driver_wh(1080, 1920, 560, 990, 32)
+        self.assertLessEqual(max(w, h), 990)
+        self.assertEqual((w % 32, h % 32), (0, 0))
 
 
 class RunCharacterSwapTests(unittest.TestCase):

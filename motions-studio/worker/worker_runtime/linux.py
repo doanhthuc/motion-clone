@@ -1920,7 +1920,29 @@ MOTION_PRESETS = {
 }
 _ASPECT = {"9:16": (9, 16), "16:9": (16, 9), "1:1": (1, 1), "3:4": (3, 4), "4:3": (4, 3), "21:9": (21, 9)}
 _QUALITY_SHORT = {"480p": 480, "540p": 544, "720p": 720, "1080p": 1080}  # ALD 30/06/2026 - 540p=544 cho Custom motion
-def _even16(n): return max(16, int(round(float(n) / 16)) * 16)
+def _even_to(n, m): return max(m, int(round(float(n) / m)) * m)
+def _even16(n): return _even_to(n, 16)
+
+# ALD 22/08/2026 - Toán FIT DRIVER tách khỏi run_motion để TEST được: block gốc nằm giữa một hàm dài và
+# chỉ chạy khi có driver thật, nên bội-32 của scail2 sẽ không có cách nào khẳng định ngoài chạy pod.
+# `multiple`: bội mà khung phải chia hết — 16 cho Wan, 32 cho scail2 (WanSCAILToVideo khai io.Int step=32,
+# builder floor về bội 32; FIT DRIVER trả bội 16 lẻ thì driver 3:4 rơi 720→704 và VHS_LoadVideo kéo dẹt
+# khung ~2.2% vì custom_width/custom_height không giữ tỷ lệ).
+def _fit_driver_wh(dw, dh, short_edge, max_edge, multiple=16):
+    ratio = max(dw, dh) / float(min(dw, dh))
+    short0, long0 = float(short_edge), float(short_edge) * ratio
+    if long0 > max_edge:
+        short0, long0 = max_edge / ratio, float(max_edge)
+    w, h = ((short0, long0) if dh >= dw else (long0, short0))
+    w, h = _even_to(w, multiple), _even_to(h, multiple)
+    # Làm tròn LÊN có thể vượt trần cạnh dài (trần lẻ 990 → 992). Trần là ngân sách VRAM đã đo, nên lùi
+    # một bậc thay vì phá nó — thà khung nhỏ hơn vài pixel còn hơn OOM giữa job.
+    if max(w, h) > max_edge:
+        if w >= h:
+            w -= multiple
+        else:
+            h -= multiple
+    return w, h
 def _motion_present(v):
     if v is None:
         return False
@@ -4428,7 +4450,7 @@ def run_motion(job):
     # 9:16 544x960) bị node 12 VHS_LoadVideo (custom_width+custom_height cùng set) KÉO DÃN không giữ tỷ lệ →
     # mặt méo/cằm nâng, DWPose lệch theo. Fix: render theo TỶ LỆ THẬT của driver — cạnh ngắn giữ nguyên hạng
     # chất lượng preset, cạnh dài theo tỷ lệ driver, CAP cạnh dài ≤ MOTION_VRAM_MAX_EDGE (968, ngân sách VRAM
-    # đã đo 22/06 — driver 21:9 thu cả khung giữ tỷ lệ), cả hai bội 16. Probe đặt SAU cut/pre-convert-16fps/tpad
+    # đã đo 22/06 — driver 21:9 thu cả khung giữ tỷ lệ), cả hai bội 16 (32 với scail2). Probe đặt SAU cut/pre-convert-16fps/tpad
     # (ffmpeg re-encode đã autorotate → đúng chiều hiển thị; 3 bước đó không scale). Ref (node 11) vẫn
     # keep_proportion=crop theo khung mới. Node cũ ép width/height tay thì tôn trọng (_raw_wh_forced, skip).
     # Tắt: param fitDriver=0 hoặc env MOTION_FIT_DRIVER=0.
@@ -4439,19 +4461,17 @@ def run_motion(job):
             _dw, _dh = _img_dims(motion_local)
             if _dw and _dh:
                 _short0 = float(min(int(params["width"]), int(params["height"])))
-                _ratio = max(_dw, _dh) / float(min(_dw, _dh))
                 # ALD 19/07/2026 - quality=720p được phép dùng cạnh dài 1280; mặc định 540p truyền
                 # maxRenderEdge=968 để giữ baseline an toàn RAM, không phụ thuộc thời lượng.
                 _max_edge = int(params.get("maxRenderEdge", params.get("max_render_edge",
                                 os.environ.get("MOTION_VRAM_MAX_EDGE", "968"))))
                 _max_edge = max(480, min(1280, _max_edge))
-                _long0 = _short0 * _ratio
-                if _long0 > _max_edge:
-                    _short0, _long0 = _max_edge / _ratio, float(_max_edge)
-                _w2, _h2 = ((_short0, _long0) if _dh >= _dw else (_long0, _short0))
-                _w2, _h2 = _even16(_w2), _even16(_h2)
+                # ALD 22/08/2026 - scail2 cần bội 32 (xem _fit_driver_wh): trả bội 16 lẻ thì builder floor
+                # xuống và driver 3:4 bị kéo dẹt. Motion + wananimate giữ nguyên bội 16 như trước.
+                _mul = 32 if str(params.get("_swapEngine") or "").strip().lower() == "scail2" else 16
+                _w2, _h2 = _fit_driver_wh(_dw, _dh, _short0, _max_edge, _mul)
                 if (_w2, _h2) != (int(params["width"]), int(params["height"])):
-                    api_log(job_id, f"FIT DRIVER: driver {_dw}x{_dh} → render {_w2}x{_h2} "
+                    api_log(job_id, f"FIT DRIVER: driver {_dw}x{_dh} → render {_w2}x{_h2} (bội {_mul}) "
                                     f"(bỏ ép khung {params['width']}x{params['height']} của preset)", "info")
                     params = {**params, "width": _w2, "height": _h2}
         except Exception as _e:
