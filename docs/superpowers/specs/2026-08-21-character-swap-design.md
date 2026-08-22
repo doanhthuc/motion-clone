@@ -43,10 +43,33 @@ Params (`params` jsonb, camelCase, đọc qua `_motion_*` helpers dùng chung):
 - `maskGrow` (px, mặc định 10), `maskBlockify` (block size, **mặc định 16** — hạ từ 32 sau khi đo thật 21/08: ô 32px nới vùng vẽ lại phình ra ngoài dáng người nên Wan có đất bịa vật thể), `maskIndices` (rỗng = union mọi người, `"0"` = chỉ người đầu) — nới rồi block-hoá mask người trước khi đưa vào graph, đúng chuỗi kijai `GrowMaskWithBlur` → `BlockifyMask`. Không có `maskFeather`: Blockify nhị phân hoá mask thành các ô vuông cứng cạnh, blur/feather trước đó vô nghĩa (đã bỏ khỏi thiết kế)
 - `sam3Prompt` (dùng chung wananimate + fallback scail2), `sam3VideoPrompt`/`sam3ImagePrompt` (scail2, tách riêng prompt track video vs segment ảnh ref), `sam3Threshold`, `sam3MaxObjects`, `sam3DetectInterval` — điều khiển `SAM3_VideoTrack`
 - `driverStartSec` / `driverDurSec` — tái dùng `_cut_motion_driver_segment`
+- `refFrameMatch` (mặc định bật), `refFrameMaxUpscale` (4.0), `refFrameHeadPrompt` (`head`) — **khớp khung hình ảnh ref với driver**, xem §4b
 - Độ phân giải: **theo tỉ lệ khung của video nguồn**, không theo ảnh ref (ảnh ref được `keep_proportion=crop` vào khung đã chốt). Dùng logic FIT DRIVER hiện có qua `_fit_driver_wh()`: cạnh ngắn = `short` của preset (`drv-*` → 544), cạnh dài = cạnh ngắn × tỉ lệ driver, cap ≤ `MOTION_VRAM_MAX_EDGE` (968) — 9:16 → 544×960, 3:4 → 544×720, 1:1 → 544×544, 16:9 → 960×544. Chịu VRAM gate `MOTION_VRAM_MAX_EDGE/FRAMES` như motion
 - **FIT DRIVER phải được mở lại riêng cho swap.** `_normalize_motion_params` tắt thẳng `fitDriver` cho MỌI preset `drv-*` (chính sách quality-v1, 19/07/2026: khung do `quality` + `aspectRatio` quyết định). Đúng cho Motion — user chọn tỉ lệ trên UI — nhưng sai cho swap, vì swap giữ nguyên background + camera của video nguồn. Không guard thì driver 3:4 bị kéo dãn vào 9:16 (đo thật trên pod 22/08: 576×768 → 544×960, mặt hẹp và dài ra). Nhánh đó nay bỏ qua khi `p["_swapEngine"]` có giá trị; user vẫn ép được bằng `fitDriver=0`
 - **Bội của khung khác nhau theo engine**: wananimate bội 16 như motion, scail2 bội **32** (`WanSCAILToVideo` khai `io.Int step=32`; builder scail2 floor về bội 32, nên nếu FIT DRIVER trả bội 16 lẻ thì driver 3:4 rơi 720→704 và `VHS_LoadVideo` kéo dẹt khung ~2.2% vì `custom_width/custom_height` không giữ tỷ lệ). Với scail2, 3:4 → 544×736. Làm tròn lên mà vượt trần cạnh dài thì lùi một bậc — trần là ngân sách VRAM đã đo
 - Toàn bộ param mask/SAM3/lora/prompt kể trên là public param — khai trong `scripts/batch-params.json` khối `character-swap.extra` (gate `make check-batch-params`), vì `run_character_swap` chỉ `setdefault(...)` (AST không thấy), giá trị thật được các builder graph `.get()` trực tiếp.
+
+## 4b. Khớp khung hình ảnh ref với driver (neo bằng cái đầu)
+
+**Bệnh** (đo thật 22/08, driver `dandong5`): driver là selfie cận sát — chỉ đầu và một bên vai, không thấy thân — còn ref `nhanvat-1.jpeg` là ảnh toàn thân. Wan cố nhét cả bố cục toàn thân của ref vào khung chỉ đủ chỗ cho cái đầu, ra **giải phẫu bịa hoàn toàn**: nửa dưới khung là một cánh tay khổng lồ quấn đúng cái chân váy xám của ảnh ref. Đây là ràng buộc của Wan-Animate replacement mode, không phải bug graph — khung hình ref phải tương đương khung hình driver.
+
+**Cách trị.** Đầu là bộ phận DUY NHẤT chắc chắn có mặt trong cả hai ảnh, bất kể khung nào. Phóng ref cho đầu cao bằng đầu driver rồi dóng tâm đầu → phần cơ thể thấy được tự khớp. Không cần dạy máy khái niệm "cận cảnh" hay "toàn thân".
+
+**Ba bước:**
+
+1. **Graph thăm dò** `build_swap_headprobe_workflow` — `LoadImage(ref)` và `VHS_LoadVideo(driver, 3 frame rải đều, custom_width/height = khung render)`, mỗi nhánh qua cùng một checkpoint SAM3 với prompt `head`, ra `MaskToImage` → `SaveImage` hai prefix tách biệt. Dùng LẠI đúng chuỗi `SAM3_VideoTrack` → `SAM3_TrackToMask` của graph chính (node này nhận IMAGE batch nên ảnh tĩnh cũng chạy) — không thêm phụ thuộc node mới nào. Driver nạp đúng khung render nên bbox đo được đã ở hệ toạ độ đích.
+2. **Đo bằng Python thuần** — `_comfy_node_images` tải PNG theo NODE ID (`comfy_fetch_output` chỉ trả file đầu tiên toàn graph, không tách được hai nhánh; `comfy_view_file` thì vứt payload ≤1024 byte, mà mask một màu nén rất nhỏ). `_mask_png_bbox` dùng `Image.getbbox()`. Lấy **trung vị theo chiều cao đầu** của 3 frame driver — khung hình có thể zoom trong clip.
+3. **`_ref_framing_crop_box`** (hàm thuần, không I/O, test đầy đủ) → cửa sổ cắt trên ảnh ref gốc, mang sẵn tỉ lệ khung render nên node 11 `ImageResizeKJv2 keep_proportion=crop` thành resize thuần, hết tự center-crop theo ý nó. Chỉ cắt, KHÔNG resize ở PIL — để node 11 resize một lần bằng cùng lanczos.
+
+**Chính sách biên:**
+- Tràn mép ảnh ref → **dời** cửa sổ vào trong, không bóp méo (sai vị trí đầu vài chục px chấp nhận được; đổi tỉ lệ cửa sổ là méo cả người).
+- Ref không đủ trường nhìn (cửa sổ rộng hơn ảnh) → **bỏ qua**, dùng ref nguyên bản.
+- Phải phóng quá `refFrameMaxUpscale` (4.0) → **`RefFramingTooFar`, lỗi job ngay**. Chạy tiếp là chắc chắn hỏng và đốt ~7 phút GPU; báo sớm để người dùng đưa ảnh cận hơn.
+- Mọi trục trặc khác (thiếu node, SAM3 không thấy đầu, probe lỗi) → log `warn` + ref nguyên bản. Khớp khung là tiện ích, không được phép làm hỏng job.
+
+**Phạm vi:** chỉ chạy khi `params["_swapEngine"]` có giá trị — **Motion lấy cả background từ ảnh ref nên cắt ref là phá Motion**. Áp cho cả hai engine swap vì crop xảy ra trước `comfy_upload`. Giữ `ref_local` nguyên vẹn, chỉ đổi file đem upload (`_apply_ref_grade_video`, `_apply_face_lock`, `_apply_motion_drift_fix` còn đọc bản gốc).
+
+**Giá phải trả:** thêm một vòng ComfyUI mỗi job (SAM3 ~1.7GB nạp rồi nhả, ước 30–60s), và ref toàn thân dùng cho cảnh cận sẽ bị phóng to nên mờ — đổi lại là hết quái dị.
 
 ## 5. Graph chi tiết
 

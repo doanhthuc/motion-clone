@@ -1716,6 +1716,179 @@ def build_wan_workflow(ref_name, motion_name, p, prefix="motion-out"):
     return wf
 
 
+# #region ALD 22/08/2026 - KHỚP KHUNG HÌNH ẢNH REF VỚI DRIVER (neo bằng cái đầu).
+#
+# Bệnh: driver là selfie cận sát (chỉ đầu + một vai) còn ref là ảnh TOÀN THÂN → Wan cố nhét cả bố
+# cục toàn thân của ref vào khung chỉ đủ chỗ cho cái đầu, ra giải phẫu bịa hoàn toàn (đo thật
+# 22/08 trên dandong5: nửa dưới khung là một cánh tay khổng lồ quấn đúng cái chân váy xám của ref).
+# Đây là ràng buộc của Wan-Animate replacement mode, không phải bug graph: khung hình ref phải
+# tương đương khung hình driver.
+#
+# Cách trị: ĐẦU là bộ phận duy nhất chắc chắn có mặt trong cả hai ảnh dù khung nào. Phóng ref cho
+# đầu cao bằng đầu driver rồi dóng tâm đầu — phần cơ thể thấy được sẽ tự khớp, không cần dạy máy
+# khái niệm "cận cảnh" hay "toàn thân". Cửa sổ cắt mang sẵn tỉ lệ khung render nên node 11
+# (ImageResizeKJv2 keep_proportion=crop) thành resize thuần, hết tự center-crop theo ý nó.
+class RefFramingTooFar(RuntimeError):
+    """Ref lệch khung quá xa driver — báo ngay thay vì đốt GPU cho kết quả chắc chắn hỏng."""
+
+
+def _ref_framing_crop_box(ref_w, ref_h, ref_head, drv_head, W, H, max_upscale):
+    """→ (box_float, scale) | None. box = (left, top, right, bottom) trên ẢNH REF GỐC.
+
+    ref_head/drv_head là bbox (x0,y0,x1,y1); của driver đã ở hệ toạ độ khung render W×H.
+    Trả float — làm tròn là việc của chỗ gọi PIL, để phép toán khẳng định được chính xác.
+    None = bỏ qua (ref không đủ khung), caller dùng ref nguyên bản. Raise khi lệch quá xa.
+    """
+    rh = float(ref_head[3] - ref_head[1])
+    dh = float(drv_head[3] - drv_head[1])
+    if rh <= 0 or dh <= 0:
+        return None
+    s = dh / rh
+    if s > float(max_upscale):
+        raise RefFramingTooFar(
+            f"ảnh mẫu lệch khung quá xa video: phải phóng {s:.1f}× (trần {float(max_upscale):.1f}×). "
+            f"Dùng ảnh mẫu cận hơn (cùng cỡ khung với video), hoặc nới refFrameMaxUpscale.")
+    cw, ch = W / s, H / s
+    # Ref không đủ trường nhìn để cắt ra cửa sổ đó → thà không cắt còn hơn cắt sai.
+    if cw > ref_w or ch > ref_h:
+        return None
+    rcx, rcy = (ref_head[0] + ref_head[2]) / 2.0, (ref_head[1] + ref_head[3]) / 2.0
+    dcx, dcy = (drv_head[0] + drv_head[2]) / 2.0, (drv_head[1] + drv_head[3]) / 2.0
+    left, top = rcx - dcx / s, rcy - dcy / s
+    # Tràn mép thì DỜI cửa sổ vào trong, không bóp méo nó: sai vị trí đầu vài chục pixel còn chấp
+    # nhận được, chứ đổi tỉ lệ cửa sổ là méo cả người.
+    left = min(max(left, 0.0), ref_w - cw)
+    top = min(max(top, 0.0), ref_h - ch)
+    return (left, top, left + cw, top + ch), s
+
+
+def build_swap_headprobe_workflow(ref_name, motion_name, W, H, p=None, stride=1, prefix="swap-probe"):
+    """Graph THĂM DÒ: xuất mask cái đầu của ref và của driver ra PNG để Python đo bbox.
+
+    Không cần node nào trả JSON — mask PNG + Image.getbbox() là ra toạ độ. Dùng LẠI đúng chuỗi
+    SAM3 của graph chính (SAM3_VideoTrack nhận IMAGE batch nên ảnh tĩnh cũng chạy), nên không
+    thêm phụ thuộc node mới nào. Driver nạp đúng khung render → bbox đã ở hệ toạ độ đích.
+    """
+    p = p or {}
+    prompt = str(p.get("refFrameHeadPrompt") or p.get("ref_frame_head_prompt") or "head").strip() or "head"
+    thr = _motion_float(p, "sam3Threshold", "sam3_threshold", default=0.5)
+
+    def _sam3(images_ref):
+        return {"class_type": "SAM3_VideoTrack", "inputs": {
+            "images": images_ref, "model": ["20", 0], "conditioning": ["21", 0],
+            "detection_threshold": thr, "max_objects": 1, "detect_interval": 1}}
+
+    return {
+        "10": {"class_type": "LoadImage", "inputs": {"image": ref_name}},
+        "20": {"class_type": "CheckpointLoaderSimple", "inputs": {
+            "ckpt_name": "sam3.1_multiplex_fp16.safetensors"}},
+        "21": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["20", 1], "text": prompt}},
+        "22": _sam3(["10", 0]),
+        "23": {"class_type": "SAM3_TrackToMask", "inputs": {"track_data": ["22", 0], "object_indices": ""}},
+        "24": {"class_type": "MaskToImage", "inputs": {"mask": ["23", 0]}},
+        "25": {"class_type": "SaveImage", "inputs": {"images": ["24", 0], "filename_prefix": f"{prefix}-ref"}},
+        # 3 frame rải đều: khung hình driver có thể zoom trong clip, một frame là chưa đủ tin.
+        "30": {"class_type": "VHS_LoadVideo", "inputs": {
+            "video": motion_name, "force_rate": 0, "custom_width": W, "custom_height": H,
+            "frame_load_cap": 3, "skip_first_frames": 0, "select_every_nth": max(1, int(stride)),
+            "format": "AnimateDiff"}},
+        "31": _sam3(["30", 0]),
+        "32": {"class_type": "SAM3_TrackToMask", "inputs": {"track_data": ["31", 0], "object_indices": ""}},
+        "33": {"class_type": "MaskToImage", "inputs": {"mask": ["32", 0]}},
+        "34": {"class_type": "SaveImage", "inputs": {"images": ["33", 0], "filename_prefix": f"{prefix}-drv"}},
+    }
+
+
+def _comfy_node_images(outputs, node_id):
+    """Tải MỌI ảnh của ĐÚNG MỘT node trong history outputs → list path tmp.
+
+    comfy_fetch_output chỉ trả file ĐẦU TIÊN tìm thấy trên toàn graph, mà probe có hai nhánh
+    (ref và driver) nên phải lấy theo node id. Cũng không dùng comfy_view_file: nó vứt payload
+    ≤1024 byte, mà mask PNG một màu nén rất nhỏ, hoàn toàn có thể lọt dưới ngưỡng đó.
+    """
+    out = []
+    for it in (((outputs or {}).get(str(node_id)) or {}).get("images") or []):
+        fn = it.get("filename", "")
+        if not fn.lower().endswith(IMG_EXTS):
+            continue
+        try:
+            r = requests.get(f"{COMFY_URL}/view", params={
+                "filename": fn, "subfolder": it.get("subfolder", ""),
+                "type": it.get("type", "output")}, timeout=120)
+            r.raise_for_status()
+            dst = os.path.join(tempfile.gettempdir(), fn)
+            with open(dst, "wb") as f:
+                f.write(r.content)
+            out.append(dst)
+        except requests.RequestException:
+            pass
+    return out
+
+
+def _mask_png_bbox(path, thresh=32):
+    """bbox (x0,y0,x1,y1) của vùng sáng trong ảnh mask — None nếu mask rỗng/ảnh hỏng."""
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            return im.convert("L").point(lambda v: 255 if v > thresh else 0).getbbox()
+    except Exception:
+        return None
+
+
+def _match_ref_framing_to_driver(job_id, ref_local, motion_local, W, H, p, tmp):
+    """Cắt ảnh ref cho khung hình khớp driver → path ảnh mới, hoặc None để dùng ref nguyên bản.
+
+    FAIL-SAFE tuyệt đối: thiếu node, SAM3 không thấy đầu, probe lỗi — đều log warn rồi trả None.
+    Ngoại lệ DUY NHẤT là RefFramingTooFar: cái đó phải nổi lên thành lỗi job, vì chạy tiếp chắc
+    chắn ra kết quả hỏng và đốt mất 7 phút GPU.
+    """
+    if not _motion_bool(p, "refFrameMatch", "ref_frame_match",
+                        default=str(os.environ.get("SWAP_REF_FRAME_MATCH", "1")).strip().lower()
+                        in ("1", "true", "yes", "on")):
+        return None
+    if not _comfy_has_node("SAM3_VideoTrack"):
+        api_log(job_id, "khớp khung ref: thiếu node SAM3_VideoTrack → giữ ảnh ref nguyên bản", "warn")
+        return None
+    try:
+        from PIL import Image
+        with Image.open(ref_local) as _im:
+            ref_w, ref_h = _im.size
+        stride = max(1, int((_video_nframes(motion_local) or 3) // 3))
+        wf = build_swap_headprobe_workflow(
+            comfy_upload(ref_local), comfy_upload(motion_local), int(W), int(H),
+            p=p, stride=stride, prefix=f"swap-probe-{job_id[:8]}")
+        outs = comfy_poll(comfy_submit(wf), job_id, deadline_sec=600)
+        ref_bb = next((b for b in (_mask_png_bbox(x) for x in _comfy_node_images(outs, "25")) if b), None)
+        drv_bbs = [b for b in (_mask_png_bbox(x) for x in _comfy_node_images(outs, "34")) if b]
+        if not ref_bb or not drv_bbs:
+            api_log(job_id, "khớp khung ref: SAM3 không thấy đầu (ref hoặc driver) → giữ ảnh ref nguyên bản", "warn")
+            return None
+        # Trung vị theo CHIỀU CAO đầu: khung hình driver có thể zoom trong clip, một frame chưa đủ tin.
+        drv_bb = sorted(drv_bbs, key=lambda b: b[3] - b[1])[len(drv_bbs) // 2]
+        res = _ref_framing_crop_box(ref_w, ref_h, ref_bb, drv_bb, int(W), int(H),
+                                    _motion_float(p, "refFrameMaxUpscale", "ref_frame_max_upscale", default=4.0))
+        if not res:
+            api_log(job_id, f"khớp khung ref: ref {ref_w}×{ref_h} không đủ trường nhìn cho khung "
+                            f"{W}×{H} → giữ ảnh ref nguyên bản", "warn")
+            return None
+        box, s = res
+        dst = os.path.join(tmp, "ref-framed.png")
+        # CHỈ cắt, không resize: cửa sổ đã mang đúng tỉ lệ khung render nên node 11
+        # (ImageResizeKJv2 keep_proportion=crop) chỉ còn việc resize — cùng lanczos, khỏi làm hai lần.
+        with Image.open(ref_local) as im:
+            im.convert("RGB").crop(tuple(int(round(v)) for v in box)).save(dst, "PNG")
+        api_log(job_id, f"khớp khung ref: đầu ref {ref_bb[3]-ref_bb[1]}px vs driver {drv_bb[3]-drv_bb[1]}px "
+                        f"→ phóng {s:.2f}×, cắt ref về {tuple(int(round(v)) for v in box)} "
+                        f"(gốc {ref_w}×{ref_h})", "info")
+        return dst
+    except RefFramingTooFar:
+        raise
+    except Exception as e:
+        api_log(job_id, f"khớp khung ref lỗi ({e}) → giữ ảnh ref nguyên bản", "warn")
+        return None
+# #endregion
+
+
 # ALD 22/08/2026 - Cụm negative CHỈ dùng cho character-swap (motion không đụng tới). Tách hằng số ra
 # đây để sửa một chỗ, và để test khẳng định được nội dung thay vì so chuỗi dài trong thân hàm.
 SWAP_NEGATIVE_EXTRA = ("bouquet, flowers, holding objects, hands holding items, "
@@ -4531,7 +4704,18 @@ def run_motion(job):
     # ALD 21/07/2026 - TỰ NHIÊN HÓA (user chốt): gỡ hẳn LivePortrait + env MOTION_FACE_SOURCE_DEFAULT khỏi motion.
     # Mặt đi thẳng theo thiết kế gốc Wan-Animate: face_images = crop driver (default trong build_wan_workflow).
     api_progress(job_id, 0.15, "upload vào ComfyUI")
-    ref_name = comfy_upload(ref_local)
+    # #region ALD 22/08/2026 - Khớp khung hình ref với driver — CHỈ character-swap. Motion lấy CẢ
+    # background từ ảnh ref nên cắt ref là phá Motion. Giữ ref_local nguyên vẹn (ba chỗ sau còn
+    # đọc nó: _apply_ref_grade_video, _apply_face_lock, _apply_motion_drift_fix), chỉ đổi file
+    # đem upload. Áp cho cả hai engine vì crop xảy ra TRƯỚC upload, graph nào cũng hưởng.
+    _ref_upload_local = ref_local
+    if str(params.get("_swapEngine") or "").strip():
+        _framed = _match_ref_framing_to_driver(job_id, ref_local, motion_local,
+                                               params.get("width"), params.get("height"), params, tmp)
+        if _framed:
+            _ref_upload_local = _framed
+    # #endregion
+    ref_name = comfy_upload(_ref_upload_local)
     motion_name = comfy_upload(motion_local)
     api_progress(job_id, 0.25, "Wan 2.2 Animate (sampling)")
     window_plan = _wan_window_plan(params, _F)

@@ -16,9 +16,12 @@ except ModuleNotFoundError:
 
 from worker_runtime import linux  # noqa: E402
 from worker_runtime.linux import (  # noqa: E402
+    RefFramingTooFar,
     _apply_swap_to_wan_workflow,
     _fit_driver_wh,
+    _ref_framing_crop_box,
     build_scail2_swap_workflow,
+    build_swap_headprobe_workflow,
     build_wan_workflow,
 )
 
@@ -138,6 +141,158 @@ class FitDriverMultipleTests(unittest.TestCase):
         w, h = _fit_driver_wh(1080, 1920, 560, 990, 32)
         self.assertLessEqual(max(w, h), 990)
         self.assertEqual((w % 32, h % 32), (0, 0))
+
+
+class RefFramingCropBoxTests(unittest.TestCase):
+    """Khớp KHUNG HÌNH ảnh ref với driver, neo bằng cái đầu.
+
+    Đo thật 22/08: driver dandong5 là selfie cận sát (chỉ đầu + một vai) còn ref là ảnh toàn thân
+    → Wan nhét cả bố cục toàn thân của ref vào khung chỉ đủ chỗ cho cái đầu, ra giải phẫu bịa
+    (tay khổng lồ quấn chân váy xám của ref). Đầu là bộ phận DUY NHẤT chắc chắn có trong cả hai
+    ảnh, nên lấy nó làm mốc: phóng ref cho đầu cao bằng đầu driver rồi dóng tâm đầu.
+
+    Test khẳng định BẤT BIẾN chứ không so số ma thuật: sau khi crop theo box rồi scale ×s, tâm đầu
+    và chiều cao đầu của ref phải trùng của driver. Sai số 1e-6 vì box trả về là float — làm tròn
+    là việc của chỗ gọi PIL, không phải của phép toán.
+    """
+
+    W, H = 544, 960
+    REF_W, REF_H = 1156, 2047
+
+    @staticmethod
+    def _center(b):
+        return ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0)
+
+    def _assert_dau_khop(self, box, s, ref_head, drv_head):
+        rcx, rcy = self._center(ref_head)
+        dcx, dcy = self._center(drv_head)
+        self.assertAlmostEqual((rcx - box[0]) * s, dcx, places=6)
+        self.assertAlmostEqual((rcy - box[1]) * s, dcy, places=6)
+        self.assertAlmostEqual((ref_head[3] - ref_head[1]) * s, drv_head[3] - drv_head[1], places=6)
+
+    def _assert_khung_dung_ty_le(self, box, s):
+        self.assertAlmostEqual(box[2] - box[0], self.W / s, places=6)
+        self.assertAlmostEqual(box[3] - box[1], self.H / s, places=6)
+
+    def test_driver_can_canh_phong_ref_len(self):
+        ref_head, drv_head = (500, 200, 650, 400), (150, 100, 400, 500)   # cao 200 → 400
+        box, s = _ref_framing_crop_box(self.REF_W, self.REF_H, ref_head, drv_head, self.W, self.H, 4.0)
+        self.assertAlmostEqual(s, 2.0)
+        self._assert_dau_khop(box, s, ref_head, drv_head)
+        self._assert_khung_dung_ty_le(box, s)
+
+    def test_driver_rong_hon_ref_thu_nho(self):
+        # s < 1: driver lùi xa hơn ảnh ref → cửa sổ cắt RỘNG hơn khung render. Đầu đặt thấp trong
+        # ref để cửa sổ 725×1280 lọt trọn 1156×2047 mà không phải dời (dời thì bất biến dưới sai).
+        ref_head, drv_head = (500, 600, 700, 1000), (172, 330, 372, 630)   # cao 400 → 300
+        box, s = _ref_framing_crop_box(self.REF_W, self.REF_H, ref_head, drv_head, self.W, self.H, 4.0)
+        self.assertAlmostEqual(s, 0.75)
+        self._assert_dau_khop(box, s, ref_head, drv_head)
+        self._assert_khung_dung_ty_le(box, s)
+
+    def test_lech_qua_xa_thi_bao_loi_chu_khong_doan(self):
+        # Ref toàn thân + driver cận cực sát: phóng 7× thì ảnh ref nát, thà báo ngay còn hơn đốt
+        # 7 phút GPU để ra thứ chắc chắn tệ.
+        with self.assertRaises(RefFramingTooFar):
+            _ref_framing_crop_box(self.REF_W, self.REF_H, (500, 200, 650, 300),
+                                  (100, 100, 400, 800), self.W, self.H, 4.0)
+
+    def test_ref_khong_du_khung_thi_bo_qua(self):
+        # Cửa sổ cắt rộng hơn cả ảnh ref → không cắt được, trả None để dùng ref nguyên bản.
+        self.assertIsNone(_ref_framing_crop_box(600, 800, (250, 300, 350, 450),
+                                                (200, 400, 340, 460), self.W, self.H, 4.0))
+
+    def test_dau_sat_mep_thi_don_cua_so_vao_trong_anh(self):
+        ref_head, drv_head = (20, 10, 120, 110), (222, 430, 322, 530)
+        box, s = _ref_framing_crop_box(self.REF_W, self.REF_H, ref_head, drv_head, self.W, self.H, 4.0)
+        self.assertAlmostEqual(s, 1.0)
+        self.assertGreaterEqual(box[0], 0.0)
+        self.assertGreaterEqual(box[1], 0.0)
+        self.assertLessEqual(box[2], self.REF_W)
+        self.assertLessEqual(box[3], self.REF_H)
+        self._assert_khung_dung_ty_le(box, s)   # dời chứ KHÔNG bóp méo cửa sổ
+
+
+class HeadProbeWorkflowTests(unittest.TestCase):
+    def _wf(self, **kw):
+        return build_swap_headprobe_workflow("ref.png", "drv.mp4", 544, 960, stride=40, **kw)
+
+    def test_hai_nhanh_dung_chung_mot_checkpoint_sam3(self):
+        wf = self._wf()
+        self.assertEqual(wf["22"]["inputs"]["images"], ["10", 0])    # nhánh ref
+        self.assertEqual(wf["31"]["inputs"]["images"], ["30", 0])    # nhánh driver
+        for nid in ("22", "31"):
+            self.assertEqual(wf[nid]["class_type"], "SAM3_VideoTrack")
+            self.assertEqual(wf[nid]["inputs"]["model"], ["20", 0])
+            self.assertEqual(wf[nid]["inputs"]["conditioning"], ["21", 0])
+
+    def test_driver_nap_dung_khung_render(self):
+        # Mask driver phải nằm SẴN trong hệ toạ độ khung render, khỏi quy đổi ở Python.
+        n30 = self._wf()["30"]["inputs"]
+        self.assertEqual((n30["custom_width"], n30["custom_height"]), (544, 960))
+        self.assertEqual(n30["frame_load_cap"], 3)      # 3 frame rải đều → lấy trung vị
+        self.assertEqual(n30["select_every_nth"], 40)
+
+    def test_hai_prefix_tach_biet_de_lay_dung_anh(self):
+        wf = self._wf(prefix="pb")
+        self.assertEqual(wf["25"]["class_type"], "SaveImage")
+        self.assertEqual(wf["25"]["inputs"]["filename_prefix"], "pb-ref")
+        self.assertEqual(wf["34"]["inputs"]["filename_prefix"], "pb-drv")
+        self.assertEqual(wf["24"]["class_type"], "MaskToImage")
+
+    def test_prompt_dau_doi_duoc(self):
+        self.assertEqual(self._wf(p={"refFrameHeadPrompt": "face"})["21"]["inputs"]["text"], "face")
+
+
+class MatchRefFramingFailSafeTests(unittest.TestCase):
+    """Khớp khung là TIỆN ÍCH, không được phép làm hỏng job: mọi trục trặc đều rơi về ref nguyên
+    bản. Ngoại lệ duy nhất là lệch quá xa — cái đó phải nổi thành lỗi job, vì chạy tiếp là chắc
+    chắn ra kết quả hỏng sau 7 phút GPU."""
+
+    def _run(self, p=None):
+        return linux._match_ref_framing_to_driver("job-1234", "/tmp/ref.png", "/tmp/drv.mp4",
+                                                  544, 960, p or {}, "/tmp")
+
+    def test_tat_bang_param_thi_khong_dung_toi_comfy(self):
+        with patch.object(linux, "_comfy_has_node") as hn:
+            self.assertIsNone(self._run({"refFrameMatch": "0"}))
+        hn.assert_not_called()
+
+    def test_thieu_node_sam3_thi_bo_qua(self):
+        with patch.object(linux, "_comfy_has_node", return_value=False), \
+             patch.object(linux, "comfy_submit") as sub:
+            self.assertIsNone(self._run())
+        sub.assert_not_called()
+
+    def test_sam3_khong_thay_dau_thi_bo_qua(self):
+        with patch.object(linux, "_comfy_has_node", return_value=True), \
+             patch.object(linux, "comfy_upload", return_value="x.png"), \
+             patch.object(linux, "comfy_submit", return_value="pid"), \
+             patch.object(linux, "comfy_poll", return_value={}), \
+             patch.object(linux, "_video_nframes", return_value=450), \
+             patch.object(linux, "_comfy_node_images", return_value=[]), \
+             patch("PIL.Image.open"):
+            self.assertIsNone(self._run())
+
+    def test_probe_no_thi_bo_qua_chu_khong_lam_hong_job(self):
+        with patch.object(linux, "_comfy_has_node", return_value=True), \
+             patch.object(linux, "comfy_upload", side_effect=RuntimeError("comfy sập")), \
+             patch("PIL.Image.open"):
+            self.assertIsNone(self._run())
+
+    def test_lech_qua_xa_thi_noi_thanh_loi_job(self):
+        with patch.object(linux, "_comfy_has_node", return_value=True), \
+             patch.object(linux, "comfy_upload", return_value="x.png"), \
+             patch.object(linux, "comfy_submit", return_value="pid"), \
+             patch.object(linux, "comfy_poll", return_value={}), \
+             patch.object(linux, "_video_nframes", return_value=450), \
+             patch.object(linux, "_comfy_node_images", return_value=["/tmp/m.png"]), \
+             patch.object(linux, "_mask_png_bbox", side_effect=[(0, 0, 100, 100),      # ref: đầu 100px
+                                                                (0, 0, 300, 700)]), \
+             patch("PIL.Image.open") as im:
+            im.return_value.__enter__.return_value.size = (1156, 2047)
+            with self.assertRaises(RefFramingTooFar):
+                self._run()
 
 
 class RunCharacterSwapTests(unittest.TestCase):

@@ -145,6 +145,18 @@
         "line": 1768,
         "why": "build_scail2_swap_workflow:1768 — fallback của positive_prompt cho WanSCAILToVideo (chỉ engine scail2)."
       },
+      "refFrameHeadPrompt": {
+        "line": 1773,
+        "why": "build_swap_headprobe_workflow:1773 — prompt SAM3 tìm cái đầu trong graph thăm dò. Mặc định 'head'; đổi sang 'face' nếu SAM3 bắt hụt."
+      },
+      "refFrameMatch": {
+        "line": 1845,
+        "why": "_match_ref_framing_to_driver:1845 — cắt ảnh ref cho khung hình khớp driver (neo bằng cái đầu). Mặc định BẬT; 0 = giữ ref nguyên bản. Trị lỗi ref toàn thân + driver cận mặt ra giải phẫu bịa (đo 22/08, dandong5)."
+      },
+      "refFrameMaxUpscale": {
+        "line": 1869,
+        "why": "_match_ref_framing_to_driver:1869 — trần hệ số phóng ref. Vượt trần thì BÁO LỖI job thay vì đốt GPU cho kết quả chắc chắn hỏng. Mặc định 4.0."
+      },
       "sam3DetectInterval": {
         "line": 1735,
         "why": "_apply_swap_to_wan_workflow:1735 — SAM3_VideoTrack.detect_interval, đọc qua _motion_int() (scail2 cố định 1)."
