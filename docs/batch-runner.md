@@ -140,11 +140,17 @@ runs:
 |---|---|---|---|
 | `motion-enhance` | motion → enhance | `character`, `driver` | — |
 | `tryon-motion-enhance` | tryon → motion → enhance | `character`, `outfit`, `driver` | `background` |
+| `character-swap-enhance` | character-swap → enhance | `character`, `driver` | — |
+| `tryon-character-swap-enhance` | tryon → character-swap → enhance | `character`, `outfit`, `driver` | `background` |
 
-Khối param tên **đúng bằng tên chặng**: `tryon:` · `motion:` · `enhance:`.
+Hai pipeline `character-swap`: `driver` = video nguồn **chứa người sẽ bị thay**, `character` = ảnh
+người mẫu sẽ thế vào (ở `tryon-character-swap-enhance`, `character` là ảnh sau khi tryon).
 
-Timeout riêng từng chặng (`batchlib/pipelines.py`): tryon 20 phút · motion 60 · enhance 90.
-enhance 1080p60 nội suy RIFE rồi encode lại nên **luôn lâu hơn** motion sinh ra nó.
+Khối param tên **đúng bằng tên chặng**: `tryon:` · `motion:` · `enhance:` · `character-swap:`
+(nhận `engine: wananimate|scail2`).
+
+Timeout riêng từng chặng (`batchlib/pipelines.py`): tryon 20 phút · motion 60 · character-swap 60 ·
+enhance 90. enhance 1080p60 nội suy RIFE rồi encode lại nên **luôn lâu hơn** chặng sinh ra nó.
 
 ### 2.3 Tra param — đừng đoán
 

@@ -36,7 +36,7 @@ FEATURE_TITLE="Motion-Transfer + Teen Flycam + Trend TikTok (Wan 2.2 Animate)"
 #     deliveredQuality cao hơn quality render → thiếu type này thì job enhance nằm queued mãi.
 #   • task-cloud-auto: tiến trình PM2 poll /api/connector/tasks/claim. KHÔNG bật thì box
 #     dựng xong vẫn "online" nhưng không bao giờ nhận được task nào từ Task Cloud.
-JOB_TYPE="motion,teen-flycam,trend-tiktok,enhance"
+JOB_TYPE="motion,teen-flycam,trend-tiktok,enhance,character-swap"
 CATALOG_FILE="$ROOT/comfyui/catalog-motion-transfer.json"
 MODEL_GROUP="Wan 2.2 Animate / FlashVSR Enhance"
 DEFAULT_DOMAIN="${DOMAIN:-motion-transfer.datools.info}"

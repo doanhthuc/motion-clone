@@ -1634,7 +1634,11 @@ def build_wan_workflow(ref_name, motion_name, p, prefix="motion-out"):
             "face_strength": _motion_float(p, "face_strength", "faceStrength", default=0.7), "clip_embeds": ["71", 0],
             "ref_images": ["11", 0], "pose_images": pose_src, "face_images": face_images_ref}},  # pose_src = DWPose thô (node 20)
         "90": {"class_type": "WanVideoSampler", "inputs": {
-            "model": ["42", 0], "image_embeds": ["81", 0], "steps": S, "cfg": cfg, "shift": shift, "seed": 42,
+            # ALD 22/08/2026 - seed ĐỌC ĐƯỢC (trước gắn cứng 42). batch-params đã khai 'seed' cho
+            # character-swap từ đầu nên nó vốn là lời hứa suông. Mặc định vẫn 42 → motion không đổi
+            # hành vi. Cần cho hai việc: chạy lại khi Wan bịa vật thể, và đo nhiễu chạy-tới-chạy.
+            "model": ["42", 0], "image_embeds": ["81", 0], "steps": S, "cfg": cfg, "shift": shift,
+            "seed": _motion_int(p, "seed", default=42),
             "force_offload": True, "scheduler": scheduler, "riflex_freq_index": 0,
             "text_embeds": ["60", 0], "rope_function": "comfy"}},
         # ALD 26/06/2026 - Tăng tile 272→400 + stride rộng hơn: ít tile hơn (3×4 thay 5×9 @ 720p), overlap giảm
@@ -1715,6 +1719,524 @@ def build_wan_workflow(ref_name, motion_name, p, prefix="motion-out"):
         wf["110"]["inputs"]["images"] = ["105", 0]
     return wf
 
+
+# #region ALD 22/08/2026 - KHỚP KHUNG HÌNH ẢNH REF VỚI DRIVER (neo bằng cái đầu).
+#
+# Bệnh: driver là selfie cận sát (chỉ đầu + một vai) còn ref là ảnh TOÀN THÂN → Wan cố nhét cả bố
+# cục toàn thân của ref vào khung chỉ đủ chỗ cho cái đầu, ra giải phẫu bịa hoàn toàn (đo thật
+# 22/08 trên dandong5: nửa dưới khung là một cánh tay khổng lồ quấn đúng cái chân váy xám của ref).
+# Đây là ràng buộc của Wan-Animate replacement mode, không phải bug graph: khung hình ref phải
+# tương đương khung hình driver.
+#
+# Cách trị: ĐẦU là bộ phận duy nhất chắc chắn có mặt trong cả hai ảnh dù khung nào. Phóng ref cho
+# đầu cao bằng đầu driver rồi dóng tâm đầu — phần cơ thể thấy được sẽ tự khớp, không cần dạy máy
+# khái niệm "cận cảnh" hay "toàn thân". Cửa sổ cắt mang sẵn tỉ lệ khung render nên node 11
+# (ImageResizeKJv2 keep_proportion=crop) thành resize thuần, hết tự center-crop theo ý nó.
+class RefFramingTooFar(RuntimeError):
+    """Ref lệch khung quá xa driver — báo ngay thay vì đốt GPU cho kết quả chắc chắn hỏng."""
+
+
+def _ref_framing_crop_box(ref_w, ref_h, ref_head, drv_head, W, H, max_upscale):
+    """→ (box_float, scale) | None. box = (left, top, right, bottom) trên ẢNH REF GỐC.
+
+    ref_head/drv_head là bbox (x0,y0,x1,y1); của driver đã ở hệ toạ độ khung render W×H.
+    Trả float — làm tròn là việc của chỗ gọi PIL, để phép toán khẳng định được chính xác.
+    None = bỏ qua (ref không đủ khung), caller dùng ref nguyên bản. Raise khi lệch quá xa.
+    """
+    rh = float(ref_head[3] - ref_head[1])
+    dh = float(drv_head[3] - drv_head[1])
+    if rh <= 0 or dh <= 0:
+        return None
+    s = dh / rh
+    if s > float(max_upscale):
+        raise RefFramingTooFar(
+            f"ảnh mẫu lệch khung quá xa video: phải phóng {s:.1f}× (trần {float(max_upscale):.1f}×). "
+            f"Dùng ảnh mẫu cận hơn (cùng cỡ khung với video), hoặc nới refFrameMaxUpscale.")
+    cw, ch = W / s, H / s
+    # Ref không đủ trường nhìn để cắt ra cửa sổ đó → thà không cắt còn hơn cắt sai.
+    if cw > ref_w or ch > ref_h:
+        return None
+    rcx, rcy = (ref_head[0] + ref_head[2]) / 2.0, (ref_head[1] + ref_head[3]) / 2.0
+    dcx, dcy = (drv_head[0] + drv_head[2]) / 2.0, (drv_head[1] + drv_head[3]) / 2.0
+    left, top = rcx - dcx / s, rcy - dcy / s
+    # Tràn mép thì DỜI cửa sổ vào trong, không bóp méo nó: sai vị trí đầu vài chục pixel còn chấp
+    # nhận được, chứ đổi tỉ lệ cửa sổ là méo cả người.
+    left = min(max(left, 0.0), ref_w - cw)
+    top = min(max(top, 0.0), ref_h - ch)
+    return (left, top, left + cw, top + ch), s
+
+
+def build_swap_headprobe_workflow(ref_name, motion_name, W, H, p=None, stride=1, prefix="swap-probe"):
+    """Graph THĂM DÒ: xuất mask cái đầu của ref và của driver ra PNG để Python đo bbox.
+
+    Không cần node nào trả JSON — mask PNG + Image.getbbox() là ra toạ độ. Dùng LẠI đúng chuỗi
+    SAM3 của graph chính (SAM3_VideoTrack nhận IMAGE batch nên ảnh tĩnh cũng chạy), nên không
+    thêm phụ thuộc node mới nào. Driver nạp đúng khung render → bbox đã ở hệ toạ độ đích.
+    """
+    p = p or {}
+    # ALD 22/08/2026 - MẶC ĐỊNH 'face', KHÔNG phải 'head'. Đo thật trên pod: 'head' trả về đầu CỘNG
+    # TOÀN BỘ TÓC, mà ở driver bbox chạm mép khung (544, 960) nên phép đo tự bão hoà — nó đo khung
+    # còn lại bao nhiêu chứ không đo cái đầu. 'face' cho cửa sổ chứa 3.58 chiều-cao-mặt, đúng bằng
+    # driver (lề trên 0.84 / dưới 1.74 cũng trùng); 'head' cho 3.97.
+    prompt = str(p.get("refFrameHeadPrompt") or p.get("ref_frame_head_prompt") or "face").strip() or "face"
+    thr = _motion_float(p, "sam3Threshold", "sam3_threshold", default=0.5)
+
+    def _sam3(images_ref, cond="21", max_objects=1):
+        return {"class_type": "SAM3_VideoTrack", "inputs": {
+            "images": images_ref, "model": ["20", 0], "conditioning": [cond, 0],
+            "detection_threshold": thr, "max_objects": max_objects, "detect_interval": 1}}
+
+    return {
+        "10": {"class_type": "LoadImage", "inputs": {"image": ref_name}},
+        "20": {"class_type": "CheckpointLoaderSimple", "inputs": {
+            "ckpt_name": "sam3.1_multiplex_fp16.safetensors"}},
+        "21": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["20", 1], "text": prompt}},
+        "22": _sam3(["10", 0]),
+        "23": {"class_type": "SAM3_TrackToMask", "inputs": {"track_data": ["22", 0], "object_indices": ""}},
+        "24": {"class_type": "MaskToImage", "inputs": {"mask": ["23", 0]}},
+        "25": {"class_type": "SaveImage", "inputs": {"images": ["24", 0], "filename_prefix": f"{prefix}-ref"}},
+        # 3 frame rải đều: khung hình driver có thể zoom trong clip, một frame là chưa đủ tin.
+        "30": {"class_type": "VHS_LoadVideo", "inputs": {
+            "video": motion_name, "force_rate": 0, "custom_width": W, "custom_height": H,
+            "frame_load_cap": 3, "skip_first_frames": 0, "select_every_nth": max(1, int(stride)),
+            "format": "AnimateDiff"}},
+        "31": _sam3(["30", 0]),
+        "32": {"class_type": "SAM3_TrackToMask", "inputs": {"track_data": ["31", 0], "object_indices": ""}},
+        "33": {"class_type": "MaskToImage", "inputs": {"mask": ["32", 0]}},
+        "34": {"class_type": "SaveImage", "inputs": {"images": ["33", 0], "filename_prefix": f"{prefix}-drv"}},
+        # ── Nhánh 3: mask NGƯỜI của driver, để đo ĐỘ PHỦ khung. Dùng đúng bộ số của graph chính
+        # (sam3Prompt, max_objects, maskIndices) để con số đo được phản ánh mask thật sẽ dùng khi render.
+        "26": {"class_type": "CLIPTextEncode", "inputs": {
+            "clip": ["20", 1],
+            "text": str(p.get("sam3Prompt") or p.get("sam3_prompt") or "person").strip() or "person"}},
+        "40": _sam3(["30", 0], cond="26",
+                    max_objects=_motion_int(p, "sam3MaxObjects", "sam3_max_objects", default=4)),
+        "41": {"class_type": "SAM3_TrackToMask", "inputs": {
+            "track_data": ["40", 0],
+            "object_indices": str(p.get("maskIndices") or p.get("mask_indices") or "")}},
+        "42": {"class_type": "MaskToImage", "inputs": {"mask": ["41", 0]}},
+        "43": {"class_type": "SaveImage", "inputs": {"images": ["42", 0], "filename_prefix": f"{prefix}-per"}},
+    }
+
+
+def _comfy_node_images(outputs, node_id):
+    """Tải MỌI ảnh của ĐÚNG MỘT node trong history outputs → list path tmp.
+
+    comfy_fetch_output chỉ trả file ĐẦU TIÊN tìm thấy trên toàn graph, mà probe có hai nhánh
+    (ref và driver) nên phải lấy theo node id. Cũng không dùng comfy_view_file: nó vứt payload
+    ≤1024 byte, mà mask PNG một màu nén rất nhỏ, hoàn toàn có thể lọt dưới ngưỡng đó.
+    """
+    out = []
+    for it in (((outputs or {}).get(str(node_id)) or {}).get("images") or []):
+        fn = it.get("filename", "")
+        if not fn.lower().endswith(IMG_EXTS):
+            continue
+        try:
+            r = requests.get(f"{COMFY_URL}/view", params={
+                "filename": fn, "subfolder": it.get("subfolder", ""),
+                "type": it.get("type", "output")}, timeout=120)
+            r.raise_for_status()
+            dst = os.path.join(tempfile.gettempdir(), fn)
+            with open(dst, "wb") as f:
+                f.write(r.content)
+            out.append(dst)
+        except requests.RequestException:
+            pass
+    return out
+
+
+def _mask_png_coverage(path, thresh=32):
+    """Tỉ lệ diện tích mask trên toàn khung (0..1) — None nếu ảnh hỏng."""
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            b = im.convert("L").point(lambda v: 1 if v > thresh else 0)
+            return sum(b.getdata()) / float(b.width * b.height)
+    except Exception:
+        return None
+
+
+def _mask_png_bbox(path, thresh=32):
+    """bbox (x0,y0,x1,y1) của vùng sáng trong ảnh mask — None nếu mask rỗng/ảnh hỏng."""
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            return im.convert("L").point(lambda v: 255 if v > thresh else 0).getbbox()
+    except Exception:
+        return None
+
+
+# ALD 22/08/2026 - Prompt CHUNG cho cả Gemini lẫn Qwen: nói rõ "phục hồi chi tiết", CẤM đổi mọi thứ
+# khác. Ảnh ref LÀ nguồn danh tính Wan sao chép — model làm nét mà tiện tay sửa mặt thì video cuối ra
+# người khác. Nêu tường minh từng thứ phải giữ vì model diễn giải "enhance" rất rộng.
+_REF_ENH_PROMPT = (
+    "Restore and sharpen this photograph to high resolution. Keep the SAME person: identical face, "
+    "facial features, eye shape, skin tone, hairstyle, makeup, clothing, jewellery, body pose, camera "
+    "angle, lighting and background. Do not change the framing or crop. Do not add or remove anything. "
+    "Only recover realistic photographic detail and remove blur.")
+
+
+def _ref_enh_mode(p):
+    v = str(p.get("refEnhance", p.get("ref_enhance", os.environ.get("SWAP_REF_ENHANCE", "restore")))).strip().lower()
+    if v in ("0", "false", "no", "none", "off", ""):
+        return "off"
+    if v in ("gen", "gemini", "nano-banana", "generate"):
+        return "gen"
+    return "restore"
+
+
+def _ref_enh_gemini(job_id, crop_path, W, H, p, tmp):
+    key = _gemini_key(p)
+    if not _valid_gemini_key(key):
+        api_log(job_id, "làm nét ref: chưa có GEMINI_API_KEY hợp lệ → bỏ tầng Gemini", "warn")
+        return None
+    # GHIM model tường minh: map geminiModel của run_create_image/run_edit_image còn trỏ id '-preview'
+    # Google đã khai tử 25/06, và docker-compose.yml:299 còn tái lập id đó đè lên default đã sửa.
+    model = str(p.get("refEnhanceModel") or p.get("ref_enhance_model") or GEMINI_IMAGE_MODEL).strip()
+    with open(crop_path, "rb") as f:
+        data = f.read()
+    return _gemini_edit([(data, _mime(crop_path))], _REF_ENH_PROMPT, key,
+                        os.path.join(tmp, "ref-enh-gemini.png"),
+                        aspect_ratio=_gemini_aspect((int(W), int(H))), model=model)
+
+
+def _ref_enh_qwen(job_id, crop_path, W, H, p, tmp):
+    """Qwen-Image-Edit CỤC BỘ trên pod — không phải API. Không tốn tiền, không chết vì mạng,
+    ảnh không rời máy. denoise thấp = tinh chỉnh chứ không vẽ lại."""
+    wf = build_qwen_create_workflow(
+        [comfy_upload(crop_path)], _REF_ENH_PROMPT, f"ref-enh-{job_id[:8]}",
+        width=int(W), height=int(H), force_size=False, realism=False,
+        denoise=_motion_float(p, "refEnhanceDenoise", "ref_enhance_denoise", default=0.35))
+    return comfy_fetch_output(comfy_poll(comfy_submit(wf), job_id, deadline_sec=600), exts=IMG_EXTS)
+
+
+def build_flashvsr_image_workflow(image_name, scale, resize_factor, prefix="ref-fv"):
+    """FlashVSR trên MỘT ẢNH TĨNH.
+
+    `FlashVSRNodeAdv.frames` nhận IMAGE batch nên `LoadImage` một ảnh chạy được. Dùng lại
+    build_flashvsr_upscale_workflow để mode/precision/attention/tile chỉ có MỘT nguồn sự thật,
+    chỉ thay đầu vào (VHS_LoadVideo → LoadImage) và đầu ra (VHS_VideoCombine → SaveImage) — bản
+    video còn lấy audio từ ["10",2], slot mà LoadImage không có.
+    """
+    wf = build_flashvsr_upscale_workflow("__unused__.mp4", scale, resize_factor, 1, prefix=prefix)
+    wf["10"] = {"class_type": "LoadImage", "inputs": {"image": image_name}}
+    wf.pop("110", None)
+    wf["120"] = {"class_type": "SaveImage", "inputs": {"images": ["30", 0], "filename_prefix": prefix}}
+    return wf
+
+
+def _ref_enh_restore(job_id, crop_path, W, p, tmp):
+    """PHỤC HỒI chi tiết, không sáng tác — rủi ro đổi danh tính thấp nhất, nên là mặc định.
+
+    Ưu tiên FlashVSR: model phục hồi thật, đã ghim sẵn trong image và model 8.7GB đã nằm trên
+    volume, nên KHÔNG phải đổi gì ở deployment. Không có node thì tụt về ESRGAN ×4 — chỉ làm sắc
+    cạnh, không phục hồi được chi tiết mặt, nhưng còn hơn không.
+    """
+    name = comfy_upload(crop_path)
+    if _comfy_has_node("FlashVSRNodeAdv"):
+        try:
+            from PIL import Image
+            with Image.open(crop_path) as im:
+                cw = im.width
+        except Exception:
+            cw = int(W)
+        scale = int(os.environ.get("MOTION_FLASHVSR_SCALE", "4"))
+        rf = min(1.0, max(0.1, round(max(1.0, int(W) / max(1, cw)) / max(1, scale), 1)))
+        wf = build_flashvsr_image_workflow(name, scale, rf, prefix=f"ref-enh-{job_id[:8]}")
+        return comfy_fetch_output(comfy_poll(comfy_submit(wf), job_id, deadline_sec=900), exts=IMG_EXTS)
+    _face = _comfy_has_node("FaceRestoreCFWithModel")
+    api_log(job_id, f"làm nét ref: thiếu FlashVSRNodeAdv → ESRGAN ×4"
+                    f"{'' if _face else ' (cũng không có FaceRestoreCFWithModel: không phục hồi mặt)'}", "warn")
+    wf = build_image_upscale_workflow(
+        name, prefix=f"ref-enh-{job_id[:8]}", face_restore=_face,
+        face_fidelity=_motion_float(p, "refFaceFidelity", "ref_face_fidelity", default=0.5))
+    return comfy_fetch_output(comfy_poll(comfy_submit(wf), job_id, deadline_sec=900), exts=IMG_EXTS)
+
+
+def _ref_fit_to_frame(path, W, H, tmp):
+    """Thu ảnh về đúng khung render nếu nó lớn hơn — ESRGAN nhân ×4 vô điều kiện nên crop nhỏ vẫn
+    ra ảnh 2900px, upload chừng đó là phí. Nhỏ hơn thì để nguyên cho node 11 phóng."""
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            if im.width <= int(W) and im.height <= int(H):
+                return path
+            dst = os.path.join(tmp, "ref-framed-fit.png")
+            im.convert("RGB").resize((int(W), int(H)), Image.LANCZOS).save(dst, "PNG")
+            return dst
+    except Exception:
+        return path
+
+
+def _enhance_ref_crop(job_id, crop_path, W, H, p, tmp):
+    """Làm nét ảnh ref ĐÃ CẮT. LUÔN trả về một path dùng được — hỏng hết thì trả lại crop trần.
+
+    Thứ tự tầng theo đúng khuôn mẫu fallback của repo (xem vòng lặp teaser ~linux.py:8895):
+    sentinel None, mỗi tầng một try/except, log warn nêu rõ tầng kế tiếp, tầng cuối luôn có sẵn.
+    """
+    mode = _ref_enh_mode(p)
+    if mode == "off":
+        return crop_path
+    try:
+        from PIL import Image
+        with Image.open(crop_path) as im:
+            cw, ch = im.size
+    except Exception:
+        return crop_path
+    # Crop đã lớn hơn khung render (s<1) → không phóng lên thì không có gì để phục hồi.
+    if cw >= int(W) and ch >= int(H):
+        api_log(job_id, f"làm nét ref: crop {cw}×{ch} ≥ khung {W}×{H} (không phóng lên) → bỏ qua", "info")
+        return crop_path
+    out = None
+    if mode == "gen":
+        try:
+            out = _ref_enh_gemini(job_id, crop_path, W, H, p, tmp)
+        except Exception as e:
+            api_log(job_id, f"làm nét ref: Gemini lỗi → Qwen cục bộ: {e}", "warn")
+        if not out:
+            try:
+                out = _ref_enh_qwen(job_id, crop_path, W, H, p, tmp)
+            except Exception as e:
+                api_log(job_id, f"làm nét ref: Qwen lỗi → phục hồi cục bộ: {e}", "warn")
+    if not out:
+        try:
+            out = _ref_enh_restore(job_id, crop_path, W, p, tmp)
+        except Exception as e:
+            api_log(job_id, f"làm nét ref: phục hồi lỗi → dùng crop trần: {e}", "warn")
+    if not out:
+        api_log(job_id, "làm nét ref: mọi tầng đều hỏng → dùng crop trần", "warn")
+        return crop_path
+    api_log(job_id, f"làm nét ref: xong bằng '{mode}' (crop {cw}×{ch} → khung {W}×{H})", "info")
+    return _ref_fit_to_frame(out, W, H, tmp)
+
+
+def _match_ref_framing_to_driver(job_id, ref_local, motion_local, W, H, p, tmp):
+    """Cắt ảnh ref cho khung hình khớp driver → path ảnh mới, hoặc None để dùng ref nguyên bản.
+
+    FAIL-SAFE tuyệt đối: thiếu node, SAM3 không thấy đầu, probe lỗi — đều log warn rồi trả None.
+    Ngoại lệ DUY NHẤT là RefFramingTooFar: cái đó phải nổi lên thành lỗi job, vì chạy tiếp chắc
+    chắn ra kết quả hỏng và đốt mất 7 phút GPU.
+    """
+    if not _motion_bool(p, "refFrameMatch", "ref_frame_match",
+                        default=str(os.environ.get("SWAP_REF_FRAME_MATCH", "1")).strip().lower()
+                        in ("1", "true", "yes", "on")):
+        return None
+    if not _comfy_has_node("SAM3_VideoTrack"):
+        api_log(job_id, "khớp khung ref: thiếu node SAM3_VideoTrack → giữ ảnh ref nguyên bản", "warn")
+        return None
+    try:
+        from PIL import Image
+        with Image.open(ref_local) as _im:
+            ref_w, ref_h = _im.size
+        stride = max(1, int((_video_nframes(motion_local) or 3) // 3))
+        wf = build_swap_headprobe_workflow(
+            comfy_upload(ref_local), comfy_upload(motion_local), int(W), int(H),
+            p=p, stride=stride, prefix=f"swap-probe-{job_id[:8]}")
+        outs = comfy_poll(comfy_submit(wf), job_id, deadline_sec=600)
+        # Đo ĐỘ PHỦ mask người TRƯỚC, và ghi vào p ngay: nó quyết định có thu mask hay không, việc
+        # đó độc lập với chuyện crop có thành công hay không (ref không có mặt vẫn cần thu mask).
+        _covs = [c for c in (_mask_png_coverage(x) for x in _comfy_node_images(outs, "43")) if c is not None]
+        if _covs:
+            p["_driverMaskCoverage"] = sorted(_covs)[len(_covs) // 2]
+            api_log(job_id, f"mask người của driver phủ {100 * p['_driverMaskCoverage']:.0f}% khung "
+                            f"({len(_covs)} frame, lấy trung vị)", "info")
+        ref_bb = next((b for b in (_mask_png_bbox(x) for x in _comfy_node_images(outs, "25")) if b), None)
+        drv_bbs = [b for b in (_mask_png_bbox(x) for x in _comfy_node_images(outs, "34")) if b]
+        if not ref_bb or not drv_bbs:
+            api_log(job_id, "khớp khung ref: SAM3 không thấy đầu (ref hoặc driver) → giữ ảnh ref nguyên bản", "warn")
+            return None
+        # Trung vị theo CHIỀU CAO đầu: khung hình driver có thể zoom trong clip, một frame chưa đủ tin.
+        drv_bb = sorted(drv_bbs, key=lambda b: b[3] - b[1])[len(drv_bbs) // 2]
+        res = _ref_framing_crop_box(ref_w, ref_h, ref_bb, drv_bb, int(W), int(H),
+                                    _motion_float(p, "refFrameMaxUpscale", "ref_frame_max_upscale", default=4.0))
+        if not res:
+            api_log(job_id, f"khớp khung ref: ref {ref_w}×{ref_h} không đủ trường nhìn cho khung "
+                            f"{W}×{H} → giữ ảnh ref nguyên bản", "warn")
+            return None
+        box, s = res
+        dst = os.path.join(tmp, "ref-framed.png")
+        # CHỈ cắt, không resize: cửa sổ đã mang đúng tỉ lệ khung render nên node 11
+        # (ImageResizeKJv2 keep_proportion=crop) chỉ còn việc resize — cùng lanczos, khỏi làm hai lần.
+        with Image.open(ref_local) as im:
+            im.convert("RGB").crop(tuple(int(round(v)) for v in box)).save(dst, "PNG")
+        api_log(job_id, f"khớp khung ref: đầu ref {ref_bb[3]-ref_bb[1]}px vs driver {drv_bb[3]-drv_bb[1]}px "
+                        f"→ phóng {s:.2f}×, cắt ref về {tuple(int(round(v)) for v in box)} "
+                        f"(gốc {ref_w}×{ref_h})", "info")
+        return _enhance_ref_crop(job_id, dst, int(W), int(H), p, tmp)
+    except RefFramingTooFar:
+        raise
+    except Exception as e:
+        api_log(job_id, f"khớp khung ref lỗi ({e}) → giữ ảnh ref nguyên bản", "warn")
+        return None
+# #endregion
+
+
+# ALD 22/08/2026 - Cụm negative CHỈ dùng cho character-swap (motion không đụng tới). Tách hằng số ra
+# đây để sửa một chỗ, và để test khẳng định được nội dung thay vì so chuỗi dài trong thân hàm.
+SWAP_NEGATIVE_EXTRA = ("bouquet, flowers, holding objects, hands holding items, "
+                       "extra objects, props, floating objects, "
+                       # ALD 22/08/2026 - nhạc cụ là BẰNG CHỨNG chứ không phải phòng xa: 5/8 lần chạy
+                       # dandong5 ra đúng một cây đàn guitar, cùng vị trí cùng góc.
+                       "guitar, musical instrument, ukulele, microphone")
+
+# ALD 22/08/2026 - Positive riêng cho swap. Prompt gốc (MOTION_BASE_POSITIVE) chỉ nói về chất lượng
+# ảnh, không nói gì về NỘI DUNG khung hình, nên với driver cận cảnh Wan tự do diễn giải chỗ trống.
+# Câu này neo vào "một người, tay không, không có gì che thân". Nối thêm, không thay.
+SWAP_POSITIVE_EXTRA = ("the same single person alone in frame with empty hands, "
+                       "unobstructed head and shoulders, nothing held in front of the body")
+
+
+def _apply_swap_to_wan_workflow(wf, p):
+    """Character-swap engine wananimate: chuyển graph animation → replacement (Mix) mode.
+
+    Mix mode giữ background CỦA VIDEO: bg_images = frame driver tô đen vùng người, mask = vùng
+    người. Chuỗi mask theo example kijai wanvideo_WanAnimate_example_01.json (Grow 10 → Blockify 32),
+    thay SAM2+PointsEditor interactive bằng SAM3 core text-prompt để chạy headless.
+    Chỉ thêm node 200-206 + 2 input của node 81; pose/face/sampler của motion giữ nguyên.
+    """
+    sam3_prompt = str(p.get("sam3Prompt") or p.get("sam3_prompt") or "person").strip() or "person"
+    wf["200"] = {"class_type": "CheckpointLoaderSimple", "inputs": {
+        "ckpt_name": "sam3.1_multiplex_fp16.safetensors"}}
+    wf["201"] = {"class_type": "CLIPTextEncode", "inputs": {"clip": ["200", 1], "text": sam3_prompt}}
+    wf["202"] = {"class_type": "SAM3_VideoTrack", "inputs": {
+        "images": ["12", 0], "model": ["200", 0], "conditioning": ["201", 0],
+        "detection_threshold": _motion_float(p, "sam3Threshold", "sam3_threshold", default=0.5),
+        "max_objects": _motion_int(p, "sam3MaxObjects", "sam3_max_objects", default=4),
+        "detect_interval": _motion_int(p, "sam3DetectInterval", "sam3_detect_interval", default=1)}}
+    wf["203"] = {"class_type": "SAM3_TrackToMask", "inputs": {
+        "track_data": ["202", 0],
+        # rỗng = union mọi người trong video; "0" = chỉ người đầu (chọn khi video đông người)
+        "object_indices": str(p.get("maskIndices") or p.get("mask_indices") or "")}}
+    # ALD 22/08/2026 - ĐÃ THỬ VÀ ĐÃ BÁC BỎ, ĐỪNG LÀM LẠI: "mask phủ 61% khung cho Wan quá nhiều đất
+    # bịa vật thể, nên khi mask lớn thì ăn mòn (-8px) và bỏ Blockify". Đo 4 seed × 2 nhánh trên
+    # dandong5: nhánh THU MASK hỏng 4/4, nhánh giữ nguyên sạch 4/4 — tách bạch hoàn toàn. Hai kiểu
+    # hỏng (bịa quần áo, răng cưa dọc mép khung) đều truy về rìa mask bị ăn mòn và mất Blockify: rìa
+    # hở không còn được làm phẳng theo lưới nên Wan vẽ vào đó thành viền gãy khúc.
+    # Thủ phạm thật là PROMPT — xem SWAP_NEGATIVE_EXTRA / SWAP_POSITIVE_EXTRA cuối hàm này.
+    # Độ phủ vẫn được đo và ghi log (chẩn đoán) nhưng KHÔNG lái chuỗi mask nữa.
+    wf["204"] = {"class_type": "GrowMaskWithBlur", "inputs": {
+        "mask": ["203", 0],
+        "expand": _motion_int(p, "maskGrow", "mask_grow", default=10),
+        "incremental_expandrate": 0.0, "tapered_corners": True, "flip_input": False,
+        "blur_radius": 0.0, "lerp_alpha": 1.0, "decay_factor": 1.0, "fill_holes": False}}
+    # ALD 22/08/2026 - MẶC ĐỊNH 32→16 sau khi đo thật trên pod 21/08. Blockify lấy bounding box của
+    # mask rồi tô ĐẦY mọi ô có dính mask, nên ô càng to vùng vẽ lại càng phình ra ngoài dáng người —
+    # 32px cho Wan cả một khoảng trống trước bụng để bịa vật thể. 16 vẫn thẳng lưới latent (VAE ×8,
+    # patch 2 → bội 16) mà bám sát người hơn. Muốn về hành vi cũ: maskBlockify=32.
+    wf["205"] = {"class_type": "BlockifyMask", "inputs": {
+        "masks": ["204", 0],
+        "block_size": _motion_int(p, "maskBlockify", "mask_blockify", default=16)}}
+    wf["206"] = {"class_type": "DrawMaskOnImage", "inputs": {
+        "image": ["12", 0], "mask": ["205", 0], "color": "0, 0, 0"}}
+    wf["81"]["inputs"]["bg_images"] = ["206", 0]
+    wf["81"]["inputs"]["mask"] = ["205", 0]
+    # #region ALD 22/08/2026 - CHẶN BỊA VẬT THỂ. Đo thật 21/08 (nhanvat-1 + dandong-2): driver chắp
+    # tay sau lưng → DWPose đặt keypoint bàn tay mơ hồ ra phía trước → Wan "giải thích" tư thế bằng
+    # cách vẽ BÓ HOA vào tay, bám từ ~frame 60 tới hết clip (frame 0 còn sạch). Cùng họ với bệnh
+    # "ngón tay kéo dài" đã ghi ở build_wan_workflow: keypoint tay hỏng thì Wan tự sáng tác.
+    # NỐI THÊM vào negative có sẵn chứ không thay — chuỗi gốc còn lo da bóng/cháy sáng.
+    # swapNegativeExtra="" TẮT hẳn: mẫu cầm sản phẩm (túi xách, hộp mỹ phẩm) là kịch bản THẬT của
+    # tool thời trang, cấm "holding objects" lúc đó là tự bắn vào chân.
+    _neg_extra = str(p.get("swapNegativeExtra", p.get("swap_negative_extra", SWAP_NEGATIVE_EXTRA))).strip()
+    if _neg_extra and "60" in wf:
+        _neg = str(wf["60"]["inputs"].get("negative_prompt") or "").strip().rstrip(",")
+        wf["60"]["inputs"]["negative_prompt"] = f"{_neg}, {_neg_extra}" if _neg else _neg_extra
+    _pos_extra = str(p.get("swapPositiveExtra", p.get("swap_positive_extra", SWAP_POSITIVE_EXTRA))).strip()
+    if _pos_extra and "60" in wf:
+        _pos = str(wf["60"]["inputs"].get("positive_prompt") or "").strip().rstrip(",")
+        wf["60"]["inputs"]["positive_prompt"] = f"{_pos}, {_pos_extra}" if _pos else _pos_extra
+    # #endregion
+    return wf
+
+def build_scail2_swap_workflow(ref_name, motion_name, p, prefix="swap-out"):
+    """Character-swap engine scail2 — node CORE native (comfy_extras/nodes_scail.py + nodes_sam3.py).
+
+    Graph bám subgraph Base của template chính thức Comfy-Org video_wan21_scail2_character_replacement
+    (nhánh turbo: 6 bước, cfg 1, euler/simple, shift 5, LoRA DPO 1.0 + lightx2v rank64 0.8).
+    Khác template: VHS_LoadVideo/VHS_VideoCombine (đồng bộ toolchain + mux audio driver), unet
+    fp8_scaled (fp16 32.8GB không vừa 5090 32GB), 1 segment ≤81 frame (extend chaining làm sau).
+    """
+    W = (int(p.get("width", 544)) // 32) * 32       # WanSCAILToVideo đòi bội 32 (io.Int step=32)
+    H = (int(p.get("height", 960)) // 32) * 32
+    F = min(int(p.get("frames", 81) or 81), 81)     # SCAIL-2 train theo chunk 81 frame
+    rfps = int(p.get("render_fps", 16) or 16)
+    sam3_vid = str(p.get("sam3VideoPrompt") or p.get("sam3Prompt") or "human").strip() or "human"
+    sam3_img = str(p.get("sam3ImagePrompt") or p.get("sam3Prompt") or "human").strip() or "human"
+    pos = str(p.get("positive_prompt") or p.get("prompt") or
+              "a person moving naturally, high quality, detailed clothing and face").strip()
+    neg = str(p.get("negative_prompt") or "").strip()
+    return {
+        "10": {"class_type": "LoadImage", "inputs": {"image": ref_name}},
+        "11": {"class_type": "ImageResizeKJv2", "inputs": {
+            "image": ["10", 0], "width": W, "height": H, "upscale_method": "lanczos",
+            "keep_proportion": "crop", "pad_color": "0, 0, 0", "crop_position": "center",
+            "divisible_by": 32, "device": "cpu"}},
+        "12": {"class_type": "VHS_LoadVideo", "inputs": {
+            "video": motion_name, "force_rate": rfps, "custom_width": W, "custom_height": H,
+            "frame_load_cap": F, "skip_first_frames": 0, "select_every_nth": 1, "format": "AnimateDiff"}},
+        # ── SAM3: track người trong driver + segment người trong ảnh ref, cùng 1 checkpoint ──
+        "20": {"class_type": "CheckpointLoaderSimple", "inputs": {
+            "ckpt_name": "sam3.1_multiplex_fp16.safetensors"}},
+        "21": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["20", 1], "text": sam3_vid}},
+        "22": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["20", 1], "text": sam3_img}},
+        "23": {"class_type": "SAM3_VideoTrack", "inputs": {
+            "images": ["12", 0], "model": ["20", 0], "conditioning": ["21", 0],
+            "detection_threshold": _motion_float(p, "sam3Threshold", "sam3_threshold", default=0.5),
+            "max_objects": _motion_int(p, "sam3MaxObjects", "sam3_max_objects", default=4),
+            "detect_interval": 1}},
+        "24": {"class_type": "SAM3_VideoTrack", "inputs": {
+            "images": ["11", 0], "model": ["20", 0], "conditioning": ["22", 0],
+            "detection_threshold": 0.5, "max_objects": 4, "detect_interval": 1}},
+        "25": {"class_type": "SCAIL2ColoredMask", "inputs": {
+            "driving_track_data": ["23", 0], "ref_track_data": ["24", 0],
+            "object_indices": str(p.get("maskIndices") or p.get("mask_indices") or ""),
+            "sort_by": "left_to_right", "replacement_mode": True}},
+        # ── model + LoRA (thứ tự template: unet → DPO → lightx2v → shift) ──
+        "30": {"class_type": "UNETLoader", "inputs": {
+            "unet_name": os.environ.get("SCAIL2_UNET", "wan2.1_14B_SCAIL_2_fp8_scaled.safetensors"),
+            "weight_dtype": "default"}},
+        "31": {"class_type": "LoraLoaderModelOnly", "inputs": {
+            "model": ["30", 0], "lora_name": "wan2.1_SCAIL_2_DPO_lora_bf16.safetensors",
+            "strength_model": _motion_float(p, "dpoLora", "dpo_lora", default=1.0)}},
+        "32": {"class_type": "LoraLoaderModelOnly", "inputs": {
+            "model": ["31", 0], "lora_name": "lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors",
+            "strength_model": _motion_float(p, "distillLora", "distill_lora", default=0.8)}},
+        "33": {"class_type": "ModelSamplingSD3", "inputs": {
+            "model": ["32", 0], "shift": _motion_float(p, "shift", default=5.0)}},
+        "40": {"class_type": "CLIPLoader", "inputs": {
+            "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors", "type": "wan", "device": "default"}},
+        "41": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["40", 0], "text": pos}},
+        "42": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["40", 0], "text": neg}},
+        "50": {"class_type": "VAELoader", "inputs": {"vae_name": "Wan2_1_VAE_bf16.safetensors"}},
+        "60": {"class_type": "CLIPVisionLoader", "inputs": {"clip_name": "clip_vision_h.safetensors"}},
+        "61": {"class_type": "CLIPVisionEncode", "inputs": {
+            "clip_vision": ["60", 0], "image": ["11", 0], "crop": "none"}},
+        # ── conditioning + sampler ──
+        "70": {"class_type": "WanSCAILToVideo", "inputs": {
+            "positive": ["41", 0], "negative": ["42", 0], "vae": ["50", 0],
+            "width": W, "height": H, "length": F, "batch_size": 1,
+            "pose_video": ["12", 0], "pose_video_mask": ["25", 0], "replacement_mode": True,
+            "pose_strength": _motion_float(p, "pose_strength", "poseStrength", default=1.0),
+            "pose_start": 0.0, "pose_end": 1.0,
+            "reference_image": ["11", 0], "reference_image_mask": ["25", 1],
+            "clip_vision_output": ["61", 0],
+            "video_frame_offset": 0, "previous_frame_count": 5}},
+        "80": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}},
+        "81": {"class_type": "BasicScheduler", "inputs": {
+            "model": ["33", 0], "scheduler": "simple",
+            "steps": int(p.get("steps", 6) or 6), "denoise": 1.0}},
+        "90": {"class_type": "SamplerCustom", "inputs": {
+            "model": ["33", 0], "add_noise": True,
+            "noise_seed": _motion_int(p, "seed", default=42),
+            "cfg": _motion_float(p, "cfg", default=1.0),
+            "positive": ["70", 0], "negative": ["70", 1],
+            "sampler": ["80", 0], "sigmas": ["81", 0], "latent_image": ["70", 2]}},
+        "100": {"class_type": "VAEDecode", "inputs": {"samples": ["90", 1], "vae": ["50", 0]}},
+        "110": {"class_type": "VHS_VideoCombine", "inputs": {
+            "images": ["100", 0], "frame_rate": rfps, "loop_count": 0, "filename_prefix": prefix,
+            "format": "video/h264-mp4", "pingpong": False, "save_output": True, "audio": ["12", 2]}},
+    }
+
 # ───────────────────────── Motion: normalize params (workflow) + RIFE 60fps ─────────────────────────
 # ALD 05/06/2026 - Luồng WORKFLOW gửi config THÔ (preset/camelCase/aspectRatio/quality) — KHÁC luồng tool
 # standalone (server proxy đã expand preset→params). Nếu không normalize ở đây, run_motion rơi hết về default
@@ -1773,7 +2295,29 @@ MOTION_PRESETS = {
 }
 _ASPECT = {"9:16": (9, 16), "16:9": (16, 9), "1:1": (1, 1), "3:4": (3, 4), "4:3": (4, 3), "21:9": (21, 9)}
 _QUALITY_SHORT = {"480p": 480, "540p": 544, "720p": 720, "1080p": 1080}  # ALD 30/06/2026 - 540p=544 cho Custom motion
-def _even16(n): return max(16, int(round(float(n) / 16)) * 16)
+def _even_to(n, m): return max(m, int(round(float(n) / m)) * m)
+def _even16(n): return _even_to(n, 16)
+
+# ALD 22/08/2026 - Toán FIT DRIVER tách khỏi run_motion để TEST được: block gốc nằm giữa một hàm dài và
+# chỉ chạy khi có driver thật, nên bội-32 của scail2 sẽ không có cách nào khẳng định ngoài chạy pod.
+# `multiple`: bội mà khung phải chia hết — 16 cho Wan, 32 cho scail2 (WanSCAILToVideo khai io.Int step=32,
+# builder floor về bội 32; FIT DRIVER trả bội 16 lẻ thì driver 3:4 rơi 720→704 và VHS_LoadVideo kéo dẹt
+# khung ~2.2% vì custom_width/custom_height không giữ tỷ lệ).
+def _fit_driver_wh(dw, dh, short_edge, max_edge, multiple=16):
+    ratio = max(dw, dh) / float(min(dw, dh))
+    short0, long0 = float(short_edge), float(short_edge) * ratio
+    if long0 > max_edge:
+        short0, long0 = max_edge / ratio, float(max_edge)
+    w, h = ((short0, long0) if dh >= dw else (long0, short0))
+    w, h = _even_to(w, multiple), _even_to(h, multiple)
+    # Làm tròn LÊN có thể vượt trần cạnh dài (trần lẻ 990 → 992). Trần là ngân sách VRAM đã đo, nên lùi
+    # một bậc thay vì phá nó — thà khung nhỏ hơn vài pixel còn hơn OOM giữa job.
+    if max(w, h) > max_edge:
+        if w >= h:
+            w -= multiple
+        else:
+            h -= multiple
+    return w, h
 def _motion_present(v):
     if v is None:
         return False
@@ -1967,6 +2511,10 @@ def _normalize_motion_params(p):
                 if p.get("loraRelight") is None and p.get("lora_relight") is None:
                     p["lora_relight"] = _v
                 continue
+            # ALD 21/08/2026 - SCAIL-2 dùng template turbo riêng (steps=6 do run_character_swap setdefault);
+            # preset "drv-*" chỉ định nghĩa steps=4 cho baseline Wan-Animate, KHÔNG áp cho scail2.
+            if _k == "steps" and p.get("_swapEngine") == "scail2":
+                continue
             p[_k] = _v
     for _dead in ("bgAnchor", "bg_anchor", "bgAnchorMaskExpand", "bg_anchor_mask_expand", "bgAnchorMaskBlur", "bg_anchor_mask_blur"):
         p.pop(_dead, None)
@@ -2037,7 +2585,10 @@ def _normalize_motion_params(p):
         p["renderProfile"] = "fast"
         p["hq"] = False
         p.pop("hq_steps", None)
-        p["steps"] = int(os.environ.get("MOTION_FAST_STEPS", "4") or "4")
+        # ALD 21/08/2026 - SCAIL-2 dùng template turbo riêng (steps=6 do run_character_swap setdefault);
+        # KHÔNG ép về MOTION_FAST_STEPS (4) — số đó là tuning riêng của Wan-Animate + lightx2v, sai template scail2.
+        if p.get("_swapEngine") != "scail2":
+            p["steps"] = int(os.environ.get("MOTION_FAST_STEPS", "4") or "4")
         p["cfg"] = 1.0
         p["scheduler"] = "dpm++_sde"
         _lx2v_s = float(os.environ.get("MOTION_LX2V_STRENGTH", "1.0") or "1.0")
@@ -2093,8 +2644,14 @@ def _normalize_motion_params(p):
     if str(p.get("preset") or "").startswith("drv-"):
         p.pop("width", None)
         p.pop("height", None)
-        p["fitDriver"] = False
-        p["fit_driver"] = False
+        # ALD 22/08/2026 - TRỪ character-swap. Chính sách quality-v1 ở trên đúng cho Motion: user chọn
+        # tỉ lệ khung trên UI nên khung KHÔNG được chạy theo driver. Swap thì ngược hẳn — nó giữ nguyên
+        # background + camera của video nguồn, ép về 9:16 mặc định là kéo dãn chính cái video phải giữ.
+        # Đo thật trên pod 22/08: driver 3:4 (576×768) ra 544×960, mặt hẹp và dài ra. Ai vẫn muốn ép
+        # khung thì truyền fitDriver=0 — nhánh này không đụng vào giá trị người dùng gửi.
+        if not p.get("_swapEngine"):
+            p["fitDriver"] = False
+            p["fit_driver"] = False
         p["quality"] = "720p" if str(p.get("quality") or "").strip().lower() == "720p" else "540p"
         p["resolutionPolicy"] = "quality-v1"
         p["resolution_policy"] = "quality-v1"
@@ -4274,7 +4831,7 @@ def run_motion(job):
     # 9:16 544x960) bị node 12 VHS_LoadVideo (custom_width+custom_height cùng set) KÉO DÃN không giữ tỷ lệ →
     # mặt méo/cằm nâng, DWPose lệch theo. Fix: render theo TỶ LỆ THẬT của driver — cạnh ngắn giữ nguyên hạng
     # chất lượng preset, cạnh dài theo tỷ lệ driver, CAP cạnh dài ≤ MOTION_VRAM_MAX_EDGE (968, ngân sách VRAM
-    # đã đo 22/06 — driver 21:9 thu cả khung giữ tỷ lệ), cả hai bội 16. Probe đặt SAU cut/pre-convert-16fps/tpad
+    # đã đo 22/06 — driver 21:9 thu cả khung giữ tỷ lệ), cả hai bội 16 (32 với scail2). Probe đặt SAU cut/pre-convert-16fps/tpad
     # (ffmpeg re-encode đã autorotate → đúng chiều hiển thị; 3 bước đó không scale). Ref (node 11) vẫn
     # keep_proportion=crop theo khung mới. Node cũ ép width/height tay thì tôn trọng (_raw_wh_forced, skip).
     # Tắt: param fitDriver=0 hoặc env MOTION_FIT_DRIVER=0.
@@ -4285,19 +4842,17 @@ def run_motion(job):
             _dw, _dh = _img_dims(motion_local)
             if _dw and _dh:
                 _short0 = float(min(int(params["width"]), int(params["height"])))
-                _ratio = max(_dw, _dh) / float(min(_dw, _dh))
                 # ALD 19/07/2026 - quality=720p được phép dùng cạnh dài 1280; mặc định 540p truyền
                 # maxRenderEdge=968 để giữ baseline an toàn RAM, không phụ thuộc thời lượng.
                 _max_edge = int(params.get("maxRenderEdge", params.get("max_render_edge",
                                 os.environ.get("MOTION_VRAM_MAX_EDGE", "968"))))
                 _max_edge = max(480, min(1280, _max_edge))
-                _long0 = _short0 * _ratio
-                if _long0 > _max_edge:
-                    _short0, _long0 = _max_edge / _ratio, float(_max_edge)
-                _w2, _h2 = ((_short0, _long0) if _dh >= _dw else (_long0, _short0))
-                _w2, _h2 = _even16(_w2), _even16(_h2)
+                # ALD 22/08/2026 - scail2 cần bội 32 (xem _fit_driver_wh): trả bội 16 lẻ thì builder floor
+                # xuống và driver 3:4 bị kéo dẹt. Motion + wananimate giữ nguyên bội 16 như trước.
+                _mul = 32 if str(params.get("_swapEngine") or "").strip().lower() == "scail2" else 16
+                _w2, _h2 = _fit_driver_wh(_dw, _dh, _short0, _max_edge, _mul)
                 if (_w2, _h2) != (int(params["width"]), int(params["height"])):
-                    api_log(job_id, f"FIT DRIVER: driver {_dw}x{_dh} → render {_w2}x{_h2} "
+                    api_log(job_id, f"FIT DRIVER: driver {_dw}x{_dh} → render {_w2}x{_h2} (bội {_mul}) "
                                     f"(bỏ ép khung {params['width']}x{params['height']} của preset)", "info")
                     params = {**params, "width": _w2, "height": _h2}
         except Exception as _e:
@@ -4351,7 +4906,18 @@ def run_motion(job):
     # ALD 21/07/2026 - TỰ NHIÊN HÓA (user chốt): gỡ hẳn LivePortrait + env MOTION_FACE_SOURCE_DEFAULT khỏi motion.
     # Mặt đi thẳng theo thiết kế gốc Wan-Animate: face_images = crop driver (default trong build_wan_workflow).
     api_progress(job_id, 0.15, "upload vào ComfyUI")
-    ref_name = comfy_upload(ref_local)
+    # #region ALD 22/08/2026 - Khớp khung hình ref với driver — CHỈ character-swap. Motion lấy CẢ
+    # background từ ảnh ref nên cắt ref là phá Motion. Giữ ref_local nguyên vẹn (ba chỗ sau còn
+    # đọc nó: _apply_ref_grade_video, _apply_face_lock, _apply_motion_drift_fix), chỉ đổi file
+    # đem upload. Áp cho cả hai engine vì crop xảy ra TRƯỚC upload, graph nào cũng hưởng.
+    _ref_upload_local = ref_local
+    if str(params.get("_swapEngine") or "").strip():
+        _framed = _match_ref_framing_to_driver(job_id, ref_local, motion_local,
+                                               params.get("width"), params.get("height"), params, tmp)
+        if _framed:
+            _ref_upload_local = _framed
+    # #endregion
+    ref_name = comfy_upload(_ref_upload_local)
     motion_name = comfy_upload(motion_local)
     api_progress(job_id, 0.25, "Wan 2.2 Animate (sampling)")
     window_plan = _wan_window_plan(params, _F)
@@ -4366,7 +4932,22 @@ def run_motion(job):
     else:
         api_log(job_id, f"Window mode: autoregressive · {est_windows} window × {_wsz}f", "info")
     wan_prefix = f"motion-{job_id[:8]}"
-    workflow = build_wan_workflow(ref_name, motion_name, params, prefix=wan_prefix)
+    # ALD 21/08/2026 - character-swap đi chung run_motion (tái dùng toàn bộ driver-processing),
+    # chỉ rẽ nhánh Ở ĐÂY theo _swapEngine. Chuỗi rỗng = motion cũ nguyên vẹn.
+    _swap_engine = str(params.get("_swapEngine") or "").strip().lower()
+    def _build_motion_workflow(_p):
+        if _swap_engine == "scail2":
+            return build_scail2_swap_workflow(ref_name, motion_name, _p, prefix=wan_prefix)
+        _wf = build_wan_workflow(ref_name, motion_name, _p, prefix=wan_prefix)
+        if _swap_engine == "wananimate":
+            _wf = _apply_swap_to_wan_workflow(_wf, _p)
+        return _wf
+    if _swap_engine == "scail2" and _F > 81:
+        api_log(job_id, f"scail2: 1 segment tối đa 81 frame (extend chaining làm sau) → cắt {_F}→81f", "warn")
+        _F = 81; params["frames"] = 81
+        params["_target_output_sec"] = min(float(params.get("_target_output_sec") or 0) or (81.0 / rfps), 81.0 / rfps)
+        window_plan = _wan_window_plan(params, _F); est_windows = 1
+    workflow = _build_motion_workflow(params)
     try:
         pid = comfy_submit(workflow)
     except Exception as _submit_error:
@@ -4381,7 +4962,7 @@ def run_motion(job):
             # faceCropMode=dwpose → _vitpose_face=False → _pose_retarget cũng tự tắt (pose về DWPose node 20).
             params = {**params, "faceCropMode": "dwpose", "face_crop_mode": "dwpose",
                       "poseRetarget": "0", "pose_retarget": "0"}
-            pid = comfy_submit(build_wan_workflow(ref_name, motion_name, params, prefix=wan_prefix))
+            pid = comfy_submit(_build_motion_workflow(params))
         else:
             _context_incompatible = any(x in _msg for x in ("WanVideoContextOptions", "WANVIDCONTEXT", "context_options"))
             if not window_plan["anchored"] or not _context_incompatible:
@@ -4389,9 +4970,7 @@ def run_motion(job):
             api_log(job_id, f"Wan wrapper chưa hỗ trợ anchored-context; fallback autoregressive: {_msg[:240]}", "warn")
             params = {**params, "window_mode": "autoregressive", "windowMode": "autoregressive"}
             window_plan = _wan_window_plan(params, _F)
-            pid = comfy_submit(build_wan_workflow(
-                ref_name, motion_name, params, prefix=wan_prefix
-            ))
+            pid = comfy_submit(_build_motion_workflow(params))
     outputs = comfy_poll(pid, job_id, deadline_sec=1800,
                          prog_lo=0.25, prog_hi=0.9, prog_step="Wan 2.2 Animate",
                          windows=1 if window_plan["anchored"] else est_windows,
@@ -4575,13 +5154,55 @@ def run_motion(job):
             api_log(job_id, f"{_fps_target}fps lỗi (giữ bản gốc fps): {e}", "warn")
 
     # ALD 27/07 - Cân màu chống ngả tông TRƯỚC ESRGAN: sửa cast trên master gốc để pass làm nét không khuếch đại nó
-    out_mp4 = _apply_motion_drift_fix(out_mp4, ref_local, tmp, params, job_id)
+    if not _swap_engine:
+        # drift-fix grade màu THEO ẢNH REF — đúng cho motion (background từ ảnh), SAI cho swap
+        # (background từ video): sẽ kéo tông video về tông ảnh mẫu.
+        out_mp4 = _apply_motion_drift_fix(out_mp4, ref_local, tmp, params, job_id)
     out_mp4 = _apply_motion_detail_upscale(out_mp4, tmp, params, job_id)  # ALD 17/07 - ESRGAN làm nét TRƯỚC delivery (trị lớp blur)
     api_progress(job_id, 0.94, "chuẩn hoá đầu ra phát hành")
     out_mp4, _delivery_applied = _apply_motion_delivery(out_mp4, tmp, params, job_id)
     api_progress(job_id, 0.98, "upload output")
     _output_label = _motion_delivery_label(params, _delivery_applied)
     api_upload_output(job_id, out_mp4, label=_output_label)  # API tự set status=done + Storage dùng label làm tên
+
+
+def run_character_swap(job):
+    """Thay nhân vật trong video bằng người mẫu từ ảnh — GIỮ background + camera CỦA VIDEO.
+
+    Ngược với motion (background từ ảnh ref). Tái dùng run_motion cho toàn bộ driver-processing;
+    rẽ nhánh build workflow theo params['_swapEngine'] (hook trong run_motion).
+    Spec: docs/superpowers/specs/2026-08-21-character-swap-design.md
+    """
+    inputs = job.get("inputs") or {}
+    params = job.get("params") or {}
+    # API/batch gửi field 'video' (video nguồn cần thay người); run_motion đọc inputs['motion']
+    if inputs.get("video") and not inputs.get("motion"):
+        inputs["motion"] = inputs["video"]
+    if not (inputs.get("ref") or inputs.get("image")) or not inputs.get("motion"):
+        raise RuntimeError("character-swap cần inputs.ref (ảnh người mẫu) + inputs.video (video nguồn)")
+    engine = str(params.get("engine") or "wananimate").strip().lower()
+    if engine not in ("wananimate", "scail2"):
+        raise RuntimeError(f"character-swap: engine không hỗ trợ: {engine!r} (chọn wananimate | scail2)")
+    params["_swapEngine"] = engine
+    params.setdefault("preset", "drv-5s")            # fps/frame/tỉ lệ theo driver 1:1 như motion
+    # ALD 21/08/2026 - Áp dụng CHUNG cho cả 2 engine: khóa "vóc dáng theo ref" của Motion Transfer mặc định
+    # BẬT sẽ ép pose_strength xuống 0.7 trong _normalize_motion_params, sai bộ số cả wananimate lẫn scail2
+    # (scail2 không dùng clip_strength nên tắt khóa vô hại).
+    params.setdefault("bodyProportionLock", "0")
+    if engine == "wananimate":
+        # Bộ số theo example WanAnimate replacement của kijai (KHÁC tuning animation-mode của motion:
+        # 0.7/0.8 bên đó trị "driver cấp vóc dáng" — swap thì người trong video là khung sẵn).
+        params.setdefault("lora_relight", 1.0)       # relight LoRA sinh ra riêng cho Mix mode
+        params.setdefault("pose_strength", 1.0)
+        params.setdefault("face_strength", 1.0)
+        # ALD 21/08/2026 - Replacement mode không hỗ trợ pose-retarget; chặn cả env MOTION_POSE_RETARGET=1 sót lại.
+        params.setdefault("poseRetarget", "0")
+    else:
+        params.setdefault("steps", 6)                # turbo scail2 (template chính thức)
+    job["inputs"] = inputs
+    job["params"] = params
+    return run_motion(job)
+
 
 # ALD 01/06/2026 - Vision auto-detect loại đồ từ ẢNH SẢN PHẨM (khi user để 'auto').
 # Gọi Ollama vision (OLLAMA_URL + VISION_MODEL), trả 1 trong 10 loại. FAIL-SAFE: trả None khi
@@ -9910,6 +10531,7 @@ PIPELINES = {
     "story-film": run_story_film,  # KỊCH BẢN → AI director tách cảnh/nhân vật/thoại → phim nhân vật (lip-sync) ghép sẵn
     "subtitle": run_subtitle,  # ALD 15/06/2026 - 1 video → ASR (OmniVoice /asr) + dịch (Ollama) → CHÁY phụ đề (hardsub), giữ tiếng gốc
     "enhance": run_enhance,  # ALD 28/06/2026 - upscale video hậu Wan bằng ffmpeg lanczos → 1080p/2K (RAM phẳng, bỏ 4K) + RIFE fps tùy chọn
+    "character-swap": run_character_swap,  # ALD 21/08/2026 - thay nhân vật trong video bằng người mẫu từ ảnh (giữ background VIDEO); engine wananimate (Mix) | scail2
 }
 
 def _startup():

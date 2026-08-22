@@ -83,6 +83,145 @@
       ]
     }
   },
+  "character-swap": {
+    "extra": {
+      "distillLora": {
+        "line": 1806,
+        "why": "build_scail2_swap_workflow:1806 — strength_model của LoRA lightx2v distill rank64 (chỉ engine scail2), đọc qua _motion_float()."
+      },
+      "dpoLora": {
+        "line": 1803,
+        "why": "build_scail2_swap_workflow:1803 — strength_model của LoRA DPO (chỉ engine scail2), đọc qua _motion_float()."
+      },
+      "driverDurSec": {
+        "line": 329,
+        "why": "_cut_motion_driver_segment:329 — cùng lý do driverStartSec; cũng bị kẹp về đúng thời lượng preset ở đây nếu vượt (log 'cắt theo preset')."
+      },
+      "driverStartSec": {
+        "line": 325,
+        "why": "_cut_motion_driver_segment:325 — không phải hàm run_*, AST của batch_params.py chỉ quét thân run_<type> nên không thấy; dùng để cắt driver theo giây khi character-swap ghép nhiều segment."
+      },
+      "face_strength": {
+        "line": 1634,
+        "why": "build_wan_workflow:1634 — WanVideoAnimateEmbeds.face_strength (chỉ engine wananimate, scail2 không có khái niệm này)."
+      },
+      "fitDriver": {
+        "line": 4463,
+        "why": "run_motion:4463 — FIT DRIVER. Với swap thì BẬT mặc định (khung theo tỉ lệ thật của driver, vì swap giữ nguyên video nguồn); truyền 0 để ép về khung 9:16 của preset như Motion."
+      },
+      "lora_relight": {
+        "line": 1594,
+        "why": "build_wan_workflow:1594 — strength_0 của WanAnimate_relight_lora (engine wananimate); run_character_swap chỉ setdefault=1.0, không .get() nên AST không thấy."
+      },
+      "maskBlockify": {
+        "line": 1757,
+        "why": "_apply_swap_to_wan_workflow:1757 — BlockifyMask.block_size, đọc qua _motion_int(). Mặc định 16 (đo 21/08: 32 nới mask quá rộng → Wan bịa vật thể vào tay)."
+      },
+      "maskGrow": {
+        "line": 1742,
+        "why": "_apply_swap_to_wan_workflow:1742 — GrowMaskWithBlur.expand (nới mask trước Blockify), đọc qua _motion_int()."
+      },
+      "maskIndices": {
+        "line": 1739,
+        "why": "_apply_swap_to_wan_workflow:1739 (SAM3_TrackToMask.object_indices) và build_scail2_swap_workflow:1795 (SCAIL2ColoredMask.object_indices) — rỗng = union mọi người, '0' = chỉ người đầu."
+      },
+      "negative_prompt": {
+        "line": 1770,
+        "why": "build_scail2_swap_workflow:1770 — CLIPTextEncode âm cho SCAIL-2 (chỉ engine scail2)."
+      },
+      "pose_strength": {
+        "line": 1822,
+        "why": "WanVideoAnimateEmbeds.pose_strength (build_wan_workflow:1512) và WanSCAILToVideo.pose_strength (build_scail2_swap_workflow:1822) — run_character_swap chỉ setdefault, các builder mới thật sự .get()."
+      },
+      "positive_prompt": {
+        "line": 1768,
+        "why": "build_scail2_swap_workflow:1768 — CLIPTextEncode dương cho SCAIL-2 (chỉ engine scail2; wananimate dùng prompt cố định của Motion Transfer)."
+      },
+      "preset": {
+        "line": 2084,
+        "why": "_normalize_motion_params:2084 đọc preset để tra MOTION_PRESETS (fps/frame/resolution); run_character_swap:4753 chỉ setdefault('preset','drv-5s'), không .get() nên AST không thấy cho job type character-swap."
+      },
+      "prompt": {
+        "line": 1768,
+        "why": "build_scail2_swap_workflow:1768 — fallback của positive_prompt cho WanSCAILToVideo (chỉ engine scail2)."
+      },
+      "refEnhance": {
+        "line": 1849,
+        "why": "_ref_enh_mode:1849 — làm nét ảnh ref sau khi cắt. off | restore (mặc định: ESRGAN+CodeFormer CỤC BỘ, phục hồi chứ không vẽ lại, ảnh không rời máy) | gen (Gemini → Qwen cục bộ, nét nhất nhưng rủi ro đổi danh tính cao nhất)."
+      },
+      "refEnhanceDenoise": {
+        "line": 1878,
+        "why": "_ref_enh_qwen:1878 — denoise của Qwen-Image-Edit cục bộ ở tầng gen. Thấp = tinh chỉnh, cao = vẽ lại (đổi mặt). Mặc định 0.35."
+      },
+      "refEnhanceModel": {
+        "line": 1864,
+        "why": "_ref_enh_gemini:1864 — GHIM model Gemini tường minh. Mặc định GEMINI_IMAGE_MODEL; đừng tin map geminiModel của run_create_image/run_edit_image, nó còn trỏ id '-preview' Google khai tử 25/06."
+      },
+      "refFaceFidelity": {
+        "line": 1890,
+        "why": "_ref_enh_restore:1890 — CodeFormer fidelity. Càng THẤP càng bám ảnh gốc. Mặc định 0.5."
+      },
+      "refFrameHeadPrompt": {
+        "line": 1773,
+        "why": "build_swap_headprobe_workflow:1773 — prompt SAM3 tìm cái đầu trong graph thăm dò. Mặc định 'head'; đổi sang 'face' nếu SAM3 bắt hụt."
+      },
+      "refFrameMatch": {
+        "line": 1845,
+        "why": "_match_ref_framing_to_driver:1845 — cắt ảnh ref cho khung hình khớp driver (neo bằng cái đầu). Mặc định BẬT; 0 = giữ ref nguyên bản. Trị lỗi ref toàn thân + driver cận mặt ra giải phẫu bịa (đo 22/08, dandong5)."
+      },
+      "refFrameMaxUpscale": {
+        "line": 1869,
+        "why": "_match_ref_framing_to_driver:1869 — trần hệ số phóng ref. Vượt trần thì BÁO LỖI job thay vì đốt GPU cho kết quả chắc chắn hỏng. Mặc định 4.0."
+      },
+      "sam3DetectInterval": {
+        "line": 1735,
+        "why": "_apply_swap_to_wan_workflow:1735 — SAM3_VideoTrack.detect_interval, đọc qua _motion_int() (scail2 cố định 1)."
+      },
+      "sam3ImagePrompt": {
+        "line": 1767,
+        "why": "build_scail2_swap_workflow:1767 — text prompt SAM3 segment người trong ẢNH ref (fallback sam3Prompt rồi 'human')."
+      },
+      "sam3MaxObjects": {
+        "line": 1734,
+        "why": "SAM3_VideoTrack.max_objects, đọc ở cả _apply_swap_to_wan_workflow:1734 và build_scail2_swap_workflow:1788 qua _motion_int()."
+      },
+      "sam3Prompt": {
+        "line": 1727,
+        "why": "run_character_swap chỉ setdefault 'engine'/'preset'/'bodyProportionLock'/... — sam3Prompt được _apply_swap_to_wan_workflow (wananimate) và build_scail2_swap_workflow (fallback chung, cả 2 engine) đọc trực tiếp qua p.get(), không phải run_* nên AST của batch_params.py mù."
+      },
+      "sam3Threshold": {
+        "line": 1733,
+        "why": "SAM3_VideoTrack.detection_threshold, đọc ở cả _apply_swap_to_wan_workflow:1733 và build_scail2_swap_workflow:1787 qua _motion_float()."
+      },
+      "sam3VideoPrompt": {
+        "line": 1766,
+        "why": "build_scail2_swap_workflow:1766 — text prompt SAM3 track người trong VIDEO driver (fallback sam3Prompt rồi 'human')."
+      },
+      "seed": {
+        "line": 1833,
+        "why": "build_scail2_swap_workflow:1833 — SamplerCustom.noise_seed (chỉ engine scail2; wananimate seed cố định 42 trong build_wan_workflow)."
+      },
+      "steps": {
+        "line": 1830,
+        "why": "build_scail2_swap_workflow:1830 (BasicScheduler.steps) — run_character_swap:4767 chỉ setdefault=6 (turbo), không .get(); _normalize_motion_params:2097 cố ý KHÔNG ép về MOTION_FAST_STEPS cho scail2 (xem #1 review 21/08/2026)."
+      },
+      "swapNegativeExtra": {
+        "line": 1769,
+        "why": "_apply_swap_to_wan_workflow:1769 — cụm negative CHỈ của swap, nối thêm vào negative gốc để chặn bịa vật thể. Chuỗi rỗng = TẮT (khi cần mẫu cầm sản phẩm thật)."
+      },
+      "swapPositiveExtra": {
+        "line": 2150,
+        "why": "_apply_swap_to_wan_workflow:2150 — cụm positive neo cảnh riêng cho swap ('một người, tay không, không có gì che thân'). Nối thêm vào prompt gốc; rỗng = tắt."
+      }
+    },
+    "api": {},
+    "allowed": {
+      "engine": [
+        "wananimate",
+        "scail2"
+      ]
+    }
+  },
   "enhance": {
     "api": {},
     "extra": {

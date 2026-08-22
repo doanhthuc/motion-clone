@@ -46,7 +46,7 @@ FEATURE_TITLE="Đầy đủ (mọi job type · Wan · Qwen · Flux · LTX)"
 # claim", tệ hơn. Máy ≥90GB thì thêm tay: nối ',wan-dancer' vào JOB_TYPES trong .env rồi
 #   pm2 restart ecosystem.config.cjs --only worker --update-env   (thiếu --update-env thì PM2
 #   giữ env cũ và .env mới không có tác dụng — xem setup-pm2.sh:850).
-JOB_TYPE="motion,bds,tryon,create-image,edit-image,product-overlay,teaser,video,text-to-video,wan-i2v,teen-flycam,trend-tiktok,ss,talk,face-motion,concat,reveal,voiceover,story-film,subtitle,enhance"
+JOB_TYPE="motion,bds,tryon,create-image,edit-image,product-overlay,teaser,video,text-to-video,wan-i2v,teen-flycam,trend-tiktok,ss,talk,face-motion,concat,reveal,voiceover,story-film,subtitle,enhance,character-swap"
 
 CATALOG_FILE="$ROOT/comfyui/catalog.json"
 # In ra trong hướng dẫn cuối phần cài. Không phải allow-list (catalog.json mới là) — chỉ là câu

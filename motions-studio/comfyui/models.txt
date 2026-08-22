@@ -76,6 +76,18 @@ checkpoints      | flux1-schnell-fp8.safetensors                            | ht
 # unet | LTX-2.3-22B-dev-Q6_K.gguf           | https://huggingface.co/QuantStack/LTX-2.3-GGUF/resolve/main/LTX-2.3-dev/LTX-2.3-22B-dev-Q6_K.gguf
 # (bf16 official, CHỈ nếu có >46GB VRAM/offload: https://huggingface.co/Lightricks/LTX-2.3 → ltx-2.3-22b-{dev,distilled-1.1}.safetensors → checkpoints/LTX-Video)
 
+# --- Character-swap (thay nhân vật trong video) — ALD 21/08/2026 ---
+# SAM3 (segmentation người, dùng CHUNG cho cả 2 engine wananimate + scail2; node core nodes_sam3.py).
+# SCAIL-2 fp8_scaled 17.7GB (fp16 32.8GB KHÔNG vừa 5090 32GB). URL verify qua HF API 21/08/2026.
+checkpoints      | sam3.1_multiplex_fp16.safetensors                              | https://huggingface.co/Comfy-Org/sam3.1/resolve/main/checkpoints/sam3.1_multiplex_fp16.safetensors
+diffusion_models | wan2.1_14B_SCAIL_2_fp8_scaled.safetensors                      | https://huggingface.co/Comfy-Org/SCAIL-2/resolve/main/diffusion_models/wan2.1_14B_SCAIL_2_fp8_scaled.safetensors
+# SCAIL-2 fp16 32.8GB: CHỦ Ý để comment — entrypoint tải MỌI dòng sống, mà bản này chỉ dành A/B trên GPU ≥48GB.
+# Tải khi cần: ./setup/preload-models.sh --id swap-scail2-unet-fp16 (catalog-motion-transfer.json), rồi set SCAIL2_UNET.
+# diffusion_models | wan2.1_14B_SCAIL_2_fp16.safetensors                           | https://huggingface.co/Comfy-Org/SCAIL-2/resolve/main/diffusion_models/wan2.1_14B_SCAIL_2_fp16.safetensors
+text_encoders    | umt5_xxl_fp8_e4m3fn_scaled.safetensors                         | https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors
+loras            | lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors | https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Lightx2v/lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors
+loras            | wan2.1_SCAIL_2_DPO_lora_bf16.safetensors                       | https://huggingface.co/Comfy-Org/SCAIL-2/resolve/main/loras/wan2.1_SCAIL_2_DPO_lora_bf16.safetensors
+
 # ════════════════════════════════════════════════════════════════════════════
 # --- node "SS" (Ảnh→Video / Text→Video, LTX-2.3 22B + LoRA custom) — ALD 14/06/2026, TỐI ƯU DISK ---
 # ĐÃ VERIFY render thật trên prod (I2V + T2V + 30s chia-đoạn). Tải 3 file rồi setup TỰ XỬ LÝ → đĩa cuối ~38GB
