@@ -300,8 +300,12 @@ class HeadProbeWorkflowTests(unittest.TestCase):
         self.assertEqual(wf["40"]["inputs"]["conditioning"], ["26", 0])
         self.assertEqual(wf["43"]["inputs"]["filename_prefix"], "pb-per")
 
-    def test_prompt_dau_doi_duoc(self):
-        self.assertEqual(self._wf(p={"refFrameHeadPrompt": "face"})["21"]["inputs"]["text"], "face")
+    def test_mac_dinh_do_bang_FACE_khong_phai_head(self):
+        """Đo thật 22/08: prompt 'head' trả về đầu CỘNG TOÀN BỘ TÓC, và ở driver bbox chạm mép khung
+        (544, 960) nên phép đo tự bão hoà — nó đo khung còn lại bao nhiêu chứ không đo cái đầu.
+        'face' cho cửa sổ chứa 3.58 chiều-cao-mặt, đúng bằng driver; 'head' cho 3.97."""
+        self.assertEqual(self._wf()["21"]["inputs"]["text"], "face")
+        self.assertEqual(self._wf(p={"refFrameHeadPrompt": "head"})["21"]["inputs"]["text"], "head")
 
 
 class MatchRefFramingFailSafeTests(unittest.TestCase):

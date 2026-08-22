@@ -1774,7 +1774,11 @@ def build_swap_headprobe_workflow(ref_name, motion_name, W, H, p=None, stride=1,
     thêm phụ thuộc node mới nào. Driver nạp đúng khung render → bbox đã ở hệ toạ độ đích.
     """
     p = p or {}
-    prompt = str(p.get("refFrameHeadPrompt") or p.get("ref_frame_head_prompt") or "head").strip() or "head"
+    # ALD 22/08/2026 - MẶC ĐỊNH 'face', KHÔNG phải 'head'. Đo thật trên pod: 'head' trả về đầu CỘNG
+    # TOÀN BỘ TÓC, mà ở driver bbox chạm mép khung (544, 960) nên phép đo tự bão hoà — nó đo khung
+    # còn lại bao nhiêu chứ không đo cái đầu. 'face' cho cửa sổ chứa 3.58 chiều-cao-mặt, đúng bằng
+    # driver (lề trên 0.84 / dưới 1.74 cũng trùng); 'head' cho 3.97.
+    prompt = str(p.get("refFrameHeadPrompt") or p.get("ref_frame_head_prompt") or "face").strip() or "face"
     thr = _motion_float(p, "sam3Threshold", "sam3_threshold", default=0.5)
 
     def _sam3(images_ref, cond="21", max_objects=1):
