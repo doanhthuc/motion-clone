@@ -2269,8 +2269,14 @@ def _normalize_motion_params(p):
     if str(p.get("preset") or "").startswith("drv-"):
         p.pop("width", None)
         p.pop("height", None)
-        p["fitDriver"] = False
-        p["fit_driver"] = False
+        # ALD 22/08/2026 - TRỪ character-swap. Chính sách quality-v1 ở trên đúng cho Motion: user chọn
+        # tỉ lệ khung trên UI nên khung KHÔNG được chạy theo driver. Swap thì ngược hẳn — nó giữ nguyên
+        # background + camera của video nguồn, ép về 9:16 mặc định là kéo dãn chính cái video phải giữ.
+        # Đo thật trên pod 22/08: driver 3:4 (576×768) ra 544×960, mặt hẹp và dài ra. Ai vẫn muốn ép
+        # khung thì truyền fitDriver=0 — nhánh này không đụng vào giá trị người dùng gửi.
+        if not p.get("_swapEngine"):
+            p["fitDriver"] = False
+            p["fit_driver"] = False
         p["quality"] = "720p" if str(p.get("quality") or "").strip().lower() == "720p" else "540p"
         p["resolutionPolicy"] = "quality-v1"
         p["resolution_policy"] = "quality-v1"

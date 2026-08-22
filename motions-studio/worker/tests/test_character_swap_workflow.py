@@ -195,6 +195,27 @@ class NormalizePathIntegrationTests(unittest.TestCase):
         self.assertEqual(wf["81"]["inputs"]["steps"], 6)               # BasicScheduler
         self.assertEqual(wf["70"]["inputs"]["pose_strength"], 1.0)     # WanSCAILToVideo
 
+    def test_swap_giu_fit_driver_du_dung_preset_drv(self):
+        """Đo thật 22/08 trên pod: driver 3:4 (576×768) ra 544×960 — bị KÉO DÃN. Vì preset drv-*
+        tắt thẳng fitDriver rồi lấy khung theo aspectRatio mặc định 9:16. Đúng cho Motion (user tự
+        chọn tỉ lệ trên UI), SAI cho swap: cả tính năng là giữ nguyên video nguồn."""
+        for engine in ("wananimate", "scail2"):
+            p = self._normalized_params(engine)
+            self.assertNotEqual(p.get("fitDriver"), False, engine)
+            self.assertNotEqual(p.get("fit_driver"), False, engine)
+
+    def test_motion_thuong_van_tat_fit_driver(self):
+        # Chính sách quality-v1 của Motion KHÔNG đổi — guard chỉ mở cho swap.
+        p = linux._normalize_motion_params({"preset": "drv-5s"})
+        self.assertIs(p["fitDriver"], False)
+        self.assertIs(p["fit_driver"], False)
+
+    def test_swap_van_tat_fit_driver_duoc_bang_tay(self):
+        # Ai muốn ép khung 9:16 từ driver 3:4 vẫn làm được — guard không cướp quyền đó.
+        p = linux._normalize_motion_params({"preset": "drv-5s", "_swapEngine": "wananimate",
+                                            "fitDriver": False})
+        self.assertIs(p["fitDriver"], False)
+
     def test_wananimate_giu_relight_pose_face_1(self):
         p = self._normalized_params("wananimate")
         wf = _apply_swap_to_wan_workflow(build_wan_workflow("ref.png", "drv.mp4", p), p)
