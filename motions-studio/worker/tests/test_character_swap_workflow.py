@@ -79,6 +79,13 @@ class ApplySwapToWanWorkflowTests(unittest.TestCase):
         self.assertNotIn("bouquet", neg_off)
         self.assertIn("过曝", neg_off)
 
+    def test_seed_doi_duoc_va_mac_dinh_van_42(self):
+        # Phát hiện 22/08 khi định chạy A/B nhiều seed: WanVideoSampler gắn CỨNG seed 42, nên param
+        # 'seed' — vốn đã khai trong batch-params cho character-swap — xưa nay là no-op. Không đổi
+        # được seed thì không chạy lại được khi Wan bịa vật thể, và không đo được nhiễu chạy-tới-chạy.
+        self.assertEqual(self._wf()["90"]["inputs"]["seed"], 42)
+        self.assertEqual(self._wf({"seed": 12345})["90"]["inputs"]["seed"], 12345)
+
     def test_khong_dung_vao_graph_motion_goc(self):
         params = {"width": 544, "height": 960, "frames": 81, "steps": 4}
         wf = build_wan_workflow("ref.png", "drv.mp4", params)

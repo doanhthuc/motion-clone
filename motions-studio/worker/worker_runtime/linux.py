@@ -1634,7 +1634,11 @@ def build_wan_workflow(ref_name, motion_name, p, prefix="motion-out"):
             "face_strength": _motion_float(p, "face_strength", "faceStrength", default=0.7), "clip_embeds": ["71", 0],
             "ref_images": ["11", 0], "pose_images": pose_src, "face_images": face_images_ref}},  # pose_src = DWPose thô (node 20)
         "90": {"class_type": "WanVideoSampler", "inputs": {
-            "model": ["42", 0], "image_embeds": ["81", 0], "steps": S, "cfg": cfg, "shift": shift, "seed": 42,
+            # ALD 22/08/2026 - seed ĐỌC ĐƯỢC (trước gắn cứng 42). batch-params đã khai 'seed' cho
+            # character-swap từ đầu nên nó vốn là lời hứa suông. Mặc định vẫn 42 → motion không đổi
+            # hành vi. Cần cho hai việc: chạy lại khi Wan bịa vật thể, và đo nhiễu chạy-tới-chạy.
+            "model": ["42", 0], "image_embeds": ["81", 0], "steps": S, "cfg": cfg, "shift": shift,
+            "seed": _motion_int(p, "seed", default=42),
             "force_offload": True, "scheduler": scheduler, "riflex_freq_index": 0,
             "text_embeds": ["60", 0], "rope_function": "comfy"}},
         # ALD 26/06/2026 - Tăng tile 272→400 + stride rộng hơn: ít tile hơn (3×4 thay 5×9 @ 720p), overlap giảm
