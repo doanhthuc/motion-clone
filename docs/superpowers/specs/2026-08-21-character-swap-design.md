@@ -78,7 +78,7 @@ Params (`params` jsonb, camelCase, đọc qua `_motion_*` helpers dùng chung):
 | Mức | Làm gì | Ảnh rời máy? | Rủi ro danh tính |
 |---|---|---|---|
 | `off` | chỉ crop | không | không |
-| `restore` *(mặc định)* | `build_image_upscale_workflow` — ESRGAN ×4 (+ CodeFormer nếu có node) | không | thấp — phục hồi, không sáng tác |
+| `restore` *(mặc định)* | **FlashVSR** (`build_flashvsr_image_workflow`), tụt về ESRGAN ×4 nếu thiếu node | không | thấp — phục hồi, không sáng tác |
 | `gen` | Gemini → **lỗi thì Qwen-Image-Edit cục bộ** → lỗi nữa thì `restore` → cuối cùng crop trần | có, ở tầng Gemini | cao nhất |
 
 **Chỉ chạy khi thật sự phóng lên**: crop ≥ khung render (trường hợp `s<1`) thì bỏ qua, không có gì để phục hồi.
@@ -87,7 +87,9 @@ Params (`params` jsonb, camelCase, đọc qua `_motion_*` helpers dùng chung):
 
 **Ghim model Gemini tường minh.** Map `geminiModel` của `run_create_image:5780` và `run_edit_image:6017` còn trỏ id `-preview` mà Google khai tử 25/06/2026, và `docker-compose.yml:299` còn tái lập id đó đè lên default đã sửa. `_ref_enh_gemini` không đọc map đó.
 
-**Đã biết trước khi chạy:** custom node `FaceRestoreCFWithModel` **không được cài** trong deployment này (không có trong Dockerfile, setup script hay catalog), nên `restore` thực tế là ESRGAN ×4 trần. Node thiếu → log warn rồi chạy tiếp không có face-restore. Muốn có CodeFormer thật thì phải thêm custom node vào image (build lại qua CI) + khai model vào catalog.
+**Vì sao FlashVSR chứ không phải CodeFormer.** Custom node `FaceRestoreCFWithModel` **không được cài** trong deployment này (không có trong Dockerfile, setup script hay catalog) — nhánh face-restore của `_run_enhance_image` xưa nay là code chết trên pod. Thêm nó vào **không đắt** (một dòng ghim sha trong `Dockerfile.selfhosted:56` nhánh `full`, sửa số đếm trong `check-comfy-nodes.mjs`, khai CodeFormer vào catalog, build lại CI, nâng `POD_IMAGE`) nhưng **có rủi ro thật**: `facerestore_cf` là pack cũ (facexlib) đặt lên image torch/cu130 rất mới, mà ComfyUI chỉ log WARNING khi một pack không nạp được — chính `Dockerfile.selfhosted:76` đang mang shim kornia vì đúng nhóm sự cố đó với LTXVideo. Image là thứ MỌI job phụ thuộc, không đáng đánh đổi khi chưa có bằng chứng cần.
+
+**FlashVSR thì đã có sẵn**: ghim trong image cho cả hai profile, model 8.7GB đã nằm trên volume (kiểm tận nơi 22/08), là model phục hồi thật nên tốt hơn hẳn ESRGAN trên khuôn mặt, và vẫn *phục hồi* chứ không *vẽ lại* nên rủi ro danh tính thấp. **Không phải đổi gì ở deployment.** Nếu A/B cho thấy FlashVSR vẫn không đủ với mặt, lúc đó mới thêm `facerestore_cf` — và thử bằng cách clone thẳng vào `custom_nodes` trên pod rồi restart ComfyUI trước, chứ đừng nướng vào image khi chưa biết nó có nạp nổi không.
 
 **Fail-safe:** mọi tầng hỏng → crop trần. Tầng làm nét không bao giờ được phép làm chết job.
 

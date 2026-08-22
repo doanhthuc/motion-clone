@@ -1879,14 +1879,45 @@ def _ref_enh_qwen(job_id, crop_path, W, H, p, tmp):
     return comfy_fetch_output(comfy_poll(comfy_submit(wf), job_id, deadline_sec=600), exts=IMG_EXTS)
 
 
-def _ref_enh_restore(job_id, crop_path, p, tmp):
-    """ESRGAN ×4 + CodeFormer — PHỤC HỒI, không sáng tác. Rủi ro đổi danh tính thấp nhất trong ba
-    tầng, nên là mặc định. faceFidelity càng thấp càng bám ảnh gốc."""
+def build_flashvsr_image_workflow(image_name, scale, resize_factor, prefix="ref-fv"):
+    """FlashVSR trên MỘT ẢNH TĨNH.
+
+    `FlashVSRNodeAdv.frames` nhận IMAGE batch nên `LoadImage` một ảnh chạy được. Dùng lại
+    build_flashvsr_upscale_workflow để mode/precision/attention/tile chỉ có MỘT nguồn sự thật,
+    chỉ thay đầu vào (VHS_LoadVideo → LoadImage) và đầu ra (VHS_VideoCombine → SaveImage) — bản
+    video còn lấy audio từ ["10",2], slot mà LoadImage không có.
+    """
+    wf = build_flashvsr_upscale_workflow("__unused__.mp4", scale, resize_factor, 1, prefix=prefix)
+    wf["10"] = {"class_type": "LoadImage", "inputs": {"image": image_name}}
+    wf.pop("110", None)
+    wf["120"] = {"class_type": "SaveImage", "inputs": {"images": ["30", 0], "filename_prefix": prefix}}
+    return wf
+
+
+def _ref_enh_restore(job_id, crop_path, W, p, tmp):
+    """PHỤC HỒI chi tiết, không sáng tác — rủi ro đổi danh tính thấp nhất, nên là mặc định.
+
+    Ưu tiên FlashVSR: model phục hồi thật, đã ghim sẵn trong image và model 8.7GB đã nằm trên
+    volume, nên KHÔNG phải đổi gì ở deployment. Không có node thì tụt về ESRGAN ×4 — chỉ làm sắc
+    cạnh, không phục hồi được chi tiết mặt, nhưng còn hơn không.
+    """
+    name = comfy_upload(crop_path)
+    if _comfy_has_node("FlashVSRNodeAdv"):
+        try:
+            from PIL import Image
+            with Image.open(crop_path) as im:
+                cw = im.width
+        except Exception:
+            cw = int(W)
+        scale = int(os.environ.get("MOTION_FLASHVSR_SCALE", "4"))
+        rf = min(1.0, max(0.1, round(max(1.0, int(W) / max(1, cw)) / max(1, scale), 1)))
+        wf = build_flashvsr_image_workflow(name, scale, rf, prefix=f"ref-enh-{job_id[:8]}")
+        return comfy_fetch_output(comfy_poll(comfy_submit(wf), job_id, deadline_sec=900), exts=IMG_EXTS)
     _face = _comfy_has_node("FaceRestoreCFWithModel")
-    if not _face:
-        api_log(job_id, "làm nét ref: thiếu FaceRestoreCFWithModel → chỉ ESRGAN, không phục hồi mặt", "warn")
+    api_log(job_id, f"làm nét ref: thiếu FlashVSRNodeAdv → ESRGAN ×4"
+                    f"{'' if _face else ' (cũng không có FaceRestoreCFWithModel: không phục hồi mặt)'}", "warn")
     wf = build_image_upscale_workflow(
-        comfy_upload(crop_path), prefix=f"ref-enh-{job_id[:8]}", face_restore=_face,
+        name, prefix=f"ref-enh-{job_id[:8]}", face_restore=_face,
         face_fidelity=_motion_float(p, "refFaceFidelity", "ref_face_fidelity", default=0.5))
     return comfy_fetch_output(comfy_poll(comfy_submit(wf), job_id, deadline_sec=900), exts=IMG_EXTS)
 
@@ -1938,7 +1969,7 @@ def _enhance_ref_crop(job_id, crop_path, W, H, p, tmp):
                 api_log(job_id, f"làm nét ref: Qwen lỗi → phục hồi cục bộ: {e}", "warn")
     if not out:
         try:
-            out = _ref_enh_restore(job_id, crop_path, p, tmp)
+            out = _ref_enh_restore(job_id, crop_path, W, p, tmp)
         except Exception as e:
             api_log(job_id, f"làm nét ref: phục hồi lỗi → dùng crop trần: {e}", "warn")
     if not out:

@@ -374,6 +374,43 @@ class EnhanceRefCropTests(unittest.TestCase):
              patch.object(linux, "_ref_enh_restore", side_effect=RuntimeError("z")):
             self.assertEqual(self._run({"refEnhance": "gen"}), self.crop)
 
+    def test_flashvsr_anh_tinh_thay_dung_dau_vao_dau_ra(self):
+        # build_flashvsr_upscale_workflow kết thúc bằng VHS_VideoCombine và lấy audio ["10",2] —
+        # không dùng thẳng cho ảnh tĩnh được. Builder mỏng chỉ thay đầu vào/đầu ra, GIỮ node 20/30
+        # để mode/precision/attention/tile vẫn một nguồn sự thật.
+        wf = linux.build_flashvsr_image_workflow("crop.png", 4, 0.3, prefix="rf")
+        self.assertEqual(wf["10"]["class_type"], "LoadImage")
+        self.assertEqual(wf["10"]["inputs"]["image"], "crop.png")
+        self.assertEqual(wf["30"]["inputs"]["frames"], ["10", 0])       # IMAGE batch một ảnh
+        self.assertEqual(wf["30"]["class_type"], "FlashVSRNodeAdv")
+        self.assertNotIn("110", wf)                                      # hết VHS_VideoCombine
+        self.assertEqual(wf["120"]["class_type"], "SaveImage")
+        self.assertEqual(wf["120"]["inputs"]["images"], ["30", 0])
+
+    def test_restore_uu_tien_flashvsr_co_san_hon_esrgan(self):
+        with patch.object(linux, "_comfy_has_node", side_effect=lambda n: n == "FlashVSRNodeAdv"), \
+             patch.object(linux, "comfy_upload", return_value="c.png"), \
+             patch.object(linux, "comfy_submit", return_value="pid"), \
+             patch.object(linux, "comfy_poll", return_value={}), \
+             patch.object(linux, "comfy_fetch_output", return_value="/tmp/o.png"), \
+             patch.object(linux, "build_flashvsr_image_workflow", return_value={}) as fv, \
+             patch.object(linux, "build_image_upscale_workflow") as es:
+            linux._ref_enh_restore("j", self.crop, self.W, {}, self.tmp)
+        fv.assert_called_once()
+        es.assert_not_called()
+
+    def test_thieu_flashvsr_thi_tut_ve_esrgan(self):
+        with patch.object(linux, "_comfy_has_node", return_value=False), \
+             patch.object(linux, "comfy_upload", return_value="c.png"), \
+             patch.object(linux, "comfy_submit", return_value="pid"), \
+             patch.object(linux, "comfy_poll", return_value={}), \
+             patch.object(linux, "comfy_fetch_output", return_value="/tmp/o.png"), \
+             patch.object(linux, "build_flashvsr_image_workflow") as fv, \
+             patch.object(linux, "build_image_upscale_workflow", return_value={}) as es:
+            linux._ref_enh_restore("j", self.crop, self.W, {}, self.tmp)
+        fv.assert_not_called()
+        es.assert_called_once()
+
     def test_ket_qua_duoc_thu_ve_dung_khung_render(self):
         # ESRGAN nhân ×4 vô điều kiện → 2900px là phí băng thông upload; thu về đúng W×H.
         from PIL import Image
