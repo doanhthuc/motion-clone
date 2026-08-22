@@ -69,7 +69,27 @@ Params (`params` jsonb, camelCase, đọc qua `_motion_*` helpers dùng chung):
 
 **Phạm vi:** chỉ chạy khi `params["_swapEngine"]` có giá trị — **Motion lấy cả background từ ảnh ref nên cắt ref là phá Motion**. Áp cho cả hai engine swap vì crop xảy ra trước `comfy_upload`. Giữ `ref_local` nguyên vẹn, chỉ đổi file đem upload (`_apply_ref_grade_video`, `_apply_face_lock`, `_apply_motion_drift_fix` còn đọc bản gốc).
 
-**Giá phải trả:** thêm một vòng ComfyUI mỗi job (SAM3 ~1.7GB nạp rồi nhả, ước 30–60s), và ref toàn thân dùng cho cảnh cận sẽ bị phóng to nên mờ — đổi lại là hết quái dị.
+**Giá phải trả:** thêm một vòng ComfyUI mỗi job (SAM3 ~1.7GB nạp rồi nhả, ước 30–60s), và ref toàn thân dùng cho cảnh cận sẽ bị phóng to nên mờ — đổi lại là hết quái dị. Chuyện mờ do `refEnhance` xử lý, xem §4c.
+
+## 4c. Làm nét ảnh ref đã cắt (`refEnhance`)
+
+Ảnh ref **LÀ nguồn danh tính** Wan sao chép: model làm nét mà tiện tay sửa mặt thì video cuối ra người khác. Vì vậy ba mức xếp theo rủi ro đổi danh tính chứ không theo độ nét.
+
+| Mức | Làm gì | Ảnh rời máy? | Rủi ro danh tính |
+|---|---|---|---|
+| `off` | chỉ crop | không | không |
+| `restore` *(mặc định)* | `build_image_upscale_workflow` — ESRGAN ×4 (+ CodeFormer nếu có node) | không | thấp — phục hồi, không sáng tác |
+| `gen` | Gemini → **lỗi thì Qwen-Image-Edit cục bộ** → lỗi nữa thì `restore` → cuối cùng crop trần | có, ở tầng Gemini | cao nhất |
+
+**Chỉ chạy khi thật sự phóng lên**: crop ≥ khung render (trường hợp `s<1`) thì bỏ qua, không có gì để phục hồi.
+
+**Không có API Qwen.** Repo chỉ có `GEMINI_API_KEY`; DashScope trong repo này chỉ dùng cho **video** (`happyhorse-i2v`, `wan2.2-animate-move`), và `scripts/batchlib/local_tryon.py:23` ghi rõ `LOCAL_PROVIDERS = {"gemini"}  # + "qwen-max" khi có endpoint/key thật`. Tầng dự phòng vì thế là **Qwen-Image-Edit-2509 chạy cục bộ** trên pod (`build_qwen_create_workflow`, `denoise=0.35` → tinh chỉnh chứ không vẽ lại): không tốn tiền, không chết vì mạng, ảnh không rời máy — tốt hơn một API thứ hai.
+
+**Ghim model Gemini tường minh.** Map `geminiModel` của `run_create_image:5780` và `run_edit_image:6017` còn trỏ id `-preview` mà Google khai tử 25/06/2026, và `docker-compose.yml:299` còn tái lập id đó đè lên default đã sửa. `_ref_enh_gemini` không đọc map đó.
+
+**Đã biết trước khi chạy:** custom node `FaceRestoreCFWithModel` **không được cài** trong deployment này (không có trong Dockerfile, setup script hay catalog), nên `restore` thực tế là ESRGAN ×4 trần. Node thiếu → log warn rồi chạy tiếp không có face-restore. Muốn có CodeFormer thật thì phải thêm custom node vào image (build lại qua CI) + khai model vào catalog.
+
+**Fail-safe:** mọi tầng hỏng → crop trần. Tầng làm nét không bao giờ được phép làm chết job.
 
 ## 5. Graph chi tiết
 

@@ -1835,6 +1835,119 @@ def _mask_png_bbox(path, thresh=32):
         return None
 
 
+# ALD 22/08/2026 - Prompt CHUNG cho cả Gemini lẫn Qwen: nói rõ "phục hồi chi tiết", CẤM đổi mọi thứ
+# khác. Ảnh ref LÀ nguồn danh tính Wan sao chép — model làm nét mà tiện tay sửa mặt thì video cuối ra
+# người khác. Nêu tường minh từng thứ phải giữ vì model diễn giải "enhance" rất rộng.
+_REF_ENH_PROMPT = (
+    "Restore and sharpen this photograph to high resolution. Keep the SAME person: identical face, "
+    "facial features, eye shape, skin tone, hairstyle, makeup, clothing, jewellery, body pose, camera "
+    "angle, lighting and background. Do not change the framing or crop. Do not add or remove anything. "
+    "Only recover realistic photographic detail and remove blur.")
+
+
+def _ref_enh_mode(p):
+    v = str(p.get("refEnhance", p.get("ref_enhance", os.environ.get("SWAP_REF_ENHANCE", "restore")))).strip().lower()
+    if v in ("0", "false", "no", "none", "off", ""):
+        return "off"
+    if v in ("gen", "gemini", "nano-banana", "generate"):
+        return "gen"
+    return "restore"
+
+
+def _ref_enh_gemini(job_id, crop_path, W, H, p, tmp):
+    key = _gemini_key(p)
+    if not _valid_gemini_key(key):
+        api_log(job_id, "làm nét ref: chưa có GEMINI_API_KEY hợp lệ → bỏ tầng Gemini", "warn")
+        return None
+    # GHIM model tường minh: map geminiModel của run_create_image/run_edit_image còn trỏ id '-preview'
+    # Google đã khai tử 25/06, và docker-compose.yml:299 còn tái lập id đó đè lên default đã sửa.
+    model = str(p.get("refEnhanceModel") or p.get("ref_enhance_model") or GEMINI_IMAGE_MODEL).strip()
+    with open(crop_path, "rb") as f:
+        data = f.read()
+    return _gemini_edit([(data, _mime(crop_path))], _REF_ENH_PROMPT, key,
+                        os.path.join(tmp, "ref-enh-gemini.png"),
+                        aspect_ratio=_gemini_aspect((int(W), int(H))), model=model)
+
+
+def _ref_enh_qwen(job_id, crop_path, W, H, p, tmp):
+    """Qwen-Image-Edit CỤC BỘ trên pod — không phải API. Không tốn tiền, không chết vì mạng,
+    ảnh không rời máy. denoise thấp = tinh chỉnh chứ không vẽ lại."""
+    wf = build_qwen_create_workflow(
+        [comfy_upload(crop_path)], _REF_ENH_PROMPT, f"ref-enh-{job_id[:8]}",
+        width=int(W), height=int(H), force_size=False, realism=False,
+        denoise=_motion_float(p, "refEnhanceDenoise", "ref_enhance_denoise", default=0.35))
+    return comfy_fetch_output(comfy_poll(comfy_submit(wf), job_id, deadline_sec=600), exts=IMG_EXTS)
+
+
+def _ref_enh_restore(job_id, crop_path, p, tmp):
+    """ESRGAN ×4 + CodeFormer — PHỤC HỒI, không sáng tác. Rủi ro đổi danh tính thấp nhất trong ba
+    tầng, nên là mặc định. faceFidelity càng thấp càng bám ảnh gốc."""
+    _face = _comfy_has_node("FaceRestoreCFWithModel")
+    if not _face:
+        api_log(job_id, "làm nét ref: thiếu FaceRestoreCFWithModel → chỉ ESRGAN, không phục hồi mặt", "warn")
+    wf = build_image_upscale_workflow(
+        comfy_upload(crop_path), prefix=f"ref-enh-{job_id[:8]}", face_restore=_face,
+        face_fidelity=_motion_float(p, "refFaceFidelity", "ref_face_fidelity", default=0.5))
+    return comfy_fetch_output(comfy_poll(comfy_submit(wf), job_id, deadline_sec=900), exts=IMG_EXTS)
+
+
+def _ref_fit_to_frame(path, W, H, tmp):
+    """Thu ảnh về đúng khung render nếu nó lớn hơn — ESRGAN nhân ×4 vô điều kiện nên crop nhỏ vẫn
+    ra ảnh 2900px, upload chừng đó là phí. Nhỏ hơn thì để nguyên cho node 11 phóng."""
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            if im.width <= int(W) and im.height <= int(H):
+                return path
+            dst = os.path.join(tmp, "ref-framed-fit.png")
+            im.convert("RGB").resize((int(W), int(H)), Image.LANCZOS).save(dst, "PNG")
+            return dst
+    except Exception:
+        return path
+
+
+def _enhance_ref_crop(job_id, crop_path, W, H, p, tmp):
+    """Làm nét ảnh ref ĐÃ CẮT. LUÔN trả về một path dùng được — hỏng hết thì trả lại crop trần.
+
+    Thứ tự tầng theo đúng khuôn mẫu fallback của repo (xem vòng lặp teaser ~linux.py:8895):
+    sentinel None, mỗi tầng một try/except, log warn nêu rõ tầng kế tiếp, tầng cuối luôn có sẵn.
+    """
+    mode = _ref_enh_mode(p)
+    if mode == "off":
+        return crop_path
+    try:
+        from PIL import Image
+        with Image.open(crop_path) as im:
+            cw, ch = im.size
+    except Exception:
+        return crop_path
+    # Crop đã lớn hơn khung render (s<1) → không phóng lên thì không có gì để phục hồi.
+    if cw >= int(W) and ch >= int(H):
+        api_log(job_id, f"làm nét ref: crop {cw}×{ch} ≥ khung {W}×{H} (không phóng lên) → bỏ qua", "info")
+        return crop_path
+    out = None
+    if mode == "gen":
+        try:
+            out = _ref_enh_gemini(job_id, crop_path, W, H, p, tmp)
+        except Exception as e:
+            api_log(job_id, f"làm nét ref: Gemini lỗi → Qwen cục bộ: {e}", "warn")
+        if not out:
+            try:
+                out = _ref_enh_qwen(job_id, crop_path, W, H, p, tmp)
+            except Exception as e:
+                api_log(job_id, f"làm nét ref: Qwen lỗi → phục hồi cục bộ: {e}", "warn")
+    if not out:
+        try:
+            out = _ref_enh_restore(job_id, crop_path, p, tmp)
+        except Exception as e:
+            api_log(job_id, f"làm nét ref: phục hồi lỗi → dùng crop trần: {e}", "warn")
+    if not out:
+        api_log(job_id, "làm nét ref: mọi tầng đều hỏng → dùng crop trần", "warn")
+        return crop_path
+    api_log(job_id, f"làm nét ref: xong bằng '{mode}' (crop {cw}×{ch} → khung {W}×{H})", "info")
+    return _ref_fit_to_frame(out, W, H, tmp)
+
+
 def _match_ref_framing_to_driver(job_id, ref_local, motion_local, W, H, p, tmp):
     """Cắt ảnh ref cho khung hình khớp driver → path ảnh mới, hoặc None để dùng ref nguyên bản.
 
@@ -1880,7 +1993,7 @@ def _match_ref_framing_to_driver(job_id, ref_local, motion_local, W, H, p, tmp):
         api_log(job_id, f"khớp khung ref: đầu ref {ref_bb[3]-ref_bb[1]}px vs driver {drv_bb[3]-drv_bb[1]}px "
                         f"→ phóng {s:.2f}×, cắt ref về {tuple(int(round(v)) for v in box)} "
                         f"(gốc {ref_w}×{ref_h})", "info")
-        return dst
+        return _enhance_ref_crop(job_id, dst, int(W), int(H), p, tmp)
     except RefFramingTooFar:
         raise
     except Exception as e:

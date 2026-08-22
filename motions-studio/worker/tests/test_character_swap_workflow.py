@@ -1,4 +1,7 @@
+import os
+import shutil
 import sys
+import tempfile
 import types
 import unittest
 from unittest.mock import patch
@@ -293,6 +296,91 @@ class MatchRefFramingFailSafeTests(unittest.TestCase):
             im.return_value.__enter__.return_value.size = (1156, 2047)
             with self.assertRaises(RefFramingTooFar):
                 self._run()
+
+
+class EnhanceRefCropTests(unittest.TestCase):
+    """Làm nét ảnh ref sau khi cắt. Ba mức: off · restore (ESRGAN+CodeFormer cục bộ, PHỤC HỒI chứ
+    không vẽ lại) · gen (Gemini → Qwen cục bộ, nét nhất nhưng rủi ro đổi danh tính cao nhất).
+
+    Ảnh ref LÀ nguồn danh tính mà Wan sao chép, nên tầng làm nét tuyệt đối không được làm chết job:
+    hỏng hết thì trả lại crop trần. Test dùng ảnh PNG THẬT, không giả lập PIL — kích thước ảnh là
+    điều kiện rẽ nhánh nên giả lập nó là tự bịt mắt mình.
+    """
+
+    W, H = 544, 960
+
+    def setUp(self):
+        from PIL import Image
+        self.tmp = tempfile.mkdtemp(prefix="reftest-")
+        self.crop = os.path.join(self.tmp, "crop.png")
+        Image.new("RGB", (160, 282), (128, 128, 128)).save(self.crop)   # nhỏ hơn khung → cần phóng
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def _run(self, p):
+        return linux._enhance_ref_crop("job-1234", self.crop, self.W, self.H, p, self.tmp)
+
+    def _big(self):
+        from PIL import Image
+        p = os.path.join(self.tmp, "big.png")
+        Image.new("RGB", (self.W + 40, self.H + 40), (10, 10, 10)).save(p)
+        return p
+
+    def test_doc_mode(self):
+        self.assertEqual(linux._ref_enh_mode({}), "restore")            # mặc định
+        self.assertEqual(linux._ref_enh_mode({"refEnhance": "0"}), "off")
+        self.assertEqual(linux._ref_enh_mode({"refEnhance": "gemini"}), "gen")
+
+    def test_off_thi_khong_dung_toi_tang_nao(self):
+        with patch.object(linux, "_ref_enh_gemini") as g, patch.object(linux, "_ref_enh_restore") as r:
+            self.assertEqual(self._run({"refEnhance": "off"}), self.crop)
+        g.assert_not_called()
+        r.assert_not_called()
+
+    def test_crop_da_du_lon_thi_bo_qua(self):
+        # s < 1: cửa sổ cắt rộng hơn khung render nên không phóng lên — không có gì để phục hồi.
+        big = self._big()
+        with patch.object(linux, "_ref_enh_restore") as r:
+            self.assertEqual(linux._enhance_ref_crop("j", big, self.W, self.H, {}, self.tmp), big)
+        r.assert_not_called()
+
+    def test_restore_khong_goi_gemini(self):
+        # Mức mặc định KHÔNG được gửi ảnh người mẫu ra ngoài internet.
+        with patch.object(linux, "_ref_enh_gemini") as g, \
+             patch.object(linux, "_ref_enh_restore", return_value=self._big()) as r:
+            self._run({})
+        g.assert_not_called()
+        r.assert_called_once()
+
+    def test_gen_gemini_loi_thi_tut_xuong_qwen(self):
+        out = self._big()
+        with patch.object(linux, "_ref_enh_gemini", side_effect=RuntimeError("Gemini API 503")), \
+             patch.object(linux, "_ref_enh_qwen", return_value=out) as q, \
+             patch.object(linux, "_ref_enh_restore") as r:
+            self.assertIsNotNone(self._run({"refEnhance": "gen"}))
+        q.assert_called_once()
+        r.assert_not_called()
+
+    def test_gen_hai_tang_gen_loi_thi_tut_xuong_phuc_hoi(self):
+        out = self._big()
+        with patch.object(linux, "_ref_enh_gemini", return_value=None), \
+             patch.object(linux, "_ref_enh_qwen", side_effect=RuntimeError("comfy sập")), \
+             patch.object(linux, "_ref_enh_restore", return_value=out) as r:
+            self.assertIsNotNone(self._run({"refEnhance": "gen"}))
+        r.assert_called_once()
+
+    def test_hong_het_thi_tra_lai_crop_tran_chu_khong_chet_job(self):
+        with patch.object(linux, "_ref_enh_gemini", side_effect=RuntimeError("x")), \
+             patch.object(linux, "_ref_enh_qwen", side_effect=RuntimeError("y")), \
+             patch.object(linux, "_ref_enh_restore", side_effect=RuntimeError("z")):
+            self.assertEqual(self._run({"refEnhance": "gen"}), self.crop)
+
+    def test_ket_qua_duoc_thu_ve_dung_khung_render(self):
+        # ESRGAN nhân ×4 vô điều kiện → 2900px là phí băng thông upload; thu về đúng W×H.
+        from PIL import Image
+        with patch.object(linux, "_ref_enh_restore", return_value=self._big()):
+            got = self._run({})
+        with Image.open(got) as im:
+            self.assertEqual(im.size, (self.W, self.H))
 
 
 class RunCharacterSwapTests(unittest.TestCase):

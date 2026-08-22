@@ -145,6 +145,22 @@
         "line": 1768,
         "why": "build_scail2_swap_workflow:1768 — fallback của positive_prompt cho WanSCAILToVideo (chỉ engine scail2)."
       },
+      "refEnhance": {
+        "line": 1849,
+        "why": "_ref_enh_mode:1849 — làm nét ảnh ref sau khi cắt. off | restore (mặc định: ESRGAN+CodeFormer CỤC BỘ, phục hồi chứ không vẽ lại, ảnh không rời máy) | gen (Gemini → Qwen cục bộ, nét nhất nhưng rủi ro đổi danh tính cao nhất)."
+      },
+      "refEnhanceDenoise": {
+        "line": 1878,
+        "why": "_ref_enh_qwen:1878 — denoise của Qwen-Image-Edit cục bộ ở tầng gen. Thấp = tinh chỉnh, cao = vẽ lại (đổi mặt). Mặc định 0.35."
+      },
+      "refEnhanceModel": {
+        "line": 1864,
+        "why": "_ref_enh_gemini:1864 — GHIM model Gemini tường minh. Mặc định GEMINI_IMAGE_MODEL; đừng tin map geminiModel của run_create_image/run_edit_image, nó còn trỏ id '-preview' Google khai tử 25/06."
+      },
+      "refFaceFidelity": {
+        "line": 1890,
+        "why": "_ref_enh_restore:1890 — CodeFormer fidelity. Càng THẤP càng bám ảnh gốc. Mặc định 0.5."
+      },
       "refFrameHeadPrompt": {
         "line": 1773,
         "why": "build_swap_headprobe_workflow:1773 — prompt SAM3 tìm cái đầu trong graph thăm dò. Mặc định 'head'; đổi sang 'face' nếu SAM3 bắt hụt."
