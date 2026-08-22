@@ -2107,39 +2107,29 @@ def _apply_swap_to_wan_workflow(wf, p):
         "track_data": ["202", 0],
         # rỗng = union mọi người trong video; "0" = chỉ người đầu (chọn khi video đông người)
         "object_indices": str(p.get("maskIndices") or p.get("mask_indices") or "")}}
-    # #region ALD 22/08/2026 - THU MASK khi nó đã phủ quá nửa khung.
-    # Đo thật 22/08 trên dandong5 (selfie cận sát): mask người phủ 61% khung, bbox 79%. Wan phải vẽ
-    # lại hai phần ba mỗi frame trong khi DWPose chỉ có vài khớp đầu-vai để dẫn đường → nó lấp chỗ
-    # trống bằng vật thể bịa, 5/8 lần ra CÙNG một cây đàn guitar. Nới thêm 10px rồi blockify (hợp lý
-    # cho driver toàn thân, mask nhỏ, cần bao trọn viền) chỉ làm chỗ trống rộng thêm. Nên khi mask
-    # đã lớn thì đảo chiều: ăn mòn vào trong và bỏ blockify.
-    # Độ phủ do graph thăm dò đo được (_match_ref_framing_to_driver) — KHÔNG có số đo thì giữ nguyên
-    # hành vi cũ, không đoán bừa. Người dùng ép maskGrow/maskBlockify thì luôn thắng.
-    _cov = p.get("_driverMaskCoverage")
-    _tight = isinstance(_cov, (int, float)) and not isinstance(_cov, bool) \
-        and float(_cov) > _motion_float(p, "maskTightenAbove", "mask_tighten_above", default=0.5)
-    _grow_default = _motion_int(p, "maskTightenErode", "mask_tighten_erode", default=-8) if _tight else 10
-    _blockify = not _tight or _motion_present(p.get("maskBlockify")) or _motion_present(p.get("mask_blockify"))
-    # #endregion
+    # ALD 22/08/2026 - ĐÃ THỬ VÀ ĐÃ BÁC BỎ, ĐỪNG LÀM LẠI: "mask phủ 61% khung cho Wan quá nhiều đất
+    # bịa vật thể, nên khi mask lớn thì ăn mòn (-8px) và bỏ Blockify". Đo 4 seed × 2 nhánh trên
+    # dandong5: nhánh THU MASK hỏng 4/4, nhánh giữ nguyên sạch 4/4 — tách bạch hoàn toàn. Hai kiểu
+    # hỏng (bịa quần áo, răng cưa dọc mép khung) đều truy về rìa mask bị ăn mòn và mất Blockify: rìa
+    # hở không còn được làm phẳng theo lưới nên Wan vẽ vào đó thành viền gãy khúc.
+    # Thủ phạm thật là PROMPT — xem SWAP_NEGATIVE_EXTRA / SWAP_POSITIVE_EXTRA cuối hàm này.
+    # Độ phủ vẫn được đo và ghi log (chẩn đoán) nhưng KHÔNG lái chuỗi mask nữa.
     wf["204"] = {"class_type": "GrowMaskWithBlur", "inputs": {
         "mask": ["203", 0],
-        "expand": _motion_int(p, "maskGrow", "mask_grow", default=_grow_default),
+        "expand": _motion_int(p, "maskGrow", "mask_grow", default=10),
         "incremental_expandrate": 0.0, "tapered_corners": True, "flip_input": False,
         "blur_radius": 0.0, "lerp_alpha": 1.0, "decay_factor": 1.0, "fill_holes": False}}
     # ALD 22/08/2026 - MẶC ĐỊNH 32→16 sau khi đo thật trên pod 21/08. Blockify lấy bounding box của
     # mask rồi tô ĐẦY mọi ô có dính mask, nên ô càng to vùng vẽ lại càng phình ra ngoài dáng người —
     # 32px cho Wan cả một khoảng trống trước bụng để bịa vật thể. 16 vẫn thẳng lưới latent (VAE ×8,
     # patch 2 → bội 16) mà bám sát người hơn. Muốn về hành vi cũ: maskBlockify=32.
-    _mask_src = ["204", 0]
-    if _blockify:
-        wf["205"] = {"class_type": "BlockifyMask", "inputs": {
-            "masks": ["204", 0],
-            "block_size": _motion_int(p, "maskBlockify", "mask_blockify", default=16)}}
-        _mask_src = ["205", 0]
+    wf["205"] = {"class_type": "BlockifyMask", "inputs": {
+        "masks": ["204", 0],
+        "block_size": _motion_int(p, "maskBlockify", "mask_blockify", default=16)}}
     wf["206"] = {"class_type": "DrawMaskOnImage", "inputs": {
-        "image": ["12", 0], "mask": _mask_src, "color": "0, 0, 0"}}
+        "image": ["12", 0], "mask": ["205", 0], "color": "0, 0, 0"}}
     wf["81"]["inputs"]["bg_images"] = ["206", 0]
-    wf["81"]["inputs"]["mask"] = _mask_src
+    wf["81"]["inputs"]["mask"] = ["205", 0]
     # #region ALD 22/08/2026 - CHẶN BỊA VẬT THỂ. Đo thật 21/08 (nhanvat-1 + dandong-2): driver chắp
     # tay sau lưng → DWPose đặt keypoint bàn tay mơ hồ ra phía trước → Wan "giải thích" tư thế bằng
     # cách vẽ BÓ HOA vào tay, bám từ ~frame 60 tới hết clip (frame 0 còn sạch). Cùng họ với bệnh

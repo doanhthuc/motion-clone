@@ -79,33 +79,23 @@ class ApplySwapToWanWorkflowTests(unittest.TestCase):
         self.assertNotIn("bouquet", neg_off)
         self.assertIn("过曝", neg_off)
 
-    def test_mask_phu_qua_nua_khung_thi_THU_lai_va_bo_blockify(self):
-        """Đo thật 22/08: mask người của driver cận cảnh phủ 61% khung (bbox 79%). Wan phải vẽ lại
-        hai phần ba khung mỗi frame trong khi DWPose chỉ có vài khớp đầu-vai để dẫn → nó lấp chỗ
-        trống bằng vật thể bịa (5/8 lần ra CÙNG một cây đàn guitar). Nới mask thêm 10px rồi blockify
-        chỉ làm chỗ trống rộng thêm, nên khi mask đã quá lớn thì phải ĂN MÒN ngược lại."""
-        wf = self._wf({"_driverMaskCoverage": 0.61})
-        self.assertLess(wf["204"]["inputs"]["expand"], 0)      # erode, không grow
-        self.assertNotIn("205", wf)                            # bỏ blockify
-        self.assertEqual(wf["206"]["inputs"]["mask"], ["204", 0])
-        self.assertEqual(wf["81"]["inputs"]["mask"], ["204", 0])
+    def test_do_phu_mask_KHONG_duoc_doi_chuoi_mask(self):
+        """ĐÃ THỬ VÀ ĐÃ BÁC BỎ 22/08 — đừng làm lại.
 
-    def test_mask_nho_thi_giu_nguyen_hanh_vi_cu(self):
-        wf = self._wf({"_driverMaskCoverage": 0.30})
-        self.assertEqual(wf["204"]["inputs"]["expand"], 10)
-        self.assertEqual(wf["205"]["inputs"]["block_size"], 16)
-        self.assertEqual(wf["81"]["inputs"]["mask"], ["205", 0])
+        Giả thuyết: mask phủ 61% khung cho Wan quá nhiều đất bịa vật thể, nên khi mask lớn thì ăn
+        mòn (-8px) và bỏ Blockify. Đo 4 seed × 2 nhánh trên dandong5: nhánh THU MASK hỏng 4/4,
+        nhánh giữ nguyên sạch 4/4 — tách bạch hoàn toàn. Hai kiểu hỏng (bịa quần áo, răng cưa dọc
+        mép khung) đều truy về rìa mask bị ăn mòn và mất Blockify: rìa hở không còn được làm phẳng
+        theo lưới nên Wan vẽ vào đó thành viền gãy khúc.
 
-    def test_chua_do_duoc_do_phu_thi_giu_nguyen_hanh_vi_cu(self):
-        # Probe hỏng / bị tắt → không có số đo. Không được đoán bừa là mask lớn.
-        wf = self._wf()
-        self.assertEqual(wf["204"]["inputs"]["expand"], 10)
-        self.assertIn("205", wf)
-
-    def test_nguoi_dung_ep_tay_thi_ton_trong(self):
-        wf = self._wf({"_driverMaskCoverage": 0.61, "maskGrow": 4, "maskBlockify": 32})
-        self.assertEqual(wf["204"]["inputs"]["expand"], 4)
-        self.assertEqual(wf["205"]["inputs"]["block_size"], 32)
+        Thủ phạm thật là PROMPT, không phải mask — xem test_negative_chan_luon_nhac_cu.
+        Số đo độ phủ vẫn giữ (ghi log để chẩn đoán) nhưng KHÔNG được lái chuỗi mask nữa.
+        """
+        for cov in (0.30, 0.61, 0.95):
+            wf = self._wf({"_driverMaskCoverage": cov})
+            self.assertEqual(wf["204"]["inputs"]["expand"], 10, cov)
+            self.assertEqual(wf["205"]["inputs"]["block_size"], 16, cov)
+            self.assertEqual(wf["81"]["inputs"]["mask"], ["205", 0], cov)
 
     def test_negative_chan_luon_nhac_cu(self):
         # Bằng chứng chứ không phòng xa: 5/8 lần chạy dandong5 ra đúng một cây đàn guitar.

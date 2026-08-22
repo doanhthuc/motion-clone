@@ -39,11 +39,12 @@ Params (`params` jsonb, camelCase, đọc qua `_motion_*` helpers dùng chung):
 - `lora_relight` / `loraRelight` (wananimate: LoRA `WanAnimate_relight_lora_fp16` đã có sẵn, hiện gắn strength 0 trong graph motion → swap bật mặc định 1.0; scail2 không dùng param này — xem `dpoLora`/`distillLora`)
 - `pose_strength` / `poseStrength`, `face_strength` / `faceStrength` (wananimate, mặc định 1.0 cả hai theo example replacement của kijai — `bodyProportionLock` bị tắt mặc định cho CẢ 2 engine để khỏi bị `_normalize_motion_params` ép `pose_strength` xuống 0.7)
 - `dpoLora`, `distillLora` (scail2: strength của LoRA DPO và lightx2v distill rank64)
-- `swapNegativeExtra` (chuỗi, mặc định cụm chặn bịa vật thể `bouquet, flowers, holding objects, …`; **rỗng = tắt** khi cần mẫu cầm sản phẩm thật) — nối thêm vào negative prompt gốc, chỉ áp cho swap
+- `swapNegativeExtra` / `swapPositiveExtra` (chuỗi; **rỗng = tắt** khi cần mẫu cầm sản phẩm thật) — nối thêm vào prompt gốc, chỉ áp cho swap. **Đây là bản vá hiệu quả nhất cho bệnh bịa vật thể** (đo 22/08: 3/8 → 4/4 sạch), xem §4d
 - `maskGrow` (px, mặc định 10), `maskBlockify` (block size, **mặc định 16** — hạ từ 32 sau khi đo thật 21/08: ô 32px nới vùng vẽ lại phình ra ngoài dáng người nên Wan có đất bịa vật thể), `maskIndices` (rỗng = union mọi người, `"0"` = chỉ người đầu) — nới rồi block-hoá mask người trước khi đưa vào graph, đúng chuỗi kijai `GrowMaskWithBlur` → `BlockifyMask`. Không có `maskFeather`: Blockify nhị phân hoá mask thành các ô vuông cứng cạnh, blur/feather trước đó vô nghĩa (đã bỏ khỏi thiết kế)
 - `sam3Prompt` (dùng chung wananimate + fallback scail2), `sam3VideoPrompt`/`sam3ImagePrompt` (scail2, tách riêng prompt track video vs segment ảnh ref), `sam3Threshold`, `sam3MaxObjects`, `sam3DetectInterval` — điều khiển `SAM3_VideoTrack`
 - `driverStartSec` / `driverDurSec` — tái dùng `_cut_motion_driver_segment`
-- `refFrameMatch` (mặc định bật), `refFrameMaxUpscale` (4.0), `refFrameHeadPrompt` (`head`) — **khớp khung hình ảnh ref với driver**, xem §4b
+- `refFrameMatch` (mặc định bật), `refFrameMaxUpscale` (4.0), `refFrameHeadPrompt` (**`face`** — không phải `head`, xem §4b) — **khớp khung hình ảnh ref với driver**
+- `refEnhance` (`off` | **`restore`** | `gen`), `refEnhanceModel`, `refEnhanceDenoise`, `refFaceFidelity` — làm nét ảnh ref đã cắt, xem §4c
 - Độ phân giải: **theo tỉ lệ khung của video nguồn**, không theo ảnh ref (ảnh ref được `keep_proportion=crop` vào khung đã chốt). Dùng logic FIT DRIVER hiện có qua `_fit_driver_wh()`: cạnh ngắn = `short` của preset (`drv-*` → 544), cạnh dài = cạnh ngắn × tỉ lệ driver, cap ≤ `MOTION_VRAM_MAX_EDGE` (968) — 9:16 → 544×960, 3:4 → 544×720, 1:1 → 544×544, 16:9 → 960×544. Chịu VRAM gate `MOTION_VRAM_MAX_EDGE/FRAMES` như motion
 - **FIT DRIVER phải được mở lại riêng cho swap.** `_normalize_motion_params` tắt thẳng `fitDriver` cho MỌI preset `drv-*` (chính sách quality-v1, 19/07/2026: khung do `quality` + `aspectRatio` quyết định). Đúng cho Motion — user chọn tỉ lệ trên UI — nhưng sai cho swap, vì swap giữ nguyên background + camera của video nguồn. Không guard thì driver 3:4 bị kéo dãn vào 9:16 (đo thật trên pod 22/08: 576×768 → 544×960, mặt hẹp và dài ra). Nhánh đó nay bỏ qua khi `p["_swapEngine"]` có giá trị; user vẫn ép được bằng `fitDriver=0`
 - **Bội của khung khác nhau theo engine**: wananimate bội 16 như motion, scail2 bội **32** (`WanSCAILToVideo` khai `io.Int step=32`; builder scail2 floor về bội 32, nên nếu FIT DRIVER trả bội 16 lẻ thì driver 3:4 rơi 720→704 và `VHS_LoadVideo` kéo dẹt khung ~2.2% vì `custom_width/custom_height` không giữ tỷ lệ). Với scail2, 3:4 → 544×736. Làm tròn lên mà vượt trần cạnh dài thì lùi một bậc — trần là ngân sách VRAM đã đo
@@ -93,19 +94,35 @@ Params (`params` jsonb, camelCase, đọc qua `_motion_*` helpers dùng chung):
 
 **Fail-safe:** mọi tầng hỏng → crop trần. Tầng làm nét không bao giờ được phép làm chết job.
 
-## 4d. Thu mask khi nó phủ quá nửa khung
+## 4d. Bịa vật thể — thủ phạm là PROMPT, không phải mask (đo 22/08)
 
-**Số đo 22/08 (dandong5, selfie cận sát):** mask người của driver phủ **61% khung**, bounding box **79%**. Wan phải vẽ lại hai phần ba mỗi frame trong khi DWPose chỉ có vài khớp đầu-vai để dẫn đường — nhiều đất trống, ít chỉ dẫn. Kết quả đo trên 8 lần chạy: **5/8 bịa ra CÙNG một cây đàn guitar**, cùng vị trí cùng góc. Không phải nhiễu vô hướng mà là một chế độ hút: mô hình đọc tư thế nghiêng đầu + tóc xõa + ngồi rồi khớp với tiên nghiệm "người ôm đàn hát".
+**Kết luận cuối, có số:** cụm `SWAP_NEGATIVE_EXTRA` (thêm `guitar, musical instrument, ukulele, microphone`) + `SWAP_POSITIVE_EXTRA` (neo "một người, tay không, không có gì che thân") trị được bệnh. Thu mask thì **làm hỏng thêm** và đã bị gỡ.
 
-Chuỗi `GrowMask(10)` → `Blockify(16)` hợp lý cho driver toàn thân (mask nhỏ, cần bao trọn viền) nhưng **phản tác dụng** khi mask đã lớn — nó chỉ nới thêm chỗ trống. Nên đảo chiều: độ phủ > `maskTightenAbove` (0.5) thì **ăn mòn** `maskTightenErode` (-8px) và **bỏ Blockify**.
+Bằng chứng — 4 seed × 2 nhánh trên dandong5, chỉ khác nhau ở chuyện có thu mask hay không:
 
-Độ phủ đo bằng **nhánh thứ ba của graph thăm dò** (§4b): SAM3 đã nạp sẵn nên thêm nhánh gần như miễn phí; tách thành job riêng là trả tiền nạp checkpoint hai lần. Nhánh này dùng đúng `sam3Prompt` / `sam3MaxObjects` / `maskIndices` của graph chính để con số phản ánh mask thật sẽ dùng khi render, và lấy **trung vị 3 frame**.
+| Seed | Thu mask BẬT | Thu mask TẮT |
+|---|---|---|
+| 11 · 22 · 33 · 44 | hỏng · hỏng · hỏng · hỏng | sạch · sạch · sạch · sạch |
 
-**Không có số đo thì giữ nguyên hành vi cũ** — probe hỏng hoặc bị tắt thì không được đoán bừa là mask lớn. Người dùng ép `maskGrow`/`maskBlockify` thì luôn thắng.
+Và so cùng seed với lô trước đó (cùng mask, khác prompt):
 
-Kèm theo: `SWAP_POSITIVE_EXTRA` neo cảnh ("một người, tay không, không có gì che thân") vì prompt gốc `MOTION_BASE_POSITIVE` chỉ nói về chất lượng ảnh, không nói gì về nội dung khung hình; và `SWAP_NEGATIVE_EXTRA` thêm cụm nhạc cụ — đây là **bằng chứng chứ không phải phòng xa**, cây đàn đã xuất hiện 5 lần.
+| Seed | Prompt cũ | Prompt mới |
+|---|---|---|
+| 11 | guitar | sạch |
+| 22 | sạch | sạch |
+| 33 | guitar | sạch |
 
-**Chưa xác nhận trên pod.** Và bài học của lô 22/08: với nhiễu ~62% thì **tối thiểu 4 seed mỗi cấu hình** mới kết luận được. Ba giả thuyết trước đó (crop trị được, FlashVSR trị được, thuần ngẫu nhiên) đều bị bác bỏ vì rút kết luận từ một mẫu.
+Tổng: prompt cũ 3/8 sạch → prompt mới 4/4 sạch.
+
+### Giả thuyết đã bác bỏ — đừng làm lại
+
+Mask người của driver cận cảnh phủ **61% khung** (bbox 79%), nên có vẻ hợp lý rằng Wan có quá nhiều đất trống để bịa. Nhưng ăn mòn mask (-8px) và bỏ `BlockifyMask` cho kết quả **hỏng 4/4**, với hai kiểu hỏng đều truy về rìa mask: bịa quần áo, và **răng cưa dọc mép khung** — rìa hở không còn được làm phẳng theo lưới nên Wan vẽ vào đó thành viền gãy khúc. `GrowMask(10)` → `Blockify(16)` giữ nguyên.
+
+Số đo độ phủ **vẫn giữ** (nhánh thứ ba của graph thăm dò, ghi log) vì nó rẻ và là dữ liệu chẩn đoán duy nhất cho nhóm lỗi này — nhưng nó không còn lái chuỗi mask.
+
+### Bài học phương pháp
+
+Ba giả thuyết trước đó — "crop khớp khung trị được", "FlashVSR trị được", "thuần ngẫu nhiên theo seed" — đều bị bác bỏ, và cả ba đều sinh ra từ việc đọc **một mẫu mỗi cấu hình** trong khi nhiễu chạy-tới-chạy là ~62%. Với job type này, **tối thiểu 4 seed mỗi nhánh** mới được kết luận bất cứ điều gì.
 
 ## 5. Graph chi tiết
 
