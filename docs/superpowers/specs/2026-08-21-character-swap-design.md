@@ -118,6 +118,8 @@ Tổng: prompt cũ 3/8 sạch → prompt mới 4/4 sạch.
 
 Mask người của driver cận cảnh phủ **61% khung** (bbox 79%), nên có vẻ hợp lý rằng Wan có quá nhiều đất trống để bịa. Nhưng ăn mòn mask (-8px) và bỏ `BlockifyMask` cho kết quả **hỏng 4/4**, với hai kiểu hỏng đều truy về rìa mask: bịa quần áo, và **răng cưa dọc mép khung** — rìa hở không còn được làm phẳng theo lưới nên Wan vẽ vào đó thành viền gãy khúc. `GrowMask(10)` → `Blockify(16)` giữ nguyên.
 
+**Mẫu thứ năm, quan trọng nhất:** `dandong4` là một **trung cảnh** — tôi giả định nó dưới ngưỡng 0.5 nên không bị ảnh hưởng, và đã báo cáo nhầm job đó là "hồi quy sạch". Xem kỹ lại thì nó **cũng hỏng**: bịa một áo khoác trắng phủ vai, kèm viền trắng cứng chạy theo đường bao mask — cùng chữ ký artifact biên. Tức độ phủ của trung cảnh cũng vượt 0.5, và nếu giữ, bản vá này sẽ đánh trúng gần như **mọi** đầu vào thật chứ không riêng vài ca cận cảnh cực đoan. Bài học kèm theo: khi đã biết chữ ký của một lỗi thì phải soi nó ở **mọi** mẫu, kể cả mẫu mình kỳ vọng là sạch.
+
 Số đo độ phủ **vẫn giữ** (nhánh thứ ba của graph thăm dò, ghi log) vì nó rẻ và là dữ liệu chẩn đoán duy nhất cho nhóm lỗi này — nhưng nó không còn lái chuỗi mask.
 
 ### Bài học phương pháp

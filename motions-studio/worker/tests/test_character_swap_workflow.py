@@ -88,6 +88,11 @@ class ApplySwapToWanWorkflowTests(unittest.TestCase):
         mép khung) đều truy về rìa mask bị ăn mòn và mất Blockify: rìa hở không còn được làm phẳng
         theo lưới nên Wan vẽ vào đó thành viền gãy khúc.
 
+        Mẫu thứ NĂM, quan trọng nhất: dandong4 — một TRUNG CẢNH, tưởng dưới ngưỡng 0.5 nên không
+        bị ảnh hưởng — hoá ra cũng vượt ngưỡng và cũng hỏng (bịa áo khoác trắng, viền trắng cứng
+        chạy theo đường bao mask). Tức nếu giữ, bản vá này sẽ đánh trúng gần như MỌI đầu vào thật
+        chứ không riêng vài ca cận cảnh cực đoan.
+
         Thủ phạm thật là PROMPT, không phải mask — xem test_negative_chan_luon_nhac_cu.
         Số đo độ phủ vẫn giữ (ghi log để chẩn đoán) nhưng KHÔNG được lái chuỗi mask nữa.
         """
