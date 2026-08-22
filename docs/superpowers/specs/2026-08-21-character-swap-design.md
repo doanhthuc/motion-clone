@@ -93,6 +93,20 @@ Params (`params` jsonb, camelCase, đọc qua `_motion_*` helpers dùng chung):
 
 **Fail-safe:** mọi tầng hỏng → crop trần. Tầng làm nét không bao giờ được phép làm chết job.
 
+## 4d. Thu mask khi nó phủ quá nửa khung
+
+**Số đo 22/08 (dandong5, selfie cận sát):** mask người của driver phủ **61% khung**, bounding box **79%**. Wan phải vẽ lại hai phần ba mỗi frame trong khi DWPose chỉ có vài khớp đầu-vai để dẫn đường — nhiều đất trống, ít chỉ dẫn. Kết quả đo trên 8 lần chạy: **5/8 bịa ra CÙNG một cây đàn guitar**, cùng vị trí cùng góc. Không phải nhiễu vô hướng mà là một chế độ hút: mô hình đọc tư thế nghiêng đầu + tóc xõa + ngồi rồi khớp với tiên nghiệm "người ôm đàn hát".
+
+Chuỗi `GrowMask(10)` → `Blockify(16)` hợp lý cho driver toàn thân (mask nhỏ, cần bao trọn viền) nhưng **phản tác dụng** khi mask đã lớn — nó chỉ nới thêm chỗ trống. Nên đảo chiều: độ phủ > `maskTightenAbove` (0.5) thì **ăn mòn** `maskTightenErode` (-8px) và **bỏ Blockify**.
+
+Độ phủ đo bằng **nhánh thứ ba của graph thăm dò** (§4b): SAM3 đã nạp sẵn nên thêm nhánh gần như miễn phí; tách thành job riêng là trả tiền nạp checkpoint hai lần. Nhánh này dùng đúng `sam3Prompt` / `sam3MaxObjects` / `maskIndices` của graph chính để con số phản ánh mask thật sẽ dùng khi render, và lấy **trung vị 3 frame**.
+
+**Không có số đo thì giữ nguyên hành vi cũ** — probe hỏng hoặc bị tắt thì không được đoán bừa là mask lớn. Người dùng ép `maskGrow`/`maskBlockify` thì luôn thắng.
+
+Kèm theo: `SWAP_POSITIVE_EXTRA` neo cảnh ("một người, tay không, không có gì che thân") vì prompt gốc `MOTION_BASE_POSITIVE` chỉ nói về chất lượng ảnh, không nói gì về nội dung khung hình; và `SWAP_NEGATIVE_EXTRA` thêm cụm nhạc cụ — đây là **bằng chứng chứ không phải phòng xa**, cây đàn đã xuất hiện 5 lần.
+
+**Chưa xác nhận trên pod.** Và bài học của lô 22/08: với nhiễu ~62% thì **tối thiểu 4 seed mỗi cấu hình** mới kết luận được. Ba giả thuyết trước đó (crop trị được, FlashVSR trị được, thuần ngẫu nhiên) đều bị bác bỏ vì rút kết luận từ một mẫu.
+
 ## 5. Graph chi tiết
 
 ### 5.1 Engine `wananimate` — mở rộng builder hiện có

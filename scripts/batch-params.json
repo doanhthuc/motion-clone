@@ -125,6 +125,14 @@
         "line": 1739,
         "why": "_apply_swap_to_wan_workflow:1739 (SAM3_TrackToMask.object_indices) và build_scail2_swap_workflow:1795 (SCAIL2ColoredMask.object_indices) — rỗng = union mọi người, '0' = chỉ người đầu."
       },
+      "maskTightenAbove": {
+        "line": 2116,
+        "why": "_apply_swap_to_wan_workflow:2116 — ngưỡng độ phủ mask (0..1) để ĐẢO CHIỀU từ nới sang thu. Mặc định 0.5. Đo 22/08: driver cận cảnh cho mask phủ 61% khung → Wan có hai phần ba khung để bịa vật thể."
+      },
+      "maskTightenErode": {
+        "line": 2117,
+        "why": "_apply_swap_to_wan_workflow:2117 — số px ĂN MÒN mask khi vượt ngưỡng (âm = co vào). Mặc định -8. Chỉ áp khi không tự truyền maskGrow."
+      },
       "negative_prompt": {
         "line": 1770,
         "why": "build_scail2_swap_workflow:1770 — CLIPTextEncode âm cho SCAIL-2 (chỉ engine scail2)."
@@ -208,6 +216,10 @@
       "swapNegativeExtra": {
         "line": 1769,
         "why": "_apply_swap_to_wan_workflow:1769 — cụm negative CHỈ của swap, nối thêm vào negative gốc để chặn bịa vật thể. Chuỗi rỗng = TẮT (khi cần mẫu cầm sản phẩm thật)."
+      },
+      "swapPositiveExtra": {
+        "line": 2150,
+        "why": "_apply_swap_to_wan_workflow:2150 — cụm positive neo cảnh riêng cho swap ('một người, tay không, không có gì che thân'). Nối thêm vào prompt gốc; rỗng = tắt."
       }
     },
     "api": {},

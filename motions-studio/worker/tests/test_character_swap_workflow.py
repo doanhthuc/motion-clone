@@ -79,6 +79,46 @@ class ApplySwapToWanWorkflowTests(unittest.TestCase):
         self.assertNotIn("bouquet", neg_off)
         self.assertIn("过曝", neg_off)
 
+    def test_mask_phu_qua_nua_khung_thi_THU_lai_va_bo_blockify(self):
+        """Đo thật 22/08: mask người của driver cận cảnh phủ 61% khung (bbox 79%). Wan phải vẽ lại
+        hai phần ba khung mỗi frame trong khi DWPose chỉ có vài khớp đầu-vai để dẫn → nó lấp chỗ
+        trống bằng vật thể bịa (5/8 lần ra CÙNG một cây đàn guitar). Nới mask thêm 10px rồi blockify
+        chỉ làm chỗ trống rộng thêm, nên khi mask đã quá lớn thì phải ĂN MÒN ngược lại."""
+        wf = self._wf({"_driverMaskCoverage": 0.61})
+        self.assertLess(wf["204"]["inputs"]["expand"], 0)      # erode, không grow
+        self.assertNotIn("205", wf)                            # bỏ blockify
+        self.assertEqual(wf["206"]["inputs"]["mask"], ["204", 0])
+        self.assertEqual(wf["81"]["inputs"]["mask"], ["204", 0])
+
+    def test_mask_nho_thi_giu_nguyen_hanh_vi_cu(self):
+        wf = self._wf({"_driverMaskCoverage": 0.30})
+        self.assertEqual(wf["204"]["inputs"]["expand"], 10)
+        self.assertEqual(wf["205"]["inputs"]["block_size"], 16)
+        self.assertEqual(wf["81"]["inputs"]["mask"], ["205", 0])
+
+    def test_chua_do_duoc_do_phu_thi_giu_nguyen_hanh_vi_cu(self):
+        # Probe hỏng / bị tắt → không có số đo. Không được đoán bừa là mask lớn.
+        wf = self._wf()
+        self.assertEqual(wf["204"]["inputs"]["expand"], 10)
+        self.assertIn("205", wf)
+
+    def test_nguoi_dung_ep_tay_thi_ton_trong(self):
+        wf = self._wf({"_driverMaskCoverage": 0.61, "maskGrow": 4, "maskBlockify": 32})
+        self.assertEqual(wf["204"]["inputs"]["expand"], 4)
+        self.assertEqual(wf["205"]["inputs"]["block_size"], 32)
+
+    def test_negative_chan_luon_nhac_cu(self):
+        # Bằng chứng chứ không phòng xa: 5/8 lần chạy dandong5 ra đúng một cây đàn guitar.
+        neg = self._wf()["60"]["inputs"]["negative_prompt"]
+        self.assertIn("guitar", neg)
+        self.assertIn("musical instrument", neg)
+
+    def test_positive_neo_canh_va_tat_duoc(self):
+        pos = self._wf()["60"]["inputs"]["positive_prompt"]
+        self.assertIn("empty hands", pos)
+        self.assertIn("natural body proportions", pos)         # NỐI THÊM, không thay chuỗi gốc
+        self.assertNotIn("empty hands", self._wf({"swapPositiveExtra": ""})["60"]["inputs"]["positive_prompt"])
+
     def test_seed_doi_duoc_va_mac_dinh_van_42(self):
         # Phát hiện 22/08 khi định chạy A/B nhiều seed: WanVideoSampler gắn CỨNG seed 42, nên param
         # 'seed' — vốn đã khai trong batch-params cho character-swap — xưa nay là no-op. Không đổi
@@ -249,6 +289,16 @@ class HeadProbeWorkflowTests(unittest.TestCase):
         self.assertEqual(wf["25"]["inputs"]["filename_prefix"], "pb-ref")
         self.assertEqual(wf["34"]["inputs"]["filename_prefix"], "pb-drv")
         self.assertEqual(wf["24"]["class_type"], "MaskToImage")
+
+    def test_probe_do_luon_do_phu_mask_nguoi(self):
+        """Nhánh thứ ba đo mask NGƯỜI của driver — quyết định có phải thu mask hay không. Đi kèm
+        trong cùng graph vì SAM3 đã nạp sẵn, thêm nhánh gần như miễn phí; tách ra một job riêng là
+        trả tiền nạp checkpoint hai lần."""
+        wf = self._wf(prefix="pb")
+        self.assertEqual(wf["26"]["inputs"]["text"], "person")
+        self.assertEqual(wf["40"]["inputs"]["images"], ["30", 0])       # driver, đúng khung render
+        self.assertEqual(wf["40"]["inputs"]["conditioning"], ["26", 0])
+        self.assertEqual(wf["43"]["inputs"]["filename_prefix"], "pb-per")
 
     def test_prompt_dau_doi_duoc(self):
         self.assertEqual(self._wf(p={"refFrameHeadPrompt": "face"})["21"]["inputs"]["text"], "face")

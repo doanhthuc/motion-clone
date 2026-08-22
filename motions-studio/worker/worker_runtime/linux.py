@@ -1777,10 +1777,10 @@ def build_swap_headprobe_workflow(ref_name, motion_name, W, H, p=None, stride=1,
     prompt = str(p.get("refFrameHeadPrompt") or p.get("ref_frame_head_prompt") or "head").strip() or "head"
     thr = _motion_float(p, "sam3Threshold", "sam3_threshold", default=0.5)
 
-    def _sam3(images_ref):
+    def _sam3(images_ref, cond="21", max_objects=1):
         return {"class_type": "SAM3_VideoTrack", "inputs": {
-            "images": images_ref, "model": ["20", 0], "conditioning": ["21", 0],
-            "detection_threshold": thr, "max_objects": 1, "detect_interval": 1}}
+            "images": images_ref, "model": ["20", 0], "conditioning": [cond, 0],
+            "detection_threshold": thr, "max_objects": max_objects, "detect_interval": 1}}
 
     return {
         "10": {"class_type": "LoadImage", "inputs": {"image": ref_name}},
@@ -1800,6 +1800,18 @@ def build_swap_headprobe_workflow(ref_name, motion_name, W, H, p=None, stride=1,
         "32": {"class_type": "SAM3_TrackToMask", "inputs": {"track_data": ["31", 0], "object_indices": ""}},
         "33": {"class_type": "MaskToImage", "inputs": {"mask": ["32", 0]}},
         "34": {"class_type": "SaveImage", "inputs": {"images": ["33", 0], "filename_prefix": f"{prefix}-drv"}},
+        # ── Nhánh 3: mask NGƯỜI của driver, để đo ĐỘ PHỦ khung. Dùng đúng bộ số của graph chính
+        # (sam3Prompt, max_objects, maskIndices) để con số đo được phản ánh mask thật sẽ dùng khi render.
+        "26": {"class_type": "CLIPTextEncode", "inputs": {
+            "clip": ["20", 1],
+            "text": str(p.get("sam3Prompt") or p.get("sam3_prompt") or "person").strip() or "person"}},
+        "40": _sam3(["30", 0], cond="26",
+                    max_objects=_motion_int(p, "sam3MaxObjects", "sam3_max_objects", default=4)),
+        "41": {"class_type": "SAM3_TrackToMask", "inputs": {
+            "track_data": ["40", 0],
+            "object_indices": str(p.get("maskIndices") or p.get("mask_indices") or "")}},
+        "42": {"class_type": "MaskToImage", "inputs": {"mask": ["41", 0]}},
+        "43": {"class_type": "SaveImage", "inputs": {"images": ["42", 0], "filename_prefix": f"{prefix}-per"}},
     }
 
 
@@ -1827,6 +1839,17 @@ def _comfy_node_images(outputs, node_id):
         except requests.RequestException:
             pass
     return out
+
+
+def _mask_png_coverage(path, thresh=32):
+    """Tỉ lệ diện tích mask trên toàn khung (0..1) — None nếu ảnh hỏng."""
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            b = im.convert("L").point(lambda v: 1 if v > thresh else 0)
+            return sum(b.getdata()) / float(b.width * b.height)
+    except Exception:
+        return None
 
 
 def _mask_png_bbox(path, thresh=32):
@@ -2006,6 +2029,13 @@ def _match_ref_framing_to_driver(job_id, ref_local, motion_local, W, H, p, tmp):
             comfy_upload(ref_local), comfy_upload(motion_local), int(W), int(H),
             p=p, stride=stride, prefix=f"swap-probe-{job_id[:8]}")
         outs = comfy_poll(comfy_submit(wf), job_id, deadline_sec=600)
+        # Đo ĐỘ PHỦ mask người TRƯỚC, và ghi vào p ngay: nó quyết định có thu mask hay không, việc
+        # đó độc lập với chuyện crop có thành công hay không (ref không có mặt vẫn cần thu mask).
+        _covs = [c for c in (_mask_png_coverage(x) for x in _comfy_node_images(outs, "43")) if c is not None]
+        if _covs:
+            p["_driverMaskCoverage"] = sorted(_covs)[len(_covs) // 2]
+            api_log(job_id, f"mask người của driver phủ {100 * p['_driverMaskCoverage']:.0f}% khung "
+                            f"({len(_covs)} frame, lấy trung vị)", "info")
         ref_bb = next((b for b in (_mask_png_bbox(x) for x in _comfy_node_images(outs, "25")) if b), None)
         drv_bbs = [b for b in (_mask_png_bbox(x) for x in _comfy_node_images(outs, "34")) if b]
         if not ref_bb or not drv_bbs:
@@ -2040,7 +2070,16 @@ def _match_ref_framing_to_driver(job_id, ref_local, motion_local, W, H, p, tmp):
 # ALD 22/08/2026 - Cụm negative CHỈ dùng cho character-swap (motion không đụng tới). Tách hằng số ra
 # đây để sửa một chỗ, và để test khẳng định được nội dung thay vì so chuỗi dài trong thân hàm.
 SWAP_NEGATIVE_EXTRA = ("bouquet, flowers, holding objects, hands holding items, "
-                       "extra objects, props, floating objects")
+                       "extra objects, props, floating objects, "
+                       # ALD 22/08/2026 - nhạc cụ là BẰNG CHỨNG chứ không phải phòng xa: 5/8 lần chạy
+                       # dandong5 ra đúng một cây đàn guitar, cùng vị trí cùng góc.
+                       "guitar, musical instrument, ukulele, microphone")
+
+# ALD 22/08/2026 - Positive riêng cho swap. Prompt gốc (MOTION_BASE_POSITIVE) chỉ nói về chất lượng
+# ảnh, không nói gì về NỘI DUNG khung hình, nên với driver cận cảnh Wan tự do diễn giải chỗ trống.
+# Câu này neo vào "một người, tay không, không có gì che thân". Nối thêm, không thay.
+SWAP_POSITIVE_EXTRA = ("the same single person alone in frame with empty hands, "
+                       "unobstructed head and shoulders, nothing held in front of the body")
 
 
 def _apply_swap_to_wan_workflow(wf, p):
@@ -2064,22 +2103,39 @@ def _apply_swap_to_wan_workflow(wf, p):
         "track_data": ["202", 0],
         # rỗng = union mọi người trong video; "0" = chỉ người đầu (chọn khi video đông người)
         "object_indices": str(p.get("maskIndices") or p.get("mask_indices") or "")}}
+    # #region ALD 22/08/2026 - THU MASK khi nó đã phủ quá nửa khung.
+    # Đo thật 22/08 trên dandong5 (selfie cận sát): mask người phủ 61% khung, bbox 79%. Wan phải vẽ
+    # lại hai phần ba mỗi frame trong khi DWPose chỉ có vài khớp đầu-vai để dẫn đường → nó lấp chỗ
+    # trống bằng vật thể bịa, 5/8 lần ra CÙNG một cây đàn guitar. Nới thêm 10px rồi blockify (hợp lý
+    # cho driver toàn thân, mask nhỏ, cần bao trọn viền) chỉ làm chỗ trống rộng thêm. Nên khi mask
+    # đã lớn thì đảo chiều: ăn mòn vào trong và bỏ blockify.
+    # Độ phủ do graph thăm dò đo được (_match_ref_framing_to_driver) — KHÔNG có số đo thì giữ nguyên
+    # hành vi cũ, không đoán bừa. Người dùng ép maskGrow/maskBlockify thì luôn thắng.
+    _cov = p.get("_driverMaskCoverage")
+    _tight = isinstance(_cov, (int, float)) and not isinstance(_cov, bool) \
+        and float(_cov) > _motion_float(p, "maskTightenAbove", "mask_tighten_above", default=0.5)
+    _grow_default = _motion_int(p, "maskTightenErode", "mask_tighten_erode", default=-8) if _tight else 10
+    _blockify = not _tight or _motion_present(p.get("maskBlockify")) or _motion_present(p.get("mask_blockify"))
+    # #endregion
     wf["204"] = {"class_type": "GrowMaskWithBlur", "inputs": {
         "mask": ["203", 0],
-        "expand": _motion_int(p, "maskGrow", "mask_grow", default=10),
+        "expand": _motion_int(p, "maskGrow", "mask_grow", default=_grow_default),
         "incremental_expandrate": 0.0, "tapered_corners": True, "flip_input": False,
         "blur_radius": 0.0, "lerp_alpha": 1.0, "decay_factor": 1.0, "fill_holes": False}}
     # ALD 22/08/2026 - MẶC ĐỊNH 32→16 sau khi đo thật trên pod 21/08. Blockify lấy bounding box của
     # mask rồi tô ĐẦY mọi ô có dính mask, nên ô càng to vùng vẽ lại càng phình ra ngoài dáng người —
     # 32px cho Wan cả một khoảng trống trước bụng để bịa vật thể. 16 vẫn thẳng lưới latent (VAE ×8,
     # patch 2 → bội 16) mà bám sát người hơn. Muốn về hành vi cũ: maskBlockify=32.
-    wf["205"] = {"class_type": "BlockifyMask", "inputs": {
-        "masks": ["204", 0],
-        "block_size": _motion_int(p, "maskBlockify", "mask_blockify", default=16)}}
+    _mask_src = ["204", 0]
+    if _blockify:
+        wf["205"] = {"class_type": "BlockifyMask", "inputs": {
+            "masks": ["204", 0],
+            "block_size": _motion_int(p, "maskBlockify", "mask_blockify", default=16)}}
+        _mask_src = ["205", 0]
     wf["206"] = {"class_type": "DrawMaskOnImage", "inputs": {
-        "image": ["12", 0], "mask": ["205", 0], "color": "0, 0, 0"}}
+        "image": ["12", 0], "mask": _mask_src, "color": "0, 0, 0"}}
     wf["81"]["inputs"]["bg_images"] = ["206", 0]
-    wf["81"]["inputs"]["mask"] = ["205", 0]
+    wf["81"]["inputs"]["mask"] = _mask_src
     # #region ALD 22/08/2026 - CHẶN BỊA VẬT THỂ. Đo thật 21/08 (nhanvat-1 + dandong-2): driver chắp
     # tay sau lưng → DWPose đặt keypoint bàn tay mơ hồ ra phía trước → Wan "giải thích" tư thế bằng
     # cách vẽ BÓ HOA vào tay, bám từ ~frame 60 tới hết clip (frame 0 còn sạch). Cùng họ với bệnh
@@ -2091,6 +2147,10 @@ def _apply_swap_to_wan_workflow(wf, p):
     if _neg_extra and "60" in wf:
         _neg = str(wf["60"]["inputs"].get("negative_prompt") or "").strip().rstrip(",")
         wf["60"]["inputs"]["negative_prompt"] = f"{_neg}, {_neg_extra}" if _neg else _neg_extra
+    _pos_extra = str(p.get("swapPositiveExtra", p.get("swap_positive_extra", SWAP_POSITIVE_EXTRA))).strip()
+    if _pos_extra and "60" in wf:
+        _pos = str(wf["60"]["inputs"].get("positive_prompt") or "").strip().rstrip(",")
+        wf["60"]["inputs"]["positive_prompt"] = f"{_pos}, {_pos_extra}" if _pos else _pos_extra
     # #endregion
     return wf
 
