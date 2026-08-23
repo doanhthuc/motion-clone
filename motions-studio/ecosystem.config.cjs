@@ -161,10 +161,20 @@ apps.push({
     // ALD 24/07/2026 - Khóa profile FlashVSR nhanh đã đo trên RTX 5090:
     // chunk 100 giữ RAM ổn định nhưng KHÔNG spatial tile (tile 4 ô làm mỗi chunk chạy lặp 4 lần,
     // 480 frame tăng từ ~76 giây lên ~17 phút). Ghi tường minh để PM2 không giữ env cũ sau deploy.
+    // ── Con số 100 ở dòng này ĐÃ BỊ THAY bằng 50 ngày 23/08 (xem ngay dưới). Kết luận cốt lõi thì
+    //    vẫn nguyên và còn được củng cố: tile đắt kinh khủng, phải tránh bằng mọi giá.
     MOTION_FLASHVSR_MODE: E.MOTION_FLASHVSR_MODE || "tiny",
     MOTION_FLASHVSR_ATTENTION: E.MOTION_FLASHVSR_ATTENTION || "sparse_sage_attention",
     MOTION_FLASHVSR_TILED: E.MOTION_FLASHVSR_TILED || "0",
-    MOTION_FLASHVSR_CHUNK: E.MOTION_FLASHVSR_CHUNK || "100",
+    // ALD 23/08/2026 - CHUNK 100 → 50. TILED=0 ở trên là ý ĐỊNH, không phải bảo đảm: khi node ước
+    // lượng thiếu VRAM nó TỰ bật tile, và đúng cái giá mà dòng 24/07 sợ lại phải trả. Bắt tận tay:
+    // character-swap bám tỉ lệ driver nên clip 3:4 lên 1080p ra 1450×1920 = 2,78 MP → node báo cần
+    // ~35,7GB, chỉ có 30,5GB → tile 6 mảnh, 33 PHÚT cho clip 15s (log ComfyUI: 10 dòng OOM detected
+    // = 5 chunk × 2 lần thử hỏng). VRAM đỉnh tỉ lệ số frame mỗi chunk, nên 50 → ~17,9GB, lọt, chạy
+    // full-frame: cùng clip còn 4 phút. Hạ chunk chỉ GIẢM VRAM đỉnh nên không thể gây OOM mà 100
+    // tránh được. Job motion (9:16 → 1088×1920 = 2,09 MP) vốn đã lọt ở 100: đo +28% và −4% trên hai
+    // clip, ngược chiều ⇒ trong nhiễu. CHƯA đo: thêm mối nối chunk có thêm giật thời gian không.
+    MOTION_FLASHVSR_CHUNK: E.MOTION_FLASHVSR_CHUNK || "50",
     // ALD 01/07/2026 - GẮN CỨNG, KHÔNG đọc .env (E.JOB_TYPES): job type là DANH MỤC TÍNH NĂNG của code, không
     // phải cấu hình môi trường. Thêm node mới = sửa DÒNG NÀY + PIPELINES trong worker, KHỎI đụng .env từng box
     // (trước đây .env cũ thiếu type mới → job treo queued mãi). Muốn shard 1 box nhận 1 phần thì set env

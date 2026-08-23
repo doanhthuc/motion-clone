@@ -562,3 +562,80 @@ class NormalizePathIntegrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SwapDefault720pTests(unittest.TestCase):
+    """ALD 23/08/2026 - run_character_swap mặc định 720p + maxRenderEdge 1280.
+
+    Vì sao phải khoá bằng test: cả hai chỉ là `setdefault` nằm cạnh `setdefault('preset', ...)`,
+    rất dễ bị xoá kèm khi ai đó dọn phần preset — mà mất chúng thì KHÔNG có triệu chứng nào ngoài
+    việc clip 3:4 lặng lẽ quay về 544×720, enhance rơi lại đường tile 33 phút (đo 23/08: 1995s so
+    với 257s). maxRenderEdge phải đi CÙNG: thiếu nó thì trần mặc định 968 kẹp driver 9:16 ngược về
+    544×960, tức quality=720p một mình không đổi gì cho clip dọc.
+    """
+
+    def _params(self, **over):
+        job = {"inputs": {"ref": "r.png", "video": "d.mp4"}, "params": dict(over)}
+        captured = {}
+        real = linux.run_motion
+        linux.run_motion = lambda j: captured.update(j["params"]) or "ok"
+        try:
+            linux.run_character_swap(job)
+        finally:
+            linux.run_motion = real
+        return captured
+
+    def test_mac_dinh_720p_va_tran_1280(self):
+        p = self._params()
+        self.assertEqual(p["quality"], "720p")
+        self.assertEqual(p["maxRenderEdge"], 1280)
+
+    def test_user_van_ha_ve_540p_duoc(self):
+        # Card <32GB cần đường lui: setdefault không được đè giá trị người dùng gửi.
+        p = self._params(quality="540p", maxRenderEdge=968)
+        self.assertEqual(p["quality"], "540p")
+        self.assertEqual(p["maxRenderEdge"], 968)
+
+    def test_720p_cho_khung_khop_dung_ti_le_driver(self):
+        # Đây là lý do đổi mặc định, nên khoá luôn con số: driver 576×768 (3:4) và 576×1024 (9:16).
+        self.assertEqual(_fit_driver_wh(576, 768, 720, 1280, 16), (720, 960))    # 0,7500 = đúng 3:4
+        self.assertEqual(_fit_driver_wh(576, 1024, 720, 1280, 16), (720, 1280))  # 0,5625 = đúng 9:16
+        # Ở 540p cả hai đều LỆCH tỉ lệ — chính cái 720p sửa.
+        self.assertEqual(_fit_driver_wh(576, 768, 544, 968, 16), (544, 720))     # 0,7556
+        self.assertEqual(_fit_driver_wh(576, 1024, 544, 968, 16), (544, 960))    # 0,5667
+
+    def test_thieu_maxRenderEdge_thi_720p_vo_nghia_voi_clip_doc(self):
+        # Trần 968 kẹp cạnh dài → cạnh ngắn tụt lại 544, y hệt 540p. Bằng chứng maxRenderEdge bắt buộc.
+        self.assertEqual(_fit_driver_wh(576, 1024, 720, 968, 16), (544, 960))
+
+
+class FlashvsrChunkDefaultTests(unittest.TestCase):
+    """ALD 23/08/2026 - frame_chunk_size mặc định 50, KHÔNG phải 100.
+
+    Đây là con số có đo, không phải thẩm mỹ: khung ra 2,78 MP (clip 3:4 lên 1080p — ca thường của
+    character-swap vì nó bám tỉ lệ driver) cần ~35,7GB ở chunk 100, tràn 30,5GB trống của 5090, nên
+    FlashVSR TỰ bật tile bất chấp MOTION_FLASHVSR_TILED=0 → 33 phút cho clip 15s thay vì 4 phút.
+    Ai nâng lại 100 phải đọc docs/gpu-pod.md trước — triệu chứng là chậm 8×, không phải lỗi.
+    """
+
+    def _chunk(self, env=None):
+        """env=None: xoá hẳn biến để đo ĐÚNG giá trị mặc định trong code, không dính env máy chạy test."""
+        with patch.dict(os.environ, env or {}, clear=False):
+            if env is None:
+                os.environ.pop("MOTION_FLASHVSR_CHUNK", None)
+            wf = linux.build_flashvsr_upscale_workflow("v.mp4", 4, 0.5, 30)
+        return wf["30"]["inputs"]["frame_chunk_size"]
+
+    def test_mac_dinh_la_50(self):
+        self.assertEqual(self._chunk(), 50)
+
+    def test_env_ghi_de_duoc(self):
+        self.assertEqual(self._chunk({"MOTION_FLASHVSR_CHUNK": "100"}), 100)
+
+    def test_tiled_van_tat_mac_dinh(self):
+        # chunk 50 tồn tại ĐỂ khỏi phải tile — nếu ai bật tile mặc định thì con số 50 mất ý nghĩa.
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MOTION_FLASHVSR_TILED", None)
+            wf = linux.build_flashvsr_upscale_workflow("v.mp4", 4, 0.5, 30)
+        self.assertFalse(wf["30"]["inputs"]["tiled_vae"])
+        self.assertFalse(wf["30"]["inputs"]["tiled_dit"])

@@ -5185,6 +5185,19 @@ def run_character_swap(job):
         raise RuntimeError(f"character-swap: engine không hỗ trợ: {engine!r} (chọn wananimate | scail2)")
     params["_swapEngine"] = engine
     params.setdefault("preset", "drv-5s")            # fps/frame/tỉ lệ theo driver 1:1 như motion
+    # ALD 23/08/2026 - MẶC ĐỊNH 720p, KHÁC motion (540p). Motion ép khung 9:16 nên cạnh ngắn 544 lên
+    # 1080p chỉ phóng ×2,00; swap bám tỉ lệ driver, mà driver 3:4 ở 544 ra cạnh dài 720 → enhance phải
+    # phóng ×2,67 thành 1450×1920 = 2,78 MP, vượt trần VRAM FlashVSR → tile → 33 phút/clip 15s.
+    # Đo 23/08 trên 5090, 4 cặp ảnh×driver, hai lô chỉ khác đúng 2 dòng này:
+    #   • nét: 544×720 → 720×960 (+76% pixel Wan SINH RA, không phải upscale đoán). Laplacian
+    #     +95%/+36%/+17% trên 3 clip; nhìn 1:1 thì mi tách sợi, tóc ra sợi lẻ, da có lỗ chân lông.
+    #   • khớp khung: 720×960 = 0,7500 ĐÚNG tỉ lệ driver 576×768 (544×720 = 0,7556, lệch → crop nhẹ).
+    #   • RẺ HƠN: cả lô 66 phút GPU so với 107 phút, vì hệ số phóng của enhance nhỏ đi.
+    # maxRenderEdge BẮT BUỘC đi kèm: trần mặc định MOTION_VRAM_MAX_EDGE=968 kẹp driver 9:16 ngược về
+    # 544×960, tức quality=720p một mình KHÔNG đổi gì cho clip dọc (_fit_driver_wh nhánh long0>max_edge).
+    # Card <32GB: 720×1280 × 450 frame nặng hơn baseline đã đo 25,3GB ở 544×960 — gửi quality=540p.
+    params.setdefault("quality", "720p")
+    params.setdefault("maxRenderEdge", 1280)
     # ALD 21/08/2026 - Áp dụng CHUNG cho cả 2 engine: khóa "vóc dáng theo ref" của Motion Transfer mặc định
     # BẬT sẽ ép pose_strength xuống 0.7 trong _normalize_motion_params, sai bộ số cả wananimate lẫn scail2
     # (scail2 không dùng clip_strength nên tắt khóa vô hại).
@@ -9592,8 +9605,15 @@ def build_flashvsr_upscale_workflow(video_name, scale, resize_factor, fps, frame
     _tiled = low_vram or str(os.environ.get("MOTION_FLASHVSR_TILED", "0")).strip().lower() in ("1", "true", "yes", "on")
     _tsize = int(os.environ.get("MOTION_FLASHVSR_TILE_SIZE", "256"))
     _tover = int(os.environ.get("MOTION_FLASHVSR_TILE_OVERLAP", "24"))
-    # 100 frame giữ peak VRAM ổn định cho video 10–20s; clip ngắn hơn vẫn đi nguyên khối.
-    _chunk = int(os.environ.get("MOTION_FLASHVSR_CHUNK", "100"))
+    # ALD 23/08/2026 - 100 → 50. VRAM đỉnh tỉ lệ (frame mỗi chunk × pixel khung ĐẦU RA), và khung ra
+    # 2,78 MP (clip 3:4 lên 1080p = 1450×1920 — character-swap bám tỉ lệ driver nên ca này là thường)
+    # cần ~35,7GB ở chunk 100, tràn 30,5GB trống của 5090 → node TỰ lùi sang tile 6 mảnh, trả giá mỗi
+    # chunk 2 lần thử hỏng + tile: 33 phút cho clip 15s. Ở 50 thì ~17,9GB, full-frame, 4 phút (đo
+    # 23/08, log không còn dòng OOM nào). Chunk nhỏ hơn NHANH hơn — nghịch lý, vì tránh được tile.
+    # Khung ra 2,09 MP (9:16, tức mọi job motion) vốn đã lọt ở chunk 100: đo được +28% ở một clip và
+    # −4% ở clip khác, ngược chiều nhau ⇒ trong nhiễu. Hạ chunk chỉ GIẢM VRAM đỉnh nên không thể gây
+    # OOM mà 100 tránh được; chưa đo là nhiều mối nối hơn có thêm giật thời gian hay không.
+    _chunk = int(os.environ.get("MOTION_FLASHVSR_CHUNK", "50"))
     return {
         "10": {"class_type": "VHS_LoadVideo", "inputs": {"video": video_name, "force_rate": 0, "custom_width": 0,
                "custom_height": 0, "frame_load_cap": int(frame_cap), "skip_first_frames": 0, "select_every_nth": 1, "format": "AnimateDiff"}},

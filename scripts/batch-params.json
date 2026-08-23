@@ -125,6 +125,10 @@
         "line": 1739,
         "why": "_apply_swap_to_wan_workflow:1739 (SAM3_TrackToMask.object_indices) và build_scail2_swap_workflow:1795 (SCAIL2ColoredMask.object_indices) — rỗng = union mọi người, '0' = chỉ người đầu."
       },
+      "maxRenderEdge": {
+        "line": 4847,
+        "why": "run_motion:4847 — trần CẠNH DÀI truyền vào _fit_driver_wh, mặc định env MOTION_VRAM_MAX_EDGE=968. Driver 9:16 ở quality=720p bị trần 968 kẹp ngược về 544×960; phải nâng 1280 mới ra 720×1280. API không tự điền cho character-swap vì enforceMotionResolution return sớm khi type!=='motion'."
+      },
       "negative_prompt": {
         "line": 1770,
         "why": "build_scail2_swap_workflow:1770 — CLIPTextEncode âm cho SCAIL-2 (chỉ engine scail2)."
@@ -144,6 +148,10 @@
       "prompt": {
         "line": 1768,
         "why": "build_scail2_swap_workflow:1768 — fallback của positive_prompt cho WanSCAILToVideo (chỉ engine scail2)."
+      },
+      "quality": {
+        "line": 2661,
+        "why": "_normalize_motion_params:2661 đọc quality để tra _QUALITY_SHORT (540p=544, 720p=720) rồi chốt cạnh ngắn render; run_character_swap không .get('quality') nên AST không thấy. Với swap đây là cần gạt ĐỘ NÉT chính: 720p nâng cạnh ngắn 544→720 VÀ hạ hệ số phóng của chặng enhance."
       },
       "refEnhance": {
         "line": 1849,
