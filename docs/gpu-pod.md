@@ -1682,6 +1682,52 @@ Cạm bẫy đã trả giá trong phiên này (đã vá, xem commit `b0b33bc`):
   phút), copy `motions-studio/.` vào `~/motion-backend/`, rồi chạy lại `make gpu-bootstrap` (rsync
   lúc đó không còn gì để truyền nên đi thẳng sang pod-volume + setup).
 
+### Tỉ lệ khung của driver quyết định enhance nhanh hay chậm — đo 23/08/2026
+
+Swap là job type ĐẦU TIÊN sinh ra video không phải 9:16: nó bám tỉ lệ driver (`fitDriver` mặc định
+bật, vì `enforceMotionResolution()` và `normalizeMotionDriverSegment()` đều `return` sớm khi
+`type !== "motion"`). Hệ quả không ai lường trước, đo trên 4 cặp ảnh×driver, clip 15s @30fps:
+
+| Driver | Swap ra | Enhance 1080p ra | Pixel | Thời gian enhance |
+|---|---|---|---|---|
+| 576×768 (**3:4**) | 544×720 | 1450×1920 | 2,78 MP | **1995s · 2095s** |
+| 576×1024 (**9:16**) | 544×960 | 1088×1920 | 2,09 MP | **200s · 228s** |
+
+Chênh **13,7×** giữa hai clip cùng độ dài, cùng engine, cùng 30,7GB VRAM trống. Lý do: "1080p"
+nghĩa là cạnh DÀI 1920, nên clip 3:4 thấp hơn phải phóng mạnh hơn (×2,67 so ×2,00) và nở ngang
+thành 1450px. FlashVSR cần ~12,8GB mỗi MP đầu ra → 2,78 MP đòi ~35,7GB, tràn 30,5GB trống, node
+tự lùi sang tile 6 mảnh và trả giá **cho từng chunk**: 2 lần thử hỏng (~70s phí) + tile ~6 phút.
+Log ComfyUI đếm đúng 10 dòng `OOM detected` = 5 chunk × 2 lần, toàn bộ thuộc hai clip 3:4.
+
+Khớp lại mốc cũ: job 2K ngày 16/08 (3,71 MP → ~47,6GB) lỗi sau 16,1 phút — cùng một cơ chế.
+
+**Hai cần gạt, mỗi cái chữa một bệnh — đừng nhầm:**
+
+- `quality: 720p` + `maxRenderEdge: 1280` (nay là **mặc định** của `run_character_swap`) chữa ĐỘ NÉT
+  và TỈ LỆ, không chữa tile. Cạnh ngắn render 544→720 (+76% pixel Wan sinh tại chỗ); khung ra
+  720×960 = 0,7500 **đúng** tỉ lệ driver 576×768, còn 544×720 = 0,7556 thì lệch. `maxRenderEdge`
+  bắt buộc đi kèm: trần mặc định 968 kẹp driver 9:16 ngược về 544×960, thiếu nó thì 720p vô nghĩa
+  với clip dọc.
+- `MOTION_FLASHVSR_CHUNK` mới chữa TILE, và **mặc định đã đổi 100 → 50** (23/08,
+  `ecosystem.config.cjs` + fallback trong `linux.py`; `.env` ghi đè được, pod-bootstrap chuyển tiếp).
+  VRAM tỉ lệ với số frame mỗi chunk, chia đôi là lọt: 0 dòng OOM, chạy full-frame. Nghịch lý —
+  chunk nhỏ hơn lại **nhanh hơn ~8×** vì tránh được tile. Lưu ý `MOTION_FLASHVSR_TILED=0` chỉ là ý
+  định chứ không phải bảo đảm: thiếu VRAM thì node TỰ bật tile, đúng cái giá mà dòng 24/07 sợ.
+  Mặc định mới áp cho CẢ job motion — khung ra 2,09 MP vốn đã lọt ở 100 nên không được lợi gì, đo
+  +28% ở một clip và −4% ở clip khác (ngược chiều ⇒ trong nhiễu). Chỉ chạy 9:16 và muốn ít mối nối
+  nhất thì đặt lại `MOTION_FLASHVSR_CHUNK=100` trong `.env`.
+
+Đo bản 720p + chunk 50 trên đúng 4 cặp đó: enhance 257s · 290s · 257s · 218s, và **cả lô tốn 66
+phút GPU so với 107 phút** của bản 540p. Nét hơn mà rẻ hơn. Laplacian vùng mặt +95%/+36%/+17% trên
+3 clip (clip thứ 4 −3%, nhưng thước toàn khung bị nền chi phối và hai bản là hai lần sinh độc lập
+nên frame không trùng tư thế — cắt vào mặt thì cả 4 đều nét hơn thấy rõ: mi tách sợi, tóc ra sợi
+lẻ, da có lỗ chân lông).
+
+Chưa đo: chunk 50 có thêm mối nối nên về lý có thể thêm giật thời gian; với khung ra 2,09 MP (vốn
+đã lọt ở chunk 100) hai phép đo cho +28% và −4%, ngược chiều nhau nên chưa kết luận được.
+
+**Card <32GB**: 720×1280 × 450 frame nặng hơn baseline 25,3GB đã đo ở 544×960 — gửi `quality: 540p`.
+
 ## Kiểm chứng sau khi dựng: `make gpu-smoke`
 
 `make gpu-status` chỉ curl `/health`. Mà `/health` là một handler tĩnh
