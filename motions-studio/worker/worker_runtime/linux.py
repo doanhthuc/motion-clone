@@ -5205,7 +5205,21 @@ def run_character_swap(job):
     if engine == "wananimate":
         # Bộ số theo example WanAnimate replacement của kijai (KHÁC tuning animation-mode của motion:
         # 0.7/0.8 bên đó trị "driver cấp vóc dáng" — swap thì người trong video là khung sẵn).
-        params.setdefault("lora_relight", 1.0)       # relight LoRA sinh ra riêng cho Mix mode
+        # ALD 23/08/2026 - 1.0 → 0.5. Mốc 1.0 cũ chỉ chép từ example WanAnimate replacement của kijai,
+        # không có A/B nào của repo đứng sau. Ở 1.0 LoRA relight kéo da NHỢT đi: đo t=6s trên dandong8,
+        # vùng da thân cr=R/G chỉ còn 1,221 so với driver 1,321; hạ 0.5 lên 1,276 = khép 55% khoảng
+        # cách (vùng mặt 1,200 → 1,235). Mọi luồng khác trong repo đều khoá relight 0 (motion mặc định
+        # 0.0, teen-flycam 7186 và trend-tiktok 6963 ép cứng 0 kèm negative "white glowing skin /
+        # wax skin") — swap là ngoại lệ duy nhất, và không có lý do nào được ghi lại.
+        # ĐÃ QUÉT NỐT 24/08 (out/2026-08-24-0945) — 0.5 là điểm dừng, ĐỪNG hạ tiếp:
+        #   relight   1.00   0.50   0.25   0.00      (driver: da thân cr 1,321 · Y 85,7)
+        #   da thân cr 1,221  1,276  1,281  1,264 ← đỉnh ở 0,25–0,5 rồi TỤT LẠI ở 0
+        #   da thân Y  89,1   91,3   93,6   95,4 ← trôi xa driver đều đặn, da sáng hơn bối cảnh
+        # 0.25 chỉ thêm 0,005 cr (nhiễu) mà đổi lấy +2,3 độ sáng. User đã soi mắt và chốt 0.5.
+        # Mặt trái "người dán vào cảnh" chưa thấy rõ ở mốc nào, nhưng cũng không có lợi ích để xuống thấp hơn.
+        # Cảnh báo cho ai đo lại: PHẢI đo trên vùng NGƯỜI. Lần đầu tôi chấm ô A/B này bằng vùng nền —
+        # đúng chỗ relight không đụng tới — nên ra +3% và kết luận nhầm là "mức nhiễu".
+        params.setdefault("lora_relight", 0.5)       # relight LoRA sinh ra riêng cho Mix mode
         params.setdefault("pose_strength", 1.0)
         params.setdefault("face_strength", 1.0)
         # ALD 21/08/2026 - Replacement mode không hỗ trợ pose-retarget; chặn cả env MOTION_POSE_RETARGET=1 sót lại.
