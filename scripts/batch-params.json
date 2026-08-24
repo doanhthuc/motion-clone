@@ -213,6 +213,14 @@
         "line": 1830,
         "why": "build_scail2_swap_workflow:1830 (BasicScheduler.steps) — run_character_swap:4767 chỉ setdefault=6 (turbo), không .get(); _normalize_motion_params:2097 cố ý KHÔNG ép về MOTION_FAST_STEPS cho scail2 (xem #1 review 21/08/2026)."
       },
+      "swapColorAnchor": {
+        "line": 0,
+        "why": "_apply_swap_color_anchor (linux.py) — bật/tắt pass neo màu theo driver. Đọc ngoài hàm run_* nên AST mù. Đặt 0 khi A/B thứ khác, nếu không pass sẽ sửa màu hậu kỳ và làm nhiễu phép so sánh."
+      },
+      "swapColorAnchorMinPct": {
+        "line": 0,
+        "why": "_apply_swap_color_anchor (linux.py) — ngưỡng % lệch dưới đó thì bỏ qua encode (mặc định 1.2)."
+      },
       "swapNegativeExtra": {
         "line": 1769,
         "why": "_apply_swap_to_wan_workflow:1769 — cụm negative CHỈ của swap, nối thêm vào negative gốc để chặn bịa vật thể. Chuỗi rỗng = TẮT (khi cần mẫu cầm sản phẩm thật)."

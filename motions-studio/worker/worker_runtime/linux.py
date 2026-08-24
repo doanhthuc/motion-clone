@@ -537,6 +537,77 @@ def _apply_motion_drift_fix(src_mp4, ref_image, tmp_dir, params, job_id):
 # #endregion
 
 
+# #region ALD 23/08/2026 - NEO MÀU THEO DRIVER cho character-swap (đối xứng với drift-fix của motion).
+# Vì sao motion và swap cần HAI pass khác nhau: drift-fix neo về 1s đầu CỦA CHÍNH CLIP vì với motion
+# thì không có gì bên ngoài để đối chiếu (background do ảnh mẫu sinh ra) — nó chỉ triệt được DRIFT
+# theo thời gian, không biết màu đúng là màu gì. Với swap thì DRIVER chính là chân lý cho nền, nên
+# neo được theo chính driver, từng frame một, và sửa được cả OFFSET tổng thể lẫn drift.
+# Bệnh: nền ở chế độ Mix không phải bản sao pixel của driver mà là frame driver đục lỗ rồi chạy lại
+# qua VAE → nén chroma. Đo 23/08: clip nền phức tạp giữ 53% biên độ cr, mất 29% SAT; clip nền đơn
+# giản bám driver trong ±2/255. Vì thế min-drift 1.2% cho pass TỰ BỎ QUA clip sạch (đo thật: clip
+# bệnh 2.21%, ba clip lành 0.77/0.55/0.21% — biên 2.9×), khỏi tốn một thế hệ nén vô ích.
+# Đã loại đường sửa ở tầng render: lô A/B 5 ô ngày 23/08 cho thấy negative prompt vô tác dụng (sampler
+# chạy cfg=1 nên nhánh unconditional không được đánh giá — ba ô ra khung hình TRÙNG BYTE), positive
+# prompt +2%, lora_relight 1.0→0.5 +3%. Xem worker/tools/swap_color_anchor.py.
+# MẶC ĐỊNH BẬT (param swapColorAnchor=0 / env SWAP_COLOR_ANCHOR_DEFAULT=0 để tắt).
+# Fail-safe tuyệt đối: mọi lỗi = warn + GIỮ output gốc.
+SWAP_COLOR_ANCHOR_SCRIPT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                        "tools", "swap_color_anchor.py")
+def _apply_swap_color_anchor(src_mp4, driver_mp4, tmp_dir, params, job_id):
+    _default = os.environ.get("SWAP_COLOR_ANCHOR_DEFAULT", "1")
+    on = str(params.get("swapColorAnchor", params.get("swap_color_anchor", _default))).strip().lower() \
+        in ("1", "true", "yes", "on")
+    if not on:
+        return src_mp4
+    if not os.path.isfile(SWAP_COLOR_ANCHOR_SCRIPT):
+        api_log(job_id, f"neo màu bật nhưng thiếu {SWAP_COLOR_ANCHOR_SCRIPT} (git pull lại worker) — bỏ qua", "warn")
+        return src_mp4
+    if not (driver_mp4 and os.path.isfile(str(driver_mp4))):
+        api_log(job_id, "neo màu: không có driver cục bộ để đối chiếu — bỏ qua", "warn")
+        return src_mp4
+    try:
+        _min_drift = float(params.get("swapColorAnchorMinPct",
+                                      os.environ.get("SWAP_COLOR_ANCHOR_MIN_PCT", "1.2")) or 1.2)
+    except Exception:
+        _min_drift = 1.2
+    dst = os.path.join(tmp_dir, "coloranchor.mp4")
+    _dur = _probe_dur(src_mp4)
+    cmd = [sys.executable, SWAP_COLOR_ANCHOR_SCRIPT, src_mp4, "--driver", str(driver_mp4),
+           "-o", dst, "--quiet", "--min-drift", f"{_min_drift:.3f}", "--crf", "16", "--preset", "medium"]
+    api_progress(job_id, 0.93, "neo màu theo video gốc")
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=max(900, int((_dur or 30) * 30)))
+        info = {}
+        for line in reversed((r.stdout or "").splitlines()):
+            if line.startswith("COLORANCHOR_JSON "):
+                try:
+                    info = json.loads(line[len("COLORANCHOR_JSON "):])
+                except Exception:
+                    info = {}
+                break
+        if r.returncode != 0:
+            api_log(job_id, f"neo màu lỗi (giữ output gốc): {((r.stderr or '') + (r.stdout or ''))[-400:]}", "warn")
+            return src_mp4
+        _bef = info.get("before") or {}
+        _aft = info.get("after") or {}
+        if not info.get("applied"):
+            api_log(job_id, f"Neo màu: bỏ qua ({info.get('note') or 'không cần sửa'})", "info")
+            return src_mp4
+        if not (os.path.isfile(dst) and os.path.getsize(dst) > 1024):
+            api_log(job_id, "neo màu báo xong nhưng file rỗng — giữ output gốc", "warn")
+            return src_mp4
+        api_log(job_id, f"Neo màu theo driver xong: lệch cr {_bef.get('cr', 0)}%→{_aft.get('cr', 0)}%, "
+                        f"cb {_bef.get('cb', 0)}%→{_aft.get('cb', 0)}%", "info")
+        return dst
+    except subprocess.TimeoutExpired:
+        api_log(job_id, "neo màu quá thời gian (giữ output gốc)", "warn")
+    except Exception as e:
+        api_log(job_id, f"neo màu lỗi (giữ output gốc): {e}", "warn")
+    return src_mp4
+# #endregion
+
+
 
 
 def _apply_ref_grade_video(src_mp4, ref_image, tmp_dir, params, job_id):
@@ -5158,6 +5229,10 @@ def run_motion(job):
         # drift-fix grade màu THEO ẢNH REF — đúng cho motion (background từ ảnh), SAI cho swap
         # (background từ video): sẽ kéo tông video về tông ảnh mẫu.
         out_mp4 = _apply_motion_drift_fix(out_mp4, ref_local, tmp, params, job_id)
+    else:
+        # ALD 23/08/2026 - swap có chân lý màu TỐT HƠN ảnh mẫu: chính driver. Neo theo nó, từng frame.
+        # motion_local = đúng đoạn driver đã nạp vào Wan (đã cắt/đổi fps/pad) nên frame khớp 1-1.
+        out_mp4 = _apply_swap_color_anchor(out_mp4, motion_local, tmp, params, job_id)
     out_mp4 = _apply_motion_detail_upscale(out_mp4, tmp, params, job_id)  # ALD 17/07 - ESRGAN làm nét TRƯỚC delivery (trị lớp blur)
     api_progress(job_id, 0.94, "chuẩn hoá đầu ra phát hành")
     out_mp4, _delivery_applied = _apply_motion_delivery(out_mp4, tmp, params, job_id)
