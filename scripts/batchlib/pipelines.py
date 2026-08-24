@@ -64,6 +64,10 @@ STAGES: dict[str, Stage] = {
 }
 
 PIPELINES: dict[str, list[str]] = {
+    # ALD 23/08/2026 - swap TRẦN, không enhance: dùng cho A/B màu. Đo trên 4 cặp 23/08 thì enhance
+    # (Lanczos lẫn FlashVSR) lệch màu ≤2/255 so với đầu vào, nên với A/B về MÀU nó chỉ tốn GPU chứ
+    # không đổi kết luận. A/B về NÉT thì vẫn phải chạy character-swap-enhance.
+    "character-swap": ["character-swap"],
     "motion-enhance": ["motion", "enhance"],
     "tryon-motion-enhance": ["tryon", "motion", "enhance"],
     "character-swap-enhance": ["character-swap", "enhance"],

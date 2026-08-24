@@ -489,7 +489,9 @@ class RunCharacterSwapTests(unittest.TestCase):
         self.assertEqual(job["inputs"]["motion"], "a/drv.mp4")
         p = job["params"]
         self.assertEqual(p["_swapEngine"], "wananimate")
-        self.assertEqual(p["lora_relight"], 1.0)      # relight LoRA sinh ra cho Mix mode
+        # ALD 23/08/2026 - 1.0 → 0.5: ở 1.0 relight kéo da nhợt (da thân cr 1,221 vs driver 1,321).
+        # Xem chú thích ở run_character_swap. pose/face vẫn giữ 1.0 theo example kijai.
+        self.assertEqual(p["lora_relight"], 0.5)      # relight LoRA sinh ra cho Mix mode
         self.assertEqual(p["pose_strength"], 1.0)     # bộ số theo example kijai replacement
         self.assertEqual(p["face_strength"], 1.0)
         self.assertEqual(p["preset"], "drv-5s")
@@ -553,9 +555,11 @@ class NormalizePathIntegrationTests(unittest.TestCase):
         self.assertIs(p["fitDriver"], False)
 
     def test_wananimate_giu_relight_pose_face_1(self):
+        """pose/face giữ 1.0 theo example kijai; relight hạ 0.5 từ 23/08 (da nhợt) — xem
+        run_character_swap. Tên hàm giữ nguyên để khỏi đứt liên kết với các ghi chú cũ."""
         p = self._normalized_params("wananimate")
         wf = _apply_swap_to_wan_workflow(build_wan_workflow("ref.png", "drv.mp4", p), p)
-        self.assertEqual(wf["40"]["inputs"]["strength_0"], 1.0)        # relight LoRA
+        self.assertEqual(wf["40"]["inputs"]["strength_0"], 0.5)        # relight LoRA
         self.assertEqual(wf["81"]["inputs"]["pose_strength"], 1.0)     # WanVideoAnimateEmbeds
         self.assertEqual(wf["81"]["inputs"]["face_strength"], 1.0)
 
