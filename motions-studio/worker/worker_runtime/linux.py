@@ -4127,6 +4127,80 @@ def _gemini_tryon_prompt_base(gt):
             f"identical. Photorealistic; output only the edited photo.")
 
 QWEN_EDIT_MAX_REFS = int(os.environ.get("QWEN_EDIT_MAX_REFS", "3"))
+
+# ───────────────────────── Qwen-Image (DashScope Model Studio) — provider='qwen-max' & fallback Gemini ─────────────────────────
+# ALD 25/08/2026 - "Qwen Max" theo yêu cầu user = Qwen-Image (image-edit) của Alibaba Model Studio, KHÔNG phải
+# LLM text Qwen-Max — dùng để: (1) provider='qwen-max' chọn thẳng qua node/param (khác 'qwen' = ComfyUI
+# self-host cũ), (2) tự rớt (fallback) khi provider='gemini' lỗi/hết quota và TRYON_GEMINI_FALLBACK=1 trên worker.
+# ALD 25/08/2026 - qwen-image-3.0-pro đang limited preview (Alibaba yêu cầu apply access qua Model Gallery
+# trước khi key gọi được — key user 25/08 CHƯA được duyệt) → mặc định về qwen-image-edit-plus (bản GA, không
+# cần xin quyền). Được duyệt 3.0 → set env QWEN_IMAGE_MODEL=qwen-image-3.0-pro để dùng lại, không cần sửa code.
+QWEN_IMAGE_MODEL = os.environ.get("QWEN_IMAGE_MODEL", "qwen-image-edit-plus")
+# Endpoint multimodal-generation/generation của họ Qwen-Image gắn Workspace ID vào HOST (khác dashscope-intl
+# .aliyuncs.com dùng cho video-generation ở _dashscope_i2v) — set QWEN_IMAGE_WORKSPACE (Workspace ID Model
+# Studio) + QWEN_IMAGE_REGION (mặc định Singapore). QWEN_IMAGE_BASE ghi đè toàn bộ URL nếu Alibaba đổi pattern.
+QWEN_IMAGE_WORKSPACE = os.environ.get("QWEN_IMAGE_WORKSPACE", "").strip()
+QWEN_IMAGE_REGION = os.environ.get("QWEN_IMAGE_REGION", "ap-southeast-1").strip()
+QWEN_IMAGE_BASE = os.environ.get("QWEN_IMAGE_BASE", "").strip()
+# Key: ưu tiên node API Key (Type: dashscope, giống _dashscope_i2v/_dashscope_animate) → env DASHSCOPE_API_KEY
+# (giống cơ chế khôi phục GEMINI_API_KEY 20/08 — dùng nhanh cho fallback khỏi nối node riêng mỗi lần).
+DASHSCOPE_API_KEY_ENV = os.environ.get("DASHSCOPE_API_KEY", "").strip()
+# Tự rớt Gemini→Qwen-Max khi Gemini lỗi/hết quota — mặc định TẮT (giữ nguyên hành vi cũ, tránh âm thầm đổi
+# kết quả). Bật bằng cách set env này = 1 trên worker.
+TRYON_GEMINI_FALLBACK = str(os.environ.get("TRYON_GEMINI_FALLBACK", "")).strip().lower() in ("1", "true", "yes", "on")
+
+def _qwen_key(params):
+    """Key DashScope cho Qwen-Max: node (apiKey/dashscopeApiKey) → env DASHSCOPE_API_KEY."""
+    return (params.get("apiKey") or params.get("dashscopeApiKey") or DASHSCOPE_API_KEY_ENV or "").strip()
+
+def _qwen_image_url():
+    if QWEN_IMAGE_BASE:
+        return f"{QWEN_IMAGE_BASE.rstrip('/')}/api/v1/services/aigc/multimodal-generation/generation"
+    if not QWEN_IMAGE_WORKSPACE:
+        raise RuntimeError("Qwen-Max try-on cần QWEN_IMAGE_WORKSPACE (Workspace ID Alibaba Model Studio) — "
+                           "set env trên worker (console.alibabacloud.com > Model Studio > workspace), hoặc set "
+                           "QWEN_IMAGE_BASE để tự ghi đè URL.")
+    return (f"https://{QWEN_IMAGE_WORKSPACE}.{QWEN_IMAGE_REGION}.maas.aliyuncs.com"
+            "/api/v1/services/aigc/multimodal-generation/generation")
+
+def _qwen_max_edit(images, prompt, key, out_path, negative_prompt=None, model=None):
+    """Qwen-Image edit (DashScope Model Studio) — provider='qwen-max' hoặc fallback của Gemini. images=[(bytes,mime),…]
+    (cap QWEN_EDIT_MAX_REFS, docs Alibaba giới hạn 1-3 ảnh/lần) + prompt → ghi ảnh ra out_path. Call ĐỒNG BỘ
+    (không async submit+poll như _dashscope_i2v/_dashscope_animate — multimodal-generation trả ảnh ngay, ảnh
+    sống trên OSS 24h nên tải về liền qua _hf_fetch). Raise nếu lỗi/không trả ảnh."""
+    content = [{"image": f"data:{mime};base64,{base64.b64encode(data).decode()}"}
+               for data, mime in images[:QWEN_EDIT_MAX_REFS]]
+    content.append({"text": prompt})
+    body = {"model": model or QWEN_IMAGE_MODEL,
+            "input": {"messages": [{"role": "user", "content": content}]},
+            "parameters": {"watermark": False}}
+    if negative_prompt:
+        body["parameters"]["negative_prompt"] = negative_prompt
+    r = requests.post(_qwen_image_url(), headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+                      json=body, timeout=180)
+    if r.status_code != 200:
+        raise RuntimeError(f"Qwen-Max API {r.status_code}: {r.text[:300]}")
+    try:
+        img_url = r.json()["output"]["choices"][0]["message"]["content"][0]["image"]
+    except (KeyError, IndexError, TypeError):
+        raise RuntimeError(f"Qwen-Max không trả ảnh: {json.dumps(r.json())[:300]}")
+    return _hf_fetch(img_url, out_path)
+
+def _tryon_gemini_or_fallback(job_id, params, images, gem_prompt, gem_key, out_path, aspect_ratio, qwen_prompt, qwen_negative=None):
+    """Gọi Gemini image-edit; lỗi (quota/500/network…) + TRYON_GEMINI_FALLBACK bật + có key Qwen-Max/DashScope
+    → tự rớt sang Qwen-Max thay vì fail job. Mặc định TẮT (raise thẳng lỗi Gemini, giữ hành vi cũ)."""
+    try:
+        return _gemini_edit(images, gem_prompt, gem_key, out_path, aspect_ratio=aspect_ratio)
+    except Exception as e:
+        if not TRYON_GEMINI_FALLBACK:
+            raise
+        qwen_key = _qwen_key(params)
+        if not qwen_key:
+            api_log(job_id, f"Gemini lỗi ({e}) — TRYON_GEMINI_FALLBACK bật nhưng thiếu key Qwen-Max/DashScope, giữ nguyên lỗi Gemini", "warn")
+            raise
+        api_log(job_id, f"Gemini lỗi ({e}) — fallback sang Qwen-Max ({QWEN_IMAGE_MODEL})", "warn")
+        return _qwen_max_edit(images, qwen_prompt, qwen_key, out_path, negative_prompt=qwen_negative)
+
 CREATE_IMAGE_CFG = float(os.environ.get("CREATE_IMAGE_CFG", "2.5"))  # ALD 11/06/2026 - 3.2→2.5: CFG cao đốt màu, da bóng kiểu render; 2.5 = mặc định template Qwen-Image(-Edit) của ComfyUI
 # ALD 13/06/2026 - steps render chính. 25→30 (mặc định): thêm bước giúp chi tiết tay/mặt/vải ổn hơn (đổi lại ~+20% thời gian).
 CREATE_IMAGE_STEPS = int(os.environ.get("CREATE_IMAGE_STEPS", "30"))
@@ -5431,7 +5505,7 @@ def run_tryon(job):
     # bận/chết vẫn chạy được; trước đây gemini vẫn upload phí và phụ thuộc ComfyUI vô cớ).
     provider = str(params.get("provider") or "qwen").lower().strip()
     m_name = p_name = None; p_names = []
-    if provider not in ("gemini", "huggingface"):
+    if provider not in ("gemini", "huggingface", "qwen-max"):
         api_progress(job_id, 0.15, "upload vào ComfyUI")
         m_name = comfy_upload(m_local)
         p_names = [comfy_upload(p) for p in p_locals]
@@ -5491,13 +5565,18 @@ def run_tryon(job):
             with open(p, "rb") as f: parts.append((f.read(), _mime(p)))
         out = os.path.join(tmp, "gemini_tryon.png")
         prompt_g = _gemini_tryon_prompt(garment, extra=extra_en)
+        # ALD 25/08/2026 - prompt tương đương bên Qwen-Image, dùng khi TRYON_GEMINI_FALLBACK rớt sang Qwen-Max.
+        pos_q, neg_q = _qwen_tryon_prompts(garment, extra=extra_en)
         # ALD 16/08/2026 - khôi phục đa-góc: p_locals có thể là 2 ảnh CÙNG sản phẩm (parts đã gửi hết bên trên).
         if len(p_locals) > 1:
             prompt_g += (" The two product images show the SAME single product from two angles — typically the "
                          "front and the back. Use both views only to render that ONE product accurately; "
                          "the second product image is NOT an additional garment to add.")
-        _gemini_edit(parts, prompt_g, gem_key, out,
-                     aspect_ratio=_gemini_aspect(_img_size(m_local)))
+            pos_q += (" The two product images show the SAME single product from two angles — typically the "
+                      "front and the back. Use both views only to render that ONE product accurately; "
+                      "the second product image is NOT an additional garment to add.")
+        _tryon_gemini_or_fallback(job_id, params, parts, prompt_g, gem_key, out,
+                                  _gemini_aspect(_img_size(m_local)), pos_q, qwen_negative=neg_q)
         # ALD 16/08/2026 - Ghép nền pass 2 (Gemini): ảnh 1 = kết quả thay đồ, ảnh 2 = bối cảnh. Tách pass riêng
         # (không nhét nền vào pass thay đồ) để mỗi lệnh 1 việc — cùng triết lý pass 2 của nhánh Qwen.
         if bg_local:
@@ -5505,8 +5584,40 @@ def run_tryon(job):
             with open(out, "rb") as f: ob = f.read()
             with open(bg_local, "rb") as f: bb = f.read()
             out2 = os.path.join(tmp, "gemini_tryon_bg.png")
-            _gemini_edit([(ob, "image/png"), (bb, _mime(bg_local))], _TRYON_BG_POS, gem_key, out2,
-                         aspect_ratio=_gemini_aspect(_img_size(out)))
+            _tryon_gemini_or_fallback(job_id, params, [(ob, "image/png"), (bb, _mime(bg_local))], _TRYON_BG_POS,
+                                      gem_key, out2, _gemini_aspect(_img_size(out)), _TRYON_BG_POS,
+                                      qwen_negative=_TRYON_BG_NEG)
+            out = out2
+        out = _tryon_postprocess(out, params, job_id)
+        api_progress(job_id, 0.95, "upload output")
+        api_upload_output(job_id, out, content_type="image/png")
+        return out
+    # ALD 25/08/2026 - provider='qwen-max' → Qwen-Image cloud (DashScope Model Studio), CHỌN THẲNG qua flag —
+    # khác 'qwen' mặc định (ComfyUI self-host). Cùng prompt/pass2 như nhánh HF (họ Qwen-Image-Edit, provider-agnostic).
+    if provider == "qwen-max":
+        qwen_key = _qwen_key(params)
+        if not qwen_key:
+            raise RuntimeError("Qwen-Max try-on cần API key — nối node API Key (Type: dashscope) vào cổng API key "
+                               "của node, đặt env DASHSCOPE_API_KEY trên worker, hoặc đổi Provider = Qwen (self-host, không cần key).")
+        api_progress(job_id, 0.3, f"Qwen-Max image-edit ({QWEN_IMAGE_MODEL})")
+        with open(m_local, "rb") as f: mb = f.read()
+        parts = [(mb, _mime(m_local))]
+        for p in p_locals:
+            with open(p, "rb") as f: parts.append((f.read(), _mime(p)))
+        out = os.path.join(tmp, "qwen_max_tryon.png")
+        pos_q, neg_q = _qwen_tryon_prompts(garment, extra=extra_en)
+        if len(p_locals) > 1:
+            pos_q += (" The two product images show the SAME single product from two angles — typically the "
+                      "front and the back. Use both views only to render that ONE product accurately; "
+                      "the second product image is NOT an additional garment to add.")
+        _qwen_max_edit(parts, pos_q, qwen_key, out, negative_prompt=neg_q)
+        if bg_local:
+            api_progress(job_id, 0.8, "ghép nền (Qwen-Max pass 2)")
+            with open(out, "rb") as f: ob = f.read()
+            with open(bg_local, "rb") as f: bb = f.read()
+            out2 = os.path.join(tmp, "qwen_max_tryon_bg.png")
+            _qwen_max_edit([(ob, "image/png"), (bb, _mime(bg_local))], _TRYON_BG_POS, qwen_key, out2,
+                          negative_prompt=_TRYON_BG_NEG)
             out = out2
         out = _tryon_postprocess(out, params, job_id)
         api_progress(job_id, 0.95, "upload output")

@@ -259,7 +259,8 @@
       ],
       "engine": [
         "flashvsr",
-        "seedvr2"
+        "seedvr2",
+        "lanczos"
       ],
       "mode": [
         "auto",

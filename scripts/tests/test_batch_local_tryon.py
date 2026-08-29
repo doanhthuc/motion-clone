@@ -179,6 +179,137 @@ class TestTranslateVnToEn(GeminiServerCase):
         self.assertEqual(out, "giữ nguyên vòng cổ")
 
 
+DASHSCOPE_STATE = {"mode": "image", "calls": 0}
+
+
+class DashscopeHandler(BaseHTTPRequestHandler):
+    def log_message(self, *_a):
+        pass
+
+    def do_POST(self):
+        DASHSCOPE_STATE["calls"] += 1
+        length = int(self.headers["content-length"])
+        self.rfile.read(length)
+        mode = DASHSCOPE_STATE["mode"]
+        if mode == "http_error":
+            self.send_response(400)
+            body = b'{"code":"InvalidApiKey","message":"bad key"}'
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if mode == "no_image":
+            payload = {"output": {"choices": [{"message": {"content": []}}]}}
+        else:
+            payload = {"output": {"choices": [{"message": {"content": [
+                {"image": f"{self.server.base_url}/img.png"}]}}]}}
+        body = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/img.png":
+            body = b"fake-qwen-png-bytes"
+            self.send_response(200)
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_response(404)
+        self.end_headers()
+
+
+class DashscopeServerCase(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.server = HTTPServer(("127.0.0.1", 0), DashscopeHandler)
+        host, port = cls.server.server_address
+        cls.base_url = f"http://{host}:{port}"
+        cls.server.base_url = cls.base_url  # đọc lại trong handler để build URL ảnh trả về
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def setUp(self):
+        DASHSCOPE_STATE["mode"] = "image"
+        DASHSCOPE_STATE["calls"] = 0
+
+
+class TestQwenImageUrl(unittest.TestCase):
+    def test_thieu_workspace_raise_joberror(self):
+        with mock.patch.object(lt, "QWEN_IMAGE_WORKSPACE", ""), \
+             mock.patch.object(lt, "QWEN_IMAGE_BASE", ""):
+            with self.assertRaises(JobError):
+                lt._qwen_image_url()
+
+    def test_co_workspace_dung_pattern_maas(self):
+        with mock.patch.object(lt, "QWEN_IMAGE_WORKSPACE", "ws-123"), \
+             mock.patch.object(lt, "QWEN_IMAGE_REGION", "ap-southeast-1"), \
+             mock.patch.object(lt, "QWEN_IMAGE_BASE", ""):
+            url = lt._qwen_image_url()
+        self.assertEqual(url, "https://ws-123.ap-southeast-1.maas.aliyuncs.com"
+                              "/api/v1/services/aigc/multimodal-generation/generation")
+
+    def test_base_override_thang_dung_khong_can_workspace(self):
+        with mock.patch.object(lt, "QWEN_IMAGE_WORKSPACE", ""), \
+             mock.patch.object(lt, "QWEN_IMAGE_BASE", "https://custom.example.com/"):
+            url = lt._qwen_image_url()
+        self.assertEqual(url, "https://custom.example.com/api/v1/services/aigc/multimodal-generation/generation")
+
+
+class TestQwenMaxEdit(DashscopeServerCase):
+    def test_thanh_cong_ghi_ra_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "out.png"
+            with mock.patch.object(lt, "QWEN_IMAGE_BASE", self.base_url):
+                result = lt.qwen_max_edit([(b"model-bytes", "image/jpeg")], "edit prompt", "sk-fake", out)
+            self.assertEqual(result, out)
+            self.assertEqual(out.read_bytes(), b"fake-qwen-png-bytes")
+
+    def test_http_loi_raise_joberror(self):
+        DASHSCOPE_STATE["mode"] = "http_error"
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(lt, "QWEN_IMAGE_BASE", self.base_url):
+                with self.assertRaises(JobError) as cm:
+                    lt.qwen_max_edit([(b"x", "image/png")], "p", "sk-fake", Path(d) / "o.png")
+            self.assertIn("400", str(cm.exception))
+
+    def test_khong_tra_anh_raise_joberror(self):
+        DASHSCOPE_STATE["mode"] = "no_image"
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(lt, "QWEN_IMAGE_BASE", self.base_url):
+                with self.assertRaises(JobError):
+                    lt.qwen_max_edit([(b"x", "image/png")], "p", "sk-fake", Path(d) / "o.png")
+
+
+class TestQwenTryonPrompts(unittest.TestCase):
+    def test_auto_khong_bia_do(self):
+        pos, neg = lt.qwen_tryon_prompts("auto")
+        self.assertIn("Copy the ENTIRE look", pos)
+        self.assertIn("different person", neg)
+
+    def test_shoes_rieng(self):
+        pos, _ = lt.qwen_tryon_prompts("shoes")
+        self.assertIn("BOTH", pos)
+
+    def test_reveal_khac_multi(self):
+        pos_reveal, _ = lt.qwen_tryon_prompts("bikini")
+        pos_multi, _ = lt.qwen_tryon_prompts("set")
+        self.assertIn("garter belt", pos_reveal)
+        self.assertIn("NORMAL everyday outfit", pos_multi)
+        self.assertNotEqual(pos_reveal, pos_multi)
+
+    def test_extra_duoc_chen_vao(self):
+        pos, _ = lt.qwen_tryon_prompts("auto", extra="keep the necklace")
+        self.assertIn("keep the necklace", pos)
+
+
 class TestIsLocalProvider(unittest.TestCase):
     def test_gemini_la_local(self):
         self.assertTrue(lt.is_local_provider("gemini"))
@@ -190,10 +321,9 @@ class TestIsLocalProvider(unittest.TestCase):
         self.assertFalse(lt.is_local_provider(""))
         self.assertFalse(lt.is_local_provider(None))
 
-    def test_qwen_max_chua_lam_nen_khong_phai_local(self):
-        # Interface đã định nghĩa (§3 spec) nhưng chưa implement — is_local_provider
-        # phải trả False cho tới khi thật sự thêm "qwen-max" vào LOCAL_PROVIDERS.
-        self.assertFalse(lt.is_local_provider("qwen-max"))
+    def test_qwen_max_la_local(self):
+        self.assertTrue(lt.is_local_provider("qwen-max"))
+        self.assertTrue(lt.is_local_provider("Qwen-Max"))
 
 
 class TestGeminiAspect(unittest.TestCase):
@@ -268,6 +398,13 @@ class TestGeminiTryonPrompt(unittest.TestCase):
         p = lt.gemini_tryon_prompt("auto", extra="keep the necklace")
         self.assertIn("keep the necklace", p)
         self.assertLess(p.index("ADDITIONAL USER INSTRUCTION"), len(p))
+
+    def test_bo_qua_nguoi_mau_trong_anh_san_pham(self):
+        # Đo 28/08/2026 (c1-o8-m2-b3): outfit photo là ảnh người mẫu, không phải flat-lay —
+        # thiếu câu này thì Gemini có thể chép tóc/mặt người mẫu trong ảnh outfit qua kết quả.
+        for gt in ("auto", "shoes", "upper", "set"):
+            p = lt.gemini_tryon_prompt(gt)
+            self.assertIn("ignore that wearer entirely", p)
 
 
 from unittest import mock
@@ -366,7 +503,7 @@ class TestRunLocalTryon(GeminiServerCase):
             tmp = Path(d)
             run = _run_gemini(tmp)
             with self.assertRaises(NotImplementedError):
-                lt.run_local_tryon(run, {"provider": "qwen-max"}, self._settings(), tmp / "out.png")
+                lt.run_local_tryon(run, {"provider": "huggingface"}, self._settings(), tmp / "out.png")
 
     def test_thieu_input_bat_buoc_raise_joberror(self):
         with tempfile.TemporaryDirectory() as d:
@@ -403,6 +540,115 @@ class TestRunLocalTryon(GeminiServerCase):
             self.assertGreaterEqual(elapsed, 0)
             self.assertEqual(size, out.stat().st_size)
             self.assertTrue(out.is_file())
+
+
+class TestRunLocalTryonQwenMax(DashscopeServerCase):
+    def _settings(self, key="dashscope-fake-key"):
+        return Settings(domain="x.test", api_key="mk_test", instance_id="i-1",
+                        dashscope_api_key=key)
+
+    def test_thanh_cong_qwen_max(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            run = _run_gemini(tmp)
+            run.stage_params["tryon"]["provider"] = "qwen-max"
+            out = tmp / "01-tryon.png"
+            with mock.patch.object(lt, "QWEN_IMAGE_BASE", self.base_url):
+                elapsed, size = lt.run_local_tryon(run, run.stage_params["tryon"],
+                                                   self._settings(), out)
+            self.assertGreaterEqual(elapsed, 0)
+            self.assertEqual(size, out.stat().st_size)
+            self.assertTrue(out.is_file())
+
+    def test_co_background_thi_goi_pass_2(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            run = _run_gemini(tmp, background=True)
+            run.stage_params["tryon"]["provider"] = "qwen-max"
+            out = tmp / "01-tryon.png"
+            with mock.patch.object(lt, "QWEN_IMAGE_BASE", self.base_url):
+                lt.run_local_tryon(run, run.stage_params["tryon"], self._settings(), out)
+            self.assertEqual(DASHSCOPE_STATE["calls"], 2)   # pass 1 (thay đồ) + pass 2 (ghép nền)
+
+    def test_thieu_key_raise_joberror(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            run = _run_gemini(tmp)
+            run.stage_params["tryon"]["provider"] = "qwen-max"
+            with mock.patch.object(lt, "QWEN_IMAGE_BASE", self.base_url):
+                with self.assertRaises(JobError):
+                    lt.run_local_tryon(run, run.stage_params["tryon"], self._settings(key=""),
+                                       tmp / "out.png")
+
+
+class TestRunLocalTryonGeminiFallback(unittest.TestCase):
+    """provider='gemini' + TRYON_GEMINI_FALLBACK bật + Gemini lỗi → tự rớt sang Qwen-Max."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.gem_server = HTTPServer(("127.0.0.1", 0), GeminiHandler)
+        threading.Thread(target=cls.gem_server.serve_forever, daemon=True).start()
+        gh, gp = cls.gem_server.server_address
+        cls.gem_url = f"http://{gh}:{gp}"
+
+        cls.dash_server = HTTPServer(("127.0.0.1", 0), DashscopeHandler)
+        dh, dp = cls.dash_server.server_address
+        cls.dash_url = f"http://{dh}:{dp}"
+        cls.dash_server.base_url = cls.dash_url
+        threading.Thread(target=cls.dash_server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.gem_server.shutdown(); cls.gem_server.server_close()
+        cls.dash_server.shutdown(); cls.dash_server.server_close()
+
+    def setUp(self):
+        GEMINI_STATE["mode"] = "http_error"
+        GEMINI_STATE["calls"] = 0
+        GEMINI_STATE.pop("modes", None)
+        GEMINI_STATE.pop("text_reply", None)
+        DASHSCOPE_STATE["mode"] = "image"
+        DASHSCOPE_STATE["calls"] = 0
+
+    def _settings(self):
+        return Settings(domain="x.test", api_key="mk_test", instance_id="i-1",
+                        gemini_api_key="AIza" + "x" * 35, dashscope_api_key="dash-fake")
+
+    def test_gemini_loi_tu_rot_qwen_max_khi_bat_co(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            run = _run_gemini(tmp)
+            out = tmp / "01-tryon.png"
+            with mock.patch.object(lt, "GEMINI_API_BASE", self.gem_url), \
+                 mock.patch.object(lt, "QWEN_IMAGE_BASE", self.dash_url), \
+                 mock.patch.object(lt, "TRYON_GEMINI_FALLBACK", True), \
+                 mock.patch.object(lt, "img_size", return_value=(1080, 1920)):
+                lt.run_local_tryon(run, run.stage_params["tryon"], self._settings(), out)
+            self.assertTrue(out.is_file())
+            self.assertEqual(out.read_bytes(), b"fake-qwen-png-bytes")
+
+    def test_gemini_loi_khong_fallback_khi_co_tat(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            run = _run_gemini(tmp)
+            out = tmp / "01-tryon.png"
+            with mock.patch.object(lt, "GEMINI_API_BASE", self.gem_url), \
+                 mock.patch.object(lt, "QWEN_IMAGE_BASE", self.dash_url), \
+                 mock.patch.object(lt, "TRYON_GEMINI_FALLBACK", False), \
+                 mock.patch.object(lt, "img_size", return_value=(1080, 1920)):
+                with self.assertRaises(JobError):
+                    lt.run_local_tryon(run, run.stage_params["tryon"], self._settings(), out)
+
+    def test_bat_co_nhung_thieu_dashscope_key_raise_som(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            run = _run_gemini(tmp)
+            settings = Settings(domain="x.test", api_key="mk_test", instance_id="i-1",
+                                gemini_api_key="AIza" + "x" * 35, dashscope_api_key="")
+            with mock.patch.object(lt, "GEMINI_API_BASE", self.gem_url), \
+                 mock.patch.object(lt, "TRYON_GEMINI_FALLBACK", True):
+                with self.assertRaises(JobError):
+                    lt.run_local_tryon(run, run.stage_params["tryon"], settings, tmp / "out.png")
 
 
 if __name__ == "__main__":

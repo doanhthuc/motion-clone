@@ -62,6 +62,13 @@ JOB_TYPES_OVERRIDE="$(env_get JOB_TYPES_OVERRIDE)"
 # pod mới. Cả hai optional: trống thì lib-feature.sh không ghi dòng vào .env trên pod.
 GEMINI_API_KEY="$(env_get GEMINI_API_KEY)"
 GEMINI_IMAGE_MODEL="$(env_get GEMINI_IMAGE_MODEL)"
+# ALD 25/08/2026 - fallback key/model Qwen-Max (try-on provider='qwen-max' + fallback tự động của
+# provider='gemini' khi TRYON_GEMINI_FALLBACK=1) — cùng cơ chế optional-forward như Gemini ở trên.
+DASHSCOPE_API_KEY="$(env_get DASHSCOPE_API_KEY)"
+QWEN_IMAGE_WORKSPACE="$(env_get QWEN_IMAGE_WORKSPACE)"
+QWEN_IMAGE_REGION="$(env_get QWEN_IMAGE_REGION)"
+QWEN_IMAGE_MODEL="$(env_get QWEN_IMAGE_MODEL)"
+TRYON_GEMINI_FALLBACK="$(env_get TRYON_GEMINI_FALLBACK)"
 
 # ── Hình dạng deploy: cài gì, và ai chạy job ─────────────────────────────────
 # Hai câu hỏi độc lập, hai biến. Cách suy ra nằm ở scripts/lib-deploy-shape.sh vì
@@ -179,6 +186,11 @@ ${MOTION_VRAM_MAX_FRAMES:+MOTION_VRAM_MAX_FRAMES='$MOTION_VRAM_MAX_FRAMES'} \
 ${MOTION_FLASHVSR_CHUNK:+MOTION_FLASHVSR_CHUNK='$MOTION_FLASHVSR_CHUNK'} \
 ${GEMINI_API_KEY:+GEMINI_API_KEY='$GEMINI_API_KEY'} \
 ${GEMINI_IMAGE_MODEL:+GEMINI_IMAGE_MODEL='$GEMINI_IMAGE_MODEL'} \
+${DASHSCOPE_API_KEY:+DASHSCOPE_API_KEY='$DASHSCOPE_API_KEY'} \
+${QWEN_IMAGE_WORKSPACE:+QWEN_IMAGE_WORKSPACE='$QWEN_IMAGE_WORKSPACE'} \
+${QWEN_IMAGE_REGION:+QWEN_IMAGE_REGION='$QWEN_IMAGE_REGION'} \
+${QWEN_IMAGE_MODEL:+QWEN_IMAGE_MODEL='$QWEN_IMAGE_MODEL'} \
+${TRYON_GEMINI_FALLBACK:+TRYON_GEMINI_FALLBACK='$TRYON_GEMINI_FALLBACK'} \
 ./$SETUP_SCRIPT" < /dev/null | tee "$LOG"
 STATUS=${PIPESTATUS[0]}
 [ "$STATUS" -eq 0 ] || die "$SETUP_SCRIPT exited $STATUS — full log: $LOG"

@@ -531,8 +531,12 @@ Câu hỏi là "5090 có phải lựa chọn duy nhất không". Trả lời b�
 
 ### Ràng buộc quyết định trước cả VRAM: volume khoá EU-RO-1
 
-Volume `motion` nằm ở EU-RO-1 và **datacenter không dời được**. Pod khác datacenter thì không mount
-được → GPU nào không có mặt ở EU-RO-1 là loại, bất kể nó tốt đến đâu.
+Volume nằm ở EU-RO-1 và **datacenter không dời được tại chỗ** (di chuyển được, nhưng phải tạo
+volume mới + rsync — xem [Thu nhỏ hoặc đổi datacenter volume](#volume-migrate)). Pod khác
+datacenter thì không mount được → GPU nào không có mặt ở EU-RO-1 là loại, bất kể nó tốt đến đâu.
+**RTX 5090 chỉ tồn tại ở đúng 2 datacenter trên toàn RunPod: EU-RO-1 và EU-CZ-1** (`get-gpu-type`,
+product=POD, đo 29/08/2026) — hết hàng ở EU-RO-1 thì EU-CZ-1 là phương án dự phòng duy nhất, không
+phải "tìm region nào còn hàng".
 
 ```bash
 runpodctl gpu list -o json | python3 -c 'import sys,json
@@ -1470,6 +1474,82 @@ cứng (exit 1) — và manifest cố ý **không** bị ghi đè lúc đó, đ�
 - **ComfyUI code + venv CỐ Ý không nằm trên volume.** Volume là network storage; `import torch`
   đọc hàng nghìn file nhỏ, mà `run_enhance` gọi `comfy_recycle` giữa mỗi chunk RIFE nên ComfyUI
   restart nhiều lần trong một job. Phần mềm để `MTC_PREBUILT=1` lo.
+
+<a id="volume-migrate"></a>
+### Thu nhỏ hoặc đổi datacenter volume — không resize tại chỗ được
+
+RunPod chỉ cho **tăng** dung lượng (`network-volume update` báo lỗi nếu size mới nhỏ hơn cũ) và
+không có API đổi datacenter. Muốn nhỏ hơn hoặc ở DC khác thì phải: tạo volume mới → chuyển dữ liệu
+→ xoá volume cũ. Không có đường tắt resize.
+
+**Trạng thái thật hiện tại (đo 29/08/2026):** volume `motion-100` (`u469c9efga`), 100GB, EU-RO-1,
+đang dùng ~79GB. Trước đó là volume `motion` (`wfe86wzkpm`) 150GB (nâng từ 100→150GB giữa tháng
+8/2026) — sau khi dọn 2 model group không còn dùng (engine character-swap `scail2` ~24,6GB và
+`ollama-models` 10GB, tổng ~34GB) thì 100GB là đủ, nên migrate xuống để giảm hoá đơn.
+
+**Quy trình di chuyển.** Một pod chỉ mount được **1** network volume (`mounts.network` trong
+`openapi.json` của RunPod ghi rõ `maxItems: 1`), nên bắt buộc qua 2 pod:
+
+1. Tạo volume mới đúng DC muốn chuyển tới (`create-network-volume`).
+2. Dựng 2 pod CPU tạm song song (~$0,06-0,07/giờ mỗi pod, `COMPUTE_TYPE=cpu`): pod A gắn volume
+   CŨ, pod B gắn volume MỚI. `pod-provision.sh` + `.env` chỉ track được 1 pod tại một thời điểm —
+   theo dõi SSH info của pod B riêng bằng `runpodctl ssh info <podId> -o json`.
+3. Tạo cặp khoá SSH tạm (`ssh-keygen -t ed25519`), gắn public key vào `~/.ssh/authorized_keys` của
+   pod B, copy private key sang pod A. `rsync -a` THẲNG pod A → pod B qua IP public — **đừng** đi
+   qua laptop làm trạm trung chuyển (chậm hơn nhiều, băng thông pod-pod cao hơn hẳn đường nhà).
+4. Verify bằng `rsync -avnc` (dry-run + checksum) — phải ra **0 file** cần đồng bộ trước khi tin
+   dữ liệu đã khớp, rồi mới xoá gì.
+5. Xoá 2 pod tạm. Sửa `.env` (`POD_VOLUME_ID`) **và endpoint Serverless** (`networkVolumeIds` +
+   `dataCenterIds` nếu đổi luôn DC) sang volume mới — quên endpoint thì worker serverless vẫn chạy
+   nhưng gắn volume cũ.
+6. Xoá volume cũ (`delete-network-volume`).
+
+**Tốc độ đo thật (29/08/2026), không phải suy luận:**
+
+| Chặng | Luồng | Công cụ | Tốc độ | 79GB mất |
+|---|---|---|---|---|
+| Cùng DC (EU-RO-1→EU-RO-1, lúc thu nhỏ 150→100GB) | 1 | `rsync` | **~500MB/s** | ~3 phút |
+| Khác DC (EU-RO-1→EU-CZ-1) | 1 | `rsync` | ~57MB/s | ~24 phút |
+| Khác DC | 4 | `rsync` | ~94MB/s (1.6×) | ~14-15 phút |
+| Khác DC | 1 | `dd\|ssh cat` (bỏ protocol rsync) | ~57MB/s | khớp rsync |
+| Khác DC | 4 | `dd\|ssh cat` | **~184MB/s (3.2×)** | gấp ~2× rsync cùng số luồng |
+| Khác DC | 8 | `dd\|ssh cat` | **~427MB/s (7.5×)** | **~3 phút** |
+| Khác DC | 16 | `dd\|ssh cat` | ~447MB/s, nhưng **3/16 kết nối lỗi** | không nên dùng |
+
+Nén trước khi sync (`rsync -z`/tar+gzip) **không đáng thử**: phần lớn dữ liệu là tensor
+`.safetensors`/`.gguf`/`.ckpt` (fp16/fp8) — entropy cao, nén được dưới 5%, trong khi pod CPU tạm
+(2 vCPU) yếu, nén tốn CPU nhiều khả năng lỗ hơn lãi.
+
+**Phát hiện quan trọng: nghẽn ở phép đo 4-luồng đầu tiên là CPU của `rsync`, không phải mạng.**
+Cùng 4 luồng, `dd|ssh cat` (gần như không tốn CPU checksum) nhanh gấp đôi `rsync` (184 vs 94MB/s)
+— vì pod tạm chỉ 2 vCPU, 4 tiến trình `rsync` tranh CPU checksum/protocol trước khi kịp bão hoà
+đường truyền. Trần thật của link cao hơn nhiều: **~430MB/s**, chạm được ở 8 luồng.
+
+**Đừng vượt quá ~8 kết nối SSH mới đồng thời tới cùng 1 pod đích.** Ở 16 luồng, sshd phía nhận từ
+chối 3/16 kết nối ngay lúc bắt tay (`kex_exchange_identification: read: Connection reset by peer`)
+— giới hạn `MaxStartups` chống bão kết nối của OpenSSH, không phải lỗi mạng. 8→16 cũng gần như
+không nhanh hơn (427→447MB/s, đã gần bão hoà), nên vượt 8 chỉ có rủi ro, không có lợi.
+
+**Áp dụng cho migration thật:** vẫn nên dùng `rsync` (không dùng `dd` thô) để có resume + verify
+checksum sẵn — nhưng muốn `rsync` chạm gần trần ~430MB/s thay vì bị CPU chặn ở ~94MB/s, phải tăng
+vCPU cho pod tạm (vd 4 thay vì 2) trước khi chạy song song. Giới hạn ở **~8 luồng** (mỗi luồng 1
+thư mục con model — `diffusion_models`, `text_encoders`, `loras`, `checkpoints`…), đừng cao hơn.
+
+**Bẫy: xoá volume cũ báo lỗi dù `list-pods` rỗng.** RunPod từ chối `delete-network-volume` với
+`"You must remove this network volume from all pods before deleting it"` kể cả khi không còn Pod
+nào chạy. Thủ phạm là **worker Serverless đang `THROTTLED`** (hết capacity GPU, xem [mục dưới về
+`throttled`](#serverless-throttled)) vẫn giữ tham chiếu volume dù không hiện trong `list-pods`.
+`purge-endpoint-queue` không giúp gì (chỉ xoá job đang chờ, không đụng worker). Cách gỡ:
+`update-endpoint` đặt tạm `workersMax: 0` (giết hết worker throttled ngay lập tức), rồi trả lại
+giá trị cũ — lúc đó `delete-network-volume` mới thành công.
+
+**Vì sao không giữ sẵn volume dự phòng ở EU-CZ-1.** Với tần suất hết 5090 ở EU-RO-1 **hiếm** (vài
+lần/tháng hoặc ít hơn — đo bằng cảm nhận thực tế, không phải số liệu RunPod), giữ volume dự phòng
+thường trực tốn ~$7/tháng ([giá thật](#network-volume) ~$0,07/GB/tháng) **cộng** phải nhớ đồng bộ
+lại mỗi lần đổi model ở volume chính — trong khi chờ ~25-30 phút di chuyển theo yêu cầu (có giới
+hạn rõ ràng, khác hẳn kiểu chờ vô thời hạn của serverless `throttled`) chỉ xảy ra vài lần/tháng.
+Quyết định: **on-demand**, không standing backup. Chạy xong việc thì xoá luôn volume tạm ở
+EU-CZ-1 — output đã tải về laptop, không cần giữ lại data đã chạy.
 
 <a id="pg-backup"></a>
 ### Sao lưu database (pg_dump sang volume) — nghiệm thu 07/08/2026

@@ -420,6 +420,15 @@ phase_dotenv() {
   # GEMINI_IMAGE_MODEL hard-code trong linux.py; thiếu GEMINI_API_KEY thì bắt buộc key ở node).
   [ -n "${GEMINI_API_KEY:-}" ] && set_kv GEMINI_API_KEY "$GEMINI_API_KEY"
   [ -n "${GEMINI_IMAGE_MODEL:-}" ] && set_kv GEMINI_IMAGE_MODEL "$GEMINI_IMAGE_MODEL"
+  # ALD 25/08/2026 - fallback key/model Qwen-Max (try-on provider='qwen-max' + fallback tự động của
+  # provider='gemini' khi TRYON_GEMINI_FALLBACK=1) — cùng quy tắc: trống = không ghi dòng (worker dùng
+  # default QWEN_IMAGE_MODEL/QWEN_IMAGE_REGION hard-code trong linux.py; thiếu DASHSCOPE_API_KEY hoặc
+  # QWEN_IMAGE_WORKSPACE thì bắt buộc key/workspace ở node hoặc provider='qwen-max' sẽ raise rõ lỗi).
+  [ -n "${DASHSCOPE_API_KEY:-}" ] && set_kv DASHSCOPE_API_KEY "$DASHSCOPE_API_KEY"
+  [ -n "${QWEN_IMAGE_WORKSPACE:-}" ] && set_kv QWEN_IMAGE_WORKSPACE "$QWEN_IMAGE_WORKSPACE"
+  [ -n "${QWEN_IMAGE_REGION:-}" ] && set_kv QWEN_IMAGE_REGION "$QWEN_IMAGE_REGION"
+  [ -n "${QWEN_IMAGE_MODEL:-}" ] && set_kv QWEN_IMAGE_MODEL "$QWEN_IMAGE_MODEL"
+  [ -n "${TRYON_GEMINI_FALLBACK:-}" ] && set_kv TRYON_GEMINI_FALLBACK "$TRYON_GEMINI_FALLBACK"
   set_kv SUPER_ADMIN "$SUPER_ADMIN"
   if [ -n "${GMAIL_USER:-}" ]; then
     set_kv IS_USED_GMAIL "true"; set_kv GMAIL_USER "$GMAIL_USER"
