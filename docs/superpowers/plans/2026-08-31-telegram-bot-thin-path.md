@@ -1117,8 +1117,16 @@ Expected: failures naming the missing handlers, not import errors from the whole
 
 - [ ] **Step 3: Implement the flow in `bot.py`**
 
-A `_STATE: dict[int, Job]` plus a small `_PENDING_SLOT: dict[int, Path]` for the one file
-awaiting an answer. On a document: `to_png_if_heic`, then `probe`, then `slot_for`; a
+A `_STATE: dict[int, Job]` plus `_PENDING: dict[int, list[tuple[Path, Probe]]]` — a
+**queue**, not a single slot.
+
+> Corrected 2026-08-31. This originally said "a small `_PENDING_SLOT: dict[int, Path]`
+> for the one file awaiting an answer", and that is wrong in the flagship case. Telegram
+> delivers a multi-file send as consecutive updates inside a single `get_updates()`
+> batch, with no opportunity for the user to answer between them — so attaching
+> character and outfit together, which is the natural way to "send four files", made the
+> second image overwrite the first with no error and no way to recover it. Ask about the
+> head of the queue; on an answer, pop it and ask about the next. On a document: `to_png_if_heic`, then `probe`, then `slot_for`; a
 video fills `driver`, an image is parked in `_PENDING_SLOT` and asked about. On a text
 that names a slot, fill it from `_PENDING_SLOT`. After every fill, if `missing_slots()`
 is empty, render the manifest with `write_manifest`, run `make batch-validate` on it, and
