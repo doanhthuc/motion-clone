@@ -1,4 +1,3 @@
-import email.parser
 import io
 import json
 import sys
@@ -114,8 +113,13 @@ class TestTg(unittest.TestCase):
 
             # Verify the multipart body structure
             self.assertIsNotNone(captured_request)
-            self.assertIn(b'name="chat_id"', captured_request.data)
-            self.assertIn(b'42', captured_request.data)
+            # Assert on the FRAMED field, not on a bare b'42' anywhere in the
+            # body: the multipart boundary is a uuid4 hex string, so a loose
+            # search for "42" was satisfied by the boundary alone in roughly
+            # 10-12% of runs (computed 2026-08-31: 31 positions x 1/256 per
+            # position, P(at least one) = 1 - (255/256)^31 ~= 0.114) — a check
+            # satisfied by coincidence one run in nine is worse than no check.
+            self.assertIn(b'name="chat_id"\r\n\r\n42\r\n', captured_request.data)
             self.assertIn(b'name="caption"', captured_request.data)
             self.assertIn(b'test caption', captured_request.data)
             self.assertIn(b'name="document"', captured_request.data)

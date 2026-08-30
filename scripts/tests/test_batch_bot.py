@@ -3,6 +3,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from batchlib.manifest import state_path_for
 import tgbot.bot as bot
 from tgbot.bot import allowed
 from tgbot.ingest import Probe
@@ -18,9 +19,16 @@ def cmd_from(user_id: int, text: str) -> dict:
     return {"message": {"from": {"id": user_id}, "chat": {"id": user_id}, "text": text}}
 
 
-def doc_from(user_id: int, file_id: str, file_name: str = "f") -> dict:
+def doc_from(user_id: int, file_id: str, file_name: str | None = None) -> dict:
+    # file_name is genuinely optional in the Bot API — some clients omit it —
+    # and when it is absent the bot falls back to the basename of what getFile
+    # returned. Omitting it here is what makes the staged copies keep the test
+    # fixtures' own names.
+    doc = {"file_id": file_id}
+    if file_name is not None:
+        doc["file_name"] = file_name
     return {"message": {"from": {"id": user_id}, "chat": {"id": user_id},
-                        "document": {"file_id": file_id, "file_name": file_name}}}
+                        "document": doc}}
 
 
 class FakeTg:
@@ -64,6 +72,16 @@ class TestAllowed(unittest.TestCase):
         self.assertFalse(allowed({}, ME))
         self.assertFalse(allowed({"message": {}}, ME))
 
+    def test_the_owner_speaking_in_a_group_is_refused(self):
+        # A private chat has chat.id == the user's id; a group does not. If the
+        # owner adds this bot to a group, the sender check alone passes and the
+        # bot would reply into the group with manifests, file paths and the
+        # finished video. Tightened 2026-08-31: the reply surface must be as
+        # narrow as the send surface.
+        group = {"message": {"from": {"id": ME}, "chat": {"id": -1001234567890},
+                             "text": "/start"}}
+        self.assertFalse(allowed(group, ME))
+
 
 class TestResultAndTryonPathSafety(unittest.TestCase):
     """Regression tests for the path-containment finding: the allowlist
@@ -93,7 +111,7 @@ class TestResultAndTryonPathSafety(unittest.TestCase):
     def test_result_refuses_an_absolute_path(self):
         tg = FakeTg()
         payload = str(self.root / "secret.yaml")
-        bot.handle(tg, cmd_from(ME, f"/result {payload}"), allowed_user_id=ME, state={})
+        bot.handle(tg, cmd_from(ME, f"/result {payload}"), allowed_user_id=ME)
         self.assertEqual(tg.documents, [])
         self.assertEqual(len(tg.messages), 1)
         self.assertIn("not allowed", tg.messages[0])
@@ -101,14 +119,14 @@ class TestResultAndTryonPathSafety(unittest.TestCase):
 
     def test_result_refuses_dotdot_traversal(self):
         tg = FakeTg()
-        bot.handle(tg, cmd_from(ME, "/result ../secret.yaml"), allowed_user_id=ME, state={})
+        bot.handle(tg, cmd_from(ME, "/result ../secret.yaml"), allowed_user_id=ME)
         self.assertEqual(tg.documents, [])
         self.assertEqual(len(tg.messages), 1)
         self.assertIn("not allowed", tg.messages[0])
 
     def test_tryon_refuses_dotdot_traversal(self):
         tg = FakeTg()
-        bot.handle(tg, cmd_from(ME, "/tryon ../evil"), allowed_user_id=ME, state={})
+        bot.handle(tg, cmd_from(ME, "/tryon ../evil"), allowed_user_id=ME)
         # Pre-fix, this sent evil/runs/job/01-tryon.png — a real file one
         # level above out/ — straight to send_document.
         self.assertEqual(tg.documents, [])
@@ -118,7 +136,7 @@ class TestResultAndTryonPathSafety(unittest.TestCase):
     def test_result_reports_not_found_for_a_valid_but_missing_name(self):
         tg = FakeTg()
         bot.handle(tg, cmd_from(ME, "/result does-not-exist.yaml"),
-                  allowed_user_id=ME, state={})
+                  allowed_user_id=ME)
         self.assertEqual(tg.documents, [])
         self.assertEqual(len(tg.messages), 1)
         # A valid (bare) name that just doesn't exist is a plain "not found",
@@ -128,7 +146,7 @@ class TestResultAndTryonPathSafety(unittest.TestCase):
     def test_refusal_does_not_echo_the_offending_input(self):
         tg = FakeTg()
         payload = "../../../../etc/passwd"
-        bot.handle(tg, cmd_from(ME, f"/result {payload}"), allowed_user_id=ME, state={})
+        bot.handle(tg, cmd_from(ME, f"/result {payload}"), allowed_user_id=ME)
         self.assertEqual(tg.documents, [])
         self.assertNotIn(payload, tg.messages[0])
         self.assertNotIn("passwd", tg.messages[0])
@@ -155,8 +173,13 @@ class TestFlow(unittest.TestCase):
         bot._STATE.clear()
         bot._PENDING.clear()
         bot._LAST_VALIDATE.clear()
+        bot._CONFIRM_WARNED.clear()
 
         # Real, if empty, files: validate_manifest checks path.is_file().
+        # These stand in for what the Bot API server wrote — the bot copies
+        # them into batch/tg-staging/<chat>/ before touching them (findings
+        # C2/I5), so every assertion below about a slot is about the STAGED
+        # path, never this one.
         self.driver_path = self.root / "driver.mp4"
         self.driver_path.write_bytes(b"d")
         self.character_path = self.root / "character.jpg"
@@ -180,10 +203,17 @@ class TestFlow(unittest.TestCase):
         bot._STATE.clear()
         bot._PENDING.clear()
         bot._LAST_VALIDATE.clear()
+        bot._CONFIRM_WARNED.clear()
+
+    def staged(self, name: str) -> Path:
+        """Where _stage_file puts a file of this name for this chat."""
+        return self.root / "batch" / bot.STAGING_DIR_NAME / str(ME) / name
 
     def _probe_for(self, mapping):
+        # Keyed by NAME, not by the source path: probe() now runs on the
+        # staged copy, so the path it is handed is not the one the test wrote.
         def fake_probe(path):
-            return mapping[Path(path)]
+            return mapping[Path(path).name]
         return fake_probe
 
     def _fill_required_slots(self):
@@ -192,39 +222,39 @@ class TestFlow(unittest.TestCase):
         hardcodes, per docs/superpowers/specs/2026-08-30-…: "four labelled
         slots". Background is optional and deliberately left unfilled."""
         probe_fn = self._probe_for({
-            self.driver_path: self.driver_probe,
-            self.character_path: self.image_probe,
-            self.outfit_path: self.image_probe,
+            self.driver_path.name: self.driver_probe,
+            self.character_path.name: self.image_probe,
+            self.outfit_path.name: self.image_probe,
         })
         with mock.patch("tgbot.bot.probe", side_effect=probe_fn):
-            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME, state={})
-            bot.handle(self.tg, doc_from(ME, "character-id"), allowed_user_id=ME, state={})
-            bot.handle(self.tg, cmd_from(ME, "character"), allowed_user_id=ME, state={})
-            bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME, state={})
-            bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME, state={})
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+            bot.handle(self.tg, doc_from(ME, "character-id"), allowed_user_id=ME)
+            bot.handle(self.tg, cmd_from(ME, "character"), allowed_user_id=ME)
+            bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME)
+            bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME)
 
     def test_a_video_fills_the_driver_slot_without_asking(self):
         with mock.patch("tgbot.bot.probe", return_value=self.driver_probe):
-            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME, state={})
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
         self.assertEqual(len(self.tg.messages), 1)
         self.assertIn("driver", self.tg.messages[0])
         self.assertNotIn("which", self.tg.messages[0].lower())
-        self.assertEqual(bot._STATE[ME].slots.get("driver"), self.driver_path)
+        self.assertEqual(bot._STATE[ME].slots.get("driver"), self.staged("driver.mp4"))
 
     def test_an_image_is_asked_about_and_the_answer_fills_the_slot(self):
         with mock.patch("tgbot.bot.probe", return_value=self.image_probe):
-            bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME, state={})
+            bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME)
         self.assertIn("which", self.tg.messages[-1].lower())
         self.assertNotIn("outfit", bot._STATE[ME].slots)
 
-        bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME, state={})
-        self.assertEqual(bot._STATE[ME].slots.get("outfit"), self.outfit_path)
+        bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME)
+        self.assertEqual(bot._STATE[ME].slots.get("outfit"), self.staged("outfit.jpg"))
         self.assertIn("outfit", self.tg.messages[-1])
 
     def test_an_unrecognised_slot_answer_is_re_asked_not_guessed(self):
         with mock.patch("tgbot.bot.probe", return_value=self.image_probe):
-            bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME, state={})
-        bot.handle(self.tg, cmd_from(ME, "banana"), allowed_user_id=ME, state={})
+            bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME)
+        bot.handle(self.tg, cmd_from(ME, "banana"), allowed_user_id=ME)
         self.assertNotIn("outfit", bot._STATE[ME].slots)
         self.assertNotIn("character", bot._STATE[ME].slots)
         self.assertEqual(len(bot._PENDING[ME]), 1)   # still parked, never guessed
@@ -251,7 +281,7 @@ class TestFlow(unittest.TestCase):
              mock.patch("tgbot.bot.drain_running", return_value=False):
             self._fill_required_slots()
             start_drain.assert_not_called()
-            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME, state={})
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
         start_drain.assert_called_once()
         _, kwargs = start_drain.call_args
         self.assertEqual(kwargs.get("dry_run"), False)
@@ -269,14 +299,14 @@ class TestFlow(unittest.TestCase):
         head is ever asked about and answers apply in arrival order.
         """
         with mock.patch("tgbot.bot.probe", return_value=self.image_probe):
-            bot.handle(self.tg, doc_from(ME, "character-id"), allowed_user_id=ME, state={})
-            bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME, state={})
+            bot.handle(self.tg, doc_from(ME, "character-id"), allowed_user_id=ME)
+            bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME)
 
-        bot.handle(self.tg, cmd_from(ME, "character"), allowed_user_id=ME, state={})
-        bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME, state={})
+        bot.handle(self.tg, cmd_from(ME, "character"), allowed_user_id=ME)
+        bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME)
 
-        self.assertEqual(bot._STATE[ME].slots.get("character"), self.character_path)
-        self.assertEqual(bot._STATE[ME].slots.get("outfit"), self.outfit_path)
+        self.assertEqual(bot._STATE[ME].slots.get("character"), self.staged("character.jpg"))
+        self.assertEqual(bot._STATE[ME].slots.get("outfit"), self.staged("outfit.jpg"))
 
     def test_confirm_is_refused_after_a_failed_validation(self):
         """Regression (Task 7 fix round 1, Finding 2): _maybe_show_manifest
@@ -288,20 +318,180 @@ class TestFlow(unittest.TestCase):
         with mock.patch("tgbot.bot.start_drain") as start_drain:
             self._fill_required_slots()
             bot._LAST_VALIDATE[ME] = False
-            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME, state={})
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
         start_drain.assert_not_called()
 
     def test_confirm_is_refused_while_a_drain_is_already_running(self):
-        with mock.patch("tgbot.bot.start_drain") as start_drain, \
-             mock.patch("tgbot.bot.drain_running", return_value=True):
+        # The slots are filled with drain_running FALSE, so the manifest is
+        # written and validated as normal and /confirm reaches its own guard.
+        # (Before finding C1 was fixed the whole fill happened under
+        # drain_running=True, which meant /confirm was actually being refused
+        # by the _LAST_VALIDATE guard and this test passed without ever
+        # exercising the drain guard it is named for.)
+        with mock.patch("tgbot.bot.start_drain") as start_drain:
             self._fill_required_slots()
-            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME, state={})
+            with mock.patch("tgbot.bot.drain_running", return_value=True):
+                bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
         start_drain.assert_not_called()
+        self.assertIn("already running", self.tg.messages[-1])
 
     def test_confirm_without_a_complete_job_is_refused(self):
         with mock.patch("tgbot.bot.start_drain") as start_drain:
-            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME, state={})
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
         start_drain.assert_not_called()
+
+    def test_a_live_drain_blocks_the_next_job_from_overwriting_the_manifest(self):
+        """Regression for finding C1 (2026-08-31): the /confirm chain was
+        guarded but the WRITE path was not.
+
+        scripts/drain.py:220-248 runs batch_run.py as a separate process
+        twice, re-reading batch/tg-<chat>.yaml from disk each time — phase A
+        (--no-start), then provision + bootstrap, then phase B (--resume). For
+        the ~10-35 minutes in between, that one deterministic path is live
+        input. Assembling the next job during the render (the most ordinary
+        thing there is) filled the last slot, _maybe_show_manifest wrote over
+        the file, and phase B loaded job B onto the pod rented for job A with
+        nobody asked. The manifest bytes must not move while a drain owns it.
+        """
+        with mock.patch("tgbot.bot.start_drain"):
+            self._fill_required_slots()
+        manifest = bot._job_manifest_path(ME)
+        before = manifest.read_bytes()
+
+        # A visibly DIFFERENT second job, so "unchanged" cannot pass by
+        # coincidence: a 20-second driver renders a different comment line and
+        # a different preset from the 5-second one above.
+        bot._STATE.clear()
+        bot._PENDING.clear()
+        bot._LAST_VALIDATE.clear()
+        second_driver = self.root / "driver2.mp4"
+        second_driver.write_bytes(b"dd")
+        self.tg.file_paths["driver2-id"] = str(second_driver)
+        long_probe = Probe(kind="video", width=1080, height=1920, duration_s=20.0,
+                           bitrate_kbps=9000, size_bytes=9_000_000)
+        # Matched by prefix, not by exact name: staging never overwrites, so
+        # the second copy of character.jpg lands as character-1.jpg.
+        def probe_fn(path):
+            return long_probe if Path(path).name.startswith("driver2") else self.image_probe
+        with mock.patch("tgbot.bot.drain_running", return_value=True), \
+             mock.patch("tgbot.bot.probe", side_effect=probe_fn):
+            bot.handle(self.tg, doc_from(ME, "driver2-id"), allowed_user_id=ME)
+            bot.handle(self.tg, doc_from(ME, "character-id"), allowed_user_id=ME)
+            bot.handle(self.tg, cmd_from(ME, "character"), allowed_user_id=ME)
+            bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME)
+            bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME)
+
+        self.assertEqual(manifest.read_bytes(), before)
+        self.assertIn("drain is still running", self.tg.messages[-1])
+
+    def test_staged_paths_replace_the_bot_api_path_that_carries_the_token(self):
+        """Findings C2 and I5: a local Bot API file path is
+        /var/lib/telegram-bot-api/<TOKEN>/documents/file_5.mp4 — the token is
+        a directory component. That path used to go into Job.slots, then into
+        the manifest, then back over Telegram verbatim.
+        """
+        token_path = self.root / "telegram-bot-api" / "SECRETTOKEN" / "documents"
+        token_path.mkdir(parents=True)
+        arrival = token_path / "file_5.mp4"
+        arrival.write_bytes(b"d")
+        self.tg.file_paths["tok-id"] = str(arrival)
+
+        with mock.patch("tgbot.bot.probe", return_value=self.driver_probe):
+            bot.handle(self.tg, doc_from(ME, "tok-id", file_name="my driver:v1.mp4"),
+                       allowed_user_id=ME)
+
+        staged = bot._STATE[ME].slots["driver"]
+        self.assertEqual(staged.parent, self.root / "batch" / bot.STAGING_DIR_NAME / str(ME))
+        self.assertNotIn("SECRETTOKEN", str(staged))
+        self.assertNotIn("SECRETTOKEN", "\n".join(self.tg.messages))
+        # The user's own name survives, minus anything that would break the
+        # plain (unquoted) YAML scalar job.py emits — job.py is protected, so
+        # the quoting has to happen by never producing a name that needs it.
+        self.assertEqual(staged.name, "my_driver_v1.mp4")
+        self.assertTrue(staged.is_file())
+
+    def test_the_accepted_file_reply_carries_the_sha256_and_byte_count(self):
+        # Finding I4: /sha was removed by Task 7, which left the README's
+        # acceptance procedure unrunnable. A6 compares this digest against
+        # out/<batch>/_final/<run>.mp4.
+        import hashlib
+        with mock.patch("tgbot.bot.probe", return_value=self.driver_probe):
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+        self.assertIn(hashlib.sha256(b"d").hexdigest(), self.tg.messages[0])
+        self.assertIn("1 bytes", self.tg.messages[0])
+
+    def test_a_failing_conversion_is_reported_not_swallowed(self):
+        """Finding I1: to_png_if_heic and getFile were outside the try, so
+        every message they raise escaped handle(), was swallowed by main()'s
+        `except Exception: log(...)`, and the user got nothing at all."""
+        with mock.patch("tgbot.bot.to_png_if_heic",
+                        side_effect=RuntimeError("ffmpeg is not installed")):
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+        self.assertIn("ffmpeg is not installed", self.tg.messages[-1])
+        self.assertNotIn(ME, bot._STATE)
+
+    def test_a_getfile_failure_is_reported_not_swallowed(self):
+        from tgbot.tgclient import TgError
+        with mock.patch.object(self.tg, "call", side_effect=TgError("getFile rejected")):
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+        self.assertIn("getFile rejected", self.tg.messages[-1])
+
+    def test_resending_a_video_says_it_is_replacing_the_driver(self):
+        # Finding I7: the second video silently replaced the first.
+        with mock.patch("tgbot.bot.probe", return_value=self.driver_probe):
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+        self.assertIn("replacing the previous driver", self.tg.messages[-1])
+
+    def test_answering_a_filled_role_says_it_is_replacing_it(self):
+        # Finding I7: this path pops the queue head AND overwrites the slot,
+        # so the displaced file is unrecoverable — it must at least be named.
+        with mock.patch("tgbot.bot.probe", return_value=self.image_probe):
+            bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME)
+            bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME)
+            bot.handle(self.tg, doc_from(ME, "character-id"), allowed_user_id=ME)
+            bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME)
+        self.assertIn("replacing the previous outfit", self.tg.messages[-1])
+
+    def test_confirm_with_files_still_unassigned_refuses_once_then_runs(self):
+        """Finding I6: /confirm succeeded with files still queued and dropped
+        them silently on the state clear. Refuse once naming the count; a
+        second /confirm runs without them, and says so."""
+        with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+            with mock.patch("tgbot.bot.probe", return_value=self.image_probe):
+                bot.handle(self.tg, doc_from(ME, "character-id"), allowed_user_id=ME)
+
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+            start_drain.assert_not_called()
+            self.assertIn("1 file(s) still unassigned", self.tg.messages[-1])
+
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+        start_drain.assert_called_once()
+        self.assertIn("running without 1 unassigned file(s)",
+                      "\n".join(self.tg.messages))
+
+    def test_status_reports_progress_from_the_journal(self):
+        # Finding I3: progress_text existed, was tested, and had no caller —
+        # after /confirm the user got one message and then silence.
+        import json
+        with mock.patch("tgbot.bot.start_drain"), \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+        manifest = bot._job_manifest_path(ME)
+        state_path_for(manifest).write_text(json.dumps(
+            {"batch": "2026-08-31-2140",
+             "runs": {"job": {"status": "running",
+                              "stages": {"motion": {"status": "done", "sec": 247}}}}}),
+            encoding="utf-8")
+        bot.handle(self.tg, cmd_from(ME, "/status"), allowed_user_id=ME)
+        self.assertIn("2026-08-31-2140", self.tg.messages[-1])
+        self.assertIn("motion", self.tg.messages[-1])
+
+    def test_status_before_anything_started_is_reported_not_crashed(self):
+        bot.handle(self.tg, cmd_from(ME, "/status"), allowed_user_id=ME)
+        self.assertIn("nothing started", self.tg.messages[-1])
 
 
 if __name__ == "__main__":

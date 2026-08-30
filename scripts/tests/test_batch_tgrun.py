@@ -1,9 +1,12 @@
 # scripts/tests/test_batch_tgrun.py
+import subprocess
 import sys, tempfile, unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batchlib.manifest import state_path_for
+from batchlib.pipelines import STAGES
 from batchlib_ext.lease import Lease, write_lease
 import tgbot.run as run_mod
 from tgbot.run import drain_running, progress_text
@@ -86,6 +89,15 @@ class TestDrainRunning(unittest.TestCase):
         # Restart=always) empties _RUNNING, and SIGKILL of the drain child
         # (KillMode=control-group) skips drain.py's `finally: teardown()`, so
         # the lease is the only signal left that a pod may still be rented.
+        #
+        # PLATFORM NOTE (2026-08-31): this test also happens to catch dropping
+        # the `.resolve()` in lease_for's comparison — but only on macOS, where
+        # tempfile.mkdtemp() returns /var/... and /var is a symlink to
+        # /private/var, so the unresolved and resolved spellings differ. On
+        # Linux (the VPS, and any future CI) mkdtemp returns an already-canonical
+        # path, the two spellings are identical, and that mutation stops being
+        # caught here silently. If this ever runs on Linux, pin it with an
+        # explicit symlinked temp dir instead of relying on the platform.
         m = Path(tempfile.mkdtemp()) / "m.yaml"
         m.write_text("runs: []", encoding="utf-8")
         lease_path = Path(tempfile.mkdtemp()) / "pod-lease.json"
@@ -105,7 +117,69 @@ class TestDrainRunning(unittest.TestCase):
         self.assertFalse(drain_running(m))
 
 
-from tgbot.run import final_files, summary_text
+from tgbot.run import estimate_minutes, final_files, start_drain, summary_text
+from tgbot.job import Job
+
+
+class TestStartDrain(unittest.TestCase):
+    """The single most money-critical line in this repo: `CONFIRM=yes` is
+    appended only when dry_run is False (tgbot/run.py:118-120), and passing it
+    reaches pod-provision.sh and rents an RTX 5090 at $0.99/hour.
+
+    Until 2026-08-31 nothing asserted on that argv at all — every bot test
+    patches `tgbot.bot.start_drain`, so an inverted condition here would have
+    shipped as a pod nobody asked for and no gate would have caught it. These
+    tests patch Popen, so they invoke nothing and cost nothing.
+    """
+
+    def setUp(self):
+        self._orig_running = dict(run_mod._RUNNING)
+        run_mod._RUNNING.clear()
+        self.manifest = Path(tempfile.mkdtemp()) / "m.yaml"
+        self.manifest.write_text("runs: []", encoding="utf-8")
+
+    def tearDown(self):
+        run_mod._RUNNING.clear()
+        run_mod._RUNNING.update(self._orig_running)
+
+    def _argv_for(self, *, dry_run: bool):
+        with mock.patch("tgbot.run.subprocess.Popen") as popen:
+            start_drain(self.manifest, dry_run=dry_run)
+        popen.assert_called_once()
+        return popen.call_args[0][0]
+
+    def test_dry_run_never_writes_confirm(self):
+        argv = self._argv_for(dry_run=True)
+        self.assertEqual(argv, ["make", "drain", f"FILE={self.manifest}"])
+        self.assertNotIn("CONFIRM=yes", argv)
+
+    def test_a_real_run_appends_confirm(self):
+        argv = self._argv_for(dry_run=False)
+        self.assertEqual(argv, ["make", "drain", f"FILE={self.manifest}", "CONFIRM=yes"])
+
+    def test_output_goes_to_a_log_file_beside_the_manifest_not_a_pipe(self):
+        # A drain runs for the lifetime of a rented pod. A Popen pipe nobody
+        # reads fills its OS buffer and deadlocks the child mid-batch.
+        with mock.patch("tgbot.run.subprocess.Popen") as popen:
+            start_drain(self.manifest, dry_run=True)
+        self.assertTrue(self.manifest.with_suffix(".drain.log").exists())
+        self.assertIsNot(popen.call_args.kwargs["stdout"], subprocess.PIPE)
+
+
+class TestEstimateMinutes(unittest.TestCase):
+    def test_sums_the_measured_medians_for_the_pipeline(self):
+        # docs/batch-runner.md section 7, batch 2026-08-18-2105: tryon 351s,
+        # motion 247s, enhance 114s = 712s -> 12 min.
+        job = Job(slots={}, probes={}, pipeline="tryon-motion-enhance")
+        self.assertEqual(estimate_minutes(job), 12)
+
+    def test_a_stage_with_no_measurement_falls_back_to_its_timeout_ceiling(self):
+        # character-swap has no measured median as of 2026-08-31, so the
+        # estimate uses STAGES[...].timeout_min — deliberately the pessimistic
+        # number rather than a made-up measurement.
+        job = Job(slots={}, probes={}, pipeline="character-swap-enhance")
+        expected = round((STAGES["character-swap"].timeout_min * 60 + 114) / 60)
+        self.assertEqual(estimate_minutes(job), expected)
 
 
 class TestDelivery(unittest.TestCase):

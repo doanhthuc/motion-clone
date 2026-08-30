@@ -130,6 +130,25 @@ def start_drain(manifest_path: Path, *, dry_run: bool) -> subprocess.Popen:
     return proc
 
 
+def lease_for(manifest_path: Path):
+    """The on-disk lease if it names THIS manifest, else None.
+
+    Read at call time, never cached: `drain.py` writes the lease from a
+    separate process and `teardown()` clears it, so any value this module
+    held would be stale the moment the drain moved on. Matching on the
+    manifest is what keeps one chat's pod out of another chat's progress
+    message — the lease file is global to the VPS, the manifest is not.
+    """
+    lease = read_lease(LEASE_PATH)
+    if lease is None:
+        return None
+    # drain.py:239 writes manifest=str(manifest_path.resolve()) at provision
+    # time — resolve ours the same way rather than comparing raw strings, so
+    # a relative vs. absolute spelling of the same file cannot cause a false
+    # "not running".
+    return lease if Path(lease.manifest).resolve() == manifest_path.resolve() else None
+
+
 def drain_running(manifest_path: Path) -> bool:
     """True if THIS process still has the drain alive, OR a lease says it might be.
 
@@ -156,14 +175,7 @@ def drain_running(manifest_path: Path) -> bool:
     if proc is not None and proc.poll() is None:
         return True
 
-    lease = read_lease(LEASE_PATH)
-    if lease is None:
-        return False
-    # drain.py:239 writes manifest=str(manifest_path.resolve()) at provision
-    # time — resolve ours the same way rather than comparing raw strings, so
-    # a relative vs. absolute spelling of the same file cannot cause a false
-    # "not running".
-    return Path(lease.manifest).resolve() == manifest_path.resolve()
+    return lease_for(manifest_path) is not None
 
 
 def final_files(batch_dir: Path) -> list[Path]:

@@ -84,46 +84,93 @@ make drain FILE=batch/2026-08-30.yaml               # dry run: prints the plan, 
 make drain FILE=batch/2026-08-30.yaml CONFIRM=yes   # rents, runs, destroys
 ```
 
+## Telegram bot
+
+### Prerequisites, in this order
+
+1. `scripts/vps/bot-api.env` **must exist before `docker compose up`** — the server exits
+   immediately without it. It is gitignored; write it by hand on the VPS:
+   ```bash
+   cat > scripts/vps/bot-api.env <<'EOF'
+   TELEGRAM_API_ID=<from https://my.telegram.org>
+   TELEGRAM_API_HASH=<from https://my.telegram.org>
+   EOF
+   ```
+   These are an **app registration**, not the bot token. The bot token lives in the root `.env` as
+   `TG_BOT_TOKEN`, along with `TG_ALLOWED_USER_ID` and (optionally) `TG_API_BASE`.
+
+2. The server's storage is bind-mounted at `/var/lib/telegram-bot-api` **on both sides**. With
+   `TELEGRAM_LOCAL=1`, `getFile` returns an absolute path on the container's filesystem and `bot.py`
+   opens that exact string on the host, so the two namespaces have to agree — see the comment in
+   `telegram-bot-api.yml`. Create it and make it readable by whoever runs `bot.py`:
+   ```bash
+   mkdir -p /var/lib/telegram-bot-api
+   ```
+
+3. `ffmpeg` (for `ffprobe`) is in the `apt install` line above. The bot refuses any file it cannot
+   probe, so a missing `ffprobe` means nothing is ever accepted.
+
+### Bring it up
+
+```bash
+docker compose -f scripts/vps/telegram-bot-api.yml up -d
+curl -s http://127.0.0.1:8081/bot<token>/getMe        # must contain "ok":true
+```
+
+**One-time and irreversible in one direction:** call `logOut` against `api.telegram.org` for this
+bot *before* pointing it at the local server, or it will silently stop receiving updates:
+
+```bash
+curl -s "https://api.telegram.org/bot<token>/logOut"
+cp scripts/vps/motion-bot.service /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now motion-bot
+```
+
+### Commands
+
+| Command | What it does |
+|---|---|
+| (send a File) | measures it, replies with the description, byte count and `sha256`, and asks which slot if it is an image |
+| `character` / `outfit` / `background` | answers the slot question for the file at the head of the queue |
+| `/confirm` | **spends money.** Rents an RTX 5090 at $0.99/hour and runs the drain |
+| `/status` | progress for this chat's job, read from the journal — still works after the pod is destroyed |
+| `/result <manifest>.yaml` | the finished video(s), or the failure logs already pulled to disk |
+| `/tryon <batch-id>` | just `01-tryon.png`, when the final video looks wrong |
+
 ## Acceptance — needs a real phone
 
-This step validates the byte-fidelity assumption: does Telegram preserve bytes for a `.MP4` sent via
-`File`? The design in spec section 4 assumes yes. This is the measurement that proves it:
+This validates the byte-fidelity assumption: does Telegram preserve bytes for a `.MP4` sent via
+`File`? The design in spec section 4 assumes yes. This is the measurement that proves it.
 
-1. Start the local Bot API server:
-   ```bash
-   docker compose -f scripts/vps/telegram-bot-api.yml up -d
-   curl -s http://127.0.0.1:8081/bot<token>/getMe
-   ```
-   Confirm `"ok":true` in the response.
+**A1/A2 — arrival.** With the bot running, send **the same file twice** from the iPhone: once via
+the Photos tab, once via `paperclip -> File`.
 
-2. **One-time and irreversible in one direction:** call `logOut` against `api.telegram.org` for this
-   bot *before* pointing it at the local server, or it will silently stop receiving updates:
-   ```bash
-   curl -s "https://api.telegram.org/bot<token>/logOut"
-   ```
+- The Photos one must be refused with the compression message.
+- The File one is accepted, and the reply carries the description, the byte count and the `sha256`.
+  (There is no `/sha` command; the digest is folded into the accepted-file reply, so nothing has to
+  be asked for a second time.)
 
-3. Start the bot:
-   ```bash
-   python3 scripts/tgbot/bot.py
-   ```
+Compare against the original on the Mac:
 
-4. From the iPhone, send **the same file twice**: once via the Photos tab, once via
-   `paperclip -> File`.
-   - The Photos one must be refused with the compression message.
-   - The File one must come back with a `sha256` and a byte count.
+```bash
+shasum -a 256 <the original file>
+stat -f %z <the original file>
+```
 
-5. On the Mac, verify the original file:
-   ```bash
-   shasum -a 256 <the original file>
-   stat -f %z <the original file>
-   ```
+Do this for an image and for a ~25MB `.mp4`. Record both digests per file, whether they match, and
+the byte counts.
 
-6. Repeat steps 4-5 for:
-   - An image file
-   - A ~25MB `.mp4` file
-
-Record in the task completion: the two digests per file, whether they match, and the byte counts.
-
-**If the digests match:** the design's central assumption holds; continue to Task 3.
+**If the digests match:** the design's central assumption holds.
 **If they do not:** stop work. Spec section 4 is invalidated and the ingest channel has to change
 before anything else is built — the rest of the plan would be built on sand. Do not work around it.
+
+**A6 — delivery.** After a run, compare the digest of the file the bot sent back against the one on
+the VPS. The arrival digest from A1 is already in the chat, so this is a comparison, not a second
+procedure:
+
+```bash
+shasum -a 256 out/<batch>/_final/job.mp4
+```
+
+They must match. If they do not, `sendDocument` is not doing what this design claims and results are
+being re-encoded — which invalidates every quality measurement made from a delivered file.

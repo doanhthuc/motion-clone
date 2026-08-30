@@ -10,6 +10,9 @@ Reads TG_BOT_TOKEN, TG_ALLOWED_USER_ID and TG_API_BASE from the root .env.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import re
+import shutil
 import subprocess
 import sys
 import time
@@ -32,7 +35,8 @@ from drain import failed_job_ids
 from tgbot.tgclient import Tg, TgError
 from tgbot.ingest import Probe, describe, probe, to_png_if_heic
 from tgbot.job import Job, missing_slots, slot_for, write_manifest
-from tgbot.run import drain_running, estimate_minutes, final_files, start_drain, summary_text
+from tgbot.run import (drain_running, estimate_minutes, final_files, lease_for,
+                       progress_text, start_drain, summary_text)
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -81,21 +85,59 @@ _PENDING: dict[int, list[tuple[Path, Probe]]] = {}
 # read-only to this bot and its behaviour is not this bot's to depend on.
 _LAST_VALIDATE: dict[int, bool] = {}
 
+# Chats that have already been told "you still have unanswered files" by
+# /confirm. The second /confirm runs anyway, dropping them — the message says
+# so. Cleared by anything that changes the job, so the warning is always about
+# the files that are pending right now, not files answered since.
+_CONFIRM_WARNED: set[int] = set()
+
+# Where accepted uploads are copied before anything else touches them.
+#
+# Two problems, one move (findings C2 and I5, 2026-08-31). (1) With
+# TELEGRAM_LOCAL=1 the Bot API server returns an absolute path on ITS
+# filesystem, and that path embeds the bot token as a directory component:
+# /var/lib/telegram-bot-api/<TOKEN>/documents/file_5.mp4. Left alone, that
+# string becomes a manifest input line, is echoed back over Telegram by
+# _maybe_show_manifest, and lands in the drain log — routing around the
+# _scrub() that tgclient.py exists to provide. (2) The staged copy is also the
+# only path downstream code ever sees, so the host/container namespace question
+# stops mattering for everything after ingest. The names are the user's own
+# ("blue-dress.jpg"), not Telegram's opaque "file_5.jpg", so a manifest read on
+# a phone is readable.
+STAGING_DIR_NAME = "tg-staging"
+
+# Filenames are re-spelled into this alphabet before they are written or put
+# into a manifest. job.py's render_manifest emits `      <slot>: <path>` as a
+# PLAIN (unquoted) YAML scalar, so a space or a ": " in a user-chosen filename
+# would produce a manifest that parses wrong or not at all — and job.py is
+# protected by this branch's constraints, so quoting cannot be added there.
+# Restricting the alphabet also means a staged name can never contain a path
+# separator or "..", the same property _safe_child() checks for.
+_SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
 
 def log(msg: str) -> None:
     print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} bot: {msg}", flush=True)
 
 
 def allowed(update: dict, allowed_user_id: int) -> bool:
-    """Allowlist of exactly one user id.
+    """Allowlist of exactly one user id, in exactly one chat: their own.
 
     Absence of a sender means refuse. channel_post and service updates carry no
     message.from, and defaulting them to allowed would let anyone who can post
     where this bot can see spend money.
+
+    The chat check is the second half and is not redundant (added 2026-08-31).
+    A private chat with a user has chat.id == that user's id; a group does not.
+    If the owner adds this bot to a group, every message THEY send there passes
+    the sender check, and the bot then replies into the group — with the
+    manifest, the file paths and the finished video. Refusing anything but the
+    one-to-one chat keeps the reply surface as narrow as the send surface.
     """
     msg = update.get("message") or {}
     sender = msg.get("from") or {}
-    return sender.get("id") == allowed_user_id
+    chat = msg.get("chat") or {}
+    return sender.get("id") == allowed_user_id and chat.get("id") == allowed_user_id
 
 
 def _safe_child(root: Path, name: str) -> Path | None:
@@ -120,6 +162,66 @@ def _safe_child(root: Path, name: str) -> Path | None:
     if not candidate.is_relative_to(root_resolved):
         return None
     return candidate
+
+
+def _safe_name(name: str) -> str:
+    """A user-supplied filename, re-spelled into `_SAFE_NAME_RE`'s alphabet."""
+    cleaned = _SAFE_NAME_RE.sub("_", Path(name).name).strip("._-")
+    return cleaned or "file"
+
+
+def _stage_file(chat_id: int, src: Path, file_name: str | None) -> Path:
+    """Copy an accepted upload under `batch/tg-staging/<chat_id>/` and return that path.
+
+    Copy, not reference: see STAGING_DIR_NAME for why the path Telegram hands
+    back must never reach a manifest, a message or a log. The copy also means
+    the Bot API server's own storage is only ever read — HEIC conversion and
+    everything after it writes into the repo's own directory, which the bot
+    owns and the container does not.
+    """
+    dest_dir = ROOT / "batch" / STAGING_DIR_NAME / str(chat_id)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    stem = _safe_name(file_name or src.name)
+    dest = dest_dir / stem
+    counter = 1
+    while dest.exists():
+        # Never overwrite: two files can share a name, and silently replacing
+        # the first would lose a file the user believes they sent.
+        dest = dest_dir / f"{Path(stem).stem}-{counter}{Path(stem).suffix}"
+        counter += 1
+    try:
+        shutil.copyfile(src, dest)
+    except OSError as exc:
+        # Deliberately does NOT include `src` in the message: that string
+        # contains the bot token (see STAGING_DIR_NAME), and this text goes
+        # straight back over Telegram. `strerror` alone ("No such file or
+        # directory") is the part that tells the operator what happened —
+        # normally that the Bot API container's storage is not mounted at the
+        # same path on the host (finding C2).
+        raise RuntimeError(
+            f"could not read the uploaded file for {stem}: {exc.strerror}. "
+            f"On the VPS, check that telegram-bot-api.yml mounts "
+            f"/var/lib/telegram-bot-api at the identical host path.") from exc
+    return dest
+
+
+def _fidelity_line(path: Path) -> str:
+    """Byte count and sha256 of an accepted file, for acceptance A6.
+
+    Folded into the accepted-file reply rather than a separate /sha command
+    (which Task 7 removed when it took over the document path): A6 compares
+    what arrived against `out/<batch>/_final/<run>.mp4`, and having the
+    arrival digest already in the transcript makes that a comparison instead
+    of a second procedure someone has to remember to run.
+    """
+    digest = hashlib.sha256()
+    # Streamed, not path.read_bytes(): a local Bot API server accepts up to
+    # 2GB and the VPS this runs on is a 4GB Hetzner CX22 (scripts/vps/README.md
+    # "Box"), so reading a whole video into memory to hash it is a real risk.
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return f"{path.stat().st_size} bytes\nsha256 {digest.hexdigest()}"
 
 
 def deliver_result(tg: Tg, chat_id: int, manifest_path: Path) -> None:
@@ -181,10 +283,31 @@ def _askable_roles(pipeline: str) -> list[str]:
     return sorted((required_roles(pipeline) | optional_roles(pipeline)) - {"driver"})
 
 
-def _ask_about(tg: Tg, chat_id: int, p: Probe, pipeline: str) -> None:
+def _ask_about(tg: Tg, chat_id: int, p: Probe, pipeline: str, extra: str = "") -> None:
     """Ask which slot a parked, ambiguous file belongs to."""
     options = " / ".join(_askable_roles(pipeline))
-    tg.send_message(chat_id, f"{describe(p)}\nWhich slot is this? Reply: {options}")
+    body = f"{describe(p)}\n{extra}" if extra else describe(p)
+    tg.send_message(chat_id, f"{body}\nWhich slot is this? Reply: {options}")
+
+
+def _fill_slot(tg: Tg, chat_id: int, job: Job, role: str, path: Path, p: Probe,
+               extra: str = "") -> None:
+    """Put a file in a slot and say so — including when it displaces one.
+
+    The one acknowledgement path for every fill (findings I6/I7,
+    2026-08-31). Both ways into a slot could previously overwrite a file the
+    user had already placed and reply as if nothing had been lost: resending a
+    video silently replaced `driver`, and answering a role that was already
+    filled both popped the queue head and overwrote the slot, so the original
+    was unrecoverable in the same breath. Overwriting is still allowed — it is
+    how you correct a mistake — but it is now named.
+    """
+    replacing = role in job.slots
+    job.slots[role] = path
+    job.probes[role] = p
+    prefix = f"replacing the previous {role}\n" if replacing else ""
+    suffix = f"\n{extra}" if extra else ""
+    tg.send_message(chat_id, f"{prefix}{role}: {describe(p)}{suffix}")
 
 
 def _maybe_show_manifest(tg: Tg, chat_id: int, job: Job) -> None:
@@ -204,11 +327,39 @@ def _maybe_show_manifest(tg: Tg, chat_id: int, job: Job) -> None:
     if missing_slots(job):
         return
     manifest_path = _job_manifest_path(chat_id)
+    if drain_running(manifest_path):
+        # The money guard on the WRITE side, not just on /confirm (finding C1,
+        # 2026-08-31). scripts/drain.py:220-248 runs batch_run.py as a separate
+        # process TWICE, each time re-reading this manifest from disk: phase A
+        # (--no-start), then provision + bootstrap, then phase B (--resume). So
+        # for the 10-35 minutes after /confirm the file is still live input, and
+        # _job_manifest_path is one deterministic path per chat. A user
+        # assembling the next job during the render — the most ordinary thing
+        # imaginable — would fill the last slot here and put job B onto the pod
+        # rented for job A, with nobody asked. The journal collides the same
+        # way: state_path_for derives batch/tg-<chat>.state.json from this same
+        # name, so --resume would re-attach to job A's recorded job_ids and
+        # /result for A could never be answered again.
+        tg.send_message(chat_id,
+                        "a drain is still running for this chat's job — wait for "
+                        "it to finish before starting another. Your files are "
+                        "kept; send /status for progress.")
+        return
     write_manifest(job, manifest_path, now=time.strftime("%Y-%m-%d %H:%M:%S"))
 
-    result = subprocess.run(
-        ["make", "batch-validate", f"FILE={manifest_path}"],
-        cwd=_REPO_ROOT, capture_output=True, text=True)
+    try:
+        result = subprocess.run(
+            ["make", "batch-validate", f"FILE={manifest_path}"],
+            cwd=_REPO_ROOT, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        # This runs inside the single synchronous poll loop: without a timeout
+        # a hung validate blocks every further update, including /status, for
+        # as long as it hangs. 120s is ~100x the observed runtime (validate
+        # loads YAML and stats files; it never touches a pod).
+        _LAST_VALIDATE[chat_id] = False
+        tg.send_message(chat_id, "make batch-validate did not finish within 120s "
+                                 "— nothing will run. Check the VPS.")
+        return
     if result.returncode != 0:
         _LAST_VALIDATE[chat_id] = False
         tg.send_message(chat_id,
@@ -226,7 +377,7 @@ def _maybe_show_manifest(tg: Tg, chat_id: int, job: Job) -> None:
         "and start, or nothing yet costs anything.")
 
 
-def handle(tg: Tg, update: dict, *, allowed_user_id: int, state: dict,
+def handle(tg: Tg, update: dict, *, allowed_user_id: int,
            dry_run: bool = False) -> None:
     if not allowed(update, allowed_user_id):
         return                              # silent: do not confirm the bot exists
@@ -243,16 +394,31 @@ def handle(tg: Tg, update: dict, *, allowed_user_id: int, state: dict,
 
     doc = msg.get("document")
     if doc:
-        path = Path(tg.call("getFile", file_id=doc["file_id"])["file_path"])
-        path = to_png_if_heic(path)
+        # Every step from getFile to probe is inside this try (finding I1,
+        # 2026-08-31). Only probe() used to be: a TgError from getFile, a
+        # KeyError on a missing file_path, and every carefully worded message
+        # to_png_if_heic raises ("ffmpeg is not installed", "reported success
+        # but wrote no file") all escaped handle(), were swallowed by main()'s
+        # `except Exception: log(...)`, and the user got nothing back at all.
+        # OSError is in the list because _stage_file's copy is the first thing
+        # that touches the host filesystem — it raises RuntimeError itself so
+        # the token in the source path can never reach the reply, but a
+        # mkdir/stat on the way there can still surface as a plain OSError.
         try:
+            src = Path(tg.call("getFile", file_id=doc["file_id"])["file_path"])
+            path = _stage_file(chat_id, src, doc.get("file_name"))
+            path = to_png_if_heic(path)
             p = probe(path)
-        except RuntimeError as exc:
+        except (RuntimeError, TgError, KeyError, OSError) as exc:
             # ffprobe raises rather than guessing (ingest.probe's own
             # contract) — the file never enters a job, so it can never
             # silently pick a wrong preset or a wrong slot.
-            tg.send_message(chat_id, str(exc))
+            tg.send_message(chat_id, f"that file was not accepted: {exc}")
             return
+
+        # Acceptance A6 compares this against the delivered file's digest.
+        fidelity = _fidelity_line(path)
+        _CONFIRM_WARNED.discard(chat_id)
 
         job = _STATE.setdefault(chat_id, Job(slots={}, probes={}, pipeline=JOB_PIPELINE))
         role = slot_for(p, job)
@@ -266,20 +432,18 @@ def handle(tg: Tg, update: dict, *, allowed_user_id: int, state: dict,
             queue = _PENDING.setdefault(chat_id, [])
             queue.append((path, p))
             if len(queue) == 1:
-                _ask_about(tg, chat_id, p, job.pipeline)
+                _ask_about(tg, chat_id, p, job.pipeline, extra=fidelity)
             else:
                 # Still show describe() — the quality gate must stay visible
                 # for every accepted file, not just the one currently asked
                 # about — but don't ask again yet: only the head is asked.
                 tg.send_message(chat_id,
-                                f"{describe(p)}\nqueued — answer the previous "
-                                "question first")
+                                f"{describe(p)}\n{fidelity}\nqueued — answer the "
+                                "previous question first")
             return
 
         # A video: structural, always `driver` — no question needed.
-        job.slots[role] = path
-        job.probes[role] = p
-        tg.send_message(chat_id, f"{role}: {describe(p)}")
+        _fill_slot(tg, chat_id, job, role, path, p, extra=fidelity)
         _maybe_show_manifest(tg, chat_id, job)
         return
 
@@ -332,6 +496,22 @@ def handle(tg: Tg, update: dict, *, allowed_user_id: int, state: dict,
         deliver_result(tg, chat_id, manifest_path)
         return
 
+    if text.startswith("/status"):
+        # The plan (Task 5) specifies "progress is one edited message,
+        # re-rendered about every 30 seconds", and progress_text was built and
+        # tested for it — but nothing ever called it, so after /confirm the
+        # user got one message and then silence for 12+ minutes with no way to
+        # ask whether it was running or dead (finding I3, 2026-08-31). This is
+        # the cheap half: pull, not push, over the same already-tested
+        # renderer. The timed edit loop is still unwired.
+        manifest_path = _job_manifest_path(chat_id)
+        if not manifest_path.exists():
+            tg.send_message(chat_id, "nothing started yet for this chat")
+            return
+        tg.send_message(chat_id, progress_text(manifest_path,
+                                               lease=lease_for(manifest_path)))
+        return
+
     if text.startswith("/confirm"):
         # THE money gate. This is the only line in this file that may call
         # start_drain — grep -rn "start_drain" must show every call site
@@ -354,6 +534,19 @@ def handle(tg: Tg, update: dict, *, allowed_user_id: int, state: dict,
                             "run. Fix the error already shown, or send the files "
                             "again.")
             return
+        pending = _PENDING.get(chat_id) or []
+        if pending and chat_id not in _CONFIRM_WARNED:
+            # /confirm used to succeed with files still queued and unanswered,
+            # then drop them silently on the state clear below (finding I6,
+            # 2026-08-31). Refuse once, naming the count; a second /confirm
+            # runs without them, because "I meant the optional one to be
+            # skipped" is a legitimate intent and there is no other way to
+            # express it.
+            _CONFIRM_WARNED.add(chat_id)
+            tg.send_message(chat_id,
+                            f"{len(pending)} file(s) still unassigned — answer "
+                            f"them, or send /confirm again to run without them")
+            return
         manifest_path = _job_manifest_path(chat_id)
         if drain_running(manifest_path):
             # The money guard: a second drain on one manifest corrupts the
@@ -368,16 +561,22 @@ def handle(tg: Tg, update: dict, *, allowed_user_id: int, state: dict,
         # Clear in-memory state so the next file starts a fresh job rather
         # than mutating one already handed to a running drain. The manifest
         # itself, and the drain's own journal, stay on disk regardless.
+        dropped = len(_PENDING.pop(chat_id, []) or [])
         _STATE.pop(chat_id, None)
-        _PENDING.pop(chat_id, None)
         _LAST_VALIDATE.pop(chat_id, None)
+        _CONFIRM_WARNED.discard(chat_id)
+        if dropped:
+            tg.send_message(chat_id, f"running without {dropped} unassigned file(s)")
         tg.send_message(chat_id,
                         "started — renting a GPU pod at $0.99/hour now.\n"
                         f"Check back with /result {manifest_path.name} once it's done.")
         return
 
     if text.startswith("/start"):
-        tg.send_message(chat_id, "Ready. Send a file with the paperclip -> File.")
+        tg.send_message(chat_id,
+                        "Ready. Send a file with the paperclip -> File.\n"
+                        "/status progress · /confirm spends money · "
+                        "/result <manifest>.yaml · /tryon <batch-id>")
         return
 
     # A plain-text reply, meant to answer the question asked about the HEAD
@@ -393,9 +592,11 @@ def handle(tg: Tg, update: dict, *, allowed_user_id: int, state: dict,
             path, p = queue.pop(0)
             if not queue:
                 _PENDING.pop(chat_id, None)
-            job.slots[answer] = path
-            job.probes[answer] = p
-            tg.send_message(chat_id, f"{answer}: {describe(p)}")
+            _CONFIRM_WARNED.discard(chat_id)
+            # _fill_slot, not a bare assignment: answering a role that is
+            # already filled pops the queue head AND overwrites the slot, so
+            # the displaced file is gone in the same step (finding I7).
+            _fill_slot(tg, chat_id, job, answer, path, p)
             _maybe_show_manifest(tg, chat_id, job)
             if queue:
                 # The next file was already queued (arrived before this
@@ -422,14 +623,13 @@ def main() -> int:
         return 2
     tg = Tg(token=token, base_url=base)
     allowed_user_id = int(raw_id)
-    state: dict = {}
     offset = 0
     log(f"started, api={base}, dry_run={args.dry_run}")
     while True:
         try:
             for update in tg.get_updates(offset):
                 offset = update["update_id"] + 1
-                handle(tg, update, allowed_user_id=allowed_user_id, state=state,
+                handle(tg, update, allowed_user_id=allowed_user_id,
                        dry_run=args.dry_run)
         except TgError as exc:
             log(f"poll failed, continuing: {exc}")

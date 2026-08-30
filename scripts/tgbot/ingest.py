@@ -58,6 +58,15 @@ def probe(path: Path) -> Probe:
             capture_output=True, text=True, timeout=60)
     except FileNotFoundError as exc:
         raise RuntimeError("ffprobe is not installed — see scripts/vps/README.md") from exc
+    except subprocess.TimeoutExpired as exc:
+        # timeout=60 above raises TimeoutExpired, which is NOT a RuntimeError —
+        # so before 2026-08-31 it escaped every caller's `except RuntimeError`,
+        # reached bot.main()'s blanket handler and the user got no reply at all.
+        # Same contract as every other failure here: raise something that names
+        # the file and that the caller already catches.
+        raise RuntimeError(
+            f"ffprobe timed out after 60s on {path.name} — the upload may be "
+            f"truncated or the file may not be media; send it again.") from exc
     if out.returncode != 0:
         raise RuntimeError(f"ffprobe could not read {path.name}: {out.stderr.strip()[:200]}")
     try:
@@ -139,12 +148,23 @@ def to_png_if_heic(path: Path) -> Path:
     cmd = (["sips", "-s", "format", "png", str(path), "--out", str(dest)] if on_darwin
            else ["ffmpeg", "-y", "-i", str(path), str(dest)])
     try:
-        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     except FileNotFoundError as exc:
         # Same shape as probe()'s missing-ffprobe message: name what to
         # install rather than leak a bare FileNotFoundError to the caller.
         raise RuntimeError(f"{tool} is not installed — cannot convert {path.name} "
                           f"from HEIC") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"{tool} timed out after 120s converting {path.name} "
+                           f"from HEIC") from exc
+    if out.returncode != 0:
+        # Was `check=True`, which raises CalledProcessError — not a
+        # RuntimeError, so it escaped bot.handle()'s ingest guard entirely and
+        # the user got silence (finding I1, 2026-08-31). Every other failure in
+        # this module raises RuntimeError naming the file; this one now does
+        # too, and carries the converter's own stderr so the reason is visible.
+        raise RuntimeError(f"{tool} could not convert {path.name} from HEIC: "
+                           f"{(out.stderr or '').strip()[:200]}")
     if not dest.exists() or dest.stat().st_size == 0:
         # A converter that exits 0 having written nothing must not hand back a
         # path to a missing/zero-byte file straight into a paid render.
