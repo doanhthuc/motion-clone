@@ -65,6 +65,8 @@ def batch_run(*args: str) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--file", required=True)
+    ap.add_argument("--resume", action="store_true",
+                    help="continue a deferred drain instead of starting a new batch")
     ap.add_argument("--yes", action="store_true",
                     help="required to actually rent — without it, dry run")
     args = ap.parse_args()
@@ -82,7 +84,16 @@ def main() -> int:
     # back: renting is this script's job, and it must be the only one doing it.
     # Local Gemini try-on happens here, before any GPU clock starts, so a 429
     # costs nothing. See docs/batch-runner.md section 2.9.
-    rc = batch_run("--file", str(manifest_path), "--no-start")
+    #
+    # --resume must be forwarded to phase A, not only to the run after
+    # provisioning. Without it, resolve_batch_id (batch_run.py:38) mints a NEW
+    # batch id on a re-drain, so every local try-on runs again and Gemini is
+    # billed a second time — silently destroying the "defer preserves the
+    # try-on you already paid for" guarantee in the design spec.
+    phase_a = ["--file", str(manifest_path), "--no-start"]
+    if args.resume:
+        phase_a.append("--resume")
+    rc = batch_run(*phase_a)
     if rc == 0:
         print("finished without needing a pod")
         return 0
