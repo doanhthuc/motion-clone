@@ -1,0 +1,135 @@
+"""The money gate: [Confirm] is the only place `CONFIRM=yes` can be written.
+
+[Run] (a future bot handler, Task 6) renders the manifest and calls
+`make batch-validate` — free, no pod. Only when the user taps [Confirm] does
+this module invoke `make drain ... CONFIRM=yes`, which reaches
+scripts/pod-provision.sh and rents an RTX 5090 at $0.99/hour
+(docs/gpu-pod.md). Putting the whole spend decision behind one literal
+string, appended in exactly one place, is what makes everything after it
+(the drain script's own provision -> bootstrap -> run -> teardown cycle)
+safe to leave fully automatic.
+
+`progress_text` never touches the pod. It reads the same on-disk journal
+(`batchlib.manifest.load_state` via `state_path_for`) that `batch_status`
+already uses, so a rendered progress message stays truthful after
+`make gpu-destroy` has already run — the pod is the thing most likely to be
+gone by the time someone asks.
+"""
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+
+# Relies on the caller having put scripts/ on sys.path (bot.py does this at
+# import time; tests do it directly) — same convention as tgbot/job.py,
+# which imports batchlib the same way without inserting its own path.
+from batchlib.manifest import load_state, state_path_for
+from batchlib.pipelines import PIPELINES, STAGES
+
+from .job import Job
+
+ROOT = Path(__file__).resolve().parents[2]
+
+# Measured medians from ONE real batch (2026-08-18-2105, RTX 5090, RunPod
+# EU-RO-1, $0.99/hr), a 15-second driver at 1088x1920 —
+# docs/batch-runner.md section 7. These are what actually happened once, not
+# a ceiling and not a guarantee: a different preset, targetRes or fpsInterp
+# changes both the runtime and the output size (batch-runner.md section 7's
+# own closing note). A stage not in this table (only character-swap, as of
+# 2026-08-31) falls back to its STAGES[...].timeout_min, which IS a ceiling
+# — so the fallback is intentionally the more pessimistic number, not a
+# substitute measurement.
+MEASURED_STAGE_SEC = {
+    "tryon": 351,
+    "motion": 247,
+    "enhance": 114,
+}
+
+# Popen handles for drains this process itself started, keyed by the
+# resolved manifest path. This is process memory, not a journal file: the
+# bot is a single long-running `python3 scripts/tgbot/bot.py` process, so
+# the handle started by start_drain() and the one checked by
+# drain_running() are the same process's dict, no persistence needed across
+# a bot restart (a restarted bot has no drain of its own running yet).
+_RUNNING: dict[Path, subprocess.Popen] = {}
+
+
+def estimate_minutes(job: Job) -> int:
+    """A minutes estimate to show BEFORE [Confirm], never presented as a promise.
+
+    The caller must put this next to a caveat ("measured once, on one
+    batch") — this function only computes the number, it does not word the
+    disclaimer, so nothing here can silently drop it.
+    """
+    stages = PIPELINES[job.pipeline]
+    total_sec = sum(MEASURED_STAGE_SEC.get(stage, STAGES[stage].timeout_min * 60)
+                    for stage in stages)
+    return max(1, round(total_sec / 60))
+
+
+def progress_text(manifest_path: Path, *, lease) -> str:
+    """Render one progress message from the journal alone.
+
+    `lease` (batchlib_ext.lease.Lease | None) is used only for its own
+    fields (pod_id, provisioned_at) already written to disk at provision
+    time — never to query RunPod. That is deliberate: the pod is exactly
+    the thing that may already be destroyed by the time this renders, while
+    the journal (load_state) is written by the runner on every stage
+    transition and outlives the pod, same as batch_status already relies on.
+    """
+    state = load_state(state_path_for(manifest_path))
+    lines = [f"batch {state.get('batch') or '(not started yet)'}"]
+
+    runs = state.get("runs") or {}
+    if not runs:
+        lines.append("no runs recorded yet")
+    for run_id in sorted(runs):
+        run = runs[run_id]
+        lines.append(f"{run_id}: {run.get('status', '?')}")
+        for stage_name, stage in (run.get("stages") or {}).items():
+            status = stage.get("status", "?")
+            sec = stage.get("sec")
+            suffix = f" ({sec}s)" if sec is not None else ""
+            lines.append(f"  {stage_name}: {status}{suffix}")
+
+    if lease is not None:
+        lines.append(f"pod {lease.pod_id}")
+
+    return "\n".join(lines)
+
+
+def start_drain(manifest_path: Path, *, dry_run: bool) -> subprocess.Popen:
+    """Launch `make drain FILE=...`, appending CONFIRM=yes only when dry_run is False.
+
+    This is the ONLY line in this module (in this repo) that may write the
+    string "CONFIRM=yes" — `grep -rn CONFIRM scripts/tgbot/` must show
+    exactly one hit, and it must be inside this `if`. Output goes to a log
+    file beside the manifest rather than a pipe: a drain can run for the
+    lifetime of a rented pod (hours), and a Popen pipe that nobody reads
+    fills its OS buffer and deadlocks the child.
+    """
+    argv = ["make", "drain", f"FILE={manifest_path}"]
+    if not dry_run:
+        argv.append("CONFIRM=yes")
+
+    log_path = manifest_path.with_suffix(".drain.log")
+    with open(log_path, "ab") as log_file:
+        # Popen duplicates the fd into the child; closing our copy on exit
+        # of this `with` is what lets the child (which can outlive this
+        # function by hours) keep writing without this process holding a
+        # second handle open for as long as the bot itself runs.
+        proc = subprocess.Popen(argv, cwd=ROOT, stdout=log_file, stderr=subprocess.STDOUT)
+    _RUNNING[manifest_path.resolve()] = proc
+    return proc
+
+
+def drain_running(manifest_path: Path) -> bool:
+    """True only for a drain THIS process started and that has not exited.
+
+    Deliberately not lease-based: a lease means a pod is rented, but a
+    dry run (no CONFIRM=yes) never writes one, and the process can still be
+    running while `make batch-validate` executes. Checking the Popen handle
+    is the one thing that is true in both cases.
+    """
+    proc = _RUNNING.get(manifest_path.resolve())
+    return proc is not None and proc.poll() is None
