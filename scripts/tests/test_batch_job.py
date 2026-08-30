@@ -51,6 +51,19 @@ class TestRenderManifest(unittest.TestCase):
         self.assertEqual(data["runs"][0]["pipeline"], "motion-enhance")
         self.assertIn("character", data["runs"][0]["inputs"])
 
+    def test_preset_lands_on_the_stage_that_actually_consumes_driver(self):
+        # _driver_stage() resolves the driver-consuming stage from PIPELINES/STAGES
+        # rather than hardcoding "motion" — character-swap-enhance runs
+        # character-swap, not motion, so the preset param must land there. The
+        # negative assertion (no "motion:" block) is what actually pins this:
+        # without it, a regression that always emitted "motion:" would pass the
+        # positive check alone by coincidence.
+        job = Job(slots={"character": Path("/c.png"), "driver": Path("/d.mp4")},
+                  probes={"driver": VIDEO}, pipeline="character-swap-enhance")
+        text = render_manifest(job, now="2026-08-31 21:40")
+        self.assertIn("character-swap: { preset: drv-15s }", text)
+        self.assertNotIn("motion:", text)
+
 
 if __name__ == "__main__":
     unittest.main()
