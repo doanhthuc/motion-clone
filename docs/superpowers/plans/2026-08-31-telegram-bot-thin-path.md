@@ -4,7 +4,7 @@
 
 **Goal:** Send four files to a Telegram bot from a phone, confirm one screen, and get a finished video back — with the GPU pod rented and destroyed automatically in between.
 
-**Architecture:** A long-polling bot on the same VPS as the watchdog, talking to a self-hosted `telegram-bot-api` server so files are not capped at 20MB and arrive as paths on disk rather than downloads. It assembles one job, writes a manifest, shells out to the `make drain` built in Plan 1, and sends the result back. Zero third-party Python dependencies, matching `scripts/batchlib/`.
+**Architecture:** A long-polling bot on the same VPS as the watchdog, talking to a self-hosted `telegram-bot-api` server so results are not capped at 50MB on the way out and files arrive as paths on disk rather than downloads. It assembles one job, writes a manifest, shells out to the `make drain` built in Plan 1, and sends the result back. Zero third-party Python dependencies, matching `scripts/batchlib/`.
 
 **Tech Stack:** Python 3 stdlib only (`urllib`, `json`, `hashlib`, `subprocess`), `unittest`, Docker (for `telegram-bot-api` only), systemd, `ffprobe`.
 
@@ -317,7 +317,7 @@ token is in it and this repo is public."
 
 **This task carries the measurement the whole design rests on.** Spec section 13's first unknown: does Telegram preserve bytes for a `.MP4` sent as File? Everything in spec section 4 assumes yes. The `/sha` behaviour below answers it through the real channel rather than in a lab, and it is not throwaway — it is the skeleton the later tasks extend.
 
-**Why a local Bot API server is not optional:** the public Bot API caps bot *downloads* at 20MB, and this user's drivers are 20-30MB. With a local server, `getFile` returns an **absolute path on disk** and the bot reads it — no download at all.
+**Why a local Bot API server is still right, for a corrected reason:** the plan first justified it by claiming this user's drivers are 20-30MB against a 20MB download cap. Measured 2026-08-31, that was false — every driver in `~/Desktop/materials/drivers/` is 1.3-15MB and would have passed. The cap that binds is the **50MB upload** on the way back: the largest delivered video in `out/` is **41MB**, an 18% margin, and `targetRes: 2k` crosses it. Independently of any cap, a local server makes `getFile` return an **absolute path on disk**, so the bot reads what the client uploaded instead of downloading it back.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -474,10 +474,12 @@ def main() -> int:
 
 ```yaml
 # scripts/vps/telegram-bot-api.yml
-# The public Bot API caps bot downloads at 20MB; this user's drivers are 20-30MB,
-# so every one of them would fail. A local server lifts that to 2GB AND makes
-# getFile return an absolute path on disk, so the bot reads the file instead of
-# downloading it.
+# Measured 2026-08-31: this user's drivers are 1.3-15MB, so the public API's
+# 20MB DOWNLOAD cap would not have bitten — an earlier claim that it would was
+# never measured. The cap that binds is the 50MB UPLOAD on the way back: the
+# largest video delivered so far is 41MB, and targetRes: 2k crosses it.
+# A local server lifts both to 2GB AND makes getFile return an absolute path on
+# disk, so the bot reads the file instead of downloading it back.
 #
 # TELEGRAM_API_ID / TELEGRAM_API_HASH come from https://my.telegram.org (an app
 # registration, not the bot token). Put them in scripts/vps/bot-api.env, which
@@ -559,9 +561,10 @@ Record in the report: the two digests per file, whether they match, and the byte
 git add scripts/tgbot/bot.py scripts/vps/telegram-bot-api.yml scripts/vps/motion-bot.service scripts/vps/README.md Makefile .gitignore scripts/tests/test_batch_bot.py
 git commit -m "Bot skeleton, local Bot API server, and the byte-fidelity probe
 
-The public Bot API caps bot downloads at 20MB and this user's drivers are
-20-30MB, so every one would fail. A local server lifts it to 2GB and makes
-getFile return a path on disk rather than a download.
+Measured 2026-08-31: the drivers are 1.3-15MB, so the 20MB download cap would
+not have bitten — the earlier claim that it would was never measured. What
+binds is the 50MB upload cap on the way back, against a largest-delivered 41MB.
+A local server lifts both to 2GB and makes getFile return a path on disk.
 
 /sha answers spec section 13's first unknown through the real channel
 rather than in a lab: does Telegram preserve bytes for a .MP4 sent as
