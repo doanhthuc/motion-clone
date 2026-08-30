@@ -62,6 +62,51 @@ def batch_run(*args: str) -> int:
                           cwd=ROOT).returncode
 
 
+def failed_job_ids(state: dict) -> list[tuple[str, str]]:
+    """(run_id, job_id) for every stage that errored with a job actually sent."""
+    out = []
+    for run_id, entry in (state.get("runs") or {}).items():
+        for stage in (entry.get("stages") or {}).values():
+            if stage.get("status") == "error" and stage.get("job_id"):
+                out.append((run_id, str(stage["job_id"])))
+    return out
+
+
+def collect_diagnostics(settings, state: dict, out_dir: Path) -> None:
+    """Pull the pod-side logs BEFORE the pod dies.
+
+    docs/batch-runner.md section 4: a failed batch is exactly when the pod is
+    needed, to read the worker log. Auto-destroy would otherwise throw that
+    away. This is strictly better than the manual flow, which relies on
+    remembering to do it before typing `make gpu-destroy`.
+    """
+    # _request is private to batchlib.client, but it is the only thing that
+    # knows the x-api-key and user-agent headers the API requires, and
+    # duplicating those here would be a second place to keep in sync. It
+    # returns (status_code, body_bytes) — client.py:93.
+    from batchlib.client import _request
+    for run_id, job_id in failed_job_ids(state):
+        dest = out_dir / "runs" / run_id / "pod-job.log"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            # GET /jobs/:id/logs, not pm2: face_crop=vitpose vs the DWPose
+            # fallback is written with api_log (linux.py:3962) and never
+            # reaches ~/.pm2/logs/worker-out.log.
+            code, body = _request(settings, f"/jobs/{job_id}/logs")
+            dest.write_bytes(body if code == 200
+                             else f"HTTP {code}\n".encode() + body)
+        except Exception as exc:
+            dest.write_text(f"could not fetch job logs: {exc!r}\n", encoding="utf-8")
+
+    worker = out_dir / "pod-worker.log"
+    try:
+        tail = subprocess.run(["make", "gpu-logs", "LOG=worker"], cwd=ROOT,
+                              capture_output=True, text=True, timeout=120)
+        worker.write_text(tail.stdout + tail.stderr, encoding="utf-8")
+    except Exception as exc:
+        worker.write_text(f"could not fetch worker log: {exc!r}\n", encoding="utf-8")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--file", required=True)
@@ -112,6 +157,14 @@ def main() -> int:
     finally:
         # Best effort only. The watchdog is the guarantee, not this block:
         # `finally` does not run when the process is SIGKILLed or the VPS dies.
+        state = load_state(state_path_for(manifest_path))
+        batch_id = state.get("batch") or ""
+        if batch_id and failed_job_ids(state):
+            # load_settings() here rather than at the top of main(): on a fresh
+            # VPS, NUXT_MOTION_API_KEY does not exist in motions/.env until
+            # gpu-bootstrap has written it, so calling it before provisioning
+            # would raise ConfigError on the very first drain.
+            collect_diagnostics(load_settings(), state, ROOT / "out" / batch_id)
         sh("make", "gpu-destroy")
         clear_lease(LEASE_PATH)
     return rc
