@@ -1,9 +1,12 @@
-import sys, unittest
+import json
+import sys
+import unittest
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batchlib_ext.lease import Lease
-from batchlib_ext.podctl import PodInfo
+from batchlib_ext.podctl import PodInfo, RunpodCtl
 from batchlib_ext.watchdog import reconcile
 
 MIN = 60.0
@@ -59,6 +62,102 @@ class TestReconcile(unittest.TestCase):
         _, seen = reconcile(pods=pods, lease=None,
                             first_seen={"temp-cpu-a": 0.0}, now=60 * MIN)
         self.assertEqual(seen, {"temp-cpu-a": 0.0})
+
+
+class TestRunpodCtlListPods(unittest.TestCase):
+    """Test error handling in RunpodCtl.list_pods()."""
+
+    @patch("subprocess.run")
+    def test_successful_list(self, mock_run):
+        """Successfully parse valid JSON output."""
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps([
+                {"id": "pod-1", "name": "motion-transfer"},
+                {"id": "pod-2", "name": "cpu-box"}
+            ]),
+            stderr=""
+        )
+        pods = RunpodCtl().list_pods()
+        self.assertEqual(len(pods), 2)
+        self.assertEqual(pods[0].pod_id, "pod-1")
+        self.assertEqual(pods[0].name, "motion-transfer")
+
+    @patch("subprocess.run")
+    def test_empty_list(self, mock_run):
+        """Handle empty JSON array."""
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout="[]",
+            stderr=""
+        )
+        pods = RunpodCtl().list_pods()
+        self.assertEqual(pods, [])
+
+    @patch("subprocess.run")
+    def test_empty_stdout(self, mock_run):
+        """Handle empty stdout (defaults to [])."""
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout="",
+            stderr=""
+        )
+        pods = RunpodCtl().list_pods()
+        self.assertEqual(pods, [])
+
+    @patch("subprocess.run")
+    def test_nonzero_exit_raises_runtime_error(self, mock_run):
+        """Non-zero exit raises RuntimeError with stderr."""
+        mock_run.return_value = MagicMock(
+            returncode=1,
+            stdout="",
+            stderr="API key not configured"
+        )
+        with self.assertRaises(RuntimeError) as cm:
+            RunpodCtl().list_pods()
+        self.assertIn("API key not configured", str(cm.exception))
+
+    @patch("subprocess.run")
+    def test_malformed_json_raises_runtime_error(self, mock_run):
+        """Malformed JSON output (even with returncode 0) raises RuntimeError."""
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout="ID\tNAME\tGPU\tIMAGE NAME\tSTATUS",  # table format, not JSON
+            stderr=""
+        )
+        with self.assertRaises(RuntimeError) as cm:
+            RunpodCtl().list_pods()
+        self.assertIn("invalid JSON", str(cm.exception))
+        self.assertIn("ID", str(cm.exception))  # snippet in output
+
+    @patch("subprocess.run")
+    def test_missing_required_field_raises_runtime_error(self, mock_run):
+        """Missing 'id' field in JSON raises RuntimeError."""
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps([
+                {"name": "pod-without-id"}
+            ]),
+            stderr=""
+        )
+        with self.assertRaises(RuntimeError) as cm:
+            RunpodCtl().list_pods()
+        self.assertIn("invalid JSON", str(cm.exception))
+
+    @patch("subprocess.run")
+    def test_pod_without_name_gets_empty_string(self, mock_run):
+        """Pod without 'name' field gets empty string (not required)."""
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps([
+                {"id": "pod-1"}
+            ]),
+            stderr=""
+        )
+        pods = RunpodCtl().list_pods()
+        self.assertEqual(len(pods), 1)
+        self.assertEqual(pods[0].pod_id, "pod-1")
+        self.assertEqual(pods[0].name, "")
 
 
 if __name__ == "__main__":

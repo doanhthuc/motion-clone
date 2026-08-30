@@ -32,9 +32,16 @@ class RunpodCtl:
             # nothing — which is the safe direction when we cannot see.
             # Destroying on a failed query would be the unsafe one.
             raise RuntimeError(f"runpodctl get pod failed: {out.stderr.strip()}")
-        data = json.loads(out.stdout or "[]")
-        return [PodInfo(pod_id=str(p["id"]), name=str(p.get("name", "")))
-                for p in data]
+        try:
+            data = json.loads(out.stdout or "[]")
+            return [PodInfo(pod_id=str(p["id"]), name=str(p.get("name", "")))
+                    for p in data]
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            # runpodctl may exit 0 but return malformed output (e.g., unauthenticated
+            # CLI). Normalize all parse failures to RuntimeError so tick() can catch
+            # "cannot list pods" uniformly. Include a snippet of the offending output.
+            snippet = out.stdout[:100] if out.stdout else "(empty)"
+            raise RuntimeError(f"runpodctl returned invalid JSON: {exc} — output: {snippet}") from exc
 
     def destroy(self, pod_id: str) -> None:
         subprocess.run(["runpodctl", "remove", "pod", pod_id],

@@ -602,6 +602,15 @@ def tick(pods_api, first_seen: dict[str, float], *, now: float,
         log(f"KILL {pod_id} — orphan, no lease claims it")
         if not dry_run:
             pods_api.destroy(pod_id)
+
+    # Say what we deliberately left alone. Tier 3 only destroys pods named by
+    # DESTROYABLE_NAMES, so an unmanaged pod is invisible to it — and silent
+    # inaction on a $0.99/hour box is exactly the thing this daemon exists to
+    # prevent. Naming them costs one log line and makes the boundary auditable.
+    untouched = [p for p in pods
+                 if p.pod_id not in kill and (lease is None or p.pod_id != lease.pod_id)]
+    for p in untouched:
+        log(f"leaving {p.pod_id} ({p.name!r}) alone — not a name tier 3 may destroy")
     return seen
 
 
