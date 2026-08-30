@@ -19,6 +19,12 @@ from .podctl import PodInfo
 # never hardcoded: pipelines.py is the single place stage timeouts are declared.
 LONGEST_STAGE_MIN = max(s.timeout_min for s in STAGES.values())
 
+# Tier 3 destroys things, so its authority is scoped to the names this repo's
+# own provisioning creates (scripts/pod-provision.sh:387). Anything else in the
+# account — a CPU box, or the two temporary pods docs/gpu-pod.md's EU-CZ-1
+# failover runbook stands up by hand for 15-25 minutes — is not ours to kill.
+DESTROYABLE_NAMES = frozenset({"motion-transfer"})
+
 
 @dataclass(frozen=True)
 class Verdict:
@@ -62,12 +68,18 @@ def decide(*, lease: Lease, state: dict, journal_mtime: float, now: float,
 
 def reconcile(*, pods: list[PodInfo], lease: Lease | None,
               first_seen: dict[str, float], now: float,
-              grace_min: int = 10) -> tuple[list[str], dict[str, float]]:
+              grace_min: int = 10,
+              destroyable_names: frozenset[str] = DESTROYABLE_NAMES) -> tuple[list[str], dict[str, float]]:
     """Tier 3: any pod we can see that no lease claims is an orphan.
 
     This is the net for the worst case — the lease file was lost, or two
     machines both think they own the pod (see the ownership decision in the
     spec). It runs on daemon start too, which covers a VPS reboot mid-batch.
+
+    Authority is scoped to the pod names this repo's own provisioning creates.
+    A pod is only marked for destruction if it is both unclaimed AND has a
+    destroyable name. This allows tier 3 to coexist with manual operations
+    like the EU-CZ-1 failover runbook, which stands up temporary CPU pods.
 
     The grace window exists because provisioning writes the lease AFTER the
     pod exists. Without it, a tick landing in that gap kills a pod that is one
@@ -76,5 +88,6 @@ def reconcile(*, pods: list[PodInfo], lease: Lease | None,
     leased = lease.pod_id if lease else None
     seen = {p.pod_id: first_seen.get(p.pod_id, now) for p in pods}
     kill = [p.pod_id for p in pods
-            if p.pod_id != leased and (now - seen[p.pod_id]) / 60.0 > grace_min]
+            if p.pod_id != leased and p.name in destroyable_names
+            and (now - seen[p.pod_id]) / 60.0 > grace_min]
     return kill, seen
