@@ -82,8 +82,10 @@ class TestRunpodCtlListPods(unittest.TestCase):
     @patch("time.sleep")
     @patch("subprocess.run")
     def test_destroy_uses_pod_delete_matching_the_makefile(self, mock_run, _sleep):
-        # `runpodctl remove pod` is not a subcommand of runpodctl 2.8 at all.
-        # Makefile:161 uses `runpodctl pod delete <id>`.
+        # Makefile:159 uses `runpodctl pod delete <id>`, so this matches it.
+        # `runpodctl remove pod` is a live deprecated alias, not a dead command
+        # (measured 2026-08-31: `runpodctl remove pod --help` exits 0), so this
+        # pins a spelling choice, not a bug fix.
         mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
         RunpodCtl().destroy("pod-1")
         self.assertEqual(mock_run.call_args[0][0],
