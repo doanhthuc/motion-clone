@@ -10,7 +10,7 @@ Reads TG_BOT_TOKEN, TG_ALLOWED_USER_ID and TG_API_BASE from the root .env.
 from __future__ import annotations
 
 import argparse
-import hashlib
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -18,6 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batchlib.config import env_get
 from batchlib.manifest import load_state, state_path_for
+from batchlib.pipelines import optional_roles, required_roles
 # Not `from batchlib_ext...` or `scripts/batchlib/...` — drain.py itself lives
 # at scripts/drain.py, a plain top-level module, same as batch_run.py. scripts/
 # is already on sys.path (the insert above), so this is the plan's own "import
@@ -29,15 +30,39 @@ from drain import failed_job_ids
 # raises ImportError regardless of sys.path. The insert above puts scripts/ on
 # the path, which is what makes the absolute form work from either entry point.
 from tgbot.tgclient import Tg, TgError
-from tgbot.run import final_files, summary_text
+from tgbot.ingest import Probe, describe, probe, to_png_if_heic
+from tgbot.job import Job, missing_slots, slot_for, write_manifest
+from tgbot.run import drain_running, estimate_minutes, final_files, start_drain, summary_text
 
 ROOT = Path(__file__).resolve().parents[2]
+
+# `make batch-validate` and the Makefile it lives in are only ever at the real
+# repo root, never wherever a test points ROOT (path-safety tests above
+# reassign `bot.ROOT` to a tempdir). A separate, never-reassigned constant —
+# same reasoning as tgbot/run.py's own ROOT for LEASE_PATH.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Every manifest this bot renders (tgbot/job.py:render_manifest) hardcodes a
 # single run id, "job" — Plan 2A is the single-job slice, multi-job baskets
 # are Plan 2B. Hardcoding it here matches that, rather than inventing a run
 # selector for a run that never has more than one name.
 SOLE_RUN_ID = "job"
+
+# The one pipeline this bot assembles a job for. Plan 2A is the single-job
+# slice — a recipe picker (batch/recipes/*.yaml) is explicitly 2B's job (see
+# task-7-brief.md "Notes for Plan 2B"). tryon-motion-enhance is the pipeline
+# whose required+optional materials are exactly the spec's "four labelled
+# slots" (character, outfit, background, driver) — docs/superpowers/specs/
+# 2026-08-30-telegram-batch-control-design.md section 1.
+JOB_PIPELINE = "tryon-motion-enhance"
+
+# Per-chat state, in memory only — Plan 2A is one job at a time per chat. A
+# bot restart loses an unsubmitted draft, never a running job: drain_running()
+# also consults the on-disk lease (tgbot/run.py), which is the durable half.
+_STATE: dict[int, Job] = {}
+# The one file parked while its slot is ambiguous (an image — a video is
+# never ambiguous, see job.slot_for). Keyed by chat_id, same as _STATE.
+_PENDING_SLOT: dict[int, tuple[Path, Probe]] = {}
 
 
 def log(msg: str) -> None:
@@ -84,11 +109,11 @@ def deliver_result(tg: Tg, chat_id: int, manifest_path: Path) -> None:
     """Send the finished video(s) back, or the failure diagnostics already on disk.
 
     Reached on request via the `/result` command in `handle()`, not by an
-    automatic drain-completion callback: no earlier task gives bot.py a way to
-    know which manifest is "the active one" for a chat (Task 5 shipped only
-    the functions in tgbot/run.py — it never wired a /run or /confirm handler
-    into bot.py), so there is nothing to hang an automatic trigger off yet.
-    This is the reachable "close the loop" hook until that tracking exists.
+    automatic drain-completion callback: nothing in this bot polls a drain to
+    completion and fires a callback when it finishes — `/confirm` (Task 7)
+    starts one and returns immediately, same as `make drain` does from a
+    terminal. This is the reachable "close the loop" hook until a completion
+    poll exists.
 
     `failed_job_ids` (imported from scripts/drain.py, not reimplemented) is
     the same function `drain.py`'s own `teardown()` uses to decide what to
@@ -120,7 +145,59 @@ def deliver_result(tg: Tg, chat_id: int, manifest_path: Path) -> None:
     tg.send_message(chat_id, summary_text(batch_dir))
 
 
-def handle(tg: Tg, update: dict, *, allowed_user_id: int, state: dict) -> None:
+def _job_manifest_path(chat_id: int) -> Path:
+    """One deterministic manifest per chat — Plan 2A's "one job at a time".
+
+    Computed from chat_id alone, not a timestamp: the same path is written
+    when the job completes and read back by /confirm, so a filename that
+    changed between those two moments would make /confirm act on a manifest
+    the user never saw. Under `ROOT/"batch"` — the same directory /result
+    already resolves bare filenames against — so a finished job stays
+    reachable by `/result tg-<chat_id>.yaml` if the in-memory state is lost.
+    """
+    return ROOT / "batch" / f"tg-{chat_id}.yaml"
+
+
+def _askable_roles(pipeline: str) -> list[str]:
+    """Slot names a user can be asked to name — every material role except
+    `driver`, which is structural (job.slot_for never asks about a video)."""
+    return sorted((required_roles(pipeline) | optional_roles(pipeline)) - {"driver"})
+
+
+def _maybe_show_manifest(tg: Tg, chat_id: int, job: Job) -> None:
+    """Once every required slot is filled: render, validate for free, show it.
+
+    This is the plan's "[Run]" step (docs/superpowers/plans/2026-08-31-…
+    Task 5: "renders the manifest, runs make batch-validate (free), and shows
+    the result with an estimate") — triggered automatically by the last slot
+    fill rather than a separate command, since there is no button to tap for
+    it. It rents nothing: `make batch-validate` never touches the pod.
+    """
+    if missing_slots(job):
+        return
+    manifest_path = _job_manifest_path(chat_id)
+    write_manifest(job, manifest_path, now=time.strftime("%Y-%m-%d %H:%M:%S"))
+
+    result = subprocess.run(
+        ["make", "batch-validate", f"FILE={manifest_path}"],
+        cwd=_REPO_ROOT, capture_output=True, text=True)
+    if result.returncode != 0:
+        tg.send_message(chat_id,
+                        "manifest failed validation — nothing will run:\n"
+                        f"{(result.stdout + result.stderr).strip()}")
+        return
+
+    minutes = estimate_minutes(job)
+    tg.send_message(
+        chat_id,
+        manifest_path.read_text(encoding="utf-8") +
+        f"\nestimated {minutes} min (measured once on one batch — not a promise)\n"
+        "This will rent a GPU pod at $0.99/hour. Reply /confirm to spend money "
+        "and start, or nothing yet costs anything.")
+
+
+def handle(tg: Tg, update: dict, *, allowed_user_id: int, state: dict,
+           dry_run: bool = False) -> None:
     if not allowed(update, allowed_user_id):
         return                              # silent: do not confirm the bot exists
     msg = update["message"]
@@ -137,11 +214,32 @@ def handle(tg: Tg, update: dict, *, allowed_user_id: int, state: dict) -> None:
     doc = msg.get("document")
     if doc:
         path = Path(tg.call("getFile", file_id=doc["file_id"])["file_path"])
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        size = path.stat().st_size
-        tg.send_message(chat_id,
-                        f"{doc.get('file_name', '?')}\n"
-                        f"{size} bytes\nsha256 {digest}")
+        path = to_png_if_heic(path)
+        try:
+            p = probe(path)
+        except RuntimeError as exc:
+            # ffprobe raises rather than guessing (ingest.probe's own
+            # contract) — the file never enters a job, so it can never
+            # silently pick a wrong preset or a wrong slot.
+            tg.send_message(chat_id, str(exc))
+            return
+
+        job = _STATE.setdefault(chat_id, Job(slots={}, probes={}, pipeline=JOB_PIPELINE))
+        role = slot_for(p, job)
+        if role is None:
+            # Ambiguous (an image): job.slot_for already refuses to guess —
+            # park it and ask, rather than reintroducing a filename heuristic
+            # here. The answer arrives as a later plain-text message.
+            _PENDING_SLOT[chat_id] = (path, p)
+            options = " / ".join(_askable_roles(job.pipeline))
+            tg.send_message(chat_id, f"{describe(p)}\nWhich slot is this? Reply: {options}")
+            return
+
+        # A video: structural, always `driver` — no question needed.
+        job.slots[role] = path
+        job.probes[role] = p
+        tg.send_message(chat_id, f"{role}: {describe(p)}")
+        _maybe_show_manifest(tg, chat_id, job)
         return
 
     text = msg.get("text") or ""
@@ -193,8 +291,61 @@ def handle(tg: Tg, update: dict, *, allowed_user_id: int, state: dict) -> None:
         deliver_result(tg, chat_id, manifest_path)
         return
 
+    if text.startswith("/confirm"):
+        # THE money gate. This is the only line in this file that may call
+        # start_drain — grep -rn "start_drain" must show every call site
+        # here, after the drain_running check below. `dry_run` comes from
+        # the caller (main()'s --dry-run, default False for real usage and
+        # for every call in this file's own tests) — the CLI flag has to
+        # actually reach this line, or "--dry-run: never invokes drain" in
+        # this module's own docstring would be false.
+        job = _STATE.get(chat_id)
+        if job is None or missing_slots(job):
+            tg.send_message(chat_id, "no complete job yet — send the required files first")
+            return
+        manifest_path = _job_manifest_path(chat_id)
+        if drain_running(manifest_path):
+            # The money guard: a second drain on one manifest corrupts the
+            # journal (two runners, one state.json) and double-books the GPU
+            # (run_enhance's comfy_recycle assumes exclusive use) —
+            # docs/batch-runner.md.
+            tg.send_message(chat_id,
+                            "a drain is already running for this job — wait for it "
+                            "to finish before confirming again")
+            return
+        start_drain(manifest_path, dry_run=dry_run)
+        # Clear in-memory state so the next file starts a fresh job rather
+        # than mutating one already handed to a running drain. The manifest
+        # itself, and the drain's own journal, stay on disk regardless.
+        _STATE.pop(chat_id, None)
+        _PENDING_SLOT.pop(chat_id, None)
+        tg.send_message(chat_id,
+                        "started — renting a GPU pod at $0.99/hour now.\n"
+                        f"Check back with /result {manifest_path.name} once it's done.")
+        return
+
     if text.startswith("/start"):
         tg.send_message(chat_id, "Ready. Send a file with the paperclip -> File.")
+        return
+
+    # A plain-text reply, meant to answer the question asked when the last
+    # file was an ambiguous image. Anything not a recognised slot name is
+    # re-asked, never guessed — mirrors job.slot_for's own refusal to guess.
+    pending = _PENDING_SLOT.get(chat_id)
+    if pending is not None:
+        job = _STATE.setdefault(chat_id, Job(slots={}, probes={}, pipeline=JOB_PIPELINE))
+        options = _askable_roles(job.pipeline)
+        answer = text.strip().lower()
+        if answer in options:
+            path, p = pending
+            job.slots[answer] = path
+            job.probes[answer] = p
+            del _PENDING_SLOT[chat_id]
+            tg.send_message(chat_id, f"{answer}: {describe(p)}")
+            _maybe_show_manifest(tg, chat_id, job)
+        else:
+            tg.send_message(chat_id, f"didn't recognise that — reply one of: "
+                            f"{' / '.join(options)}")
 
 
 def main() -> int:
@@ -218,7 +369,8 @@ def main() -> int:
         try:
             for update in tg.get_updates(offset):
                 offset = update["update_id"] + 1
-                handle(tg, update, allowed_user_id=allowed_user_id, state=state)
+                handle(tg, update, allowed_user_id=allowed_user_id, state=state,
+                       dry_run=args.dry_run)
         except TgError as exc:
             log(f"poll failed, continuing: {exc}")
             time.sleep(5)
