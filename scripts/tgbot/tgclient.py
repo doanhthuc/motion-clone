@@ -10,7 +10,6 @@ from __future__ import annotations
 import json
 import mimetypes
 import urllib.error
-import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
@@ -28,23 +27,42 @@ class Tg:
     def _url(self, method: str) -> str:
         return f"{self._base}/bot{self._token}/{method}"
 
+    def _scrub(self, text: str) -> str:
+        """Remove the token from anything on its way to a message or a log.
+
+        Not belt-and-braces. The token is in the URL of every request, and
+        exceptions raised by urllib quote that URL: a base_url missing its
+        scheme makes Request() raise `ValueError: unknown url type: '<url>'`
+        with the token inline. This repo is public, and a bot main loop that
+        does `except Exception as e: log(e)` is the normal shape.
+        """
+        return text.replace(self._token, "<token>") if self._token else text
+
     def call(self, method: str, **params) -> dict:
         """POST a JSON call. Raises TgError on ok:false.
 
         Telegram reports failures in the response BODY with HTTP 200, so the
-        status code alone proves nothing.
+        status code alone proves nothing. Telegram also returns real HTTP
+        statuses (400, 401, 403, 429) with the error JSON in the body, so
+        HTTPError.read() must be checked before raising.
         """
         data = json.dumps({k: v for k, v in params.items() if v is not None}).encode()
-        req = urllib.request.Request(self._url(method), data=data,
-                                     headers={"content-type": "application/json"})
         try:
+            req = urllib.request.Request(self._url(method), data=data,
+                                         headers={"content-type": "application/json"})
             with urllib.request.urlopen(req, timeout=90) as resp:
-                body = json.loads(resp.read())
+                raw = resp.read()
+        except urllib.error.HTTPError as exc:
+            with exc:
+                raw = exc.read()        # Telegram's JSON error body lives here
         except (urllib.error.URLError, OSError, ValueError) as exc:
-            # Deliberately does not include the URL: the token is in it.
-            raise TgError(f"{method} failed: {exc!r}") from exc
+            raise TgError(self._scrub(f"{method} failed: {exc!r}")) from exc
+        try:
+            body = json.loads(raw)
+        except ValueError as exc:
+            raise TgError(self._scrub(f"{method} returned non-JSON: {raw[:200]!r}")) from exc
         if not body.get("ok"):
-            raise TgError(f"{method} rejected: {body.get('description', body)}")
+            raise TgError(self._scrub(f"{method} rejected: {body.get('description', body)}"))
         return body.get("result")
 
     def send_message(self, chat_id: int, text: str) -> int:
@@ -81,16 +99,23 @@ class Tg:
                  f"content-type: {ctype}\r\n\r\n").encode()
         body += path.read_bytes() + b"\r\n"
         body += f"--{boundary}--\r\n".encode()
-        req = urllib.request.Request(
-            self._url("sendDocument"), data=bytes(body),
-            headers={"content-type": f"multipart/form-data; boundary={boundary}"})
         try:
+            req = urllib.request.Request(
+                self._url("sendDocument"), data=bytes(body),
+                headers={"content-type": f"multipart/form-data; boundary={boundary}"})
             with urllib.request.urlopen(req, timeout=600) as resp:
-                result = json.loads(resp.read())
+                raw = resp.read()
+        except urllib.error.HTTPError as exc:
+            with exc:
+                raw = exc.read()        # Telegram's JSON error body lives here
         except (urllib.error.URLError, OSError, ValueError) as exc:
-            raise TgError(f"sendDocument failed: {exc!r}") from exc
+            raise TgError(self._scrub(f"sendDocument failed: {exc!r}")) from exc
+        try:
+            result = json.loads(raw)
+        except ValueError as exc:
+            raise TgError(self._scrub(f"sendDocument returned non-JSON: {raw[:200]!r}")) from exc
         if not result.get("ok"):
-            raise TgError(f"sendDocument rejected: {result.get('description', result)}")
+            raise TgError(self._scrub(f"sendDocument rejected: {result.get('description', result)}"))
 
     def get_updates(self, offset: int, timeout: int = 50) -> list[dict]:
         return self.call("getUpdates", offset=offset, timeout=timeout) or []
