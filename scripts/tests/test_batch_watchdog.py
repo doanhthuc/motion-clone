@@ -68,6 +68,19 @@ class TestTier2(unittest.TestCase):
         self.assertTrue(v.kill)
         self.assertIn("ceiling", v.reason)
 
+    def test_ceiling_wins_when_both_tiers_would_fire(self):
+        # Both tier 1 and tier 2 conditions are true. The ordering matters:
+        # if tier 1 is checked first, the reason will contain "silent" (journal
+        # timeout). If tier 2 is checked first, the reason will contain "ceiling"
+        # and NOT "silent". This test pins the implementation order.
+        # age_min=300 > 240 (ceiling fires) AND silent_min=300 > 105 (enhance's
+        # 90+15 budget, so tier 1 would also fire).
+        v = decide(lease=LEASE, state=state_with("enhance", "running"),
+                   journal_mtime=0.0, now=300 * MIN)
+        self.assertTrue(v.kill)
+        self.assertIn("ceiling", v.reason)
+        self.assertNotIn("silent", v.reason)
+
 
 if __name__ == "__main__":
     unittest.main()
