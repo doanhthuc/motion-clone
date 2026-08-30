@@ -27,6 +27,12 @@ ROOT = Path(__file__).resolve().parents[1]
 LINUX_PY = ROOT / "motions-studio" / "worker" / "worker_runtime" / "linux.py"
 CURATED = ROOT / "scripts" / "batch-params.json"
 
+# Distinct from 1 ("something went wrong") on purpose. scripts/drain.py rents a
+# $0.99/hour pod when it sees this, so "I stopped because there is no pod, and
+# nothing is wrong" must not be confusable with fail-fast or a dropped
+# connection, both of which also return 1.
+EXIT_NEEDS_POD = 3
+
 
 @dataclass(frozen=True)
 class BatchIdDecision:
@@ -179,7 +185,7 @@ def main(argv: list[str]) -> int:
                       file=sys.stderr)
                 print(f"  Thuê/bật pod rồi chạy tiếp: make batch FILE={args.file} RESUME=1",
                       file=sys.stderr)
-            return 1
+            return EXIT_NEEDS_POD
 
     run_batch_kwargs = dict(settings=settings, manifest=manifest, out_root=ROOT / "out",
                             batch_id=decision.batch_id, resume=decision.resumed,

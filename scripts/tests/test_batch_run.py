@@ -26,7 +26,7 @@ from batchlib.config import ConfigError, Settings
 from batchlib.manifest import save_state, state_path_for
 from batchlib.runner import BatchResult, LocalPhaseResult
 import batch_run
-from batch_run import preflight, resolve_batch_id
+from batch_run import EXIT_NEEDS_POD, preflight, resolve_batch_id
 
 NOW = datetime.datetime(2026, 8, 18, 14, 30)
 
@@ -383,7 +383,10 @@ class TestMainPreflightKhongCoPod(unittest.TestCase):
                  mock.patch("batch_run.run_batch") as m_run_batch, \
                  contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
                 code = batch_run.main(["--file", str(p)])
-            self.assertEqual(code, 1)
+            # EXIT_NEEDS_POD (3), not 1: scripts/drain.py rents a pod on this exact
+            # code, so "no pod exists yet" must stay distinguishable from fail-fast
+            # and from a dropped connection, both of which are plain 1.
+            self.assertEqual(code, EXIT_NEEDS_POD)
             self.assertIn("gpu-provision", err.getvalue())
             m_run_batch.assert_not_called()
 
@@ -408,13 +411,13 @@ class TestNoStartTruyenXuongPreflight(unittest.TestCase):
     def test_co_no_start_thi_allow_start_false(self):
         with tempfile.TemporaryDirectory() as d:
             code, captured = self._goi(["--no-start"], Path(d))
-            self.assertEqual(code, 1)
+            self.assertEqual(code, EXIT_NEEDS_POD)
             self.assertFalse(captured["allow_start"])
 
     def test_khong_co_no_start_thi_allow_start_true(self):
         with tempfile.TemporaryDirectory() as d:
             code, captured = self._goi([], Path(d))
-            self.assertEqual(code, 1)
+            self.assertEqual(code, EXIT_NEEDS_POD)
             self.assertTrue(captured["allow_start"])
 
 
@@ -502,7 +505,9 @@ class TestMainPhaA(unittest.TestCase):
                  mock.patch("batch_run.run_batch") as m_run_batch, \
                  contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
                 code = batch_run.main(["--file", str(p)])
-            self.assertEqual(code, 1)
+            # EXIT_NEEDS_POD (3): same preflight branch as TestMainPreflightKhongCoPod —
+            # drain.py relies on this exact code to decide whether to rent a pod.
+            self.assertEqual(code, EXIT_NEEDS_POD)
             self.assertIn("gpu-provision", err.getvalue())
             self.assertIn("RESUME=1", err.getvalue())
             m_run_batch.assert_not_called()

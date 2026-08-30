@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: batch-mcp-check batch-coverage check-comfy-nodes help setup dev down clean gpu-preflight gpu-provision gpu-wait gpu-bootstrap gpu-fe gpu-up gpu-down gpu-destroy gpu-db-dump gpu-db-check gpu-status gpu-logs batch-test batch-params check-batch-params batch-scan batch-validate batch batch-clean watchdog-dry
+.PHONY: batch-mcp-check batch-coverage check-comfy-nodes help setup dev down clean gpu-preflight gpu-provision gpu-wait gpu-bootstrap gpu-fe gpu-up gpu-down gpu-destroy gpu-db-dump gpu-db-check gpu-status gpu-logs batch-test batch-params check-batch-params batch-scan batch-validate batch batch-clean watchdog-dry drain
 
 help: ## Show this help
 	@echo "motion-clone — make targets:"
@@ -74,6 +74,11 @@ batch-mcp-check: ## Bắt tay thật với MCP server rồi in 4 tool nó khai (
 
 watchdog-dry: ## Report what the watchdog would destroy right now — destroys nothing
 	@python3 scripts/pod_watchdog.py --once --dry-run
+
+drain: ## Rent a pod, run FILE, destroy it (dry run unless CONFIRM=yes)
+	@test -n "$(FILE)" || { echo "usage: make drain FILE=batch/….yaml [CONFIRM=yes] [RESUME=1]"; exit 1; }
+	@python3 scripts/drain.py --file "$(FILE)" \
+		$(if $(filter yes,$(CONFIRM)),--yes) $(if $(RESUME),--resume)
 
 gpu-preflight: ## Check root .env is complete BEFORE you spend money on a pod
 	@bash scripts/gpu-preflight.sh
