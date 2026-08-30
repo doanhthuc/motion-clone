@@ -189,23 +189,44 @@ class Tg:
     def _url(self, method: str) -> str:
         return f"{self._base}/bot{self._token}/{method}"
 
-    def call(self, method: str, **params) -> dict:
-        """POST a JSON call. Raises TgError on ok:false.
+    def _scrub(self, text: str) -> str:
+        """Remove the token from anything on its way to a message or a log.
 
-        Telegram reports failures in the response BODY with HTTP 200, so the
-        status code alone proves nothing.
+        Not belt-and-braces. The token is in the URL of every request, and
+        exceptions raised by urllib quote that URL: a base_url missing its
+        scheme makes Request() raise `ValueError: unknown url type: '<url>'`
+        with the token inline. This repo is public, and a bot main loop that
+        does `except Exception as e: log(e)` is the normal shape.
+        """
+        return text.replace(self._token, "<token>") if self._token else text
+
+    def call(self, method: str, **params) -> dict:
+        """POST a JSON call. Raises TgError on ok:false or on a non-2xx body.
+
+        Telegram reports failures in the response BODY, and it ALSO sets a real
+        HTTP status: 400 for "message is not modified", 401, 403, 409, 429 and
+        so on. urlopen raises HTTPError on those before any body check runs, so
+        a client that only handles URLError never sees the description at all.
+        scripts/batchlib/client.py:103-105 already solves this — read the body
+        off the HTTPError — and this mirrors it.
         """
         data = json.dumps({k: v for k, v in params.items() if v is not None}).encode()
-        req = urllib.request.Request(self._url(method), data=data,
-                                     headers={"content-type": "application/json"})
         try:
+            req = urllib.request.Request(self._url(method), data=data,
+                                         headers={"content-type": "application/json"})
             with urllib.request.urlopen(req, timeout=90) as resp:
-                body = json.loads(resp.read())
+                raw = resp.read()
+        except urllib.error.HTTPError as exc:
+            with exc:
+                raw = exc.read()        # Telegram's JSON error body lives here
         except (urllib.error.URLError, OSError, ValueError) as exc:
-            # Deliberately does not include the URL: the token is in it.
-            raise TgError(f"{method} failed: {exc!r}") from exc
+            raise TgError(self._scrub(f"{method} failed: {exc!r}")) from exc
+        try:
+            body = json.loads(raw)
+        except ValueError as exc:
+            raise TgError(self._scrub(f"{method} returned non-JSON: {raw[:200]!r}")) from exc
         if not body.get("ok"):
-            raise TgError(f"{method} rejected: {body.get('description', body)}")
+            raise TgError(self._scrub(f"{method} rejected: {body.get('description', body)}"))
         return body.get("result")
 
     def send_message(self, chat_id: int, text: str) -> int:
@@ -917,7 +938,12 @@ batch_status uses — so it stays correct after the pod is destroyed."
 
 **Interfaces:**
 - Consumes: `failed_job_ids` from `scripts/drain.py` (import it; do not reimplement).
-- Produces: `final_files(manifest_path: Path) -> list[Path]`, `summary_text(manifest_path: Path) -> str`.
+- Produces: `final_files(batch_dir: Path) -> list[Path]`, `summary_text(batch_dir: Path) -> str`.
+
+Both take the **batch output directory** (`out/<batch-id>/`), not the manifest path — the
+tests pass `batch` directly. Task 5's `progress_text` takes a manifest path instead because
+it derives the journal through `state_path_for`; these two read files that already live
+under the batch directory, so making them re-derive it would add a lookup for nothing.
 
 **Results go out with `sendDocument`, never `sendVideo`.** `sendVideo` may let Telegram re-encode for streaming, and this repo's quality work measures background chroma, skin exposure and hair jitter. Nobody may judge quality on a re-encode. A document still plays when tapped — it plays the original bytes.
 
