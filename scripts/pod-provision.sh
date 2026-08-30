@@ -384,6 +384,12 @@ $RAW"
   # whose driver is too old, instead of finding out from a warn line 30 minutes into setup.
   build_create() {
     CREATE=(runpodctl pod create
+      # This name is the ONLY thing that makes a pod destroyable by the watchdog:
+      # it must stay in DESTROYABLE_NAMES (scripts/batchlib_ext/watchdog.py:31).
+      # Renaming it here and not there silently disarms tier 3 — the pod becomes
+      # "not ours to kill" and bills $0.99/hour unattended. Changing it the other
+      # way round makes tier 3 destroy pods it did not rent. No check-* gate ties
+      # the two yet, so change both by hand.
       --name motion-transfer
       --gpu-id "$1" --gpu-count 1
       --image "$IMAGE"

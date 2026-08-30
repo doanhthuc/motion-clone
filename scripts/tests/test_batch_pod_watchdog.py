@@ -27,6 +27,23 @@ class FakePods:
         self.destroyed.append(pod_id)
 
 
+class NoOpDestroyPods:
+    """A pod API whose destroy() exits cleanly and does nothing.
+
+    This is the real failure Makefile:139-142 records: a destroy that reports
+    success without taking effect. The pod stays in list_pods() afterwards.
+    """
+    def __init__(self, pods: list[PodInfo]):
+        self.pods = pods
+        self.destroy_calls: list[str] = []
+
+    def list_pods(self) -> list[PodInfo]:
+        return list(self.pods)
+
+    def destroy(self, pod_id: str) -> None:
+        self.destroy_calls.append(pod_id)   # exits 0, changes nothing
+
+
 class TestPodWatchdog(unittest.TestCase):
     """Test the four safety properties of the watchdog daemon."""
 
@@ -143,6 +160,143 @@ class TestPodWatchdog(unittest.TestCase):
 
         # Assert: first_seen is updated
         self.assertIn("orphan-1", returned_2)
+
+
+class TestDestroyIsVerified(unittest.TestCase):
+    """C3: a destroy that exits 0 without taking effect must not clear the lease."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.lease_path = Path(self.temp_dir.name) / "pod-lease.json"
+        self.patcher = patch.object(pod_watchdog, "LEASE_PATH", self.lease_path)
+        self.patcher.start()
+        self.logs: list[str] = []
+        self.log_patcher = patch.object(pod_watchdog, "log", self.logs.append)
+        self.log_patcher.start()
+
+    def tearDown(self):
+        self.log_patcher.stop()
+        self.patcher.stop()
+        self.temp_dir.cleanup()
+
+    def _expired_lease(self, pod_id: str = "pod-old") -> Lease:
+        return Lease(pod_id=pod_id, provisioned_at=0.0,
+                     manifest="batch/test.yaml", abs_max_min=10)
+
+    def test_unverified_destroy_keeps_the_lease(self):
+        # Clearing the lease here would hand a still-billing pod to tier 3, which
+        # needs a 10-minute grace window to notice it. Keeping it means the next
+        # tick retries in 60s.
+        write_lease(self.lease_path, self._expired_lease())
+        pods_api = NoOpDestroyPods([PodInfo("pod-old", "motion-transfer")])
+
+        pod_watchdog.tick(pods_api, {}, now=1000.0 * 60.0, dry_run=False)
+
+        self.assertEqual(pods_api.destroy_calls, ["pod-old"])
+        self.assertTrue(self.lease_path.is_file(),
+                        "lease was cleared over a destroy that did nothing")
+
+    def test_unverified_destroy_logs_loudly_and_claims_no_success(self):
+        write_lease(self.lease_path, self._expired_lease())
+        pods_api = NoOpDestroyPods([PodInfo("pod-old", "motion-transfer")])
+
+        pod_watchdog.tick(pods_api, {}, now=1000.0 * 60.0, dry_run=False)
+
+        joined = "\n".join(self.logs)
+        self.assertIn("DESTROY NOT CONFIRMED", joined)
+        self.assertIn("STILL BILLING", joined)
+        self.assertIn("pod-old", joined)
+
+    def test_verified_destroy_clears_the_lease(self):
+        # The other direction: when the pod really is gone, the lease must go too,
+        # or every later tick would try to destroy a pod that no longer exists.
+        write_lease(self.lease_path, self._expired_lease())
+        pods_api = NoOpDestroyPods([])   # nothing visible => confirmed gone
+
+        pod_watchdog.tick(pods_api, {}, now=1000.0 * 60.0, dry_run=False)
+
+        self.assertEqual(pods_api.destroy_calls, ["pod-old"])
+        self.assertFalse(self.lease_path.is_file())
+
+
+class TestLeaseBranchCannotDisableTierThree(unittest.TestCase):
+    """I2: one raise in the tier-1/2 branch must not skip reconciliation."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.lease_path = Path(self.temp_dir.name) / "pod-lease.json"
+        self.patcher = patch.object(pod_watchdog, "LEASE_PATH", self.lease_path)
+        self.patcher.start()
+        self.logs: list[str] = []
+        self.log_patcher = patch.object(pod_watchdog, "log", self.logs.append)
+        self.log_patcher.start()
+
+    def tearDown(self):
+        self.log_patcher.stop()
+        self.patcher.stop()
+        self.temp_dir.cleanup()
+
+    def test_a_raising_decide_still_reaches_reconciliation(self):
+        # The lease names "mine"; a DIFFERENT pod is running and long past grace.
+        # Before this guard, decide() raising took tiers 1, 2 AND 3 down together
+        # and main() logged "tick failed, continuing" forever.
+        write_lease(self.lease_path, Lease(pod_id="mine", provisioned_at=0.0,
+                                           manifest="batch/test.yaml",
+                                           abs_max_min=10_000))
+        pods_api = FakePods()
+        pods_api.pods = [PodInfo("stray", "motion-transfer")]
+
+        with patch.object(pod_watchdog, "decide",
+                          side_effect=KeyError("unknown-stage")):
+            pod_watchdog.tick(pods_api, {"stray": 0.0}, now=11 * 60.0,
+                              dry_run=False)
+
+        self.assertEqual(pods_api.destroyed, ["stray"])
+        self.assertIn("falling through to tier 3", "\n".join(self.logs))
+
+    def test_tier_three_reports_how_many_pods_it_saw(self):
+        # I4: "saw nothing" and "saw things and matched nothing" used to be the
+        # same silence, which is what hid tier 3 never running at all.
+        pods_api = FakePods()
+        pods_api.pods = [PodInfo("a", "cpu-failover-temp"),
+                         PodInfo("b", "cpu-failover-temp")]
+
+        pod_watchdog.tick(pods_api, {}, now=0.0, dry_run=True)
+
+        self.assertIn("tier 3: 2 pod(s) visible", "\n".join(self.logs))
+
+    def test_untouched_message_names_the_real_reason(self):
+        # A motion-transfer pod inside its grace window is left alone BECAUSE of
+        # the grace window, not because its name is unmanaged. Saying the latter
+        # would be a false statement in the one log a reviewer reads after a bill.
+        pods_api = FakePods()
+        pods_api.pods = [PodInfo("young", "motion-transfer"),
+                         PodInfo("other", "cpu-failover-temp")]
+
+        pod_watchdog.tick(pods_api, {}, now=0.0, dry_run=True)
+
+        joined = "\n".join(self.logs)
+        self.assertIn("grace window", joined)
+        self.assertIn("not a name tier 3 may destroy", joined)
+        self.assertNotIn("young ('motion-transfer') alone — not a name", joined)
+
+
+class TestOnceExitCode(unittest.TestCase):
+    """Minor: --once must fail loudly. make watchdog-dry is acceptance step A1."""
+
+    def test_once_returns_nonzero_when_the_tick_raised(self):
+        with patch.object(sys, "argv", ["pod_watchdog.py", "--once", "--dry-run"]), \
+             patch.object(pod_watchdog, "RunpodCtl", lambda: object()), \
+             patch.object(pod_watchdog, "log", lambda *_: None), \
+             patch.object(pod_watchdog, "tick", side_effect=RuntimeError("boom")):
+            self.assertEqual(pod_watchdog.main(), 1)
+
+    def test_once_returns_zero_on_a_clean_tick(self):
+        with patch.object(sys, "argv", ["pod_watchdog.py", "--once", "--dry-run"]), \
+             patch.object(pod_watchdog, "RunpodCtl", lambda: object()), \
+             patch.object(pod_watchdog, "log", lambda *_: None), \
+             patch.object(pod_watchdog, "tick", return_value={}):
+            self.assertEqual(pod_watchdog.main(), 0)
 
 
 if __name__ == "__main__":

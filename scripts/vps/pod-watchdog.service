@@ -3,6 +3,12 @@
 #   systemctl daemon-reload && systemctl enable --now pod-watchdog
 [Unit]
 Description=Destroy GPU pods that outlive their deadline
+# Wants= alongside After=: After alone only orders the unit, it does not pull
+# network-online.target into the boot transaction, so on a VPS where nothing else
+# requests it the target never activates and the ordering is a no-op. The first
+# tick after a reboot is the one that reconciles a pod left running by the crash
+# that caused the reboot — it must not fire before runpodctl can reach the API.
+Wants=network-online.target
 After=network-online.target
 
 [Service]

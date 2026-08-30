@@ -68,6 +68,38 @@ class TestRunpodCtlListPods(unittest.TestCase):
     """Test error handling in RunpodCtl.list_pods()."""
 
     @patch("subprocess.run")
+    def test_uses_pod_list_not_the_deprecated_get_pod(self, mock_run):
+        # C1. `runpodctl get pod -o json` is deprecated in runpodctl 2.8 and
+        # IGNORES -o: it prints a tab-separated table, so json.loads raised on
+        # every call and tier 3 — the outermost net — never executed once.
+        # Verified 2026-08-31 against the real CLI: `runpodctl pod list -o json`
+        # with no pods rented prints `[]`.
+        mock_run.return_value = MagicMock(returncode=0, stdout="[]", stderr="")
+        RunpodCtl().list_pods()
+        self.assertEqual(mock_run.call_args[0][0],
+                         ["runpodctl", "pod", "list", "-o", "json"])
+
+    @patch("time.sleep")
+    @patch("subprocess.run")
+    def test_destroy_uses_pod_delete_matching_the_makefile(self, mock_run, _sleep):
+        # `runpodctl remove pod` is not a subcommand of runpodctl 2.8 at all.
+        # Makefile:161 uses `runpodctl pod delete <id>`.
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        RunpodCtl().destroy("pod-1")
+        self.assertEqual(mock_run.call_args[0][0],
+                         ["runpodctl", "pod", "delete", "pod-1"])
+
+    @patch("time.sleep")
+    @patch("subprocess.run")
+    def test_destroy_raises_on_non_zero_exit(self, mock_run, _sleep):
+        # Raising keeps the caller's lease, so the next tick retries.
+        mock_run.return_value = MagicMock(returncode=1, stdout="",
+                                          stderr="pod not found")
+        with self.assertRaises(RuntimeError) as cm:
+            RunpodCtl().destroy("pod-1")
+        self.assertIn("pod not found", str(cm.exception))
+
+    @patch("subprocess.run")
     def test_successful_list(self, mock_run):
         """Successfully parse valid JSON output."""
         mock_run.return_value = MagicMock(

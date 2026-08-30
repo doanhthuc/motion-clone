@@ -82,5 +82,28 @@ class TestTier2(unittest.TestCase):
         self.assertNotIn("silent", v.reason)
 
 
+class TestUnknownStageNeverRaises(unittest.TestCase):
+    """I2: lease.py's docstring makes it a house rule — this must never raise."""
+
+    def test_unknown_stage_does_not_raise(self):
+        # An old journal replayed after a stage rename, or a hand-edited state
+        # file. A KeyError here propagated out of the whole tick and took tiers
+        # 1, 2 and 3 down with it, forever.
+        v = decide(lease=LEASE, state=state_with("no-such-stage", "running"),
+                   journal_mtime=0.0, now=10 * MIN)
+        self.assertFalse(v.kill)
+
+    def test_unknown_stage_falls_back_to_the_longest_timeout(self):
+        # Same 105 min budget (enhance 90 + 15 slack) as "no stage running":
+        # the fallback can only ever delay a kill, never cause an early one.
+        self.assertFalse(decide(lease=LEASE,
+                                state=state_with("no-such-stage", "running"),
+                                journal_mtime=0.0, now=104 * MIN).kill)
+        v = decide(lease=LEASE, state=state_with("no-such-stage", "running"),
+                   journal_mtime=0.0, now=106 * MIN)
+        self.assertTrue(v.kill)
+        self.assertIn("unknown to pipelines.py", v.reason)
+
+
 if __name__ == "__main__":
     unittest.main()
