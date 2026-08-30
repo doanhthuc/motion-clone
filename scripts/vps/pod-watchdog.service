@@ -1,0 +1,18 @@
+# scripts/vps/pod-watchdog.service
+# Install: cp to /etc/systemd/system/, then
+#   systemctl daemon-reload && systemctl enable --now pod-watchdog
+[Unit]
+Description=Destroy GPU pods that outlive their deadline
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/motion-clone
+ExecStart=/usr/bin/python3 /opt/motion-clone/scripts/pod_watchdog.py
+Restart=always
+RestartSec=10
+# Restart=always matters more than it looks: this process is the only thing
+# standing between a crashed runner and an overnight $0.99/hour bill.
+
+[Install]
+WantedBy=multi-user.target
