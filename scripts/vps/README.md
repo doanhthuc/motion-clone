@@ -58,9 +58,21 @@ journalctl -u pod-watchdog -f          # watch it tick
 
 **From this point the VPS is the sole owner of pod lifecycle.** Do not run `gpu-provision`,
 `gpu-up` or `gpu-destroy` on the Mac. Two machines each tracking a pod in their own `.env` means
-double provisioning, or the Mac destroying a pod mid-batch — at $0.99/hour. `make gpu-preflight`
-on the Mac warns when the VPS holds a lease; tier-3 reconciliation catches the collision, but only
-after the money is spent.
+double provisioning, or the Mac destroying a pod mid-batch — at $0.99/hour.
+
+What actually protects you, and what does not:
+
+- **`make gpu-preflight` on the Mac warns when a live pod named `motion-transfer` exists** — it asks
+  `runpodctl pod list -o json`, which is the only state both machines share. It is a warning, not a
+  block: it cannot tell a pod the VPS rented from one you rented yourself, and it says nothing about
+  whether a batch is running on it. Check `make watchdog-dry` on the VPS before acting on it.
+- **It does not read `batch/pod-lease.json`.** That file is written by `drain.py` on the VPS and is
+  gitignored, so it never exists on the Mac. A guard that checked it (as this one did until
+  2026-08-31) could never fire on the machine it was written for.
+- **Nothing prevents double ownership.** There is no lock, no shared lease, no handshake. The rule
+  above is a convention enforced by one warning and by tier-3 reconciliation — and tier 3 catches
+  the collision only after the money is spent, and only for pods named `motion-transfer` that no
+  lease claims, after a 10-minute grace window.
 
 The Mac keeps `make batch` for debugging against a pod the VPS already rented. That is read-only
 with respect to ownership and is fine.
