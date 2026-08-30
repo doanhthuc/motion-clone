@@ -38,6 +38,11 @@ class Probe:
 PRESET_CEILINGS = [(5, "drv-5s"), (10, "drv-10s"), (15, "drv-15s"),
                    (20, "drv-20s"), (30, "drv-30s")]
 
+# An allowlist, so anything unrecognised is treated as video and gets the
+# duration check below. The inverse — treating unrecognised codecs as images —
+# would let a video skip that check silently.
+IMAGE_CODECS = frozenset({"mjpeg", "png", "bmp", "webp"})
+
 
 def probe(path: Path) -> Probe:
     """Measure a file with ffprobe. Raises rather than guessing.
@@ -64,8 +69,22 @@ def probe(path: Path) -> Probe:
         # A still image is a one-frame "video" stream to ffprobe. Distinguish by
         # the codec, not by the file extension: a .mov holding a live photo and
         # a .jpg both lie about themselves by name.
-        kind = "image" if v.get("codec_name") in {"mjpeg", "png", "bmp", "webp"} \
-            or duration == 0.0 else "video"
+        #
+        # An earlier version also treated `duration == 0.0` as evidence of an
+        # image. Measured 2026-08-31 with a real 2-second raw h264 stream: some
+        # containers carry no duration at all, so that clause classified a
+        # genuine video as an image — and describe() then omits duration and
+        # bitrate, hiding the anomaly from the confirmation screen instead of
+        # showing it. Codec alone decides the kind now.
+        kind = "image" if v.get("codec_name") in IMAGE_CODECS else "video"
+        if kind == "video" and duration <= 0.0:
+            # Loud, not a guess. suggest_preset() would silently return drv-5s
+            # for an unmeasured driver and truncate a 30-second one, after the
+            # pod was already rented. A truncated upload is the likely cause.
+            raise RuntimeError(
+                f"{path.name}: ffprobe reported no duration for a "
+                f"{v.get('codec_name')} video stream. A preset cannot be chosen "
+                f"without it — the file may be truncated; send it again.")
         return Probe(kind=kind,
                      width=int(v.get("width") or 0), height=int(v.get("height") or 0),
                      duration_s=duration,
@@ -115,10 +134,19 @@ def to_png_if_heic(path: Path) -> Path:
     if path.suffix.lower() not in (".heic", ".heif"):
         return path
     dest = path.with_suffix(".png")
-    if platform.system() == "Darwin":
-        subprocess.run(["sips", "-s", "format", "png", str(path), "--out", str(dest)],
-                       capture_output=True, text=True, check=True)
-    else:
-        subprocess.run(["ffmpeg", "-y", "-i", str(path), str(dest)],
-                       capture_output=True, text=True, check=True)
+    on_darwin = platform.system() == "Darwin"
+    tool = "sips" if on_darwin else "ffmpeg"
+    cmd = (["sips", "-s", "format", "png", str(path), "--out", str(dest)] if on_darwin
+           else ["ffmpeg", "-y", "-i", str(path), str(dest)])
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+    except FileNotFoundError as exc:
+        # Same shape as probe()'s missing-ffprobe message: name what to
+        # install rather than leak a bare FileNotFoundError to the caller.
+        raise RuntimeError(f"{tool} is not installed — cannot convert {path.name} "
+                          f"from HEIC") from exc
+    if not dest.exists() or dest.stat().st_size == 0:
+        # A converter that exits 0 having written nothing must not hand back a
+        # path to a missing/zero-byte file straight into a paid render.
+        raise RuntimeError(f"{tool} reported success but wrote no file for {path.name}")
     return dest
