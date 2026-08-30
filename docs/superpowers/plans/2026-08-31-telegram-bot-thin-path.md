@@ -1056,6 +1056,105 @@ reaches for a pod that is gone."
 
 ---
 
+### Task 7: Assemble the flow — added 2026-08-31 after Tasks 1-6 shipped
+
+**Files:**
+- Modify: `scripts/tgbot/bot.py`
+- Test: `scripts/tests/test_batch_bot.py` (append)
+
+**Why this task exists, and why it is a plan defect that it did not.** Tasks 1-6 built five
+well-tested modules and a bot that handles `/sha`, `/tryon`, `/result` and `/start` — and
+calls none of `slot_for`, `render_manifest` or `start_drain`. The Goal line at the top of
+this plan promises "send four files, confirm one screen, get a finished video back", and
+acceptance A3 requires exactly that, but no task's steps ever did the wiring. The Task 6
+implementer found this, declared it, and correctly refused to invent the missing state
+machine. This task is that machine, specified.
+
+**Interfaces consumed** (all committed, none to be modified): `Tg.send_message` /
+`edit_message` / `send_document` / `call`; `ingest.probe` / `describe` / `suggest_preset`
+/ `to_png_if_heic`; `job.Job` / `slot_for` / `missing_slots` / `write_manifest`;
+`run.estimate_minutes` / `progress_text` / `start_drain` / `drain_running` /
+`final_files` / `summary_text`; `bot._safe_child` / `allowed` / `deliver_result`.
+
+**No inline keyboards.** Buttons arrive as `callback_query`, which carries no
+`message.from` — so `allowed()` would refuse them, and widening `allowed()` is a change
+to the one security boundary in this bot. Slot assignment is a text reply instead
+(`character` / `outfit` / `background`). Buttons are Plan 2B's ergonomics work, and 2B
+can extend `allowed()` deliberately rather than as a side effect of wiring.
+
+**State is per chat, in memory, one job at a time.** A dict keyed by `chat_id`. It does
+not survive a restart, and that is acceptable *here* only because `drain_running()`
+consults the lease (Task 5) — the durable half of the answer already exists, so a restart
+loses an unsubmitted draft, never a running job.
+
+- [ ] **Step 1: Write the failing tests**
+
+Append a `TestFlow` class to `scripts/tests/test_batch_bot.py`, reusing the existing
+`FakeTg`. Patch `tgbot.bot.probe` so no real media is needed. Cases, each named for what
+it pins:
+
+- `test_a_video_fills_the_driver_slot_without_asking` — send a document, `probe` returns
+  `kind="video"`. Assert the reply names `driver` and that no question was asked.
+- `test_an_image_is_asked_about_and_the_answer_fills_the_slot` — `probe` returns
+  `kind="image"`; assert the bot asks; then send the text `outfit` and assert the slot
+  filled. This pins that guessing was not reintroduced.
+- `test_an_unrecognised_slot_answer_is_re_asked_not_guessed` — reply `banana`. Assert the
+  bot asks again and fills nothing.
+- `test_the_manifest_is_shown_before_anything_is_confirmed` — fill every required slot;
+  assert a manifest preview is sent and `start_drain` was **not** called.
+- `test_confirm_starts_a_drain_and_nothing_else_does` — patch `tgbot.bot.start_drain`;
+  assert it is called exactly once, only after `/confirm`, and with `dry_run=False`.
+- `test_confirm_is_refused_while_a_drain_is_already_running` — patch `drain_running` to
+  return `True`; assert `start_drain` is not called. This is the money guard: a second
+  drain on one manifest corrupts the journal and double-books the GPU.
+- `test_confirm_without_a_complete_job_is_refused` — no slots filled; assert
+  `start_drain` not called.
+
+- [ ] **Step 2: Run them and watch them fail**
+
+Run: `python3 -m unittest discover -s scripts/tests -p 'test_batch_bot.py' -v`
+Expected: failures naming the missing handlers, not import errors from the whole module.
+
+- [ ] **Step 3: Implement the flow in `bot.py`**
+
+A `_STATE: dict[int, Job]` plus a small `_PENDING_SLOT: dict[int, Path]` for the one file
+awaiting an answer. On a document: `to_png_if_heic`, then `probe`, then `slot_for`; a
+video fills `driver`, an image is parked in `_PENDING_SLOT` and asked about. On a text
+that names a slot, fill it from `_PENDING_SLOT`. After every fill, if `missing_slots()`
+is empty, render the manifest with `write_manifest`, run `make batch-validate` on it, and
+send the manifest text plus `estimate_minutes` and the words that make the cost explicit.
+`/confirm` checks `drain_running()` first, then calls `start_drain(..., dry_run=False)`.
+
+Every `describe()` line goes into the reply as the file is accepted — that is the quality
+gate being *visible*, which is the whole reason it exists.
+
+- [ ] **Step 4: Run the tests green, then the full suite**
+
+`python3 -m unittest discover -s scripts/tests -p 'test_batch_bot.py' -v`, then
+`make batch-test`.
+
+- [ ] **Step 5: Prove the money gate one more way**
+
+`grep -rn "start_drain" scripts/tgbot/bot.py` — every call site must be inside the
+`/confirm` handler and after a `drain_running()` check. Paste the output.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add scripts/tgbot/bot.py scripts/tests/test_batch_bot.py
+git commit -m "Wire the flow: files in, manifest shown, /confirm spends
+
+Tasks 1-6 built five tested modules and a bot that called none of them.
+The plan's own goal and acceptance A3 needed this and no task did it.
+
+Slot answers are text, not inline buttons: a callback_query carries no
+message.from, so allowed() would refuse it, and widening the one
+security boundary in this bot should be a deliberate act in 2B rather
+than a side effect of wiring."
+```
+
+---
+
 ## Acceptance — needs a phone, and one of them costs money
 
 - [ ] **A1.** Task 2 Step 8's `sha256` measurement, for an image and a ~25MB video. **Everything else is built on this.**
