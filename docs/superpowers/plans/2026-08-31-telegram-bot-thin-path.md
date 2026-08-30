@@ -867,6 +867,24 @@ the user writes by hand today so the file still explains itself later."
 
 **`progress_text` reads the journal, not the pod.** `load_state` is the same source `batch_status` uses, so it stays correct after the pod is destroyed.
 
+**`drain_running` must be an OR of a live process handle and a live lease for this
+manifest — not the process alone.** `scripts/vps/motion-bot.service` sets
+`Restart=always`, so the bot process *will* be replaced at some point, and a fresh
+process has an empty `_RUNNING` dict. Worse, systemd's default `KillMode=control-group`
+takes the `make drain` child with it, and SIGKILL bypasses Python's `finally`, so
+`drain.py`'s `teardown()` never runs and the pod is orphaned — **with its lease still on
+disk**. The lease is precisely the signal that survives the event that destroys the
+process memory. Read it via `read_lease(ROOT / "batch" / "pod-lease.json")` (the same
+path `drain.py:26` writes) and compare `lease.manifest` against the resolved manifest
+path.
+
+Without this, a second `[Confirm]` tap after a restart launches a second
+`make drain … CONFIRM=yes` on the same manifest: two runners writing one `state.json`
+corrupts the journal, and two jobs on one GPU break the exclusive-use assumption
+`run_enhance`'s `comfy_recycle` depends on — both documented in `docs/batch-runner.md`.
+Nothing else guards this; `drain.py` imports `Lease`, `clear_lease` and `write_lease`
+but not `read_lease`.
+
 - [ ] **Step 1: Write the failing test**
 
 ```python
