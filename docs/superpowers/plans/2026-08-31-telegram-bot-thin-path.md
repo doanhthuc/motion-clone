@@ -863,7 +863,17 @@ the user writes by hand today so the file still explains itself later."
 
 **The money gate lives here, and it is a human tap.** `[Run]` does not rent anything: it renders the manifest, runs `make batch-validate` (free), and shows the result with an estimate. Only `[Confirm]` invokes `make drain … CONFIRM=yes`. Everything after that is automatic — which is exactly what makes the tap safe to be the only gate.
 
-**Progress is one edited message**, re-rendered about every 30 seconds. Telegram rate-limits edits, and a message per stage would bury the batch in scrollback.
+**Progress is one edited message**, re-rendered about every 30 seconds. Telegram rate-limits
+edits, and a message per stage would bury the batch in scrollback.
+
+> **Not built. Corrected 2026-08-31.** No task's steps ever wired this, so `progress_text`
+> and `Tg.edit_message` shipped as dead code and the plan claimed a feature that does not
+> exist. The final fix wave added a `/status` command as a pull substitute; the 30-second
+> edit loop remains unwired. This is the same shape as the gap that produced Task 7 and the
+> one that made Task 2's acceptance procedure unrunnable: **a later task quietly removed or
+> never delivered an earlier task's deliverable, and nothing checked.** Three times in one
+> plan is a missing gate, not bad luck — a plan needs a step that asks whether each task
+> broke what an earlier one promised.
 
 **`progress_text` reads the journal, not the pod.** `load_state` is the same source `batch_status` uses, so it stays correct after the pod is destroyed.
 
