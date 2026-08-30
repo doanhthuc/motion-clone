@@ -56,6 +56,30 @@ def allowed(update: dict, allowed_user_id: int) -> bool:
     return sender.get("id") == allowed_user_id
 
 
+def _safe_child(root: Path, name: str) -> Path | None:
+    """Resolve `name` as a single path component directly under `root`, or None.
+
+    The allowlist (`allowed()`) restricts WHO can message the bot, not WHAT
+    the one allowed user types or pastes — a mistyped or copy-pasted path is
+    enough to turn `/result`/`/tryon` into a probe for arbitrary files this
+    process can see. `name` is meant to be a bare filename or a bare batch
+    id, never a path, so an absolute argument, a literal ".." anywhere, or
+    any path separator at all is refused outright — three independent
+    reasons the same mistake would be caught. Then the joined path is
+    resolved (symlinks and any remaining "." collapsed) and re-checked with
+    `is_relative_to` against the resolved root, a second, independent check
+    after the first.
+    """
+    name = name.strip()
+    if not name or Path(name).is_absolute() or ".." in name or "/" in name or "\\" in name:
+        return None
+    root_resolved = root.resolve()
+    candidate = (root_resolved / name).resolve()
+    if not candidate.is_relative_to(root_resolved):
+        return None
+    return candidate
+
+
 def deliver_result(tg: Tg, chat_id: int, manifest_path: Path) -> None:
     """Send the finished video(s) back, or the failure diagnostics already on disk.
 
@@ -133,11 +157,19 @@ def handle(tg: Tg, update: dict, *, allowed_user_id: int, state: dict) -> None:
                             "usage: /tryon <batch-id>  (the id progress showed, "
                             "e.g. 2026-08-31-2140)")
             return
-        batch_id = parts[1].strip()
+        batch_dir = _safe_child(ROOT / "out", parts[1])
+        if batch_dir is None:
+            # Refuse without echoing the argument back: reflecting whatever
+            # was typed into the reply is how a refusal message becomes its
+            # own small problem.
+            tg.send_message(chat_id,
+                            "that batch id is not allowed — send a bare id, "
+                            "no path separators or '..'")
+            return
         # SOLE_RUN_ID: Plan 2A's manifests only ever have one run, "job".
-        path = ROOT / "out" / batch_id / "runs" / SOLE_RUN_ID / "01-tryon.png"
+        path = batch_dir / "runs" / SOLE_RUN_ID / "01-tryon.png"
         if not path.exists():
-            tg.send_message(chat_id, f"no try-on image found for {batch_id}")
+            tg.send_message(chat_id, "no try-on image found for that batch")
             return
         tg.send_document(chat_id, path, caption="try-on")
         return
@@ -149,11 +181,14 @@ def handle(tg: Tg, update: dict, *, allowed_user_id: int, state: dict) -> None:
                             "usage: /result <manifest filename under batch/>, "
                             "e.g. /result 2026-08-31-2140.yaml")
             return
-        manifest_path = Path(parts[1].strip())
-        if not manifest_path.is_absolute():
-            manifest_path = ROOT / "batch" / manifest_path
+        manifest_path = _safe_child(ROOT / "batch", parts[1])
+        if manifest_path is None:
+            tg.send_message(chat_id,
+                            "that manifest name is not allowed — send a bare "
+                            "filename under batch/, no path separators or '..'")
+            return
         if not manifest_path.exists():
-            tg.send_message(chat_id, f"no manifest at {manifest_path.name}")
+            tg.send_message(chat_id, "no manifest found with that name")
             return
         deliver_result(tg, chat_id, manifest_path)
         return
