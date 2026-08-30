@@ -27,6 +27,8 @@ batch/*.state.json
 # MCP server ghi pid/argv/log/mã thoát của lượt chạy nền cạnh manifest (*.mcp.json,
 # *.mcp.log, *.mcp.rc). Dữ liệu của máy này, không của repo.
 batch/*.mcp.*
+# Pod lease written by drain.py/watchdog — machine state about a rented pod, not repo content.
+batch/pod-lease.json
 
 # IDE junk — repo public, config cá nhân không vào đây (cùng lý do .DS_Store)
 .idea/

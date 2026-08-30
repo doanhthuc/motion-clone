@@ -268,6 +268,17 @@ if [ "$provider" = "runpod" ]; then
   fi
 fi
 
+# Pod ownership. Since 2026-08-30 the VPS is the sole owner of pod lifecycle
+# (see docs/superpowers/specs/2026-08-30-telegram-batch-control-design.md).
+# Two machines both provisioning is the same drift class check-job-types.mjs
+# exists to stop — and here it costs $0.99/hour, not a confusing error.
+if [ -f batch/pod-lease.json ]; then
+  LEASE_POD="$(python3 -c 'import json,sys; print(json.load(open("batch/pod-lease.json"))["pod_id"])' 2>/dev/null || echo '?')"
+  echo -e "${Y}! A pod lease is held: $LEASE_POD${X}"
+  echo -e "${D}  The VPS owns pod lifecycle. Do NOT run gpu-provision or gpu-destroy here${X}"
+  echo -e "${D}  until 'make watchdog-dry' on the VPS reports no lease.${X}"
+fi
+
 if [ "$blocking" -gt 0 ]; then
   echo
   echo -e "${R}${blocking} blocking issue(s) — fix before renting. Everything above is free to fix now.${X}"
