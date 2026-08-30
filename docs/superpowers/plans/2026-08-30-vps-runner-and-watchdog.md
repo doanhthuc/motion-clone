@@ -1053,8 +1053,11 @@ def collect_diagnostics(settings, state: dict, out_dir: Path) -> None:
     from batchlib.client import _request
     for run_id, job_id in failed_job_ids(state):
         dest = out_dir / "runs" / run_id / "pod-job.log"
-        dest.parent.mkdir(parents=True, exist_ok=True)
         try:
+            # mkdir belongs INSIDE the try. Outside it, a disk-full or
+            # permission error escapes the loop, escapes this function, and
+            # aborts the caller's finally block before it can destroy the pod.
+            dest.parent.mkdir(parents=True, exist_ok=True)
             # GET /jobs/:id/logs, not pm2: face_crop=vitpose vs the DWPose
             # fallback is written with api_log (linux.py:3962) and never
             # reaches ~/.pm2/logs/worker-out.log.
@@ -1077,20 +1080,42 @@ Then change the `finally` block in `main()` to:
 
 ```python
     finally:
-        state = load_state(state_path_for(manifest_path))
-        batch_id = state.get("batch") or ""
-        if batch_id and failed_job_ids(state):
+        teardown(manifest_path)
+```
+
+And the teardown itself, extracted so the money-critical ordering is reachable by a test — a
+`finally` block's interior is not:
+
+```python
+def teardown(manifest_path: Path) -> None:
+    """Collect diagnostics if anything failed, then destroy the pod. Always runs.
+
+    Diagnostics must never be able to stop the destroy. `finally` protects
+    against an exception in the TRY block; it does not protect against an
+    exception raised inside `finally` itself, which aborts the rest of the
+    block — so a disk-full mkdir while fetching a log would skip
+    `make gpu-destroy` and leave a $0.99/hour pod running. A failed log fetch
+    is an inconvenience; a pod that outlives its batch is a bill.
+    """
+    state = load_state(state_path_for(manifest_path))
+    batch_id = state.get("batch") or ""
+    if batch_id and failed_job_ids(state):
+        try:
             # load_settings() here rather than at the top of main(): on a fresh
             # VPS, NUXT_MOTION_API_KEY does not exist in motions/.env until
             # gpu-bootstrap has written it, so calling it before provisioning
             # would raise ConfigError on the very first drain.
             collect_diagnostics(load_settings(), state, ROOT / "out" / batch_id)
-        sh("make", "gpu-destroy")
-        clear_lease(LEASE_PATH)
+        except Exception as exc:
+            print(f"could not collect diagnostics: {exc!r}", file=sys.stderr)
+    sh("make", "gpu-destroy")
+    clear_lease(LEASE_PATH)
 ```
 
-Note the ordering: diagnostics are collected **inside** `finally`, **before** `gpu-destroy`. Moving
-`gpu-destroy` earlier would make this task pointless — the logs only exist while the pod lives.
+Note the ordering: diagnostics are collected **before** `gpu-destroy`. Moving `gpu-destroy` earlier
+would make this task pointless — the logs only exist while the pod lives. That ordering, and the
+guarantee that a diagnostics failure cannot skip the destroy, are the two properties worth testing
+here; `failed_job_ids` is the easy part.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
