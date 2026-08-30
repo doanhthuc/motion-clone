@@ -153,7 +153,8 @@ class TestFlow(unittest.TestCase):
         (self.root / "out").mkdir()
         bot.ROOT = self.root
         bot._STATE.clear()
-        bot._PENDING_SLOT.clear()
+        bot._PENDING.clear()
+        bot._LAST_VALIDATE.clear()
 
         # Real, if empty, files: validate_manifest checks path.is_file().
         self.driver_path = self.root / "driver.mp4"
@@ -177,7 +178,8 @@ class TestFlow(unittest.TestCase):
     def tearDown(self):
         bot.ROOT = self._orig_root
         bot._STATE.clear()
-        bot._PENDING_SLOT.clear()
+        bot._PENDING.clear()
+        bot._LAST_VALIDATE.clear()
 
     def _probe_for(self, mapping):
         def fake_probe(path):
@@ -225,7 +227,7 @@ class TestFlow(unittest.TestCase):
         bot.handle(self.tg, cmd_from(ME, "banana"), allowed_user_id=ME, state={})
         self.assertNotIn("outfit", bot._STATE[ME].slots)
         self.assertNotIn("character", bot._STATE[ME].slots)
-        self.assertIn(ME, bot._PENDING_SLOT)   # still parked, never guessed
+        self.assertEqual(len(bot._PENDING[ME]), 1)   # still parked, never guessed
         last = self.tg.messages[-1].lower()
         self.assertIn("didn't recognise", last)
         self.assertIn("outfit", last)          # re-asks with the same options, not silence
@@ -238,7 +240,13 @@ class TestFlow(unittest.TestCase):
         self.assertIn("pipeline", joined)
         self.assertIn("runs:", joined)
 
-    def test_confirm_starts_a_drain_and_nothing_else_does(self):
+    def test_confirm_calls_start_drain_once_with_dry_run_false(self):
+        # Renamed from "...and_nothing_else_does": with drain_running mocked
+        # to False, this test is identical with or without that guard — it
+        # does NOT pin the guard (see
+        # test_confirm_is_refused_while_a_drain_is_already_running for
+        # that). What this pins is the call itself: exactly once, with the
+        # right dry_run value, only reachable after /confirm.
         with mock.patch("tgbot.bot.start_drain") as start_drain, \
              mock.patch("tgbot.bot.drain_running", return_value=False):
             self._fill_required_slots()
@@ -247,6 +255,41 @@ class TestFlow(unittest.TestCase):
         start_drain.assert_called_once()
         _, kwargs = start_drain.call_args
         self.assertEqual(kwargs.get("dry_run"), False)
+
+    def test_two_ambiguous_images_sent_back_to_back_do_not_clobber_each_other(self):
+        """Regression (Task 7 fix round 1, Finding 1): Telegram delivers a
+        multi-file send as consecutive updates inside one get_updates()
+        batch, with no chance to answer between them — the natural way to
+        do the Goal line's "send four files". Pre-fix, `_PENDING_SLOT` held
+        a single Path, so parking a second ambiguous image before the first
+        was answered silently discarded the first: answering "character"
+        then assigned the SECOND file to it, and the answer meant for the
+        first file's real slot went nowhere (no pending entry left to
+        consume, and no error). This pins the fix: a queue, where only the
+        head is ever asked about and answers apply in arrival order.
+        """
+        with mock.patch("tgbot.bot.probe", return_value=self.image_probe):
+            bot.handle(self.tg, doc_from(ME, "character-id"), allowed_user_id=ME, state={})
+            bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME, state={})
+
+        bot.handle(self.tg, cmd_from(ME, "character"), allowed_user_id=ME, state={})
+        bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME, state={})
+
+        self.assertEqual(bot._STATE[ME].slots.get("character"), self.character_path)
+        self.assertEqual(bot._STATE[ME].slots.get("outfit"), self.outfit_path)
+
+    def test_confirm_is_refused_after_a_failed_validation(self):
+        """Regression (Task 7 fix round 1, Finding 2): _maybe_show_manifest
+        only skipped the confirm PROMPT on a failed `make batch-validate` —
+        /confirm's own guard never re-checked, so a user who ignored the
+        failure message and typed /confirm anyway reached start_drain on a
+        manifest already known to be invalid. Forcing the cached outcome to
+        False (as if the last render failed validation) must refuse."""
+        with mock.patch("tgbot.bot.start_drain") as start_drain:
+            self._fill_required_slots()
+            bot._LAST_VALIDATE[ME] = False
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME, state={})
+        start_drain.assert_not_called()
 
     def test_confirm_is_refused_while_a_drain_is_already_running(self):
         with mock.patch("tgbot.bot.start_drain") as start_drain, \

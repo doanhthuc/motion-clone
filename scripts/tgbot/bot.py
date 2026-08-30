@@ -60,9 +60,26 @@ JOB_PIPELINE = "tryon-motion-enhance"
 # bot restart loses an unsubmitted draft, never a running job: drain_running()
 # also consults the on-disk lease (tgbot/run.py), which is the durable half.
 _STATE: dict[int, Job] = {}
-# The one file parked while its slot is ambiguous (an image — a video is
-# never ambiguous, see job.slot_for). Keyed by chat_id, same as _STATE.
-_PENDING_SLOT: dict[int, tuple[Path, Probe]] = {}
+# A QUEUE of files parked while their slot is ambiguous (images — a video is
+# never ambiguous, see job.slot_for), keyed by chat_id, same as _STATE.
+#
+# Corrected 2026-08-31 (docs/superpowers/plans/2026-08-31-telegram-bot-thin-
+# path.md, commit c5c2a35): this was originally a single `Path`, "the one
+# file awaiting an answer". Telegram delivers a multi-file send as
+# consecutive updates inside one get_updates() batch, with no opportunity
+# for the user to answer between them — so attaching character and outfit
+# together, the natural way to do the Goal line's "send four files", made
+# the second image silently overwrite the first, with no error and no
+# recovery. Only the head of the queue is ever asked about; a valid answer
+# pops it and asks about the new head, if any.
+_PENDING: dict[int, list[tuple[Path, Probe]]] = {}
+
+# The outcome of the last `make batch-validate` run for a chat's manifest,
+# set only by `_maybe_show_manifest`. /confirm consults this cache rather
+# than trusting that a downstream safety net (drain.py's own pre-provision
+# validate) will catch a manifest the user already saw fail — that file is
+# read-only to this bot and its behaviour is not this bot's to depend on.
+_LAST_VALIDATE: dict[int, bool] = {}
 
 
 def log(msg: str) -> None:
@@ -164,6 +181,12 @@ def _askable_roles(pipeline: str) -> list[str]:
     return sorted((required_roles(pipeline) | optional_roles(pipeline)) - {"driver"})
 
 
+def _ask_about(tg: Tg, chat_id: int, p: Probe, pipeline: str) -> None:
+    """Ask which slot a parked, ambiguous file belongs to."""
+    options = " / ".join(_askable_roles(pipeline))
+    tg.send_message(chat_id, f"{describe(p)}\nWhich slot is this? Reply: {options}")
+
+
 def _maybe_show_manifest(tg: Tg, chat_id: int, job: Job) -> None:
     """Once every required slot is filled: render, validate for free, show it.
 
@@ -172,6 +195,11 @@ def _maybe_show_manifest(tg: Tg, chat_id: int, job: Job) -> None:
     the result with an estimate") — triggered automatically by the last slot
     fill rather than a separate command, since there is no button to tap for
     it. It rents nothing: `make batch-validate` never touches the pod.
+
+    Records the outcome in `_LAST_VALIDATE` either way — `/confirm` refuses
+    rather than re-deriving "was the last render valid" from scratch, since
+    a user who ignores the failure message below and types /confirm anyway
+    must still be refused (Task 7 fix round 1, Finding 2).
     """
     if missing_slots(job):
         return
@@ -182,10 +210,12 @@ def _maybe_show_manifest(tg: Tg, chat_id: int, job: Job) -> None:
         ["make", "batch-validate", f"FILE={manifest_path}"],
         cwd=_REPO_ROOT, capture_output=True, text=True)
     if result.returncode != 0:
+        _LAST_VALIDATE[chat_id] = False
         tg.send_message(chat_id,
                         "manifest failed validation — nothing will run:\n"
                         f"{(result.stdout + result.stderr).strip()}")
         return
+    _LAST_VALIDATE[chat_id] = True
 
     minutes = estimate_minutes(job)
     tg.send_message(
@@ -228,11 +258,22 @@ def handle(tg: Tg, update: dict, *, allowed_user_id: int, state: dict,
         role = slot_for(p, job)
         if role is None:
             # Ambiguous (an image): job.slot_for already refuses to guess —
-            # park it and ask, rather than reintroducing a filename heuristic
-            # here. The answer arrives as a later plain-text message.
-            _PENDING_SLOT[chat_id] = (path, p)
-            options = " / ".join(_askable_roles(job.pipeline))
-            tg.send_message(chat_id, f"{describe(p)}\nWhich slot is this? Reply: {options}")
+            # queue it and ask, rather than reintroducing a filename
+            # heuristic here. The answer arrives as a later plain-text
+            # message. Queued, not overwritten: a phone naturally attaches
+            # several images in one send, which arrive as consecutive
+            # updates with no chance to answer in between (see _PENDING).
+            queue = _PENDING.setdefault(chat_id, [])
+            queue.append((path, p))
+            if len(queue) == 1:
+                _ask_about(tg, chat_id, p, job.pipeline)
+            else:
+                # Still show describe() — the quality gate must stay visible
+                # for every accepted file, not just the one currently asked
+                # about — but don't ask again yet: only the head is asked.
+                tg.send_message(chat_id,
+                                f"{describe(p)}\nqueued — answer the previous "
+                                "question first")
             return
 
         # A video: structural, always `driver` — no question needed.
@@ -303,6 +344,16 @@ def handle(tg: Tg, update: dict, *, allowed_user_id: int, state: dict,
         if job is None or missing_slots(job):
             tg.send_message(chat_id, "no complete job yet — send the required files first")
             return
+        if not _LAST_VALIDATE.get(chat_id):
+            # Refuse rather than trust a downstream safety net: drain.py's
+            # own Phase A validate would likely catch this before a pod is
+            # rented, but that file is read-only to this bot, so this guard
+            # cannot rely on it (Task 7 fix round 1, Finding 2).
+            tg.send_message(chat_id,
+                            "the manifest hasn't passed validation — nothing will "
+                            "run. Fix the error already shown, or send the files "
+                            "again.")
+            return
         manifest_path = _job_manifest_path(chat_id)
         if drain_running(manifest_path):
             # The money guard: a second drain on one manifest corrupts the
@@ -318,7 +369,8 @@ def handle(tg: Tg, update: dict, *, allowed_user_id: int, state: dict,
         # than mutating one already handed to a running drain. The manifest
         # itself, and the drain's own journal, stay on disk regardless.
         _STATE.pop(chat_id, None)
-        _PENDING_SLOT.pop(chat_id, None)
+        _PENDING.pop(chat_id, None)
+        _LAST_VALIDATE.pop(chat_id, None)
         tg.send_message(chat_id,
                         "started — renting a GPU pod at $0.99/hour now.\n"
                         f"Check back with /result {manifest_path.name} once it's done.")
@@ -328,21 +380,29 @@ def handle(tg: Tg, update: dict, *, allowed_user_id: int, state: dict,
         tg.send_message(chat_id, "Ready. Send a file with the paperclip -> File.")
         return
 
-    # A plain-text reply, meant to answer the question asked when the last
-    # file was an ambiguous image. Anything not a recognised slot name is
-    # re-asked, never guessed — mirrors job.slot_for's own refusal to guess.
-    pending = _PENDING_SLOT.get(chat_id)
-    if pending is not None:
+    # A plain-text reply, meant to answer the question asked about the HEAD
+    # of the pending queue (never any other queued file — only the head is
+    # ever asked about). Anything not a recognised slot name is re-asked,
+    # never guessed — mirrors job.slot_for's own refusal to guess.
+    queue = _PENDING.get(chat_id)
+    if queue:
         job = _STATE.setdefault(chat_id, Job(slots={}, probes={}, pipeline=JOB_PIPELINE))
         options = _askable_roles(job.pipeline)
         answer = text.strip().lower()
         if answer in options:
-            path, p = pending
+            path, p = queue.pop(0)
+            if not queue:
+                _PENDING.pop(chat_id, None)
             job.slots[answer] = path
             job.probes[answer] = p
-            del _PENDING_SLOT[chat_id]
             tg.send_message(chat_id, f"{answer}: {describe(p)}")
             _maybe_show_manifest(tg, chat_id, job)
+            if queue:
+                # The next file was already queued (arrived before this
+                # answer) — ask about it immediately rather than waiting for
+                # another document to trigger it.
+                _, next_p = queue[0]
+                _ask_about(tg, chat_id, next_p, job.pipeline)
         else:
             tg.send_message(chat_id, f"didn't recognise that — reply one of: "
                             f"{' / '.join(options)}")
