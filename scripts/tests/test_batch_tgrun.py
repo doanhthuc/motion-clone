@@ -105,5 +105,30 @@ class TestDrainRunning(unittest.TestCase):
         self.assertFalse(drain_running(m))
 
 
+from tgbot.run import final_files, summary_text
+
+
+class TestDelivery(unittest.TestCase):
+    def test_final_files_lists_only_the_final_directory(self):
+        root = Path(tempfile.mkdtemp())
+        batch = root / "out" / "2026-08-31-2140"
+        (batch / "_final").mkdir(parents=True)
+        (batch / "runs" / "job").mkdir(parents=True)
+        (batch / "_final" / "job.mp4").write_bytes(b"x" * 200_000)
+        (batch / "runs" / "job" / "02-motion.mp4").write_bytes(b"y" * 200_000)
+        found = final_files(batch)
+        self.assertEqual([p.name for p in found], ["job.mp4"])
+
+    def test_summary_names_the_failed_run_and_its_local_log(self):
+        # teardown already pulled the pod logs down before destroying the pod,
+        # so the bot attaches what is on disk and never reaches for the pod.
+        root = Path(tempfile.mkdtemp())
+        batch = root / "out" / "b"
+        (batch / "runs" / "job").mkdir(parents=True)
+        (batch / "runs" / "job" / "pod-job.log").write_text("boom", encoding="utf-8")
+        text = summary_text(batch)
+        self.assertIn("job", text)
+
+
 if __name__ == "__main__":
     unittest.main()

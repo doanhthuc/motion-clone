@@ -164,3 +164,56 @@ def drain_running(manifest_path: Path) -> bool:
     # a relative vs. absolute spelling of the same file cannot cause a false
     # "not running".
     return Path(lease.manifest).resolve() == manifest_path.resolve()
+
+
+def final_files(batch_dir: Path) -> list[Path]:
+    """The finished video(s) for a batch — `_final/*.mp4` only, nothing from `runs/`.
+
+    `runs/<run>/NN-stage.mp4` holds an intermediate for every stage of the
+    pipeline (e.g. `02-motion.mp4` before `enhance` runs); scripts/batchlib
+    only promotes a run's LAST stage output into `_final/<run>.mp4`
+    (runner.py's `_finalize`). Shipping an intermediate to the user as if it
+    were the finished result would be worse than shipping nothing — they
+    would have no way to tell it apart from the real output.
+    """
+    final_dir = batch_dir / "_final"
+    if not final_dir.is_dir():
+        return []
+    return sorted(final_dir.glob("*.mp4"))
+
+
+def summary_text(batch_dir: Path) -> str:
+    """One text summary of a batch: per-stage seconds/bytes, and which runs failed.
+
+    Reads only `_index.tsv` (runner.py's `write_index` — one row per STAGE,
+    run/status/stage/job_id/elapsed_sec/bytes/params) and `runs/<run>/` on
+    disk. A failed run is recognised the same way `_index.tsv` already can
+    show it (a run whose last stage row has status "error"), and by the
+    presence of `pod-job.log`/`run.log` under `runs/<run>/` — files
+    `scripts/drain.py`'s `teardown()` already pulled down (or wrote, for
+    run.log) before the pod was destroyed. Never touches the pod itself.
+    """
+    lines = [f"batch {batch_dir.name}"]
+
+    index_path = batch_dir / "_index.tsv"
+    if index_path.exists():
+        rows = index_path.read_text(encoding="utf-8").splitlines()
+        header, data_rows = (rows[0].split("\t"), rows[1:]) if rows else ([], [])
+        for row in data_rows:
+            if not row:
+                continue
+            record = dict(zip(header, row.split("\t")))
+            lines.append(f"{record.get('run', '?')} {record.get('stage', '?')}: "
+                         f"{record.get('status', '?')} "
+                         f"{record.get('elapsed_sec', '?')}s "
+                         f"{record.get('bytes', '?')}B")
+    else:
+        lines.append("no _index.tsv yet")
+
+    runs_dir = batch_dir / "runs"
+    if runs_dir.is_dir():
+        for run_dir in sorted(p for p in runs_dir.iterdir() if p.is_dir()):
+            if (run_dir / "pod-job.log").exists():
+                lines.append(f"{run_dir.name}: failed — pod-job.log and run.log attached")
+
+    return "\n".join(lines)
