@@ -5,7 +5,8 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batchlib.manifest import load_manifest, state_path_for
 import drain
-from drain import abs_max_min, collect_diagnostics, failed_job_ids, teardown
+from drain import (abs_max_min, collect_diagnostics, failed_job_ids,
+                   pod_max_hours, teardown)
 
 YAML = """
 runs:
@@ -24,6 +25,65 @@ class TestAbsMax(unittest.TestCase):
         path = Path(tempfile.mkdtemp()) / "m.yaml"
         path.write_text(YAML, encoding="utf-8")
         self.assertEqual(abs_max_min(load_manifest(path)), 330)
+
+
+class TestPodMaxHours(unittest.TestCase):
+    """The RunPod-side --stop-after net may only be tightened, never loosened."""
+
+    def test_a_long_manifest_is_capped_at_the_configured_default(self):
+        # batch/2026-08-28-lanczos-6cap.yaml: ceiling 1030 min = 18h uncapped.
+        # Measured 2026-08-31: 4 of the 7 manifests in batch/ exceed 8 hours.
+        self.assertEqual(pod_max_hours(1030, "8"), "8")
+
+    def test_a_short_manifest_tightens_below_the_default(self):
+        # batch/2026-08-24-relight-sweep.yaml: ceiling 150 min -> 3h.
+        self.assertEqual(pod_max_hours(150, "8"), "3")
+
+    def test_rounds_up_never_down(self):
+        # 330 min is 5.5h; granting 5 would stop the pod mid-batch.
+        self.assertEqual(pod_max_hours(330, "8"), "6")
+
+    def test_never_returns_zero_hours_for_a_tiny_manifest(self):
+        # A 30-minute ceiling must not become --stop-after 0 hours.
+        self.assertEqual(pod_max_hours(30, "8"), "1")
+
+    def test_zero_disables_the_net_and_stays_zero(self):
+        # pod-provision.sh:70 documents POD_MAX_HOURS=0 as "no net". Substituting
+        # a number would re-enable a net the operator deliberately switched off.
+        self.assertEqual(pod_max_hours(1030, "0"), "0")
+
+    def test_unset_falls_back_to_the_documented_default(self):
+        # env_get returns "" for a missing key AND for an unreadable .env
+        # (config.py:62-66); pod-provision.sh:28 defaults that to 8.
+        self.assertEqual(pod_max_hours(1030, ""), "8")
+
+    def test_garbage_is_handed_through_for_pod_provision_to_reject(self):
+        # pod-provision.sh:72 dies by name on a non-numeric value. Guessing here
+        # would hide a typo in .env behind a rent that looks fine.
+        self.assertEqual(pod_max_hours(1030, "eight"), "eight")
+
+
+class TestProvision(unittest.TestCase):
+    def test_empty_pod_id_raises_instead_of_writing_a_useless_lease(self):
+        # env_get returns "" on ANY failure to read .env (config.py:62-66). A
+        # lease with an empty pod_id makes every later kill `runpodctl pod delete
+        # ""`, which raises — so the watchdog could never clean up the pod that
+        # was just rented.
+        with mock.patch.object(drain.subprocess, "run") as mock_run, \
+             mock.patch.object(drain, "env_get", return_value=""):
+            mock_run.return_value = mock.Mock(returncode=0)
+            with self.assertRaises(RuntimeError) as cm:
+                drain.provision(ceiling_min=120)
+        self.assertIn("GPU_INSTANCE_ID is empty", str(cm.exception))
+
+    def test_returns_the_pod_id_provisioning_wrote_to_env(self):
+        with mock.patch.object(drain.subprocess, "run") as mock_run, \
+             mock.patch.object(drain, "env_get", side_effect=["8", "pod-xyz"]):
+            mock_run.return_value = mock.Mock(returncode=0)
+            self.assertEqual(drain.provision(ceiling_min=120), "pod-xyz")
+        # provision() must NOT wait or bootstrap: main() writes the lease between
+        # the two, because the pod bills from the moment provisioning returns.
+        self.assertEqual(mock_run.call_count, 1)
 
 
 class TestFailedJobIds(unittest.TestCase):

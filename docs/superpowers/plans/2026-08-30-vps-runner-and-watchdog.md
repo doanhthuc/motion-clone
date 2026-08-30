@@ -182,7 +182,7 @@ reconciliation, which destroys it — the safe direction to fail in."
 - Consumes: `Lease` from Task 1; `STAGES` from `scripts/batchlib/pipelines.py`.
 - Produces: `Verdict` (frozen dataclass: `kill: bool`, `reason: str`), `in_flight_stage(state: dict) -> str | None`, `decide(*, lease: Lease, state: dict, journal_mtime: float, now: float, slack_min: int = 15) -> Verdict`.
 
-**Why mtime and not a heartbeat call:** `run_one()` in `scripts/batchlib/runner.py` already calls `save_state()` twice per stage — at line 196 when the job is submitted, and at line 226 when the stage finishes. That makes the journal's mtime a *progress* signal, not merely a liveness signal, and it means `batchlib` needs no modification.
+**Why mtime and not a heartbeat call:** `run_one()` in `scripts/batchlib/runner.py` already calls `save_state()` twice per stage — at line 198 when the job is submitted, and at line 226 when the stage finishes. That makes the journal's mtime a *progress* signal, not merely a liveness signal, and it means `batchlib` needs no modification.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -350,7 +350,7 @@ git add scripts/batchlib_ext/watchdog.py scripts/tests/test_batch_watchdog.py
 git commit -m "Watchdog: tier-1 dead-man's switch and tier-2 ceiling
 
 The heartbeat is the journal's mtime, not a callback: run_one() already
-calls save_state() at runner.py:196 and :226, so this needs no change to
+calls save_state() at runner.py:198 and :226, so this needs no change to
 batchlib and measures progress rather than mere liveness.
 
 The tier-1 leash is the running stage's own timeout_min plus 15 min,
@@ -990,7 +990,7 @@ hours: an unattended run knows its own ceiling, so the RunPod-side
 - Consumes: `BatchResult` from `batchlib.runner`.
 - Produces: `failed_job_ids(state: dict) -> list[tuple[str, str]]` returning `(run_id, job_id)` pairs.
 
-**Why:** `docs/batch-runner.md` section 4 says plainly that a failed batch is exactly when you must not destroy the pod, because the worker log is only readable while it lives. Auto-destroy contradicts that, so the diagnostics have to be pulled first. `GET /jobs/:id/logs` matters specifically: `face_crop=vitpose` versus the DWPose fallback is written with `api_log` (`linux.py:3962`) and is therefore **not** in `~/.pm2/logs/worker-out.log`. That exact trap has already cost one debugging session.
+**Why:** `docs/batch-runner.md` section 4 says plainly that a failed batch is exactly when you must not destroy the pod, because the worker log is only readable while it lives. Auto-destroy contradicts that, so the diagnostics have to be pulled first. `GET /jobs/:id/logs` matters specifically: `face_crop=vitpose` versus the DWPose fallback is written with `api_log` (`linux.py:4605`) and is therefore **not** in `~/.pm2/logs/worker-out.log`. That exact trap has already cost one debugging session.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1059,7 +1059,7 @@ def collect_diagnostics(settings, state: dict, out_dir: Path) -> None:
             # aborts the caller's finally block before it can destroy the pod.
             dest.parent.mkdir(parents=True, exist_ok=True)
             # GET /jobs/:id/logs, not pm2: face_crop=vitpose vs the DWPose
-            # fallback is written with api_log (linux.py:3962) and never
+            # fallback is written with api_log (linux.py:4605) and never
             # reaches ~/.pm2/logs/worker-out.log.
             code, body = _request(settings, f"/jobs/{job_id}/logs")
             dest.write_bytes(body if code == 200
@@ -1131,7 +1131,7 @@ git commit -m "drain: pull pod logs before destroying on failure
 docs/batch-runner.md section 4 says a failed batch is exactly when you
 must not destroy the pod. Auto-destroy contradicts that, so collect
 first. GET /jobs/:id/logs specifically: face_crop=vitpose vs the DWPose
-fallback is written with api_log (linux.py:3962) and never reaches
+fallback is written with api_log (linux.py:4605) and never reaches
 ~/.pm2/logs/worker-out.log — a trap that already cost one session."
 ```
 

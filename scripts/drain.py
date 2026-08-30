@@ -25,6 +25,7 @@ from batchlib_ext.lease import Lease, clear_lease, write_lease
 ROOT = Path(__file__).resolve().parents[1]
 LEASE_PATH = ROOT / "batch" / "pod-lease.json"
 CEILING_SLACK_MIN = 30
+DEFAULT_POD_MAX_HOURS = 8   # the fallback pod-provision.sh:28 applies
 
 
 def abs_max_min(manifest: Manifest) -> int:
@@ -39,21 +40,74 @@ def sh(*argv: str) -> None:
     subprocess.run(argv, check=True, cwd=ROOT)
 
 
-def provision_and_wait(*, ceiling_min: int) -> str:
-    """Rent a pod, bootstrap it, return its instance id.
+def pod_max_hours(ceiling_min: int, configured: str) -> str:
+    """The POD_MAX_HOURS to hand pod-provision.sh: the tier-2 ceiling, CAPPED.
 
-    POD_MAX_HOURS is passed rather than left at its default of 8: an
-    unattended drain knows its own ceiling, so the RunPod-side --stop-after
-    net (pod-provision.sh:66) should be tightened to match instead of always
-    granting 8 hours. pod-provision.sh already reads it from the environment.
+    This can only ever tighten the RunPod-side --stop-after net, never loosen it.
+    An uncapped ceil(ceiling/60) loosens it for most real manifests — measured
+    2026-08-31 over the 7 manifests in batch/: 11, 6, 11, 9, 3, 18 and 6 hours,
+    so 4 of 7 would have RAISED the 8-hour default, and the 6-cap lanczos batch
+    would have been granted 18. The design spec says tier 0 stays "still capped
+    by POD_MAX_HOURS", and a safety net you are allowed to widen is not one.
+
+    POD_MAX_HOURS=0 means the net is deliberately disabled (pod-provision.sh:70).
+    Passing 0 through preserves that; substituting a number would quietly
+    re-enable a net the operator switched off.
+
+    A cap below the tier-2 ceiling can stop a long batch mid-run — the lanczos
+    6-cap manifest wants 18h and gets 8. That is the same thing `make batch` has
+    always done with POD_MAX_HOURS=8, and --stop-after only STOPS the pod (the DB
+    survives, `make gpu-up` resumes). Wanting more is a deliberate edit to .env,
+    not something a manifest may grant itself.
     """
-    hours = max(1, -(-ceiling_min // 60))   # ceil
-    env_prefix = f"POD_MAX_HOURS={hours} CONFIRM=yes"
-    subprocess.run(f"{env_prefix} bash scripts/pod-provision.sh",
+    value = (configured or "").strip()
+    if value == "0":
+        return "0"
+    if not value.isdigit():
+        # Garbage is handed straight through so pod-provision.sh:72 reports it by
+        # name and dies before renting. Guessing a number here would hide a typo
+        # in .env behind a working-looking rent.
+        if value:
+            return value
+        value = str(DEFAULT_POD_MAX_HOURS)
+    return str(max(1, min(-(-ceiling_min // 60), int(value))))   # ceil, capped
+
+
+def provision(*, ceiling_min: int) -> str:
+    """Rent a pod and return its instance id. Does NOT wait or bootstrap.
+
+    Split from the wait so main() can write the lease in between. The pod is
+    visible to runpodctl — and therefore to the watchdog's 10-minute tier-3 grace
+    window — from the moment this returns, while pod-wait.sh alone defaults to a
+    25-minute TIMEOUT (pod-wait.sh:118) and a first, non-prebuilt bootstrap runs
+    ~30 min (docs/gpu-pod.md:228). Writing the lease after all that let tier 3
+    destroy the pod drain had just legitimately rented.
+
+    POD_MAX_HOURS is tightened per-drain — see pod_max_hours(). pod-provision.sh
+    already reads it from the environment.
+    """
+    hours = pod_max_hours(ceiling_min, env_get(ROOT / ".env", "POD_MAX_HOURS"))
+    subprocess.run(f"POD_MAX_HOURS={hours} CONFIRM=yes bash scripts/pod-provision.sh",
                    shell=True, check=True, cwd=ROOT)
+    pod_id = env_get(ROOT / ".env", "GPU_INSTANCE_ID")
+    if not pod_id:
+        # env_get returns "" for every failure mode, including .env being
+        # unreadable (config.py:62-66). An empty id in the lease makes every later
+        # kill attempt `runpodctl pod delete ""`, which raises — so the watchdog
+        # can never clean up the pod that was just rented.
+        raise RuntimeError(
+            "pod-provision.sh exited 0 but GPU_INSTANCE_ID is empty in .env — "
+            "refusing to write a lease that cannot destroy anything. Check that "
+            f"{ROOT / '.env'} is readable and has a GPU_INSTANCE_ID line, then "
+            "run 'runpodctl pod list -o json' and delete the pod by hand if one "
+            "was rented.")
+    return pod_id
+
+
+def wait_and_bootstrap() -> None:
+    """Block until the pod answers SSH, then install the backend on it."""
     sh("bash", "scripts/pod-wait.sh")
     sh("bash", "scripts/pod-bootstrap.sh")
-    return env_get(ROOT / ".env", "GPU_INSTANCE_ID")
 
 
 def batch_run(*args: str) -> int:
@@ -93,7 +147,7 @@ def collect_diagnostics(settings, state: dict, out_dir: Path) -> None:
             # aborts the caller's finally block before it can destroy the pod.
             dest.parent.mkdir(parents=True, exist_ok=True)
             # GET /jobs/:id/logs, not pm2: face_crop=vitpose vs the DWPose
-            # fallback is written with api_log (linux.py:3962) and never
+            # fallback is written with api_log (linux.py:4605) and never
             # reaches ~/.pm2/logs/worker-out.log.
             code, body = _request(settings, f"/jobs/{job_id}/logs")
             dest.write_bytes(body if code == 200
@@ -174,11 +228,21 @@ def main() -> int:
         print(f"local phase failed (exit {rc}) — NOT renting a pod", file=sys.stderr)
         return rc
 
-    pod_id = provision_and_wait(ceiling_min=ceiling)
+    pod_id = provision(ceiling_min=ceiling)
+    # The lease is written HERE, between provisioning and waiting — not after
+    # bootstrap. The pod bills from the line above, and tier 3's grace window is
+    # 10 minutes while bootstrap is 284s prebuilt (docs/gpu-pod.md:81) and ~30 min
+    # on a first run (docs/gpu-pod.md:228). The manifest path is resolved: the
+    # watchdog reads it as ROOT / lease.manifest, so a relative path recorded from
+    # another cwd would resolve to a different (or missing) journal and tier 1
+    # would fire on a live batch at 105 minutes.
     write_lease(LEASE_PATH, Lease(pod_id=pod_id, provisioned_at=time.time(),
-                                  manifest=str(manifest_path),
+                                  manifest=str(manifest_path.resolve()),
                                   abs_max_min=ceiling))
     try:
+        # Inside the try, so a wait/bootstrap failure still reaches teardown.
+        # Tiers 1 and 2 now cover this phase too, because the lease exists.
+        wait_and_bootstrap()
         # --resume, always: phase A already journalled the try-on stages, and
         # resume is what makes them skipped rather than paid for twice.
         rc = batch_run("--file", str(manifest_path), "--resume")
