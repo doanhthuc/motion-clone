@@ -32,3 +32,7 @@ batch/pod-lease.json
 
 # IDE junk — repo public, config cá nhân không vào đây (cùng lý do .DS_Store)
 .idea/
+
+# Telegram bot API — local secrets and container data
+scripts/vps/bot-api.env
+scripts/vps/telegram-bot-api-data/

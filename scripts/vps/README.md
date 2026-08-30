@@ -83,3 +83,47 @@ with respect to ownership and is fine.
 make drain FILE=batch/2026-08-30.yaml               # dry run: prints the plan, rents nothing
 make drain FILE=batch/2026-08-30.yaml CONFIRM=yes   # rents, runs, destroys
 ```
+
+## Acceptance — needs a real phone
+
+This step validates the byte-fidelity assumption: does Telegram preserve bytes for a `.MP4` sent via
+`File`? The design in spec section 4 assumes yes. This is the measurement that proves it:
+
+1. Start the local Bot API server:
+   ```bash
+   docker compose -f scripts/vps/telegram-bot-api.yml up -d
+   curl -s http://127.0.0.1:8081/bot<token>/getMe
+   ```
+   Confirm `"ok":true` in the response.
+
+2. **One-time and irreversible in one direction:** call `logOut` against `api.telegram.org` for this
+   bot *before* pointing it at the local server, or it will silently stop receiving updates:
+   ```bash
+   curl -s "https://api.telegram.org/bot<token>/logOut"
+   ```
+
+3. Start the bot:
+   ```bash
+   python3 scripts/tgbot/bot.py
+   ```
+
+4. From the iPhone, send **the same file twice**: once via the Photos tab, once via
+   `paperclip -> File`.
+   - The Photos one must be refused with the compression message.
+   - The File one must come back with a `sha256` and a byte count.
+
+5. On the Mac, verify the original file:
+   ```bash
+   shasum -a 256 <the original file>
+   stat -f %z <the original file>
+   ```
+
+6. Repeat steps 4-5 for:
+   - An image file
+   - A ~25MB `.mp4` file
+
+Record in the task completion: the two digests per file, whether they match, and the byte counts.
+
+**If the digests match:** the design's central assumption holds; continue to Task 3.
+**If they do not:** stop work. Spec section 4 is invalidated and the ingest channel has to change
+before anything else is built — the rest of the plan would be built on sand. Do not work around it.

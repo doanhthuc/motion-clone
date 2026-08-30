@@ -1,0 +1,20 @@
+# scripts/vps/telegram-bot-api.yml
+# The public Bot API caps bot downloads at 20MB; this user's drivers are 20-30MB,
+# so every one of them would fail. A local server lifts that to 2GB AND makes
+# getFile return an absolute path on disk, so the bot reads the file instead of
+# downloading it.
+#
+# TELEGRAM_API_ID / TELEGRAM_API_HASH come from https://my.telegram.org (an app
+# registration, not the bot token). Put them in scripts/vps/bot-api.env, which
+# is gitignored.
+services:
+  telegram-bot-api:
+    image: ghcr.io/gramiojs/telegram-bot-api:latest
+    restart: unless-stopped
+    env_file: bot-api.env
+    environment:
+      TELEGRAM_LOCAL: "1"
+    ports:
+      - "127.0.0.1:8081:8081"
+    volumes:
+      - ./telegram-bot-api-data:/var/lib/telegram-bot-api
