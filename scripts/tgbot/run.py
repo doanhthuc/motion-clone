@@ -25,10 +25,17 @@ from pathlib import Path
 # which imports batchlib the same way without inserting its own path.
 from batchlib.manifest import load_state, state_path_for
 from batchlib.pipelines import PIPELINES, STAGES
+from batchlib_ext.lease import read_lease
 
 from .job import Job
 
 ROOT = Path(__file__).resolve().parents[2]
+
+# Same path scripts/drain.py:26 writes to (and clear_lease/write_lease use).
+# Not imported from drain.py — drain.py itself imports Lease/clear_lease/
+# write_lease but never read_lease, so nothing there re-derives this path for
+# a reader; it is duplicated here on purpose, pinned to the one writer.
+LEASE_PATH = ROOT / "batch" / "pod-lease.json"
 
 # Measured medians from ONE real batch (2026-08-18-2105, RTX 5090, RunPod
 # EU-RO-1, $0.99/hr), a 15-second driver at 1088x1920 —
@@ -124,12 +131,36 @@ def start_drain(manifest_path: Path, *, dry_run: bool) -> subprocess.Popen:
 
 
 def drain_running(manifest_path: Path) -> bool:
-    """True only for a drain THIS process started and that has not exited.
+    """True if THIS process still has the drain alive, OR a lease says it might be.
 
-    Deliberately not lease-based: a lease means a pod is rented, but a
-    dry run (no CONFIRM=yes) never writes one, and the process can still be
-    running while `make batch-validate` executes. Checking the Popen handle
-    is the one thing that is true in both cases.
+    Neither half alone is enough. The Popen check alone (what this used to
+    be) is blind to a bot restart: scripts/vps/motion-bot.service sets
+    `Restart=always`, so the bot process is replaced and a fresh interpreter
+    starts with an empty `_RUNNING` — and if systemd's default
+    KillMode=control-group took the `make drain` child down with the old
+    process, that child was SIGKILLed, which skips drain.py's `finally:
+    teardown()` entirely. The lease scripts/drain.py:26 writes right after
+    provisioning is the one thing that survives both: it is a file, not
+    process memory. A dry run (no CONFIRM=yes) never writes a lease, which
+    is why the Popen check is still needed for that case, and why this is an
+    OR rather than a lease-only check.
+
+    Without this, a restarted bot would answer False for a manifest whose
+    pod is still live or being drained, and a second [Confirm] tap would
+    launch a second `make drain ... CONFIRM=yes` on the same manifest — two
+    runners writing one state.json corrupts the journal, and two jobs on one
+    GPU breaks the exclusive-use assumption run_enhance's comfy_recycle
+    depends on (docs/batch-runner.md).
     """
     proc = _RUNNING.get(manifest_path.resolve())
-    return proc is not None and proc.poll() is None
+    if proc is not None and proc.poll() is None:
+        return True
+
+    lease = read_lease(LEASE_PATH)
+    if lease is None:
+        return False
+    # drain.py:239 writes manifest=str(manifest_path.resolve()) at provision
+    # time — resolve ours the same way rather than comparing raw strings, so
+    # a relative vs. absolute spelling of the same file cannot cause a false
+    # "not running".
+    return Path(lease.manifest).resolve() == manifest_path.resolve()
