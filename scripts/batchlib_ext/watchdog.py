@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batchlib.pipelines import STAGES
 
 from .lease import Lease
+from .podctl import PodInfo
 
 # Longest declared stage timeout (enhance, 90 min as of 2026-08-30). Derived,
 # never hardcoded: pipelines.py is the single place stage timeouts are declared.
@@ -36,7 +37,7 @@ def in_flight_stage(state: dict) -> str | None:
 
 def decide(*, lease: Lease, state: dict, journal_mtime: float, now: float,
            slack_min: int = 15) -> Verdict:
-    """Tier 1 (dead-man's switch) then tier 2 (absolute ceiling).
+    """Tier 2 (absolute ceiling) then tier 1 (dead-man's switch).
 
     Tier 1 leash is the CURRENT stage's own timeout plus slack. Anything
     shorter would kill a stage the runner still legitimately considers alive —
@@ -57,3 +58,23 @@ def decide(*, lease: Lease, state: dict, journal_mtime: float, now: float,
                              f"> {budget} min budget ({where})")
 
     return Verdict(False, "")
+
+
+def reconcile(*, pods: list[PodInfo], lease: Lease | None,
+              first_seen: dict[str, float], now: float,
+              grace_min: int = 10) -> tuple[list[str], dict[str, float]]:
+    """Tier 3: any pod we can see that no lease claims is an orphan.
+
+    This is the net for the worst case — the lease file was lost, or two
+    machines both think they own the pod (see the ownership decision in the
+    spec). It runs on daemon start too, which covers a VPS reboot mid-batch.
+
+    The grace window exists because provisioning writes the lease AFTER the
+    pod exists. Without it, a tick landing in that gap kills a pod that is one
+    second old.
+    """
+    leased = lease.pod_id if lease else None
+    seen = {p.pod_id: first_seen.get(p.pod_id, now) for p in pods}
+    kill = [p.pod_id for p in pods
+            if p.pod_id != leased and (now - seen[p.pod_id]) / 60.0 > grace_min]
+    return kill, seen
