@@ -623,5 +623,50 @@ class TestFlow(unittest.TestCase):
         self.assertNotIn(ME, bot._STATE)
 
 
+class TestSafeNameFoldsDiacritics(unittest.TestCase):
+    """Vietnamese names survive staging instead of being deleted down to the
+    separators between their letters.
+
+    Before this, `_SAFE_NAME_RE` deleted every accented letter outright:
+    `áo dài.jpg` became `o_d_i.jpg`. That is not tidiness — the manifest is
+    what the user reads on a phone before confirming a $0.99/hour render, and
+    a filename they cannot recognise is a file they cannot check is the right
+    one. Staging exists partly to make those names readable.
+    """
+
+    def test_accents_fold_to_their_base_letter(self):
+        self.assertEqual(bot._safe_name("áo dài.jpg"), "ao_dai.jpg")
+        self.assertEqual(bot._safe_name("Nguyễn.png"), "Nguyen.png")
+        self.assertEqual(bot._safe_name("cà phê sữa đá.mov"), "ca_phe_sua_da.mov")
+
+    def test_d_with_stroke_is_mapped_by_hand(self):
+        # đ (U+0111) is a distinct letter, not d + a combining mark, so NFD
+        # leaves it whole and the filter would delete it. It is the only
+        # Vietnamese letter needing an explicit mapping.
+        self.assertEqual(bot._safe_name("đầm dạ hội.MP4"), "dam_da_hoi.MP4")
+        self.assertEqual(bot._safe_name("Đ.jpg"), "D.jpg")
+
+    def test_a_script_with_no_latin_base_still_falls_back(self):
+        # Folding must not rescue what has no Latin base — the finding-C
+        # fallback still applies, and the extension still survives.
+        self.assertEqual(bot._safe_name("写真.heic"), "file.heic")
+
+    def test_normalisation_never_manufactures_a_path_separator(self):
+        # The regression guard for the ONE way this fold could be made unsafe.
+        # NFKD applies compatibility mappings: normalize("NFKD", "／") is "/"
+        # and normalize("NFKD", "．") is "." (measured 2026-08-31). Folding
+        # with NFKD would therefore create separators and dots out of input
+        # that had none, upstream of _SAFE_NAME_RE and of every reason
+        # _safe_child() refuses them. NFD does not, and this pins that.
+        self.assertEqual(bot._fold_diacritics("／"), "／")
+        self.assertEqual(bot._fold_diacritics("．"), "．")
+        self.assertEqual(bot._safe_name("..／..／etc／passwd.jpg"), "etc_passwd.jpg")
+        for hostile in ("a／b.jpg", "ｄ．．/x.jpg", "..／x.png"):
+            out = bot._safe_name(hostile)
+            self.assertNotIn("/", out)
+            self.assertNotIn("\\", out)
+            self.assertNotIn("..", out)
+
+
 if __name__ == "__main__":
     unittest.main()

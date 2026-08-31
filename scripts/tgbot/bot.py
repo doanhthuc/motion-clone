@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import time
+import unicodedata
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -126,6 +127,42 @@ STAGING_DIR_NAME = "tg-staging"
 # separator or "..", the same property _safe_child() checks for.
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
+# `đ` (U+0111) is a distinct letter, not `d` plus a combining mark, so NFD
+# leaves it whole and the filter below would delete it. It is the only such
+# case in Vietnamese: ă â ê ô ơ ư and every tone mark do decompose, so this
+# one pair is the whole table rather than the start of one.
+_TRANSLIT = {"đ": "d", "Đ": "D", "ð": "d", "Ð": "D"}
+
+
+def _fold_diacritics(text: str) -> str:
+    """Drop accents while keeping the letter under them.
+
+    Without this, `_SAFE_NAME_RE` turned `áo dài.jpg` into `o_d_i.jpg`
+    (measured 2026-08-31) — the accented letters are outside `[A-Za-z0-9._-]`,
+    so they were deleted rather than folded. That matters beyond tidiness: the
+    manifest is what the user reads on a phone before confirming a $0.99/hour
+    render, and a file they cannot recognise is a file they cannot check is the
+    right one. Staging exists partly to make those names readable, and this is
+    what makes it true for the Vietnamese names this repo's material actually
+    uses.
+
+    NFD splits a base letter from its combining marks; dropping the marks keeps
+    the letter. `unicodedata` is stdlib, so this adds no dependency.
+
+    **NFD, never NFKD, and that is a security choice rather than a stylistic
+    one.** NFKD also applies compatibility mappings, which turn fullwidth forms
+    into their ASCII equivalents — measured 2026-08-31: `unicodedata.normalize
+    ("NFKD", "／")` is `"/"` and `("NFKD", "．")` is `"."`. Folding with NFKD
+    would therefore MANUFACTURE path separators and dots out of input that
+    contained none, upstream of `_SAFE_NAME_RE` and of every reason
+    `_safe_child()` gives for refusing them. Under NFD those characters are
+    left alone and the filter replaces them with "_", which is the whole point.
+    Do not "improve" this to NFKD for better folding.
+    """
+    text = "".join(_TRANSLIT.get(ch, ch) for ch in text)
+    return "".join(ch for ch in unicodedata.normalize("NFD", text)
+                   if not unicodedata.combining(ch))
+
 
 def log(msg: str) -> None:
     print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} bot: {msg}", flush=True)
@@ -187,7 +224,7 @@ def _safe_name(name: str) -> str:
     stem is the ordinary case; the extension is the part downstream code
     actually dispatches on, so it is the part that must survive.
     """
-    base = Path(name).name
+    base = _fold_diacritics(Path(name).name)
     stem = _SAFE_NAME_RE.sub("_", Path(base).stem).strip("._-")
     # lstrip(".") first so the separating dot is re-added below rather than
     # stripped away with the rest — ".heic" -> "heic" -> ".heic".
