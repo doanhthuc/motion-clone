@@ -142,12 +142,40 @@ systemctl daemon-reload && systemctl enable --now motion-bot
 |---|---|
 | (send a File) | measures it, replies with the description, byte count and short `sha256`, and asks which slot if it is an image — as tappable buttons |
 | `character` / `outfit` / `background` | answers the slot question by typing, for the file at the head of the queue. The buttons do the same thing; both run `_answer_slot` |
+| `/job` | what is assembled: each filled slot with its measurements, what is still missing, what is waiting for a label — plus re-label and Start over buttons |
 | `/pipeline` | lists the pipelines and shows the current one |
 | `/pipeline <name>` | switches this job's pipeline, keeping the slots the new one still uses and naming any it drops |
 | `/confirm` | **spends money.** Rents an RTX 5090 at $0.99/hour and runs the drain |
 | `/status` | progress for this chat's job, read from the journal — still works after the pod is destroyed |
 | `/result <manifest>.yaml` | the finished video(s), or the failure logs already pulled to disk |
 | `/tryon <batch-id>` | just `01-tryon.png`, when the final video looks wrong |
+| `/again` | rebuild the last submitted job from the same files — change one thing (usually the pipeline) and run it again |
+| `/clear` | drop the job being assembled and delete its staged copies. Always asks first, and refuses while a drain is running |
+
+`/status` with nothing running falls through to `/job` rather than dead-ending on "nothing
+started" — which is true, but useless in the state `/status` is most often asked in.
+
+### The low-bitrate warning
+
+`ingest.quality_warning` flags a video whose bitrate is too low to be original material, in kbps
+per megapixel so resolutions are comparable. It never blocks.
+
+The threshold, 1000, comes from measuring all 64 videos on this machine on 2026-08-31:
+
+| kbps/Mpx | file | |
+|---|---|---|
+| 417 | `IMG_6783.MP4` | sent as a File, so Telegram preserved it exactly — it was already a re-compressed copy before it was sent |
+| 1397 | `s1.mp4` | the **lowest legitimate driver** in the set |
+| 3227 | — | median of the 64 |
+| 8421 | `nhanvat3__dandong8.mp4` | highest |
+
+1000 sits between the two that matter: 1.4x below the lowest real driver, 2.4x above the known-bad
+one. A first attempt at 1500 was rejected by this same survey because it flags `s1.mp4`, and a
+warning that cries wolf on real material gets ignored on the file that matters.
+
+This closes a gap spec section 4.3 left open. "Measure on arrival, do not trust the channel" was
+implemented as far as `describe()` — the numbers were shown, and nothing judged them. The File rule
+guarantees Telegram did no damage; it cannot guarantee the bytes were good before they were sent.
 
 ### Buttons
 
@@ -186,7 +214,13 @@ to justify the file.
 attempted", re-runs the free `make batch-validate` and re-sends the manifest before anything spends.
 A cached pass carried across a restart would be a verdict about a process that no longer exists.
 
-To discard a half-assembled job, delete that file and its `batch/tg-staging/<chat_id>/` directory.
+To discard a half-assembled job, use `/clear` — or delete that file and its
+`batch/tg-staging/<chat_id>/` directory by hand.
+
+`batch/tg-<chat_id>.last.json` (also gitignored) is the job most recently submitted, written by
+`/confirm` just before it clears the draft. `/again` copies it back. It is a **separate file on
+purpose**: `_load_draft` reads only `.draft.json`, so a submitted job can never be rehydrated by a
+restart and re-confirmed by accident.
 
 ## Acceptance — needs a real phone
 

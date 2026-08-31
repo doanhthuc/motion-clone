@@ -170,3 +170,54 @@ def to_png_if_heic(path: Path) -> Path:
         # path to a missing/zero-byte file straight into a paid render.
         raise RuntimeError(f"{tool} reported success but wrote no file for {path.name}")
     return dest
+
+# Below this, a video is almost certainly a re-compressed copy rather than
+# original material. Units are kbps per megapixel, which makes a 576x1024
+# driver comparable with a 1440x1920 one.
+#
+# Chosen from a survey of all 64 videos on this user's machine (material,
+# batch/tg-staging and out/), 2026-08-31:
+#
+#   417   IMG_6783.MP4        the known-bad case: sent as a File, so Telegram
+#                             preserved it exactly, but it was already a
+#                             re-compressed copy before it was sent
+#   1397  s1.mp4              the LOWEST legitimate driver in the set
+#   1900  s2.mp4
+#   3227  median of the 64
+#   8421  nhanvat3__dandong8  highest
+#
+# 1000 sits between the two that matter, with 1.4x headroom below the lowest
+# real driver and 2.4x above the known-bad one. An earlier attempt at 1500 was
+# rejected by this same survey: it flags s1.mp4, which is material the user
+# actually uses, and a warning that cries wolf on real files gets ignored on
+# the one that matters.
+#
+# This is a HEURISTIC from one person's 64 files, not a universal rule — hence
+# a warning that never blocks. The user kept a 417 driver deliberately on
+# 2026-08-31 after being shown the number, which is exactly the outcome the
+# design should allow.
+LOW_BITRATE_KBPS_PER_MPX = 1000
+
+
+def quality_warning(p: Probe) -> str:
+    """A note when a video's bitrate is too low to be original material.
+
+    Empty string when nothing is wrong, so callers can concatenate it.
+
+    Why this exists: spec section 4.3 is "measure on arrival, do not trust the
+    channel", and describe() did the measuring — but nothing judged the result.
+    On 2026-08-31 a driver arrived at 865 kbps for 1080x1920, 15x below the
+    file it was standing in for, and the bot printed the number and accepted it
+    without comment. The File rule guarantees Telegram did not damage the bytes;
+    it cannot guarantee the bytes were good before they were sent.
+    """
+    if p.kind != "video" or p.width <= 0 or p.height <= 0:
+        return ""
+    mpx = p.width * p.height / 1_000_000
+    per_mpx = p.bitrate_kbps / mpx if mpx else 0
+    if per_mpx >= LOW_BITRATE_KBPS_PER_MPX:
+        return ""
+    return (f"low bitrate for {p.width}x{p.height}: {p.bitrate_kbps} kbps "
+            f"({per_mpx:.0f} per megapixel). Real drivers here measure "
+            f"1400-8400; this looks like an already-compressed copy. It will "
+            f"still run if you want it to.")

@@ -783,6 +783,193 @@ class TestFlow(unittest.TestCase):
                 bot.handle(tg, cmd_from(ME, f"/{name}"), allowed_user_id=ME)
                 self.assertTrue(tg.messages, f"/{name} answered nothing")
 
+    # ---- /job, re-label, /clear, /again (added 2026-08-31) ---------------
+
+    def test_job_with_nothing_assembled_says_so(self):
+        bot.handle(self.tg, cmd_from(ME, "/job"), allowed_user_id=ME)
+        self.assertIn("nothing assembled yet", self.tg.messages[-1])
+
+    def test_job_names_what_is_filled_and_what_is_missing(self):
+        # The gap this closes: on 2026-08-31 a slot label went missing and the
+        # only way to find out what the bot held was a screenshot of the chat.
+        with mock.patch("tgbot.bot.probe", return_value=self.driver_probe):
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+        bot.handle(self.tg, cmd_from(ME, "/job"), allowed_user_id=ME)
+        body = self.tg.messages[-1]
+        self.assertIn("driver", body)
+        self.assertIn("driver.mp4", body)
+        self.assertIn("still needed", body)
+        self.assertIn("character", body)
+        self.assertIn("outfit", body)
+
+    def test_job_lists_files_still_waiting_for_a_label(self):
+        with mock.patch("tgbot.bot.probe", return_value=self.image_probe):
+            bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME)
+        bot.handle(self.tg, cmd_from(ME, "/job"), allowed_user_id=ME)
+        self.assertIn("waiting for a label", self.tg.messages[-1])
+        self.assertIn("outfit.jpg", self.tg.messages[-1])
+
+    def test_job_offers_a_relabel_button_per_filled_slot(self):
+        with mock.patch("tgbot.bot.probe", return_value=self.driver_probe):
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+        self.tg.buttons.clear()
+        bot.handle(self.tg, cmd_from(ME, "/job"), allowed_user_id=ME)
+        offered = self.tg.callback_data()
+        self.assertIn(bot._CB_REDO + "driver", offered)
+        self.assertIn(bot._CB_CLEAR_ASK, offered)
+
+    def test_relabelling_moves_a_file_back_to_the_queue_and_re_asks(self):
+        with mock.patch("tgbot.bot.probe", return_value=self.image_probe):
+            bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME)
+        bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME)
+        self.assertIn("outfit", bot._STATE[ME].slots)
+        bot.handle(self.tg, cb_from(ME, bot._CB_REDO + "outfit"), allowed_user_id=ME)
+        self.assertNotIn("outfit", bot._STATE[ME].slots)
+        self.assertEqual(len(bot._PENDING[ME]), 1)
+        self.assertIn("Which slot is this?", self.tg.messages[-1])
+        # And it may be answered straight into a different role.
+        bot.handle(self.tg, cb_from(ME, bot._CB_SLOT + "character"), allowed_user_id=ME)
+        self.assertEqual(bot._STATE[ME].slots["character"],
+                         self.staged("outfit.jpg"))
+
+    def test_relabelling_invalidates_the_cached_validation(self):
+        # _LAST_VALIDATE is what /confirm trusts; the job just changed.
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+        self.assertTrue(bot._LAST_VALIDATE.get(ME))
+        bot.handle(self.tg, cb_from(ME, bot._CB_REDO + "outfit"), allowed_user_id=ME)
+        self.assertNotIn(ME, bot._LAST_VALIDATE)
+
+    def test_relabelling_a_video_explains_instead_of_re_asking(self):
+        # slot_for gives a video to `driver` structurally, so the question
+        # would have exactly one answer.
+        with mock.patch("tgbot.bot.probe", return_value=self.driver_probe):
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+        bot.handle(self.tg, cb_from(ME, bot._CB_REDO + "driver"), allowed_user_id=ME)
+        self.assertIn("only be the driver", self.tg.messages[-1])
+        self.assertIn("driver", bot._STATE[ME].slots)   # unchanged
+
+    def test_relabelling_an_empty_slot_says_so(self):
+        bot.handle(self.tg, cb_from(ME, bot._CB_REDO + "outfit"), allowed_user_id=ME)
+        self.assertIn("nothing is in outfit", self.tg.messages[-1])
+
+    def test_clear_asks_before_deleting_anything(self):
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+        bot.handle(self.tg, cmd_from(ME, "/clear"), allowed_user_id=ME)
+        self.assertIn("Delete this job", self.tg.messages[-1])
+        self.assertIn(bot._CB_CLEAR_GO, self.tg.callback_data())
+        self.assertIn(ME, bot._STATE)                   # nothing gone yet
+        self.assertTrue(self.staged("driver.mp4").exists())
+
+    def test_confirming_clear_deletes_the_staged_files_and_the_draft(self):
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._CB_CLEAR_GO), allowed_user_id=ME)
+        self.assertNotIn(ME, bot._STATE)
+        self.assertFalse(self.staged("driver.mp4").exists())
+        self.assertFalse(bot._draft_path(ME).exists())
+        self.assertIn("cleared", self.tg.messages[-1])
+
+    def test_clear_is_refused_while_a_drain_is_running(self):
+        """The staged files ARE the running job's inputs.
+
+        The manifest points straight at batch/tg-staging/<chat>/, so deleting
+        them mid-drain breaks a run already being paid for at $0.99/hour.
+        """
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+        with mock.patch("tgbot.bot.drain_running", return_value=True):
+            bot.handle(self.tg, cb_from(ME, bot._CB_CLEAR_GO), allowed_user_id=ME)
+        self.assertIn("a drain is running", self.tg.messages[-1])
+        self.assertTrue(self.staged("driver.mp4").exists())
+        self.assertIn(ME, bot._STATE)
+
+    def test_clear_with_nothing_to_clear_does_not_ask(self):
+        bot.handle(self.tg, cmd_from(ME, "/clear"), allowed_user_id=ME)
+        self.assertIn("nothing to clear", self.tg.messages[-1])
+
+    def test_confirm_records_the_job_so_again_can_reuse_it(self):
+        with mock.patch("tgbot.bot.start_drain"), \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+        self.assertNotIn(ME, bot._STATE)                # submitted, cleared
+        self.assertFalse(bot._draft_path(ME).exists())  # cannot be resurrected
+        self.assertTrue(bot._last_path(ME).exists())    # but is repeatable
+
+    def test_again_rebuilds_the_last_job_from_the_same_files(self):
+        with mock.patch("tgbot.bot.start_drain"), \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+            bot.handle(self.tg, cmd_from(ME, "/again"), allowed_user_id=ME)
+        self.assertEqual(sorted(bot._STATE[ME].slots),
+                         ["character", "driver", "outfit"])
+        # And the probes come back, or the manifest's preset and the estimate
+        # would both be wrong.
+        self.assertEqual(bot._STATE[ME].probes["driver"], self.driver_probe)
+
+    def test_again_refuses_to_overwrite_a_job_in_progress(self):
+        with mock.patch("tgbot.bot.start_drain"), \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+        with mock.patch("tgbot.bot.probe", return_value=self.driver_probe):
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+        bot.handle(self.tg, cmd_from(ME, "/again"), allowed_user_id=ME)
+        self.assertIn("job in progress", self.tg.messages[-1])
+
+    def test_again_names_the_files_that_have_gone_missing(self):
+        # `make batch-clean` and /clear both remove staged files, so a recorded
+        # job can outlive its inputs. "some files are missing" is not
+        # actionable; the role and the filename are.
+        with mock.patch("tgbot.bot.start_drain"), \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+        self.staged("driver.mp4").unlink()
+        bot.handle(self.tg, cmd_from(ME, "/again"), allowed_user_id=ME)
+        self.assertIn("no longer on disk", self.tg.messages[-1])
+        self.assertIn("driver.mp4", self.tg.messages[-1])
+        self.assertNotIn(ME, bot._STATE)
+
+    def test_again_with_nothing_recorded_says_so(self):
+        bot.handle(self.tg, cmd_from(ME, "/again"), allowed_user_id=ME)
+        self.assertIn("nothing to repeat", self.tg.messages[-1])
+
+    def test_a_low_bitrate_driver_is_flagged_on_arrival_and_at_the_gate(self):
+        """The gap spec section 4.3 left open: it measured but never judged.
+
+        On 2026-08-31 a driver arrived at 865 kbps for 1080x1920 — 15x below
+        the file it stood in for — and the bot printed the number and accepted
+        it in silence. Sent as a File, so Telegram had not touched it: the rule
+        guarantees the channel did no damage, not that the bytes were good.
+        """
+        weak = Probe(kind="video", width=1080, height=1920, duration_s=15.0,
+                     bitrate_kbps=865, size_bytes=1_622_500)
+        with mock.patch("tgbot.bot.probe", return_value=weak):
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+        self.assertIn("low bitrate", self.tg.messages[-1])
+        # And again on the review screen: the upload-time warning has scrolled
+        # away by the time the money decision is made.
+        with mock.patch("tgbot.bot.probe", return_value=self.image_probe), \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, doc_from(ME, "character-id"), allowed_user_id=ME)
+            bot.handle(self.tg, cmd_from(ME, "character"), allowed_user_id=ME)
+            bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME)
+            bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME)
+        self.assertIn("low bitrate", self.tg.messages[-1])
+        self.assertIn("$0.99/hour", self.tg.messages[-1])
+
+    def test_a_normal_driver_is_not_flagged(self):
+        # The threshold has to leave real material alone: s1.mp4, the lowest
+        # legitimate driver in the 64-file survey, measures 1397 kbps/Mpx.
+        with mock.patch("tgbot.bot.probe", return_value=self.driver_probe):
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+        self.assertNotIn("low bitrate", self.tg.messages[-1])
+
     def test_confirm_calls_start_drain_once_with_dry_run_false(self):
         # Renamed from "...and_nothing_else_does": with drain_running mocked
         # to False, this test is identical with or without that guard — it
@@ -1009,7 +1196,12 @@ class TestFlow(unittest.TestCase):
 
     def test_status_before_anything_started_is_reported_not_crashed(self):
         bot.handle(self.tg, cmd_from(ME, "/status"), allowed_user_id=ME)
-        self.assertIn("nothing started", self.tg.messages[-1])
+        # Reworded 2026-08-31: /status now falls through to the assembly state
+        # instead of dead-ending on "nothing started", which is true but
+        # useless while a job is being put together — the state /status is
+        # most often asked in.
+        self.assertIn("nothing running", self.tg.messages[-1])
+        self.assertIn("nothing assembled yet", self.tg.messages[-1])
 
     def test_a_heic_upload_never_overwrites_an_already_accepted_png(self):
         """Regression for finding A (2026-08-31).

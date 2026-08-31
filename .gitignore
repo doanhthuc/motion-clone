@@ -31,6 +31,8 @@ batch/*.mcp.*
 batch/pod-lease.json
 # bản nháp job của bot Telegram — chứa đường dẫn material cá nhân
 batch/*.draft.json
+# job vừa gửi, giữ lại cho /again — cùng lý do như draft
+batch/*.last.json
 
 # IDE junk — repo public, config cá nhân không vào đây (cùng lý do .DS_Store)
 .idea/
