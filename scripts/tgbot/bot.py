@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import re
 import shutil
 import subprocess
 import sys
 import time
 import unicodedata
+from dataclasses import asdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -70,16 +72,25 @@ JOB_PIPELINE = "tryon-motion-enhance"
 # reach every part of the flow except the choice of what the flow IS, which is
 # the one thing they asked about first.
 #
-# Why the durable half is an env var and the volatile half is /pipeline: _STATE
-# is in-memory (see below), so a restart reverts the chat to this default. If
-# that default were a hard-coded constant, a crash mid-assembly would silently
-# switch pipelines under the user. Pointing it at a value they set themselves
-# makes the fallback predictable instead of surprising.
+# This is the value a NEW job starts on. An existing draft keeps whatever
+# /pipeline last set, because _save_draft persists job.pipeline with the slots
+# (as of 2026-08-31 — before that a restart reverted the chat here, which is
+# the reason this was made configurable rather than left a constant: falling
+# back to a value the user set is predictable, falling back to a hard-coded
+# one silently switches pipelines under them).
 _DEFAULT_PIPELINE = JOB_PIPELINE
 
-# Per-chat state, in memory only — Plan 2A is one job at a time per chat. A
-# bot restart loses an unsubmitted draft, never a running job: drain_running()
-# also consults the on-disk lease (tgbot/run.py), which is the durable half.
+# Per-chat state — Plan 2A is one job at a time per chat.
+#
+# Was memory-only until 2026-08-31. The claim here used to be that "a bot
+# restart loses an unsubmitted draft, never a running job", offered as an
+# acceptable trade because drain_running() consults the on-disk lease. Three
+# restarts in one session showed why it is not: the staged FILES survive on
+# disk while their slot LABELS do not, so material the user had already
+# answered questions about became unreachable with no message and no way back
+# except sending it again. _save_draft/_load_draft now mirror this dict to
+# batch/tg-<chat>.draft.json; the lease is still the durable record of a
+# RUNNING job, and this is the durable record of an unsubmitted one.
 _STATE: dict[int, Job] = {}
 # A QUEUE of files parked while their slot is ambiguous (images — a video is
 # never ambiguous, see job.slot_for), keyed by chat_id, same as _STATE.
@@ -582,7 +593,106 @@ def _maybe_show_manifest(tg: Tg, chat_id: int, job: Job) -> None:
         "and start, or nothing yet costs anything.")
 
 
+_DRAFT_SUFFIX = ".draft.json"
+
+# Chats whose draft has already been read off disk this process. Without it,
+# every update would re-read and clobber the live state with the saved copy.
+_LOADED: set[int] = set()
+
+
+def _draft_path(chat_id: int) -> Path:
+    """Beside the chat's manifest, and gitignored by the same `batch/` rules."""
+    return ROOT / "batch" / f"tg-{chat_id}{_DRAFT_SUFFIX}"
+
+
+def _save_draft(chat_id: int) -> None:
+    """Write the chat's unsubmitted draft — slots, probes, pipeline, queue.
+
+    Added 2026-08-31, after this bit three times in one session. `_STATE` and
+    `_PENDING` were memory-only, so an ordinary restart discarded every slot
+    LABEL while leaving the staged FILES on disk: material the user had
+    already answered questions about became unreachable, with no message and
+    no way to re-attach it except sending it again. motion-bot.service is
+    `Restart=always`, so on the VPS nobody has to restart it by hand for this
+    to happen.
+
+    Not persisted, on purpose: `_LAST_VALIDATE`. /confirm already treats a
+    missing verdict as "never attempted" and re-runs the free validate,
+    re-sending the manifest before anything spends — which is the behaviour
+    you want after a restart anyway. A cached pass carried across a restart
+    would be a verdict about a process that no longer exists.
+
+    Atomic via tmp+replace, same as batchlib_ext/lease.py: a draft truncated
+    by a kill mid-write is the exact failure this function exists to prevent.
+    """
+    path = _draft_path(chat_id)
+    job = _STATE.get(chat_id)
+    pending = _PENDING.get(chat_id) or []
+    if job is None and not pending:
+        # /confirm clears the state after submitting; the draft must go with
+        # it, or the next restart would resurrect a job already running.
+        path.unlink(missing_ok=True)
+        return
+    payload = {
+        "pipeline": job.pipeline if job else _DEFAULT_PIPELINE,
+        "slots": {r: str(p) for r, p in (job.slots if job else {}).items()},
+        "probes": {r: asdict(pr) for r, pr in (job.probes if job else {}).items()},
+        "pending": [[str(p), asdict(pr)] for p, pr in pending],
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _load_draft(chat_id: int) -> None:
+    """Rehydrate one chat's draft. A corrupt file is reported, not obeyed."""
+    path = _draft_path(chat_id)
+    if not path.exists():
+        return
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        pipeline = payload["pipeline"]
+        if pipeline not in PIPELINES:
+            raise ValueError(f"unknown pipeline {pipeline!r}")
+        slots = {r: Path(v) for r, v in payload["slots"].items()}
+        probes = {r: Probe(**d) for r, d in payload["probes"].items()}
+        pending = [(Path(v), Probe(**d)) for v, d in payload["pending"]]
+    except (ValueError, KeyError, TypeError) as exc:
+        # Loud, and the staged files are still on disk: the user can re-send
+        # or forward them. Silently starting fresh is what made the original
+        # loss so confusing.
+        log(f"draft for chat {chat_id} is unreadable, starting fresh: {exc!r}")
+        return
+    _STATE[chat_id] = Job(slots=slots, probes=probes, pipeline=pipeline)
+    if pending:
+        _PENDING[chat_id] = pending
+
+
 def handle(tg: Tg, update: dict, *, allowed_user_id: int,
+           dry_run: bool = False) -> None:
+    """Load the draft, handle the update, save the draft.
+
+    One save site rather than one per mutation: `_fill_slot`, the `_PENDING`
+    queue, `_switch_pipeline` and /confirm's clear all change the draft, and
+    four independent save calls is how one of them ends up missing. `finally`,
+    so a handler that raises still persists what it managed to change — the
+    poll loop in main() logs and continues, and the next update must not see
+    a stale draft.
+    """
+    if not allowed(update, allowed_user_id):
+        return                              # silent: do not confirm the bot exists
+    chat_id = update["message"]["chat"]["id"]
+    if chat_id not in _LOADED:
+        _LOADED.add(chat_id)
+        _load_draft(chat_id)
+    try:
+        _handle(tg, update, allowed_user_id=allowed_user_id, dry_run=dry_run)
+    finally:
+        _save_draft(chat_id)
+
+
+def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
            dry_run: bool = False) -> None:
     if not allowed(update, allowed_user_id):
         return                              # silent: do not confirm the bot exists

@@ -29,6 +29,8 @@ batch/*.state.json
 batch/*.mcp.*
 # Pod lease written by drain.py/watchdog — machine state about a rented pod, not repo content.
 batch/pod-lease.json
+# bản nháp job của bot Telegram — chứa đường dẫn material cá nhân
+batch/*.draft.json
 
 # IDE junk — repo public, config cá nhân không vào đây (cùng lý do .DS_Store)
 .idea/

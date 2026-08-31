@@ -185,13 +185,24 @@ class TestPipelineCommand(unittest.TestCase):
 
     def setUp(self):
         bot._STATE.clear()
+        bot._LOADED.clear()
+        bot._PENDING.clear()
         bot._LAST_VALIDATE.clear()
         bot._CONFIRM_WARNED.clear()
         self._orig_default = bot._DEFAULT_PIPELINE
         bot._DEFAULT_PIPELINE = "tryon-motion-enhance"
+        # ROOT must move: handle() persists the draft on every update now, and
+        # without this the suite wrote batch/tg-12345.draft.json into the real
+        # repo — which a later run would then rehydrate, making these tests
+        # pass or fail on a leftover from a previous run.
+        self._orig_root = bot.ROOT
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "batch").mkdir()
+        bot.ROOT = self.root
 
     def tearDown(self):
         bot._DEFAULT_PIPELINE = self._orig_default
+        bot.ROOT = self._orig_root
 
     def test_bare_pipeline_lists_the_real_names(self):
         # The names are close enough that guessing fails: the user asked for
@@ -251,6 +262,140 @@ class TestPipelineCommand(unittest.TestCase):
         bot.handle(tg, cmd_from(ME, "/pipeline tryon-motion-enhance"),
                    allowed_user_id=ME)
         self.assertIn("already on", tg.messages[0])
+
+
+class TestDraftPersistence(unittest.TestCase):
+    """Added 2026-08-31 after this bit three times in one session.
+
+    `_STATE` and `_PENDING` were memory-only, so an ordinary restart discarded
+    every slot LABEL while leaving the staged FILES on disk. Material the user
+    had already answered questions about became unreachable — no message, and
+    no way to re-attach it short of sending it again. motion-bot.service is
+    `Restart=always`, so on the VPS nobody has to restart it by hand for this
+    to happen.
+
+    "Restart" in these tests is exactly what the process loses: `_STATE`,
+    `_PENDING` and `_LOADED` cleared, ROOT left alone.
+    """
+
+    def setUp(self):
+        self._orig_root = bot.ROOT
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "batch").mkdir()
+        bot.ROOT = self.root
+        self._restart()
+        self.driver = Probe(kind="video", width=1080, height=1920, duration_s=15.0,
+                            bitrate_kbps=865, size_bytes=1_622_500)
+        self.image = Probe(kind="image", width=1536, height=2720, duration_s=0.0,
+                           bitrate_kbps=0, size_bytes=4_873_992)
+
+    def tearDown(self):
+        bot.ROOT = self._orig_root
+        self._restart()
+
+    def _restart(self):
+        bot._STATE.clear()
+        bot._LOADED.clear()
+        bot._PENDING.clear()
+        bot._LAST_VALIDATE.clear()
+        bot._CONFIRM_WARNED.clear()
+
+    def _seed(self):
+        job = bot._job_for(ME)
+        job.pipeline = "tryon-character-swap-enhance"
+        job.slots.update({"character": Path("/s/c.png"), "driver": Path("/s/d.mp4")})
+        job.probes.update({"character": self.image, "driver": self.driver})
+        bot._PENDING[ME] = [(Path("/s/o.png"), self.image)]
+        bot._save_draft(ME)
+
+    def test_a_draft_survives_a_restart(self):
+        self._seed()
+        self._restart()
+        bot._load_draft(ME)
+        job = bot._STATE[ME]
+        self.assertEqual(job.pipeline, "tryon-character-swap-enhance")
+        self.assertEqual(sorted(job.slots), ["character", "driver"])
+        self.assertEqual(job.slots["driver"], Path("/s/d.mp4"))
+        # The probes must come back too: estimate_minutes and the manifest's
+        # preset are derived from the driver's duration, so a job restored
+        # without them is not restored.
+        self.assertEqual(job.probes["driver"], self.driver)
+
+    def test_the_unanswered_queue_survives_a_restart(self):
+        # The queue is the half that mattered most in the real incident: a file
+        # parked awaiting its label is staged on disk but reachable only
+        # through _PENDING.
+        self._seed()
+        self._restart()
+        bot._load_draft(ME)
+        self.assertEqual(bot._PENDING[ME], [(Path("/s/o.png"), self.image)])
+
+    def test_the_validation_verdict_is_deliberately_not_persisted(self):
+        # /confirm treats a missing verdict as "never attempted" and re-runs
+        # the free validate, re-sending the manifest before anything spends. A
+        # cached pass carried across a restart is a verdict about a process
+        # that no longer exists.
+        self._seed()
+        bot._LAST_VALIDATE[ME] = True
+        bot._save_draft(ME)
+        self._restart()
+        bot._load_draft(ME)
+        self.assertNotIn(ME, bot._LAST_VALIDATE)
+
+    def test_clearing_the_state_removes_the_file(self):
+        # /confirm clears _STATE after submitting. If the draft outlived it,
+        # the next restart would resurrect a job that is already running.
+        self._seed()
+        self.assertTrue(bot._draft_path(ME).exists())
+        bot._STATE.pop(ME)
+        bot._PENDING.pop(ME)
+        bot._save_draft(ME)
+        self.assertFalse(bot._draft_path(ME).exists())
+
+    def test_a_corrupt_draft_is_reported_and_does_not_crash(self):
+        bot._draft_path(ME).write_text("{ not json", encoding="utf-8")
+        with mock.patch.object(bot, "log") as logged:
+            bot._load_draft(ME)
+        self.assertNotIn(ME, bot._STATE)
+        self.assertTrue(logged.called)
+        self.assertIn("unreadable", logged.call_args[0][0])
+
+    def test_a_draft_naming_an_unknown_pipeline_is_refused(self):
+        # A pipeline renamed or removed between restarts would otherwise be
+        # loaded and then fail much later, during manifest validation.
+        self._seed()
+        import json
+        path = bot._draft_path(ME)
+        payload = json.loads(path.read_text())
+        payload["pipeline"] = "swap-character-enhance"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        self._restart()
+        with mock.patch.object(bot, "log"):
+            bot._load_draft(ME)
+        self.assertNotIn(ME, bot._STATE)
+
+    def test_handle_loads_the_draft_before_acting_on_the_update(self):
+        # The end-to-end property: after a restart, the first message must see
+        # the restored job rather than a fresh empty one.
+        self._seed()
+        self._restart()
+        tg = FakeTg()
+        bot.handle(tg, cmd_from(ME, "/pipeline"), allowed_user_id=ME)
+        self.assertIn("tryon-character-swap-enhance", tg.messages[0])
+
+    def test_handle_saves_even_when_the_handler_raises(self):
+        # main() logs and continues past a failing update, so a draft change
+        # made before the raise must not be lost.
+        self._seed()
+        self._restart()
+        with mock.patch.object(bot, "_handle", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                bot.handle(FakeTg(), cmd_from(ME, "/status"), allowed_user_id=ME)
+        self.assertTrue(bot._draft_path(ME).exists())
+
+    def test_a_stranger_never_creates_a_draft(self):
+        bot.handle(FakeTg(), cmd_from(99999, "/status"), allowed_user_id=ME)
+        self.assertFalse(bot._draft_path(99999).exists())
 
 
 class TestSafeName(unittest.TestCase):
@@ -367,6 +512,7 @@ class TestFlow(unittest.TestCase):
         (self.root / "out").mkdir()
         bot.ROOT = self.root
         bot._STATE.clear()
+        bot._LOADED.clear()
         bot._PENDING.clear()
         bot._LAST_VALIDATE.clear()
         bot._CONFIRM_WARNED.clear()
@@ -397,6 +543,7 @@ class TestFlow(unittest.TestCase):
     def tearDown(self):
         bot.ROOT = self._orig_root
         bot._STATE.clear()
+        bot._LOADED.clear()
         bot._PENDING.clear()
         bot._LAST_VALIDATE.clear()
         bot._CONFIRM_WARNED.clear()
@@ -558,6 +705,7 @@ class TestFlow(unittest.TestCase):
         # coincidence: a 20-second driver renders a different comment line and
         # a different preset from the 5-second one above.
         bot._STATE.clear()
+        bot._LOADED.clear()
         bot._PENDING.clear()
         bot._LAST_VALIDATE.clear()
         second_driver = self.root / "driver2.mp4"

@@ -148,6 +148,24 @@ systemctl daemon-reload && systemctl enable --now motion-bot
 | `/result <manifest>.yaml` | the finished video(s), or the failure logs already pulled to disk |
 | `/tryon <batch-id>` | just `01-tryon.png`, when the final video looks wrong |
 
+### Where an unfinished job lives
+
+`batch/tg-<chat_id>.draft.json` (gitignored) holds the slots, their probes, the pipeline and the
+queue of files still awaiting a label. It is written after every update and deleted when `/confirm`
+submits, so a restart — including the automatic one `Restart=always` gives you — resumes the job
+being assembled instead of discarding it.
+
+This was memory-only until 2026-08-31. The staged **files** always survived a restart; their slot
+**labels** did not, so material the user had already answered questions about became unreachable
+with no message and no way back except sending it again. Three restarts in one session were enough
+to justify the file.
+
+`_LAST_VALIDATE` is deliberately *not* in it: `/confirm` treats a missing verdict as "never
+attempted", re-runs the free `make batch-validate` and re-sends the manifest before anything spends.
+A cached pass carried across a restart would be a verdict about a process that no longer exists.
+
+To discard a half-assembled job, delete that file and its `batch/tg-staging/<chat_id>/` directory.
+
 ## Acceptance — needs a real phone
 
 This validates the byte-fidelity assumption: does Telegram preserve bytes for a `.MP4` sent via
