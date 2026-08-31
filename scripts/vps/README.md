@@ -236,16 +236,15 @@ succeeded.
 
 `/confirm` sends one progress message and then keeps **editing that same
 message** — it never posts a new one. `main()`'s poll loop calls `tick_progress`
-after each `getUpdates`, and the message is re-edited at most every
-`bot.PROGRESS_EVERY_SEC` (300s).
+after each `getUpdates`, so the message updates roughly every 50s, which is how
+long `getUpdates` long-polls for.
 
-**The throttle is on the edit, not on the poll.** `getUpdates` long-polls for
-50s and must keep doing so, because that is how a button press is received —
-slowing the loop would put up to five minutes between a tap and its reply. The
-completion check also runs every loop (`drain_running` is a `Popen.poll` plus a
-small file read), so the result lands the moment the drain ends rather than at
-the next 5-minute boundary. An edit sends no notification, but it does bump the
-chat to the top of the list, and once a minute for 68 minutes is noise.
+A 5-minute throttle was added here and then removed the same day, on the user's
+instruction. An edit sends no notification and adds no message to the chat, so
+there is nothing to be spammed by — the throttle was solving a problem that does
+not exist, and a knob that never fires is worse than no knob. (The claim that
+prompted it, that an edit bumps the chat to the top of the list, was asserted
+without being verified and is probably wrong.)
 
 ```
 🎬 2026-08-31-2140
