@@ -89,12 +89,25 @@ compressed it. Send it again with 📎 → File." Only `message.document` is acc
 silent quality loss into a loud error — the same principle as the four silent param traps in
 [batch-runner.md §2.4](../../batch-runner.md).
 
-### 4.2 The 20MB wall — the real blocker, solved by self-hosting
+### 4.2 The size caps — corrected 2026-08-31, and the binding one is the OUTPUT
 
-The public Bot API caps bot **downloads at 20MB** and uploads at 50MB. The user's drivers are
-20-30MB, so the standard API fails on the common case. Any tool sitting on the public Bot API hits
-the same wall — that is why n8n's Telegram node fails here too, and why Nous Research's Hermes Agent
-shipped "2GB cap via local Bot API server" for the same reason.
+The public Bot API caps bot **downloads at 20MB** and **uploads at 50MB**.
+
+> **This section originally claimed "the user's drivers are 20-30MB, so the standard API fails on
+> the common case." That was wrong, and it was never measured** — it came from the user's own
+> off-hand estimate in the first conversation, which this document then restated as a fact and
+> illustrated with an invented `22.8 MB` figure. Measured 2026-08-31 across every file in
+> `~/Desktop/materials/drivers/`: **1.3MB to 15MB**, all 720x1280 or smaller, every one of them
+> comfortably under the 20MB download cap. On ingest, the public API would have worked.
+
+The cap that actually binds is on the way **out**. The largest video this repo has delivered is
+**41MB** (`out/2026-08-23-1732/_final/nhanvat3__dandong8.mp4`, measured 2026-08-31) against a 50MB
+upload cap — an 18% margin, and `targetRes: 2k` or a longer driver crosses it. Self-hosting is
+therefore still right, but for delivery, not for ingest.
+
+The second reason is not about size at all: with a local server `getFile` returns an **absolute
+path on disk**, so the bot reads the file the client uploaded instead of downloading it back. That
+removes a whole transfer from every job regardless of any cap.
 
 Self-hosting `telegram-bot-api` (tdlib) lifts both to 2GB, and gives a better property: with a local
 server, **`getFile` returns an absolute path on disk**. The file Telegram receives lands directly in

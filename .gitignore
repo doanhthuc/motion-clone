@@ -32,3 +32,15 @@ batch/pod-lease.json
 
 # IDE junk — repo public, config cá nhân không vào đây (cùng lý do .DS_Store)
 .idea/
+
+# Telegram bot API — local secrets. The server's storage moved out of the repo
+# entirely on 2026-08-31: it is now bind-mounted at /var/lib/telegram-bot-api on
+# both sides (scripts/vps/telegram-bot-api.yml), because getFile returns a
+# container path that bot.py has to be able to open on the host. Nothing under
+# scripts/vps/ holds media any more.
+scripts/vps/bot-api.env
+
+# Uploads the Telegram bot accepted, copied out of the Bot API server's storage
+# (bot.py:STAGING_DIR_NAME). Personal media, and the paths it replaces contain
+# the bot token — neither belongs in a public repo.
+batch/tg-staging/
