@@ -1,4 +1,4 @@
-import sys, tempfile, unittest
+import subprocess, sys, tempfile, unittest
 from pathlib import Path
 from unittest import mock
 
@@ -81,6 +81,32 @@ class TestAllowed(unittest.TestCase):
         group = {"message": {"from": {"id": ME}, "chat": {"id": -1001234567890},
                              "text": "/start"}}
         self.assertFalse(allowed(group, ME))
+
+
+class TestSafeName(unittest.TestCase):
+    """Finding C (2026-08-31): _safe_name re-spelled the whole basename in one
+    pass, so a stem made entirely of characters outside the alphabet collapsed
+    and the strip("._-") then ate the dot in front of the extension.
+    `_safe_name('写真.heic')` returned `'heic'` — a name with NO suffix, so
+    to_png_if_heic never fired and probe() rejected the file. The user's
+    material comes from a Vietnamese-language workflow, so non-Latin filenames
+    are the ordinary case, not the exotic one.
+    """
+
+    def test_a_non_ascii_stem_keeps_its_extension(self):
+        self.assertEqual(bot._safe_name("写真.heic"), "file.heic")
+
+    def test_a_dotfile_keeps_its_name(self):
+        # Path('.hidden').suffix is '' — the whole thing is a stem, so the
+        # result is a plain stem too, not an extension promoted to a name.
+        self.assertEqual(bot._safe_name(".hidden"), "hidden")
+
+    def test_a_name_stripped_to_nothing_falls_back(self):
+        self.assertEqual(bot._safe_name("写真"), "file")
+        self.assertEqual(bot._safe_name("___"), "file")
+
+    def test_an_ordinary_name_is_unchanged_apart_from_the_alphabet(self):
+        self.assertEqual(bot._safe_name("my driver:v1.mp4"), "my_driver_v1.mp4")
 
 
 class TestResultAndTryonPathSafety(unittest.TestCase):
@@ -492,6 +518,109 @@ class TestFlow(unittest.TestCase):
     def test_status_before_anything_started_is_reported_not_crashed(self):
         bot.handle(self.tg, cmd_from(ME, "/status"), allowed_user_id=ME)
         self.assertIn("nothing started", self.tg.messages[-1])
+
+    def test_a_heic_upload_never_overwrites_an_already_accepted_png(self):
+        """Regression for finding A (2026-08-31).
+
+        _stage_file's never-overwrite counter only ever checked the INCOMING
+        file's own staged name. ingest.to_png_if_heic then writes
+        `path.with_suffix('.png')` (ingest.py:145) with no collision check of
+        its own, so `photo.png` (already accepted, already sitting in
+        Job.slots) had its bytes replaced by the conversion of a later
+        `photo.heic`. No message, no manifest change, and both slots then
+        pointed at the same file — the wrong image inside a $0.99/hour render.
+        Created by the staging change: before it, conversion happened against
+        Telegram's unique `file_N.heic` names.
+        """
+        png_src = self.root / "photo.png"
+        png_src.write_bytes(b"the original png the user accepted")
+        heic_src = self.root / "photo.heic"
+        heic_src.write_bytes(b"heic bytes")
+        self.tg.file_paths["png-id"] = str(png_src)
+        self.tg.file_paths["heic-id"] = str(heic_src)
+
+        def fake_convert(path: Path) -> Path:
+            # Mirrors ingest.to_png_if_heic's naming rule exactly (it writes
+            # `dest = path.with_suffix('.png')`), without needing sips/ffmpeg
+            # or a real HEIC file. The naming rule IS the bug.
+            if path.suffix.lower() not in (".heic", ".heif"):
+                return path
+            dest = path.with_suffix(".png")
+            dest.write_bytes(b"converted from heic")
+            return dest
+
+        with mock.patch("tgbot.bot.probe", return_value=self.image_probe), \
+             mock.patch("tgbot.bot.to_png_if_heic", side_effect=fake_convert):
+            bot.handle(self.tg, doc_from(ME, "png-id"), allowed_user_id=ME)
+            bot.handle(self.tg, cmd_from(ME, "character"), allowed_user_id=ME)
+            bot.handle(self.tg, doc_from(ME, "heic-id"), allowed_user_id=ME)
+            bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME)
+
+        slots = bot._STATE[ME].slots
+        self.assertEqual(self.staged("photo.png").read_bytes(),
+                         b"the original png the user accepted")
+        self.assertEqual(slots["character"], self.staged("photo.png"))
+        self.assertNotEqual(slots["character"], slots["outfit"])
+        self.assertTrue(slots["outfit"].is_file())
+
+    def test_confirm_recovers_from_the_write_guard_instead_of_stranding_the_user(self):
+        """Regression for finding B (2026-08-31).
+
+        The C1 write guard refuses to render while a drain is live and says
+        "your files are kept; send /status" — but it left _LAST_VALIDATE
+        unset. The job is already complete at that point, so no further slot
+        fill re-enters _maybe_show_manifest and nothing ever sets it. /confirm
+        then refused with "the manifest hasn't passed validation ... Fix the
+        error already shown" — and no error had ever been shown. The only
+        escape was to re-send a file, which nothing tells the user.
+        """
+        with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot.drain_running", return_value=True):
+            self._fill_required_slots()
+        self.assertIn("drain is still running", self.tg.messages[-1])
+        self.assertNotIn(ME, bot._LAST_VALIDATE)
+
+        # The drain has since finished, so the write guard now passes.
+        with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+        start_drain.assert_called_once()
+        self.assertIn("started", self.tg.messages[-1])
+        # The manifest was never shown before money was spent — show it now,
+        # so the transcript still records what was paid for.
+        self.assertIn("runs:", "\n".join(self.tg.messages))
+
+    def test_confirm_after_a_real_validation_failure_names_the_real_reason(self):
+        """The other half of finding B: recovering from the write guard must
+        not turn into "retry until it runs". A manifest that genuinely fails
+        `make batch-validate` is still refused, and the refusal describes what
+        actually happened rather than pointing at an error nobody was sent."""
+        failed = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="run 'job': character: not a file", stderr="")
+        with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.subprocess.run", return_value=failed):
+            self._fill_required_slots()
+            self.assertIn("character: not a file", self.tg.messages[-1])
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+        start_drain.assert_not_called()
+        last = self.tg.messages[-1]
+        self.assertIn("batch-validate", last)
+        # Must not claim an error was shown when the point of finding B is
+        # that sometimes none was.
+        self.assertNotIn("already shown", last)
+
+    def test_a_fidelity_read_failure_is_reported_not_swallowed(self):
+        """Finding D (2026-08-31): _fidelity_line sat one line below the try
+        that finding I1 widened, so an OSError from its open()/stat() escaped
+        handle() into main()'s blanket `except Exception: log(...)` — exactly
+        the silence I1 existed to remove."""
+        with mock.patch("tgbot.bot.probe", return_value=self.driver_probe), \
+             mock.patch("tgbot.bot._fidelity_line",
+                        side_effect=OSError("Input/output error")):
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+        self.assertIn("Input/output error", self.tg.messages[-1])
+        self.assertNotIn(ME, bot._STATE)
 
 
 if __name__ == "__main__":

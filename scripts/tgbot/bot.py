@@ -108,9 +108,20 @@ STAGING_DIR_NAME = "tg-staging"
 
 # Filenames are re-spelled into this alphabet before they are written or put
 # into a manifest. job.py's render_manifest emits `      <slot>: <path>` as a
-# PLAIN (unquoted) YAML scalar, so a space or a ": " in a user-chosen filename
+# PLAIN (unquoted) YAML scalar, so a space or a ": " anywhere in that line
 # would produce a manifest that parses wrong or not at all — and job.py is
 # protected by this branch's constraints, so quoting cannot be added there.
+#
+# What this actually guarantees is narrower than "the emitted line is always
+# valid plain YAML" (finding E, 2026-08-31). The line job.py emits is the whole
+# staged path — ROOT/batch/tg-staging/<chat_id>/<name> — and only the last
+# component passes through here. The rest is the checkout directory, an
+# unchecked assumption: clone this repo into "~/My Projects/motion clone" and
+# every manifest this bot writes breaks, with nothing in this file to catch it.
+# Sanitising only the filename is still the right split — ROOT is
+# developer-chosen and inspected once, the filename is user-chosen, arbitrary
+# and arrives at $0.99/hour — but the assumption is an assumption, not a proof.
+#
 # Restricting the alphabet also means a staged name can never contain a path
 # separator or "..", the same property _safe_child() checks for.
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -165,9 +176,23 @@ def _safe_child(root: Path, name: str) -> Path | None:
 
 
 def _safe_name(name: str) -> str:
-    """A user-supplied filename, re-spelled into `_SAFE_NAME_RE`'s alphabet."""
-    cleaned = _SAFE_NAME_RE.sub("_", Path(name).name).strip("._-")
-    return cleaned or "file"
+    """A user-supplied filename, re-spelled into `_SAFE_NAME_RE`'s alphabet.
+
+    Stem and extension are re-spelled SEPARATELY (finding C, 2026-08-31).
+    Doing the whole basename in one pass and then stripping "._-" off the ends
+    destroyed the extension whenever the stem re-spelled to nothing:
+    `_safe_name('写真.heic')` returned `'heic'`, a name with no suffix at all,
+    so `to_png_if_heic` never fired and `probe` then rejected the file. This
+    user's material comes from a Vietnamese-language workflow, so a non-Latin
+    stem is the ordinary case; the extension is the part downstream code
+    actually dispatches on, so it is the part that must survive.
+    """
+    base = Path(name).name
+    stem = _SAFE_NAME_RE.sub("_", Path(base).stem).strip("._-")
+    # lstrip(".") first so the separating dot is re-added below rather than
+    # stripped away with the rest — ".heic" -> "heic" -> ".heic".
+    suffix = _SAFE_NAME_RE.sub("_", Path(base).suffix.lstrip(".")).strip("._-")
+    return f"{stem or 'file'}.{suffix}" if suffix else (stem or "file")
 
 
 def _stage_file(chat_id: int, src: Path, file_name: str | None) -> Path:
@@ -182,9 +207,34 @@ def _stage_file(chat_id: int, src: Path, file_name: str | None) -> Path:
     dest_dir = ROOT / "batch" / STAGING_DIR_NAME / str(chat_id)
     dest_dir.mkdir(parents=True, exist_ok=True)
     stem = _safe_name(file_name or src.name)
+
+    # HEIC/HEIF is converted the moment it lands, and ingest.to_png_if_heic
+    # writes `path.with_suffix(".png")` with no collision check of its own
+    # (ingest.py:145). So an incoming `photo.heic` claims TWO names, and both
+    # have to be reserved here (finding A, 2026-08-31). Reserving them in one
+    # place rather than giving to_png_if_heic its own counter is deliberate:
+    # this function already owns the staging directory and the never-overwrite
+    # rule, while ingest.py is written to know nothing about Telegram or
+    # staging (its module docstring) and returns a name the caller predicts.
+    # Two counters would be two owners of "which names are taken", which is
+    # how the hole opened in the first place.
+    #
+    # The hole it closes: send photo.png, answer "character", then send
+    # photo.heic. The .heic staged cleanly under its own name, converted, and
+    # overwrote the BYTES of the already-assigned photo.png. Job.slots and the
+    # manifest were unchanged and no message was sent, so the render used the
+    # wrong image inside a paid job. Created by staging itself — before it,
+    # conversion ran against Telegram's unique file_N.heic names.
+    derived_suffix = ".png" if Path(stem).suffix.lower() in (".heic", ".heif") else None
+
+    def taken(candidate: Path) -> bool:
+        if candidate.exists():
+            return True
+        return derived_suffix is not None and candidate.with_suffix(derived_suffix).exists()
+
     dest = dest_dir / stem
     counter = 1
-    while dest.exists():
+    while taken(dest):
         # Never overwrite: two files can share a name, and silently replacing
         # the first would lose a file the user believes they sent.
         dest = dest_dir / f"{Path(stem).stem}-{counter}{Path(stem).suffix}"
@@ -310,22 +360,26 @@ def _fill_slot(tg: Tg, chat_id: int, job: Job, role: str, path: Path, p: Probe,
     tg.send_message(chat_id, f"{prefix}{role}: {describe(p)}{suffix}")
 
 
-def _maybe_show_manifest(tg: Tg, chat_id: int, job: Job) -> None:
-    """Once every required slot is filled: render, validate for free, show it.
+def _render_and_validate(tg: Tg, chat_id: int, job: Job) -> bool:
+    """Write this chat's manifest and run the free `make batch-validate` on it.
 
-    This is the plan's "[Run]" step (docs/superpowers/plans/2026-08-31-…
-    Task 5: "renders the manifest, runs make batch-validate (free), and shows
-    the result with an estimate") — triggered automatically by the last slot
-    fill rather than a separate command, since there is no button to tap for
-    it. It rents nothing: `make batch-validate` never touches the pod.
+    Returns whether the manifest is safe to run, and records that in
+    `_LAST_VALIDATE` — `/confirm` consults the cache rather than re-deriving
+    "was the last render valid" from scratch, since a user who ignores the
+    failure message and types /confirm anyway must still be refused (Task 7
+    fix round 1, Finding 2).
 
-    Records the outcome in `_LAST_VALIDATE` either way — `/confirm` refuses
-    rather than re-deriving "was the last render valid" from scratch, since
-    a user who ignores the failure message below and types /confirm anyway
-    must still be refused (Task 7 fix round 1, Finding 2).
+    Split out of `_maybe_show_manifest` for finding B (2026-08-31): /confirm
+    needs the render-and-validate half without the "reply /confirm to spend
+    money" prompt that follows it. Every path that returns False has already
+    sent its own specific message — callers must not add a second, vaguer one
+    on top, because burying the real reason is the bug finding B is about.
+
+    One asymmetry is load-bearing: the drain-still-running branch leaves
+    `_LAST_VALIDATE` UNSET rather than setting it False. Unset means "never
+    attempted", which is what /confirm keys off to retry later; False means
+    "attempted and the manifest is bad", which /confirm must not retry.
     """
-    if missing_slots(job):
-        return
     manifest_path = _job_manifest_path(chat_id)
     if drain_running(manifest_path):
         # The money guard on the WRITE side, not just on /confirm (finding C1,
@@ -343,8 +397,9 @@ def _maybe_show_manifest(tg: Tg, chat_id: int, job: Job) -> None:
         tg.send_message(chat_id,
                         "a drain is still running for this chat's job — wait for "
                         "it to finish before starting another. Your files are "
-                        "kept; send /status for progress.")
-        return
+                        "kept; send /status for progress. Once it has finished, "
+                        "send /confirm and this job will be checked and started.")
+        return False
     write_manifest(job, manifest_path, now=time.strftime("%Y-%m-%d %H:%M:%S"))
 
     try:
@@ -359,15 +414,32 @@ def _maybe_show_manifest(tg: Tg, chat_id: int, job: Job) -> None:
         _LAST_VALIDATE[chat_id] = False
         tg.send_message(chat_id, "make batch-validate did not finish within 120s "
                                  "— nothing will run. Check the VPS.")
-        return
+        return False
     if result.returncode != 0:
         _LAST_VALIDATE[chat_id] = False
         tg.send_message(chat_id,
                         "manifest failed validation — nothing will run:\n"
                         f"{(result.stdout + result.stderr).strip()}")
-        return
+        return False
     _LAST_VALIDATE[chat_id] = True
+    return True
 
+
+def _maybe_show_manifest(tg: Tg, chat_id: int, job: Job) -> None:
+    """Once every required slot is filled: render, validate for free, show it.
+
+    This is the plan's "[Run]" step (docs/superpowers/plans/2026-08-31-…
+    Task 5: "renders the manifest, runs make batch-validate (free), and shows
+    the result with an estimate") — triggered automatically by the last slot
+    fill rather than a separate command, since there is no button to tap for
+    it. It rents nothing: `make batch-validate` never touches the pod.
+    """
+    if missing_slots(job):
+        return
+    if not _render_and_validate(tg, chat_id, job):
+        return
+
+    manifest_path = _job_manifest_path(chat_id)
     minutes = estimate_minutes(job)
     tg.send_message(
         chat_id,
@@ -409,6 +481,14 @@ def handle(tg: Tg, update: dict, *, allowed_user_id: int,
             path = _stage_file(chat_id, src, doc.get("file_name"))
             path = to_png_if_heic(path)
             p = probe(path)
+            # Inside the try, not one line below it (finding D, 2026-08-31).
+            # Its open()/stat() on a just-written file is near-certain to
+            # succeed, but "near-certain" was the whole of the guarantee: an
+            # OSError here escaped handle() into main()'s blanket
+            # `except Exception: log(...)` and the user got nothing back —
+            # exactly the silence finding I1 existed to remove.
+            # Acceptance A6 compares this against the delivered file's digest.
+            fidelity = _fidelity_line(path)
         except (RuntimeError, TgError, KeyError, OSError) as exc:
             # ffprobe raises rather than guessing (ingest.probe's own
             # contract) — the file never enters a job, so it can never
@@ -416,8 +496,6 @@ def handle(tg: Tg, update: dict, *, allowed_user_id: int,
             tg.send_message(chat_id, f"that file was not accepted: {exc}")
             return
 
-        # Acceptance A6 compares this against the delivered file's digest.
-        fidelity = _fidelity_line(path)
         _CONFIRM_WARNED.discard(chat_id)
 
         job = _STATE.setdefault(chat_id, Job(slots={}, probes={}, pipeline=JOB_PIPELINE))
@@ -524,16 +602,6 @@ def handle(tg: Tg, update: dict, *, allowed_user_id: int,
         if job is None or missing_slots(job):
             tg.send_message(chat_id, "no complete job yet — send the required files first")
             return
-        if not _LAST_VALIDATE.get(chat_id):
-            # Refuse rather than trust a downstream safety net: drain.py's
-            # own Phase A validate would likely catch this before a pod is
-            # rented, but that file is read-only to this bot, so this guard
-            # cannot rely on it (Task 7 fix round 1, Finding 2).
-            tg.send_message(chat_id,
-                            "the manifest hasn't passed validation — nothing will "
-                            "run. Fix the error already shown, or send the files "
-                            "again.")
-            return
         pending = _PENDING.get(chat_id) or []
         if pending and chat_id not in _CONFIRM_WARNED:
             # /confirm used to succeed with files still queued and unanswered,
@@ -547,6 +615,44 @@ def handle(tg: Tg, update: dict, *, allowed_user_id: int,
                             f"{len(pending)} file(s) still unassigned — answer "
                             f"them, or send /confirm again to run without them")
             return
+
+        # Ordered AFTER the pending check on purpose: the render below writes
+        # the manifest, and writing one we are about to refuse to run is noise.
+        validated = _LAST_VALIDATE.get(chat_id)
+        if validated is None:
+            # Never attempted — the only way to get here is the write guard in
+            # _render_and_validate having refused while a drain was live
+            # (finding B, 2026-08-31). The job was already complete at that
+            # moment, so no further slot fill re-enters _maybe_show_manifest
+            # and nothing would ever set this; the old code refused here with
+            # "fix the error already shown" when no error had ever been shown,
+            # and the only escape was re-sending a file, which nothing tells
+            # the user. Attempt it now instead: by this point the drain has
+            # normally finished, the write guard passes, and the normal path
+            # resumes. If it has NOT finished, _render_and_validate says so
+            # itself and names /status — a true reason with a real action.
+            if not _render_and_validate(tg, chat_id, job):
+                # It already sent the specific reason; a second, vaguer line
+                # would only bury it.
+                return
+            # The confirmation screen was never shown for this job, so send
+            # the manifest now: nothing may spend $0.99/hour without the exact
+            # inputs it spent on being in the transcript.
+            tg.send_message(chat_id,
+                            _job_manifest_path(chat_id).read_text(encoding="utf-8"))
+        elif not validated:
+            # Attempted and failed. Refuse rather than trust a downstream
+            # safety net: drain.py's own Phase A validate would likely catch
+            # this before a pod is rented, but that file is read-only to this
+            # bot, so this guard cannot rely on it (Task 7 fix round 1,
+            # Finding 2). Retrying the validate here would be pointless — the
+            # job has not changed since it failed.
+            tg.send_message(chat_id,
+                            "this manifest did not pass `make batch-validate`, and "
+                            "its output was sent above — nothing will run. Fix what "
+                            "it named and send the file(s) again.")
+            return
+
         manifest_path = _job_manifest_path(chat_id)
         if drain_running(manifest_path):
             # The money guard: a second drain on one manifest corrupts the
