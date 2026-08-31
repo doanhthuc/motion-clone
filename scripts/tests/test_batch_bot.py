@@ -488,6 +488,30 @@ class TestDraftPersistence(unittest.TestCase):
         self.assertTrue(logged.called)
         self.assertIn("unreadable", logged.call_args[0][0])
 
+    def test_a_corrupt_draft_is_moved_aside_not_left_to_be_deleted(self):
+        """The destructive interaction, found 2026-08-31.
+
+        _load_draft used to log and skip. Skipping leaves _STATE empty, and
+        handle()'s `finally: _save_draft` then sees no state and unlinks the
+        file — so the ONE record of the job was destroyed by the line after the
+        one that failed to read it. Reconstructing a draft by hand from the
+        staged files is possible (it was done once, earlier the same day) but
+        only while the file still exists.
+        """
+        path = bot._draft_path(ME)
+        path.write_text('{"pipeline": "tryon-motion-enhance", "slots": {', encoding="utf-8")
+        tg = FakeTg()
+        with mock.patch.object(bot, "log"):
+            bot.handle(tg, cmd_from(ME, "/status"), allowed_user_id=ME)
+        self.assertFalse(path.exists())
+        salvaged = path.with_suffix(path.suffix + ".bad")
+        self.assertTrue(salvaged.exists(), "the unreadable draft was destroyed")
+        self.assertIn("slots", salvaged.read_text())
+        # And the user is told, not only the log: otherwise /job answers
+        # "nothing assembled yet" for a job they know they built.
+        self.assertIn("could not be read", tg.messages[0])
+        self.assertIn(salvaged.name, tg.messages[0])
+
     def test_a_draft_naming_an_unknown_pipeline_is_refused(self):
         # A pipeline renamed or removed between restarts would otherwise be
         # loaded and then fail much later, during manifest validation.

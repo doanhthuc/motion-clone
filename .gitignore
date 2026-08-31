@@ -35,6 +35,8 @@ batch/*.draft.json
 batch/*.last.json
 # tin nhắn tiến độ đang được sửa tại chỗ
 batch/*.progress.json
+# draft không đọc được, dọn sang một bên để còn dựng lại tay
+batch/*.json.bad
 
 # IDE junk — repo public, config cá nhân không vào đây (cùng lý do .DS_Store)
 .idea/

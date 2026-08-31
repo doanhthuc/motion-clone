@@ -770,11 +770,20 @@ def _save_draft(chat_id: int) -> None:
     tmp.replace(path)
 
 
-def _load_draft(chat_id: int) -> None:
-    """Rehydrate one chat's draft. A corrupt file is reported, not obeyed."""
+def _load_draft(chat_id: int) -> str | None:
+    """Rehydrate one chat's draft. Returns the name of a file it had to set aside.
+
+    A corrupt draft is MOVED, never left in place (fixed 2026-08-31). It used
+    to be logged and skipped, which looked harmless and was not: skipping
+    leaves `_STATE` empty, and `handle`'s `finally: _save_draft` then sees no
+    state and unlinks the file — so the one record of the job was destroyed by
+    the line after the one that failed to read it, with nothing said to the
+    user. Reconstructing a draft by hand from the staged files is possible (it
+    was done once, earlier the same day) but only while the file still exists.
+    """
     path = _draft_path(chat_id)
     if not path.exists():
-        return
+        return None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
         pipeline = payload["pipeline"]
@@ -784,14 +793,17 @@ def _load_draft(chat_id: int) -> None:
         probes = {r: Probe(**d) for r, d in payload["probes"].items()}
         pending = [(Path(v), Probe(**d)) for v, d in payload["pending"]]
     except (ValueError, KeyError, TypeError) as exc:
-        # Loud, and the staged files are still on disk: the user can re-send
-        # or forward them. Silently starting fresh is what made the original
-        # loss so confusing.
-        log(f"draft for chat {chat_id} is unreadable, starting fresh: {exc!r}")
-        return
+        # Moved aside, not left to be unlinked by the save that follows. An
+        # existing .bad from a previous failure is overwritten: the most recent
+        # one matches the state on disk, and this must not grow without bound.
+        bad = path.with_suffix(path.suffix + ".bad")
+        path.replace(bad)
+        log(f"draft for chat {chat_id} is unreadable, moved to {bad.name}: {exc!r}")
+        return bad.name
     _STATE[chat_id] = Job(slots=slots, probes=probes, pipeline=pipeline)
     if pending:
         _PENDING[chat_id] = pending
+    return None
 
 
 def handle(tg: Tg, update: dict, *, allowed_user_id: int,
@@ -812,7 +824,18 @@ def handle(tg: Tg, update: dict, *, allowed_user_id: int,
     _, chat_id = _identify(update)
     if chat_id not in _LOADED:
         _LOADED.add(chat_id)
-        _load_draft(chat_id)
+        salvaged = _load_draft(chat_id)
+        if salvaged:
+            # Told, not just logged. Otherwise /job answers "nothing assembled
+            # yet" for a job the user knows they built, and the only trace is a
+            # log line on a box they are not looking at.
+            tg.send_message(
+                chat_id,
+                "⚠️ <b>The job I was holding could not be read.</b>\n"
+                f"Saved as <code>{_esc(salvaged)}</code> and set aside; the "
+                "staged files are still on disk. Send the files again, or "
+                "forward them from earlier in this chat.",
+                parse_mode=PARSE_HTML)
     try:
         _handle(tg, update, allowed_user_id=allowed_user_id, dry_run=dry_run)
     finally:

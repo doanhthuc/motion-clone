@@ -302,6 +302,13 @@ to justify the file.
 attempted", re-runs the free `make batch-validate` and re-sends the manifest before anything spends.
 A cached pass carried across a restart would be a verdict about a process that no longer exists.
 
+An **unreadable** draft is moved to `batch/tg-<chat_id>.draft.json.bad` rather than skipped. Skipping
+looked harmless and was not: it leaves the in-memory state empty, and the save that runs after every
+update then sees no state and deletes the file — so the one record of the job was destroyed by the
+line after the one that failed to read it, silently. Reconstructing a draft by hand from the staged
+files is possible, but only while the file still exists. The bot also says so in the chat, because a
+log line on a box nobody is looking at is not a report.
+
 To discard a half-assembled job, use `/clear` — or delete that file and its
 `batch/tg-staging/<chat_id>/` directory by hand.
 
