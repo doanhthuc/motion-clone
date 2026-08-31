@@ -22,7 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batchlib.config import env_get
 from batchlib.manifest import load_state, state_path_for
-from batchlib.pipelines import optional_roles, required_roles
+from batchlib.pipelines import PIPELINES, optional_roles, required_roles
 # Not `from batchlib_ext...` or `scripts/batchlib/...` — drain.py itself lives
 # at scripts/drain.py, a plain top-level module, same as batch_run.py. scripts/
 # is already on sys.path (the insert above), so this is the plan's own "import
@@ -60,6 +60,22 @@ SOLE_RUN_ID = "job"
 # slots" (character, outfit, background, driver) — docs/superpowers/specs/
 # 2026-08-30-telegram-batch-control-design.md section 1.
 JOB_PIPELINE = "tryon-motion-enhance"
+
+# The default above is only a fallback. `main()` replaces this with TG_PIPELINE
+# from the root .env when it is set, and /pipeline overrides it per chat.
+#
+# Added 2026-08-31, on the user's first real run: they assembled a job, read
+# the manifest, and wanted character-swap rather than motion — the two features
+# this repo actually has. A pipeline nailed to one constant means the phone can
+# reach every part of the flow except the choice of what the flow IS, which is
+# the one thing they asked about first.
+#
+# Why the durable half is an env var and the volatile half is /pipeline: _STATE
+# is in-memory (see below), so a restart reverts the chat to this default. If
+# that default were a hard-coded constant, a crash mid-assembly would silently
+# switch pipelines under the user. Pointing it at a value they set themselves
+# makes the fallback predictable instead of surprising.
+_DEFAULT_PIPELINE = JOB_PIPELINE
 
 # Per-chat state, in memory only — Plan 2A is one job at a time per chat. A
 # bot restart loses an unsubmitted draft, never a running job: drain_running()
@@ -396,6 +412,41 @@ def deliver_result(tg: Tg, chat_id: int, manifest_path: Path) -> None:
     tg.send_message(chat_id, summary_text(batch_dir))
 
 
+def _job_for(chat_id: int) -> Job:
+    """The chat's draft job, created on first use at the current default.
+
+    One accessor rather than two `_STATE.setdefault(...)` calls: the default
+    pipeline is now a variable, and two call sites reading it independently is
+    how they drift apart.
+    """
+    return _STATE.setdefault(
+        chat_id, Job(slots={}, probes={}, pipeline=_DEFAULT_PIPELINE))
+
+
+def _switch_pipeline(chat_id: int, name: str) -> tuple[Job, list[str]]:
+    """Point the chat's job at `name`, keeping slots the new pipeline can use.
+
+    Returns the job and the roles that had to be dropped. Both pipelines the
+    user moves between here need character/driver/outfit, so in practice
+    nothing is dropped — but character-swap-enhance does not take an outfit,
+    and silently carrying one into a manifest that has no stage to consume it
+    would produce a run that ignores a file the user deliberately labelled.
+    """
+    job = _job_for(chat_id)
+    usable = required_roles(name) | optional_roles(name)
+    dropped = sorted(set(job.slots) - usable)
+    for role in dropped:
+        job.slots.pop(role, None)
+        job.probes.pop(role, None)
+    job.pipeline = name
+    # The cached verdict belongs to the manifest of the OLD pipeline. Leaving
+    # it set would let a later /confirm act on a validation that never ran
+    # against what is about to be submitted.
+    _LAST_VALIDATE.pop(chat_id, None)
+    _CONFIRM_WARNED.discard(chat_id)
+    return job, dropped
+
+
 def _job_manifest_path(chat_id: int) -> Path:
     """One deterministic manifest per chat — Plan 2A's "one job at a time".
 
@@ -592,7 +643,7 @@ def handle(tg: Tg, update: dict, *, allowed_user_id: int,
 
         _CONFIRM_WARNED.discard(chat_id)
 
-        job = _STATE.setdefault(chat_id, Job(slots={}, probes={}, pipeline=JOB_PIPELINE))
+        job = _job_for(chat_id)
         role = slot_for(p, job)
         if role is None:
             # Ambiguous (an image): job.slot_for already refuses to guess —
@@ -772,11 +823,46 @@ def handle(tg: Tg, update: dict, *, allowed_user_id: int,
                         f"Check back with /result {manifest_path.name} once it's done.")
         return
 
+    if text.startswith("/pipeline"):
+        job = _job_for(chat_id)
+        parts = text.split(maxsplit=1)
+        if len(parts) != 2:
+            # Listing beats guessing: the names are close enough to each other
+            # that "swap-character-enhance" — what the user actually asked for
+            # on 2026-08-31 — is not any of them.
+            tg.send_message(chat_id,
+                            f"pipeline: {job.pipeline}\n\navailable:\n" +
+                            "\n".join(f"  {n}  ({' -> '.join(PIPELINES[n])})"
+                                      for n in sorted(PIPELINES)) +
+                            "\n\nusage: /pipeline <name>")
+            return
+        name = parts[1].strip()
+        if name not in PIPELINES:
+            tg.send_message(chat_id,
+                            "no pipeline called that. send /pipeline to list them.")
+            return
+        if name == job.pipeline:
+            tg.send_message(chat_id, f"already on {name}")
+            return
+        job, dropped = _switch_pipeline(chat_id, name)
+        note = (f"\ndropped {', '.join(dropped)} — {name} has no stage that "
+                "uses it" if dropped else "")
+        still = sorted(missing_slots(job))
+        tg.send_message(chat_id,
+                        f"pipeline: {name}  ({' -> '.join(PIPELINES[name])}){note}\n" +
+                        (f"still needed: {', '.join(still)}" if still
+                         else "all slots filled — re-checking the manifest"))
+        # Re-render against the new pipeline rather than leaving the manifest
+        # the user last saw on screen: that file is what /confirm submits.
+        _maybe_show_manifest(tg, chat_id, job)
+        return
+
     if text.startswith("/start"):
         tg.send_message(chat_id,
                         "Ready. Send a file with the paperclip -> File.\n"
                         "/status progress · /confirm spends money · "
-                        "/result <manifest>.yaml · /tryon <batch-id>")
+                        "/pipeline <name> · /result <manifest>.yaml · "
+                        "/tryon <batch-id>")
         return
 
     # A plain-text reply, meant to answer the question asked about the HEAD
@@ -785,7 +871,7 @@ def handle(tg: Tg, update: dict, *, allowed_user_id: int,
     # never guessed — mirrors job.slot_for's own refusal to guess.
     queue = _PENDING.get(chat_id)
     if queue:
-        job = _STATE.setdefault(chat_id, Job(slots={}, probes={}, pipeline=JOB_PIPELINE))
+        job = _job_for(chat_id)
         options = _askable_roles(job.pipeline)
         answer = text.strip().lower()
         if answer in options:
@@ -821,10 +907,22 @@ def main() -> int:
     if not token or not raw_id:
         print("TG_BOT_TOKEN and TG_ALLOWED_USER_ID must be set in .env", file=sys.stderr)
         return 2
+    # Validated here, loudly, rather than at first use: an unknown pipeline
+    # name in .env would otherwise surface as a confusing manifest-validation
+    # failure on the phone, hours later, after material was already uploaded.
+    global _DEFAULT_PIPELINE
+    configured = env_get(ROOT / ".env", "TG_PIPELINE")
+    if configured:
+        if configured not in PIPELINES:
+            print(f"TG_PIPELINE={configured!r} is not a known pipeline. "
+                  f"Known: {', '.join(sorted(PIPELINES))}", file=sys.stderr)
+            return 2
+        _DEFAULT_PIPELINE = configured
+
     tg = Tg(token=token, base_url=base)
     allowed_user_id = int(raw_id)
     offset = 0
-    log(f"started, api={base}, dry_run={args.dry_run}")
+    log(f"started, api={base}, dry_run={args.dry_run}, pipeline={_DEFAULT_PIPELINE}")
     while True:
         try:
             for update in tg.get_updates(offset):

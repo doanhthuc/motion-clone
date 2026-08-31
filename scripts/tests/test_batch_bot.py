@@ -175,6 +175,84 @@ class TestNonFileMediaIsRefused(unittest.TestCase):
         self.assertEqual(tg.messages, [])
 
 
+class TestPipelineCommand(unittest.TestCase):
+    """Added 2026-08-31 after the first real run from the phone: the user
+    assembled a job, read the manifest, and wanted character-swap instead of
+    motion — the other feature this repo has. The pipeline was a module
+    constant, so the phone could reach every part of the flow except the
+    choice of what the flow is.
+    """
+
+    def setUp(self):
+        bot._STATE.clear()
+        bot._LAST_VALIDATE.clear()
+        bot._CONFIRM_WARNED.clear()
+        self._orig_default = bot._DEFAULT_PIPELINE
+        bot._DEFAULT_PIPELINE = "tryon-motion-enhance"
+
+    def tearDown(self):
+        bot._DEFAULT_PIPELINE = self._orig_default
+
+    def test_bare_pipeline_lists_the_real_names(self):
+        # The names are close enough that guessing fails: the user asked for
+        # "swap-character-enhance", which is not any of them.
+        tg = FakeTg()
+        bot.handle(tg, cmd_from(ME, "/pipeline"), allowed_user_id=ME)
+        self.assertIn("tryon-motion-enhance", tg.messages[0])
+        self.assertIn("character-swap-enhance", tg.messages[0])
+        self.assertNotIn("swap-character-enhance", tg.messages[0])
+
+    def test_an_unknown_name_is_refused_and_changes_nothing(self):
+        tg = FakeTg()
+        bot.handle(tg, cmd_from(ME, "/pipeline swap-character-enhance"),
+                   allowed_user_id=ME)
+        self.assertIn("no pipeline called that", tg.messages[0])
+        self.assertEqual(bot._job_for(ME).pipeline, "tryon-motion-enhance")
+
+    def test_switching_keeps_slots_the_new_pipeline_still_uses(self):
+        # Both of these need character/driver/outfit, so a switch between them
+        # must not throw away material the user already labelled.
+        job = bot._job_for(ME)
+        job.slots.update({"character": Path("c.png"), "driver": Path("d.mp4"),
+                          "outfit": Path("o.png")})
+        with mock.patch.object(bot, "_maybe_show_manifest"):
+            tg = FakeTg()
+            bot.handle(tg, cmd_from(ME, "/pipeline tryon-character-swap-enhance"),
+                       allowed_user_id=ME)
+        self.assertEqual(bot._job_for(ME).pipeline, "tryon-character-swap-enhance")
+        self.assertEqual(sorted(bot._job_for(ME).slots), ["character", "driver", "outfit"])
+
+    def test_switching_drops_a_slot_the_new_pipeline_cannot_consume(self):
+        # character-swap-enhance has no tryon stage, so an outfit would ride
+        # into the manifest with nothing to consume it — a run that silently
+        # ignores a file the user deliberately labelled.
+        job = bot._job_for(ME)
+        job.slots.update({"character": Path("c.png"), "driver": Path("d.mp4"),
+                          "outfit": Path("o.png")})
+        with mock.patch.object(bot, "_maybe_show_manifest"):
+            tg = FakeTg()
+            bot.handle(tg, cmd_from(ME, "/pipeline character-swap-enhance"),
+                       allowed_user_id=ME)
+        self.assertNotIn("outfit", bot._job_for(ME).slots)
+        self.assertIn("dropped outfit", tg.messages[0])
+
+    def test_switching_invalidates_the_cached_validation(self):
+        # _LAST_VALIDATE is what /confirm trusts. Left set across a switch, a
+        # /confirm would act on a validation that never ran against the
+        # manifest about to be submitted.
+        bot._LAST_VALIDATE[ME] = True
+        with mock.patch.object(bot, "_maybe_show_manifest"):
+            bot.handle(FakeTg(), cmd_from(ME, "/pipeline character-swap-enhance"),
+                       allowed_user_id=ME)
+        self.assertNotIn(ME, bot._LAST_VALIDATE)
+
+    def test_switching_to_the_current_pipeline_is_a_no_op(self):
+        tg = FakeTg()
+        bot.handle(tg, cmd_from(ME, "/pipeline tryon-motion-enhance"),
+                   allowed_user_id=ME)
+        self.assertIn("already on", tg.messages[0])
+
+
 class TestSafeName(unittest.TestCase):
     """Finding C (2026-08-31): _safe_name re-spelled the whole basename in one
     pass, so a stem made entirely of characters outside the alphabet collapsed

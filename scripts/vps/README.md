@@ -97,7 +97,16 @@ make drain FILE=batch/2026-08-30.yaml CONFIRM=yes   # rents, runs, destroys
    EOF
    ```
    These are an **app registration**, not the bot token. The bot token lives in the root `.env` as
-   `TG_BOT_TOKEN`, along with `TG_ALLOWED_USER_ID` and (optionally) `TG_API_BASE`.
+   `TG_BOT_TOKEN`, along with `TG_ALLOWED_USER_ID` and (optionally) `TG_API_BASE`
+   and `TG_PIPELINE`.
+
+   `TG_PIPELINE` picks which pipeline a new job starts on — one of the names
+   `/pipeline` lists, default `tryon-motion-enhance`. It is validated at
+   startup and an unknown name exits 2, because the alternative is a
+   confusing manifest-validation failure on the phone hours later, after the
+   material has already been uploaded. `/pipeline <name>` overrides it for the
+   current job; because per-chat state is in memory, a restart falls back to
+   this value, so set it to whichever flow you use most.
 
 2. The server's storage is bind-mounted at `/var/lib/telegram-bot-api` **on both sides**. With
    `TELEGRAM_LOCAL=1`, `getFile` returns an absolute path on the container's filesystem and `bot.py`
@@ -132,6 +141,8 @@ systemctl daemon-reload && systemctl enable --now motion-bot
 |---|---|
 | (send a File) | measures it, replies with the description, byte count and `sha256`, and asks which slot if it is an image |
 | `character` / `outfit` / `background` | answers the slot question for the file at the head of the queue |
+| `/pipeline` | lists the pipelines and shows the current one |
+| `/pipeline <name>` | switches this job's pipeline, keeping the slots the new one still uses and naming any it drops |
 | `/confirm` | **spends money.** Rents an RTX 5090 at $0.99/hour and runs the drain |
 | `/status` | progress for this chat's job, read from the journal — still works after the pod is destroyed |
 | `/result <manifest>.yaml` | the finished video(s), or the failure logs already pulled to disk |
