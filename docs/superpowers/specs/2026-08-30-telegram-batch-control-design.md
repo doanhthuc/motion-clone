@@ -501,6 +501,27 @@ Bot API server.
    listing and invisible in a still, and is exactly what the chroma/exposure/jitter measurements in
    this repo are sensitive to. §4.1's "attach as File, never as Photo" now has a number behind it.
 
+   **Images are damaged worse than video, and in three ways at once.** Same picture from the same
+   phone, sent every available way (measured 2026-08-31):
+
+   | path | resolution | format | bytes | vs original |
+   |---|---|---|---|---|
+   | File / "Send as File" | 1536x2720 | PNG | 4,873,992 | — |
+   | Photos, "high quality" | 1445x2560 | JPEG | 98,085 | **-98.0%** |
+   | Photos, default | 722x1280 | JPEG | 29,820 | **-99.4%** |
+
+   Telegram caps the long edge at 2560, so a 2720px source shrinks even on the high-quality option;
+   PNG becomes JPEG, lossless to lossy with chroma subsampling; and the file compresses ~50x.
+   **Relaxing the rule for images was considered on the user's request and rejected on these
+   numbers** — try-on consumes the character image directly, and §4.3's chroma measurements assume
+   the colour was not subsampled on the way in.
+
+   The refusal therefore stays, but it now quotes the cost for the kind that was actually sent
+   (`bot._RECOMPRESSION_COST`) rather than the video figure for everything, and it names
+   **"Send as File"** — verified present in the iOS picker on 2026-08-31. That is the finding that
+   makes the rule cheap to obey: the user keeps picking from Photos as usual and pays one extra tap,
+   instead of being sent off to save the file elsewhere first.
+
    Two side findings from the same run, both worth keeping:
    - **Telegram's own `video.width`/`video.height` are not the stream's.** It reported `480x848`
      for a stream that ffprobe reads as `1088x1920`. Any code trusting those fields is wrong by

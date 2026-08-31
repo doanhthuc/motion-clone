@@ -119,6 +119,42 @@ class TestNonFileMediaIsRefused(unittest.TestCase):
         self.assertEqual(len(tg.messages), 1)
         self.assertIn("paperclip", tg.messages[0])
 
+    def test_every_refusal_names_send_as_file(self):
+        # Verified 2026-08-31 that the iOS picker offers "Send as File", so the
+        # refusal has an answer that costs one tap. Pointing at Files instead
+        # sends the user off to save the picture first, and that friction is
+        # what makes the rule feel arbitrary enough to argue with.
+        for kind in bot.NON_FILE_MEDIA:
+            with self.subTest(kind=kind):
+                tg = FakeTg()
+                bot.handle(tg, media_from(ME, kind), allowed_user_id=ME)
+                self.assertIn("Send as File", tg.messages[0])
+
+    def test_the_photo_refusal_quotes_the_image_measurement(self):
+        # Images are damaged differently from video — downscaled AND converted
+        # PNG->JPEG — so quoting the video bitrate figure at them, as the first
+        # version of this branch did, is a wrong claim in a user-facing string.
+        tg = FakeTg()
+        bot.handle(tg, media_from(ME, "photo"), allowed_user_id=ME)
+        self.assertIn("1445x2560", tg.messages[0])
+        self.assertNotIn("6,603", tg.messages[0])
+
+    def test_the_video_refusal_quotes_the_video_measurement(self):
+        tg = FakeTg()
+        bot.handle(tg, media_from(ME, "video"), allowed_user_id=ME)
+        self.assertIn("6,603", tg.messages[0])
+        self.assertNotIn("1445x2560", tg.messages[0])
+
+    def test_an_unmeasured_kind_does_not_claim_a_measurement(self):
+        # `voice` has no row in _RECOMPRESSION_COST. Saying "measured" about
+        # something never measured is exactly how this spec's 20-30MB error
+        # got in, so the absence has to stay visible rather than borrow a
+        # neighbouring number.
+        tg = FakeTg()
+        bot.handle(tg, media_from(ME, "voice"), allowed_user_id=ME)
+        self.assertNotIn("measured", tg.messages[0])
+        self.assertIn("outside the File path", tg.messages[0])
+
     def test_every_non_file_kind_draws_exactly_one_reply(self):
         # The point is coverage of the whole tuple: any kind added later that
         # forgets a reply reintroduces the silence this class exists for.

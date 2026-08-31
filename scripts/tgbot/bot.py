@@ -128,6 +128,30 @@ STAGING_DIR_NAME = "tg-staging"
 NON_FILE_MEDIA = ("photo", "video", "animation", "audio",
                   "voice", "video_note", "sticker")
 
+# What each wrong path actually costs, so the refusal argues from a number
+# instead of from authority. Measured 2026-08-31 from the iPhone client, one
+# file sent every available way.
+#
+# Images come out worse than video, and in three ways at once: Telegram caps
+# the long edge at 2560 (the source was 2720, so even "high quality" shrinks
+# it), converts PNG to JPEG — lossless to lossy, with chroma subsampling — and
+# compresses ~50x. That last part is why relaxing this rule for images was
+# considered and rejected: try-on consumes the character image directly, and
+# this repo's background-chroma measurements assume the colour was not
+# subsampled on the way in.
+#
+# Kinds with no row here get a claim with no number attached, deliberately:
+# saying "measured" about something never measured is how the 20-30MB error in
+# this spec happened.
+_RECOMPRESSION_COST = {
+    "photo": ("a 1536x2720 PNG came back a 1445x2560 JPEG with 98% of its "
+              "bytes gone, and that was the 'high quality' option — the "
+              "default cut it to 722x1280, 0.6% of the original"),
+    "video": ("the 1088x1920 frame and all 444 frames survived, but the "
+              "bitrate was halved (13,196 -> 6,603 kbps) and 49.8% of the "
+              "bytes were gone"),
+}
+
 # Filenames are re-spelled into this alphabet before they are written or put
 # into a manifest. job.py's render_manifest emits `      <slot>: <path>` as a
 # PLAIN (unquoted) YAML scalar, so a space or a ": " anywhere in that line
@@ -519,11 +543,19 @@ def handle(tg: Tg, update: dict, *, allowed_user_id: int,
     # never answers. See NON_FILE_MEDIA for the measurement.
     kind = next((k for k in NON_FILE_MEDIA if msg.get(k)), None)
     if kind:
+        cost = _RECOMPRESSION_COST.get(kind)
+        why = (f"measured 2026-08-31, {cost}" if cost
+               else "Telegram re-encodes everything sent outside the File path")
+        # Naming "Send as File" matters more than naming the paperclip:
+        # verified 2026-08-31 that the iOS picker offers it, so the fix costs
+        # one extra tap and the user never has to leave Photos. Telling them to
+        # use Files instead sends them off to save the picture somewhere first,
+        # which is the friction that makes the whole rule feel arbitrary.
         tg.send_message(chat_id,
-                        f"That arrived as a {kind}, not a File, so Telegram "
-                        "re-encoded it — measured 2026-08-31: same 1088x1920 "
-                        "frame, but half the bitrate and 49.8% of the bytes "
-                        "gone.\nSend it again with the paperclip -> File.")
+                        f"That arrived as a {kind}, not a File — {why}.\n"
+                        'Send it again as a File: in the picker tap "..." and '
+                        'choose "Send as File", or attach it with the '
+                        "paperclip -> File.")
         return
 
     doc = msg.get("document")
