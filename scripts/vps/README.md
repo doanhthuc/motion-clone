@@ -177,6 +177,40 @@ This closes a gap spec section 4.3 left open. "Measure on arrival, do not trust 
 implemented as far as `describe()` — the numbers were shown, and nothing judged them. The File rule
 guarantees Telegram did no damage; it cannot guarantee the bytes were good before they were sent.
 
+### Presentation
+
+Messages use `parse_mode="HTML"`, ordinary emoji as icons, and one collapsed
+`<blockquote expandable>` per screen for the measurements. Verified against the
+running server on 2026-08-31: bold/italic/`code`, `<pre>`, `<blockquote>`,
+`<blockquote expandable>`, spoilers, emoji and `sendChatAction` all work on this
+image.
+
+Three rules, each with a failure mode behind it:
+
+- **HTML, never MarkdownV2.** MarkdownV2 requires escaping fifteen characters
+  including `.`, `-` and `!` — all of which occur in ordinary filenames and
+  measurements. One unescaped character makes Telegram reject the whole message,
+  so the user sees *nothing*. HTML needs only `&`, `<` and `>`.
+- **Escape every interpolated value** with `bot._esc`, not just the ones that
+  look risky. `_safe_name` already strips brackets from staged names, so nothing
+  can carry one today; escaping keeps that from being load-bearing.
+- **The headline line carries resolution and size only.** Duration and bitrate
+  are diagnostic and live in the collapsed block — except a *warning*, which is
+  repeated outside it on the review screen. That screen is the last thing read
+  before $0.99/hour is committed, and anything needing a tap to reveal is
+  something that gets skipped.
+
+`FakeTg._check_markup` in the tests gates every message the suite produces
+against both failure modes: HTML tags with no `parse_mode` (the user reads the
+raw tags), and an unescaped bracket under `parse_mode=HTML` (Telegram rejects
+the whole send, and nothing arrives).
+
+**Image previews do not work from a local path.** Measured 2026-08-31:
+`sendPhoto` with an absolute path returns `invalid file HTTP URL specified`, and
+with a `file://` URI returns `can't find real file path` — because the path has
+to exist *inside* the container, and only `/var/lib/telegram-bot-api` is
+mounted, not the repo. Showing staged images back would need a real upload.
+
 ### Buttons
 
 Every message offering a fixed set of choices carries an inline keyboard: the slot question, the

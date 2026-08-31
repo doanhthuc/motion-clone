@@ -65,11 +65,60 @@ class FakeTg:
         # has to be observable.
         self.buttons: list[list[list[tuple[str, str]]] | None] = []
         self.answered: list[str] = []
+        self.parse_modes: list[str | None] = []
+        self.actions: list[str] = []
 
-    def send_message(self, chat_id, text, *, buttons=None):
+    # The tags bot.py actually uses. Anything outside this set is either a
+    # typo or unescaped user text, and Telegram rejects the whole message for
+    # either — so the user sees nothing at all.
+    ALLOWED_TAGS = ("<b>", "</b>", "<i>", "</i>", "<code>", "</code>",
+                    "<pre>", "</pre>", "<blockquote expandable>", "<blockquote>",
+                    "</blockquote>")
+
+    def send_message(self, chat_id, text, *, buttons=None, parse_mode=None):
+        self._check_markup(text, parse_mode)
         self.messages.append(text)
         self.buttons.append(buttons)
+        # Recorded so a test can assert that HTML-formatted bodies actually
+        # declare it: HTML sent without parse_mode shows the raw <b> tags,
+        # and HTML declared without escaping makes Telegram reject the whole
+        # message so nothing arrives at all.
+        self.parse_modes.append(parse_mode)
         return 1
+
+    def send_chat_action(self, chat_id, action="typing"):
+        self.actions.append(action)
+
+    def _check_markup(self, text, parse_mode):
+        """Fail here rather than let Telegram silently reject the message.
+
+        Two failure modes, both invisible in production and both caught by
+        running this on every message the suite produces:
+
+        1. HTML in the body with no parse_mode — the user reads literal
+           "<b>character</b>" instead of bold text.
+        2. parse_mode=HTML with an unescaped `<` or an unknown tag — Telegram
+           rejects the ENTIRE sendMessage, so nothing arrives. That is the same
+           silence class as the NON_FILE_MEDIA bug, and no unit test would see
+           it without this check.
+        """
+        looks_like_html = any(t in text for t in self.ALLOWED_TAGS)
+        if parse_mode is None:
+            assert not looks_like_html, (
+                f"HTML tags sent without parse_mode: {text[:120]!r}")
+            return
+        assert parse_mode == "HTML", f"unexpected parse_mode {parse_mode!r}"
+        stripped = text
+        for tag in self.ALLOWED_TAGS:
+            stripped = stripped.replace(tag, "")
+        # &lt; / &gt; / &amp; are what _esc produces and are legal; bare
+        # brackets are not.
+        for entity in ("&lt;", "&gt;", "&amp;"):
+            stripped = stripped.replace(entity, "")
+        for ch in "<>":
+            assert ch not in stripped, (
+                f"unescaped {ch!r} in an HTML message — Telegram would reject "
+                f"the whole thing: {text[:160]!r}")
 
     def answer_callback_query(self, callback_id, text=""):
         self.answered.append(callback_id)
@@ -787,7 +836,7 @@ class TestFlow(unittest.TestCase):
 
     def test_job_with_nothing_assembled_says_so(self):
         bot.handle(self.tg, cmd_from(ME, "/job"), allowed_user_id=ME)
-        self.assertIn("nothing assembled yet", self.tg.messages[-1])
+        self.assertIn("Nothing assembled yet", self.tg.messages[-1])
 
     def test_job_names_what_is_filled_and_what_is_missing(self):
         # The gap this closes: on 2026-08-31 a slot label went missing and the
@@ -796,11 +845,18 @@ class TestFlow(unittest.TestCase):
             bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
         bot.handle(self.tg, cmd_from(ME, "/job"), allowed_user_id=ME)
         body = self.tg.messages[-1]
-        self.assertIn("driver", body)
+        # Every role of the pipeline appears, filled or not: listing only what
+        # is present hides the empty required slot, which is the single thing
+        # the user most needs to see.
+        self.assertIn(f"{bot.ICON_OK} {bot.ROLE_ICON['driver']} driver", body)
+        for role in ("character", "outfit"):
+            self.assertIn(f"{bot.ICON_EMPTY} {bot.ROLE_ICON[role]} {role}", body)
+        # An optional slot is marked as such, so an empty one is not mistaken
+        # for something still owed.
+        self.assertIn("background — optional", body)
+        # The filename lives in the collapsed detail block, not the headline.
         self.assertIn("driver.mp4", body)
-        self.assertIn("still needed", body)
-        self.assertIn("character", body)
-        self.assertIn("outfit", body)
+        self.assertEqual(self.tg.parse_modes[-1], bot.PARSE_HTML)
 
     def test_job_lists_files_still_waiting_for_a_label(self):
         with mock.patch("tgbot.bot.probe", return_value=self.image_probe):
@@ -969,6 +1025,64 @@ class TestFlow(unittest.TestCase):
         with mock.patch("tgbot.bot.probe", return_value=self.driver_probe):
             bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
         self.assertNotIn("low bitrate", self.tg.messages[-1])
+
+
+    def test_a_filename_with_a_bracket_cannot_break_the_message(self):
+        """_esc is the guard, and this is why it is applied to everything.
+
+        A `<` reaching Telegram inside parse_mode=HTML makes it reject the
+        WHOLE sendMessage, so the user gets nothing. _safe_name already strips
+        brackets from staged names, so this is defence in depth rather than a
+        live hole — and the point is that it stays defended when _safe_name
+        changes.
+        """
+        job = bot._job_for(ME)
+        job.slots["character"] = Path("we<ird>.png")
+        job.probes["character"] = self.image_probe
+        body, _ = bot._job_status(ME)
+        self.assertNotIn("<ird", body)
+        # FakeTg._check_markup would have failed the send; assert the escape
+        # directly too, so the reason is visible when this breaks.
+        self.assertIn("&lt;ird&gt;", bot._details_block(ME, job))
+
+    def test_uploading_a_file_shows_a_chat_action_before_the_slow_part(self):
+        # ffprobe on a 25MB video plus the staging copy takes long enough that
+        # a silent bot reads as a stuck one.
+        with mock.patch("tgbot.bot.probe", return_value=self.driver_probe):
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+        self.assertIn("upload_document", self.tg.actions)
+
+    def test_validating_shows_a_chat_action(self):
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+        self.assertIn("typing", self.tg.actions)
+
+    def test_the_review_screen_shows_a_warning_outside_the_collapsed_block(self):
+        # On /job the detail is one tap away; here it must not be. This is the
+        # last thing read before $0.99/hour is committed, and anything needing
+        # a tap to reveal is something that gets skipped.
+        weak = Probe(kind="video", width=1080, height=1920, duration_s=15.0,
+                     bitrate_kbps=865, size_bytes=1_622_500)
+        with mock.patch("tgbot.bot.probe", return_value=weak):
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+        with mock.patch("tgbot.bot.probe", return_value=self.image_probe), \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, doc_from(ME, "character-id"), allowed_user_id=ME)
+            bot.handle(self.tg, cmd_from(ME, "character"), allowed_user_id=ME)
+            bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME)
+            bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME)
+        review = self.tg.messages[-1]
+        before_block = review.split("<blockquote")[0]
+        self.assertIn("low bitrate", before_block)
+
+    def test_the_fix_buttons_are_two_per_row(self):
+        # Four stacked full-width buttons pushed the message they belong to off
+        # the top of a phone screen — that was the original complaint.
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+        rows = bot._fix_buttons(bot._STATE[ME])
+        self.assertTrue(all(len(r) <= 2 for r in rows), rows)
+        self.assertEqual(rows[-1][0][1], bot._CB_CLEAR_ASK)
 
     def test_confirm_calls_start_drain_once_with_dry_run_false(self):
         # Renamed from "...and_nothing_else_does": with drain_running mocked
@@ -1200,8 +1314,8 @@ class TestFlow(unittest.TestCase):
         # instead of dead-ending on "nothing started", which is true but
         # useless while a job is being put together — the state /status is
         # most often asked in.
-        self.assertIn("nothing running", self.tg.messages[-1])
-        self.assertIn("nothing assembled yet", self.tg.messages[-1])
+        self.assertIn("Nothing running", self.tg.messages[-1])
+        self.assertIn("Nothing assembled yet", self.tg.messages[-1])
 
     def test_a_heic_upload_never_overwrites_an_already_accepted_png(self):
         """Regression for finding A (2026-08-31).
@@ -1350,6 +1464,40 @@ class TestSafeNameFoldsDiacritics(unittest.TestCase):
             self.assertNotIn("/", out)
             self.assertNotIn("\\", out)
             self.assertNotIn("..", out)
+
+
+class TestNoDuplicateDefinitions(unittest.TestCase):
+    """A file cannot define the same name twice and still mean one thing.
+
+    Added 2026-08-31 after a patch inserted an entire block of functions that
+    was already present. Python simply re-binds each name, so the LATER
+    definition wins and every test kept passing — 151 duplicated lines,
+    including a second copy of the job-clearing logic, invisible to the whole
+    suite. Editing the earlier copy would have changed nothing at runtime,
+    which is the kind of bug that costs an afternoon.
+    """
+
+    MODULES = ["tgbot/bot.py", "tgbot/job.py", "tgbot/ingest.py",
+               "tgbot/run.py", "tgbot/tgclient.py"]
+
+    def test_no_module_defines_a_top_level_name_twice(self):
+        import ast
+        root = Path(__file__).resolve().parents[1]
+        for rel in self.MODULES:
+            with self.subTest(module=rel):
+                tree = ast.parse((root / rel).read_text(encoding="utf-8"))
+                names = []
+                for node in tree.body:
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                         ast.ClassDef)):
+                        names.append(node.name)
+                    elif isinstance(node, ast.Assign):
+                        names += [t.id for t in node.targets
+                                  if isinstance(t, ast.Name)]
+                    elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                        names.append(node.target.id)
+                dupes = sorted({n for n in names if names.count(n) > 1})
+                self.assertEqual(dupes, [], f"{rel} defines {dupes} more than once")
 
 
 if __name__ == "__main__":

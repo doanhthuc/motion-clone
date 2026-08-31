@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import re
 import shutil
@@ -585,6 +586,7 @@ def _render_and_validate(tg: Tg, chat_id: int, job: Job) -> bool:
         return False
     write_manifest(job, manifest_path, now=time.strftime("%Y-%m-%d %H:%M:%S"))
 
+    tg.send_chat_action(chat_id)
     try:
         result = subprocess.run(
             ["make", "batch-validate", f"FILE={manifest_path}"],
@@ -621,29 +623,21 @@ def _manifest_summary(chat_id: int, job: Job) -> str:
     line and told the reader nothing. The full YAML is still on disk and still
     reachable with /result.
     """
-    lines = [job.pipeline, " -> ".join(PIPELINES[job.pipeline]), ""]
-    for role in sorted(job.slots):
-        p = job.probes.get(role)
-        detail = describe(p).split(" ", 1)[1] if p else "?"
-        lines.append(f"{role} · {job.slots[role].name} · {detail}")
-    unused = sorted(optional_roles(job.pipeline) - set(job.slots))
-    if unused:
-        # Named, not omitted: an optional slot left empty is a choice, and the
-        # review screen is where the user should notice they made it.
-        lines.append(f"(no {' or '.join(unused)})")
+    lines = [f"🎬 <b>{_esc(job.pipeline)}</b>", ""]
+    for role in sorted(required_roles(job.pipeline) | optional_roles(job.pipeline)):
+        lines.append(_role_line(role, job))
+    # Any warning is repeated OUTSIDE the collapsed block here, unlike on /job:
+    # this is the last thing read before $0.99/hour is committed, and something
+    # that needs a tap to reveal is something that gets skipped.
     for role in sorted(job.slots):
         pr = job.probes.get(role)
         warning = quality_warning(pr) if pr else ""
         if warning:
-            # Repeated on the review screen deliberately: this is the last
-            # thing read before $0.99/hour is committed, and a warning shown
-            # only at upload time has scrolled away by now.
-            lines.append(f"\n! {role}: {warning}")
-    lines.append("")
-    lines.append(f"~{estimate_minutes(job)} min · $0.99/hour "
-                 "(estimate measured once on one batch — not a promise)")
-    lines.append(f"manifest: {_job_manifest_path(chat_id).name}")
-    return "\n".join(l for l in lines if l is not None)
+            lines += ["", f"{ICON_WARN} <b>{_esc(role)}</b>: {_esc(warning)}"]
+    lines += ["", _details_block(chat_id, job), "",
+              f"⏱ ~{estimate_minutes(job)} min    💸 $0.99/hour",
+              "<i>estimate measured once on one batch — not a promise</i>"]
+    return "\n".join(lines)
 
 
 def _maybe_show_manifest(tg: Tg, chat_id: int, job: Job) -> None:
@@ -661,7 +655,8 @@ def _maybe_show_manifest(tg: Tg, chat_id: int, job: Job) -> None:
         return
 
     tg.send_message(chat_id, _manifest_summary(chat_id, job),
-                    buttons=[[("Run · $0.99/h", _CB_RUN_ASK)]])
+                    buttons=[[("▶️ Run · $0.99/h", _CB_RUN_ASK)]],
+                    parse_mode=PARSE_HTML)
 
 
 _DRAFT_SUFFIX = ".draft.json"
@@ -773,10 +768,6 @@ _CB_PIPE = "pipe:"
 _CB_RUN_ASK = "run:ask"
 _CB_RUN_GO = "run:go:"      # + the manifest's mtime_ns, see _run_token
 _CB_RUN_NO = "run:no"
-_CB_REDO = "redo:"
-_CB_CLEAR_ASK = "clr:ask"
-_CB_CLEAR_GO = "clr:go"
-_CB_CLEAR_NO = "clr:no"
 _CB_REDO = "redo:"
 _CB_CLEAR_ASK = "clr:ask"
 _CB_CLEAR_GO = "clr:go"
@@ -927,155 +918,84 @@ def _answer_slot(tg: Tg, chat_id: int, role: str) -> None:
 
 
 
-_LAST_SUFFIX = ".last.json"
+# One icon per role, one per state. Ordinary emoji, not Telegram's custom
+# emoji: those are a Premium feature and render as a placeholder for anyone
+# without it, which would put meaning somewhere not everyone can see.
+ROLE_ICON = {"character": "👤", "outfit": "👗", "driver": "🎬", "background": "🖼"}
+ICON_OK = "✅"
+ICON_WARN = "⚠️"
+ICON_EMPTY = "⬜"
+
+PARSE_HTML = "HTML"
 
 
-def _last_path(chat_id: int) -> Path:
-    """The job most recently submitted, kept for /again.
+def _esc(value: object) -> str:
+    """Escape a dynamic value for parse_mode=HTML.
 
-    A separate file from the draft on purpose. _load_draft reads only
-    `.draft.json`, so a submitted job can never be rehydrated into _STATE by a
-    restart and re-confirmed by accident — the property /confirm's clear exists
-    to protect. /again is an explicit request to copy it back.
+    Applied to everything interpolated, not only to what looks dangerous. One
+    stray `<` makes Telegram reject the WHOLE message, so the user sees nothing
+    — the same silence class as the NON_FILE_MEDIA bug. Staged filenames are
+    already reduced to [A-Za-z0-9._-] by _safe_name, so nothing can carry a
+    bracket today; this stops that from being load-bearing.
     """
-    return ROOT / "batch" / f"tg-{chat_id}{_LAST_SUFFIX}"
+    return html.escape(str(value), quote=False)
 
 
-def _job_status(chat_id: int) -> tuple[str, list[list[tuple[str, str]]]]:
-    """What is assembled, what is missing, and the buttons to fix it.
+def _compact(p: Probe) -> str:
+    """Resolution and size only — the two numbers worth a glance.
 
-    Added 2026-08-31. Until this existed there was no way to ask the bot what
-    it was holding: when a slot label went missing, the only way to find out
-    was a screenshot of the chat. The draft was on disk and the answer was
-    always knowable — nothing exposed it.
+    Duration and bitrate move into the expandable block. They matter (bitrate
+    is how a re-compressed driver is caught) but they are diagnostic, and five
+    figures per line is what made the first version of this screen a wall of
+    text the user could not read.
     """
-    job = _STATE.get(chat_id)
-    if job is None:
-        return ("nothing assembled yet. Send a file as a File and I will "
-                "measure it.", [])
-    lines = [job.pipeline, " -> ".join(PIPELINES[job.pipeline]), ""]
-    buttons: list[list[tuple[str, str]]] = []
-    if job.slots:
-        for role in sorted(job.slots):
-            pr = job.probes.get(role)
-            detail = describe(pr).split(" ", 1)[1] if pr else "?"
-            lines.append(f"{role} \u00b7 {job.slots[role].name} \u00b7 {detail}")
-            warning = quality_warning(pr) if pr else ""
-            if warning:
-                lines.append(f"  ! {warning}")
-            buttons.append([(f"re-label {role}", _CB_REDO + role)])
-    else:
-        lines.append("(no slots filled)")
-    missing = sorted(missing_slots(job))
-    if missing:
-        lines.append("")
-        lines.append(f"still needed: {', '.join(missing)}")
-    queued = _PENDING.get(chat_id) or []
-    if queued:
-        lines.append(f"waiting for a label: {', '.join(q[0].name for q in queued)}")
-    if job.slots:
-        buttons.append([("Start over", _CB_CLEAR_ASK)])
-    return "\n".join(lines), buttons
+    return f"{p.width}×{p.height} · {p.size_bytes / 1_000_000:.1f} MB"
 
 
-def _redo_slot(tg: Tg, chat_id: int, role: str) -> None:
-    """Put a filled slot's file back at the head of the queue and re-ask.
-
-    The only previous way to correct a mis-labelled file was to send it again
-    so _fill_slot would overwrite the slot — which means re-uploading, and only
-    works if the file is still to hand. On 2026-08-31 the actual recovery was
-    hand-editing a JSON file on the host.
-    """
-    job = _STATE.get(chat_id)
-    if job is None or role not in job.slots:
-        tg.send_message(chat_id, f"nothing is in {role} right now")
-        return
+def _role_line(role: str, job: Job) -> str:
+    """One line per slot: state, role icon, name, the two headline numbers."""
+    icon_role = ROLE_ICON.get(role, "")
+    if role not in job.slots:
+        tail = "" if role in required_roles(job.pipeline) else " — optional"
+        return f"{ICON_EMPTY} {icon_role} {_esc(role)}{tail}"
     pr = job.probes.get(role)
-    if pr is not None and pr.kind == "video":
-        # slot_for assigns a video to `driver` structurally, so there is no
-        # other role to move it to. Saying so beats re-asking a question that
-        # has one possible answer.
-        tg.send_message(chat_id, "a video can only be the driver — send a "
-                                 "different video as a File to replace it")
-        return
-    path = job.slots.pop(role)
-    job.probes.pop(role, None)
-    _LAST_VALIDATE.pop(chat_id, None)
-    _CONFIRM_WARNED.discard(chat_id)
-    # At the FRONT: the user asked about this file, so it is the one to ask
-    # about, ahead of anything already parked.
-    _PENDING.setdefault(chat_id, []).insert(0, (path, pr))
-    tg.send_message(chat_id, f"{path.name} is out of {role}")
-    _ask_about(tg, chat_id, pr, job.pipeline)
+    state = ICON_WARN if (pr and quality_warning(pr)) else ICON_OK
+    detail = f" · {_compact(pr)}" if pr else ""
+    return f"{state} {icon_role} {_esc(role)}{detail}"
 
 
-def _clear_job(tg: Tg, chat_id: int) -> None:
-    """Throw away the draft, the queue and the staged files for this chat."""
-    if drain_running(_job_manifest_path(chat_id)):
-        # The staged files ARE the running job's inputs — the manifest points
-        # straight at them — so deleting them mid-drain breaks a run already
-        # being paid for.
-        tg.send_message(chat_id, "a drain is running for this job — clearing "
-                                 "now would delete the files it is reading. "
-                                 "Wait for it, then /clear.")
-        return
-    staged = ROOT / "batch" / STAGING_DIR_NAME / str(chat_id)
-    removed = 0
-    if staged.exists():
-        removed = sum(1 for f in staged.rglob("*") if f.is_file())
-        shutil.rmtree(staged, ignore_errors=True)
-    _STATE.pop(chat_id, None)
-    _PENDING.pop(chat_id, None)
-    _LAST_VALIDATE.pop(chat_id, None)
-    _CONFIRM_WARNED.discard(chat_id)
-    # handle()'s finally calls _save_draft, which deletes the draft file itself
-    # now that there is no state left to write.
-    tg.send_message(chat_id, f"cleared — {removed} staged file(s) deleted. "
-                             f"Send a file to start again.")
+def _details_block(chat_id: int, job: Job) -> str:
+    """The expandable blockquote: full measurements and any warnings.
 
-
-def _again(tg: Tg, chat_id: int) -> None:
-    """Rebuild the last submitted job so it can be re-run with one thing changed.
-
-    This repo's working method is A/B: change one variable, hold the rest. Until
-    now /confirm cleared the draft, so re-running the same material with a
-    different pipeline meant re-uploading every file.
+    Collapsed by default so the screen stays scannable, but one tap away.
+    Measuring on arrival is the point of spec section 4.3, and the bitrate
+    figure must not become unreachable in the name of tidiness.
     """
-    if _STATE.get(chat_id) is not None:
-        # Refuse rather than overwrite: a half-built job is work already done
-        # and nothing else would recover it.
-        tg.send_message(chat_id, "you have a job in progress — /job to see it, "
-                                 "/clear to drop it, then /again")
-        return
-    path = _last_path(chat_id)
-    if not path.exists():
-        tg.send_message(chat_id, "nothing to repeat yet — /again reuses the "
-                                 "material from the last job you ran")
-        return
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        pipeline = payload["pipeline"]
-        if pipeline not in PIPELINES:
-            raise ValueError(f"unknown pipeline {pipeline!r}")
-        slots = {r: Path(v) for r, v in payload["slots"].items()}
-        probes = {r: Probe(**d) for r, d in payload["probes"].items()}
-    except (ValueError, KeyError, TypeError) as exc:
-        log(f"last-job file for chat {chat_id} is unreadable: {exc!r}")
-        tg.send_message(chat_id, "the last job's record is unreadable — send "
-                                 "the files again")
-        return
-    # The staged files may have been swept by `make batch-clean` or /clear
-    # since. Named individually: "some files are missing" is not actionable.
-    gone = sorted(r for r, sp in slots.items() if not sp.is_file())
-    if gone:
-        tg.send_message(chat_id,
-                        "cannot repeat that job — these files are no longer on "
-                        f"disk: {', '.join(f'{r} ({slots[r].name})' for r in gone)}")
-        return
-    _STATE[chat_id] = Job(slots=slots, probes=probes, pipeline=pipeline)
-    tg.send_message(chat_id, f"reusing the last job's {len(slots)} file(s). "
-                             f"/pipeline to change the flow, then Run.")
-    _maybe_show_manifest(tg, chat_id, _STATE[chat_id])
+    lines = [_esc(" → ".join(PIPELINES[job.pipeline]))]
+    for role in sorted(job.slots):
+        pr = job.probes.get(role)
+        if pr is None:
+            continue
+        lines += ["", f"<b>{_esc(role)}</b> · {_esc(job.slots[role].name)}",
+                  _esc(describe(pr))]
+        warning = quality_warning(pr)
+        if warning:
+            lines.append(f"{ICON_WARN} {_esc(warning)}")
+    lines += ["", f"manifest: {_esc(_job_manifest_path(chat_id).name)}"]
+    return "<blockquote expandable>" + "\n".join(lines) + "</blockquote>"
+
+
+def _fix_buttons(job: Job) -> list[list[tuple[str, str]]]:
+    """Re-label buttons two per row, then Start over.
+
+    Two per row, not one: four stacked full-width buttons pushed the message
+    they belong to off the top of a phone screen.
+    """
+    labels = [(f"🔁 {r}", _CB_REDO + r) for r in sorted(job.slots)]
+    rows = [labels[i:i + 2] for i in range(0, len(labels), 2)]
+    if labels:
+        rows.append([("🗑 clear", _CB_CLEAR_ASK)])
+    return rows
 
 
 _LAST_SUFFIX = ".last.json"
@@ -1102,31 +1022,23 @@ def _job_status(chat_id: int) -> tuple[str, list[list[tuple[str, str]]]]:
     """
     job = _STATE.get(chat_id)
     if job is None:
-        return ("nothing assembled yet. Send a file as a File and I will "
-                "measure it.", [])
-    lines = [job.pipeline, " -> ".join(PIPELINES[job.pipeline]), ""]
-    buttons: list[list[tuple[str, str]]] = []
-    if job.slots:
-        for role in sorted(job.slots):
-            pr = job.probes.get(role)
-            detail = describe(pr).split(" ", 1)[1] if pr else "?"
-            lines.append(f"{role} · {job.slots[role].name} · {detail}")
-            warning = quality_warning(pr) if pr else ""
-            if warning:
-                lines.append(f"  ! {warning}")
-            buttons.append([(f"re-label {role}", _CB_REDO + role)])
-    else:
-        lines.append("(no slots filled)")
-    missing = sorted(missing_slots(job))
-    if missing:
-        lines.append("")
-        lines.append(f"still needed: {', '.join(missing)}")
+        return ("📎 <b>Nothing assembled yet.</b>\nSend a file as a "
+                "<b>File</b> and I will measure it.", [])
+    lines = [f"🎬 <b>{_esc(job.pipeline)}</b>", ""]
+    # Every role of the pipeline, filled or not — an empty required slot is the
+    # thing the user most needs to see, and listing only what is present hides
+    # exactly that.
+    for role in sorted(required_roles(job.pipeline) | optional_roles(job.pipeline)):
+        lines.append(_role_line(role, job))
     queued = _PENDING.get(chat_id) or []
     if queued:
-        lines.append(f"waiting for a label: {', '.join(q[0].name for q in queued)}")
+        lines += ["", f"⏳ waiting for a label: "
+                      f"{_esc(', '.join(q[0].name for q in queued))}"]
     if job.slots:
-        buttons.append([("Start over", _CB_CLEAR_ASK)])
-    return "\n".join(lines), buttons
+        lines += ["", _details_block(chat_id, job)]
+    if not missing_slots(job):
+        lines += ["", f"⏱ ~{estimate_minutes(job)} min    💸 $0.99/h"]
+    return "\n".join(lines), _fix_buttons(job)
 
 
 def _redo_slot(tg: Tg, chat_id: int, role: str) -> None:
@@ -1399,6 +1311,9 @@ def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
         # that touches the host filesystem — it raises RuntimeError itself so
         # the token in the source path can never reach the reply, but a
         # mkdir/stat on the way there can still surface as a plain OSError.
+        # Before the slow part, not after: ffprobe on a 25MB video plus the
+        # staging copy is long enough that a silent bot reads as a stuck one.
+        tg.send_chat_action(chat_id, "upload_document")
         try:
             src = Path(tg.call("getFile", file_id=doc["file_id"])["file_path"])
             path = _stage_file(chat_id, src, doc.get("file_name"))
@@ -1511,8 +1426,8 @@ def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
             # useless while a job is being assembled, which is most of the
             # time /status gets asked. Answer the question actually being put.
             body, buttons = _job_status(chat_id)
-            tg.send_message(chat_id, f"nothing running.\n\n{body}",
-                            buttons=buttons or None)
+            tg.send_message(chat_id, f"💤 <b>Nothing running.</b>\n\n{body}",
+                            buttons=buttons or None, parse_mode=PARSE_HTML)
             return
         tg.send_message(chat_id, progress_text(manifest_path,
                                                lease=lease_for(manifest_path)))
@@ -1524,7 +1439,8 @@ def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
 
     if text.startswith("/job"):
         body, buttons = _job_status(chat_id)
-        tg.send_message(chat_id, body, buttons=buttons or None)
+        tg.send_message(chat_id, body, buttons=buttons or None,
+                        parse_mode=PARSE_HTML)
         return
 
     if text.startswith("/clear"):

@@ -85,10 +85,34 @@ class Tg:
                                      for label, data in row] for row in rows]}
 
     def send_message(self, chat_id: int, text: str, *,
-                     buttons: list[list[tuple[str, str]]] | None = None) -> int:
+                     buttons: list[list[tuple[str, str]]] | None = None,
+                     parse_mode: str | None = None) -> int:
+        """Send text, optionally with an inline keyboard and formatting.
+
+        parse_mode="HTML" is opt-in per call, and HTML rather than MarkdownV2
+        on purpose: MarkdownV2 requires escaping fifteen characters including
+        `.`, `-` and `!`, all of which occur in ordinary filenames and
+        measurements. An unescaped one makes Telegram reject the WHOLE message,
+        so the user sees nothing at all. HTML needs only &, < and > escaped.
+        Callers must still escape every dynamic value they interpolate.
+        """
         markup = self.keyboard(buttons) if buttons else None
         return int(self.call("sendMessage", chat_id=chat_id, text=text,
-                             reply_markup=markup)["message_id"])
+                             reply_markup=markup,
+                             parse_mode=parse_mode)["message_id"])
+
+    def send_chat_action(self, chat_id: int, action: str = "typing") -> None:
+        """Show "typing…"/"uploading…" while something slow happens.
+
+        Best-effort: this is feedback, not work. ffprobe on a 25MB video and
+        `make batch-validate` both take long enough that a silent bot looks
+        stuck, and this is the only in-band way to say "still here" without
+        sending a message that has to be scrolled past afterwards.
+        """
+        try:
+            self.call("sendChatAction", chat_id=chat_id, action=action)
+        except TgError:
+            pass
 
     def answer_callback_query(self, callback_id: str, text: str = "") -> None:
         """Acknowledge a button press.
@@ -105,9 +129,11 @@ class Tg:
         except TgError:
             pass
 
-    def edit_message(self, chat_id: int, message_id: int, text: str) -> None:
+    def edit_message(self, chat_id: int, message_id: int, text: str, *,
+                     parse_mode: str | None = None) -> None:
         try:
-            self.call("editMessageText", chat_id=chat_id, message_id=message_id, text=text)
+            self.call("editMessageText", chat_id=chat_id, message_id=message_id,
+                      text=text, parse_mode=parse_mode)
         except TgError as exc:
             # Editing to identical text is an error in the Bot API and is
             # meaningless here — the progress loop re-renders on a timer.
