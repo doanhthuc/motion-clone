@@ -1,4 +1,4 @@
-import json, subprocess, sys, tempfile, unittest
+import json, subprocess, sys, tempfile, time, unittest
 from pathlib import Path
 from unittest import mock
 
@@ -289,6 +289,7 @@ class TestPipelineCommand(unittest.TestCase):
     def setUp(self):
         bot._STATE.clear()
         bot._LOADED.clear()
+        bot._LAST_PROGRESS_EDIT.clear()
         bot._PENDING.clear()
         bot._LAST_VALIDATE.clear()
         bot._CONFIRM_WARNED.clear()
@@ -424,6 +425,7 @@ class TestDraftPersistence(unittest.TestCase):
     def _restart(self):
         bot._STATE.clear()
         bot._LOADED.clear()
+        bot._LAST_PROGRESS_EDIT.clear()
         bot._PENDING.clear()
         bot._LAST_VALIDATE.clear()
         bot._CONFIRM_WARNED.clear()
@@ -641,6 +643,7 @@ class TestFlow(unittest.TestCase):
         bot.ROOT = self.root
         bot._STATE.clear()
         bot._LOADED.clear()
+        bot._LAST_PROGRESS_EDIT.clear()
         bot._PENDING.clear()
         bot._LAST_VALIDATE.clear()
         bot._CONFIRM_WARNED.clear()
@@ -672,6 +675,7 @@ class TestFlow(unittest.TestCase):
         bot.ROOT = self._orig_root
         bot._STATE.clear()
         bot._LOADED.clear()
+        bot._LAST_PROGRESS_EDIT.clear()
         bot._PENDING.clear()
         bot._LAST_VALIDATE.clear()
         bot._CONFIRM_WARNED.clear()
@@ -1114,12 +1118,50 @@ class TestFlow(unittest.TestCase):
     def test_a_tick_edits_the_message_instead_of_sending_a_new_one(self):
         self._confirm_and_start()
         before = len(self.tg.messages)
+        # Past the throttle window, so the edit is due.
+        bot._LAST_PROGRESS_EDIT[ME] = 0.0
         with mock.patch("tgbot.bot.drain_running", return_value=True):
             bot.tick_progress(self.tg, ME)
-            bot.tick_progress(self.tg, ME)
         self.assertEqual(len(self.tg.messages), before)   # nothing new sent
-        self.assertEqual(len(self.tg.edits), 2)
+        self.assertEqual(len(self.tg.edits), 1)
         self.assertTrue(bot._progress_path(ME).exists())
+
+    def test_the_edit_is_throttled_but_the_poll_is_not(self):
+        """Set to 5 minutes on the user's request: "cho poll 5p một lần thôi".
+
+        An edit sends no notification, but it does bump the chat to the top of
+        their list, and once a minute for 68 minutes is noise. What must NOT
+        slow down is the loop itself — get_updates long-polls 50s and that is
+        how a button press is received, so throttling the loop would put up to
+        five minutes between a tap and its reply.
+        """
+        self._confirm_and_start()
+        with mock.patch("tgbot.bot.drain_running", return_value=True):
+            # Straight after _start_progress: the message already shows the
+            # current state, so nothing is due yet.
+            bot.tick_progress(self.tg, ME)
+            self.assertEqual(self.tg.edits, [])
+            # Still inside the window.
+            bot._LAST_PROGRESS_EDIT[ME] = time.time() - bot.PROGRESS_EVERY_SEC + 30
+            bot.tick_progress(self.tg, ME)
+            self.assertEqual(self.tg.edits, [])
+            # Past it.
+            bot._LAST_PROGRESS_EDIT[ME] = time.time() - bot.PROGRESS_EVERY_SEC
+            bot.tick_progress(self.tg, ME)
+            self.assertEqual(len(self.tg.edits), 1)
+
+    def test_the_result_is_not_delayed_by_the_edit_throttle(self):
+        # The completion check runs every loop, unlike the edit: waiting up to
+        # five minutes to be told a 68-minute job has finished would be a worse
+        # bargain than the noise it saves.
+        self._confirm_and_start()
+        self.assertIn(ME, bot._LAST_PROGRESS_EDIT)      # window just opened
+        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.deliver_result") as deliver:
+            bot.tick_progress(self.tg, ME)
+            deliver.assert_called_once()
+        self.assertEqual(len(self.tg.edits), 1)         # final edit still happened
+        self.assertNotIn(ME, bot._LAST_PROGRESS_EDIT)
 
     def test_when_the_drain_ends_the_result_is_delivered_unasked(self):
         """The gap deliver_result's own docstring described.
@@ -1261,6 +1303,7 @@ class TestFlow(unittest.TestCase):
         # a different preset from the 5-second one above.
         bot._STATE.clear()
         bot._LOADED.clear()
+        bot._LAST_PROGRESS_EDIT.clear()
         bot._PENDING.clear()
         bot._LAST_VALIDATE.clear()
         second_driver = self.root / "driver2.mp4"

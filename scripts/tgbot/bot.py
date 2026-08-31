@@ -1059,6 +1059,22 @@ def _fix_buttons(job: Job) -> list[list[tuple[str, str]]]:
 
 _PROGRESS_SUFFIX = ".progress.json"
 
+# How often the progress message is re-edited. Set to 5 minutes on the user's
+# request, 2026-08-31: an edit sends no notification, but it does bump the chat
+# to the top of their list, and once a minute for 68 minutes is noise.
+#
+# This throttles the EDIT only, never the poll. get_updates long-polls for 50s
+# and the loop must keep waking at that rate, because that is how a button
+# press is received — slowing it down would put up to 5 minutes between a tap
+# and its reply. The completion check runs every loop too (drain_running is a
+# Popen.poll plus a small file read), so the result still arrives the moment the
+# drain ends rather than at the next 5-minute boundary.
+PROGRESS_EVERY_SEC = 300
+
+# In process, not on disk: a restart mid-drain simply edits once immediately,
+# which is what you want anyway — the message may be minutes stale by then.
+_LAST_PROGRESS_EDIT: dict[int, float] = {}
+
 
 def _progress_path(chat_id: int) -> Path:
     """Which message to keep editing while a drain runs, and with what stages.
@@ -1078,6 +1094,9 @@ def _start_progress(tg: Tg, chat_id: int, manifest_path: Path,
     text = progress_text(manifest_path, lease=lease_for(manifest_path),
                          stages=stages)
     message_id = tg.send_message(chat_id, text, parse_mode=PARSE_HTML)
+    # Seeded, so the first edit is PROGRESS_EVERY_SEC away rather than on the
+    # next poll: this message already shows the current state.
+    _LAST_PROGRESS_EDIT[chat_id] = time.time()
     _progress_path(chat_id).write_text(json.dumps({
         "manifest": str(manifest_path), "message_id": message_id,
         "stages": stages}, indent=2), encoding="utf-8")
@@ -1111,9 +1130,19 @@ def tick_progress(tg: Tg, chat_id: int) -> None:
         path.unlink(missing_ok=True)
         return
 
+    # Checked every loop, unlike the edit: the result should land the moment
+    # the drain ends, not at the next 5-minute boundary.
+    running = drain_running(manifest_path)
+    due = time.time() - _LAST_PROGRESS_EDIT.get(chat_id, 0.0) >= PROGRESS_EVERY_SEC
+    if running and not due:
+        # Return before progress_text, so a throttled tick does not even read
+        # the journal off disk 60 times an hour for nothing.
+        return
+
     text = progress_text(manifest_path, lease=lease_for(manifest_path),
                          stages=stages)
-    if drain_running(manifest_path):
+    _LAST_PROGRESS_EDIT[chat_id] = time.time()
+    if running:
         tg.edit_message(chat_id, message_id, text, parse_mode=PARSE_HTML)
         return
 
@@ -1121,6 +1150,7 @@ def tick_progress(tg: Tg, chat_id: int) -> None:
     # files. The progress file goes first: if delivery raises, the next tick
     # must not deliver a second copy of everything.
     path.unlink(missing_ok=True)
+    _LAST_PROGRESS_EDIT.pop(chat_id, None)
     tg.edit_message(chat_id, message_id, text, parse_mode=PARSE_HTML)
     deliver_result(tg, chat_id, manifest_path)
 
