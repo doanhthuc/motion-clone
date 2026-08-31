@@ -84,10 +84,22 @@ different answers.
 Telegram only re-encodes media sent as *photo* or *video*. Sent as **File / Document** the bytes are
 untouched. On iOS that means `📎 → File`, not the Photos tab.
 
-The bot **rejects `message.photo` outright**: "That was sent as a photo, so Telegram already
-compressed it. Send it again with 📎 → File." Only `message.document` is accepted. This converts a
-silent quality loss into a loud error — the same principle as the four silent param traps in
-[batch-runner.md §2.4](../../batch-runner.md).
+The bot **rejects every non-File message kind outright** (`bot.NON_FILE_MEDIA`) and accepts only
+`message.document`. This converts a silent quality loss into a loud error — the same principle as
+the four silent param traps in [batch-runner.md §2.4](../../batch-runner.md).
+
+> **Corrected 2026-08-31 after measuring.** This section originally specified rejecting
+> `message.photo` alone, and the implementation matched it. But the iOS Photo/Video tab — the
+> default tab, whose "1080p" option reads as lossless — delivers a driver as **`message.video`**,
+> not `message.photo`. That matched neither the photo branch nor the document branch, fell through
+> to the text handlers as `""`, matched no command, and **the bot replied nothing at all**. The
+> most likely wrong move a user can make produced silence, which is worse than the loss it hides:
+> a refusal can be acted on, silence looks like a broken bot.
+>
+> It is the first mistake made while taking the §13 measurement, on the first attempt. The refusal
+> now covers `photo`, `video`, `animation`, `audio`, `voice`, `video_note` and `sticker`, and the
+> message carries the measured cost so the reason is not a matter of trust. See §13 item 1 for the
+> numbers.
 
 ### 4.2 The size caps — corrected 2026-08-31, and the binding one is the OUTPUT
 
@@ -476,11 +488,26 @@ Bot API server.
 
 ## 13. Unknowns — measure before building on them
 
-Both are cheap and must be done first:
+1. ~~**Does Telegram preserve bytes for a `.MP4` sent as File?**~~ **Answered 2026-08-31: yes,
+   exactly.** Sent `out/2026-08-23-1540/_final/nhanvat1__dandong-3.mp4` (24,558,897 bytes,
+   1088x1920, 13,275 kbps) from the iPhone client through a local `telegram-bot-api` server. It
+   arrived as `message.document` at **24,558,897 bytes, sha256 `fce94a50…b217` — identical**, and
+   `ingest.probe()` read back the same 1088x1920 / 14.8s / 13,275 kbps.
 
-1. **Does Telegram preserve bytes for a `.MP4` sent as File?** Verify with `sha256` at both ends,
-   from the actual iPhone client, for both an image and a 25MB video. Everything in §4 assumes yes.
-   If it does not hold, the ingest channel has to change before anything else is built.
+   The same file, same phone, sent via **Photo/Video with the "1080p" option** instead: resolution
+   and frame count survive untouched (1088x1920, 444 frames, 14.8s) but the bitrate is **halved,
+   13,196 → 6,603 kbps, and the file loses 49.8%** of its bytes. So the damage the File rule
+   prevents is not a smaller frame — it is every frame re-compressed, which is invisible in a file
+   listing and invisible in a still, and is exactly what the chroma/exposure/jitter measurements in
+   this repo are sensitive to. §4.1's "attach as File, never as Photo" now has a number behind it.
+
+   Two side findings from the same run, both worth keeping:
+   - **Telegram's own `video.width`/`video.height` are not the stream's.** It reported `480x848`
+     for a stream that ffprobe reads as `1088x1920`. Any code trusting those fields is wrong by
+     nearly 2x per axis; `ingest.probe()` shells out to ffprobe and so never sees them.
+   - **`getFile` really does return a path containing the bot token**
+     (`/var/lib/telegram-bot-api/<token>/documents/file_1.mp4`), confirming finding I5 was real
+     rather than theoretical. Staging into `batch/tg-staging/` is what keeps it out of messages.
 2. **How long does `gpu-bootstrap` take when models are already on the Network Volume?** It is added
    to every single drain and is currently unmeasured. It also sets the floor for the stockout
    economics table in §9.

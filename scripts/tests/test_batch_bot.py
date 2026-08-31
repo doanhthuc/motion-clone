@@ -31,6 +31,15 @@ def doc_from(user_id: int, file_id: str, file_name: str | None = None) -> dict:
                         "document": doc}}
 
 
+def media_from(user_id: int, kind: str) -> dict:
+    # `photo` is the one kind the Bot API delivers as a list (one entry per
+    # generated thumbnail size); the rest are plain objects. Only the presence
+    # of the key matters to the branch under test.
+    payload = [{"file_id": "x"}] if kind == "photo" else {"file_id": "x"}
+    return {"message": {"from": {"id": user_id}, "chat": {"id": user_id},
+                        kind: payload}}
+
+
 class FakeTg:
     """Records calls instead of touching the network. `call()` only needs to
     answer getFile — /tryon, /result and the document-ingest flow (Task 7)
@@ -81,6 +90,53 @@ class TestAllowed(unittest.TestCase):
         group = {"message": {"from": {"id": ME}, "chat": {"id": -1001234567890},
                              "text": "/start"}}
         self.assertFalse(allowed(group, ME))
+
+
+class TestNonFileMediaIsRefused(unittest.TestCase):
+    """Measured 2026-08-31 by sending the same driver from the same iPhone
+    twice. As a File: 24,558,897 bytes in and out, sha256 identical. Through
+    the Photo/Video tab's "1080p" option: 1088x1920 and 444 frames both
+    survive, the bitrate is halved (13,196 -> 6,603 kbps) and 49.8% of the
+    bytes are gone — a loss invisible in a file listing and in a still.
+
+    Before NON_FILE_MEDIA only `photo` was checked. A `video` — which is what
+    that tab produces for a driver, and the first mistake made while taking
+    the measurement above — matched neither media branch, fell through to the
+    text handlers as "", matched no command, and drew NO reply at all. The
+    user waits on a bot that never saw the file.
+    """
+
+    def test_a_video_is_refused_rather_than_silently_ignored(self):
+        tg = FakeTg()
+        bot.handle(tg, media_from(ME, "video"), allowed_user_id=ME)
+        self.assertEqual(len(tg.messages), 1)
+        self.assertIn("not a File", tg.messages[0])
+        self.assertIn("video", tg.messages[0])
+
+    def test_a_photo_is_still_refused(self):
+        tg = FakeTg()
+        bot.handle(tg, media_from(ME, "photo"), allowed_user_id=ME)
+        self.assertEqual(len(tg.messages), 1)
+        self.assertIn("paperclip", tg.messages[0])
+
+    def test_every_non_file_kind_draws_exactly_one_reply(self):
+        # The point is coverage of the whole tuple: any kind added later that
+        # forgets a reply reintroduces the silence this class exists for.
+        for kind in bot.NON_FILE_MEDIA:
+            with self.subTest(kind=kind):
+                tg = FakeTg()
+                bot.handle(tg, media_from(ME, kind), allowed_user_id=ME)
+                self.assertEqual(len(tg.messages), 1, f"{kind} drew no reply")
+                # Ingest must not be reached at all: FakeTg.call() raises on
+                # any method, so a getFile here would fail this test loudly.
+                self.assertEqual(tg.documents, [])
+
+    def test_a_stranger_sending_a_video_still_gets_silence(self):
+        # allowed() runs before this branch and must keep doing so — a refusal
+        # message would confirm to a stranger that the bot exists.
+        tg = FakeTg()
+        bot.handle(tg, media_from(99999, "video"), allowed_user_id=ME)
+        self.assertEqual(tg.messages, [])
 
 
 class TestSafeName(unittest.TestCase):

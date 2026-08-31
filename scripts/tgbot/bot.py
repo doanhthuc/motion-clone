@@ -107,6 +107,27 @@ _CONFIRM_WARNED: set[int] = set()
 # a phone is readable.
 STAGING_DIR_NAME = "tg-staging"
 
+# Every message kind that is NOT the File path, and so must be refused.
+#
+# Measured 2026-08-31, sending out/2026-08-23-1540/_final/nhanvat1__dandong-3.mp4
+# from the iPhone client twice. As a File: 24,558,897 bytes in, 24,558,897 out,
+# sha256 identical. Through the Photo/Video tab with its "1080p" option: the
+# frame (1088x1920) and the frame count (444) both survive untouched, but the
+# bitrate is HALVED — 13,196 -> 6,603 kbps — and 49.8% of the bytes are gone.
+# So the loss this refusal prevents is not a smaller picture, it is every frame
+# re-compressed: invisible in a file listing, invisible in a still, and exactly
+# what this repo's chroma/exposure/jitter measurements are sensitive to.
+#
+# `video` is why this list exists rather than a bare `msg.get("photo")` check.
+# The Photo/Video tab is the iOS default and its "1080p" label reads as
+# lossless, so it is the first mistake a real user makes — it was the first
+# mistake made while measuring the above. A `video` matched neither the photo
+# branch nor the document branch, fell through to the text handlers as "",
+# matched no command, and the bot replied NOTHING AT ALL. Silence on the most
+# likely wrong move is worse than the quality loss it hides.
+NON_FILE_MEDIA = ("photo", "video", "animation", "audio",
+                  "voice", "video_note", "sticker")
+
 # Filenames are re-spelled into this alphabet before they are written or put
 # into a manifest. job.py's render_manifest emits `      <slot>: <path>` as a
 # PLAIN (unquoted) YAML scalar, so a space or a ": " anywhere in that line
@@ -493,12 +514,16 @@ def handle(tg: Tg, update: dict, *, allowed_user_id: int,
     msg = update["message"]
     chat_id = msg["chat"]["id"]
 
-    if msg.get("photo"):
-        # Telegram re-encodes anything sent through the photo path. Accepting it
-        # would put a silently degraded image into a $0.99/hour render.
+    # Accepting any of these would put a silently degraded input into a
+    # $0.99/hour render; ignoring them leaves the user watching a chat that
+    # never answers. See NON_FILE_MEDIA for the measurement.
+    kind = next((k for k in NON_FILE_MEDIA if msg.get(k)), None)
+    if kind:
         tg.send_message(chat_id,
-                        "That was sent as a photo, so Telegram already compressed it.\n"
-                        "Send it again with the paperclip -> File.")
+                        f"That arrived as a {kind}, not a File, so Telegram "
+                        "re-encoded it — measured 2026-08-31: same 1088x1920 "
+                        "frame, but half the bitrate and 49.8% of the bytes "
+                        "gone.\nSend it again with the paperclip -> File.")
         return
 
     doc = msg.get("document")
