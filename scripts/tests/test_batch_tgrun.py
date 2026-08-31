@@ -1,6 +1,10 @@
 # scripts/tests/test_batch_tgrun.py
+import json
 import subprocess
-import sys, tempfile, unittest
+import sys
+import tempfile
+import time
+import unittest
 from pathlib import Path
 from unittest import mock
 
@@ -202,6 +206,62 @@ class TestDelivery(unittest.TestCase):
         (batch / "runs" / "job" / "pod-job.log").write_text("boom", encoding="utf-8")
         text = summary_text(batch)
         self.assertIn("job", text)
+
+class TestProgressBar(unittest.TestCase):
+    """The bar, added 2026-08-31 with the auto-updating progress message."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.manifest = self.root / "m.yaml"
+        self.manifest.write_text("runs: []\n", encoding="utf-8")
+
+    def _state(self, payload):
+        state_path_for(self.manifest).write_text(json.dumps(payload),
+                                                encoding="utf-8")
+
+    def test_the_bar_counts_against_the_planned_stages_not_the_seen_ones(self):
+        """Why `stages` is a parameter at all.
+
+        The journal records only stages that have already begun, so a bar
+        computed from it alone would read 1/1 while the first of three ran, and
+        never move. The denominator has to come from the pipeline.
+        """
+        self._state({"batch": "b", "runs": {"job": {"status": "running", "stages": {
+            "tryon": {"status": "done", "sec": 351},
+            "motion": {"status": "running"}}}}})
+        text = progress_text(self.manifest, lease=None,
+                             stages=["tryon", "motion", "enhance"])
+        self.assertIn("1/3", text)
+        self.assertIn("▰▱▱", text)
+        self.assertIn("motion running", text)
+        # A stage not started yet is listed, not omitted — otherwise the user
+        # cannot see what is still to come.
+        self.assertIn("enhance", text)
+
+    def test_a_failed_stage_is_marked_and_the_run_is_called_failed(self):
+        self._state({"batch": "b", "runs": {"job": {"status": "error", "stages": {
+            "tryon": {"status": "done", "sec": 351},
+            "motion": {"status": "error"}}}}})
+        text = progress_text(self.manifest, lease=None,
+                            stages=["tryon", "motion", "enhance"])
+        self.assertIn("❌", text)
+        self.assertIn("this run failed", text)
+
+    def test_before_the_pod_reports_anything_it_says_so(self):
+        self._state({"batch": "b", "runs": {}})
+        self.assertIn("waiting for the pod",
+                      progress_text(self.manifest, lease=None, stages=["tryon"]))
+
+    def test_the_lease_line_reports_money_already_spent(self):
+        # Elapsed, not predicted: the pod bills from provisioned_at whether or
+        # not a stage is moving, so this is the number that costs money.
+        from batchlib_ext.lease import Lease
+        self._state({"batch": "b", "runs": {}})
+        lease = Lease(pod_id="p1", provisioned_at=time.time() - 3600,
+                      manifest=str(self.manifest), abs_max_min=240)
+        text = progress_text(self.manifest, lease=lease, stages=["tryon"])
+        self.assertIn("60 min on the pod", text)
+        self.assertIn("$0.99", text)
 
 
 if __name__ == "__main__":

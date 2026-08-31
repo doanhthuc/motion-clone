@@ -17,7 +17,9 @@ gone by the time someone asks.
 """
 from __future__ import annotations
 
+import html
 import subprocess
+import time
 from pathlib import Path
 
 # Relies on the caller having put scripts/ on sys.path (bot.py does this at
@@ -74,8 +76,9 @@ def estimate_minutes(job: Job) -> int:
     return max(1, round(total_sec / 60))
 
 
-def progress_text(manifest_path: Path, *, lease) -> str:
-    """Render one progress message from the journal alone.
+def progress_text(manifest_path: Path, *, lease,
+                  stages: list[str] | None = None) -> str:
+    """Render one progress message from the journal alone. Returns HTML.
 
     `lease` (batchlib_ext.lease.Lease | None) is used only for its own
     fields (pod_id, provisioned_at) already written to disk at provision
@@ -83,24 +86,53 @@ def progress_text(manifest_path: Path, *, lease) -> str:
     the thing that may already be destroyed by the time this renders, while
     the journal (load_state) is written by the runner on every stage
     transition and outlives the pod, same as batch_status already relies on.
+
+    `stages` is the pipeline's full stage list, captured when the drain starts.
+    Without it there is no denominator: the journal records only stages that
+    have already begun, so a bar computed from it alone would read 1/1 at the
+    first stage and never move.
+
+    HTML (2026-08-31) because this is re-rendered into the same message every
+    poll — the caller must send it with parse_mode="HTML", and every
+    interpolated value here is escaped for that reason.
     """
     state = load_state(state_path_for(manifest_path))
-    lines = [f"batch {state.get('batch') or '(not started yet)'}"]
+    batch = state.get("batch") or "(not started yet)"
+    lines = [f"🎬 <b>{html.escape(str(batch), quote=False)}</b>"]
 
     runs = state.get("runs") or {}
     if not runs:
-        lines.append("no runs recorded yet")
+        lines.append("waiting for the pod — nothing recorded yet")
     for run_id in sorted(runs):
         run = runs[run_id]
-        lines.append(f"{run_id}: {run.get('status', '?')}")
-        for stage_name, stage in (run.get("stages") or {}).items():
-            status = stage.get("status", "?")
+        seen = run.get("stages") or {}
+        # The bar needs a DENOMINATOR the journal cannot give: it only records
+        # stages already started, so done/seen would read 1/1 at the first
+        # stage and never move. `stages` is captured from the pipeline when the
+        # drain starts (bot._start_progress) precisely so this can say 1/3.
+        planned = list(stages or seen.keys())
+        done = sum(1 for st in seen.values() if st.get("status") == "done")
+        if planned:
+            filled = "▰" * done + "▱" * max(0, len(planned) - done)
+            current = next((n for n in planned
+                            if (seen.get(n) or {}).get("status") == "running"), None)
+            tail = f" · {html.escape(current, quote=False)} running" if current else ""
+            lines.append(f"{filled} {done}/{len(planned)}{tail}")
+        for stage_name in planned:
+            stage = seen.get(stage_name) or {}
+            status = stage.get("status")
+            icon = {"done": "✅", "running": "⏳", "error": "❌"}.get(status, "⬜")
             sec = stage.get("sec")
-            suffix = f" ({sec}s)" if sec is not None else ""
-            lines.append(f"  {stage_name}: {status}{suffix}")
+            suffix = f" · {sec}s" if sec is not None else ""
+            lines.append(f"{icon} {html.escape(stage_name, quote=False)}{suffix}")
+        if run.get("status") == "error":
+            lines.append("❌ <b>this run failed</b>")
 
     if lease is not None:
-        lines.append(f"pod {lease.pod_id}")
+        mins = int((time.time() - lease.provisioned_at) / 60)
+        # Elapsed, not a prediction: the pod bills from provisioned_at whether
+        # or not a stage is moving, so this is the number that costs money.
+        lines.append(f"\n⏱ {mins} min on the pod · 💸 ${mins / 60 * 0.99:.2f} so far")
 
     return "\n".join(lines)
 

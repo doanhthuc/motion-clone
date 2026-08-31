@@ -232,6 +232,53 @@ Two things worth knowing before changing any of it:
 spinning on the button and eventually reporting the bot as unresponsive, even when the work
 succeeded.
 
+### Progress, and what happens when it ends
+
+`/confirm` sends one progress message and then keeps **editing that same
+message** — it does not post a new one every minute. `main()`'s poll loop calls
+`tick_progress` after each `getUpdates`, which long-polls for 50s, so the update
+cadence costs no timer of its own and suits a job measured in tens of minutes.
+
+```
+🎬 2026-08-31-2140
+▰▱▱ 1/3 · character-swap running
+✅ tryon · 351s
+⏳ character-swap
+⬜ enhance
+
+⏱ 42 min on the pod · 💸 $0.69 so far
+```
+
+The bar's **denominator comes from the pipeline, not the journal**. The journal
+records only stages that have already begun, so a bar computed from it alone
+would read 1/1 while the first of three ran and never move; the stage list is
+captured into `batch/tg-<chat>.progress.json` when the drain starts. That file
+also holds the `message_id`, and it is on disk rather than in memory because a
+68-minute job plus `Restart=always` means the process that sent the message is
+often not the one that finishes it.
+
+The money line is **elapsed, never predicted**: the pod bills from
+`provisioned_at` whether or not a stage is moving.
+
+When the drain ends, `tick_progress` edits the message one last time and then
+calls `deliver_result` **unasked**. That closes the gap `deliver_result`'s own
+docstring described — "nothing in this bot polls a drain to completion and fires
+a callback when it finishes ... the reachable close-the-loop hook until a
+completion poll exists". Before this the user had to remember to type `/result`,
+with nothing telling them the job had finished, or failed.
+
+On failure the report names **which stage broke**, from the journal, and inlines
+the last 1200 characters of `pod-job.log` in a collapsed block as well as
+attaching the file — opening a `.log` document on a phone is several taps and an
+app switch, and the last few lines are usually the whole answer. The tail is
+capped because a Telegram message is 4096 characters and a pod log is megabytes:
+sending the whole thing would make the send fail, which is how an error report
+becomes a second error.
+
+Three ways a job can end quietly are each given a message rather than silence: no
+batch recorded at all (the drain died before starting), outputs present, and
+neither outputs nor any run marked failed.
+
 ### Where an unfinished job lives
 
 `batch/tg-<chat_id>.draft.json` (gitignored) holds the slots, their probes, the pipeline and the

@@ -412,6 +412,29 @@ def _fidelity_line(path: Path) -> str:
     return f"{path.stat().st_size} bytes · sha256 {digest.hexdigest()[:12]}"
 
 
+TAIL_CHARS = 1200
+
+
+def _tail(path: Path, limit: int = TAIL_CHARS) -> str:
+    """The end of a log file, small enough to inline in a message.
+
+    Capped because a Telegram message is 4096 characters and a pod log is
+    megabytes: sending the whole thing would make the send fail, which is how
+    an error report becomes a second error. Reads only the tail rather than the
+    whole file — these logs are large and the box is a 4GB CX22.
+    """
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as handle:
+            if size > limit * 4:
+                handle.seek(-limit * 4, 2)
+            raw = handle.read()
+    except OSError as exc:
+        return f"(could not read {path.name}: {exc.strerror})"
+    text = raw.decode("utf-8", errors="replace").strip()
+    return text[-limit:]
+
+
 def deliver_result(tg: Tg, chat_id: int, manifest_path: Path) -> None:
     """Send the finished video(s) back, or the failure diagnostics already on disk.
 
@@ -432,24 +455,60 @@ def deliver_result(tg: Tg, chat_id: int, manifest_path: Path) -> None:
     state = load_state(state_path_for(manifest_path))
     batch_id = state.get("batch") or ""
     if not batch_id:
-        tg.send_message(chat_id, f"no batch recorded yet for {manifest_path.name}")
+        tg.send_message(chat_id, "❌ <b>No batch was ever recorded</b> for "
+                                 f"<code>{_esc(manifest_path.name)}</code> — the "
+                                 "drain failed before it started. The log is "
+                                 f"<code>{_esc(manifest_path.stem)}.drain.log</code> "
+                                 "on the box.", parse_mode=PARSE_HTML)
         return
     batch_dir = ROOT / "out" / batch_id
+    failures = failed_job_ids(state)
+    outputs = final_files(batch_dir)
 
-    for path in final_files(batch_dir):
-        tg.send_document(chat_id, path, caption=path.name)
+    if outputs:
+        tg.send_message(chat_id, f"✅ <b>Done</b> · {_esc(batch_id)} · "
+                                 f"{len(outputs)} file(s)", parse_mode=PARSE_HTML)
+        for path in outputs:
+            tg.send_chat_action(chat_id, "upload_document")
+            tg.send_document(chat_id, path, caption=path.name)
 
-    # On failure, attach exactly what scripts/drain.py's teardown() already
-    # pulled onto local disk BEFORE destroying the pod. Never reach for the
-    # pod here — by the time this runs it is normally already gone.
-    for run_id, _job_id in failed_job_ids(state):
+    for run_id, _job_id in failures:
+        # The failing stage, named. "the run failed" sends the user to read a
+        # log to learn something the journal already knows.
+        stages = ((state.get("runs") or {}).get(run_id) or {}).get("stages") or {}
+        broke = [n for n, st in stages.items() if st.get("status") == "error"]
+        where = f" at <b>{_esc(broke[0])}</b>" if broke else ""
+        tg.send_message(chat_id, f"❌ <b>{_esc(run_id)} failed</b>{where}",
+                        parse_mode=PARSE_HTML)
+        # On failure, attach exactly what scripts/drain.py's teardown() already
+        # pulled onto local disk BEFORE destroying the pod. Never reach for the
+        # pod here — by the time this runs it is normally already gone.
         run_dir = batch_dir / "runs" / run_id
         for name in ("pod-job.log", "run.log"):
             log_path = run_dir / name
-            if log_path.exists():
-                tg.send_document(chat_id, log_path, caption=f"{run_id}/{name}")
+            if not log_path.exists():
+                continue
+            tail = _tail(log_path)
+            if tail:
+                # Inline as well as attached: opening a .log document on a
+                # phone is several taps and an app switch, and the last few
+                # lines are almost always the whole answer.
+                tg.send_message(chat_id,
+                                f"<b>{_esc(name)}</b>, last lines:\n"
+                                f"<blockquote expandable>{_esc(tail)}</blockquote>",
+                                parse_mode=PARSE_HTML)
+            tg.send_document(chat_id, log_path, caption=f"{run_id}/{name}")
 
-    tg.send_message(chat_id, summary_text(batch_dir))
+    if not outputs and not failures:
+        tg.send_message(chat_id, f"⚠️ <b>Nothing to send</b> for "
+                                 f"{_esc(batch_id)} — no output files and no "
+                                 "run marked failed. Check the drain log on "
+                                 "the box.", parse_mode=PARSE_HTML)
+
+    tg.send_message(chat_id,
+                    f"📋 <b>{_esc(batch_id)}</b>\n"
+                    f"<blockquote expandable>{_esc(summary_text(batch_dir))}"
+                    "</blockquote>", parse_mode=PARSE_HTML)
 
 
 def _job_for(chat_id: int) -> Job:
@@ -998,6 +1057,74 @@ def _fix_buttons(job: Job) -> list[list[tuple[str, str]]]:
     return rows
 
 
+_PROGRESS_SUFFIX = ".progress.json"
+
+
+def _progress_path(chat_id: int) -> Path:
+    """Which message to keep editing while a drain runs, and with what stages.
+
+    On disk rather than in memory because a drain outlives a bot restart by
+    design: `Restart=always` plus a 68-minute job means the process that sent
+    the progress message is often not the one that finishes it. Losing the
+    message_id would leave a progress message frozen forever at whatever it
+    last said, with the real job invisible.
+    """
+    return ROOT / "batch" / f"tg-{chat_id}{_PROGRESS_SUFFIX}"
+
+
+def _start_progress(tg: Tg, chat_id: int, manifest_path: Path,
+                    stages: list[str]) -> None:
+    """Send the first progress message and record it for later edits."""
+    text = progress_text(manifest_path, lease=lease_for(manifest_path),
+                         stages=stages)
+    message_id = tg.send_message(chat_id, text, parse_mode=PARSE_HTML)
+    _progress_path(chat_id).write_text(json.dumps({
+        "manifest": str(manifest_path), "message_id": message_id,
+        "stages": stages}, indent=2), encoding="utf-8")
+
+
+def tick_progress(tg: Tg, chat_id: int) -> None:
+    """Re-render the progress message, and deliver the result when it ends.
+
+    Called from main()'s poll loop, which wakes at least every 50s because
+    get_updates long-polls for that long — so this costs no timer of its own
+    and updates at a cadence that suits a job measured in tens of minutes.
+
+    This is the completion poll `deliver_result` was written to wait for: its
+    docstring said "nothing in this bot polls a drain to completion and fires a
+    callback when it finishes ... This is the reachable close-the-loop hook
+    until a completion poll exists." Until now the user had to remember to ask
+    /result, with nothing telling them the job had finished — or failed.
+    """
+    path = _progress_path(chat_id)
+    if not path.exists():
+        return
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        manifest_path = Path(payload["manifest"])
+        message_id = int(payload["message_id"])
+        stages = list(payload.get("stages") or [])
+    except (ValueError, KeyError, TypeError) as exc:
+        # Stop trying rather than raise every 50s forever: the drain itself is
+        # unaffected, and /status still works.
+        log(f"progress file for chat {chat_id} is unreadable, dropping it: {exc!r}")
+        path.unlink(missing_ok=True)
+        return
+
+    text = progress_text(manifest_path, lease=lease_for(manifest_path),
+                         stages=stages)
+    if drain_running(manifest_path):
+        tg.edit_message(chat_id, message_id, text, parse_mode=PARSE_HTML)
+        return
+
+    # Finished — one last edit so the message ends on the truth, then the
+    # files. The progress file goes first: if delivery raises, the next tick
+    # must not deliver a second copy of everything.
+    path.unlink(missing_ok=True)
+    tg.edit_message(chat_id, message_id, text, parse_mode=PARSE_HTML)
+    deliver_result(tg, chat_id, manifest_path)
+
+
 _LAST_SUFFIX = ".last.json"
 
 
@@ -1239,6 +1366,7 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
                         "a drain is already running for this job — wait for it "
                         "to finish before confirming again")
         return
+    stages = list(PIPELINES[job.pipeline])
     start_drain(manifest_path, dry_run=dry_run)
     # Clear in-memory state so the next file starts a fresh job rather
     # than mutating one already handed to a running drain. The manifest
@@ -1259,9 +1387,11 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
     _CONFIRM_WARNED.discard(chat_id)
     if dropped:
         tg.send_message(chat_id, f"running without {dropped} unassigned file(s)")
-    tg.send_message(chat_id,
-                    "started — renting a GPU pod at $0.99/hour now.\n"
-                    f"Check back with /result {manifest_path.name} once it's done.")
+    tg.send_message(chat_id, "🚀 <b>Started.</b> Renting a GPU pod at "
+                             "$0.99/hour now.\nI will keep the message below "
+                             "updated and send the result when it finishes — "
+                             "no need to ask.", parse_mode=PARSE_HTML)
+    _start_progress(tg, chat_id, manifest_path, stages)
     return
 
 
@@ -1429,8 +1559,20 @@ def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
             tg.send_message(chat_id, f"💤 <b>Nothing running.</b>\n\n{body}",
                             buttons=buttons or None, parse_mode=PARSE_HTML)
             return
-        tg.send_message(chat_id, progress_text(manifest_path,
-                                               lease=lease_for(manifest_path)))
+        # The same renderer the auto-updating message uses, so /status can
+        # never disagree with what is already on screen.
+        stages = None
+        prog = _progress_path(chat_id)
+        if prog.exists():
+            try:
+                stages = json.loads(prog.read_text(encoding="utf-8")).get("stages")
+            except ValueError:
+                stages = None
+        tg.send_message(chat_id,
+                        progress_text(manifest_path,
+                                      lease=lease_for(manifest_path),
+                                      stages=stages),
+                        parse_mode=PARSE_HTML)
         return
 
     if text.startswith("/confirm"):
@@ -1561,6 +1703,10 @@ def main() -> int:
                 offset = update["update_id"] + 1
                 handle(tg, update, allowed_user_id=allowed_user_id,
                        dry_run=args.dry_run)
+            # After the updates, not instead of them: get_updates long-polls
+            # for 50s, so this runs on that cadence with no timer of its own.
+            # One chat, because the allowlist is one user (spec section 2).
+            tick_progress(tg, allowed_user_id)
         except TgError as exc:
             log(f"poll failed, continuing: {exc}")
             time.sleep(5)

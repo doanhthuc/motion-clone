@@ -33,6 +33,8 @@ batch/pod-lease.json
 batch/*.draft.json
 # job vừa gửi, giữ lại cho /again — cùng lý do như draft
 batch/*.last.json
+# tin nhắn tiến độ đang được sửa tại chỗ
+batch/*.progress.json
 
 # IDE junk — repo public, config cá nhân không vào đây (cùng lý do .DS_Store)
 .idea/

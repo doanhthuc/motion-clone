@@ -1,4 +1,4 @@
-import subprocess, sys, tempfile, unittest
+import json, subprocess, sys, tempfile, unittest
 from pathlib import Path
 from unittest import mock
 
@@ -67,6 +67,10 @@ class FakeTg:
         self.answered: list[str] = []
         self.parse_modes: list[str | None] = []
         self.actions: list[str] = []
+        # Edits are what the progress message does — recorded separately from
+        # `messages`, because the whole point is that it does NOT send a new
+        # message every 50 seconds.
+        self.edits: list[tuple[int, str]] = []
 
     # The tags bot.py actually uses. Anything outside this set is either a
     # typo or unescaped user text, and Telegram rejects the whole message for
@@ -88,6 +92,10 @@ class FakeTg:
 
     def send_chat_action(self, chat_id, action="typing"):
         self.actions.append(action)
+
+    def edit_message(self, chat_id, message_id, text, *, parse_mode=None):
+        self._check_markup(text, parse_mode)
+        self.edits.append((message_id, text))
 
     def _check_markup(self, text, parse_mode):
         """Fail here rather than let Telegram silently reject the message.
@@ -1084,6 +1092,82 @@ class TestFlow(unittest.TestCase):
         self.assertTrue(all(len(r) <= 2 for r in rows), rows)
         self.assertEqual(rows[-1][0][1], bot._CB_CLEAR_ASK)
 
+
+    # ---- the completion poll (added 2026-08-31) --------------------------
+
+    def _confirm_and_start(self):
+        with mock.patch("tgbot.bot.start_drain"), \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+
+    def test_confirm_records_a_progress_message_to_keep_editing(self):
+        self._confirm_and_start()
+        self.assertTrue(bot._progress_path(ME).exists())
+        import json
+        payload = json.loads(bot._progress_path(ME).read_text())
+        # The stage list is captured HERE, from the pipeline, because the
+        # journal only records stages that have already begun — without a
+        # denominator the bar would read 1/1 at the first stage and never move.
+        self.assertEqual(payload["stages"], ["tryon", "motion", "enhance"])
+
+    def test_a_tick_edits_the_message_instead_of_sending_a_new_one(self):
+        self._confirm_and_start()
+        before = len(self.tg.messages)
+        with mock.patch("tgbot.bot.drain_running", return_value=True):
+            bot.tick_progress(self.tg, ME)
+            bot.tick_progress(self.tg, ME)
+        self.assertEqual(len(self.tg.messages), before)   # nothing new sent
+        self.assertEqual(len(self.tg.edits), 2)
+        self.assertTrue(bot._progress_path(ME).exists())
+
+    def test_when_the_drain_ends_the_result_is_delivered_unasked(self):
+        """The gap deliver_result's own docstring described.
+
+        It said: "nothing in this bot polls a drain to completion and fires a
+        callback when it finishes ... This is the reachable close-the-loop hook
+        until a completion poll exists." Until now the user had to remember to
+        type /result, with nothing telling them the job had finished — or
+        failed.
+        """
+        self._confirm_and_start()
+        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.deliver_result") as deliver:
+            bot.tick_progress(self.tg, ME)
+            deliver.assert_called_once()
+        # And the tracking file is gone, so it cannot deliver twice.
+        self.assertFalse(bot._progress_path(ME).exists())
+
+    def test_a_finished_drain_is_never_delivered_twice(self):
+        self._confirm_and_start()
+        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.deliver_result") as deliver:
+            bot.tick_progress(self.tg, ME)
+            bot.tick_progress(self.tg, ME)
+            self.assertEqual(deliver.call_count, 1)
+
+    def test_the_progress_file_is_dropped_if_delivery_raises(self):
+        # Removed BEFORE delivery on purpose: a raising deliver_result must not
+        # leave a file that re-delivers everything on the next tick, every 50
+        # seconds, for as long as the bot runs.
+        self._confirm_and_start()
+        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.deliver_result", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                bot.tick_progress(self.tg, ME)
+        self.assertFalse(bot._progress_path(ME).exists())
+
+    def test_a_tick_with_no_drain_tracked_does_nothing(self):
+        bot.tick_progress(self.tg, ME)
+        self.assertEqual(self.tg.edits, [])
+
+    def test_an_unreadable_progress_file_is_dropped_and_logged(self):
+        bot._progress_path(ME).write_text("{ not json", encoding="utf-8")
+        with mock.patch.object(bot, "log") as logged:
+            bot.tick_progress(self.tg, ME)
+        self.assertFalse(bot._progress_path(ME).exists())
+        self.assertTrue(logged.called)
+
     def test_confirm_calls_start_drain_once_with_dry_run_false(self):
         # Renamed from "...and_nothing_else_does": with drain_running mocked
         # to False, this test is identical with or without that guard — it
@@ -1498,6 +1582,96 @@ class TestNoDuplicateDefinitions(unittest.TestCase):
                         names.append(node.target.id)
                 dupes = sorted({n for n in names if names.count(n) > 1})
                 self.assertEqual(dupes, [], f"{rel} defines {dupes} more than once")
+
+
+class TestDeliverResult(unittest.TestCase):
+    """What the user is shown when a job ends.
+
+    Never covered before 2026-08-31, when this stopped being something the
+    user had to ask for: tick_progress now calls it the moment the drain
+    finishes, so its wording is the whole report on both success and failure.
+    """
+
+    def setUp(self):
+        self._orig_root = bot.ROOT
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "batch").mkdir()
+        (self.root / "out").mkdir()
+        bot.ROOT = self.root
+        self.manifest = self.root / "batch" / "tg-1.yaml"
+        self.manifest.write_text("runs: []\n", encoding="utf-8")
+        self.tg = FakeTg()
+
+    def tearDown(self):
+        bot.ROOT = self._orig_root
+
+    def _write_state(self, payload):
+        state_path_for(self.manifest).write_text(json.dumps(payload),
+                                                encoding="utf-8")
+
+    def _batch_dir(self, batch_id):
+        d = self.root / "out" / batch_id
+        (d / "_final").mkdir(parents=True)
+        (d / "runs" / "job").mkdir(parents=True)
+        return d
+
+    def test_success_names_the_batch_and_sends_every_final_file(self):
+        d = self._batch_dir("2026-08-31-2140")
+        (d / "_final" / "job.mp4").write_bytes(b"video")
+        self._write_state({"batch": "2026-08-31-2140",
+                           "runs": {"job": {"status": "done", "stages": {
+                               "enhance": {"status": "done", "sec": 114}}}}})
+        bot.deliver_result(self.tg, ME, self.manifest)
+        joined = "\n".join(self.tg.messages)
+        self.assertIn("Done", joined)
+        self.assertIn("2026-08-31-2140", joined)
+        self.assertEqual([c for _, c in self.tg.documents], ["job.mp4"])
+
+    def test_failure_names_the_stage_that_broke(self):
+        # "the run failed" sends the user off to read a log for something the
+        # journal already knows.
+        d = self._batch_dir("2026-08-31-2200")
+        (d / "runs" / "job" / "pod-job.log").write_text(
+            "loading model\nCUDA out of memory\n", encoding="utf-8")
+        self._write_state({"batch": "2026-08-31-2200",
+                           "runs": {"job": {"status": "error", "stages": {
+                               "tryon": {"status": "done", "sec": 351},
+                               "enhance": {"status": "error", "job_id": "j-9"}}}}})
+        bot.deliver_result(self.tg, ME, self.manifest)
+        joined = "\n".join(self.tg.messages)
+        self.assertIn("job failed", joined)
+        self.assertIn("enhance", joined)
+        # The tail is inlined, because opening a .log on a phone is several
+        # taps and an app switch.
+        self.assertIn("CUDA out of memory", joined)
+        # And still attached, for the whole thing.
+        self.assertIn("job/pod-job.log", [c for _, c in self.tg.documents])
+
+    def test_a_drain_that_never_started_says_so_instead_of_going_quiet(self):
+        self._write_state({"runs": {}})
+        bot.deliver_result(self.tg, ME, self.manifest)
+        self.assertIn("No batch was ever recorded", self.tg.messages[0])
+        self.assertIn("drain.log", self.tg.messages[0])
+
+    def test_no_outputs_and_no_recorded_failure_is_still_reported(self):
+        # The silent case: a batch directory exists, nothing was produced, and
+        # nothing is marked failed. Saying nothing would leave the user
+        # waiting on a job that has already ended.
+        self._batch_dir("2026-08-31-2300")
+        self._write_state({"batch": "2026-08-31-2300", "runs": {}})
+        bot.deliver_result(self.tg, ME, self.manifest)
+        self.assertIn("Nothing to send", "\n".join(self.tg.messages))
+
+    def test_the_log_tail_is_capped_so_the_send_cannot_fail(self):
+        # A Telegram message is 4096 characters and a pod log is megabytes.
+        # Sending the whole thing would make the send fail — an error report
+        # that becomes a second error.
+        big = self.root / "big.log"
+        big.write_text("x" * 100_000, encoding="utf-8")
+        self.assertEqual(len(bot._tail(big)), bot.TAIL_CHARS)
+
+    def test_an_unreadable_log_reports_itself_rather_than_raising(self):
+        self.assertIn("could not read", bot._tail(self.root / "missing.log"))
 
 
 if __name__ == "__main__":
