@@ -105,8 +105,9 @@ make drain FILE=batch/2026-08-30.yaml CONFIRM=yes   # rents, runs, destroys
    startup and an unknown name exits 2, because the alternative is a
    confusing manifest-validation failure on the phone hours later, after the
    material has already been uploaded. `/pipeline <name>` overrides it for the
-   current job; because per-chat state is in memory, a restart falls back to
-   this value, so set it to whichever flow you use most.
+   current job, and that choice is saved with the draft — so a restart resumes
+   the flow you picked, and only a brand-new job starts from this value. Set it
+   to whichever flow you use most.
 
 2. The server's storage is bind-mounted at `/var/lib/telegram-bot-api` **on both sides**. With
    `TELEGRAM_LOCAL=1`, `getFile` returns an absolute path on the container's filesystem and `bot.py`
@@ -139,14 +140,35 @@ systemctl daemon-reload && systemctl enable --now motion-bot
 
 | Command | What it does |
 |---|---|
-| (send a File) | measures it, replies with the description, byte count and `sha256`, and asks which slot if it is an image |
-| `character` / `outfit` / `background` | answers the slot question for the file at the head of the queue |
+| (send a File) | measures it, replies with the description, byte count and short `sha256`, and asks which slot if it is an image — as tappable buttons |
+| `character` / `outfit` / `background` | answers the slot question by typing, for the file at the head of the queue. The buttons do the same thing; both run `_answer_slot` |
 | `/pipeline` | lists the pipelines and shows the current one |
 | `/pipeline <name>` | switches this job's pipeline, keeping the slots the new one still uses and naming any it drops |
 | `/confirm` | **spends money.** Rents an RTX 5090 at $0.99/hour and runs the drain |
 | `/status` | progress for this chat's job, read from the journal — still works after the pod is destroyed |
 | `/result <manifest>.yaml` | the finished video(s), or the failure logs already pulled to disk |
 | `/tryon <batch-id>` | just `01-tryon.png`, when the final video looks wrong |
+
+### Buttons
+
+Every message offering a fixed set of choices carries an inline keyboard: the slot question, the
+`/pipeline` listing, and the review screen's **Run**. Typing still works everywhere — a shared body
+(`_answer_slot`, `_switch_pipeline_and_report`, `_do_confirm`) serves both, so the two cannot drift.
+
+Two things worth knowing before changing any of it:
+
+- **`callback_data` is capped at 64 bytes**, and one over-long button makes the whole `sendMessage`
+  fail — the user sees no message at all, not a broken button. `Tg.keyboard` raises instead, naming
+  the button, and a test walks every pipeline name through it.
+- **Telegram never expires an inline keyboard.** There is no expiry and no way to make one
+  single-use, so an old Run button stays tappable forever. That is why `run:go` carries the
+  manifest's `mtime_ns`: any change to the job invalidates every button minted before it, so a Run
+  offered for inputs the user has since replaced cannot rent a GPU. Tapping a stale one says the job
+  changed and spends nothing.
+
+`answerCallbackQuery` is called in a `finally` for every press. Skipping it leaves the client
+spinning on the button and eventually reporting the bot as unresponsive, even when the work
+succeeded.
 
 ### Where an unfinished job lives
 

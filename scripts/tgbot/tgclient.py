@@ -65,8 +65,45 @@ class Tg:
             raise TgError(self._scrub(f"{method} rejected: {body.get('description', body)}"))
         return body.get("result")
 
-    def send_message(self, chat_id: int, text: str) -> int:
-        return int(self.call("sendMessage", chat_id=chat_id, text=text)["message_id"])
+    @staticmethod
+    def keyboard(rows: list[list[tuple[str, str]]]) -> dict:
+        """An inline keyboard from [[(label, callback_data), ...], ...].
+
+        callback_data is capped at 64 BYTES by the Bot API, and a button that
+        exceeds it makes the whole sendMessage fail — so the caller's data
+        scheme has to stay short. Asserted here rather than trusted: the
+        failure is a rejected message, i.e. the user sees nothing at all.
+        """
+        for row in rows:
+            for label, data in row:
+                encoded = data.encode()
+                if len(encoded) > 64:
+                    raise ValueError(
+                        f"callback_data for {label!r} is {len(encoded)} bytes, "
+                        "max 64")
+        return {"inline_keyboard": [[{"text": label, "callback_data": data}
+                                     for label, data in row] for row in rows]}
+
+    def send_message(self, chat_id: int, text: str, *,
+                     buttons: list[list[tuple[str, str]]] | None = None) -> int:
+        markup = self.keyboard(buttons) if buttons else None
+        return int(self.call("sendMessage", chat_id=chat_id, text=text,
+                             reply_markup=markup)["message_id"])
+
+    def answer_callback_query(self, callback_id: str, text: str = "") -> None:
+        """Acknowledge a button press.
+
+        Not optional: until this is called the client shows a spinner on the
+        button and eventually reports the bot as unresponsive, even when the
+        work succeeded. Errors are swallowed on purpose — the acknowledgement
+        is cosmetic, and a callback id expires after ~15 minutes, so a failure
+        here must not abort the handler that already did the real work.
+        """
+        try:
+            self.call("answerCallbackQuery", callback_query_id=callback_id,
+                      text=text or None)
+        except TgError:
+            pass
 
     def edit_message(self, chat_id: int, message_id: int, text: str) -> None:
         try:

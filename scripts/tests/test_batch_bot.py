@@ -40,6 +40,16 @@ def media_from(user_id: int, kind: str) -> dict:
                         kind: payload}}
 
 
+def cb_from(user_id: int, data: str, cb_id: str = "cb1") -> dict:
+    # A callback_query keeps its sender at callback_query.from and its chat at
+    # callback_query.message.chat — NOT at message.from. That difference is
+    # what made every button press fail the allowlist before _identify.
+    return {"callback_query": {"id": cb_id, "from": {"id": user_id},
+                               "message": {"chat": {"id": user_id},
+                                           "message_id": 7},
+                               "data": data}}
+
+
 class FakeTg:
     """Records calls instead of touching the network. `call()` only needs to
     answer getFile — /tryon, /result and the document-ingest flow (Task 7)
@@ -49,10 +59,25 @@ class FakeTg:
         self.messages: list[str] = []
         self.documents: list[tuple] = []
         self.file_paths: dict[str, str] = {}   # file_id -> local path, set by the test
+        # Buttons are recorded per message, so a test can assert what was
+        # offered as well as what was said. `answered` records every
+        # answerCallbackQuery: skipping it leaves the client spinning, so it
+        # has to be observable.
+        self.buttons: list[list[list[tuple[str, str]]] | None] = []
+        self.answered: list[str] = []
 
-    def send_message(self, chat_id, text):
+    def send_message(self, chat_id, text, *, buttons=None):
         self.messages.append(text)
+        self.buttons.append(buttons)
         return 1
+
+    def answer_callback_query(self, callback_id, text=""):
+        self.answered.append(callback_id)
+
+    def callback_data(self):
+        """Every callback_data offered so far, flattened."""
+        return [d for rows in self.buttons if rows
+                for row in rows for _, d in row]
 
     def send_document(self, chat_id, path, caption=""):
         self.documents.append((path, caption))
@@ -80,6 +105,27 @@ class TestAllowed(unittest.TestCase):
     def test_a_malformed_update_is_refused_not_crashed(self):
         self.assertFalse(allowed({}, ME))
         self.assertFalse(allowed({"message": {}}, ME))
+
+    def test_the_owner_pressing_a_button_is_allowed(self):
+        # Buttons arrived 2026-08-31. Before _identify, allowed() read only
+        # message.from, so this returned False and every press did nothing —
+        # silently, which looks exactly like a broken bot.
+        self.assertTrue(allowed(cb_from(ME, "run:ask"), ME))
+
+    def test_a_stranger_pressing_a_button_is_refused(self):
+        # The button that spends $0.99/hour is reachable by callback_query, so
+        # the allowlist has to be as strict in this shape as in the other.
+        self.assertFalse(allowed(cb_from(99999, "run:go:1"), ME))
+
+    def test_a_button_press_from_a_group_is_refused(self):
+        press = cb_from(ME, "run:ask")
+        press["callback_query"]["message"]["chat"]["id"] = -1001234567890
+        self.assertFalse(allowed(press, ME))
+
+    def test_a_button_press_with_no_sender_is_refused(self):
+        press = cb_from(ME, "run:ask")
+        del press["callback_query"]["from"]
+        self.assertFalse(allowed(press, ME))
 
     def test_the_owner_speaking_in_a_group_is_refused(self):
         # A private chat has chat.id == the user's id; a group does not. If the
@@ -256,6 +302,31 @@ class TestPipelineCommand(unittest.TestCase):
             bot.handle(FakeTg(), cmd_from(ME, "/pipeline character-swap-enhance"),
                        allowed_user_id=ME)
         self.assertNotIn(ME, bot._LAST_VALIDATE)
+
+    def test_the_listing_offers_a_button_per_other_pipeline(self):
+        tg = FakeTg()
+        bot.handle(tg, cmd_from(ME, "/pipeline"), allowed_user_id=ME)
+        offered = tg.callback_data()
+        self.assertIn(bot._CB_PIPE + "character-swap-enhance", offered)
+        # Not the current one: a button that does nothing is worse than absent,
+        # and the text already marks which is active.
+        self.assertNotIn(bot._CB_PIPE + "tryon-motion-enhance", offered)
+
+    def test_tapping_a_pipeline_button_switches_like_the_command_does(self):
+        with mock.patch.object(bot, "_maybe_show_manifest"):
+            tg = FakeTg()
+            bot.handle(tg, cb_from(ME, bot._CB_PIPE + "character-swap-enhance"),
+                       allowed_user_id=ME)
+        self.assertEqual(bot._job_for(ME).pipeline, "character-swap-enhance")
+        self.assertEqual(tg.answered, ["cb1"])
+
+    def test_every_pipeline_name_fits_in_callback_data(self):
+        # The 64-byte cap is on the DATA, and a single over-long button makes
+        # the whole listing message fail to send — i.e. /pipeline would answer
+        # nothing. A pipeline added later with a long name breaks this here
+        # rather than silently on the phone.
+        from tgbot.tgclient import Tg as RealTg
+        RealTg.keyboard([[(n, bot._CB_PIPE + n)] for n in bot.PIPELINES])
 
     def test_switching_to_the_current_pipeline_is_a_no_op(self):
         tg = FakeTg()
@@ -610,8 +681,107 @@ class TestFlow(unittest.TestCase):
             self._fill_required_slots()
             start_drain.assert_not_called()
         joined = "\n".join(self.tg.messages)
-        self.assertIn("pipeline", joined)
-        self.assertIn("runs:", joined)
+        # Asserts the REVIEW CONTENT, not the YAML syntax it used to be echoed
+        # in (changed 2026-08-31 with _manifest_summary). The rule this guards
+        # is "nothing may spend $0.99/hour without the exact inputs it spent on
+        # being in the transcript", so what has to be present is the pipeline,
+        # every role, and the file name in each — not the word "runs:".
+        self.assertIn("tryon-motion-enhance", joined)
+        for role, name in (("character", "character.jpg"), ("outfit", "outfit.jpg"),
+                           ("driver", "driver.mp4")):
+            self.assertIn(role, joined)
+            self.assertIn(name, joined)
+        self.assertIn("$0.99/hour", joined)
+        # And the Run button, since that is now the offered way to spend.
+        self.assertIn(bot._CB_RUN_ASK, self.tg.callback_data())
+
+    def test_the_slot_question_offers_a_button_per_role(self):
+        with mock.patch("tgbot.bot.probe", return_value=self.image_probe):
+            bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME)
+        offered = self.tg.callback_data()
+        for role in bot._askable_roles(bot._job_for(ME).pipeline):
+            self.assertIn(bot._CB_SLOT + role, offered)
+
+    def test_tapping_a_slot_button_fills_the_slot_like_typing_does(self):
+        # _answer_slot is the single body both paths run; this pins that the
+        # button path actually reaches it, including finding I7's overwrite
+        # handling inside _fill_slot.
+        with mock.patch("tgbot.bot.probe", return_value=self.image_probe):
+            bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME)
+        bot.handle(self.tg, cb_from(ME, bot._CB_SLOT + "character"),
+                   allowed_user_id=ME)
+        # The file sent was outfit.jpg and the button tapped was `character`,
+        # and the slot holds outfit.jpg: the label is the user's answer, never
+        # inferred from the filename. That is job.slot_for's refusal to guess,
+        # and the button path must not quietly reintroduce a name heuristic.
+        self.assertEqual(bot._STATE[ME].slots["character"],
+                         self.staged("outfit.jpg"))
+        self.assertNotIn(ME, bot._PENDING)
+        # Acknowledged, or the client spins on the button forever.
+        self.assertEqual(self.tg.answered, ["cb1"])
+
+    def test_a_slot_button_tapped_with_nothing_queued_says_so(self):
+        # Telegram keeps old keyboards tappable forever, with no expiry and no
+        # way to make one single-use, so this arrives in normal use.
+        bot.handle(self.tg, cb_from(ME, bot._CB_SLOT + "character"),
+                   allowed_user_id=ME)
+        self.assertIn("no file is waiting", self.tg.messages[-1])
+        self.assertEqual(self.tg.answered, ["cb1"])
+
+    def test_the_run_button_needs_a_second_tap_before_it_spends(self):
+        with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
+            start_drain.assert_not_called()     # first tap only asks
+            self.assertIn("$0.99/hour", self.tg.messages[-1])
+            token = bot._run_token(ME)
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_GO + token),
+                       allowed_user_id=ME)
+            start_drain.assert_called_once()
+            self.assertIs(start_drain.call_args.kwargs["dry_run"], False)
+
+    def test_a_run_button_from_a_changed_job_cannot_spend(self):
+        """The stale-keyboard guard, and the reason _run_token exists.
+
+        Telegram never expires an inline keyboard. Without the token, a Run
+        button offered for one manifest stays live after the job changes, and
+        tapping it would rent a $0.99/hour GPU for inputs the user never
+        reviewed.
+        """
+        with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+            stale = bot._CB_RUN_GO + "1"       # never this manifest's mtime_ns
+            bot.handle(self.tg, cb_from(ME, stale), allowed_user_id=ME)
+            start_drain.assert_not_called()
+        self.assertIn("changed since that button was sent", self.tg.messages[-1])
+
+    def test_cancelling_spends_nothing(self):
+        with mock.patch("tgbot.bot.start_drain") as start_drain:
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_NO), allowed_user_id=ME)
+            start_drain.assert_not_called()
+        self.assertIn("cancelled", self.tg.messages[-1])
+
+    def test_an_unknown_callback_is_answered_not_ignored(self):
+        bot.handle(self.tg, cb_from(ME, "nonsense:42"), allowed_user_id=ME)
+        self.assertIn("older version", self.tg.messages[-1])
+        self.assertEqual(self.tg.answered, ["cb1"])
+
+    def test_every_command_in_the_menu_actually_answers(self):
+        """Drift guard for BOT_COMMANDS, in the spirit of make check-job-types.
+
+        setMyCommands publishes these names to Telegram, so they appear as
+        tappable suggestions. One that no branch handles falls through to the
+        text handlers, matches nothing, and answers NOTHING — the same silence
+        that NON_FILE_MEDIA was added to fix, except advertised by the bot
+        itself.
+        """
+        for name, _desc in bot.BOT_COMMANDS:
+            with self.subTest(command=name):
+                tg = FakeTg()
+                bot.handle(tg, cmd_from(ME, f"/{name}"), allowed_user_id=ME)
+                self.assertTrue(tg.messages, f"/{name} answered nothing")
 
     def test_confirm_calls_start_drain_once_with_dry_run_false(self):
         # Renamed from "...and_nothing_else_does": with drain_running mocked
@@ -761,7 +931,11 @@ class TestFlow(unittest.TestCase):
         import hashlib
         with mock.patch("tgbot.bot.probe", return_value=self.driver_probe):
             bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
-        self.assertIn(hashlib.sha256(b"d").hexdigest(), self.tg.messages[0])
+        # 12 hex chars, not 64 (shortened 2026-08-31): the full digest took two
+        # lines on a phone and pushed resolution/bitrate/size — the numbers
+        # that actually reveal recompression — off the top of the message.
+        self.assertIn(hashlib.sha256(b"d").hexdigest()[:12], self.tg.messages[0])
+        self.assertNotIn(hashlib.sha256(b"d").hexdigest(), self.tg.messages[0])
         self.assertIn("1 bytes", self.tg.messages[0])
 
     def test_a_failing_conversion_is_reported_not_swallowed(self):

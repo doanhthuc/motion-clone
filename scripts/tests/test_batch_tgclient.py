@@ -156,5 +156,40 @@ class TestTg(unittest.TestCase):
             temp_path.unlink()
 
 
+class TestKeyboard(unittest.TestCase):
+    """Inline keyboards, added 2026-08-31."""
+
+    def test_a_keyboard_becomes_the_bot_api_shape(self):
+        markup = Tg.keyboard([[("Run", "run:ask"), ("Cancel", "run:no")]])
+        self.assertEqual(markup, {"inline_keyboard": [
+            [{"text": "Run", "callback_data": "run:ask"},
+             {"text": "Cancel", "callback_data": "run:no"}]]})
+
+    def test_callback_data_over_64_bytes_is_refused_loudly(self):
+        # The Bot API caps callback_data at 64 bytes and rejects the whole
+        # sendMessage when a button exceeds it — so the user would see NO
+        # message at all, not a broken button. Failing here names the button.
+        with self.assertRaises(ValueError) as cm:
+            Tg.keyboard([[("x", "pipe:" + "a" * 60)]])
+        self.assertIn("64", str(cm.exception))
+        self.assertIn("'x'", str(cm.exception))
+
+    def test_the_limit_is_bytes_not_characters(self):
+        # Multi-byte labels are fine, but multi-byte DATA counts double or
+        # more. A character count would pass this and Telegram would reject it.
+        with self.assertRaises(ValueError):
+            Tg.keyboard([[("nhãn", "á" * 33)]])   # 33 chars, 66 bytes
+
+    def test_answer_callback_query_swallows_failures(self):
+        # A callback id expires after ~15 minutes, and the acknowledgement is
+        # cosmetic: a failure must not abort the handler that already did the
+        # real work.
+        with patch("urllib.request.urlopen",
+                   return_value=FakeResponse({"ok": False,
+                                              "description": "query is too old"})):
+            self.tg = Tg(token="TESTTOKEN", base_url="http://127.0.0.1:8081")
+            self.tg.answer_callback_query("stale-id")   # must not raise
+
+
 if __name__ == "__main__":
     unittest.main()

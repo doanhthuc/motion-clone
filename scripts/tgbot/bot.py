@@ -254,10 +254,32 @@ def allowed(update: dict, allowed_user_id: int) -> bool:
     manifest, the file paths and the finished video. Refusing anything but the
     one-to-one chat keeps the reply surface as narrow as the send surface.
     """
-    msg = update.get("message") or {}
-    sender = msg.get("from") or {}
-    chat = msg.get("chat") or {}
-    return sender.get("id") == allowed_user_id and chat.get("id") == allowed_user_id
+    sender, chat = _identify(update)
+    return sender == allowed_user_id and chat == allowed_user_id
+
+
+def _identify(update: dict) -> tuple[int | None, int | None]:
+    """(sender id, chat id) from an ordinary message OR a button press.
+
+    Two shapes, one check (added 2026-08-31 with the inline keyboards). A
+    callback_query carries its sender at `callback_query.from` and its chat at
+    `callback_query.message.chat` — NOT at `message.from`. The message-only
+    reader this replaced returned (None, None) for every button press, so
+    allowed() refused all of them, silently: buttons would render and do
+    nothing at all when tapped.
+
+    Both `None` when neither shape is present, which allowed() then refuses —
+    the absence-means-refuse rule has to survive the second shape.
+    """
+    msg = update.get("message")
+    if msg:
+        return (msg.get("from") or {}).get("id"), (msg.get("chat") or {}).get("id")
+    query = update.get("callback_query")
+    if query:
+        holder = query.get("message") or {}
+        return ((query.get("from") or {}).get("id"),
+                (holder.get("chat") or {}).get("id"))
+    return None, None
 
 
 def _safe_child(root: Path, name: str) -> Path | None:
@@ -380,7 +402,12 @@ def _fidelity_line(path: Path) -> str:
     with open(path, "rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
-    return f"{path.stat().st_size} bytes\nsha256 {digest.hexdigest()}"
+    # 12 hex chars, not all 64 (shortened 2026-08-31). The full digest took
+    # two lines on a phone and pushed the numbers that actually reveal
+    # recompression — resolution, bitrate, size — off the top. 48 bits is far
+    # more than enough to notice that what came back is not what went in, and
+    # the full digest is recomputable from the staged file whenever A6 wants it.
+    return f"{path.stat().st_size} bytes · sha256 {digest.hexdigest()[:12]}"
 
 
 def deliver_result(tg: Tg, chat_id: int, manifest_path: Path) -> None:
@@ -478,10 +505,16 @@ def _askable_roles(pipeline: str) -> list[str]:
 
 
 def _ask_about(tg: Tg, chat_id: int, p: Probe, pipeline: str, extra: str = "") -> None:
-    """Ask which slot a parked, ambiguous file belongs to."""
-    options = " / ".join(_askable_roles(pipeline))
+    """Ask which slot a parked, ambiguous file belongs to.
+
+    One button per askable role (2026-08-31). Typing "character" on a phone is
+    the friction the buttons remove; the typed reply still works, and
+    _answer_slot is the single body both paths run.
+    """
+    roles = _askable_roles(pipeline)
     body = f"{describe(p)}\n{extra}" if extra else describe(p)
-    tg.send_message(chat_id, f"{body}\nWhich slot is this? Reply: {options}")
+    tg.send_message(chat_id, f"{body}\nWhich slot is this?",
+                    buttons=[[(r, _CB_SLOT + r) for r in roles]])
 
 
 def _fill_slot(tg: Tg, chat_id: int, job: Job, role: str, path: Path, p: Probe,
@@ -569,6 +602,36 @@ def _render_and_validate(tg: Tg, chat_id: int, job: Job) -> bool:
     return True
 
 
+def _manifest_summary(chat_id: int, job: Job) -> str:
+    """What the user reads before spending — the review screen.
+
+    Replaces echoing the raw YAML (2026-08-31). The trade is deliberate and
+    worth naming: the rule this file works to is "nothing may spend $0.99/hour
+    without the exact inputs it spent on being in the transcript", and a
+    summary is weaker than the file itself. What keeps it honest is that the
+    FILENAMES stay — and staged names are the user's own by design (see
+    STAGING_DIR_NAME), chosen precisely so a manifest is readable on a phone.
+    What goes is the repeated absolute path prefix, which is identical on every
+    line and told the reader nothing. The full YAML is still on disk and still
+    reachable with /result.
+    """
+    lines = [job.pipeline, " -> ".join(PIPELINES[job.pipeline]), ""]
+    for role in sorted(job.slots):
+        p = job.probes.get(role)
+        detail = describe(p).split(" ", 1)[1] if p else "?"
+        lines.append(f"{role} · {job.slots[role].name} · {detail}")
+    unused = sorted(optional_roles(job.pipeline) - set(job.slots))
+    if unused:
+        # Named, not omitted: an optional slot left empty is a choice, and the
+        # review screen is where the user should notice they made it.
+        lines.append(f"(no {' or '.join(unused)})")
+    lines.append("")
+    lines.append(f"~{estimate_minutes(job)} min · $0.99/hour "
+                 "(estimate measured once on one batch — not a promise)")
+    lines.append(f"manifest: {_job_manifest_path(chat_id).name}")
+    return "\n".join(l for l in lines if l is not None)
+
+
 def _maybe_show_manifest(tg: Tg, chat_id: int, job: Job) -> None:
     """Once every required slot is filled: render, validate for free, show it.
 
@@ -583,14 +646,8 @@ def _maybe_show_manifest(tg: Tg, chat_id: int, job: Job) -> None:
     if not _render_and_validate(tg, chat_id, job):
         return
 
-    manifest_path = _job_manifest_path(chat_id)
-    minutes = estimate_minutes(job)
-    tg.send_message(
-        chat_id,
-        manifest_path.read_text(encoding="utf-8") +
-        f"\nestimated {minutes} min (measured once on one batch — not a promise)\n"
-        "This will rent a GPU pod at $0.99/hour. Reply /confirm to spend money "
-        "and start, or nothing yet costs anything.")
+    tg.send_message(chat_id, _manifest_summary(chat_id, job),
+                    buttons=[[("Run · $0.99/h", _CB_RUN_ASK)]])
 
 
 _DRAFT_SUFFIX = ".draft.json"
@@ -682,7 +739,9 @@ def handle(tg: Tg, update: dict, *, allowed_user_id: int,
     """
     if not allowed(update, allowed_user_id):
         return                              # silent: do not confirm the bot exists
-    chat_id = update["message"]["chat"]["id"]
+    # From _identify, not update["message"], so a button press does not KeyError
+    # here before its own branch in _handle ever runs.
+    _, chat_id = _identify(update)
     if chat_id not in _LOADED:
         _LOADED.add(chat_id)
         _load_draft(chat_id)
@@ -692,10 +751,256 @@ def handle(tg: Tg, update: dict, *, allowed_user_id: int,
         _save_draft(chat_id)
 
 
+# callback_data prefixes. Kept this short because the Bot API caps
+# callback_data at 64 bytes and an over-long button makes the whole
+# sendMessage fail — i.e. the user sees nothing (Tg.keyboard asserts it).
+_CB_SLOT = "slot:"
+_CB_PIPE = "pipe:"
+_CB_RUN_ASK = "run:ask"
+_CB_RUN_GO = "run:go:"      # + the manifest's mtime_ns, see _run_token
+_CB_RUN_NO = "run:no"
+
+
+def _run_token(chat_id: int) -> str:
+    """A stamp identifying the exact manifest a Run button was offered for.
+
+    Telegram keeps old inline keyboards tappable forever — there is no expiry
+    and no way to make one single-use. Without this, a Run button from a
+    manifest the user has since changed (or already submitted) stays live, and
+    tapping it would spend $0.99/hour on inputs they never reviewed.
+
+    mtime_ns of the manifest, because _maybe_show_manifest rewrites that file
+    every time it renders: any change to the job invalidates every button
+    minted before it, with no extra state to keep in sync and nothing to lose
+    across a restart.
+    """
+    try:
+        return str(_job_manifest_path(chat_id).stat().st_mtime_ns)
+    except OSError:
+        return "0"
+
+
+def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> None:
+    """Dispatch a button press.
+
+    answerCallbackQuery in a `finally`: until it is called the client spins on
+    the button and eventually reports the bot as unresponsive, even when the
+    work succeeded. That must happen whether the branch replied, refused, or
+    raised.
+    """
+    data = query.get("data") or ""
+    try:
+        if data.startswith(_CB_SLOT):
+            role = data[len(_CB_SLOT):]
+            job = _job_for(chat_id)
+            if role not in _askable_roles(job.pipeline):
+                # Reachable from a keyboard minted before a /pipeline switch.
+                tg.send_message(chat_id,
+                                f"{role} is not a slot for {job.pipeline}")
+            elif not (_PENDING.get(chat_id) or []):
+                tg.send_message(chat_id, "no file is waiting for a slot — that "
+                                         "button is from an earlier question")
+            else:
+                _answer_slot(tg, chat_id, role)
+
+        elif data.startswith(_CB_PIPE):
+            _switch_pipeline_and_report(tg, chat_id, data[len(_CB_PIPE):])
+
+        elif data == _CB_RUN_ASK:
+            job = _STATE.get(chat_id)
+            if job is None or missing_slots(job):
+                tg.send_message(chat_id, "no complete job yet — send the "
+                                         "required files first")
+            else:
+                # The second step. Deliberately a separate tap: the first one
+                # is next to the manifest and easy to hit by accident.
+                tg.send_message(
+                    chat_id,
+                    "This rents a GPU pod at $0.99/hour and starts the job.\n"
+                    "Confirm?",
+                    buttons=[[("Yes, spend $0.99/h", _CB_RUN_GO + _run_token(chat_id)),
+                              ("Cancel", _CB_RUN_NO)]])
+
+        elif data.startswith(_CB_RUN_GO):
+            if data[len(_CB_RUN_GO):] != _run_token(chat_id):
+                tg.send_message(chat_id,
+                                "the job changed since that button was sent, so "
+                                "nothing ran. Check the manifest above and "
+                                "confirm again.")
+            else:
+                _do_confirm(tg, chat_id, dry_run=dry_run)
+
+        elif data == _CB_RUN_NO:
+            tg.send_message(chat_id, "cancelled — nothing was spent")
+
+        else:
+            tg.send_message(chat_id, "that button is from an older version of "
+                                     "the bot; send /start for the commands")
+    finally:
+        tg.answer_callback_query(query.get("id") or "")
+
+
+def _switch_pipeline_and_report(tg: Tg, chat_id: int, name: str) -> None:
+    """The /pipeline body, shared by the typed command and the buttons."""
+    job = _job_for(chat_id)
+    if name not in PIPELINES:
+        tg.send_message(chat_id, "no pipeline called that. send /pipeline to "
+                                 "list them.")
+        return
+    if name == job.pipeline:
+        tg.send_message(chat_id, f"already on {name}")
+        return
+    job, dropped = _switch_pipeline(chat_id, name)
+    note = (f"\ndropped {', '.join(dropped)} — {name} has no stage that uses it"
+            if dropped else "")
+    still = sorted(missing_slots(job))
+    tg.send_message(chat_id,
+                    f"pipeline: {name}  ({' -> '.join(PIPELINES[name])}){note}\n" +
+                    (f"still needed: {', '.join(still)}" if still
+                     else "all slots filled — re-checking the manifest"))
+    # Re-render against the new pipeline rather than leaving the manifest the
+    # user last saw on screen: that file is what /confirm submits.
+    _maybe_show_manifest(tg, chat_id, job)
+
+
+def _answer_slot(tg: Tg, chat_id: int, role: str) -> None:
+    """Assign the head of the queue to `role` — the one path, two callers.
+
+    A typed reply and a tapped button must do the SAME thing: pop the head,
+    fill the slot, re-render the manifest, and ask about whatever is still
+    queued. Buttons arrived on 2026-08-31 and duplicating this sequence for
+    them is how the two drift — finding I7 lives inside it (see _fill_slot).
+    """
+    queue = _PENDING.get(chat_id) or []
+    if not queue:
+        return
+    job = _job_for(chat_id)
+    path, p = queue.pop(0)
+    if not queue:
+        _PENDING.pop(chat_id, None)
+    _CONFIRM_WARNED.discard(chat_id)
+    # _fill_slot, not a bare assignment: answering a role that is already
+    # filled pops the queue head AND overwrites the slot, so the displaced
+    # file is gone in the same step (finding I7).
+    _fill_slot(tg, chat_id, job, role, path, p)
+    _maybe_show_manifest(tg, chat_id, job)
+    if queue:
+        # The next file was already queued (it arrived before this answer) —
+        # ask about it now rather than waiting for another document.
+        _, next_p = queue[0]
+        _ask_about(tg, chat_id, next_p, job.pipeline)
+
+
+def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
+    """THE money gate. The ONLY function that may call start_drain.
+
+    Extracted from the /confirm branch on 2026-08-31 when the Run button
+    arrived. Two entry points must not mean two gates: every check below —
+    completeness, the unanswered queue, the validation verdict, and
+    drain_running — has to apply identically whether the user typed
+    /confirm or tapped a button, and the way to guarantee that is one body
+    with two callers rather than two bodies that agree today.
+
+    `grep -rn "start_drain" scripts/tgbot/bot.py` must show exactly one
+    call site, and it must be in here.
+    """
+    # `dry_run` is threaded from the caller (main()'s --dry-run; False for real
+    # usage and for every call in this file's own tests) all the way to the one
+    # start_drain below. The CLI flag has to actually reach that line, or
+    # "--dry-run: never invokes drain" in this module's docstring would be
+    # false — and the button path has to thread it just as far as the typed one.
+    job = _STATE.get(chat_id)
+    if job is None or missing_slots(job):
+        tg.send_message(chat_id, "no complete job yet — send the required files first")
+        return
+    pending = _PENDING.get(chat_id) or []
+    if pending and chat_id not in _CONFIRM_WARNED:
+        # /confirm used to succeed with files still queued and unanswered,
+        # then drop them silently on the state clear below (finding I6,
+        # 2026-08-31). Refuse once, naming the count; a second /confirm
+        # runs without them, because "I meant the optional one to be
+        # skipped" is a legitimate intent and there is no other way to
+        # express it.
+        _CONFIRM_WARNED.add(chat_id)
+        tg.send_message(chat_id,
+                        f"{len(pending)} file(s) still unassigned — answer "
+                        f"them, or send /confirm again to run without them")
+        return
+
+    # Ordered AFTER the pending check on purpose: the render below writes
+    # the manifest, and writing one we are about to refuse to run is noise.
+    validated = _LAST_VALIDATE.get(chat_id)
+    if validated is None:
+        # Never attempted — the only way to get here is the write guard in
+        # _render_and_validate having refused while a drain was live
+        # (finding B, 2026-08-31). The job was already complete at that
+        # moment, so no further slot fill re-enters _maybe_show_manifest
+        # and nothing would ever set this; the old code refused here with
+        # "fix the error already shown" when no error had ever been shown,
+        # and the only escape was re-sending a file, which nothing tells
+        # the user. Attempt it now instead: by this point the drain has
+        # normally finished, the write guard passes, and the normal path
+        # resumes. If it has NOT finished, _render_and_validate says so
+        # itself and names /status — a true reason with a real action.
+        if not _render_and_validate(tg, chat_id, job):
+            # It already sent the specific reason; a second, vaguer line
+            # would only bury it.
+            return
+        # The confirmation screen was never shown for this job, so send
+        # the manifest now: nothing may spend $0.99/hour without the exact
+        # inputs it spent on being in the transcript.
+        tg.send_message(chat_id,
+                        _job_manifest_path(chat_id).read_text(encoding="utf-8"))
+    elif not validated:
+        # Attempted and failed. Refuse rather than trust a downstream
+        # safety net: drain.py's own Phase A validate would likely catch
+        # this before a pod is rented, but that file is read-only to this
+        # bot, so this guard cannot rely on it (Task 7 fix round 1,
+        # Finding 2). Retrying the validate here would be pointless — the
+        # job has not changed since it failed.
+        tg.send_message(chat_id,
+                        "this manifest did not pass `make batch-validate`, and "
+                        "its output was sent above — nothing will run. Fix what "
+                        "it named and send the file(s) again.")
+        return
+
+    manifest_path = _job_manifest_path(chat_id)
+    if drain_running(manifest_path):
+        # The money guard: a second drain on one manifest corrupts the
+        # journal (two runners, one state.json) and double-books the GPU
+        # (run_enhance's comfy_recycle assumes exclusive use) —
+        # docs/batch-runner.md.
+        tg.send_message(chat_id,
+                        "a drain is already running for this job — wait for it "
+                        "to finish before confirming again")
+        return
+    start_drain(manifest_path, dry_run=dry_run)
+    # Clear in-memory state so the next file starts a fresh job rather
+    # than mutating one already handed to a running drain. The manifest
+    # itself, and the drain's own journal, stay on disk regardless.
+    dropped = len(_PENDING.pop(chat_id, []) or [])
+    _STATE.pop(chat_id, None)
+    _LAST_VALIDATE.pop(chat_id, None)
+    _CONFIRM_WARNED.discard(chat_id)
+    if dropped:
+        tg.send_message(chat_id, f"running without {dropped} unassigned file(s)")
+    tg.send_message(chat_id,
+                    "started — renting a GPU pod at $0.99/hour now.\n"
+                    f"Check back with /result {manifest_path.name} once it's done.")
+    return
+
+
 def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
            dry_run: bool = False) -> None:
     if not allowed(update, allowed_user_id):
         return                              # silent: do not confirm the bot exists
+    query = update.get("callback_query")
+    if query:
+        # Before `update["message"]` below, which a button press does not have
+        # in that shape (see _identify).
+        _, chat_id = _identify(update)
+        _handle_callback(tg, chat_id, query, dry_run=dry_run)
+        return
     msg = update["message"]
     chat_id = msg["chat"]["id"]
 
@@ -846,91 +1151,7 @@ def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
         return
 
     if text.startswith("/confirm"):
-        # THE money gate. This is the only line in this file that may call
-        # start_drain — grep -rn "start_drain" must show every call site
-        # here, after the drain_running check below. `dry_run` comes from
-        # the caller (main()'s --dry-run, default False for real usage and
-        # for every call in this file's own tests) — the CLI flag has to
-        # actually reach this line, or "--dry-run: never invokes drain" in
-        # this module's own docstring would be false.
-        job = _STATE.get(chat_id)
-        if job is None or missing_slots(job):
-            tg.send_message(chat_id, "no complete job yet — send the required files first")
-            return
-        pending = _PENDING.get(chat_id) or []
-        if pending and chat_id not in _CONFIRM_WARNED:
-            # /confirm used to succeed with files still queued and unanswered,
-            # then drop them silently on the state clear below (finding I6,
-            # 2026-08-31). Refuse once, naming the count; a second /confirm
-            # runs without them, because "I meant the optional one to be
-            # skipped" is a legitimate intent and there is no other way to
-            # express it.
-            _CONFIRM_WARNED.add(chat_id)
-            tg.send_message(chat_id,
-                            f"{len(pending)} file(s) still unassigned — answer "
-                            f"them, or send /confirm again to run without them")
-            return
-
-        # Ordered AFTER the pending check on purpose: the render below writes
-        # the manifest, and writing one we are about to refuse to run is noise.
-        validated = _LAST_VALIDATE.get(chat_id)
-        if validated is None:
-            # Never attempted — the only way to get here is the write guard in
-            # _render_and_validate having refused while a drain was live
-            # (finding B, 2026-08-31). The job was already complete at that
-            # moment, so no further slot fill re-enters _maybe_show_manifest
-            # and nothing would ever set this; the old code refused here with
-            # "fix the error already shown" when no error had ever been shown,
-            # and the only escape was re-sending a file, which nothing tells
-            # the user. Attempt it now instead: by this point the drain has
-            # normally finished, the write guard passes, and the normal path
-            # resumes. If it has NOT finished, _render_and_validate says so
-            # itself and names /status — a true reason with a real action.
-            if not _render_and_validate(tg, chat_id, job):
-                # It already sent the specific reason; a second, vaguer line
-                # would only bury it.
-                return
-            # The confirmation screen was never shown for this job, so send
-            # the manifest now: nothing may spend $0.99/hour without the exact
-            # inputs it spent on being in the transcript.
-            tg.send_message(chat_id,
-                            _job_manifest_path(chat_id).read_text(encoding="utf-8"))
-        elif not validated:
-            # Attempted and failed. Refuse rather than trust a downstream
-            # safety net: drain.py's own Phase A validate would likely catch
-            # this before a pod is rented, but that file is read-only to this
-            # bot, so this guard cannot rely on it (Task 7 fix round 1,
-            # Finding 2). Retrying the validate here would be pointless — the
-            # job has not changed since it failed.
-            tg.send_message(chat_id,
-                            "this manifest did not pass `make batch-validate`, and "
-                            "its output was sent above — nothing will run. Fix what "
-                            "it named and send the file(s) again.")
-            return
-
-        manifest_path = _job_manifest_path(chat_id)
-        if drain_running(manifest_path):
-            # The money guard: a second drain on one manifest corrupts the
-            # journal (two runners, one state.json) and double-books the GPU
-            # (run_enhance's comfy_recycle assumes exclusive use) —
-            # docs/batch-runner.md.
-            tg.send_message(chat_id,
-                            "a drain is already running for this job — wait for it "
-                            "to finish before confirming again")
-            return
-        start_drain(manifest_path, dry_run=dry_run)
-        # Clear in-memory state so the next file starts a fresh job rather
-        # than mutating one already handed to a running drain. The manifest
-        # itself, and the drain's own journal, stay on disk regardless.
-        dropped = len(_PENDING.pop(chat_id, []) or [])
-        _STATE.pop(chat_id, None)
-        _LAST_VALIDATE.pop(chat_id, None)
-        _CONFIRM_WARNED.discard(chat_id)
-        if dropped:
-            tg.send_message(chat_id, f"running without {dropped} unassigned file(s)")
-        tg.send_message(chat_id,
-                        "started — renting a GPU pod at $0.99/hour now.\n"
-                        f"Check back with /result {manifest_path.name} once it's done.")
+        _do_confirm(tg, chat_id, dry_run=dry_run)
         return
 
     if text.startswith("/pipeline"):
@@ -940,39 +1161,31 @@ def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
             # Listing beats guessing: the names are close enough to each other
             # that "swap-character-enhance" — what the user actually asked for
             # on 2026-08-31 — is not any of them.
-            tg.send_message(chat_id,
-                            f"pipeline: {job.pipeline}\n\navailable:\n" +
-                            "\n".join(f"  {n}  ({' -> '.join(PIPELINES[n])})"
-                                      for n in sorted(PIPELINES)) +
-                            "\n\nusage: /pipeline <name>")
+            # One button per pipeline: these are the names the user could not
+            # guess (they asked for "swap-character-enhance", which is none of
+            # them), so tapping beats typing.
+            tg.send_message(
+                chat_id,
+                f"pipeline: {job.pipeline}\n\n" +
+                "\n".join(f"{'* ' if n == job.pipeline else '  '}{n}"
+                          f"  ({' -> '.join(PIPELINES[n])})"
+                          for n in sorted(PIPELINES)),
+                buttons=[[(n, _CB_PIPE + n)] for n in sorted(PIPELINES)
+                         if n != job.pipeline])
             return
-        name = parts[1].strip()
-        if name not in PIPELINES:
-            tg.send_message(chat_id,
-                            "no pipeline called that. send /pipeline to list them.")
-            return
-        if name == job.pipeline:
-            tg.send_message(chat_id, f"already on {name}")
-            return
-        job, dropped = _switch_pipeline(chat_id, name)
-        note = (f"\ndropped {', '.join(dropped)} — {name} has no stage that "
-                "uses it" if dropped else "")
-        still = sorted(missing_slots(job))
-        tg.send_message(chat_id,
-                        f"pipeline: {name}  ({' -> '.join(PIPELINES[name])}){note}\n" +
-                        (f"still needed: {', '.join(still)}" if still
-                         else "all slots filled — re-checking the manifest"))
-        # Re-render against the new pipeline rather than leaving the manifest
-        # the user last saw on screen: that file is what /confirm submits.
-        _maybe_show_manifest(tg, chat_id, job)
+        _switch_pipeline_and_report(tg, chat_id, parts[1].strip())
         return
 
     if text.startswith("/start"):
-        tg.send_message(chat_id,
-                        "Ready. Send a file with the paperclip -> File.\n"
-                        "/status progress · /confirm spends money · "
-                        "/pipeline <name> · /result <manifest>.yaml · "
-                        "/tryon <batch-id>")
+        tg.send_message(
+            chat_id,
+            "Send each file as a File (in the picker: \"...\" -> Send as "
+            "File). Videos are the driver; for an image I ask which slot, "
+            "and you tap the answer.\n\n"
+            "When every slot is filled I show the job and a Run button. "
+            "Nothing spends money until you tap Run and confirm.\n\n"
+            "/pipeline switch flow · /status progress · "
+            "/result <name>.yaml · /tryon <batch-id>")
         return
 
     # A plain-text reply, meant to answer the question asked about the HEAD
@@ -985,24 +1198,23 @@ def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
         options = _askable_roles(job.pipeline)
         answer = text.strip().lower()
         if answer in options:
-            path, p = queue.pop(0)
-            if not queue:
-                _PENDING.pop(chat_id, None)
-            _CONFIRM_WARNED.discard(chat_id)
-            # _fill_slot, not a bare assignment: answering a role that is
-            # already filled pops the queue head AND overwrites the slot, so
-            # the displaced file is gone in the same step (finding I7).
-            _fill_slot(tg, chat_id, job, answer, path, p)
-            _maybe_show_manifest(tg, chat_id, job)
-            if queue:
-                # The next file was already queued (arrived before this
-                # answer) — ask about it immediately rather than waiting for
-                # another document to trigger it.
-                _, next_p = queue[0]
-                _ask_about(tg, chat_id, next_p, job.pipeline)
+            _answer_slot(tg, chat_id, answer)
         else:
             tg.send_message(chat_id, f"didn't recognise that — reply one of: "
                             f"{' / '.join(options)}")
+
+
+# Registered with Telegram at startup so typing "/" offers them instead of
+# requiring the user to remember. Descriptions are what shows in that menu, so
+# the money one has to say so there — the menu is where a tap originates.
+BOT_COMMANDS = [
+    ("start", "what this bot does and the commands"),
+    ("pipeline", "show or switch the pipeline"),
+    ("status", "progress of this chat's job"),
+    ("confirm", "SPENDS MONEY - rents a GPU at $0.99/h and starts"),
+    ("result", "the finished video, or the failure logs"),
+    ("tryon", "just the try-on image, when the result looks wrong"),
+]
 
 
 def main() -> int:
@@ -1032,6 +1244,13 @@ def main() -> int:
     tg = Tg(token=token, base_url=base)
     allowed_user_id = int(raw_id)
     offset = 0
+    # Best-effort: a failure here costs a menu, not the bot. Raising would stop
+    # a working bot from starting over a cosmetic call.
+    try:
+        tg.call("setMyCommands", commands=[{"command": c, "description": d}
+                                          for c, d in BOT_COMMANDS])
+    except TgError as exc:
+        log(f"setMyCommands failed, continuing without the menu: {exc}")
     log(f"started, api={base}, dry_run={args.dry_run}, pipeline={_DEFAULT_PIPELINE}")
     while True:
         try:
