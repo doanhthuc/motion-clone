@@ -191,8 +191,24 @@ the only thing pinning the bot to one.
 - **The progress bar counts the union of stages** across the queued pipelines. A
   batch mixing `tryon-motion-enhance` and `tryon-character-swap-enhance` would
   otherwise have the wrong denominator for half its runs.
-- **A queued job can be edited or removed.** Each entry gets `✏️` and `🗑`
-  buttons labelled with its colour square. `✏️` pulls the job back out for
+- **The keyboard is a fixed four rows, whatever the batch size.**
+
+  ```
+  ▶️ Run 4 · $0.99/h    ➕ Add
+  🟦  🟧  🟩  ▸🟪              ← tap a square to open that job
+  🔁👤  🔁🎬  🔁👗            ← replace a slot of the open one
+  🗑 this job          🗑 all
+  ```
+
+  The first version gave every job its own row of two buttons: measured at
+  **nine rows and seventeen buttons for six jobs**, which the user rejected
+  ("menu dài hơn nữa à, làm vậy không được quá dài"). One row of squares gets
+  it to four rows for one job and four for eight. The open job's square is
+  marked rather than omitted, so the squares in the keyboard stay one-to-one
+  with the bars down the picture. The slot buttons are icon-only for the same
+  budget: four named buttons two per row cost half the keyboard, and the icons
+  are the ones already printed beside each role name a few lines above.
+- **A queued job can be edited or removed.** `✏️` pulls the job back out for
   editing and it **stays queued throughout** — `_jobs_for` is the basket *plus*
   the job being edited, so the moment it leaves the basket it is counted again
   and there is no "add it back" step to forget. What changes is only which row

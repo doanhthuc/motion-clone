@@ -1469,14 +1469,36 @@ class TestFlow(unittest.TestCase):
         self.assertIn("x below", before_block)
         self.assertIn(bot.ICON_WARN, before_block)
 
-    def test_the_fix_buttons_are_two_per_row(self):
-        # Four stacked full-width buttons pushed the message they belong to off
-        # the top of a phone screen — that was the original complaint.
+    def test_the_fix_buttons_are_one_icon_row(self):
+        """Four named buttons two per row cost half the keyboard.
+
+        The panel's keyboard has to stay a fixed height as the batch grows, and
+        the icons are the ones already printed beside each role name a few
+        lines above, so the mapping is on screen.
+        """
         with mock.patch("tgbot.bot.drain_running", return_value=False):
             self._fill_required_slots()
         rows = bot._fix_buttons(bot._STATE[ME])
-        self.assertTrue(all(len(r) <= 2 for r in rows), rows)
-        self.assertEqual(rows[-1][0][1], bot._CB_CLEAR_ASK)
+        self.assertEqual(len(rows), 1)
+        for label, data in rows[0]:
+            self.assertTrue(data.startswith(bot._CB_REDO))
+            self.assertNotIn(data[len(bot._CB_REDO):], label,
+                             "the role name is still spelled out")
+
+    def test_the_keyboard_does_not_grow_with_the_batch(self):
+        """Measured before the change: six jobs came to nine rows and
+        seventeen buttons — "menu dài hơn nữa à, làm vậy không được quá dài"."""
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+        job = bot._STATE[ME]
+        bot._LAST_VALIDATE[ME] = True
+        heights = []
+        for extra in range(8):
+            bot._BASKET[ME] = [bot._copy_job(job) for _ in range(extra)]
+            for index, other in enumerate(bot._BASKET[ME]):
+                other.slots["outfit"] = Path(f"/s/o{index}.png")
+            heights.append(len(bot._panel_buttons(ME, job)))
+        self.assertLessEqual(max(heights), 4, f"keyboard heights: {heights}")
 
 
     # ---- the completion poll (added 2026-08-31) --------------------------
@@ -1783,12 +1805,27 @@ class TestFlow(unittest.TestCase):
         self.assertEqual(len(bot._jobs_for(ME)), remaining, "a stale tap hit a job")
         self.assertIn("no longer in the batch", self.tg.messages[-1])
 
-    def test_every_batch_entry_offers_edit_and_remove(self):
+    def test_every_batch_entry_gets_a_square_and_the_open_one_is_marked(self):
+        """One row of squares whatever the batch size, and the squares in the
+        keyboard stay one-to-one with the bars down the picture."""
         self._add_second_job()
         offered = self.tg.callback_data()
-        digest = self._digest_of_first()
-        self.assertIn(bot._CB_JOB_EDIT + digest, offered)
-        self.assertIn(bot._CB_JOB_DROP + digest, offered)
+        self.assertIn(bot._CB_JOB_EDIT + self._digest_of_first(), offered)
+        # The job being edited is the last row of the sheet; it is marked
+        # rather than left out, or the squares and the bars would not match.
+        self.assertIn(bot._CB_JOB_OPEN, offered)
+        self.assertIn(bot._CB_JOB_HERE, offered)
+
+    def test_removing_the_open_job_opens_the_next_one(self):
+        """Something has to stay on screen, or the panel shows an empty job
+        while the batch still has entries — which reads as "everything gone"."""
+        self._add_second_job()
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._CB_JOB_HERE), allowed_user_id=ME)
+        self.assertEqual(len(bot._jobs_for(ME)), 1)
+        self.assertIsNotNone(bot._STATE.get(ME))
+        from tgbot.job import missing_slots
+        self.assertFalse(missing_slots(bot._STATE[ME]))
 
     def test_confirm_records_a_progress_message_to_keep_editing(self):
         self._confirm_and_start()

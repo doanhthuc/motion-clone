@@ -900,6 +900,8 @@ _CB_CLEAR_NO = "clr:no"
 _CB_ADD = "add"
 _CB_JOB_EDIT = "bj:e:"   # + _job_digest
 _CB_JOB_DROP = "bj:d:"   # + _job_digest
+_CB_JOB_OPEN = "bj:open" # the square of the job already on screen
+_CB_JOB_HERE = "bj:here" # drop the job currently on screen
 
 
 def _run_token(chat_id: int) -> str:
@@ -983,7 +985,18 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
         elif data.startswith(_CB_JOB_EDIT):
             _edit_from_batch(tg, chat_id, data[len(_CB_JOB_EDIT):])
 
+        elif data == _CB_JOB_OPEN:
+            tg.answer_callback_query(query.get("id") or "",
+                                     "this one is already open")
+            return
+
+        elif data == _CB_JOB_HERE:
+            _drop_current(tg, chat_id)
+
         elif data.startswith(_CB_JOB_DROP):
+            # Still handled although nothing offers it any more: Telegram never
+            # expires an inline keyboard, so panels minted before the layout
+            # changed are still sitting in the chat with these buttons on them.
             _drop_from_batch(tg, chat_id, data[len(_CB_JOB_DROP):])
 
         elif data == _CB_CLEAR_ASK:
@@ -1165,16 +1178,16 @@ def _details_block(chat_id: int, job: Job) -> str:
 
 
 def _fix_buttons(job: Job) -> list[list[tuple[str, str]]]:
-    """Re-label buttons two per row, then Start over.
+    """Replace one slot of the job on screen — ONE row, icon only.
 
-    Two per row, not one: four stacked full-width buttons pushed the message
-    they belong to off the top of a phone screen.
+    Icon rather than name (2026-09-01): the panel's keyboard has to stay a
+    fixed height as the batch grows, and four named buttons two per row cost
+    two of the four rows available. The icons are the ones already printed
+    beside each role name a few lines above, so the mapping is on screen.
     """
-    labels = [(f"🔁 {r}", _CB_REDO + r) for r in sorted(job.slots)]
-    rows = [labels[i:i + 2] for i in range(0, len(labels), 2)]
-    if labels:
-        rows.append([("🗑 clear", _CB_CLEAR_ASK)])
-    return rows
+    labels = [(f"🔁{ROLE_ICON.get(role, '')}", _CB_REDO + role)
+              for role in sorted(job.slots)]
+    return [labels] if labels else []
 
 
 # ----------------------------------------------------------------- the panel
@@ -1302,22 +1315,42 @@ def _panel_buttons(chat_id: int, job: Job) -> list[list[tuple[str, str]]]:
     """
     rows: list[list[tuple[str, str]]] = []
     queued = _jobs_for(chat_id)
+    basket = _BASKET.get(chat_id) or []
     if queued and not (_PENDING.get(chat_id) or []) and _LAST_VALIDATE.get(chat_id) is True:
         run = [(f"▶️ Run {len(queued)} · $0.99/h" if len(queued) > 1
                 else "▶️ Run · $0.99/h", _CB_RUN_ASK)]
         # Offered beside Run, not instead of it: one pod runs everything in the
         # manifest, so adding another job costs nothing but the render itself.
         if not missing_slots(job):
-            run.append(("➕ Add another", _CB_ADD))
+            run.append(("➕ Add", _CB_ADD))
         rows.append(run)
-    # One row per committed job: edit it, or take it out. Keyed by the colour
-    # square the panel prints beside it and the sheet draws down its left, so
-    # the button says which job without needing a name.
-    for index, other in enumerate(_BASKET.get(chat_id) or []):
-        digest = _job_digest(other)
-        rows.append([(f"✏️ {_row_mark(index)}", _CB_JOB_EDIT + digest),
-                     (f"🗑 {_row_mark(index)}", _CB_JOB_DROP + digest)])
-    return rows + _fix_buttons(job)
+
+    # ONE row of coloured squares, whatever the batch size. The first version
+    # gave every job its own row of two buttons, which the user measured as
+    # nine rows and seventeen buttons for six jobs: "menu dài hơn nữa à, làm
+    # vậy không được quá dài". Tapping a square opens that job, and the slot
+    # and delete buttons below then act on whatever is open — so the keyboard
+    # is four rows for one job and four rows for eight.
+    if len(queued) > 1:
+        squares = [(_row_mark(index), _CB_JOB_EDIT + _job_digest(other))
+                   for index, other in enumerate(basket)]
+        if len(queued) > len(basket):
+            # The job being edited is always the last row of the sheet. Marked
+            # rather than omitted, so the squares in the keyboard and the bars
+            # in the picture stay one-to-one.
+            squares.append((f"▸{_row_mark(len(basket))}", _CB_JOB_OPEN))
+        rows.append(squares)
+
+    rows += _fix_buttons(job)
+
+    trash: list[tuple[str, str]] = []
+    if len(queued) > 1:
+        trash.append(("🗑 this job", _CB_JOB_HERE))
+    if job.slots or basket:
+        trash.append(("🗑 all", _CB_CLEAR_ASK))
+    if trash:
+        rows.append(trash)
+    return rows
 
 
 def _preview_dir(chat_id: int) -> Path:
@@ -1413,6 +1446,33 @@ def _edit_from_batch(tg: Tg, chat_id: int, digest: str) -> None:
     _LAST_VALIDATE.pop(chat_id, None)
     _render_and_validate(tg, chat_id)
     _show_panel(tg, chat_id, note="editing this one — it is still in the batch")
+
+
+def _drop_current(tg: Tg, chat_id: int) -> None:
+    """Remove the job on screen from the batch, and open the next one.
+
+    Something has to stay on screen afterwards or the panel would show an empty
+    job while the batch still has entries, which reads as "everything is gone".
+    So the last committed job is pulled back out to take its place.
+    """
+    job = _STATE.get(chat_id)
+    basket = _BASKET.get(chat_id) or []
+    if job is None and not basket:
+        tg.send_message(chat_id, "nothing to remove")
+        return
+    name = run_id_for(job) if job is not None else "that job"
+    _STATE.pop(chat_id, None)
+    _PENDING.pop(chat_id, None)
+    if basket:
+        _STATE[chat_id] = basket.pop()
+        if not basket:
+            _BASKET.pop(chat_id, None)
+    _LAST_VALIDATE.pop(chat_id, None)
+    if _jobs_for(chat_id):
+        _render_and_validate(tg, chat_id)
+    # Files are NOT deleted here, for the same reason as _drop_from_batch: the
+    # material is shared with every other run in the batch.
+    _show_panel(tg, chat_id, note=f"removed {_esc(name)} from the batch")
 
 
 def _drop_from_batch(tg: Tg, chat_id: int, digest: str) -> None:
