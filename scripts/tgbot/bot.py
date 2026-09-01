@@ -573,9 +573,17 @@ def _ask_about(tg: Tg, chat_id: int, p: Probe, pipeline: str, extra: str = "") -
     _answer_slot is the single body both paths run.
     """
     roles = _askable_roles(pipeline)
+    job = _STATE.get(chat_id)
+    filled = set(job.slots) if job else set()
+    # Two per row and marked, for the same reason _fix_buttons is (2026-09-01):
+    # three or four buttons on one row have their labels truncated on a phone,
+    # and an unmarked role gives no warning that tapping it overwrites a file
+    # already placed — _fill_slot names the replacement, but only afterwards.
+    labels = [(f"{ROLE_ICON.get(r, '')} {r}" + (f" {ICON_OK}" if r in filled else ""),
+               _CB_SLOT + r) for r in roles]
+    rows = [labels[i:i + 2] for i in range(0, len(labels), 2)]
     body = f"{describe(p)}\n{extra}" if extra else describe(p)
-    tg.send_message(chat_id, f"{body}\nWhich slot is this?",
-                    buttons=[[(r, _CB_SLOT + r) for r in roles]])
+    tg.send_message(chat_id, f"{body}\nWhich slot is this?", buttons=rows)
 
 
 def _fill_slot(tg: Tg, chat_id: int, job: Job, role: str, path: Path, p: Probe,
@@ -589,18 +597,26 @@ def _fill_slot(tg: Tg, chat_id: int, job: Job, role: str, path: Path, p: Probe,
     filled both popped the queue head and overwrote the slot, so the original
     was unrecoverable in the same breath. Overwriting is still allowed — it is
     how you correct a mistake — but it is now named.
+
+    Since 2026-09-01 this writes the acknowledgement into `_PANEL_NOTE` instead
+    of sending it, and renders nothing itself — every caller reaches
+    `_maybe_show_manifest`, which is now the single place the panel is drawn.
+    The naming survived the move, in the past tense the new position calls for
+    ("replaced the previous outfit" rather than "replacing"): a note sits under
+    a panel that already shows the result, so the present tense would be
+    describing something that has finished happening.
     """
     replacing = role in job.slots
     job.slots[role] = path
     job.probes[role] = p
-    prefix = f"replacing the previous {role}\n" if replacing else ""
-    suffix = f"\n{extra}" if extra else ""
-    # Said here as well as on the review screen: this is the moment the user is
-    # looking at this particular file, and it is the last point where sending a
-    # better one is cheap. See ingest.quality_warning for the survey behind it.
-    warning = quality_warning(p)
-    warn = f"\n\n{warning}" if warning else ""
-    tg.send_message(chat_id, f"{prefix}{role}: {describe(p)}{suffix}{warn}")
+    verb = f"replaced the previous {role}" if replacing else f"added {role}"
+    _PANEL_NOTE[chat_id] = f"{verb} — {path.name}"
+    if extra:
+        # The fidelity line (bytes in == bytes out) is evidence about THIS
+        # file at the moment it arrived, and acceptance A6 compares it against
+        # the delivered digest — so it stays a real message rather than a note
+        # that the next upload overwrites.
+        tg.send_message(chat_id, f"{role}: {describe(p)}\n{extra}")
 
 
 def _render_and_validate(tg: Tg, chat_id: int, job: Job) -> bool:
@@ -669,53 +685,28 @@ def _render_and_validate(tg: Tg, chat_id: int, job: Job) -> bool:
     return True
 
 
-def _manifest_summary(chat_id: int, job: Job) -> str:
-    """What the user reads before spending — the review screen.
-
-    Replaces echoing the raw YAML (2026-08-31). The trade is deliberate and
-    worth naming: the rule this file works to is "nothing may spend $0.99/hour
-    without the exact inputs it spent on being in the transcript", and a
-    summary is weaker than the file itself. What keeps it honest is that the
-    FILENAMES stay — and staged names are the user's own by design (see
-    STAGING_DIR_NAME), chosen precisely so a manifest is readable on a phone.
-    What goes is the repeated absolute path prefix, which is identical on every
-    line and told the reader nothing. The full YAML is still on disk and still
-    reachable with /result.
-    """
-    lines = [f"🎬 <b>{_esc(job.pipeline)}</b>", ""]
-    for role in sorted(required_roles(job.pipeline) | optional_roles(job.pipeline)):
-        lines.append(_role_line(role, job))
-    # Any warning is repeated OUTSIDE the collapsed block here, unlike on /job:
-    # this is the last thing read before $0.99/hour is committed, and something
-    # that needs a tap to reveal is something that gets skipped.
-    for role in sorted(job.slots):
-        pr = job.probes.get(role)
-        warning = quality_warning(pr) if pr else ""
-        if warning:
-            lines += ["", f"{ICON_WARN} <b>{_esc(role)}</b>: {_esc(warning)}"]
-    lines += ["", _details_block(chat_id, job), "",
-              f"⏱ ~{estimate_minutes(job)} min    💸 $0.99/hour",
-              "<i>estimate measured once on one batch — not a promise</i>"]
-    return "\n".join(lines)
-
-
 def _maybe_show_manifest(tg: Tg, chat_id: int, job: Job) -> None:
-    """Once every required slot is filled: render, validate for free, show it.
+    """Redraw the panel, validating for free first if the job is complete.
 
     This is the plan's "[Run]" step (docs/superpowers/plans/2026-08-31-…
     Task 5: "renders the manifest, runs make batch-validate (free), and shows
     the result with an estimate") — triggered automatically by the last slot
     fill rather than a separate command, since there is no button to tap for
     it. It rents nothing: `make batch-validate` never touches the pod.
-    """
-    if missing_slots(job):
-        return
-    if not _render_and_validate(tg, chat_id, job):
-        return
 
-    tg.send_message(chat_id, _manifest_summary(chat_id, job),
-                    buttons=[[("▶️ Run · $0.99/h", _CB_RUN_ASK)]],
-                    parse_mode=PARSE_HTML)
+    It now draws on EVERY call, not only on a complete job (2026-09-01). The
+    panel is the one thing the user reads, so a fill that leaves the job
+    incomplete has to move it too — otherwise two of the three slot fills in an
+    ordinary job would change nothing on screen.
+
+    The validate verdict is not consulted here: `_render_and_validate` records
+    it in `_LAST_VALIDATE` and sends its own specific message on failure, and
+    `_panel_buttons` reads it to decide whether Run may be offered at all. One
+    reader, one writer.
+    """
+    if not missing_slots(job):
+        _render_and_validate(tg, chat_id, job)
+    _show_panel(tg, chat_id)
 
 
 _DRAFT_SUFFIX = ".draft.json"
@@ -763,6 +754,14 @@ def _save_draft(chat_id: int) -> None:
         "slots": {r: str(p) for r, p in (job.slots if job else {}).items()},
         "probes": {r: asdict(pr) for r, pr in (job.probes if job else {}).items()},
         "pending": [[str(p), asdict(pr)] for p, pr in pending],
+        # The panel has to survive a restart for the same reason the slots do:
+        # motion-bot.service is Restart=always, and a bot that came back
+        # without the message id would send a SECOND panel while the first sat
+        # above it with live buttons — two keyboards for one job, which is how
+        # a tap lands on a job that no longer exists.
+        "panel": _PANEL.get(chat_id),
+        "note": _PANEL_NOTE.get(chat_id),
+        "last_seen": _LAST_SEEN.get(chat_id),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
@@ -803,6 +802,19 @@ def _load_draft(chat_id: int) -> str | None:
     _STATE[chat_id] = Job(slots=slots, probes=probes, pipeline=pipeline)
     if pending:
         _PENDING[chat_id] = pending
+    # Read with .get, unlike the fields above: a draft written by the previous
+    # version of this bot has no "panel" key, and refusing to load an otherwise
+    # perfectly good job over a missing cosmetic field would set it aside as
+    # corrupt — the one outcome _load_draft exists to avoid.
+    panel = payload.get("panel")
+    if panel is not None:
+        _PANEL[chat_id] = int(panel)
+    note = payload.get("note")
+    if note:
+        _PANEL_NOTE[chat_id] = str(note)
+    last_seen = payload.get("last_seen")
+    if last_seen is not None:
+        _LAST_SEEN[chat_id] = int(last_seen)
     return None
 
 
@@ -958,13 +970,14 @@ def _switch_pipeline_and_report(tg: Tg, chat_id: int, name: str) -> None:
         tg.send_message(chat_id, f"already on {name}")
         return
     job, dropped = _switch_pipeline(chat_id, name)
-    note = (f"\ndropped {', '.join(dropped)} — {name} has no stage that uses it"
-            if dropped else "")
-    still = sorted(missing_slots(job))
-    tg.send_message(chat_id,
-                    f"pipeline: {name}  ({' -> '.join(PIPELINES[name])}){note}\n" +
-                    (f"still needed: {', '.join(still)}" if still
-                     else "all slots filled — re-checking the manifest"))
+    # A note, not a message: the panel's first line IS the pipeline and its
+    # slot list is redrawn below, so a separate message would restate what the
+    # reader is already looking at. What a redraw cannot show is the dropped
+    # material, because the evidence of it is exactly what just disappeared.
+    _PANEL_NOTE[chat_id] = (
+        f"switched to {name}"
+        + (f" · dropped {', '.join(dropped)} — no stage in {name} uses it"
+           if dropped else ""))
     # Re-render against the new pipeline rather than leaving the manifest the
     # user last saw on screen: that file is what /confirm submits.
     _maybe_show_manifest(tg, chat_id, job)
@@ -1000,9 +1013,18 @@ def _answer_slot(tg: Tg, chat_id: int, role: str) -> None:
 
 
 
-# One icon per role, one per state. Ordinary emoji, not Telegram's custom
-# emoji: those are a Premium feature and render as a placeholder for anyone
-# without it, which would put meaning somewhere not everyone can see.
+# One icon per role, one per state. Ordinary emoji, not Telegram's animated
+# custom emoji — measured 2026-09-01 against this bot on the real API, because
+# the reason recorded here before ("a Premium feature, renders as a
+# placeholder") was wrong about both the cause and the symptom: a
+# `<tg-emoji emoji-id="...">` entity is accepted with ok:true and then STRIPPED,
+# the message coming back with entities:null and only the fallback glyph. The
+# Bot API grants custom emoji to bots that bought a username on Fragment, and
+# this one has not. There is no error to catch and nothing renders wrong — the
+# animation simply never exists, which is why reading the docs was never going
+# to settle it. Animated .tgs stickers DO work (getStickerSet "AnimatedEmojies"
+# has ⏳ ✅ ❌ 🎬), but a sticker message cannot be edited, so it can never
+# carry state. Motion in this bot comes from re-editing text; see run._SPIN.
 ROLE_ICON = {"character": "👤", "outfit": "👗", "driver": "🎬", "background": "🖼"}
 ICON_OK = "✅"
 ICON_WARN = "⚠️"
@@ -1080,6 +1102,169 @@ def _fix_buttons(job: Job) -> list[list[tuple[str, str]]]:
     return rows
 
 
+# ----------------------------------------------------------------- the panel
+#
+# ONE message per chat holds the whole state of the job being assembled, and
+# every change re-edits it instead of sending a new message (2026-09-01, on the
+# user's instruction after a screenshot of the old behaviour: "UI hiện tại vẫn
+# đang quá xấu, không được trực quan"). Before this, each step — a file
+# accepted, a slot answered, a pipeline switched, the manifest re-shown — was
+# its own message, so assembling a three-file job left eight fragments and the
+# only way to see the current state was to scroll or type /job.
+#
+# The rule that makes it safe: the panel is frozen, never deleted, at the
+# moment money is committed. The invariant this file works to is that nothing
+# may spend $0.99/hour without the exact inputs it spent on being in the
+# transcript, and an edited message keeps only its latest version — so
+# _freeze_panel stops editing it and strips its keyboard, leaving the submitted
+# job permanently in the chat above the progress message.
+
+_PANEL: dict[int, int] = {}          # chat_id -> message_id of the live panel
+_PANEL_NOTE: dict[int, str] = {}     # chat_id -> one line about the last change
+_LAST_SEEN: dict[int, int] = {}      # chat_id -> id of the newest message seen
+
+# How many messages may sit between the panel and the bottom of the chat before
+# it is moved rather than edited. In a private chat message ids increment by
+# one per message, so `newest - panel` IS the drift in messages — no guessing.
+# Editing is preferred (it is silent and keeps one message), but a panel that
+# has scrolled off the screen is a panel the user cannot see, which is the
+# problem this whole thing exists to fix.
+_PANEL_DRIFT_MAX = 3
+
+
+def _panel_next_line(chat_id: int, job: Job) -> str:
+    """The one line that says what to do now — the bar plus its caption."""
+    required = sorted(required_roles(job.pipeline))
+    # Required roles only: an unfilled OPTIONAL slot must not make the bar look
+    # unfinished, because nothing is waiting on it.
+    filled = sum(1 for r in required if r in job.slots)
+    bar = "▰" * filled + "▱" * (len(required) - filled)
+    head = f"{bar} {filled}/{len(required)}"
+    missing = sorted(missing_slots(job))
+    if missing:
+        return f"{head} · send the <b>{_esc(missing[0])}</b> as a File"
+    verdict = _LAST_VALIDATE.get(chat_id)
+    if verdict is True:
+        # The caveat travels with the number, because estimate_minutes' own
+        # contract says it must: "The caller must put this next to a caveat
+        # (measured once, on one batch) — this function only computes the
+        # number". Carried here verbatim when _manifest_summary was folded into
+        # the panel (2026-09-01) rather than dropped as clutter.
+        return (f"{head} · ready · ⏱ ~{estimate_minutes(job)} min · 💸 $0.99/hour"
+                "\n<i>estimate measured once on one batch — not a promise</i>")
+    if verdict is False:
+        return f"{head} · {ICON_WARN} did not pass <code>batch-validate</code>"
+    return f"{head} · not checked yet — see the message above"
+
+
+def _panel_text(chat_id: int, job: Job) -> str:
+    """The panel body. Same vocabulary as the old review screen, one message."""
+    lines = [f"🎬 <b>{_esc(job.pipeline)}</b>", ""]
+    for role in sorted(required_roles(job.pipeline) | optional_roles(job.pipeline)):
+        lines.append(_role_line(role, job))
+    lines += ["", _panel_next_line(chat_id, job)]
+
+    queued = _PENDING.get(chat_id) or []
+    if queued:
+        lines += ["", f"⏳ waiting for a label: "
+                      f"{_esc(', '.join(q[0].name for q in queued))}"]
+    # Repeated OUTSIDE the collapsed block, as the review screen already did:
+    # this is the last thing read before $0.99/hour is committed, and anything
+    # that needs a tap to reveal is something that gets skipped.
+    for role in sorted(job.slots):
+        pr = job.probes.get(role)
+        warning = quality_warning(pr) if pr else ""
+        if warning:
+            lines += ["", f"{ICON_WARN} <b>{_esc(role)}</b>: {_esc(warning)}"]
+
+    note = _PANEL_NOTE.get(chat_id)
+    if note:
+        # The acknowledgement that used to be its own message. Kept in the
+        # panel so "replacing the previous outfit" is still named — losing that
+        # was the risk of collapsing the per-step messages (finding I6/I7).
+        lines += ["", f"<i>{_esc(note)}</i>"]
+    if job.slots:
+        lines += ["", _details_block(chat_id, job)]
+    return "\n".join(lines)
+
+
+def _panel_buttons(chat_id: int, job: Job) -> list[list[tuple[str, str]]]:
+    """Run only when there is genuinely something safe to run.
+
+    Gated on `_LAST_VALIDATE is True` as well as completeness — stricter than
+    the old review screen, which showed Run next to a manifest that had just
+    failed validation and relied on _do_confirm refusing the tap afterwards.
+    A button that cannot work should not be offered.
+    """
+    rows: list[list[tuple[str, str]]] = []
+    if (not missing_slots(job) and not (_PENDING.get(chat_id) or [])
+            and _LAST_VALIDATE.get(chat_id) is True):
+        rows.append([("▶️ Run · $0.99/h", _CB_RUN_ASK)])
+    return rows + _fix_buttons(job)
+
+
+def _show_panel(tg: Tg, chat_id: int, *, note: str = "",
+                bump: bool = False) -> None:
+    """Render the panel: edit it in place, or move it back to the bottom.
+
+    `bump` forces the move — used by /job, where the user has explicitly asked
+    to see the thing now and a silent edit somewhere above would look like the
+    command did nothing at all.
+    """
+    job = _STATE.get(chat_id)
+    if job is None:
+        _drop_panel(tg, chat_id)
+        return
+    if note:
+        _PANEL_NOTE[chat_id] = note
+    text = _panel_text(chat_id, job)
+    buttons = _panel_buttons(chat_id, job)
+
+    message_id = _PANEL.get(chat_id)
+    drifted = bump or (message_id is not None
+                       and _LAST_SEEN.get(chat_id, 0) - message_id > _PANEL_DRIFT_MAX)
+    if message_id is not None and not drifted:
+        if tg.edit_message(chat_id, message_id, text, buttons=buttons,
+                           parse_mode=PARSE_HTML):
+            return
+        # False means the user deleted it. Fall through and build a new one
+        # rather than leaving the chat with no panel at all.
+    elif message_id is not None:
+        tg.delete_message(chat_id, message_id)
+    _PANEL[chat_id] = tg.send_message(chat_id, text, buttons=buttons,
+                                      parse_mode=PARSE_HTML)
+
+
+def _drop_panel(tg: Tg, chat_id: int) -> None:
+    """Remove the panel entirely — only for /clear, where the job is gone."""
+    message_id = _PANEL.pop(chat_id, None)
+    _PANEL_NOTE.pop(chat_id, None)
+    if message_id is not None:
+        tg.delete_message(chat_id, message_id)
+
+
+def _freeze_panel(tg: Tg, chat_id: int, stamp: str) -> None:
+    """Stop editing the panel and strip its keyboard. Called only from _do_confirm.
+
+    Two jobs at once. It preserves the transcript invariant — the panel stops
+    changing at the instant money is committed, so what it shows is what was
+    submitted — and it removes the Run button from a job that has already been
+    handed to a drain, which is a second line of defence behind _run_token's
+    staleness check rather than a replacement for it.
+
+    Must run BEFORE `_STATE.pop`: the text is rendered from the job it is
+    freezing.
+    """
+    message_id = _PANEL.pop(chat_id, None)
+    _PANEL_NOTE.pop(chat_id, None)
+    job = _STATE.get(chat_id)
+    if message_id is None or job is None:
+        return
+    tg.edit_message(chat_id, message_id,
+                    _panel_text(chat_id, job) + f"\n\n🚀 <b>{_esc(stamp)}</b>",
+                    parse_mode=PARSE_HTML)
+
+
 _PROGRESS_SUFFIX = ".progress.json"
 
 # The progress message is re-edited on every poll — roughly every 50s, since
@@ -1092,6 +1277,23 @@ _PROGRESS_SUFFIX = ".progress.json"
 # knob that never fires is worse than no knob. The elapsed-minutes line changes
 # every minute, so these edits are real rather than the "message is not
 # modified" no-ops that edit_message swallows.
+
+
+# Animation state, in memory on purpose: a frame number is cosmetic, and a
+# restart that resets it to 0 costs one visual stutter. Putting it in the
+# progress file would mean a disk write every 2 seconds for the length of a
+# render, to persist something nobody would notice being wrong.
+_FRAME: dict[int, int] = {}
+_ANIM_PAUSE: dict[int, float] = {}      # chat_id -> time.time() to resume at
+
+# While a drain runs the poll drops from a 50s long-poll to 2s, and each spin
+# redraws one frame. Measured against the real API on 2026-09-01: 0.48 edits/s
+# sustained with zero rejections (also clean at 0.91/s and 2.02/s in shorter
+# bursts). 2s rather than 1s because the animation reads the same either way
+# and half the calls is half the exposure to a flood limit that is not
+# published and can change without notice.
+_POLL_IDLE_SEC = 50
+_POLL_ANIMATED_SEC = 2
 
 
 def _progress_path(chat_id: int) -> Path:
@@ -1145,16 +1347,43 @@ def tick_progress(tg: Tg, chat_id: int) -> None:
         path.unlink(missing_ok=True)
         return
 
+    running = drain_running(manifest_path)
+    # Checked before the throttle below, never after: a cosmetic rate limit
+    # must not be able to delay the delivery of a finished render.
+    if running and time.time() < _ANIM_PAUSE.get(chat_id, 0.0):
+        return
+
+    frame = _FRAME[chat_id] = _FRAME.get(chat_id, 0) + 1
     text = progress_text(manifest_path, lease=lease_for(manifest_path),
-                         stages=stages)
-    if drain_running(manifest_path):
-        tg.edit_message(chat_id, message_id, text, parse_mode=PARSE_HTML)
+                         stages=stages, frame=frame)
+    if running:
+        try:
+            if not tg.edit_message(chat_id, message_id, text,
+                                   parse_mode=PARSE_HTML):
+                # The user deleted the progress message. Rebuild it and record
+                # the new id, rather than editing into the void for the rest of
+                # a 40-minute render.
+                payload["message_id"] = tg.send_message(chat_id, text,
+                                                        parse_mode=PARSE_HTML)
+                path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except TgError as exc:
+            # Telegram asked for a pause. Honour its own number when it gives
+            # one. Measured 2026-09-01 that this does not fire at one edit per
+            # 2s over 40 minutes, which is exactly why it must be handled
+            # rather than assumed away: the measurement covers one chat on one
+            # day, and the cost of being wrong is the bot arguing with flood
+            # control for the length of a paid render.
+            wait = exc.retry_after or 60.0
+            _ANIM_PAUSE[chat_id] = time.time() + wait
+            log(f"progress edit throttled, pausing the animation {wait:.0f}s: {exc}")
         return
 
     # Finished — one last edit so the message ends on the truth, then the
     # files. The progress file goes first: if delivery raises, the next tick
     # must not deliver a second copy of everything.
     path.unlink(missing_ok=True)
+    _FRAME.pop(chat_id, None)
+    _ANIM_PAUSE.pop(chat_id, None)
     tg.edit_message(chat_id, message_id, text, parse_mode=PARSE_HTML)
     deliver_result(tg, chat_id, manifest_path)
 
@@ -1173,33 +1402,8 @@ def _last_path(chat_id: int) -> Path:
     return ROOT / "batch" / f"tg-{chat_id}{_LAST_SUFFIX}"
 
 
-def _job_status(chat_id: int) -> tuple[str, list[list[tuple[str, str]]]]:
-    """What is assembled, what is missing, and the buttons to fix it.
-
-    Added 2026-08-31. Until this existed there was no way to ask the bot what
-    it was holding: when a slot label went missing, the only way to find out
-    what state the job was in was a screenshot of the chat. The draft was on
-    disk and the answer was always knowable — nothing exposed it.
-    """
-    job = _STATE.get(chat_id)
-    if job is None:
-        return ("📎 <b>Nothing assembled yet.</b>\nSend a file as a "
-                "<b>File</b> and I will measure it.", [])
-    lines = [f"🎬 <b>{_esc(job.pipeline)}</b>", ""]
-    # Every role of the pipeline, filled or not — an empty required slot is the
-    # thing the user most needs to see, and listing only what is present hides
-    # exactly that.
-    for role in sorted(required_roles(job.pipeline) | optional_roles(job.pipeline)):
-        lines.append(_role_line(role, job))
-    queued = _PENDING.get(chat_id) or []
-    if queued:
-        lines += ["", f"⏳ waiting for a label: "
-                      f"{_esc(', '.join(q[0].name for q in queued))}"]
-    if job.slots:
-        lines += ["", _details_block(chat_id, job)]
-    if not missing_slots(job):
-        lines += ["", f"⏱ ~{estimate_minutes(job)} min    💸 $0.99/h"]
-    return "\n".join(lines), _fix_buttons(job)
+NOTHING_ASSEMBLED = ("📎 <b>Nothing assembled yet.</b>\n"
+                     "Send a file as a <b>File</b> and I will measure it.")
 
 
 def _redo_slot(tg: Tg, chat_id: int, role: str) -> None:
@@ -1229,7 +1433,7 @@ def _redo_slot(tg: Tg, chat_id: int, role: str) -> None:
     # At the FRONT of the queue: the user asked about this file, so it is the
     # one to ask about, ahead of anything already parked.
     _PENDING.setdefault(chat_id, []).insert(0, (path, pr))
-    tg.send_message(chat_id, f"{path.name} is out of {role}")
+    _show_panel(tg, chat_id, note=f"took {path.name} out of {role}")
     _ask_about(tg, chat_id, pr, job.pipeline)
 
 
@@ -1267,9 +1471,13 @@ def _clear_job(tg: Tg, chat_id: int) -> None:
     _PENDING.pop(chat_id, None)
     _LAST_VALIDATE.pop(chat_id, None)
     _CONFIRM_WARNED.discard(chat_id)
+    # Deleted rather than frozen: /clear means the job never happened, and a
+    # panel left behind describing files that are no longer on disk is the
+    # stalest thing in the chat. Nothing spent, so nothing to keep a record of.
+    _drop_panel(tg, chat_id)
     # handle()'s finally calls _save_draft, which deletes the draft file itself
     # now that there is no state left to write.
-    tg.send_message(chat_id, f"cleared — {removed} staged file(s) deleted. "
+    tg.send_message(chat_id, f"🗑 cleared — {removed} staged file(s) deleted. "
                              "Send a file to start again.")
 
 
@@ -1401,6 +1609,10 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
                         "to finish before confirming again")
         return
     stages = list(PIPELINES[job.pipeline])
+    # BEFORE start_drain and before the state clear: this is the last instant
+    # the submitted job exists in memory, and freezing the panel here is what
+    # leaves the exact inputs permanently in the transcript.
+    _freeze_panel(tg, chat_id, f"submitted {time.strftime('%H:%M')}")
     start_drain(manifest_path, dry_run=dry_run)
     # Clear in-memory state so the next file starts a fresh job rather
     # than mutating one already handed to a running drain. The manifest
@@ -1442,6 +1654,13 @@ def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
         return
     msg = update["message"]
     chat_id = msg["chat"]["id"]
+    # How far the panel has drifted from the bottom of the chat is measured
+    # from this: in a private chat, message ids increment by one per message,
+    # so `newest - panel` is a message count, not an estimate. Recorded before
+    # anything below can draw the panel. max() because updates can be replayed
+    # after a restart (the offset is not persisted) and drift must not go
+    # backwards and pin a panel that has really scrolled away.
+    _LAST_SEEN[chat_id] = max(_LAST_SEEN.get(chat_id, 0), msg.get("message_id") or 0)
 
     # Accepting any of these would put a silently degraded input into a
     # $0.99/hour render; ignoring them leaves the user watching a chat that
@@ -1511,6 +1730,10 @@ def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
             # updates with no chance to answer in between (see _PENDING).
             queue = _PENDING.setdefault(chat_id, [])
             queue.append((path, p))
+            # The panel carries the "waiting for a label" line, so it has to
+            # move for a queued file too — otherwise the one screen the user
+            # reads goes stale precisely when the state got more complicated.
+            _show_panel(tg, chat_id)
             if len(queue) == 1:
                 _ask_about(tg, chat_id, p, job.pipeline, extra=fidelity)
             else:
@@ -1589,9 +1812,17 @@ def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
             # Not a dead end (2026-08-31). "nothing started" is true but
             # useless while a job is being assembled, which is most of the
             # time /status gets asked. Answer the question actually being put.
-            body, buttons = _job_status(chat_id)
-            tg.send_message(chat_id, f"💤 <b>Nothing running.</b>\n\n{body}",
-                            buttons=buttons or None, parse_mode=PARSE_HTML)
+            if _STATE.get(chat_id) is None:
+                tg.send_message(chat_id, f"💤 <b>Nothing running.</b>\n\n"
+                                         f"{NOTHING_ASSEMBLED}",
+                                parse_mode=PARSE_HTML)
+            else:
+                # The panel itself, moved down, rather than a second copy of it
+                # here: two live keyboards for one job is how a tap lands on
+                # the wrong one.
+                _show_panel(tg, chat_id, bump=True,
+                            note="nothing running yet — this is what you are "
+                                 "assembling")
             return
         # The same renderer the auto-updating message uses, so /status can
         # never disagree with what is already on screen.
@@ -1614,9 +1845,12 @@ def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
         return
 
     if text.startswith("/job"):
-        body, buttons = _job_status(chat_id)
-        tg.send_message(chat_id, body, buttons=buttons or None,
-                        parse_mode=PARSE_HTML)
+        if _STATE.get(chat_id) is None:
+            tg.send_message(chat_id, NOTHING_ASSEMBLED, parse_mode=PARSE_HTML)
+        else:
+            # bump: /job is an explicit "show me now", and a silent edit to a
+            # message somewhere above would look like the command did nothing.
+            _show_panel(tg, chat_id, bump=True)
         return
 
     if text.startswith("/clear"):
@@ -1733,12 +1967,20 @@ def main() -> int:
     log(f"started, api={base}, dry_run={args.dry_run}, pipeline={_DEFAULT_PIPELINE}")
     while True:
         try:
-            for update in tg.get_updates(offset):
+            # The long-poll IS the animation timer (2026-09-01). While a drain
+            # is running the poll shortens to 2s so the loop comes round often
+            # enough to redraw a moving frame; the rest of the time it stays at
+            # 50s, which costs one request per 50s and no timer of its own.
+            # Keyed on the progress file rather than a flag, so a bot restarted
+            # mid-render picks the fast cadence straight back up.
+            animating = _progress_path(allowed_user_id).exists()
+            for update in tg.get_updates(
+                    offset, timeout=(_POLL_ANIMATED_SEC if animating
+                                     else _POLL_IDLE_SEC)):
                 offset = update["update_id"] + 1
                 handle(tg, update, allowed_user_id=allowed_user_id,
                        dry_run=args.dry_run)
-            # After the updates, not instead of them: get_updates long-polls
-            # for 50s, so this runs on that cadence with no timer of its own.
+            # After the updates, not instead of them.
             # One chat, because the allowlist is one user (spec section 2).
             tick_progress(tg, allowed_user_id)
         except TgError as exc:

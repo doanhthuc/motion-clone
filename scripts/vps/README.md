@@ -177,6 +177,63 @@ This closes a gap spec section 4.3 left open. "Measure on arrival, do not trust 
 implemented as far as `describe()` — the numbers were shown, and nothing judged them. The File rule
 guarantees Telegram did no damage; it cannot guarantee the bytes were good before they were sent.
 
+### The control panel
+
+**One message per chat holds the whole job being assembled.** Every change —
+a file accepted, a slot answered, a pipeline switched, a slot re-labelled —
+re-edits that message instead of sending a new one. Before 2026-09-01 each step
+was its own message, so a three-file job left eight fragments and the only way
+to see the current state was to scroll or type `/job`.
+
+```
+🎬 tryon-character-swap-enhance          ← the panel (assembling)
+
+✅ 👤 character · 1536×2720 · 4.9 MB
+✅ 👗 outfit · 1080×1440 · 2.1 MB
+⬜ 🎬 driver
+⬜ 🖼 background — optional
+
+▰▰▱ 2/3 · send the driver as a File
+▸ details                                ← collapsed measurements
+[🔁 character] [🔁 outfit]  [🗑 clear]
+```
+
+The bar counts **required** roles only: an unfilled optional slot must not make
+the job look unfinished, because nothing is waiting on it.
+
+Four rules hold it together:
+
+- **It is frozen, never deleted, when money is committed.** The invariant is
+  that nothing may spend $0.99/hour without the exact inputs it spent on being
+  in the transcript — and an edited message keeps only its latest version. So
+  `_freeze_panel` stops editing it and strips its keyboard, leaving the
+  submitted job permanently in the chat above the progress message. `/clear` is
+  the opposite case and *does* delete it: nothing was spent, so there is no
+  record to keep, and a panel describing files that no longer exist is the
+  stalest thing in the chat.
+- **It moves down when it drifts.** Editing is silent and preferred, but a
+  panel five messages up is one the user has to hunt for. Message ids increment
+  by one per message in a private chat, so `newest_seen - panel_id` *is* the
+  drift in messages — no guessing. Past `_PANEL_DRIFT_MAX` (3) it is deleted and
+  re-sent at the bottom. `/job` forces that move, because an explicit "show me
+  now" answered by a silent edit somewhere above reads as the command doing
+  nothing.
+- **Run appears only once `make batch-validate` has actually passed.** Stricter
+  than the screen it replaced, which offered Run beside a manifest that had just
+  failed and leaned on `_do_confirm` to refuse the tap. A button that cannot
+  work is not offered.
+- **Its message id is persisted in the draft.** `motion-bot.service` is
+  `Restart=always`; a bot that came back without the id would send a *second*
+  panel while the first sat above it with live buttons — two keyboards for one
+  job. The key is read with `.get()`, so a draft written by an older bot still
+  loads rather than being set aside as corrupt.
+
+The one-line acknowledgement that each step used to send ("replaced the previous
+outfit — o.png") now lives on the panel as an italic note. The fidelity line
+(bytes in == bytes out) stays a real message: it is evidence about one file at
+the moment it arrived, and acceptance A6 compares it against the delivered
+digest, so it must not be overwritten by the next upload.
+
 ### Presentation
 
 Messages use `parse_mode="HTML"`, ordinary emoji as icons, and one collapsed
@@ -236,8 +293,50 @@ succeeded.
 
 `/confirm` sends one progress message and then keeps **editing that same
 message** — it never posts a new one. `main()`'s poll loop calls `tick_progress`
-after each `getUpdates`, so the message updates roughly every 50s, which is how
-long `getUpdates` long-polls for.
+after each `getUpdates`, and the long-poll timeout *is* the animation timer:
+**2s while a drain is running, 50s otherwise.** It is keyed on the progress file
+existing, so a bot restarted mid-render picks the fast cadence straight back up.
+
+The message opens with ⚙️, not the panel's 🎬. The two sit next to each other
+for the whole of a render and mean different things — what was submitted, versus
+what is happening.
+
+#### Animation: what is actually possible
+
+Measured against this bot on the real API, 2026-09-01. The conclusion is narrow
+and worth not re-deriving:
+
+| Approach | Works? | Why it matters |
+|---|---|---|
+| `<tg-emoji>` custom emoji | **No — silently** | `sendMessage` returns `ok:true`; the message comes back with `entities:null` and only the fallback glyph. The Bot API grants custom emoji to bots that bought a username on Fragment. There is no error to catch and nothing renders wrong; the animation simply never exists. A test gates the string literal so it cannot be reached for again. |
+| Animated `.tgs` stickers | Yes, but | `getStickerSet("AnimatedEmojies")` has 599 animated stickers including ⏳ ✅ ❌ 🎬. But a sticker message **cannot be edited** (`message can't be edited`) — only deleted — so it can never carry state. |
+| `sendDice` | Yes | Genuinely animated, semantically wrong for progress. |
+| **Re-editing the text** | **Yes** | The only way to get motion *inside* a message. This is what the bot does. |
+
+Rate, measured the same day: 0.48, 0.91 and 2.02 edits/s all completed with
+**zero** rejections. 2s was chosen over 1s because the animation reads the same
+either way and half the calls is half the exposure to a flood limit that is not
+published. A 429 is still handled — `TgError.retry_after` carries Telegram's own
+number, `_ANIM_PAUSE` honours it, and the pause is checked *after* the
+completion check so a cosmetic rate limit can never delay delivering a result.
+
+`frame` may change the spinner and the hourglass and **nothing else**. A test
+strips those glyphs from two consecutive frames and asserts the remainder is
+byte-identical. The bar stays discrete (`done/len(planned)`) because the journal
+is discrete; smoothing it into a percentage would be inventing progress the
+runner never reported. What the motion says is "this process is alive", which is
+the one thing a journal genuinely cannot say — a drain that died mid-stage
+leaves exactly the same `running` record as one still working.
+
+The spinner also rides the `waiting for the pod` line. That is the ~10-minute
+provision-and-bootstrap window where the journal says nothing at all: without it
+the text is byte-identical every poll, every edit is swallowed as `message is
+not modified`, and the fast cadence costs 25× the API calls to show nothing —
+during the one phase where the only real question is whether it is alive.
+
+If the user deletes the progress message, `edit_message` returns `False` and the
+next tick rebuilds it and records the new id, rather than editing into the void
+for the rest of a paid render.
 
 A 5-minute throttle was added here and then removed the same day, on the user's
 instruction. An edit sends no notification and adds no message to the chat, so

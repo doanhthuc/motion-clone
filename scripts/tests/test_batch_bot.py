@@ -1,4 +1,4 @@
-import json, subprocess, sys, tempfile, time, unittest
+import itertools, json, subprocess, sys, tempfile, time, unittest
 from pathlib import Path
 from unittest import mock
 
@@ -11,12 +11,29 @@ from tgbot.ingest import Probe
 ME = 12345
 
 
+_MESSAGE_IDS = itertools.count(1)
+
+
+def next_message_id() -> int:
+    """One id space shared by the user's messages and the bot's.
+
+    That is how a real private chat numbers them, and _show_panel's drift check
+    is arithmetic on those ids — `newest_seen - panel_id`. Two separate
+    counters would have made the difference meaningless and the drift branch
+    untestable, which is precisely the branch that decides whether the panel is
+    still on screen.
+    """
+    return next(_MESSAGE_IDS)
+
+
 def update_from(user_id: int) -> dict:
-    return {"message": {"from": {"id": user_id}, "chat": {"id": user_id}, "text": "/start"}}
+    return {"message": {"from": {"id": user_id}, "chat": {"id": user_id},
+                        "message_id": next_message_id(), "text": "/start"}}
 
 
 def cmd_from(user_id: int, text: str) -> dict:
-    return {"message": {"from": {"id": user_id}, "chat": {"id": user_id}, "text": text}}
+    return {"message": {"from": {"id": user_id}, "chat": {"id": user_id},
+                        "message_id": next_message_id(), "text": text}}
 
 
 def doc_from(user_id: int, file_id: str, file_name: str | None = None) -> dict:
@@ -28,7 +45,7 @@ def doc_from(user_id: int, file_id: str, file_name: str | None = None) -> dict:
     if file_name is not None:
         doc["file_name"] = file_name
     return {"message": {"from": {"id": user_id}, "chat": {"id": user_id},
-                        "document": doc}}
+                        "message_id": next_message_id(), "document": doc}}
 
 
 def media_from(user_id: int, kind: str) -> dict:
@@ -37,7 +54,7 @@ def media_from(user_id: int, kind: str) -> dict:
     # of the key matters to the branch under test.
     payload = [{"file_id": "x"}] if kind == "photo" else {"file_id": "x"}
     return {"message": {"from": {"id": user_id}, "chat": {"id": user_id},
-                        kind: payload}}
+                        "message_id": next_message_id(), kind: payload}}
 
 
 def cb_from(user_id: int, data: str, cb_id: str = "cb1") -> dict:
@@ -48,6 +65,37 @@ def cb_from(user_id: int, data: str, cb_id: str = "cb1") -> dict:
                                "message": {"chat": {"id": user_id},
                                            "message_id": 7},
                                "data": data}}
+
+
+# The control panel is the only thing that opens with the clapperboard and a
+# bold pipeline name, so this identifies it without the tests having to track
+# message ids through sends, edits, bumps and freezes.
+PANEL_MARK = "🎬 <b>"
+
+
+def panel_text(tg):
+    """The most recent rendering of the control panel, whether sent or edited."""
+    panels = [t for t in tg.screen if t.startswith(PANEL_MARK)]
+    assert panels, "the bot never rendered a control panel"
+    return panels[-1]
+
+
+def reset_bot_state():
+    """Clear every per-chat dict in bot.py between tests.
+
+    One function rather than the three hand-written `.clear()` calls this
+    replaced (2026-09-01). Those were duplicated across five setUp methods, so
+    every dict added to bot.py had five places to be remembered in and none of
+    them failed loudly when it was not — the control-panel dicts would have
+    leaked message ids from one test into the next, which reads as a panel that
+    mysteriously refuses to be created.
+    """
+    for name in ("_STATE", "_LOADED", "_PENDING", "_LAST_VALIDATE",
+                 "_CONFIRM_WARNED", "_PANEL", "_PANEL_NOTE", "_LAST_SEEN",
+                 "_FRAME", "_ANIM_PAUSE"):
+        # getattr, not bot._STATE etc: a name that disappears from bot.py
+        # should fail here loudly rather than be silently skipped.
+        getattr(bot, name).clear()
 
 
 class FakeTg:
@@ -67,10 +115,27 @@ class FakeTg:
         self.answered: list[str] = []
         self.parse_modes: list[str | None] = []
         self.actions: list[str] = []
-        # Edits are what the progress message does — recorded separately from
-        # `messages`, because the whole point is that it does NOT send a new
-        # message every 50 seconds.
+        # Edits are what the progress message and the control panel do —
+        # recorded separately from `messages`, because the whole point of both
+        # is that they do NOT send a new message on every change.
         self.edits: list[tuple[int, str]] = []
+        self.edit_buttons: list[list[list[tuple[str, str]]] | None] = []
+        # Every text that reached the chat, sent or edited, in order. `messages`
+        # alone stopped being enough once the control panel arrived: the panel's
+        # first render is a send and every one after it is an edit, so an
+        # assertion against `messages` silently stops seeing the panel from the
+        # second update onwards — which is most of a job.
+        self.screen: list[str] = []
+        self.deleted: list[int] = []
+        # Message ids increment, as they do in a real chat: _show_panel's drift
+        # check is arithmetic on ids, so a fake that returns a constant would
+        # make that logic untestable — and would have hidden a panel that never
+        # moves no matter how far up the chat it goes.
+        # Flipped by a test to simulate the user deleting the message the bot
+        # keeps editing; the real client returns False for that case.
+        self.edit_ok = True
+        # Set to a TgError to make the next edit raise, as a 429 does.
+        self.edit_raises = None
 
     # The tags bot.py actually uses. Anything outside this set is either a
     # typo or unescaped user text, and Telegram rejects the whole message for
@@ -82,20 +147,30 @@ class FakeTg:
     def send_message(self, chat_id, text, *, buttons=None, parse_mode=None):
         self._check_markup(text, parse_mode)
         self.messages.append(text)
+        self.screen.append(text)
         self.buttons.append(buttons)
         # Recorded so a test can assert that HTML-formatted bodies actually
         # declare it: HTML sent without parse_mode shows the raw <b> tags,
         # and HTML declared without escaping makes Telegram reject the whole
         # message so nothing arrives at all.
         self.parse_modes.append(parse_mode)
-        return 1
+        return next_message_id()
 
     def send_chat_action(self, chat_id, action="typing"):
         self.actions.append(action)
 
-    def edit_message(self, chat_id, message_id, text, *, parse_mode=None):
+    def edit_message(self, chat_id, message_id, text, *, buttons=None,
+                     parse_mode=None):
+        if self.edit_raises is not None:
+            raise self.edit_raises
         self._check_markup(text, parse_mode)
         self.edits.append((message_id, text))
+        self.screen.append(text)
+        self.edit_buttons.append(buttons)
+        return self.edit_ok
+
+    def delete_message(self, chat_id, message_id):
+        self.deleted.append(message_id)
 
     def _check_markup(self, text, parse_mode):
         """Fail here rather than let Telegram silently reject the message.
@@ -132,8 +207,14 @@ class FakeTg:
         self.answered.append(callback_id)
 
     def callback_data(self):
-        """Every callback_data offered so far, flattened."""
-        return [d for rows in self.buttons if rows
+        """Every callback_data offered so far, flattened.
+
+        Spans sends AND edits (2026-09-01). The Run button lives on the control
+        panel, which is sent once and edited from then on — so a version of
+        this that read `self.buttons` alone reported that Run had never been
+        offered on any job the user did not build in a single update.
+        """
+        return [d for rows in self.buttons + self.edit_buttons if rows
                 for row in rows for _, d in row]
 
     def send_document(self, chat_id, path, caption=""):
@@ -287,9 +368,7 @@ class TestPipelineCommand(unittest.TestCase):
     """
 
     def setUp(self):
-        bot._STATE.clear()
-        bot._LOADED.clear()
-        bot._PENDING.clear()
+        reset_bot_state()
         bot._LAST_VALIDATE.clear()
         bot._CONFIRM_WARNED.clear()
         self._orig_default = bot._DEFAULT_PIPELINE
@@ -348,7 +427,9 @@ class TestPipelineCommand(unittest.TestCase):
             bot.handle(tg, cmd_from(ME, "/pipeline character-swap-enhance"),
                        allowed_user_id=ME)
         self.assertNotIn("outfit", bot._job_for(ME).slots)
-        self.assertIn("dropped outfit", tg.messages[0])
+        # _maybe_show_manifest is patched out, so the note is asserted where it
+        # is written rather than where it would have been drawn.
+        self.assertIn("dropped outfit", bot._PANEL_NOTE[ME])
 
     def test_switching_invalidates_the_cached_validation(self):
         # _LAST_VALIDATE is what /confirm trusts. Left set across a switch, a
@@ -422,9 +503,7 @@ class TestDraftPersistence(unittest.TestCase):
         self._restart()
 
     def _restart(self):
-        bot._STATE.clear()
-        bot._LOADED.clear()
-        bot._PENDING.clear()
+        reset_bot_state()
         bot._LAST_VALIDATE.clear()
         bot._CONFIRM_WARNED.clear()
 
@@ -663,9 +742,7 @@ class TestFlow(unittest.TestCase):
         (self.root / "batch").mkdir()
         (self.root / "out").mkdir()
         bot.ROOT = self.root
-        bot._STATE.clear()
-        bot._LOADED.clear()
-        bot._PENDING.clear()
+        reset_bot_state()
         bot._LAST_VALIDATE.clear()
         bot._CONFIRM_WARNED.clear()
 
@@ -694,9 +771,7 @@ class TestFlow(unittest.TestCase):
 
     def tearDown(self):
         bot.ROOT = self._orig_root
-        bot._STATE.clear()
-        bot._LOADED.clear()
-        bot._PENDING.clear()
+        reset_bot_state()
         bot._LAST_VALIDATE.clear()
         bot._CONFIRM_WARNED.clear()
 
@@ -728,12 +803,216 @@ class TestFlow(unittest.TestCase):
             bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME)
             bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME)
 
+    # ---- the control panel (2026-09-01) ------------------------------------
+    #
+    # One message per chat, edited in place. Everything below guards a
+    # property that has no other enforcement: the suite was fully green
+    # immediately after the panel was written and before any of these existed,
+    # which says only that nothing OLD broke.
+
+    def _send_driver(self):
+        with mock.patch("tgbot.bot.probe", return_value=self.driver_probe):
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+
+    def test_a_second_file_edits_the_panel_rather_than_sending_another(self):
+        """The whole reason the panel exists: no growing pile of fragments."""
+        probe_fn = self._probe_for({
+            self.driver_path.name: self.driver_probe,
+            self.character_path.name: self.image_probe,
+        })
+        with mock.patch("tgbot.bot.probe", side_effect=probe_fn):
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+            bot.handle(self.tg, doc_from(ME, "character-id"), allowed_user_id=ME)
+        sent = [t for t in self.tg.messages if t.startswith(PANEL_MARK)]
+        self.assertEqual(len(sent), 1, "a second panel was SENT, not edited")
+        self.assertTrue(any(t.startswith(PANEL_MARK) for _, t in self.tg.edits))
+
+    def test_the_panel_is_moved_down_once_it_has_drifted_off_screen(self):
+        """Editing is silent and preferred — but not at any distance.
+
+        A panel five messages up is a panel the user has to scroll to find,
+        which is the exact complaint the panel was built to answer.
+        """
+        self._send_driver()
+        first = bot._PANEL[ME]
+        bot._LAST_SEEN[ME] = first + bot._PANEL_DRIFT_MAX + 1
+        bot._show_panel(self.tg, ME)
+        self.assertIn(first, self.tg.deleted)
+        self.assertNotEqual(bot._PANEL[ME], first)
+        # Exactly one panel survives: the old one is deleted, not just orphaned
+        # with its buttons still live.
+        self.assertEqual(len(self.tg.deleted), 1)
+
+    def test_a_panel_the_user_deleted_is_rebuilt_rather_than_edited_into_the_void(self):
+        self._send_driver()
+        first = bot._PANEL[ME]
+        self.tg.edit_ok = False          # what the real client returns for a gone message
+        bot._show_panel(self.tg, ME)
+        self.assertNotEqual(bot._PANEL[ME], first)
+
+    def test_job_bumps_the_panel_to_the_bottom(self):
+        """/job is an explicit "show me now" — a silent edit above would read
+        as the command having done nothing."""
+        self._send_driver()
+        first = bot._PANEL[ME]
+        bot.handle(self.tg, cmd_from(ME, "/job"), allowed_user_id=ME)
+        self.assertIn(first, self.tg.deleted)
+        self.assertNotEqual(bot._PANEL[ME], first)
+
+    def test_run_is_not_offered_until_the_manifest_has_actually_validated(self):
+        """Stricter than the screen it replaced, which offered Run beside a
+        manifest that had just failed and leaned on _do_confirm to refuse."""
+        job = bot._job_for(ME)
+        job.slots.update({"character": Path("c.png"), "outfit": Path("o.png"),
+                          "driver": Path("d.mp4")})
+        flat = lambda rows: [d for row in rows for _, d in row]
+        bot._LAST_VALIDATE.pop(ME, None)
+        self.assertNotIn(bot._CB_RUN_ASK, flat(bot._panel_buttons(ME, job)))
+        bot._LAST_VALIDATE[ME] = False
+        self.assertNotIn(bot._CB_RUN_ASK, flat(bot._panel_buttons(ME, job)))
+        bot._LAST_VALIDATE[ME] = True
+        self.assertIn(bot._CB_RUN_ASK, flat(bot._panel_buttons(ME, job)))
+
+    def test_confirm_freezes_the_panel_with_the_inputs_and_no_buttons(self):
+        """The transcript invariant, under the new shape.
+
+        Nothing may spend $0.99/hour without the exact inputs it spent on
+        being in the transcript. An edited message keeps only its latest
+        version, so the panel has to STOP being edited at the moment money is
+        committed — otherwise the record of what was submitted would be
+        overwritten by whatever the user assembled next.
+        """
+        self._confirm_and_start()
+        frozen = panel_text(self.tg)
+        self.assertIn("submitted", frozen)
+        for name in ("character.jpg", "outfit.jpg", "driver.mp4"):
+            self.assertIn(name, frozen)
+        # The keyboard goes with it: a Run button on an already-running job is
+        # a second line of defence behind _run_token, not a decoration.
+        index = [i for i, (_, t) in enumerate(self.tg.edits)
+                 if "submitted" in t][-1]
+        self.assertIsNone(self.tg.edit_buttons[index])
+        # And it is untracked, so nothing can edit that record afterwards.
+        self.assertNotIn(ME, bot._PANEL)
+
+    def test_a_later_job_cannot_overwrite_the_frozen_record(self):
+        """The property the freeze exists for, exercised end to end."""
+        self._confirm_and_start()
+        frozen_id = [mid for mid, t in self.tg.edits if "submitted" in t][-1]
+        touched = sum(1 for mid, _ in self.tg.edits if mid == frozen_id)
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._send_driver()
+        # The next job builds its own panel and never reaches back to this id.
+        self.assertEqual(sum(1 for mid, _ in self.tg.edits if mid == frozen_id),
+                         touched)
+        self.assertNotEqual(bot._PANEL.get(ME), frozen_id)
+
+    def test_clear_deletes_the_panel_rather_than_leaving_it_stale(self):
+        self._send_driver()
+        first = bot._PANEL[ME]
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._CB_CLEAR_GO), allowed_user_id=ME)
+        self.assertIn(first, self.tg.deleted)
+        self.assertNotIn(ME, bot._PANEL)
+
+    def test_the_panel_id_survives_a_restart(self):
+        """motion-bot.service is Restart=always. A bot that came back without
+        the id would send a SECOND panel while the first sat above it with
+        live buttons — two keyboards for one job."""
+        self._send_driver()
+        saved = bot._PANEL[ME]
+        for holder in (bot._STATE, bot._PENDING, bot._PANEL, bot._PANEL_NOTE,
+                       bot._LOADED):
+            holder.clear()
+        self.assertIsNone(bot._load_draft(ME))
+        self.assertEqual(bot._PANEL[ME], saved)
+
+    def test_a_draft_written_before_the_panel_existed_still_loads(self):
+        """Forward compatibility, and the reason `panel` is read with .get().
+
+        A draft from yesterday's bot has no "panel" key. Refusing to load an
+        otherwise perfectly good job over a missing COSMETIC field would set it
+        aside as corrupt — the single outcome _load_draft exists to prevent.
+        """
+        self._send_driver()
+        path = bot._draft_path(ME)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        for key in ("panel", "note", "last_seen"):
+            payload.pop(key, None)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        for holder in (bot._STATE, bot._PENDING, bot._PANEL, bot._LOADED):
+            holder.clear()
+        self.assertIsNone(bot._load_draft(ME), "an older draft was set aside")
+        self.assertIn("driver", bot._STATE[ME].slots)
+
+    def test_the_slot_question_stacks_its_buttons_and_marks_what_is_filled(self):
+        """Three buttons on one row have their labels truncated on a phone,
+        and an unmarked role gives no warning that tapping it overwrites."""
+        probe_fn = self._probe_for({
+            self.character_path.name: self.image_probe,
+            self.outfit_path.name: self.image_probe,
+        })
+        with mock.patch("tgbot.bot.probe", side_effect=probe_fn):
+            bot.handle(self.tg, doc_from(ME, "character-id"), allowed_user_id=ME)
+            bot.handle(self.tg, cmd_from(ME, "character"), allowed_user_id=ME)
+            bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME)
+        rows = [b for b in self.tg.buttons if b
+                and any(d.startswith(bot._CB_SLOT) for row in b for _, d in row)][-1]
+        self.assertTrue(all(len(row) <= 2 for row in rows), rows)
+        labels = {d: label for row in rows for label, d in row}
+        self.assertIn(bot.ICON_OK, labels[bot._CB_SLOT + "character"])
+        self.assertNotIn(bot.ICON_OK, labels[bot._CB_SLOT + "outfit"])
+
+    def test_successive_ticks_actually_move_the_progress_message(self):
+        """Otherwise the 2s poll is 25x the API calls for no visible change.
+
+        Every edit would be swallowed as "message is not modified", and the
+        cost of the fast cadence would buy nothing at all.
+        """
+        self._confirm_and_start()
+        with mock.patch("tgbot.bot.drain_running", return_value=True):
+            bot.tick_progress(self.tg, ME)
+            bot.tick_progress(self.tg, ME)
+        self.assertNotEqual(self.tg.edits[-2][1], self.tg.edits[-1][1])
+
+    def test_a_throttled_edit_pauses_the_animation_but_never_delivery(self):
+        """Telegram's own backoff is honoured, and it cannot hold up a result.
+
+        A cosmetic rate limit delaying the delivery of a finished render would
+        be the animation costing the user the thing they paid for.
+        """
+        from tgbot.tgclient import TgError
+        self._confirm_and_start()
+        self.tg.edit_raises = TgError("Too Many Requests", retry_after=42.0)
+        with mock.patch("tgbot.bot.drain_running", return_value=True):
+            bot.tick_progress(self.tg, ME)
+        self.assertGreater(bot._ANIM_PAUSE[ME], time.time() + 40)
+        # Still paused: a second tick must not argue with flood control.
+        edits = len(self.tg.edits)
+        with mock.patch("tgbot.bot.drain_running", return_value=True):
+            bot.tick_progress(self.tg, ME)
+        self.assertEqual(len(self.tg.edits), edits)
+        # But the finished job is delivered regardless of the pause.
+        self.tg.edit_raises = None
+        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.deliver_result") as deliver:
+            bot.tick_progress(self.tg, ME)
+        deliver.assert_called_once()
+
+    def test_a_deleted_progress_message_is_rebuilt_with_its_new_id(self):
+        self._confirm_and_start()
+        before = json.loads(bot._progress_path(ME).read_text())["message_id"]
+        self.tg.edit_ok = False
+        with mock.patch("tgbot.bot.drain_running", return_value=True):
+            bot.tick_progress(self.tg, ME)
+        after = json.loads(bot._progress_path(ME).read_text())["message_id"]
+        self.assertNotEqual(after, before)
+
     def test_a_video_fills_the_driver_slot_without_asking(self):
         with mock.patch("tgbot.bot.probe", return_value=self.driver_probe):
             bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
-        self.assertEqual(len(self.tg.messages), 1)
-        self.assertIn("driver", self.tg.messages[0])
-        self.assertNotIn("which", self.tg.messages[0].lower())
+        self.assertIn("driver", panel_text(self.tg))
+        self.assertNotIn("which", panel_text(self.tg).lower())
         self.assertEqual(bot._STATE[ME].slots.get("driver"), self.staged("driver.mp4"))
 
     def test_an_image_is_asked_about_and_the_answer_fills_the_slot(self):
@@ -744,7 +1023,7 @@ class TestFlow(unittest.TestCase):
 
         bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME)
         self.assertEqual(bot._STATE[ME].slots.get("outfit"), self.staged("outfit.jpg"))
-        self.assertIn("outfit", self.tg.messages[-1])
+        self.assertIn("outfit", panel_text(self.tg))
 
     def test_an_unrecognised_slot_answer_is_re_asked_not_guessed(self):
         with mock.patch("tgbot.bot.probe", return_value=self.image_probe):
@@ -761,7 +1040,8 @@ class TestFlow(unittest.TestCase):
         with mock.patch("tgbot.bot.start_drain") as start_drain:
             self._fill_required_slots()
             start_drain.assert_not_called()
-        joined = "\n".join(self.tg.messages)
+        # `screen`, not `messages`: the panel is sent once and edited after.
+        joined = "\n".join(self.tg.screen)
         # Asserts the REVIEW CONTENT, not the YAML syntax it used to be echoed
         # in (changed 2026-08-31 with _manifest_summary). The rule this guards
         # is "nothing may spend $0.99/hour without the exact inputs it spent on
@@ -1039,17 +1319,18 @@ class TestFlow(unittest.TestCase):
                      bitrate_kbps=865, size_bytes=1_622_500)
         with mock.patch("tgbot.bot.probe", return_value=weak):
             bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
-        self.assertIn("low bitrate", self.tg.messages[-1])
-        # And again on the review screen: the upload-time warning has scrolled
-        # away by the time the money decision is made.
+        self.assertIn("low bitrate", panel_text(self.tg))
+        # And again once the job is complete: the panel is one message, so the
+        # warning has to still be on it at the moment the money decision is
+        # made — it cannot rely on an earlier message still being in view.
         with mock.patch("tgbot.bot.probe", return_value=self.image_probe), \
              mock.patch("tgbot.bot.drain_running", return_value=False):
             bot.handle(self.tg, doc_from(ME, "character-id"), allowed_user_id=ME)
             bot.handle(self.tg, cmd_from(ME, "character"), allowed_user_id=ME)
             bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME)
             bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME)
-        self.assertIn("low bitrate", self.tg.messages[-1])
-        self.assertIn("$0.99/hour", self.tg.messages[-1])
+        self.assertIn("low bitrate", panel_text(self.tg))
+        self.assertIn("$0.99/hour", panel_text(self.tg))
 
     def test_a_normal_driver_is_not_flagged(self):
         # The threshold has to leave real material alone: s1.mp4, the lowest
@@ -1071,8 +1352,7 @@ class TestFlow(unittest.TestCase):
         job = bot._job_for(ME)
         job.slots["character"] = Path("we<ird>.png")
         job.probes["character"] = self.image_probe
-        body, _ = bot._job_status(ME)
-        self.assertNotIn("<ird", body)
+        self.assertNotIn("<ird", bot._panel_text(ME, job))
         # FakeTg._check_markup would have failed the send; assert the escape
         # directly too, so the reason is visible when this breaks.
         self.assertIn("&lt;ird&gt;", bot._details_block(ME, job))
@@ -1103,7 +1383,7 @@ class TestFlow(unittest.TestCase):
             bot.handle(self.tg, cmd_from(ME, "character"), allowed_user_id=ME)
             bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME)
             bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME)
-        review = self.tg.messages[-1]
+        review = panel_text(self.tg)
         before_block = review.split("<blockquote")[0]
         self.assertIn("low bitrate", before_block)
 
@@ -1144,12 +1424,17 @@ class TestFlow(unittest.TestCase):
         """
         self._confirm_and_start()
         before = len(self.tg.messages)
+        edits_before = len(self.tg.edits)
         with mock.patch("tgbot.bot.drain_running", return_value=True):
             bot.tick_progress(self.tg, ME)
             bot.tick_progress(self.tg, ME)
         self.assertEqual(len(self.tg.messages), before)   # nothing new sent
-        self.assertEqual(len(self.tg.edits), 2)
-        self.assertEqual({mid for mid, _ in self.tg.edits}, {1})  # the same one
+        # Sliced from `edits_before`: confirming the job now freezes the panel,
+        # which is itself an edit, so a count over the whole list would be
+        # asserting about the panel rather than about the progress message.
+        ticked = self.tg.edits[edits_before:]
+        self.assertEqual(len(ticked), 2)
+        self.assertEqual(len({mid for mid, _ in ticked}), 1)  # the same one
         self.assertTrue(bot._progress_path(ME).exists())
 
     def test_when_the_drain_ends_the_result_is_delivered_unasked(self):
@@ -1290,9 +1575,7 @@ class TestFlow(unittest.TestCase):
         # A visibly DIFFERENT second job, so "unchanged" cannot pass by
         # coincidence: a 20-second driver renders a different comment line and
         # a different preset from the 5-second one above.
-        bot._STATE.clear()
-        bot._LOADED.clear()
-        bot._PENDING.clear()
+        reset_bot_state()
         bot._LAST_VALIDATE.clear()
         second_driver = self.root / "driver2.mp4"
         second_driver.write_bytes(b"dd")
@@ -1375,7 +1658,7 @@ class TestFlow(unittest.TestCase):
         with mock.patch("tgbot.bot.probe", return_value=self.driver_probe):
             bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
             bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
-        self.assertIn("replacing the previous driver", self.tg.messages[-1])
+        self.assertIn("replaced the previous driver", panel_text(self.tg))
 
     def test_answering_a_filled_role_says_it_is_replacing_it(self):
         # Finding I7: this path pops the queue head AND overwrites the slot,
@@ -1385,7 +1668,7 @@ class TestFlow(unittest.TestCase):
             bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME)
             bot.handle(self.tg, doc_from(ME, "character-id"), allowed_user_id=ME)
             bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME)
-        self.assertIn("replacing the previous outfit", self.tg.messages[-1])
+        self.assertIn("replaced the previous outfit", panel_text(self.tg))
 
     def test_confirm_with_files_still_unassigned_refuses_once_then_runs(self):
         """Finding I6: /confirm succeeded with files still queued and dropped
@@ -1594,6 +1877,34 @@ class TestNoDuplicateDefinitions(unittest.TestCase):
 
     MODULES = ["tgbot/bot.py", "tgbot/job.py", "tgbot/ingest.py",
                "tgbot/run.py", "tgbot/tgclient.py"]
+
+    def test_no_module_reaches_for_a_custom_emoji_entity(self):
+        """`<tg-emoji>` does nothing here, and does it silently.
+
+        Measured 2026-09-01 against this bot on the real API: sendMessage
+        returns ok:true, and the message comes back with entities:null and only
+        the fallback glyph. The Bot API grants custom emoji to bots that bought
+        a username on Fragment, and this one has not — so there is no error to
+        catch, no rejected send, and nothing renders wrong. It just never
+        animates. That is invisible to every test that asserts on the text the
+        bot BUILT rather than on what Telegram kept, which is all of them.
+        """
+        import ast
+        root = Path(__file__).resolve().parents[1]
+        for rel in self.MODULES:
+            with self.subTest(module=rel):
+                tree = ast.parse((root / rel).read_text(encoding="utf-8"))
+                # String literals only, not raw file text: both modules carry a
+                # `#` comment recording WHY this is forbidden, and a grep-style
+                # check would fire on the explanation rather than on a use.
+                literals = [n.value for n in ast.walk(tree)
+                            if isinstance(n, ast.Constant)
+                            and isinstance(n.value, str)]
+                for text in literals:
+                    self.assertNotIn("<tg-emoji", text,
+                                     f"{rel} builds a custom-emoji entity — it is "
+                                     "stripped for this bot; motion comes from "
+                                     "re-editing (run._SPIN)")
 
     def test_no_module_defines_a_top_level_name_twice(self):
         import ast

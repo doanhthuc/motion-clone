@@ -16,7 +16,21 @@ from pathlib import Path
 
 
 class TgError(Exception):
-    """A Telegram call failed. Never carries the token."""
+    """A Telegram call failed. Never carries the token.
+
+    `retry_after` carries Telegram's own backoff instruction when it sends one
+    (HTTP 429, `parameters.retry_after`, in seconds). Kept as a field rather
+    than left inside the description string because the progress animation
+    edits one message every 2s for the length of a render — measured
+    2026-09-01 at 0.48-2.0 edits/s with no rejection, but that was minutes, not
+    the 40+ of a real job. A caller that has to parse English out of an
+    exception to find out how long to wait will not do it, and will keep
+    hammering a chat Telegram has already told it to leave alone.
+    """
+
+    def __init__(self, message: str, *, retry_after: float | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 class Tg:
@@ -62,7 +76,10 @@ class Tg:
         except ValueError as exc:
             raise TgError(self._scrub(f"{method} returned non-JSON: {raw[:200]!r}")) from exc
         if not body.get("ok"):
-            raise TgError(self._scrub(f"{method} rejected: {body.get('description', body)}"))
+            retry_after = (body.get("parameters") or {}).get("retry_after")
+            raise TgError(
+                self._scrub(f"{method} rejected: {body.get('description', body)}"),
+                retry_after=float(retry_after) if retry_after is not None else None)
         return body.get("result")
 
     @staticmethod
@@ -130,15 +147,50 @@ class Tg:
             pass
 
     def edit_message(self, chat_id: int, message_id: int, text: str, *,
-                     parse_mode: str | None = None) -> None:
+                     buttons: list[list[tuple[str, str]]] | None = None,
+                     parse_mode: str | None = None) -> bool:
+        """Re-render one message in place. False means that message is gone.
+
+        Returning a bool rather than raising for the gone case (2026-09-01) is
+        what lets a caller rebuild: the control panel and the progress message
+        are both single messages this bot keeps editing for the length of a
+        job, and a user is free to delete either one from their own chat. The
+        old behaviour raised, main() logged it, and the bot then re-raised on
+        every poll forever while the user saw nothing at all.
+
+        Omitting `buttons` REMOVES the keyboard, and that is used deliberately:
+        it is how the panel is frozen into a permanent record at /confirm, so
+        the stale Run button on it cannot be tapped afterwards.
+        """
         try:
             self.call("editMessageText", chat_id=chat_id, message_id=message_id,
-                      text=text, parse_mode=parse_mode)
+                      text=text, parse_mode=parse_mode,
+                      reply_markup=self.keyboard(buttons) if buttons else None)
         except TgError as exc:
+            reason = str(exc)
             # Editing to identical text is an error in the Bot API and is
             # meaningless here — the progress loop re-renders on a timer.
-            if "message is not modified" not in str(exc):
-                raise
+            if "message is not modified" in reason:
+                return True
+            if ("message to edit not found" in reason
+                    or "message can't be edited" in reason
+                    or "MESSAGE_ID_INVALID" in reason):
+                return False
+            raise
+        return True
+
+    def delete_message(self, chat_id: int, message_id: int) -> None:
+        """Best-effort delete of one of the bot's own messages.
+
+        Used only to move the control panel back to the bottom of the chat
+        after it has drifted up. Failure is not worth surfacing: a bot may not
+        delete its own message after 48 hours, and the panel it could not
+        remove is stale text, not a wrong action.
+        """
+        try:
+            self.call("deleteMessage", chat_id=chat_id, message_id=message_id)
+        except TgError:
+            pass
 
     def send_document(self, chat_id: int, path: Path, caption: str = "") -> None:
         """sendDocument, never sendVideo.

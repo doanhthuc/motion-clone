@@ -76,9 +76,29 @@ def estimate_minutes(job: Job) -> int:
     return max(1, round(total_sec / 60))
 
 
+# Motion inside a message can ONLY come from re-editing it. Measured against
+# the real Bot API on 2026-09-01: a `<tg-emoji>` custom-emoji entity is
+# accepted with ok:true and then silently STRIPPED (the message comes back with
+# entities:null and a plain fallback glyph) — the Bot API grants custom emoji
+# only to bots that bought a username on Fragment, and there is no error to
+# catch. Animated .tgs stickers do work, but a sticker message cannot be edited
+# at all ("message can't be edited"), so it can never be a progress display.
+# Re-editing measured at 0.48/s, 0.91/s and 2.02/s with zero rejections.
+_SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+_HOURGLASS = ("⏳", "⌛")
+
+
 def progress_text(manifest_path: Path, *, lease,
-                  stages: list[str] | None = None) -> str:
+                  stages: list[str] | None = None, frame: int = 0) -> str:
     """Render one progress message from the journal alone. Returns HTML.
+
+    `frame` advances the animation only — it must never change a number. The
+    spinner and the flipping hourglass are the whole of it, deliberately: a bar
+    of `done/len(planned)` cells is discrete because the journal is discrete,
+    and smoothing it into a percentage would be inventing progress the runner
+    never reported. The moving parts say "this process is alive", which is the
+    thing a journal genuinely cannot say, since a drain that died mid-stage
+    leaves exactly the same `running` record as one still working.
 
     `lease` (batchlib_ext.lease.Lease | None) is used only for its own
     fields (pod_id, provisioned_at) already written to disk at provision
@@ -98,11 +118,23 @@ def progress_text(manifest_path: Path, *, lease,
     """
     state = load_state(state_path_for(manifest_path))
     batch = state.get("batch") or "(not started yet)"
-    lines = [f"🎬 <b>{html.escape(str(batch), quote=False)}</b>"]
+    # ⚙️, not the 🎬 the control panel opens with (2026-09-01). The two used to
+    # be indistinguishable at a glance, which matters most in the one place
+    # they sit next to each other: the frozen panel and the progress message
+    # are adjacent in the chat for the whole of a render, and they mean
+    # different things — what was submitted, versus what is happening.
+    lines = [f"⚙️ <b>{html.escape(str(batch), quote=False)}</b>"]
 
     runs = state.get("runs") or {}
     if not runs:
-        lines.append("waiting for the pod — nothing recorded yet")
+        # The spinner belongs HERE most of all: this is the provision +
+        # bootstrap window, the longest stretch (~10 min) in which the journal
+        # says nothing whatsoever. Without it the text is byte-identical every
+        # frame, so the message never moves during the one phase where the
+        # only real question is whether anything is happening at all — and
+        # every edit would be swallowed as "message is not modified".
+        lines.append(f"{_SPIN[frame % len(_SPIN)]} waiting for the pod — "
+                     "nothing recorded yet")
     for run_id in sorted(runs):
         run = runs[run_id]
         seen = run.get("stages") or {}
@@ -112,16 +144,21 @@ def progress_text(manifest_path: Path, *, lease,
         # drain starts (bot._start_progress) precisely so this can say 1/3.
         planned = list(stages or seen.keys())
         done = sum(1 for st in seen.values() if st.get("status") == "done")
+        current = next((n for n in planned
+                        if (seen.get(n) or {}).get("status") == "running"), None)
         if planned:
             filled = "▰" * done + "▱" * max(0, len(planned) - done)
-            current = next((n for n in planned
-                            if (seen.get(n) or {}).get("status") == "running"), None)
-            tail = f" · {html.escape(current, quote=False)} running" if current else ""
+            # The spinner rides beside the bar rather than inside it: a cell
+            # that blinked between ▰ and ▱ would read as the bar losing and
+            # regaining a stage, which is a lie about the journal.
+            tail = (f" {_SPIN[frame % len(_SPIN)]} {html.escape(current, quote=False)}"
+                    if current else "")
             lines.append(f"{filled} {done}/{len(planned)}{tail}")
         for stage_name in planned:
             stage = seen.get(stage_name) or {}
             status = stage.get("status")
-            icon = {"done": "✅", "running": "⏳", "error": "❌"}.get(status, "⬜")
+            running = _HOURGLASS[frame % len(_HOURGLASS)]
+            icon = {"done": "✅", "running": running, "error": "❌"}.get(status, "⬜")
             sec = stage.get("sec")
             suffix = f" · {sec}s" if sec is not None else ""
             lines.append(f"{icon} {html.escape(stage_name, quote=False)}{suffix}")

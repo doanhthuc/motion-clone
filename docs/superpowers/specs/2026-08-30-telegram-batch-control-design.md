@@ -206,6 +206,27 @@ Consequence: [trap #4](../../batch-runner.md) — mistyping a third variant of a
 `params.get()` returns `None`, the job runs anyway, bills anyway, and silently uses the default —
 becomes **structurally impossible** rather than merely caught by validation.
 
+### 5.2 Implementation status
+
+The live card was built on **2026-09-01** (`bot._show_panel`), after the first
+implementation had shipped as the transcript this section was written to avoid — each step its own
+message, eight fragments for a three-file job. The user's own words on seeing it: *"UI hiện tại vẫn
+đang quá xấu, không được trực quan"*. Worth recording as a pattern rather than a one-off: the
+departure was never decided, it accumulated one reasonable-looking `send_message` at a time, and no
+test could see it because every one of them asserted on message *content*.
+
+What is built, and what is not:
+
+- **Built:** one edited message per chat, required/optional slots, the progress bar and next step,
+  inline buttons for re-labelling and clearing, `Run` gated on a passing validate, and the
+  measurements in a collapsed block. Two additions this section did not anticipate, both forced by
+  the medium: the panel is **frozen** rather than left live when money is committed (an edited
+  message keeps only its latest version, so §6's transcript invariant would otherwise be
+  destroyed by the next job), and it is **moved down** past a drift of 3 messages, since editing in
+  place is silent but a card scrolled off screen defeats the purpose.
+- **Not built:** the basket (multi-job batching) and recipes (§5.1). One job at a time; the pipeline
+  is chosen with `/pipeline` or `TG_PIPELINE`.
+
 ---
 
 ## 6. The manifest gate
@@ -532,6 +553,32 @@ Bot API server.
 2. **How long does `gpu-bootstrap` take when models are already on the Network Volume?** It is added
    to every single drain and is currently unmeasured. It also sets the floor for the stockout
    economics table in §9.
+3. ~~**Can the bot put animated emoji in a message?**~~ **Answered 2026-09-01: not the way it is
+   usually meant, and the failure is silent.** A `<tg-emoji emoji-id="…">` entity is accepted with
+   `ok:true` and then **stripped** — the message comes back with `entities:null` and only the
+   fallback glyph. The Bot API grants custom emoji to bots that bought a username on Fragment, and
+   this one has not. There is no error, no rejected send, and nothing renders wrong; the animation
+   just never exists, which is invisible to any test asserting on the text the bot *built* rather
+   than on what Telegram *kept*. `TestNoDuplicateDefinitions` now gates the string literal.
+
+   What does work, measured the same day against the running server:
+
+   | approach | result |
+   |---|---|
+   | animated `.tgs` stickers | Yes — `getStickerSet("AnimatedEmojies")` returns 599 with `is_animated: true`, including ⏳ ✅ ❌ 🎬. But a sticker message **cannot be edited** (`message can't be edited`), only deleted, so it can never carry state. |
+   | `sendDice` | Yes, genuinely animated; semantically wrong for progress. |
+   | re-editing the message text | Yes — the only way to get motion *inside* a message. |
+
+   Sustained edit rate, same day: **0.48, 0.91 and 2.02 edits/s each completed with zero
+   rejections.** The progress message therefore animates by re-editing at one frame per 2s, driven
+   by shortening `getUpdates`' long-poll from 50s to 2s while a drain runs. `TgError.retry_after`
+   carries Telegram's own backoff if a 429 ever does arrive, and the pause is checked *after* the
+   completion check so a cosmetic rate limit cannot delay delivering a result.
+
+   The constraint that came out of it: **a frame may change the spinner and nothing else.** The bar
+   stays discrete (`done/len(planned)`) because the journal is discrete — smoothing it into a
+   percentage would be inventing progress the runner never reported. A test strips the animated
+   glyphs from two consecutive frames and asserts the remainder is byte-identical.
 
 ---
 

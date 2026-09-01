@@ -233,10 +233,52 @@ class TestProgressBar(unittest.TestCase):
                              stages=["tryon", "motion", "enhance"])
         self.assertIn("1/3", text)
         self.assertIn("▰▱▱", text)
-        self.assertIn("motion running", text)
+        # The running stage is named beside the bar. Since 2026-09-01 a spinner
+        # stands where the word "running" used to, so the assertion is on the
+        # name plus a spinner frame rather than on the old phrasing.
+        self.assertIn("motion", text)
+        self.assertTrue(any(ch in text for ch in run_mod._SPIN),
+                        f"no spinner frame beside the bar: {text!r}")
         # A stage not started yet is listed, not omitted — otherwise the user
         # cannot see what is still to come.
         self.assertIn("enhance", text)
+
+    def test_the_frame_animates_the_message_without_changing_a_single_number(self):
+        """The line between animation and lying.
+
+        `frame` exists to say "this process is alive" — the one thing a
+        journal genuinely cannot say, since a drain that died mid-stage leaves
+        exactly the same `running` record as one still working. It must never
+        reach any figure: strip the animated glyphs and two frames have to be
+        byte-identical.
+        """
+        self._state({"batch": "b", "runs": {"job": {"status": "running", "stages": {
+            "tryon": {"status": "done", "sec": 351},
+            "motion": {"status": "running"}}}}})
+        stages = ["tryon", "motion", "enhance"]
+        a = progress_text(self.manifest, lease=None, stages=stages, frame=0)
+        b = progress_text(self.manifest, lease=None, stages=stages, frame=1)
+        self.assertNotEqual(a, b, "the message does not animate at all")
+
+        animated = run_mod._SPIN + "".join(run_mod._HOURGLASS)
+        strip = lambda t: "".join(ch for ch in t if ch not in animated)
+        self.assertEqual(strip(a), strip(b),
+                         "a frame changed something other than the animation")
+
+    def test_the_waiting_for_the_pod_line_animates_too(self):
+        """The longest silent stretch of the whole render.
+
+        Provision + bootstrap is ~10 minutes in which the journal says nothing
+        whatsoever. Without a moving frame here the text is byte-identical
+        every poll, every edit is swallowed as "message is not modified", and
+        the fast 2s cadence costs 25x the API calls to show nothing — during
+        the one phase where the only real question is whether it is alive.
+        """
+        self._state({"batch": "b", "runs": {}})
+        a = progress_text(self.manifest, lease=None, stages=["tryon"], frame=0)
+        b = progress_text(self.manifest, lease=None, stages=["tryon"], frame=1)
+        self.assertIn("waiting for the pod", a)
+        self.assertNotEqual(a, b)
 
     def test_a_failed_stage_is_marked_and_the_run_is_called_failed(self):
         self._state({"batch": "b", "runs": {"job": {"status": "error", "stages": {
