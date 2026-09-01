@@ -1653,6 +1653,26 @@ class TestFlow(unittest.TestCase):
                    allowed_user_id=ME)
         self.assertEqual(self.tg.documents, [])
 
+    def test_a_video_slot_shows_its_duration_on_the_panel(self):
+        """Not diagnostic — an input to the decision.
+
+        Duration picks the preset (ingest.suggest_preset), the preset sets how
+        much work the pod does, and that is what $0.99/hour buys. A 30-second
+        driver where a 15-second one was meant is the difference the estimate
+        on the same screen is computed from, and it used to be one tap away.
+        """
+        with mock.patch("tgbot.bot.probe", return_value=self.driver_probe):
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+        line = bot._role_line("driver", bot._STATE[ME])
+        self.assertIn("5.0s", line)
+        self.assertIn("1080×1920", line)
+
+    def test_an_image_slot_shows_no_duration(self):
+        """Every image has duration 0.0; printing it would be noise on three
+        lines out of four."""
+        self.assertNotIn("s ·", bot._compact(self.image_probe))
+        self.assertNotIn("0.0s", bot._compact(self.image_probe))
+
     def test_confirm_records_a_progress_message_to_keep_editing(self):
         self._confirm_and_start()
         self.assertTrue(bot._progress_path(ME).exists())

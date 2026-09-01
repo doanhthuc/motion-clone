@@ -437,11 +437,14 @@ Three rules, each with a failure mode behind it:
 - **Escape every interpolated value** with `bot._esc`, not just the ones that
   look risky. `_safe_name` already strips brackets from staged names, so nothing
   can carry one today; escaping keeps that from being load-bearing.
-- **The headline line carries resolution and size only.** Duration and bitrate
-  are diagnostic and live in the collapsed block — except a *warning*, which is
-  repeated outside it on the review screen. That screen is the last thing read
-  before $0.99/hour is committed, and anything needing a tap to reveal is
-  something that gets skipped.
+- **The headline line carries resolution, duration for a video, and size.**
+  Bitrate stays in the collapsed block — it is diagnostic. Duration does not:
+  it picks the preset, the preset sets how much work the pod does, and that is
+  what the $0.99/hour buys, so a 30-second driver where a 15-second one was
+  meant is the difference the estimate on the same screen is computed from. It
+  came back out of the block on 2026-09-01 at the user's request. A *warning* is
+  likewise repeated outside the block — that screen is the last thing read
+  before money is committed, and anything needing a tap to reveal gets skipped.
 
 `FakeTg._check_markup` in the tests gates every message the suite produces
 against both failure modes: HTML tags with no `parse_mode` (the user reads the

@@ -1080,14 +1080,21 @@ def _esc(value: object) -> str:
 
 
 def _compact(p: Probe) -> str:
-    """Resolution and size only — the two numbers worth a glance.
+    """The numbers worth a glance: resolution, duration for a video, size.
 
-    Duration and bitrate move into the expandable block. They matter (bitrate
-    is how a re-compressed driver is caught) but they are diagnostic, and five
-    figures per line is what made the first version of this screen a wall of
-    text the user could not read.
+    Bitrate stays in the expandable block — it is how a re-compressed driver is
+    caught, but it is diagnostic, and five figures per line is what made the
+    first version of this screen a wall of text the user could not read.
+
+    Duration came back out of that block on 2026-09-01, at the user's request
+    and correctly: it is not diagnostic, it is an INPUT to the decision. It
+    picks the preset (`ingest.suggest_preset`), the preset sets how much work
+    the pod does, and that is what the $0.99/hour buys. A 30-second driver
+    where a 15-second one was intended is the difference the estimate on the
+    same screen is computed from, and it was one tap away.
     """
-    return f"{p.width}×{p.height} · {p.size_bytes / 1_000_000:.1f} MB"
+    length = f" · {p.duration_s:.1f}s" if p.kind == "video" else ""
+    return f"{p.width}×{p.height}{length} · {p.size_bytes / 1_000_000:.1f} MB"
 
 
 def _role_line(role: str, job: Job) -> str:
