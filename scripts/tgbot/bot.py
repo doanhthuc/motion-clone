@@ -902,6 +902,12 @@ _CB_JOB_EDIT = "bj:e:"   # + _job_digest
 _CB_JOB_DROP = "bj:d:"   # + _job_digest
 _CB_JOB_OPEN = "bj:open" # the square of the job already on screen
 _CB_JOB_HERE = "bj:here" # drop the job currently on screen
+# "pipe-ask", not "pipe:ask": _CB_PIPE is the prefix "pipe:", and the dispatch
+# matches it with startswith, so "pipe:ask" was swallowed by that branch and
+# read as a request to switch to a pipeline named "ask". Caught by a test on
+# its first run — a prefix scheme needs the shorter key to not be a prefix of
+# the longer one, which is easy to lose sight of when adding a key months later.
+_CB_PIPE_ASK = "pipe-ask"
 
 
 def _run_token(chat_id: int) -> str:
@@ -985,6 +991,9 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
         elif data.startswith(_CB_JOB_EDIT):
             _edit_from_batch(tg, chat_id, data[len(_CB_JOB_EDIT):])
 
+        elif data == _CB_PIPE_ASK:
+            _offer_pipelines(tg, chat_id)
+
         elif data == _CB_JOB_OPEN:
             tg.answer_callback_query(query.get("id") or "",
                                      "this one is already open")
@@ -1013,6 +1022,30 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
                                      "the bot; send /start for the commands")
     finally:
         tg.answer_callback_query(query.get("id") or "")
+
+
+def _offer_pipelines(tg: Tg, chat_id: int) -> None:
+    """List the pipelines with one button each, for the job on screen.
+
+    Listing beats guessing: the names are close enough to each other that
+    "swap-character-enhance" — what the user actually asked for on 2026-08-31
+    — is not any of them.
+
+    Shared by `/pipeline` and the ⚙️ button (2026-09-01). The button exists
+    because the choice is now PER JOB: open a queued job with its coloured
+    square, tap ⚙️, pick. Everything it changes lands on `_STATE`, which is
+    whichever job is open, so one flow serves the whole batch and nothing had
+    to be built for it beyond the button itself.
+    """
+    job = _job_for(chat_id)
+    tg.send_message(
+        chat_id,
+        f"pipeline for the job on screen: {job.pipeline}\n\n" +
+        "\n".join(f"{'* ' if n == job.pipeline else '  '}{n}"
+                  f"  ({' -> '.join(PIPELINES[n])})"
+                  for n in sorted(PIPELINES)),
+        buttons=[[(n, _CB_PIPE + n)] for n in sorted(PIPELINES)
+                 if n != job.pipeline])
 
 
 def _switch_pipeline_and_report(tg: Tg, chat_id: int, name: str) -> None:
@@ -1185,9 +1218,10 @@ def _fix_buttons(job: Job) -> list[list[tuple[str, str]]]:
     two of the four rows available. The icons are the ones already printed
     beside each role name a few lines above, so the mapping is on screen.
     """
-    labels = [(f"🔁{ROLE_ICON.get(role, '')}", _CB_REDO + role)
-              for role in sorted(job.slots)]
-    return [labels] if labels else []
+    labels = [("⚙️", _CB_PIPE_ASK)]
+    labels += [(f"🔁{ROLE_ICON.get(role, '')}", _CB_REDO + role)
+               for role in sorted(job.slots)]
+    return [labels]
 
 
 # ----------------------------------------------------------------- the panel
@@ -2462,20 +2496,7 @@ def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
         job = _job_for(chat_id)
         parts = text.split(maxsplit=1)
         if len(parts) != 2:
-            # Listing beats guessing: the names are close enough to each other
-            # that "swap-character-enhance" — what the user actually asked for
-            # on 2026-08-31 — is not any of them.
-            # One button per pipeline: these are the names the user could not
-            # guess (they asked for "swap-character-enhance", which is none of
-            # them), so tapping beats typing.
-            tg.send_message(
-                chat_id,
-                f"pipeline: {job.pipeline}\n\n" +
-                "\n".join(f"{'* ' if n == job.pipeline else '  '}{n}"
-                          f"  ({' -> '.join(PIPELINES[n])})"
-                          for n in sorted(PIPELINES)),
-                buttons=[[(n, _CB_PIPE + n)] for n in sorted(PIPELINES)
-                         if n != job.pipeline])
+            _offer_pipelines(tg, chat_id)
             return
         _switch_pipeline_and_report(tg, chat_id, parts[1].strip())
         return

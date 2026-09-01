@@ -196,7 +196,7 @@ the only thing pinning the bot to one.
   ```
   ▶️ Run 4 · $0.99/h    ➕ Add
   🟦  🟧  🟩  ▸🟪              ← tap a square to open that job
-  🔁👤  🔁🎬  🔁👗            ← replace a slot of the open one
+  ⚙️  🔁👤  🔁🎬  🔁👗        ← its pipeline, and its slots
   🗑 this job          🗑 all
   ```
 
@@ -208,6 +208,14 @@ the only thing pinning the bot to one.
   with the bars down the picture. The slot buttons are icon-only for the same
   budget: four named buttons two per row cost half the keyboard, and the icons
   are the ones already printed beside each role name a few lines above.
+- **Each job carries its own pipeline.** Open a job with its square, tap `⚙️`,
+  pick — the choice lands on whichever job is open, so a batch can mix flows.
+  That is this repo's own A/B method: the same material through
+  `tryon-motion-enhance` and `tryon-character-swap-enhance`, on one pod, for one
+  provisioning. Nothing was built for it beyond the button; `_switch_pipeline`
+  already acted on the open job, and `render_manifest` already writes a
+  `pipeline:` per run. Two runs sharing material get distinct ids from the
+  collision suffix, which is what stops the second overwriting the first's video.
 - **A queued job can be edited or removed.** `✏️` pulls the job back out for
   editing and it **stays queued throughout** — `_jobs_for` is the basket *plus*
   the job being edited, so the moment it leaves the basket it is counted again

@@ -1480,10 +1480,45 @@ class TestFlow(unittest.TestCase):
             self._fill_required_slots()
         rows = bot._fix_buttons(bot._STATE[ME])
         self.assertEqual(len(rows), 1)
-        for label, data in rows[0]:
+        self.assertEqual(rows[0][0][1], bot._CB_PIPE_ASK)
+        for label, data in rows[0][1:]:
             self.assertTrue(data.startswith(bot._CB_REDO))
             self.assertNotIn(data[len(bot._CB_REDO):], label,
                              "the role name is still spelled out")
+
+    def test_the_pipeline_can_be_picked_per_job_from_the_panel(self):
+        """Each run carries its own pipeline in the manifest, so a batch can mix
+        them — the repo's own A/B method is the same material through two
+        flows. Open a job with its square, tap ⚙️, pick."""
+        self._add_second_job()
+        first = bot._BASKET[ME][0]
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._CB_JOB_EDIT + bot._job_digest(first)),
+                       allowed_user_id=ME)
+            bot.handle(self.tg, cb_from(ME, bot._CB_PIPE_ASK), allowed_user_id=ME)
+            self.assertIn(bot._CB_PIPE + "tryon-character-swap-enhance",
+                          self.tg.callback_data())
+            bot.handle(self.tg, cb_from(ME, bot._CB_PIPE + "tryon-character-swap-enhance"),
+                       allowed_user_id=ME)
+        pipelines = sorted(job.pipeline for job in bot._jobs_for(ME))
+        self.assertEqual(pipelines, ["tryon-character-swap-enhance",
+                                     "tryon-motion-enhance"])
+
+    def test_a_mixed_batch_writes_each_pipeline_into_its_own_run(self):
+        import yaml
+        self._add_second_job()
+        first = bot._BASKET[ME][0]
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._CB_JOB_EDIT + bot._job_digest(first)),
+                       allowed_user_id=ME)
+            bot.handle(self.tg, cb_from(ME, bot._CB_PIPE + "tryon-character-swap-enhance"),
+                       allowed_user_id=ME)
+        with mock.patch("tgbot.bot.start_drain"), \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+        data = yaml.safe_load(bot._job_manifest_path(ME).read_text(encoding="utf-8"))
+        self.assertEqual(sorted(r["pipeline"] for r in data["runs"]),
+                         ["tryon-character-swap-enhance", "tryon-motion-enhance"])
 
     def test_the_keyboard_does_not_grow_with_the_batch(self):
         """Measured before the change: six jobs came to nine rows and
@@ -2632,6 +2667,27 @@ class TestNoDuplicateDefinitions(unittest.TestCase):
 
     MODULES = ["tgbot/bot.py", "tgbot/job.py", "tgbot/ingest.py",
                "tgbot/run.py", "tgbot/tgclient.py"]
+
+    def test_no_callback_key_is_a_prefix_of_another(self):
+        """The dispatch matches callback_data with startswith.
+
+        So a key that is a prefix of another one is silently swallowed by
+        whichever branch comes first. That happened on 2026-09-01: `pipe:ask`
+        began with `pipe:`, so tapping the pipeline button was read as a
+        request to switch to a pipeline named "ask". A test caught it on its
+        first run; nothing in the code could have. The rule is easy to lose
+        sight of when a key is added months after the ones it collides with.
+        """
+        keys = {name: value for name, value in vars(bot).items()
+                if name.startswith("_CB_") and isinstance(value, str)}
+        for name, value in sorted(keys.items()):
+            for other_name, other in sorted(keys.items()):
+                if name == other_name or len(other) <= len(value):
+                    continue
+                self.assertFalse(
+                    other.startswith(value),
+                    f"{other_name}={other!r} starts with {name}={value!r} — the "
+                    f"{name} branch will swallow it")
 
     def test_no_module_reaches_for_a_custom_emoji_entity(self):
         """`<tg-emoji>` does nothing here, and does it silently.
