@@ -191,6 +191,22 @@ the only thing pinning the bot to one.
 - **The progress bar counts the union of stages** across the queued pipelines. A
   batch mixing `tryon-motion-enhance` and `tryon-character-swap-enhance` would
   otherwise have the wrong denominator for half its runs.
+- **A queued job can be edited or removed.** Each entry gets `✏️` and `🗑`
+  buttons labelled with its colour square. `✏️` pulls the job back out for
+  editing and it **stays queued throughout** — `_jobs_for` is the basket *plus*
+  the job being edited, so the moment it leaves the basket it is counted again
+  and there is no "add it back" step to forget. What changes is only which row
+  of the sheet it occupies: the edited job is always the last one, so its colour
+  moves, visibly rather than silently. Editing is refused while a half-built job
+  is open, because that job is work already done and nothing else recovers it.
+- **`🗑` does not delete files.** Material is shared across a batch by design —
+  the character appears in every run — so removing one run must not take it from
+  the rest. `/clear` is the thing that deletes files.
+- **Both buttons are keyed by a digest of the job's material, never its index.**
+  Telegram never expires an inline keyboard, so a panel from before the batch
+  changed is still tappable; `bj:d:2` would delete whatever is second *now*,
+  while a digest simply fails to match and says so. Same reasoning as
+  `_run_token` on the money button.
 - **`/again` restores the whole batch**, not the last run of it. `.last.json`
   holds a `jobs` list; records written before batches existed are still read.
 

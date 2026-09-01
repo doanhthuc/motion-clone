@@ -40,7 +40,8 @@ from tgbot.tgclient import Tg, TgError
 from tgbot.ingest import (Probe, describe, probe, quality_warning,
                          quality_warning_html,
                          to_png_if_heic)
-from tgbot.job import Job, missing_slots, slot_for, write_manifest
+from tgbot.job import (Job, missing_slots, run_id_for, slot_for,
+                       write_manifest)
 from tgbot.preview import sheet, slot_preview
 from tgbot.run import (drain_running, estimate_minutes, final_files, lease_for,
                        progress_text, start_drain, summary_text)
@@ -897,6 +898,8 @@ _CB_CLEAR_ASK = "clr:ask"
 _CB_CLEAR_GO = "clr:go"
 _CB_CLEAR_NO = "clr:no"
 _CB_ADD = "add"
+_CB_JOB_EDIT = "bj:e:"   # + _job_digest
+_CB_JOB_DROP = "bj:d:"   # + _job_digest
 
 
 def _run_token(chat_id: int) -> str:
@@ -976,6 +979,12 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
 
         elif data == _CB_ADD:
             _add_to_batch(tg, chat_id)
+
+        elif data.startswith(_CB_JOB_EDIT):
+            _edit_from_batch(tg, chat_id, data[len(_CB_JOB_EDIT):])
+
+        elif data.startswith(_CB_JOB_DROP):
+            _drop_from_batch(tg, chat_id, data[len(_CB_JOB_DROP):])
 
         elif data == _CB_CLEAR_ASK:
             _ask_to_clear(tg, chat_id)
@@ -1301,6 +1310,13 @@ def _panel_buttons(chat_id: int, job: Job) -> list[list[tuple[str, str]]]:
         if not missing_slots(job):
             run.append(("➕ Add another", _CB_ADD))
         rows.append(run)
+    # One row per committed job: edit it, or take it out. Keyed by the colour
+    # square the panel prints beside it and the sheet draws down its left, so
+    # the button says which job without needing a name.
+    for index, other in enumerate(_BASKET.get(chat_id) or []):
+        digest = _job_digest(other)
+        rows.append([(f"✏️ {_row_mark(index)}", _CB_JOB_EDIT + digest),
+                     (f"🗑 {_row_mark(index)}", _CB_JOB_DROP + digest)])
     return rows + _fix_buttons(job)
 
 
@@ -1346,6 +1362,77 @@ def _copy_job(job: Job) -> Job:
 def _signature(job: Job) -> tuple:
     """What makes two runs the same run — pipeline plus material."""
     return (job.pipeline, tuple(sorted((r, str(p)) for r, p in job.slots.items())))
+
+
+def _job_digest(job: Job) -> str:
+    """A short, stable handle for one queued job, for callback_data.
+
+    Keyed on the job's own material rather than its position in the basket. An
+    index would be a stale-button hazard: the keyboard on an older panel still
+    works — Telegram never expires one — so `bj:d:2` tapped after the batch has
+    changed would delete whatever is second NOW. A digest simply fails to match
+    and says so, which is the same reasoning as _run_token's staleness guard on
+    the money button.
+    """
+    return hashlib.sha256(repr(_signature(job)).encode()).hexdigest()[:10]
+
+
+def _find_in_batch(chat_id: int, digest: str) -> int | None:
+    basket = _BASKET.get(chat_id) or []
+    return next((i for i, job in enumerate(basket)
+                 if _job_digest(job) == digest), None)
+
+
+def _edit_from_batch(tg: Tg, chat_id: int, digest: str) -> None:
+    """Pull a committed job back out for editing. It stays queued throughout.
+
+    No "add it back" step, because `_jobs_for` is the basket PLUS the job being
+    edited — so the moment it leaves the basket it is already counted again.
+    What changes is only which row of the sheet it occupies: the edited job is
+    always the last one, so its colour moves. That is visible rather than
+    hidden, which is the right way round.
+    """
+    index = _find_in_batch(chat_id, digest)
+    if index is None:
+        tg.send_message(chat_id, "that entry is no longer in the batch — the "
+                                 "button was from an older version of this panel")
+        return
+    current = _STATE.get(chat_id)
+    if current is not None and missing_slots(current):
+        # Refuse rather than discard: a half-built job is work already done and
+        # nothing else would recover it.
+        tg.send_message(chat_id, "finish or /clear the job you are building "
+                                 "first — otherwise it would be lost")
+        return
+    basket = _BASKET[chat_id]
+    picked = basket.pop(index)
+    if current is not None and not any(_signature(current) == _signature(other)
+                                       for other in basket):
+        basket.append(_copy_job(current))
+    _STATE[chat_id] = picked
+    _LAST_VALIDATE.pop(chat_id, None)
+    _render_and_validate(tg, chat_id)
+    _show_panel(tg, chat_id, note="editing this one — it is still in the batch")
+
+
+def _drop_from_batch(tg: Tg, chat_id: int, digest: str) -> None:
+    """Remove one job from the batch. The staged files stay — other jobs use them."""
+    index = _find_in_batch(chat_id, digest)
+    if index is None:
+        tg.send_message(chat_id, "that entry is no longer in the batch — the "
+                                 "button was from an older version of this panel")
+        return
+    dropped = _BASKET[chat_id].pop(index)
+    if not _BASKET[chat_id]:
+        _BASKET.pop(chat_id, None)
+    _LAST_VALIDATE.pop(chat_id, None)
+    if _jobs_for(chat_id):
+        _render_and_validate(tg, chat_id)
+    # Deliberately does NOT delete the staged files: material is shared across
+    # a batch by design, so removing one run must not take the character every
+    # other run points at. /clear is the thing that deletes files.
+    _show_panel(tg, chat_id,
+                note=f"removed {_esc(run_id_for(dropped))} from the batch")
 
 
 def _jobs_for(chat_id: int) -> list[Job]:

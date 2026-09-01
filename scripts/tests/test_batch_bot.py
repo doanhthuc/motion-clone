@@ -1697,6 +1697,99 @@ class TestFlow(unittest.TestCase):
         # rather than one wrapping while the other runs off the end.
         self.assertEqual(bot._row_mark(len(bot.ROW_MARK)), bot.ROW_MARK[0])
 
+    # ---- editing and removing one job of a batch --------------------------
+
+    def _digest_of_first(self):
+        return bot._job_digest(bot._BASKET[ME][0])
+
+    def test_a_job_can_be_taken_out_of_the_batch(self):
+        """Before this the only way to drop one wrong job was /clear, which
+        threw away the whole batch and every staged file with it."""
+        self._add_second_job()
+        digest = self._digest_of_first()
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._CB_JOB_DROP + digest),
+                       allowed_user_id=ME)
+        self.assertEqual(len(bot._jobs_for(ME)), 1)
+        self.assertIsNone(bot._find_in_batch(ME, digest))
+
+    def test_removing_a_job_keeps_the_files_the_others_still_use(self):
+        """Material is shared across a batch by design — the character appears
+        in every run. Deleting one run must not take it from the rest."""
+        self._add_second_job()
+        character = bot._STATE[ME].slots["character"]
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._CB_JOB_DROP + self._digest_of_first()),
+                       allowed_user_id=ME)
+        self.assertTrue(character.is_file())
+
+    def test_a_job_can_be_pulled_back_out_for_editing_and_stays_queued(self):
+        """`_jobs_for` is the basket PLUS the job being edited, so the moment
+        it leaves the basket it is already counted again — there is no "add it
+        back" step to forget."""
+        self._add_second_job()
+        first = bot._BASKET[ME][0]
+        before = len(bot._jobs_for(ME))
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._job_digest(first)
+                                        and bot._CB_JOB_EDIT + bot._job_digest(first)),
+                       allowed_user_id=ME)
+        self.assertEqual(len(bot._jobs_for(ME)), before, "the batch changed size")
+        self.assertEqual(bot._signature(bot._STATE[ME]), bot._signature(first))
+
+    def test_editing_a_slot_of_a_pulled_job_changes_only_that_job(self):
+        self._add_second_job()
+        first = bot._BASKET[ME][0]
+        other_signature = bot._signature(bot._BASKET[ME][-1]) if len(bot._BASKET[ME]) > 1 \
+            else bot._signature(bot._STATE[ME])
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._CB_JOB_EDIT + bot._job_digest(first)),
+                       allowed_user_id=ME)
+            third = self.root / "outfit3.jpg"
+            third.write_bytes(b"o3")
+            self.tg.file_paths["outfit3-id"] = str(third)
+            with mock.patch("tgbot.bot.probe", return_value=self.image_probe):
+                bot.handle(self.tg, doc_from(ME, "outfit3-id"), allowed_user_id=ME)
+                bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME)
+        self.assertEqual(bot._STATE[ME].slots["outfit"], self.staged("outfit3.jpg"))
+        self.assertIn(other_signature,
+                      [bot._signature(j) for j in bot._jobs_for(ME)],
+                      "the other job was changed too")
+        self.assertEqual(len(bot._jobs_for(ME)), 2)
+
+    def test_editing_refuses_while_a_half_built_job_is_open(self):
+        """A half-built job is work already done and nothing else recovers it."""
+        self._add_second_job()
+        first = bot._BASKET[ME][0]
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._CB_JOB_EDIT + bot._job_digest(first)),
+                       allowed_user_id=ME)
+            bot.handle(self.tg, cb_from(ME, bot._CB_REDO + "outfit"), allowed_user_id=ME)
+            second = bot._BASKET[ME][0]
+            bot.handle(self.tg, cb_from(ME, bot._CB_JOB_EDIT + bot._job_digest(second)),
+                       allowed_user_id=ME)
+        self.assertIn("finish or /clear", self.tg.messages[-1])
+
+    def test_a_stale_batch_button_names_itself_rather_than_hitting_the_wrong_job(self):
+        """Telegram never expires an inline keyboard, so a panel from before
+        the batch changed is still tappable. An index would delete whatever is
+        second NOW; a digest simply fails to match."""
+        self._add_second_job()
+        digest = self._digest_of_first()
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._CB_JOB_DROP + digest), allowed_user_id=ME)
+            remaining = len(bot._jobs_for(ME))
+            bot.handle(self.tg, cb_from(ME, bot._CB_JOB_DROP + digest), allowed_user_id=ME)
+        self.assertEqual(len(bot._jobs_for(ME)), remaining, "a stale tap hit a job")
+        self.assertIn("no longer in the batch", self.tg.messages[-1])
+
+    def test_every_batch_entry_offers_edit_and_remove(self):
+        self._add_second_job()
+        offered = self.tg.callback_data()
+        digest = self._digest_of_first()
+        self.assertIn(bot._CB_JOB_EDIT + digest, offered)
+        self.assertIn(bot._CB_JOB_DROP + digest, offered)
+
     def test_confirm_records_a_progress_message_to_keep_editing(self):
         self._confirm_and_start()
         self.assertTrue(bot._progress_path(ME).exists())
