@@ -813,9 +813,10 @@ class TestFlow(unittest.TestCase):
         # costs a process per ambiguous image (17s across the suite when this
         # was left live). Preview BEHAVIOUR is asserted in TestPreviews, where
         # `make` is patched to return a real file.
-        self._no_preview = mock.patch("tgbot.bot.make", return_value=None)
-        self._no_preview.start()
-        self.addCleanup(self._no_preview.stop)
+        for name in ("slot_preview", "strip"):
+            patcher = mock.patch(f"tgbot.bot.{name}", return_value=None)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def tearDown(self):
         bot.ROOT = self._orig_root
@@ -1967,7 +1968,7 @@ class TestPreviews(unittest.TestCase):
         return job
 
     def test_the_slot_question_carries_the_picture_and_the_same_buttons(self):
-        with mock.patch("tgbot.bot.make", return_value=self.shot):
+        with mock.patch("tgbot.bot.slot_preview", return_value=self.shot):
             bot._ask_about(self.tg, ME, self.img, "tryon-motion-enhance",
                            path=Path("c.png"))
         self.assertEqual(len(self.tg.photos), 1)
@@ -1979,7 +1980,7 @@ class TestPreviews(unittest.TestCase):
 
     def test_no_preview_still_asks_the_question(self):
         """A courtesy must never be able to swallow the question itself."""
-        with mock.patch("tgbot.bot.make", return_value=None):
+        with mock.patch("tgbot.bot.slot_preview", return_value=None):
             bot._ask_about(self.tg, ME, self.img, "tryon-motion-enhance",
                            path=Path("c.png"))
         self.assertEqual(self.tg.photos, [])
@@ -1989,61 +1990,93 @@ class TestPreviews(unittest.TestCase):
     def test_a_failed_upload_falls_back_to_the_text_question(self):
         from tgbot.tgclient import TgError
         self.tg.photo_raises = TgError("Bad Request: image is too big")
-        with mock.patch("tgbot.bot.make", return_value=self.shot):
+        with mock.patch("tgbot.bot.slot_preview", return_value=self.shot):
             bot._ask_about(self.tg, ME, self.img, "tryon-motion-enhance",
                            path=Path("c.png"))
         self.assertIn("Which slot is this?", self.tg.messages[-1])
         self.assertIn(bot._CB_SLOT + "character", self.tg.callback_data())
 
-    def test_the_album_shows_every_slot_once_the_job_is_ready(self):
+    def test_the_strip_names_every_slot_once_the_job_is_ready(self):
+        """One wide image, and its caption is the ONLY thing saying which panel
+        is which — nothing is drawn onto the strip (preview.strip explains why),
+        so the roles must be listed in the order they were stacked."""
         job = self._ready_job()
-        with mock.patch("tgbot.bot.make", return_value=self.shot):
+        with mock.patch("tgbot.bot.strip", return_value=self.shot):
             self.assertTrue(bot._maybe_send_album(self.tg, ME, job))
-        self.assertEqual(len(self.tg.albums), 1)
-        captions = "\n".join(c for _, c in self.tg.albums[0])
-        self.assertIn("character", captions)
-        self.assertIn("driver", captions)
-        # The warning travels with the picture it is about: a low-bitrate
-        # driver is the thing a preview is most likely to make obvious.
-        self.assertIn("low bitrate", captions)
+        self.assertEqual(len(self.tg.photos), 1)
+        caption = self.tg.photos[0][1]
+        self.assertLess(caption.index("character"), caption.index("driver"),
+                        "the caption order does not match sorted(job.slots)")
+        # The warning rides with the picture: a low-bitrate driver is exactly
+        # what a preview is most likely to make obvious.
+        self.assertIn("low bitrate", caption)
+
+    def test_the_strip_is_built_from_every_slot_in_caption_order(self):
+        job = self._ready_job()
+        seen = {}
+        def fake_strip(sources, *, into):
+            seen["sources"] = list(sources)
+            return self.shot
+        with mock.patch("tgbot.bot.strip", side_effect=fake_strip):
+            bot._maybe_send_album(self.tg, ME, job)
+        self.assertEqual([p for p, _ in seen["sources"]],
+                         [job.slots[r] for r in sorted(job.slots)])
+        # The driver is the video, and only it may be seeked as one.
+        self.assertEqual([is_vid for _, is_vid in seen["sources"]], [False, True])
+
+    def test_a_strip_that_could_not_be_built_is_skipped_not_fatal(self):
+        job = self._ready_job()
+        with mock.patch("tgbot.bot.strip", return_value=None):
+            self.assertFalse(bot._maybe_send_album(self.tg, ME, job))
+        self.assertEqual(self.tg.photos, [])
+        self.assertNotIn(ME, bot._ALBUM_KEY)
 
     def test_the_album_is_not_resent_for_material_that_has_not_changed(self):
         """The panel is re-edited on every change; an album per edit would
         rebuild the wall of messages the panel exists to remove."""
         job = self._ready_job()
-        with mock.patch("tgbot.bot.make", return_value=self.shot):
+        with mock.patch("tgbot.bot.strip", return_value=self.shot):
             self.assertTrue(bot._maybe_send_album(self.tg, ME, job))
             self.assertFalse(bot._maybe_send_album(self.tg, ME, job))
             self.assertFalse(bot._maybe_send_album(self.tg, ME, job))
-        self.assertEqual(len(self.tg.albums), 1)
+        self.assertEqual(len(self.tg.photos), 1)
 
     def test_replacing_a_file_sends_a_fresh_album(self):
         job = self._ready_job()
-        with mock.patch("tgbot.bot.make", return_value=self.shot):
+        with mock.patch("tgbot.bot.strip", return_value=self.shot):
             bot._maybe_send_album(self.tg, ME, job)
             job.slots["character"] = Path("c2.png")
             self.assertTrue(bot._maybe_send_album(self.tg, ME, job))
-        self.assertEqual(len(self.tg.albums), 2)
+        self.assertEqual(len(self.tg.photos), 2)
 
     def test_nothing_is_shown_before_the_manifest_has_validated(self):
         """Pictures say "this is what will run". Showing them next to a
         manifest that cannot run says the wrong thing."""
         job = self._ready_job()
         bot._LAST_VALIDATE[ME] = False
-        with mock.patch("tgbot.bot.make", return_value=self.shot):
+        with mock.patch("tgbot.bot.strip", return_value=self.shot):
             self.assertFalse(bot._maybe_send_album(self.tg, ME, job))
         bot._LAST_VALIDATE.pop(ME)
-        with mock.patch("tgbot.bot.make", return_value=self.shot):
+        with mock.patch("tgbot.bot.strip", return_value=self.shot):
             self.assertFalse(bot._maybe_send_album(self.tg, ME, job))
-        self.assertEqual(self.tg.albums, [])
+        self.assertEqual(self.tg.photos, [])
 
     def test_an_incomplete_job_shows_nothing(self):
         job = bot._job_for(ME)
         job.pipeline = "character-swap-enhance"
         job.slots["character"] = Path("c.png")
         bot._LAST_VALIDATE[ME] = True
-        with mock.patch("tgbot.bot.make", return_value=self.shot):
+        with mock.patch("tgbot.bot.strip", return_value=self.shot):
             self.assertFalse(bot._maybe_send_album(self.tg, ME, job))
+
+
+def _dimensions(path):
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", str(path)],
+        capture_output=True, text=True).stdout.strip()
+    w, h = out.split("x")
+    return int(w), int(h)
 
 
 class TestPreviewBuilder(unittest.TestCase):
@@ -2066,12 +2099,14 @@ class TestPreviewBuilder(unittest.TestCase):
         if made.returncode != 0 or not cls.video.exists():
             raise unittest.SkipTest("ffmpeg unavailable")
 
-    def test_a_video_yields_a_jpeg(self):
+    def test_a_video_yields_a_wide_jpeg(self):
         from tgbot import preview
-        shot = preview.make(self.video, is_video=True, into=self.tmp / "out")
+        shot = preview.slot_preview(self.video, is_video=True, into=self.tmp / "out")
         self.assertIsNotNone(shot)
         self.assertGreater(shot.stat().st_size, 0)
-        self.assertEqual(shot.suffix, ".jpg")
+        # Wide is the whole point: shrinking the pixels does nothing because
+        # Telegram scales to the bubble width, so the shape is the only lever.
+        self.assertEqual(_dimensions(shot), (preview.SLOT_W, preview.SLOT_H))
 
     def test_a_clip_shorter_than_the_seek_still_yields_a_frame(self):
         """The 1s seek is a preference, not a requirement — a 0.4s driver has
@@ -2081,14 +2116,39 @@ class TestPreviewBuilder(unittest.TestCase):
         subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
                         "-i", "testsrc=duration=0.4:size=160x120:rate=10",
                         "-pix_fmt", "yuv420p", str(short)], capture_output=True)
-        shot = preview.make(short, is_video=True, into=self.tmp / "out2")
+        shot = preview.slot_preview(short, is_video=True, into=self.tmp / "out2")
         self.assertIsNotNone(shot, "no frame recovered from a sub-second clip")
 
     def test_a_file_ffmpeg_cannot_read_returns_none_rather_than_raising(self):
         from tgbot import preview
         junk = self.tmp / "junk.png"
         junk.write_bytes(b"not an image")
-        self.assertIsNone(preview.make(junk, is_video=False, into=self.tmp / "out3"))
+        self.assertIsNone(preview.slot_preview(junk, is_video=False,
+                                               into=self.tmp / "out3"))
+
+    def test_the_strip_is_one_image_as_wide_as_its_panels_combined(self):
+        from tgbot import preview
+        out = preview.strip([(self.video, True)] * 3, into=self.tmp / "out4")
+        self.assertIsNotNone(out)
+        width, height = _dimensions(out)
+        self.assertEqual(height, preview.STRIP_H)
+        self.assertGreater(width, height, "the strip is not a wide image")
+
+    def test_one_slot_gets_the_wide_treatment_rather_than_a_lone_portrait(self):
+        """hstack of one input is legal and pointless — it would leave exactly
+        the tall shape this module exists to avoid."""
+        from tgbot import preview
+        out = preview.strip([(self.video, True)], into=self.tmp / "out5")
+        self.assertIsNotNone(out)
+        self.assertEqual(_dimensions(out), (preview.SLOT_W, preview.SLOT_H))
+
+    def test_a_strip_is_all_or_nothing(self):
+        """A strip missing a slot reads as the job missing that slot."""
+        from tgbot import preview
+        junk = self.tmp / "junk2.png"
+        junk.write_bytes(b"not an image")
+        self.assertIsNone(preview.strip([(self.video, True), (junk, False)],
+                                        into=self.tmp / "out6"))
 
 
 class TestNoDuplicateDefinitions(unittest.TestCase):

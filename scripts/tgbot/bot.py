@@ -40,7 +40,7 @@ from tgbot.tgclient import Tg, TgError
 from tgbot.ingest import (Probe, describe, probe, quality_warning,
                          to_png_if_heic)
 from tgbot.job import Job, missing_slots, slot_for, write_manifest
-from tgbot.preview import make
+from tgbot.preview import slot_preview, strip
 from tgbot.run import (drain_running, estimate_minutes, final_files, lease_for,
                        progress_text, start_drain, summary_text)
 
@@ -591,7 +591,8 @@ def _ask_about(tg: Tg, chat_id: int, p: Probe, pipeline: str,
     # the bytes intact also means nothing is ever shown back, so the whole
     # prompt was "image 1536x2720, 4.9 MB / Which slot is this?" and the only
     # way to answer was to remember the upload order.
-    shot = make(path, is_video=False, into=_preview_dir(chat_id)) if path else None
+    shot = (slot_preview(path, is_video=False, into=_preview_dir(chat_id))
+            if path else None)
     if shot is not None:
         try:
             tg.send_photo(chat_id, shot, caption=question, buttons=rows)
@@ -1266,8 +1267,21 @@ def _maybe_send_album(tg: Tg, chat_id: int, job: Job) -> bool:
     filename. The confirmation screen therefore described $0.99/hour of
     material entirely in resolutions and byte counts.
 
+    ONE wide strip, not an album of separate photos. Both were built and shown
+    on the user's phone and they chose the strip: an album of portraits is a
+    tall grid, and height is the whole problem (see preview.py — shrinking the
+    images does nothing, Telegram scales to the bubble width). The trade they
+    accepted is that each picture gets a third of the width.
+
+    The strip is NOT merged into the panel as a caption, though a single photo
+    can carry one. Measured 2026-09-01: the panel is 1,060 characters with the
+    three required slots filled and 1,164 with four, against a caption cap of
+    1,024. Merging would mean truncating, and what truncates first is the
+    collapsed block holding the arrival digests — the evidence acceptance A6
+    exists to compare against.
+
     Sent once per distinct set of material, not on every redraw: the panel is
-    re-edited on every change, and an album per edit would rebuild the wall of
+    re-edited on every change, and a picture per edit would rebuild the wall of
     messages the panel exists to remove.
     """
     if missing_slots(job) or _LAST_VALIDATE.get(chat_id) is not True:
@@ -1276,26 +1290,26 @@ def _maybe_send_album(tg: Tg, chat_id: int, job: Job) -> bool:
     if _ALBUM_KEY.get(chat_id) == key:
         return False
 
-    items: list[tuple[Path, str]] = []
-    for role in sorted(job.slots):
-        pr = job.probes.get(role)
-        shot = make(job.slots[role], is_video=bool(pr and pr.kind == "video"),
-                    into=_preview_dir(chat_id))
-        if shot is None:
-            continue
-        warning = quality_warning(pr) if pr else ""
-        caption = (f"{ROLE_ICON.get(role, '')} <b>{_esc(role)}</b>"
-                   + (f" · {_compact(pr)}" if pr else "")
-                   + (f"\n{ICON_WARN} {_esc(warning)}" if warning else ""))
-        items.append((shot, caption))
-    if not items:
+    roles = sorted(job.slots)
+    sources = [(job.slots[r], bool((job.probes.get(r) or None)
+                                   and job.probes[r].kind == "video")) for r in roles]
+    shot = strip(sources, into=_preview_dir(chat_id))
+    if shot is None:
         return False
+    # The caption names the roles in the SAME left-to-right order the strip was
+    # built in — nothing is drawn onto the image itself (see preview.strip), so
+    # this line is the only thing that says which panel is which.
+    names = " · ".join(f"{ROLE_ICON.get(r, '')} <b>{_esc(r)}</b>" for r in roles)
+    warnings = [f"{ICON_WARN} <b>{_esc(r)}</b>: {_esc(quality_warning(job.probes[r]))}"
+                for r in roles
+                if job.probes.get(r) and quality_warning(job.probes[r])]
+    caption = "\n".join([names, *warnings])
     try:
-        tg.send_media_group(chat_id, items, parse_mode=PARSE_HTML)
+        tg.send_photo(chat_id, shot, caption=caption, parse_mode=PARSE_HTML)
     except TgError as exc:
         # Never fatal. The panel below carries the same facts in text, and a
         # failed courtesy must not block a job the user has assembled.
-        log(f"preview album failed, continuing without it: {exc}")
+        log(f"preview strip failed, continuing without it: {exc}")
         return False
     _ALBUM_KEY[chat_id] = key
     return True

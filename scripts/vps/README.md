@@ -263,12 +263,41 @@ The obvious fix does not work. Measured the same day:
 | `sendDocument(document=<file_id>)` | works — but renders as a file row again |
 | fresh upload of a downscaled JPEG | works, and is what the bot does |
 
-So a preview costs one small upload. `tgbot/preview.py` writes a 512px JPEG with
-ffmpeg — 0.03–0.05s and 19–35 KB per slot, an album of two in 0.50s, small
-enough to sit in the synchronous poll loop. For a video it takes the frame at
-**1s**, not 0: a driver's first frame is routinely black or the subject not yet
-in position, which answers nothing. A sub-second clip has no frame there, so
-`make()` retries at 0 before giving up.
+So a preview costs one small upload. `tgbot/preview.py` builds them with ffmpeg
+— 0.03–0.05s and 19–35 KB each, small enough to sit in the synchronous poll
+loop. For a video it takes the frame at **1s**, not 0: a driver's first frame is
+routinely black or the subject not yet in position, which answers nothing. A
+sub-second clip has no frame there, so both builders retry at 0 before giving up.
+
+**Shrinking the image does not shrink the preview.** This cost a round of work
+and is the thing to know before touching any of it. Telegram scales a photo to
+the chat bubble's width whatever its pixel size, so 512px, 320px and 220px
+versions of the same portrait all render the same height — only blurrier. Four
+were sent to the user's phone and the verdict was unambiguous: *"cả 4 đều không
+có giúp thu nhỏ preview mà còn làm preview mở hơn"*.
+
+**The lever is aspect ratio.** A 1536×2720 portrait is 1.8× taller than it is
+wide, so it is always tall in the chat; a 2:1 landscape is half its own width.
+Both shapes are therefore wide ones, and both were chosen by the user from
+candidates rendered on their own phone:
+
+| where | shape | why not the alternatives |
+|---|---|---|
+| the slot question | one image on a 2:1 canvas, filled with a **blurred copy of itself** (`slot_preview`) | a flat black pad was rejected as waste (*"nền đen thừa nhiều quá"*); a 3:2 or 1:1 crop removes the padding entirely but cannot know whether the hem, the shoes or the face is the part that distinguishes this outfit from the next one |
+| the confirmation | **all slots in ONE wide strip**, side by side (`strip`) | an album of separate photos is a tall grid, and height is the whole problem. The accepted trade is that each picture gets a third of the width |
+
+**The strip is not merged into the panel as a caption**, though a single photo
+can carry one and that would save a bubble. Measured: the panel is **1,060
+characters** with the three required slots filled and **1,164** with four,
+against a caption cap of **1,024**. Merging would mean truncating, and what
+truncates first is the collapsed block holding the arrival digests — the
+evidence acceptance A6 exists to compare against.
+
+Nothing is drawn onto the strip. Burning labels in needs a font file whose path
+differs per platform, and a preview that fails on the VPS because DejaVu moved
+is worse than one that relies on its caption — so the caption lists the roles in
+the same left-to-right order the strip was stacked in, and that ordering is
+asserted by a test.
 
 Two rules:
 
@@ -282,12 +311,13 @@ Two rules:
   `/clear` counts staged files to report how many it deleted and that number is
   one the user checks against what they sent.
 
-The album is sent **once per distinct set of material**, when the job is complete
+The strip is sent **once per distinct set of material**, when the job is complete
 *and* `make batch-validate` has passed — pictures say "this is what will run",
-and showing them beside a manifest that cannot run says the wrong thing. It
-carries no keyboard: `sendMediaGroup` accepted a `reply_markup` without
-complaint when probed, which is not the same as honouring it, so the buttons
-stay on the panel below where they are verified to work.
+and showing them beside a manifest that cannot run says the wrong thing. The
+Run button stays on the panel that follows it, never on the picture.
+
+A three-file job comes to five bubbles: the panel, one question per ambiguous
+image with its picture, the strip, and the panel moved down below it.
 
 ### Presentation
 
