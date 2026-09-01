@@ -569,11 +569,13 @@ Bot API server.
    | `sendDice` | Yes, genuinely animated; semantically wrong for progress. |
    | re-editing the message text | Yes — the only way to get motion *inside* a message. |
 
-   Sustained edit rate, same day: **0.48, 0.91 and 2.02 edits/s each completed with zero
-   rejections.** The progress message therefore animates by re-editing at one frame per 2s, driven
-   by shortening `getUpdates`' long-poll from 50s to 2s while a drain runs. `TgError.retry_after`
-   carries Telegram's own backoff if a 429 ever does arrive, and the pause is checked *after* the
-   completion check so a cosmetic rate limit cannot delay delivering a result.
+   Edit rate, same day. Short bursts: **0.48, 0.91 and 2.02 edits/s, each with zero rejections.**
+   Those measure a minute, not a render, so the cadence was then run for the length of a real job:
+   **1,147 consecutive edits to one message over 40.0 minutes, zero rejections.** The progress
+   message therefore animates by re-editing at one frame per 2s, driven by shortening `getUpdates`'
+   long-poll from 50s to 2s while a drain runs. `TgError.retry_after` carries Telegram's own backoff
+   for the 429 that never arrived, and the pause is checked *after* the completion check so a
+   cosmetic rate limit cannot delay delivering a result.
 
    The constraint that came out of it: **a frame may change the spinner and nothing else.** The bar
    stays discrete (`done/len(planned)`) because the journal is discrete — smoothing it into a

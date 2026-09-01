@@ -318,12 +318,20 @@ and worth not re-deriving:
 | `sendDice` | Yes | Genuinely animated, semantically wrong for progress. |
 | **Re-editing the text** | **Yes** | The only way to get motion *inside* a message. This is what the bot does. |
 
-Rate, measured the same day: 0.48, 0.91 and 2.02 edits/s all completed with
-**zero** rejections. 2s was chosen over 1s because the animation reads the same
-either way and half the calls is half the exposure to a flood limit that is not
-published. A 429 is still handled — `TgError.retry_after` carries Telegram's own
-number, `_ANIM_PAUSE` honours it, and the pause is checked *after* the
-completion check so a cosmetic rate limit can never delay delivering a result.
+Rate, measured the same day. Short bursts first: 0.48, 0.91 and 2.02 edits/s all
+completed with **zero** rejections. Then the question those did not answer —
+whether the cadence survives a whole job rather than a minute of it — settled by
+running it: **1,147 consecutive edits to one message over a full 40 minutes,
+zero rejections.** That is the length of a real render at this repo's measured
+stage times, so the 2s cadence is proven for the case it is used in.
+
+2s was chosen over 1s because the animation reads the same either way and half
+the calls is half the exposure to a flood limit that is not published. A 429 is
+still handled even though none was ever seen — `TgError.retry_after` carries
+Telegram's own number, `_ANIM_PAUSE` honours it, and the pause is checked
+*after* the completion check so a cosmetic rate limit can never delay delivering
+a result. One chat, one day, one self-hosted server is not a guarantee about a
+limit that can change without notice.
 
 **The spinner glyph was chosen on a real phone, not from a Unicode table.**
 Seven candidate sets were sent to the user's iPhone on 2026-09-01; none rendered

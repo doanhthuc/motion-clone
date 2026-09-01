@@ -1368,11 +1368,13 @@ def tick_progress(tg: Tg, chat_id: int) -> None:
                 path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         except TgError as exc:
             # Telegram asked for a pause. Honour its own number when it gives
-            # one. Measured 2026-09-01 that this does not fire at one edit per
-            # 2s over 40 minutes, which is exactly why it must be handled
-            # rather than assumed away: the measurement covers one chat on one
-            # day, and the cost of being wrong is the bot arguing with flood
-            # control for the length of a paid render.
+            # one. Measured 2026-09-01: one edit every 2s for a full 40 minutes
+            # — 1,147 consecutive edits to a single message, ZERO rejections —
+            # so this branch is not expected to run. It exists anyway because
+            # that is one chat on one day against a self-hosted server, the
+            # limit is not published and can change without notice, and the
+            # cost of being wrong is the bot arguing with flood control for the
+            # length of a render the user is paying $0.99/hour for.
             wait = exc.retry_after or 60.0
             _ANIM_PAUSE[chat_id] = time.time() + wait
             log(f"progress edit throttled, pausing the animation {wait:.0f}s: {exc}")
