@@ -207,7 +207,12 @@ Four rules hold it together:
   that nothing may spend $0.99/hour without the exact inputs it spent on being
   in the transcript — and an edited message keeps only its latest version. So
   `_freeze_panel` stops editing it and strips its keyboard, leaving the
-  submitted job permanently in the chat above the progress message. `/clear` is
+  submitted job permanently in the chat above the progress message. Stripping
+  works by *omitting* `reply_markup` from `editMessageText`, verified against
+  the real API 2026-09-01: the returned `Message` carries `reply_markup` when
+  the call passes one and does not when it omits one. (`forwardMessage` is not
+  a way to check this — it drops inline keyboards from every message, so a
+  control forwarded alongside reports "no keyboard" too.) `/clear` is
   the opposite case and *does* delete it: nothing was spent, so there is no
   record to keep, and a panel describing files that no longer exist is the
   stalest thing in the chat.
@@ -319,6 +324,15 @@ either way and half the calls is half the exposure to a flood limit that is not
 published. A 429 is still handled — `TgError.retry_after` carries Telegram's own
 number, `_ANIM_PAUSE` honours it, and the pause is checked *after* the
 completion check so a cosmetic rate limit can never delay delivering a result.
+
+**The spinner glyph was chosen on a real phone, not from a Unicode table.**
+Seven candidate sets were sent to the user's iPhone on 2026-09-01: none rendered
+as tofu, but the braille spinner `⠋⠙⠹⠸…` — the obvious choice on paper — is a
+few faint dots that all but vanish against a dark chat background. It renders
+and you still cannot see it, which fails the only job a liveness indicator has.
+`_SPIN` is `◐◓◑◒`: four frames rather than ten is also the better trade at a 2s
+cadence, since the eye reads *"that changed"* rather than *"that is rotating"*,
+and a 90° jump per tick carries further than a one-tenth shift.
 
 `frame` may change the spinner and the hourglass and **nothing else**. A test
 strips those glyphs from two consecutive frames and asserts the remainder is

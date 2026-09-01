@@ -84,7 +84,15 @@ def estimate_minutes(job: Job) -> int:
 # catch. Animated .tgs stickers do work, but a sticker message cannot be edited
 # at all ("message can't be edited"), so it can never be a progress display.
 # Re-editing measured at 0.48/s, 0.91/s and 2.02/s with zero rejections.
-_SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+#
+# Quarter-circles, not the braille spinner ⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ this started as. Checked
+# on the user's own iPhone 2026-09-01: braille renders (it is not tofu) but it
+# is a few faint dots that all but vanish against a dark chat background, and a
+# liveness indicator nobody can see fails at the only job it has. Four frames
+# rather than ten is also the better trade at a 2s cadence — the eye reads
+# "that changed", not "that is rotating", so a 90-degree jump per tick carries
+# further than a one-tenth shift.
+_SPIN = "◐◓◑◒"
 _HOURGLASS = ("⏳", "⌛")
 
 
