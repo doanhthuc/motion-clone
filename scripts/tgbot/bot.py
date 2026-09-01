@@ -1135,6 +1135,17 @@ ICON_EMPTY = "⬜"
 
 PARSE_HTML = "HTML"
 
+# Attached once, to /start's reply. Labels are the exact literal command text
+# — tapping a reply-keyboard button sends its label back as a plain message,
+# so an emoji-decorated label (e.g. "🎨 /pipeline") would stop matching the
+# `text.startswith("/pipeline")` dispatch below and silently do nothing.
+# /pipeline and /status work with no argument, so those two taps just work;
+# /result and /tryon still need an argument for anything but this chat's own
+# job, so a bare tap falls through to their usage message instead of erroring
+# silently (2026-09-01, see the /start UI rework).
+START_KEYBOARD = [["/pipeline", "/status"],
+                  ["/result", "/tryon"]]
+
 
 def _esc(value: object) -> str:
     """Escape a dynamic value for parse_mode=HTML.
@@ -2437,19 +2448,26 @@ def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
 
     if text.startswith("/result"):
         parts = text.split(maxsplit=1)
-        if len(parts) != 2:
-            tg.send_message(chat_id,
-                            "usage: /result <manifest filename under batch/>, "
-                            "e.g. /result 2026-08-31-2140.yaml")
-            return
-        manifest_path = _safe_child(ROOT / "batch", parts[1])
-        if manifest_path is None:
-            tg.send_message(chat_id,
-                            "that manifest name is not allowed — send a bare "
-                            "filename under batch/, no path separators or '..'")
-            return
+        if len(parts) == 2:
+            manifest_path = _safe_child(ROOT / "batch", parts[1])
+            if manifest_path is None:
+                tg.send_message(chat_id,
+                                "that manifest name is not allowed — send a "
+                                "bare filename under batch/, no path "
+                                "separators or '..'")
+                return
+        else:
+            # Bare /result (the Result button sends exactly this): the same
+            # manifest /status already defaults to for this chat, so the
+            # button works without the user typing a filename.
+            manifest_path = _job_manifest_path(chat_id)
         if not manifest_path.exists():
-            tg.send_message(chat_id, "no manifest found with that name")
+            if len(parts) == 2:
+                tg.send_message(chat_id, "no manifest found with that name")
+            else:
+                tg.send_message(chat_id,
+                                "nothing finished yet for this chat — or "
+                                "name a manifest: /result 2026-08-31-2140.yaml")
             return
         deliver_result(tg, chat_id, manifest_path)
         return
@@ -2531,13 +2549,17 @@ def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
     if text.startswith("/start"):
         tg.send_message(
             chat_id,
-            "Send each file as a File (in the picker: \"...\" -> Send as "
-            "File). Videos are the driver; for an image I ask which slot, "
-            "and you tap the answer.\n\n"
-            "When every slot is filled I show the job and a Run button. "
-            "Nothing spends money until you tap Run and confirm.\n\n"
-            "/pipeline switch flow · /status progress · "
-            "/result <name>.yaml · /tryon <batch-id>")
+            "📤 <b>Send files as Files</b> (picker → \"...\" → Send as File)\n"
+            "🎬 Videos are the driver. For images, I'll ask which slot — "
+            "just tap the answer.\n\n"
+            "✅ When every slot is filled, I'll show the job and a "
+            "▶️ Run button.\n"
+            "💸 <b>Nothing spends money until you tap Run and confirm.</b>\n\n"
+            "Buttons below, or type:\n"
+            "/pipeline · /status · /result &lt;name&gt;.yaml · "
+            "/tryon &lt;batch-id&gt;",
+            parse_mode=PARSE_HTML,
+            reply_keyboard=START_KEYBOARD)
         return
 
     # A plain-text reply, meant to answer the question asked about the HEAD

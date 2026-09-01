@@ -103,10 +103,25 @@ class Tg:
         return {"inline_keyboard": [[{"text": label, "callback_data": data}
                                      for label, data in row] for row in rows]}
 
+    @staticmethod
+    def reply_keyboard(rows: list[list[str]]) -> dict:
+        """A persistent keyboard under the text box, from [[label, ...], ...].
+
+        Distinct from `keyboard()`: tapping one of these sends its label as an
+        ordinary text message the bot already parses as a command, rather than
+        a callback_data the bot intercepts separately. `resize_keyboard` keeps
+        it to the height of its rows instead of Telegram's default full-screen
+        size. Meant to be attached once, on /start — it stays on screen across
+        every later message until the client is told otherwise.
+        """
+        return {"keyboard": [[{"text": label} for label in row] for row in rows],
+                "resize_keyboard": True}
+
     def send_message(self, chat_id: int, text: str, *,
                      buttons: list[list[tuple[str, str]]] | None = None,
+                     reply_keyboard: list[list[str]] | None = None,
                      parse_mode: str | None = None) -> int:
-        """Send text, optionally with an inline keyboard and formatting.
+        """Send text, optionally with a keyboard and formatting.
 
         parse_mode="HTML" is opt-in per call, and HTML rather than MarkdownV2
         on purpose: MarkdownV2 requires escaping fifteen characters including
@@ -114,8 +129,16 @@ class Tg:
         measurements. An unescaped one makes Telegram reject the WHOLE message,
         so the user sees nothing at all. HTML needs only &, < and > escaped.
         Callers must still escape every dynamic value they interpolate.
+
+        `buttons` and `reply_keyboard` are mutually exclusive — inline buttons
+        live on the message itself, a reply keyboard lives under the text box.
         """
-        markup = self.keyboard(buttons) if buttons else None
+        if buttons:
+            markup = self.keyboard(buttons)
+        elif reply_keyboard:
+            markup = self.reply_keyboard(reply_keyboard)
+        else:
+            markup = None
         return int(self.call("sendMessage", chat_id=chat_id, text=text,
                              reply_markup=markup,
                              parse_mode=parse_mode)["message_id"])

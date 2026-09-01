@@ -138,6 +138,11 @@ class FakeTg:
         # answerCallbackQuery: skipping it leaves the client spinning, so it
         # has to be observable.
         self.buttons: list[list[list[tuple[str, str]]] | None] = []
+        # The persistent under-the-textbox keyboard, sent only by /start —
+        # recorded separately from `buttons` (inline, per-message) since the
+        # two are mutually exclusive and a test asserting on one should not
+        # have to know the other stayed empty.
+        self.reply_keyboards: list[list[list[str]] | None] = []
         self.answered: list[str] = []
         self.parse_modes: list[str | None] = []
         self.actions: list[str] = []
@@ -174,11 +179,13 @@ class FakeTg:
                     "<pre>", "</pre>", "<blockquote expandable>", "<blockquote>",
                     "</blockquote>")
 
-    def send_message(self, chat_id, text, *, buttons=None, parse_mode=None):
+    def send_message(self, chat_id, text, *, buttons=None, reply_keyboard=None,
+                     parse_mode=None):
         self._check_markup(text, parse_mode)
         self.messages.append(text)
         self.screen.append(text)
         self.buttons.append(buttons)
+        self.reply_keyboards.append(reply_keyboard)
         # Recorded so a test can assert that HTML-formatted bodies actually
         # declare it: HTML sent without parse_mode shows the raw <b> tags,
         # and HTML declared without escaping makes Telegram reject the whole
