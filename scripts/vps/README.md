@@ -326,13 +326,17 @@ number, `_ANIM_PAUSE` honours it, and the pause is checked *after* the
 completion check so a cosmetic rate limit can never delay delivering a result.
 
 **The spinner glyph was chosen on a real phone, not from a Unicode table.**
-Seven candidate sets were sent to the user's iPhone on 2026-09-01: none rendered
-as tofu, but the braille spinner `⠋⠙⠹⠸…` — the obvious choice on paper — is a
-few faint dots that all but vanish against a dark chat background. It renders
-and you still cannot see it, which fails the only job a liveness indicator has.
-`_SPIN` is `◐◓◑◒`: four frames rather than ten is also the better trade at a 2s
-cadence, since the eye reads *"that changed"* rather than *"that is rotating"*,
-and a 90° jump per tick carries further than a one-tenth shift.
+Seven candidate sets were sent to the user's iPhone on 2026-09-01; none rendered
+as tofu, so "does it render" settled nothing. `_SPIN` is the braille spinner
+`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`, picked by the user after watching both it and `◐◓◑◒` animate live
+in the chat. The case against it — on a dark background those dots are markedly
+fainter than quarter-circles, so a legibility check fails where a rendering
+check passes — was put and did not win. The person who watches that message for
+forty minutes is the right judge of it.
+
+Ten frames at 2s each means a 20s cycle, one dot of movement per tick. A stride
+of 3 would enlarge each step while keeping the look, if the motion ever reads as
+too subtle in use.
 
 `frame` may change the spinner and the hourglass and **nothing else**. A test
 strips those glyphs from two consecutive frames and asserts the remainder is

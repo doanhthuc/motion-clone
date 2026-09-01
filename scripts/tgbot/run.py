@@ -85,14 +85,19 @@ def estimate_minutes(job: Job) -> int:
 # at all ("message can't be edited"), so it can never be a progress display.
 # Re-editing measured at 0.48/s, 0.91/s and 2.02/s with zero rejections.
 #
-# Quarter-circles, not the braille spinner ⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ this started as. Checked
-# on the user's own iPhone 2026-09-01: braille renders (it is not tofu) but it
-# is a few faint dots that all but vanish against a dark chat background, and a
-# liveness indicator nobody can see fails at the only job it has. Four frames
-# rather than ten is also the better trade at a 2s cadence — the eye reads
-# "that changed", not "that is rotating", so a 90-degree jump per tick carries
-# further than a one-tenth shift.
-_SPIN = "◐◓◑◒"
+# Braille, chosen by the user on 2026-09-01 after watching BOTH options animate
+# on their own phone — braille first, then ◐◓◑◒ — not from a screenshot. Worth
+# recording because the argument against it was reasonable and lost anyway: on
+# a dark background these dots are much fainter than quarter-circles, so a
+# rendering check ("is it tofu?") passes them while a legibility check does
+# not. The person watching the screen for forty minutes preferred them, and
+# that is the measurement that counts here.
+#
+# Ten frames at one tick per 2s means a full cycle takes 20s and each tick
+# shifts by one dot. Advancing by a stride of 3 would make each change larger
+# while keeping the look; left alone unless the motion reads as too subtle in
+# use.
+_SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 _HOURGLASS = ("⏳", "⌛")
 
 
