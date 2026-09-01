@@ -224,8 +224,13 @@ What is built, and what is not:
   message keeps only its latest version, so §6's transcript invariant would otherwise be
   destroyed by the next job), and it is **moved down** past a drift of 3 messages, since editing in
   place is silent but a card scrolled off screen defeats the purpose.
-- **Not built:** the basket (multi-job batching) and recipes (§5.1). One job at a time; the pipeline
-  is chosen with `/pipeline` or `TG_PIPELINE`.
+- **Built 2026-09-01, later the same day:** the basket. Run submits every queued job as one
+  manifest on one pod — the user's point being that provisioning is paid per *drain*, not per job.
+  `➕ Add another` keeps every slot and the pipeline (their choice: *"không cố định — giữ hết, tôi
+  tự thay"*), so a second run is one replaced file rather than four fresh uploads. Everything below
+  the bot was already multi-run; `render_manifest` was the only thing pinning it to one.
+- **Not built:** recipes (§5.1). The pipeline is chosen with `/pipeline` or `TG_PIPELINE`, and the
+  39 motion params are still `defaults` written by hand.
 
 ---
 

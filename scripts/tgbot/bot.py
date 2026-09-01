@@ -53,11 +53,10 @@ ROOT = Path(__file__).resolve().parents[2]
 # same reasoning as tgbot/run.py's own ROOT for LEASE_PATH.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# Every manifest this bot renders (tgbot/job.py:render_manifest) hardcodes a
-# single run id, "job" — Plan 2A is the single-job slice, multi-job baskets
-# are Plan 2B. Hardcoding it here matches that, rather than inventing a run
-# selector for a run that never has more than one name.
-SOLE_RUN_ID = "job"
+# How many try-on images /tryon will send before it stops and lists the runs
+# instead. A batch can hold six, and six full-size images arriving unasked is
+# the wall of clutter the panel exists to prevent.
+TRYON_MAX_SENT = 4
 
 # The one pipeline this bot assembles a job for. Plan 2A is the single-job
 # slice — a recipe picker (batch/recipes/*.yaml) is explicitly 2B's job (see
@@ -632,7 +631,7 @@ def _fill_slot(tg: Tg, chat_id: int, job: Job, role: str, path: Path,
     _PANEL_NOTE[chat_id] = f"{verb} — {path.name}"
 
 
-def _render_and_validate(tg: Tg, chat_id: int, job: Job) -> bool:
+def _render_and_validate(tg: Tg, chat_id: int) -> bool:
     """Write this chat's manifest and run the free `make batch-validate` on it.
 
     Returns whether the manifest is safe to run, and records that in
@@ -672,7 +671,8 @@ def _render_and_validate(tg: Tg, chat_id: int, job: Job) -> bool:
                         "kept; send /status for progress. Once it has finished, "
                         "send /confirm and this job will be checked and started.")
         return False
-    write_manifest(job, manifest_path, now=time.strftime("%Y-%m-%d %H:%M:%S"))
+    write_manifest(_jobs_for(chat_id), manifest_path,
+                   now=time.strftime("%Y-%m-%d %H:%M:%S"))
 
     tg.send_chat_action(chat_id)
     try:
@@ -717,8 +717,8 @@ def _maybe_show_manifest(tg: Tg, chat_id: int, job: Job) -> None:
     `_panel_buttons` reads it to decide whether Run may be offered at all. One
     reader, one writer.
     """
-    if not missing_slots(job):
-        _render_and_validate(tg, chat_id, job)
+    if _jobs_for(chat_id):
+        _render_and_validate(tg, chat_id)
     _show_panel(tg, chat_id)
 
 
@@ -757,7 +757,7 @@ def _save_draft(chat_id: int) -> None:
     path = _draft_path(chat_id)
     job = _STATE.get(chat_id)
     pending = _PENDING.get(chat_id) or []
-    if job is None and not pending:
+    if job is None and not pending and not _BASKET.get(chat_id):
         # /confirm clears the state after submitting; the draft must go with
         # it, or the next restart would resurrect a job already running.
         path.unlink(missing_ok=True)
@@ -780,6 +780,7 @@ def _save_draft(chat_id: int) -> None:
         # while it is still there — and the digest is what proves the file on
         # disk IS the one that arrived, which a later re-hash cannot.
         "fidelity": _FIDELITY.get(chat_id),
+        "basket": _dump_jobs(_BASKET.get(chat_id) or []),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
@@ -841,6 +842,9 @@ def _load_draft(chat_id: int) -> str | None:
     fidelity = payload.get("fidelity")
     if fidelity:
         _FIDELITY[chat_id] = {str(k): str(v) for k, v in fidelity.items()}
+    basket = payload.get("basket")
+    if basket:
+        _BASKET[chat_id] = _load_jobs(basket)
     return None
 
 
@@ -892,6 +896,7 @@ _CB_REDO = "redo:"
 _CB_CLEAR_ASK = "clr:ask"
 _CB_CLEAR_GO = "clr:go"
 _CB_CLEAR_NO = "clr:no"
+_CB_ADD = "add"
 
 
 def _run_token(chat_id: int) -> str:
@@ -968,6 +973,9 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
 
         elif data.startswith(_CB_REDO):
             _redo_slot(tg, chat_id, data[len(_CB_REDO):])
+
+        elif data == _CB_ADD:
+            _add_to_batch(tg, chat_id)
 
         elif data == _CB_CLEAR_ASK:
             _ask_to_clear(tg, chat_id)
@@ -1185,12 +1193,15 @@ def _panel_next_line(chat_id: int, job: Job) -> str:
         return f"{head} · send the <b>{_esc(missing[0])}</b> as a File"
     verdict = _LAST_VALIDATE.get(chat_id)
     if verdict is True:
+        queued = _jobs_for(chat_id)
+        minutes = sum(estimate_minutes(j) for j in queued)
+        head = f"{head} · {len(queued)} job(s)" if len(queued) > 1 else head
         # The caveat travels with the number, because estimate_minutes' own
         # contract says it must: "The caller must put this next to a caveat
         # (measured once, on one batch) — this function only computes the
         # number". Carried here verbatim when _manifest_summary was folded into
         # the panel (2026-09-01) rather than dropped as clutter.
-        return (f"{head} · ready · ⏱ ~{estimate_minutes(job)} min · 💸 $0.99/hour"
+        return (f"{head} · ready · ⏱ ~{minutes} min · 💸 $0.99/hour"
                 "\n<i>estimate measured once on one batch — not a promise</i>")
     if verdict is False:
         return f"{head} · {ICON_WARN} did not pass <code>batch-validate</code>"
@@ -1202,7 +1213,26 @@ def _panel_text(chat_id: int, job: Job) -> str:
     lines = [f"🎬 <b>{_esc(job.pipeline)}</b>", ""]
     for role in sorted(required_roles(job.pipeline) | optional_roles(job.pipeline)):
         lines.append(_role_line(role, job))
+    basket = _BASKET.get(chat_id) or []
+    if basket:
+        # Listed above the slots, because it is what the money is mostly for:
+        # one pod, N videos. Each line names the material so a wrong entry is
+        # visible without opening anything.
+        lines += [""]
+        for index, other in enumerate(basket, 1):
+            names = " · ".join(f"{ROLE_ICON.get(r, '')}{_esc(Path(other.slots[r]).stem)}"
+                               for r in sorted(other.slots))
+            lines.append(f"<code>{index}.</code> {names}")
+            if other.pipeline != job.pipeline:
+                lines.append(f"    <i>{_esc(other.pipeline)}</i>")
     lines += ["", _panel_next_line(chat_id, job)]
+
+    if basket and _STATE.get(chat_id) is not None and not missing_slots(job) \
+            and any(_signature(job) == _signature(o) for o in basket):
+        # Named, not silently dropped. After "add another" every slot is kept
+        # so one can be swapped, which means this job IS entry N until the user
+        # changes something — and running it would pay twice for one video.
+        lines.append("<i>same as an entry above — change something, or just Run</i>")
 
     queued = _PENDING.get(chat_id) or []
     if queued:
@@ -1238,9 +1268,15 @@ def _panel_buttons(chat_id: int, job: Job) -> list[list[tuple[str, str]]]:
     A button that cannot work should not be offered.
     """
     rows: list[list[tuple[str, str]]] = []
-    if (not missing_slots(job) and not (_PENDING.get(chat_id) or [])
-            and _LAST_VALIDATE.get(chat_id) is True):
-        rows.append([("▶️ Run · $0.99/h", _CB_RUN_ASK)])
+    queued = _jobs_for(chat_id)
+    if queued and not (_PENDING.get(chat_id) or []) and _LAST_VALIDATE.get(chat_id) is True:
+        run = [(f"▶️ Run {len(queued)} · $0.99/h" if len(queued) > 1
+                else "▶️ Run · $0.99/h", _CB_RUN_ASK)]
+        # Offered beside Run, not instead of it: one pod runs everything in the
+        # manifest, so adding another job costs nothing but the render itself.
+        if not missing_slots(job):
+            run.append(("➕ Add another", _CB_ADD))
+        rows.append(run)
     return rows + _fix_buttons(job)
 
 
@@ -1259,6 +1295,51 @@ def _preview_dir(chat_id: int) -> Path:
 # because an ambiguous image is queued first and answered later — keying it on
 # the role would lose the digest of anything that waited.
 _FIDELITY: dict[int, dict[str, str]] = {}
+
+
+# Jobs already assembled and waiting for the next pod. The whole point of
+# renting by the hour: provisioning and bootstrap are paid once per DRAIN, not
+# once per job, so a batch of four amortises them four ways. The user's words
+# (2026-09-01): "tận dụng tối đa thời gian thuê gpu tránh chờ gpu khởi động tốn
+# thời gian chờ và tiền trong lúc chờ nữa".
+#
+# This is spec section 5's basket. The runner, the journal and final_files were
+# already multi-run — the bot's manifest writer was the only thing pinning it
+# to one, and their own hand-written manifests have had 2-6 runs all along.
+_BASKET: dict[int, list[Job]] = {}
+
+
+def _copy_job(job: Job) -> Job:
+    """A detached copy. The basket must not alias the job still being edited.
+
+    Job holds plain dicts, so appending the live object and carrying on editing
+    it would silently rewrite an entry the user already committed to the batch.
+    """
+    return Job(pipeline=job.pipeline, slots=dict(job.slots),
+               probes=dict(job.probes))
+
+
+def _signature(job: Job) -> tuple:
+    """What makes two runs the same run — pipeline plus material."""
+    return (job.pipeline, tuple(sorted((r, str(p)) for r, p in job.slots.items())))
+
+
+def _jobs_for(chat_id: int) -> list[Job]:
+    """Everything Run would submit, in order.
+
+    The job still being assembled joins the basket only when it is complete AND
+    differs from every entry already there. After "add another" the panel keeps
+    every slot — the user asked for that, so they can replace just the one thing
+    they want changed — which means it is briefly an exact duplicate. Running it
+    would pay twice for one video.
+    """
+    jobs = list(_BASKET.get(chat_id) or [])
+    current = _STATE.get(chat_id)
+    if current is None or missing_slots(current):
+        return jobs
+    if any(_signature(current) == _signature(other) for other in jobs):
+        return jobs
+    return jobs + [current]
 
 
 # Panels that are a PHOTO rather than a text message. A ready job becomes one
@@ -1602,6 +1683,20 @@ def tick_progress(tg: Tg, chat_id: int) -> None:
 _LAST_SUFFIX = ".last.json"
 
 
+def _dump_jobs(jobs: list[Job]) -> list[dict]:
+    return [{"pipeline": j.pipeline,
+             "slots": {r: str(v) for r, v in j.slots.items()},
+             "probes": {r: asdict(pr) for r, pr in j.probes.items()}}
+            for j in jobs]
+
+
+def _load_jobs(payload: list) -> list[Job]:
+    return [Job(pipeline=entry["pipeline"],
+                slots={r: Path(v) for r, v in entry["slots"].items()},
+                probes={r: Probe(**d) for r, d in entry["probes"].items()})
+            for entry in payload]
+
+
 def _last_path(chat_id: int) -> Path:
     """The job most recently submitted, kept for /again.
 
@@ -1648,6 +1743,41 @@ def _redo_slot(tg: Tg, chat_id: int, role: str) -> None:
     _ask_about(tg, chat_id, pr, job.pipeline, path=path)
 
 
+def _add_to_batch(tg: Tg, chat_id: int) -> None:
+    """Commit the assembled job to the batch and keep its material for the next.
+
+    Every slot and the pipeline stay in place — the user's choice when asked
+    what varies between runs ("không cố định — giữ hết, tôi tự thay"), so the
+    next job starts from this one and you replace only what you want changed.
+    Nothing is re-uploaded.
+
+    The consequence, handled rather than hidden: until something IS changed the
+    job on screen is an exact duplicate of the entry just added, so `_jobs_for`
+    leaves it out and the panel says why. Running two identical runs would
+    render the same video twice and bill for both.
+    """
+    job = _STATE.get(chat_id)
+    if job is None or missing_slots(job):
+        tg.send_message(chat_id, "nothing complete to add yet — fill every "
+                                 "required slot first")
+        return
+    basket = _BASKET.setdefault(chat_id, [])
+    if any(_signature(job) == _signature(other) for other in basket):
+        tg.send_message(chat_id, "that exact job is already in the batch — "
+                                 "change a file or the pipeline first")
+        return
+    basket.append(_copy_job(job))
+    # A copy stays behind as the working job, so editing it cannot reach back
+    # into the entry just committed.
+    _STATE[chat_id] = _copy_job(job)
+    # The manifest now has one more run in it; the previous verdict was about a
+    # different file.
+    _LAST_VALIDATE.pop(chat_id, None)
+    _render_and_validate(tg, chat_id)
+    _show_panel(tg, chat_id, note=f"added job {len(basket)} to the batch — "
+                                  "replace whatever should differ")
+
+
 def _ask_to_clear(tg: Tg, chat_id: int) -> None:
     """The confirm step for /clear — shared by the command and the button.
 
@@ -1687,6 +1817,7 @@ def _clear_job(tg: Tg, chat_id: int) -> None:
     _CONFIRM_WARNED.discard(chat_id)
     _ALBUM_KEY.pop(chat_id, None)
     _FIDELITY.pop(chat_id, None)
+    _BASKET.pop(chat_id, None)
     # Replaced in place rather than deleted: /clear means the job never happened, and a
     # panel left behind describing files that are no longer on disk is the
     # stalest thing in the chat. Nothing spent, so nothing to keep a record of.
@@ -1734,11 +1865,15 @@ def _again(tg: Tg, chat_id: int) -> None:
         return
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        pipeline = payload["pipeline"]
-        if pipeline not in PIPELINES:
-            raise ValueError(f"unknown pipeline {pipeline!r}")
-        slots = {r: Path(v) for r, v in payload["slots"].items()}
-        probes = {r: Probe(**d) for r, d in payload["probes"].items()}
+        # Records written before batches existed hold a single job at the top
+        # level. Read both rather than discard a user's last batch on upgrade.
+        entries = payload["jobs"] if "jobs" in payload else [payload]
+        jobs = _load_jobs(entries)
+        if not jobs:
+            raise ValueError("no runs recorded")
+        for restored in jobs:
+            if restored.pipeline not in PIPELINES:
+                raise ValueError(f"unknown pipeline {restored.pipeline!r}")
     except (ValueError, KeyError, TypeError) as exc:
         log(f"last-job file for chat {chat_id} is unreadable: {exc!r}")
         tg.send_message(chat_id, "the last job's record is unreadable — send "
@@ -1746,16 +1881,21 @@ def _again(tg: Tg, chat_id: int) -> None:
         return
     # The staged copies may have been swept by `make batch-clean` or /clear
     # since. Named individually: "some files are missing" is not actionable.
-    gone = sorted(r for r, sp in slots.items() if not sp.is_file())
+    gone = sorted({f"{r} ({sp.name})" for restored in jobs
+                   for r, sp in restored.slots.items() if not sp.is_file()})
     if gone:
         tg.send_message(chat_id,
-                        "cannot repeat that job — these files are no longer on "
-                        f"disk: {', '.join(f'{r} ({slots[r].name})' for r in gone)}")
+                        "cannot repeat that batch — these files are no longer "
+                        f"on disk: {', '.join(gone)}")
         return
-    _STATE[chat_id] = Job(slots=slots, probes=probes, pipeline=pipeline)
-    tg.send_message(chat_id, f"reusing the last job's {len(slots)} file(s). "
+    # The last job becomes the editable one and the rest go back in the basket,
+    # which is the shape they were submitted in.
+    *earlier, current = jobs
+    _BASKET[chat_id] = earlier
+    _STATE[chat_id] = current
+    tg.send_message(chat_id, f"reusing the last batch — {len(jobs)} job(s). "
                              "/pipeline to change the flow, then Run.")
-    _maybe_show_manifest(tg, chat_id, _STATE[chat_id])
+    _maybe_show_manifest(tg, chat_id, current)
 
 
 def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
@@ -1777,7 +1917,8 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
     # "--dry-run: never invokes drain" in this module's docstring would be
     # false — and the button path has to thread it just as far as the typed one.
     job = _STATE.get(chat_id)
-    if job is None or missing_slots(job):
+    queued = _jobs_for(chat_id)
+    if not queued:
         tg.send_message(chat_id, "no complete job yet — send the required files first")
         return
     pending = _PENDING.get(chat_id) or []
@@ -1809,7 +1950,7 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
         # normally finished, the write guard passes, and the normal path
         # resumes. If it has NOT finished, _render_and_validate says so
         # itself and names /status — a true reason with a real action.
-        if not _render_and_validate(tg, chat_id, job):
+        if not _render_and_validate(tg, chat_id):
             # It already sent the specific reason; a second, vaguer line
             # would only bury it.
             return
@@ -1841,7 +1982,14 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
                         "a drain is already running for this job — wait for it "
                         "to finish before confirming again")
         return
-    stages = list(PIPELINES[job.pipeline])
+    # Every stage any queued job will run, in pipeline order, de-duplicated.
+    # The progress bar counts against this: a batch mixing two pipelines has to
+    # show the union or the denominator would be wrong for half of it.
+    stages: list[str] = []
+    for other in queued:
+        for stage in PIPELINES[other.pipeline]:
+            if stage not in stages:
+                stages.append(stage)
     # BEFORE start_drain and before the state clear: this is the last instant
     # the submitted job exists in memory, and freezing the panel here is what
     # leaves the exact inputs permanently in the transcript.
@@ -1851,16 +1999,16 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
     # than mutating one already handed to a running drain. The manifest
     # itself, and the drain's own journal, stay on disk regardless.
     dropped = len(_PENDING.pop(chat_id, []) or [])
+    submitted_count = len(queued)
+    _BASKET.pop(chat_id, None)
     # Copied to `.last.json` BEFORE the clear, so /again can rebuild it.
     # Deliberately not left in `.draft.json`: _load_draft reads that file, so a
     # restart would resurrect a job already handed to a running drain.
-    submitted = _STATE.get(chat_id)
-    if submitted is not None:
-        _last_path(chat_id).write_text(json.dumps({
-            "pipeline": submitted.pipeline,
-            "slots": {r: str(v) for r, v in submitted.slots.items()},
-            "probes": {r: asdict(pr) for r, pr in submitted.probes.items()},
-        }, indent=2), encoding="utf-8")
+    # The whole batch, not just the last job: /again exists so a batch can be
+    # re-run with one thing changed, and restoring one run out of four would
+    # quietly discard the other three.
+    _last_path(chat_id).write_text(json.dumps(
+        {"jobs": _dump_jobs(queued)}, indent=2), encoding="utf-8")
     _STATE.pop(chat_id, None)
     _LAST_VALIDATE.pop(chat_id, None)
     _CONFIRM_WARNED.discard(chat_id)
@@ -1869,10 +2017,11 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
     _STRIP.pop(chat_id, None)
     if dropped:
         tg.send_message(chat_id, f"running without {dropped} unassigned file(s)")
-    tg.send_message(chat_id, "🚀 <b>Started.</b> Renting a GPU pod at "
-                             "$0.99/hour now.\nI will keep the message below "
-                             "updated and send the result when it finishes — "
-                             "no need to ask.", parse_mode=PARSE_HTML)
+    tg.send_message(chat_id,
+                    f"🚀 <b>Started.</b> {submitted_count} job(s) on one pod at "
+                    "$0.99/hour.\nI will keep the message below updated and "
+                    "send the results when it finishes — no need to ask.",
+                    parse_mode=PARSE_HTML)
     _start_progress(tg, chat_id, manifest_path, stages)
     return
 
@@ -2000,7 +2149,10 @@ def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
                             "usage: /tryon <batch-id>  (the id progress showed, "
                             "e.g. 2026-08-31-2140)")
             return
-        batch_dir = _safe_child(ROOT / "out", parts[1])
+        # `<batch>` or `<batch>/<run>`. Split first so each component is
+        # validated on its own by _safe_child and neither can smuggle a path.
+        target, _, wanted_run = parts[1].partition("/")
+        batch_dir = _safe_child(ROOT / "out", target)
         if batch_dir is None:
             # Refuse without echoing the argument back: reflecting whatever
             # was typed into the reply is how a refusal message becomes its
@@ -2009,12 +2161,29 @@ def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
                             "that batch id is not allowed — send a bare id, "
                             "no path separators or '..'")
             return
-        # SOLE_RUN_ID: Plan 2A's manifests only ever have one run, "job".
-        path = batch_dir / "runs" / SOLE_RUN_ID / "01-tryon.png"
-        if not path.exists():
+        # Every run in the batch, not a hardcoded "job" (2026-09-01). Manifests
+        # used to have exactly one run so the id was a constant; a batch has
+        # one per queued job, named after its material, and a /tryon that still
+        # looked for `runs/job/` would answer "no try-on image found" for every
+        # batch the bot now produces.
+        runs_dir = batch_dir / "runs"
+        if wanted_run:
+            one = _safe_child(runs_dir, wanted_run)
+            found = [one / "01-tryon.png"] if one and (one / "01-tryon.png").exists() else []
+        else:
+            found = sorted(runs_dir.glob("*/01-tryon.png")) if runs_dir.is_dir() else []
+        if not found:
             tg.send_message(chat_id, "no try-on image found for that batch")
             return
-        tg.send_document(chat_id, path, caption="try-on")
+        if len(found) > TRYON_MAX_SENT:
+            names = "\n".join(f"• <code>{_esc(f.parent.name)}</code>" for f in found)
+            tg.send_message(chat_id,
+                            f"that batch has {len(found)} runs — name one:\n{names}\n"
+                            f"<i>/tryon {_esc(batch_dir.name)}/&lt;run&gt;</i>",
+                            parse_mode=PARSE_HTML)
+            return
+        for image in found:
+            tg.send_document(chat_id, image, caption=f"try-on · {image.parent.name}")
         return
 
     if text.startswith("/result"):

@@ -155,6 +155,56 @@ systemctl daemon-reload && systemctl enable --now motion-bot
 `/status` with nothing running falls through to `/job` rather than dead-ending on "nothing
 started" — which is true, but useless in the state `/status` is most often asked in.
 
+### Batches — many jobs, one pod
+
+**The Run button submits every job in the batch, not just the one on screen.**
+This is spec section 5's basket, built 2026-09-01 on the user's point: *"chúng
+ta đang muốn chạy theo batch tạo 1 lượt nhiều video ... tận dụng tối đa thời
+gian thuê gpu tránh chờ gpu khởi động tốn thời gian chờ và tiền trong lúc chờ
+nữa"*. Provisioning and bootstrap are paid **once per drain**, not once per job.
+
+Almost everything below the bot was already multi-run — `batchlib`'s runner, the
+journal `progress_text` reads, and `final_files` — and the user's own
+hand-written manifests have had 2-6 runs all along. `tgbot/job.py`'s writer was
+the only thing pinning the bot to one.
+
+```
+▶️ Run 3 · $0.99/h     ➕ Add another
+```
+
+- **`➕ Add another` keeps every slot and the pipeline.** The user's answer when
+  asked what varies between runs: *"không cố định — giữ hết, tôi tự thay"*. So
+  the next job starts as a copy and you replace only what should differ —
+  nothing is re-uploaded.
+- **The copy is detached.** `Job` holds plain dicts; appending the live object
+  would let a later edit silently rewrite an entry already committed.
+- **An unchanged duplicate is not queued twice.** Straight after Add the job on
+  screen *is* the entry just added, and running both would render one video
+  twice and bill for both. `_jobs_for` leaves it out and the panel says so
+  rather than dropping it silently. Tapping Add again is refused outright.
+- **Run ids name their material** — `nhanvat-vaytrang-c5relight0p2`, the shape
+  the user writes by hand. The id names the output directory, `_final/<id>.mp4`
+  and every journal row, so `job-3` would make a six-run batch unreadable at
+  exactly the moment it matters. Two runs sharing material but differing by
+  pipeline get a numeric suffix, because `batchlib` refuses a repeated id —
+  rightly, since the second run would overwrite the first one's video.
+- **The progress bar counts the union of stages** across the queued pipelines. A
+  batch mixing `tryon-motion-enhance` and `tryon-character-swap-enhance` would
+  otherwise have the wrong denominator for half its runs.
+- **`/again` restores the whole batch**, not the last run of it. `.last.json`
+  holds a `jobs` list; records written before batches existed are still read.
+
+`/tryon <batch-id>` now sends the try-on image for **every** run, or lists the
+run names when there are more than `TRYON_MAX_SENT` (4) of them —
+`/tryon <batch-id>/<run>` picks one. It used to look in `runs/job/`, a constant
+that no longer exists.
+
+**Still unmeasured:** how long `gpu-bootstrap` takes when the models are already
+on the Network Volume (§13 item 2). The batch is worth having regardless — it
+also removes a round of waiting and tapping per job — but the size of the saving
+is not known yet, and this README should not claim one. It is due to be measured
+during acceptance A4b, which rents a pod anyway.
+
 ### The low-bitrate warning
 
 `ingest.quality_warning` judges an arriving video against

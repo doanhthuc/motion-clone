@@ -110,7 +110,7 @@ def reset_bot_state():
     for name in ("_STATE", "_LOADED", "_PENDING", "_LAST_VALIDATE",
                  "_CONFIRM_WARNED", "_PANEL", "_PANEL_NOTE", "_LAST_SEEN",
                  "_FRAME", "_ANIM_PAUSE", "_ALBUM_KEY", "_FIDELITY",
-                 "_PANEL_IS_PHOTO", "_STRIP"):
+                 "_PANEL_IS_PHOTO", "_STRIP", "_BASKET"):
         # getattr, not bot._STATE etc: a name that disappears from bot.py
         # should fail here loudly rather than be silently skipped.
         getattr(bot, name).clear()
@@ -1486,6 +1486,172 @@ class TestFlow(unittest.TestCase):
              mock.patch("tgbot.bot.drain_running", return_value=False):
             self._fill_required_slots()
             bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+
+    # ---- the batch (spec section 5's basket, built 2026-09-01) -------------
+    #
+    # "chúng ta đang muốn chạy theo batch tạo 1 lượt nhiều video ... tận dụng
+    # tối đa thời gian thuê gpu tránh chờ gpu khởi động tốn thời gian chờ và
+    # tiền trong lúc chờ nữa". Provisioning is paid once per drain, not once
+    # per job.
+
+    def _add_second_job(self):
+        """Complete one job, add it, then swap the outfit for a real second."""
+        self._fill_required_slots()
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._CB_ADD), allowed_user_id=ME)
+            other = self.root / "outfit2.jpg"
+            other.write_bytes(b"o2")
+            self.tg.file_paths["outfit2-id"] = str(other)
+            with mock.patch("tgbot.bot.probe", return_value=self.image_probe):
+                bot.handle(self.tg, doc_from(ME, "outfit2-id"), allowed_user_id=ME)
+                bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME)
+
+    def test_add_keeps_every_slot_so_only_one_thing_need_change(self):
+        """The user's answer when asked what varies between runs: "không cố
+        định — giữ hết, tôi tự thay"."""
+        self._fill_required_slots()
+        before = dict(bot._STATE[ME].slots)
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._CB_ADD), allowed_user_id=ME)
+        self.assertEqual(len(bot._BASKET[ME]), 1)
+        self.assertEqual(bot._STATE[ME].slots, before)
+        self.assertEqual(bot._STATE[ME].pipeline, bot._BASKET[ME][0].pipeline)
+
+    def test_the_basket_entry_is_detached_from_the_job_still_being_edited(self):
+        """Job holds plain dicts. Appending the live object would let a later
+        edit silently rewrite an entry already committed to the batch."""
+        self._fill_required_slots()
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._CB_ADD), allowed_user_id=ME)
+        bot._STATE[ME].slots["outfit"] = Path("/somewhere/else.png")
+        self.assertNotEqual(bot._BASKET[ME][0].slots["outfit"],
+                            Path("/somewhere/else.png"))
+
+    def test_an_unchanged_duplicate_is_not_queued_twice(self):
+        """Straight after Add the job on screen IS the entry just added.
+        Running both would render one video twice and bill for both."""
+        self._fill_required_slots()
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._CB_ADD), allowed_user_id=ME)
+        self.assertEqual(len(bot._jobs_for(ME)), 1)
+        # And it says so rather than quietly dropping it.
+        self.assertIn("same as an entry above", panel_text(self.tg))
+
+    def test_adding_the_same_job_twice_is_refused(self):
+        self._fill_required_slots()
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._CB_ADD), allowed_user_id=ME)
+            bot.handle(self.tg, cb_from(ME, bot._CB_ADD), allowed_user_id=ME)
+        self.assertEqual(len(bot._BASKET[ME]), 1)
+        self.assertIn("already in the batch", self.tg.messages[-1])
+
+    def test_changing_one_file_makes_it_a_real_second_job(self):
+        self._add_second_job()
+        self.assertEqual(len(bot._jobs_for(ME)), 2)
+
+    def test_confirm_submits_every_job_in_one_manifest(self):
+        """The whole point: one pod, N runs, provisioning paid once."""
+        import yaml
+        self._add_second_job()
+        with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+            start_drain.assert_called_once()
+        data = yaml.safe_load(bot._job_manifest_path(ME).read_text(encoding="utf-8"))
+        self.assertEqual(len(data["runs"]), 2)
+        self.assertNotEqual(data["runs"][0]["inputs"]["outfit"],
+                            data["runs"][1]["inputs"]["outfit"])
+        self.assertNotIn(ME, bot._BASKET)
+
+    def test_the_progress_stage_list_is_the_union_across_pipelines(self):
+        """A batch may mix pipelines. Counting against one of them would give
+        the wrong denominator for every run of the other."""
+        self._fill_required_slots()
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._CB_ADD), allowed_user_id=ME)
+            bot.handle(self.tg, cmd_from(ME, "/pipeline tryon-character-swap-enhance"),
+                       allowed_user_id=ME)
+        with mock.patch("tgbot.bot.start_drain"), \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+        stages = json.loads(bot._progress_path(ME).read_text())["stages"]
+        for stage in ("tryon", "motion", "enhance", "character-swap"):
+            self.assertIn(stage, stages)
+
+    def test_the_basket_survives_a_restart(self):
+        self._add_second_job()
+        for holder in (bot._STATE, bot._PENDING, bot._BASKET, bot._PANEL,
+                       bot._LOADED):
+            holder.clear()
+        self.assertIsNone(bot._load_draft(ME))
+        self.assertEqual(len(bot._BASKET[ME]), 1)
+        self.assertEqual(len(bot._jobs_for(ME)), 2)
+
+    def test_clear_empties_the_batch_too(self):
+        """/clear deletes the staged files every queued job points at."""
+        self._add_second_job()
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._CB_CLEAR_GO), allowed_user_id=ME)
+        self.assertNotIn(ME, bot._BASKET)
+        self.assertEqual(bot._jobs_for(ME), [])
+
+    def test_again_restores_the_whole_batch_not_just_the_last_run(self):
+        self._add_second_job()
+        with mock.patch("tgbot.bot.start_drain"), \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+            bot.handle(self.tg, cmd_from(ME, "/again"), allowed_user_id=ME)
+        self.assertEqual(len(bot._jobs_for(ME)), 2)
+
+    def test_the_estimate_covers_every_queued_job(self):
+        self._fill_required_slots()
+        one = bot._panel_next_line(ME, bot._STATE[ME])
+        self._add_second_job()
+        two = bot._panel_next_line(ME, bot._STATE[ME])
+        self.assertIn("2 job(s)", two)
+        self.assertNotEqual(one, two, "the estimate did not grow with the batch")
+
+    def test_tryon_finds_every_run_not_a_hardcoded_one(self):
+        """Manifests used to have exactly one run called "job", so the id was a
+        constant here. A batch names each run after its material, and a /tryon
+        still looking for `runs/job/` would answer "no try-on image found" for
+        every batch the bot now produces."""
+        batch = self.root / "out" / "2026-09-01-1200"
+        for run_id in ("c1-o4-m1", "c1-o8-m1"):
+            (batch / "runs" / run_id).mkdir(parents=True)
+            (batch / "runs" / run_id / "01-tryon.png").write_bytes(b"p")
+        bot.handle(self.tg, cmd_from(ME, "/tryon 2026-09-01-1200"), allowed_user_id=ME)
+        sent = [c for _, c in self.tg.documents]
+        self.assertEqual(len(sent), 2)
+        self.assertTrue(any("c1-o4-m1" in c for c in sent))
+        self.assertTrue(any("c1-o8-m1" in c for c in sent))
+
+    def test_a_big_batch_lists_its_runs_instead_of_sending_all_of_them(self):
+        batch = self.root / "out" / "2026-09-01-1300"
+        for i in range(bot.TRYON_MAX_SENT + 1):
+            (batch / "runs" / f"run{i}").mkdir(parents=True)
+            (batch / "runs" / f"run{i}" / "01-tryon.png").write_bytes(b"p")
+        bot.handle(self.tg, cmd_from(ME, "/tryon 2026-09-01-1300"), allowed_user_id=ME)
+        self.assertEqual(self.tg.documents, [])
+        self.assertIn("name one", self.tg.messages[-1])
+
+    def test_one_run_can_be_asked_for_by_name(self):
+        batch = self.root / "out" / "2026-09-01-1400"
+        for run_id in ("c1-o4-m1", "c1-o8-m1"):
+            (batch / "runs" / run_id).mkdir(parents=True)
+            (batch / "runs" / run_id / "01-tryon.png").write_bytes(b"p")
+        bot.handle(self.tg, cmd_from(ME, "/tryon 2026-09-01-1400/c1-o8-m1"),
+                   allowed_user_id=ME)
+        self.assertEqual(len(self.tg.documents), 1)
+        self.assertIn("c1-o8-m1", self.tg.documents[0][1])
+
+    def test_a_run_name_cannot_escape_the_batch_directory(self):
+        batch = self.root / "out" / "2026-09-01-1500"
+        (batch / "runs" / "ok").mkdir(parents=True)
+        (batch / "runs" / "ok" / "01-tryon.png").write_bytes(b"p")
+        bot.handle(self.tg, cmd_from(ME, "/tryon 2026-09-01-1500/../../.."),
+                   allowed_user_id=ME)
+        self.assertEqual(self.tg.documents, [])
 
     def test_confirm_records_a_progress_message_to_keep_editing(self):
         self._confirm_and_start()
