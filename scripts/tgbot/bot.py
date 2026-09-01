@@ -1060,6 +1060,17 @@ def _answer_slot(tg: Tg, chat_id: int, role: str) -> None:
 # has ⏳ ✅ ❌ 🎬), but a sticker message cannot be edited, so it can never
 # carry state. Motion in this bot comes from re-editing text; see run._SPIN.
 ROLE_ICON = {"character": "👤", "outfit": "👗", "driver": "🎬", "background": "🖼"}
+
+# One square per job, in the same order as preview.ROW_ACCENTS and the same
+# colours. Nothing can be written onto the contact sheet — `drawtext` is not
+# compiled into the ffmpeg this runs against — so colour is the only legend
+# that reads in the picture and in the text at once: the bar down the left of
+# row 2 is the square printed beside entry 2 here.
+ROW_MARK = ["🟦", "🟧", "🟩", "🟪", "🟥", "🟨"]
+
+
+def _row_mark(index: int) -> str:
+    return ROW_MARK[index % len(ROW_MARK)]
 ICON_OK = "✅"
 ICON_WARN = "⚠️"
 ICON_EMPTY = "⬜"
@@ -1226,12 +1237,18 @@ def _panel_text(chat_id: int, job: Job) -> str:
         # one pod, N videos. Each line names the material so a wrong entry is
         # visible without opening anything.
         lines += [""]
-        for index, other in enumerate(basket, 1):
+        for index, other in enumerate(basket):
             names = " · ".join(f"{ROLE_ICON.get(r, '')}{_esc(Path(other.slots[r]).stem)}"
                                for r in sorted(other.slots))
-            lines.append(f"<code>{index}.</code> {names}")
+            lines.append(f"{_row_mark(index)} {names}")
             if other.pipeline != job.pipeline:
                 lines.append(f"    <i>{_esc(other.pipeline)}</i>")
+        queued_now = _jobs_for(chat_id)
+        if len(queued_now) > len(basket):
+            # The job being edited is the LAST row of the sheet, so it gets the
+            # next square. Without this the picture has one more coloured bar
+            # than the list has squares, and the mapping silently breaks.
+            lines.append(f"{_row_mark(len(basket))} <i>this one</i>")
     lines += ["", _panel_next_line(chat_id, job)]
 
     if basket and _STATE.get(chat_id) is not None and not missing_slots(job) \

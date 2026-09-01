@@ -109,7 +109,26 @@ def slot_preview(src: Path, *, is_video: bool, into: Path | None = None) -> Path
 
 # The contact sheet. Every number below was chosen by the user from variants
 # rendered on their own phone (2026-09-01) — none of it is taste asserted here.
-TILE_W, TILE_H = 186, 248     # one slot; uniform, so columns line up
+TILE_W, TILE_H = 190, 250     # one slot; uniform, so columns line up
+
+# Tiles are CROPPED to fill, not letterboxed onto a blurred copy of themselves.
+# Both were rendered side by side on the user's phone and this one was chosen:
+# twelve blur-filled cells read as twelve smudges, while a cropped grid is
+# crisp to every edge. The trade is real and was made knowingly — a crop can
+# remove the hem or the shoes, which is sometimes the very thing that tells two
+# outfits apart. It is accepted here because the sheet is a glance across jobs;
+# the slot question, where the whole point is identifying ONE file, keeps the
+# full frame and its blurred fill for exactly that reason.
+#
+# Biased upward: a standing figure keeps its head rather than its shoes.
+TILE_CROP_BIAS = 0.30
+
+# One per job row. Chosen to match the coloured squares the panel puts beside
+# each entry — the caption cannot number the rows (no drawtext, see `sheet`),
+# so colour is the only legend that works in both places at once.
+ROW_ACCENTS = ["0x5b9dd9", "0xd9a05b", "0x77c47f",
+               "0x9b8ad9", "0xd97a7a", "0xd9cf5b"]
+ACCENT_BAR_W = 6
 TILE_RADIUS = 14
 CARD_RADIUS = 20
 COL_GAP, ROW_GAP, CARD_PAD = 8, 14, 12
@@ -157,11 +176,8 @@ def _tile(src: Path | None, dst: Path, *, is_video: bool) -> Path | None:
         return _ffmpeg(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
                         f"color=c={EMPTY_BG}:s={TILE_W}x{TILE_H}",
                         "-frames:v", "1", "-vf", vf, str(dst)], dst)
-    fill = ("split=2[a][b];"
-            f"[a]scale={TILE_W}:{TILE_H}:force_original_aspect_ratio=increase,"
-            f"crop={TILE_W}:{TILE_H},gblur=sigma=22[bg];"
-            f"[b]scale={TILE_W}:{TILE_H}:force_original_aspect_ratio=decrease[fg];"
-            "[bg][fg]overlay=(W-w)/2:(H-h)/2,"
+    fill = (f"scale={TILE_W}:{TILE_H}:force_original_aspect_ratio=increase,"
+            f"crop={TILE_W}:{TILE_H}:(iw-{TILE_W})/2:(ih-{TILE_H})*{TILE_CROP_BIAS},"
             f"drawbox=x=0:y=0:w={TILE_W}:h={TILE_H}:color={TILE_RIM}:t=1,"
             + _rounded(TILE_RADIUS))
     for seek in ([str(VIDEO_SEEK_SEC), "0"] if is_video else [None]):
@@ -217,7 +233,8 @@ def sheet(rows: list[list[tuple[Path, bool] | None]], *,
                 return None
             tiles.append(made)
 
-    width = columns * TILE_W + (columns + 1) * COL_GAP + 2 * CARD_PAD
+    lead = ACCENT_BAR_W + 10
+    width = lead + columns * TILE_W + (columns + 1) * COL_GAP + 2 * CARD_PAD
     card_h = TILE_H + 2 * CARD_PAD
     height = len(rows) * card_h + (len(rows) + 1) * ROW_GAP
     card = _panel(into / "card.png", width, card_h, CARD_BG, CARD_RADIUS)
@@ -236,11 +253,19 @@ def sheet(rows: list[list[tuple[Path, bool] | None]], *,
         prev = f"k{r}"
     for index in range(len(tiles)):
         r, c = divmod(index, columns)
-        x = COL_GAP + CARD_PAD + c * (TILE_W + COL_GAP)
+        x = lead + COL_GAP + CARD_PAD + c * (TILE_W + COL_GAP)
         y = ROW_GAP + CARD_PAD + r * (card_h + ROW_GAP)
         graph.append(f"[{prev}][1:v]overlay={x + 2}:{y + 3}[s{index}]")
         graph.append(f"[s{index}][{2 + index}:v]overlay={x}:{y}[o{index}]")
         prev = f"o{index}"
+    # One coloured bar per job, matching the square the panel prints beside
+    # that job. Nothing can be written on the image, so this is the only
+    # legend that reads in the picture and in the text at the same time.
+    bars = [f"drawbox=x={CARD_PAD}:y={ROW_GAP + r * (card_h + ROW_GAP) + CARD_PAD}:"
+            f"w={ACCENT_BAR_W}:h={TILE_H}:"
+            f"color={ROW_ACCENTS[r % len(ROW_ACCENTS)]}@0.95:t=fill"
+            for r in range(len(rows))]
+    graph.append(f"[{prev}]" + ",".join(bars) + "[sheet]")
     dst = into / "sheet.jpg"
-    return _ffmpeg(argv + ["-filter_complex", ";".join(graph), "-map", f"[{prev}]",
+    return _ffmpeg(argv + ["-filter_complex", ";".join(graph), "-map", "[sheet]",
                            "-frames:v", "1", "-q:v", "4", str(dst)], dst)

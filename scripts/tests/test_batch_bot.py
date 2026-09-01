@@ -1673,6 +1673,30 @@ class TestFlow(unittest.TestCase):
         self.assertNotIn("s ·", bot._compact(self.image_probe))
         self.assertNotIn("0.0s", bot._compact(self.image_probe))
 
+    def test_every_sheet_row_has_a_matching_square_in_the_panel(self):
+        """Nothing can be written onto the sheet, so colour is the whole legend.
+
+        The bar down the left of row 2 has to be the square printed beside
+        entry 2 in the text. If the picture grows a row the list does not, the
+        mapping breaks silently — and it is the mapping that lets someone say
+        "job 3 is wrong" before spending.
+        """
+        self._add_second_job()
+        text = panel_text(self.tg)
+        rows = len(bot._jobs_for(ME))
+        self.assertEqual(rows, 2)
+        for index in range(rows):
+            self.assertIn(bot._row_mark(index), text,
+                          f"row {index + 1} has no square in the panel")
+        self.assertNotIn(bot._row_mark(rows), text, "one square too many")
+
+    def test_the_squares_and_the_bars_are_the_same_sequence(self):
+        from tgbot import preview
+        self.assertGreaterEqual(len(bot.ROW_MARK), len(preview.ROW_ACCENTS))
+        # Both cycle, so a seventh job reuses the first colour in both places
+        # rather than one wrapping while the other runs off the end.
+        self.assertEqual(bot._row_mark(len(bot.ROW_MARK)), bot.ROW_MARK[0])
+
     def test_confirm_records_a_progress_message_to_keep_editing(self):
         self._confirm_and_start()
         self.assertTrue(bot._progress_path(ME).exists())
@@ -2445,7 +2469,9 @@ class TestPreviewBuilder(unittest.TestCase):
         out = preview.sheet(rows, into=self.tmp / "out5")
         self.assertIsNotNone(out)
         width, height = _dimensions(out)
-        self.assertEqual(width, 3 * preview.TILE_W + 4 * preview.COL_GAP
+        # The lead gutter holds the coloured bar that identifies the row.
+        self.assertEqual(width, preview.ACCENT_BAR_W + 10
+                         + 3 * preview.TILE_W + 4 * preview.COL_GAP
                          + 2 * preview.CARD_PAD)
         self.assertEqual(height, 2 * (preview.TILE_H + 2 * preview.CARD_PAD)
                          + 3 * preview.ROW_GAP)

@@ -374,9 +374,22 @@ candidates rendered on their own phone:
 Every dimension in it was picked by the user from variants rendered on their
 phone, over five rounds. What each one is for:
 
-- **Uniform tiles, blur-filled.** Portraits and video frames have different
-  aspect ratios, so cells of natural width left the columns ragged. Every tile
-  is now 186×248 and the columns line up.
+- **Uniform tiles, cropped to fill.** Portraits and video frames have different
+  aspect ratios, so cells of natural width left the columns ragged; every tile
+  is now 190×250. Cropping rather than letterboxing onto a blurred copy was
+  chosen after seeing both side by side — twelve blur-filled cells read as
+  twelve smudges. The trade was made knowingly: a crop can remove the hem or
+  the shoes, which is sometimes exactly what tells two outfits apart. It is
+  accepted because the sheet is a glance ACROSS jobs, while the slot question —
+  where the point is identifying one file — keeps the full frame and its
+  blurred fill for that same reason. The crop is biased upward so a standing
+  figure keeps its head rather than its shoes.
+- **A coloured bar down the left of each row**, matching a coloured square
+  printed beside that job in the panel text. Since nothing can be written onto
+  the image, colour is the only legend that reads in the picture and in the
+  text at once — 🟦 is row one in both. Seven-segment digits drawn with
+  `drawbox` were built and rejected: they work and cost nothing, but next to
+  photographs they look like a calculator.
 - **A rounded card per job, and a row gap wider than the column gap.** With even
   gaps the eye reads twelve separate pictures; with these it reads three jobs of
   four slots, which is what the sheet is for.
