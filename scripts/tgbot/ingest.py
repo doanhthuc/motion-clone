@@ -260,12 +260,12 @@ def quality_warning_html(p: Probe) -> str:
     exact figures stay one tap away in the panel's collapsed block, and in
     `quality_warning` for the logs.
 
-    "your call" rather than "it will still run": this threshold is a heuristic
-    from one person's 64 files and it never blocks, so the sentence should say
-    whose decision it is rather than merely report that the software is not
-    stopping them. On 2026-08-31 the user kept a flagged driver deliberately
-    after being shown the number, which is the outcome the design exists to
-    allow.
+    "still runs" is the user's own choice (2026-09-01), after "your call" was
+    tried and rejected. Both say the same thing about the threshold — it is a
+    heuristic from one person's 64 files and it never blocks — and the shorter
+    one is the one that ships. On 2026-08-31 the user kept a flagged driver
+    deliberately after being shown the number, which is the outcome the design
+    exists to allow.
     """
     per_mpx = _per_megapixel(p)
     if per_mpx is None or per_mpx >= LOW_BITRATE_KBPS_PER_MPX:
@@ -275,6 +275,6 @@ def quality_warning_html(p: Probe) -> str:
         # 0 through faithfully. A ratio against 0 is infinity, which would
         # render as "inf x below" — so say the true thing instead: nothing was
         # measured, which is itself worth knowing before spending.
-        return "<b>no bitrate reported</b> — cannot check this file · your call"
+        return "<b>no bitrate reported</b> — cannot check this file · still runs"
     return (f"bitrate <b>{REAL_DRIVER_LOW_PER_MPX / per_mpx:.1f}x below</b> the "
-            f"lowest real driver here · your call")
+            f"lowest real driver here · still runs")

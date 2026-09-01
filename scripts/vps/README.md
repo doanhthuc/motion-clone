@@ -181,7 +181,7 @@ between two per-megapixel numbers, where the units cancel and the mistake
 cannot be expressed:
 
 ```
-⚠️ driver — bitrate 3.4x below the lowest real driver here · your call
+⚠️ driver — bitrate 3.4x below the lowest real driver here · still runs
 ```
 
 A laid-out table was built first and rejected as too long: four of its six
@@ -189,11 +189,11 @@ lines either restated `describe()`, which sits directly beside it, or explained
 a unit. The exact figures are not lost — `quality_warning` keeps every one of
 them for the logs, and the panel's collapsed block carries that sentence.
 
-"your call", not "it will still run": the threshold is a heuristic from one
-person's 64 files and it never blocks, so the line should say whose decision it
-is rather than report that the software is not stopping them. The user kept a
-flagged driver deliberately on 2026-08-31 after being shown the number, which
-is the outcome the design exists to allow.
+"still runs" is the user's own wording, picked after "your call" was tried
+(2026-09-01). Either way the point is that this threshold is a heuristic from
+one person's 64 files and never blocks — the user kept a flagged driver
+deliberately on 2026-08-31 after being shown the number, which is the outcome
+the design exists to allow.
 
 Two functions, one judgment: `quality_warning` (plain, every figure, for logs
 and non-HTML callers) and `quality_warning_html` (returns markup — callers must
