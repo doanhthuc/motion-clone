@@ -11,6 +11,23 @@ from tgbot.ingest import Probe
 ME = 12345
 
 
+def setUpModule():
+    """Silence bot.log for the suite.
+
+    _show_panel logs one line per redraw — deliberate, since a panel that
+    failed to appear on the user's phone (2026-09-01) left no trace to read
+    afterwards. Useful on the VPS, pure noise here, and noise in test output is
+    how a real failure gets scrolled past.
+    """
+    global _QUIET
+    _QUIET = mock.patch("tgbot.bot.log")
+    _QUIET.start()
+
+
+def tearDownModule():
+    _QUIET.stop()
+
+
 _MESSAGE_IDS = itertools.count(1)
 
 
@@ -92,7 +109,7 @@ def reset_bot_state():
     """
     for name in ("_STATE", "_LOADED", "_PENDING", "_LAST_VALIDATE",
                  "_CONFIRM_WARNED", "_PANEL", "_PANEL_NOTE", "_LAST_SEEN",
-                 "_FRAME", "_ANIM_PAUSE"):
+                 "_FRAME", "_ANIM_PAUSE", "_ALBUM_KEY", "_FIDELITY"):
         # getattr, not bot._STATE etc: a name that disappears from bot.py
         # should fail here loudly rather than be silently skipped.
         getattr(bot, name).clear()
@@ -106,6 +123,10 @@ class FakeTg:
     def __init__(self):
         self.messages: list[str] = []
         self.documents: list[tuple] = []
+        # Previews: one image with the slot question, and the album shown once
+        # a job is ready to spend on.
+        self.photos: list[tuple] = []
+        self.albums: list[list] = []
         self.file_paths: dict[str, str] = {}   # file_id -> local path, set by the test
         # Buttons are recorded per message, so a test can assert what was
         # offered as well as what was said. `answered` records every
@@ -136,6 +157,10 @@ class FakeTg:
         self.edit_ok = True
         # Set to a TgError to make the next edit raise, as a 429 does.
         self.edit_raises = None
+        # Same, for a rejected preview upload — Telegram refuses images over
+        # 10MB and images whose sides are too lopsided, neither of which the
+        # bot can know before trying.
+        self.photo_raises = None
 
     # The tags bot.py actually uses. Anything outside this set is either a
     # typo or unescaped user text, and Telegram rejects the whole message for
@@ -219,6 +244,21 @@ class FakeTg:
 
     def send_document(self, chat_id, path, caption=""):
         self.documents.append((path, caption))
+
+    def send_photo(self, chat_id, path, *, caption="", buttons=None,
+                   parse_mode=None):
+        if self.photo_raises is not None:
+            raise self.photo_raises
+        self._check_markup(caption, parse_mode)
+        self.photos.append((path, caption))
+        self.screen.append(caption)
+        self.buttons.append(buttons)
+        self.parse_modes.append(parse_mode)
+
+    def send_media_group(self, chat_id, items, *, parse_mode=None):
+        for _, caption in items:
+            self._check_markup(caption, parse_mode)
+        self.albums.append(list(items))
 
     def call(self, method, **params):
         if method == "getFile":
@@ -768,6 +808,14 @@ class TestFlow(unittest.TestCase):
                                   bitrate_kbps=3000, size_bytes=1_500_000)
         self.image_probe = Probe(kind="image", width=1024, height=1024, duration_s=0.0,
                                  bitrate_kbps=0, size_bytes=800_000)
+        # No previews by default. The fixtures are 1-byte files, so a real
+        # `make` shells out to ffmpeg, fails, and returns None anyway — it just
+        # costs a process per ambiguous image (17s across the suite when this
+        # was left live). Preview BEHAVIOUR is asserted in TestPreviews, where
+        # `make` is patched to return a real file.
+        self._no_preview = mock.patch("tgbot.bot.make", return_value=None)
+        self._no_preview.start()
+        self.addCleanup(self._no_preview.stop)
 
     def tearDown(self):
         bot.ROOT = self._orig_root
@@ -907,13 +955,24 @@ class TestFlow(unittest.TestCase):
                          touched)
         self.assertNotEqual(bot._PANEL.get(ME), frozen_id)
 
-    def test_clear_deletes_the_panel_rather_than_leaving_it_stale(self):
+    def test_clear_replaces_the_panel_in_place_rather_than_leaving_a_hole(self):
+        """Deleting it left only the loose messages around it — the debris the
+        panel exists to prevent, and the state the user photographed and
+        reported as the panel never having appeared (2026-09-01)."""
         self._send_driver()
         first = bot._PANEL[ME]
         with mock.patch("tgbot.bot.drain_running", return_value=False):
             bot.handle(self.tg, cb_from(ME, bot._CB_CLEAR_GO), allowed_user_id=ME)
-        self.assertIn(first, self.tg.deleted)
+        self.assertNotIn(first, self.tg.deleted)
+        cleared = [t for mid, t in self.tg.edits if mid == first and "Cleared" in t]
+        self.assertEqual(len(cleared), 1, "the panel was not replaced in place")
         self.assertNotIn(ME, bot._PANEL)
+
+    def test_clear_still_says_so_when_there_is_no_panel_to_replace(self):
+        bot._STATE[ME] = bot._job_for(ME)
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._CB_CLEAR_GO), allowed_user_id=ME)
+        self.assertIn("Cleared", self.tg.messages[-1])
 
     def test_the_panel_id_survives_a_restart(self):
         """motion-bot.service is Restart=always. A bot that came back without
@@ -1238,7 +1297,10 @@ class TestFlow(unittest.TestCase):
         self.assertNotIn(ME, bot._STATE)
         self.assertFalse(self.staged("driver.mp4").exists())
         self.assertFalse(bot._draft_path(ME).exists())
-        self.assertIn("cleared", self.tg.messages[-1])
+        # `screen`, not `messages`: the confirmation now REPLACES the panel
+        # rather than being posted underneath it.
+        self.assertTrue(any("Cleared" in t for t in self.tg.screen),
+                        "nothing in the chat said the job was cleared")
 
     def test_clear_is_refused_while_a_drain_is_running(self):
         """The staged files ARE the running job's inputs.
@@ -1862,6 +1924,171 @@ class TestSafeNameFoldsDiacritics(unittest.TestCase):
             self.assertNotIn("/", out)
             self.assertNotIn("\\", out)
             self.assertNotIn("..", out)
+
+
+class TestPreviews(unittest.TestCase):
+    """Pictures, added 2026-09-01 on the user's objection.
+
+    *"hỏi xác nhận thì không có preview ảnh hay video đó để trực quan cho người
+    dùng mà gửi một loạt text khó hiểu"* — and they were right. It is a direct
+    consequence of the File rule: everything arrives as a Document so the bytes
+    survive, and a Document renders as a filename, so the bot was asking "Which
+    slot is this?" about an image nobody could see and offering to spend
+    $0.99/hour on a list of resolutions.
+    """
+
+    def setUp(self):
+        self._orig_root = bot.ROOT
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "batch").mkdir()
+        bot.ROOT = self.root
+        reset_bot_state()
+        self.tg = FakeTg()
+        # A stand-in for what ffmpeg would have written. Its CONTENT never
+        # matters here — every assertion is about whether a picture was offered
+        # and what it was captioned, which is the part that was missing.
+        self.shot = self.root / "preview.jpg"
+        self.shot.write_bytes(b"\xff\xd8\xff")
+        self.img = Probe(kind="image", width=1536, height=2720, duration_s=0.0,
+                         bitrate_kbps=0, size_bytes=4_873_992)
+        self.vid = Probe(kind="video", width=1080, height=1920, duration_s=15.0,
+                         bitrate_kbps=865, size_bytes=1_622_500)
+
+    def tearDown(self):
+        bot.ROOT = self._orig_root
+        reset_bot_state()
+
+    def _ready_job(self):
+        job = bot._job_for(ME)
+        job.pipeline = "character-swap-enhance"
+        job.slots.update({"character": Path("c.png"), "driver": Path("d.mp4")})
+        job.probes.update({"character": self.img, "driver": self.vid})
+        bot._LAST_VALIDATE[ME] = True
+        return job
+
+    def test_the_slot_question_carries_the_picture_and_the_same_buttons(self):
+        with mock.patch("tgbot.bot.make", return_value=self.shot):
+            bot._ask_about(self.tg, ME, self.img, "tryon-motion-enhance",
+                           path=Path("c.png"))
+        self.assertEqual(len(self.tg.photos), 1)
+        self.assertEqual(self.tg.messages, [])          # not asked twice
+        self.assertIn("Which slot is this?", self.tg.photos[0][1])
+        offered = self.tg.callback_data()
+        for role in ("character", "outfit", "background"):
+            self.assertIn(bot._CB_SLOT + role, offered)
+
+    def test_no_preview_still_asks_the_question(self):
+        """A courtesy must never be able to swallow the question itself."""
+        with mock.patch("tgbot.bot.make", return_value=None):
+            bot._ask_about(self.tg, ME, self.img, "tryon-motion-enhance",
+                           path=Path("c.png"))
+        self.assertEqual(self.tg.photos, [])
+        self.assertIn("Which slot is this?", self.tg.messages[-1])
+        self.assertIn(bot._CB_SLOT + "character", self.tg.callback_data())
+
+    def test_a_failed_upload_falls_back_to_the_text_question(self):
+        from tgbot.tgclient import TgError
+        self.tg.photo_raises = TgError("Bad Request: image is too big")
+        with mock.patch("tgbot.bot.make", return_value=self.shot):
+            bot._ask_about(self.tg, ME, self.img, "tryon-motion-enhance",
+                           path=Path("c.png"))
+        self.assertIn("Which slot is this?", self.tg.messages[-1])
+        self.assertIn(bot._CB_SLOT + "character", self.tg.callback_data())
+
+    def test_the_album_shows_every_slot_once_the_job_is_ready(self):
+        job = self._ready_job()
+        with mock.patch("tgbot.bot.make", return_value=self.shot):
+            self.assertTrue(bot._maybe_send_album(self.tg, ME, job))
+        self.assertEqual(len(self.tg.albums), 1)
+        captions = "\n".join(c for _, c in self.tg.albums[0])
+        self.assertIn("character", captions)
+        self.assertIn("driver", captions)
+        # The warning travels with the picture it is about: a low-bitrate
+        # driver is the thing a preview is most likely to make obvious.
+        self.assertIn("low bitrate", captions)
+
+    def test_the_album_is_not_resent_for_material_that_has_not_changed(self):
+        """The panel is re-edited on every change; an album per edit would
+        rebuild the wall of messages the panel exists to remove."""
+        job = self._ready_job()
+        with mock.patch("tgbot.bot.make", return_value=self.shot):
+            self.assertTrue(bot._maybe_send_album(self.tg, ME, job))
+            self.assertFalse(bot._maybe_send_album(self.tg, ME, job))
+            self.assertFalse(bot._maybe_send_album(self.tg, ME, job))
+        self.assertEqual(len(self.tg.albums), 1)
+
+    def test_replacing_a_file_sends_a_fresh_album(self):
+        job = self._ready_job()
+        with mock.patch("tgbot.bot.make", return_value=self.shot):
+            bot._maybe_send_album(self.tg, ME, job)
+            job.slots["character"] = Path("c2.png")
+            self.assertTrue(bot._maybe_send_album(self.tg, ME, job))
+        self.assertEqual(len(self.tg.albums), 2)
+
+    def test_nothing_is_shown_before_the_manifest_has_validated(self):
+        """Pictures say "this is what will run". Showing them next to a
+        manifest that cannot run says the wrong thing."""
+        job = self._ready_job()
+        bot._LAST_VALIDATE[ME] = False
+        with mock.patch("tgbot.bot.make", return_value=self.shot):
+            self.assertFalse(bot._maybe_send_album(self.tg, ME, job))
+        bot._LAST_VALIDATE.pop(ME)
+        with mock.patch("tgbot.bot.make", return_value=self.shot):
+            self.assertFalse(bot._maybe_send_album(self.tg, ME, job))
+        self.assertEqual(self.tg.albums, [])
+
+    def test_an_incomplete_job_shows_nothing(self):
+        job = bot._job_for(ME)
+        job.pipeline = "character-swap-enhance"
+        job.slots["character"] = Path("c.png")
+        bot._LAST_VALIDATE[ME] = True
+        with mock.patch("tgbot.bot.make", return_value=self.shot):
+            self.assertFalse(bot._maybe_send_album(self.tg, ME, job))
+
+
+class TestPreviewBuilder(unittest.TestCase):
+    """`preview.make` against real ffmpeg on a real file.
+
+    Generated rather than taken from `out/`: that directory is gitignored
+    personal media, so a test reading it passes here and fails on any clean
+    checkout.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp())
+        cls.video = cls.tmp / "clip.mp4"
+        made = subprocess.run(
+            ["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+             "-i", "testsrc=duration=3:size=320x240:rate=10",
+             "-pix_fmt", "yuv420p", str(cls.video)],
+            capture_output=True)
+        if made.returncode != 0 or not cls.video.exists():
+            raise unittest.SkipTest("ffmpeg unavailable")
+
+    def test_a_video_yields_a_jpeg(self):
+        from tgbot import preview
+        shot = preview.make(self.video, is_video=True, into=self.tmp / "out")
+        self.assertIsNotNone(shot)
+        self.assertGreater(shot.stat().st_size, 0)
+        self.assertEqual(shot.suffix, ".jpg")
+
+    def test_a_clip_shorter_than_the_seek_still_yields_a_frame(self):
+        """The 1s seek is a preference, not a requirement — a 0.4s driver has
+        no frame there, and `make` must fall back rather than give up."""
+        from tgbot import preview
+        short = self.tmp / "short.mp4"
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+                        "-i", "testsrc=duration=0.4:size=160x120:rate=10",
+                        "-pix_fmt", "yuv420p", str(short)], capture_output=True)
+        shot = preview.make(short, is_video=True, into=self.tmp / "out2")
+        self.assertIsNotNone(shot, "no frame recovered from a sub-second clip")
+
+    def test_a_file_ffmpeg_cannot_read_returns_none_rather_than_raising(self):
+        from tgbot import preview
+        junk = self.tmp / "junk.png"
+        junk.write_bytes(b"not an image")
+        self.assertIsNone(preview.make(junk, is_video=False, into=self.tmp / "out3"))
 
 
 class TestNoDuplicateDefinitions(unittest.TestCase):

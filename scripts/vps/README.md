@@ -233,11 +233,61 @@ Four rules hold it together:
   job. The key is read with `.get()`, so a draft written by an older bot still
   loads rather than being set aside as corrupt.
 
-The one-line acknowledgement that each step used to send ("replaced the previous
-outfit — o.png") now lives on the panel as an italic note. The fidelity line
-(bytes in == bytes out) stays a real message: it is evidence about one file at
-the moment it arrived, and acceptance A6 compares it against the delivered
-digest, so it must not be overwritten by the next upload.
+**Assembling a job now produces no loose messages at all.** The one-line
+acknowledgement each step used to send ("replaced the previous outfit — o.png")
+is an italic note on the panel, and the arrival digest — byte count and sha256,
+the evidence acceptance A6 compares against the delivered file — moved into the
+collapsed detail block. Three lines of hex scattered through the flow were the
+first thing the user pointed at, and the block is the better home anyway: it is
+inside what `_freeze_panel` preserves, so the digests are still in the
+transcript at the moment money is committed rather than scrolled past.
+
+A three-file job is now: the panel (edited in place), one question per ambiguous
+image *with the picture attached*, and one album when it is ready to run.
+
+### Previews — why the bot has to build its own
+
+The File rule (§4.1) keeps the bytes intact and costs the user every picture:
+a Document renders as a filename and a size, so the bot was asking *"Which slot
+is this?"* about an image nobody could see, and offering to spend $0.99/hour on
+a list of resolutions. The user's words on seeing it, 2026-09-01: *"hỏi xác nhận
+thì không có preview ảnh hay video đó để trực quan cho người dùng mà gửi một
+loạt text khó hiểu"*.
+
+The obvious fix does not work. Measured the same day:
+
+| attempt | result |
+|---|---|
+| `sendPhoto(photo=<document file_id>)` | **`can't use file of type Document as Photo`** |
+| `sendMediaGroup` with `type: photo` and a document file_id | same rejection |
+| `sendDocument(document=<file_id>)` | works — but renders as a file row again |
+| fresh upload of a downscaled JPEG | works, and is what the bot does |
+
+So a preview costs one small upload. `tgbot/preview.py` writes a 512px JPEG with
+ffmpeg — 0.03–0.05s and 19–35 KB per slot, an album of two in 0.50s, small
+enough to sit in the synchronous poll loop. For a video it takes the frame at
+**1s**, not 0: a driver's first frame is routinely black or the subject not yet
+in position, which answers nothing. A sub-second clip has no frame there, so
+`make()` retries at 0 before giving up.
+
+Two rules:
+
+- **A preview is a courtesy and may never block anything.** `make()` returns
+  `None` rather than raising, a failed upload falls back to the text question,
+  and a failed album is logged and skipped. The measurements the bot *decides*
+  on come from `ingest.probe`, which does raise, and which has already run.
+- **Never the staged original, always a re-encoded copy.** The preview is for
+  looking at; the job runs on the untouched bytes. Previews live in
+  `batch/tg-preview/<chat>/`, deliberately not under `tg-staging/`, because
+  `/clear` counts staged files to report how many it deleted and that number is
+  one the user checks against what they sent.
+
+The album is sent **once per distinct set of material**, when the job is complete
+*and* `make batch-validate` has passed — pictures say "this is what will run",
+and showing them beside a manifest that cannot run says the wrong thing. It
+carries no keyboard: `sendMediaGroup` accepted a `reply_markup` without
+complaint when probed, which is not the same as honouring it, so the buttons
+stay on the panel below where they are verified to work.
 
 ### Presentation
 

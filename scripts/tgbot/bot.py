@@ -40,6 +40,7 @@ from tgbot.tgclient import Tg, TgError
 from tgbot.ingest import (Probe, describe, probe, quality_warning,
                          to_png_if_heic)
 from tgbot.job import Job, missing_slots, slot_for, write_manifest
+from tgbot.preview import make
 from tgbot.run import (drain_running, estimate_minutes, final_files, lease_for,
                        progress_text, start_drain, summary_text)
 
@@ -565,7 +566,8 @@ def _askable_roles(pipeline: str) -> list[str]:
     return sorted((required_roles(pipeline) | optional_roles(pipeline)) - {"driver"})
 
 
-def _ask_about(tg: Tg, chat_id: int, p: Probe, pipeline: str, extra: str = "") -> None:
+def _ask_about(tg: Tg, chat_id: int, p: Probe, pipeline: str,
+               path: Path | None = None) -> None:
     """Ask which slot a parked, ambiguous file belongs to.
 
     One button per askable role (2026-08-31). Typing "character" on a phone is
@@ -582,12 +584,27 @@ def _ask_about(tg: Tg, chat_id: int, p: Probe, pipeline: str, extra: str = "") -
     labels = [(f"{ROLE_ICON.get(r, '')} {r}" + (f" {ICON_OK}" if r in filled else ""),
                _CB_SLOT + r) for r in roles]
     rows = [labels[i:i + 2] for i in range(0, len(labels), 2)]
-    body = f"{describe(p)}\n{extra}" if extra else describe(p)
-    tg.send_message(chat_id, f"{body}\nWhich slot is this?", buttons=rows)
+    question = f"{describe(p)}\nWhich slot is this?"
+
+    # With the picture, when there is one (2026-09-01). This question used to
+    # be asked about an image the user could not see — the File rule that keeps
+    # the bytes intact also means nothing is ever shown back, so the whole
+    # prompt was "image 1536x2720, 4.9 MB / Which slot is this?" and the only
+    # way to answer was to remember the upload order.
+    shot = make(path, is_video=False, into=_preview_dir(chat_id)) if path else None
+    if shot is not None:
+        try:
+            tg.send_photo(chat_id, shot, caption=question, buttons=rows)
+            return
+        except TgError as exc:
+            # Fall through to text. A preview is a courtesy and must never be
+            # able to swallow the question itself.
+            log(f"preview upload failed, asking without it: {exc}")
+    tg.send_message(chat_id, question, buttons=rows)
 
 
-def _fill_slot(tg: Tg, chat_id: int, job: Job, role: str, path: Path, p: Probe,
-               extra: str = "") -> None:
+def _fill_slot(tg: Tg, chat_id: int, job: Job, role: str, path: Path,
+               p: Probe) -> None:
     """Put a file in a slot and say so — including when it displaces one.
 
     The one acknowledgement path for every fill (findings I6/I7,
@@ -611,12 +628,6 @@ def _fill_slot(tg: Tg, chat_id: int, job: Job, role: str, path: Path, p: Probe,
     job.probes[role] = p
     verb = f"replaced the previous {role}" if replacing else f"added {role}"
     _PANEL_NOTE[chat_id] = f"{verb} — {path.name}"
-    if extra:
-        # The fidelity line (bytes in == bytes out) is evidence about THIS
-        # file at the moment it arrived, and acceptance A6 compares it against
-        # the delivered digest — so it stays a real message rather than a note
-        # that the next upload overwrites.
-        tg.send_message(chat_id, f"{role}: {describe(p)}\n{extra}")
 
 
 def _render_and_validate(tg: Tg, chat_id: int, job: Job) -> bool:
@@ -762,6 +773,10 @@ def _save_draft(chat_id: int) -> None:
         "panel": _PANEL.get(chat_id),
         "note": _PANEL_NOTE.get(chat_id),
         "last_seen": _LAST_SEEN.get(chat_id),
+        # Acceptance A6 evidence. Recomputable from the staged file, but only
+        # while it is still there — and the digest is what proves the file on
+        # disk IS the one that arrived, which a later re-hash cannot.
+        "fidelity": _FIDELITY.get(chat_id),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
@@ -815,6 +830,9 @@ def _load_draft(chat_id: int) -> str | None:
     last_seen = payload.get("last_seen")
     if last_seen is not None:
         _LAST_SEEN[chat_id] = int(last_seen)
+    fidelity = payload.get("fidelity")
+    if fidelity:
+        _FIDELITY[chat_id] = {str(k): str(v) for k, v in fidelity.items()}
     return None
 
 
@@ -1007,8 +1025,8 @@ def _answer_slot(tg: Tg, chat_id: int, role: str) -> None:
     if queue:
         # The next file was already queued (it arrived before this answer) —
         # ask about it now rather than waiting for another document.
-        _, next_p = queue[0]
-        _ask_about(tg, chat_id, next_p, job.pipeline)
+        next_path, next_p = queue[0]
+        _ask_about(tg, chat_id, next_p, job.pipeline, path=next_path)
 
 
 
@@ -1082,6 +1100,15 @@ def _details_block(chat_id: int, job: Job) -> str:
             continue
         lines += ["", f"<b>{_esc(role)}</b> · {_esc(job.slots[role].name)}",
                   _esc(describe(pr))]
+        # Acceptance A6 compares what arrived against the delivered file, so
+        # the arrival digest has to be in the transcript at the moment money is
+        # committed. It used to be its own message per upload — three loose
+        # lines of hex in the middle of the flow, and the first thing the user
+        # called "một loạt text khó hiểu" (2026-09-01). Here it is one tap away
+        # and, unlike a message, it is inside what _freeze_panel preserves.
+        fidelity = (_FIDELITY.get(chat_id) or {}).get(str(job.slots[role]))
+        if fidelity:
+            lines.append(_esc(fidelity))
         warning = quality_warning(pr)
         if warning:
             lines.append(f"{ICON_WARN} {_esc(warning)}")
@@ -1203,6 +1230,77 @@ def _panel_buttons(chat_id: int, job: Job) -> list[list[tuple[str, str]]]:
     return rows + _fix_buttons(job)
 
 
+def _preview_dir(chat_id: int) -> Path:
+    """Throwaway JPEGs, deliberately NOT under the staging dir.
+
+    `_clear_job` counts `staged.rglob("*")` to tell the user how many files it
+    deleted, and previews living there would inflate a number the user checks
+    against what they sent. Both directories are removed on /clear.
+    """
+    return ROOT / "batch" / "tg-preview" / str(chat_id)
+
+
+# Byte count and sha256 of each accepted file, keyed by chat then by staged
+# path. Recorded when the file ARRIVES rather than when it lands in a slot,
+# because an ambiguous image is queued first and answered later — keying it on
+# the role would lose the digest of anything that waited.
+_FIDELITY: dict[int, dict[str, str]] = {}
+
+
+# The material an album was last sent for. Keyed on the slot->path mapping, so
+# replacing one file sends a fresh album and re-uploading the same job does not.
+_ALBUM_KEY: dict[int, tuple] = {}
+
+
+def _material_key(job: Job) -> tuple:
+    return tuple(sorted((r, str(pth)) for r, pth in job.slots.items()))
+
+
+def _maybe_send_album(tg: Tg, chat_id: int, job: Job) -> bool:
+    """Show the material itself once the job is ready to spend on.
+
+    The user's objection, 2026-09-01: *"hỏi xác nhận thì không có preview ảnh
+    hay video đó để trực quan cho người dùng mà gửi một loạt text khó hiểu"*.
+    They were right, and it was a direct consequence of §4.1 — everything
+    arrives as a Document so the bytes survive, and a Document renders as a
+    filename. The confirmation screen therefore described $0.99/hour of
+    material entirely in resolutions and byte counts.
+
+    Sent once per distinct set of material, not on every redraw: the panel is
+    re-edited on every change, and an album per edit would rebuild the wall of
+    messages the panel exists to remove.
+    """
+    if missing_slots(job) or _LAST_VALIDATE.get(chat_id) is not True:
+        return False
+    key = _material_key(job)
+    if _ALBUM_KEY.get(chat_id) == key:
+        return False
+
+    items: list[tuple[Path, str]] = []
+    for role in sorted(job.slots):
+        pr = job.probes.get(role)
+        shot = make(job.slots[role], is_video=bool(pr and pr.kind == "video"),
+                    into=_preview_dir(chat_id))
+        if shot is None:
+            continue
+        warning = quality_warning(pr) if pr else ""
+        caption = (f"{ROLE_ICON.get(role, '')} <b>{_esc(role)}</b>"
+                   + (f" · {_compact(pr)}" if pr else "")
+                   + (f"\n{ICON_WARN} {_esc(warning)}" if warning else ""))
+        items.append((shot, caption))
+    if not items:
+        return False
+    try:
+        tg.send_media_group(chat_id, items, parse_mode=PARSE_HTML)
+    except TgError as exc:
+        # Never fatal. The panel below carries the same facts in text, and a
+        # failed courtesy must not block a job the user has assembled.
+        log(f"preview album failed, continuing without it: {exc}")
+        return False
+    _ALBUM_KEY[chat_id] = key
+    return True
+
+
 def _show_panel(tg: Tg, chat_id: int, *, note: str = "",
                 bump: bool = False) -> None:
     """Render the panel: edit it in place, or move it back to the bottom.
@@ -1217,12 +1315,24 @@ def _show_panel(tg: Tg, chat_id: int, *, note: str = "",
         return
     if note:
         _PANEL_NOTE[chat_id] = note
+    # Before the panel is drawn, so the pictures land ABOVE it and the Run
+    # button stays the last thing on screen.
+    sent_album = _maybe_send_album(tg, chat_id, job)
     text = _panel_text(chat_id, job)
     buttons = _panel_buttons(chat_id, job)
 
     message_id = _PANEL.get(chat_id)
-    drifted = bump or (message_id is not None
-                       and _LAST_SEEN.get(chat_id, 0) - message_id > _PANEL_DRIFT_MAX)
+    drifted = bump or sent_album or (
+        message_id is not None
+        and _LAST_SEEN.get(chat_id, 0) - message_id > _PANEL_DRIFT_MAX)
+    # Logged because the panel failed to appear once on the user's phone
+    # (2026-09-01) and the state that would have explained it — pipeline, panel
+    # id, how far it had drifted — was in memory and gone by the time it was
+    # reported. One line per redraw is cheap; a second unexplained disappearance
+    # is not.
+    log(f"panel chat={chat_id} pipeline={job.pipeline} slots={sorted(job.slots)} "
+        f"id={message_id} last_seen={_LAST_SEEN.get(chat_id)} "
+        f"drifted={drifted} album={sent_album}")
     if message_id is not None and not drifted:
         if tg.edit_message(chat_id, message_id, text, buttons=buttons,
                            parse_mode=PARSE_HTML):
@@ -1436,7 +1546,7 @@ def _redo_slot(tg: Tg, chat_id: int, role: str) -> None:
     # one to ask about, ahead of anything already parked.
     _PENDING.setdefault(chat_id, []).insert(0, (path, pr))
     _show_panel(tg, chat_id, note=f"took {path.name} out of {role}")
-    _ask_about(tg, chat_id, pr, job.pipeline)
+    _ask_about(tg, chat_id, pr, job.pipeline, path=path)
 
 
 def _ask_to_clear(tg: Tg, chat_id: int) -> None:
@@ -1469,18 +1579,32 @@ def _clear_job(tg: Tg, chat_id: int) -> None:
     if staged.exists():
         removed = sum(1 for f in staged.rglob("*") if f.is_file())
         shutil.rmtree(staged, ignore_errors=True)
+    # Not counted in `removed`: previews are the bot's own throwaways, and the
+    # number reported is the one the user checks against what they sent.
+    shutil.rmtree(_preview_dir(chat_id), ignore_errors=True)
     _STATE.pop(chat_id, None)
     _PENDING.pop(chat_id, None)
     _LAST_VALIDATE.pop(chat_id, None)
     _CONFIRM_WARNED.discard(chat_id)
-    # Deleted rather than frozen: /clear means the job never happened, and a
+    _ALBUM_KEY.pop(chat_id, None)
+    _FIDELITY.pop(chat_id, None)
+    # Replaced in place rather than deleted: /clear means the job never happened, and a
     # panel left behind describing files that are no longer on disk is the
     # stalest thing in the chat. Nothing spent, so nothing to keep a record of.
-    _drop_panel(tg, chat_id)
     # handle()'s finally calls _save_draft, which deletes the draft file itself
     # now that there is no state left to write.
-    tg.send_message(chat_id, f"🗑 cleared — {removed} staged file(s) deleted. "
-                             "Send a file to start again.")
+    done = (f"🗑 <b>Cleared.</b> {removed} staged file(s) deleted.\n"
+            "Send a file as a <b>File</b> to start again.")
+    message_id = _PANEL.pop(chat_id, None)
+    _PANEL_NOTE.pop(chat_id, None)
+    # Replaced in place, not deleted (2026-09-01). Deleting it left the chat
+    # holding only the loose messages around it, which is exactly the debris
+    # the panel exists to prevent — and the user photographed that state and
+    # reported it as the panel never having appeared. One line where the panel
+    # was reads as "this is finished"; a hole reads as a bug.
+    if message_id is None or not tg.edit_message(chat_id, message_id, done,
+                                                 parse_mode=PARSE_HTML):
+        tg.send_message(chat_id, done, parse_mode=PARSE_HTML)
 
 
 def _again(tg: Tg, chat_id: int) -> None:
@@ -1633,6 +1757,8 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
     _STATE.pop(chat_id, None)
     _LAST_VALIDATE.pop(chat_id, None)
     _CONFIRM_WARNED.discard(chat_id)
+    _ALBUM_KEY.pop(chat_id, None)
+    _FIDELITY.pop(chat_id, None)
     if dropped:
         tg.send_message(chat_id, f"running without {dropped} unassigned file(s)")
     tg.send_message(chat_id, "🚀 <b>Started.</b> Renting a GPU pod at "
@@ -1712,6 +1838,7 @@ def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
             # exactly the silence finding I1 existed to remove.
             # Acceptance A6 compares this against the delivered file's digest.
             fidelity = _fidelity_line(path)
+            _FIDELITY.setdefault(chat_id, {})[str(path)] = fidelity
         except (RuntimeError, TgError, KeyError, OSError) as exc:
             # ffprobe raises rather than guessing (ingest.probe's own
             # contract) — the file never enters a job, so it can never
@@ -1735,20 +1862,20 @@ def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
             # The panel carries the "waiting for a label" line, so it has to
             # move for a queued file too — otherwise the one screen the user
             # reads goes stale precisely when the state got more complicated.
-            _show_panel(tg, chat_id)
             if len(queue) == 1:
-                _ask_about(tg, chat_id, p, job.pipeline, extra=fidelity)
+                _show_panel(tg, chat_id)
+                _ask_about(tg, chat_id, p, job.pipeline, path=path)
             else:
-                # Still show describe() — the quality gate must stay visible
-                # for every accepted file, not just the one currently asked
-                # about — but don't ask again yet: only the head is asked.
-                tg.send_message(chat_id,
-                                f"{describe(p)}\n{fidelity}\nqueued — answer the "
-                                "previous question first")
+                # Only the head is ever asked about, so a second image gets
+                # acknowledged on the panel instead of in a message of its own
+                # — the panel already lists everything waiting for a label, and
+                # a duplicate line per queued file is the wall this replaced.
+                _show_panel(tg, chat_id,
+                            note=f"queued {path.name} — answer the question above first")
             return
 
         # A video: structural, always `driver` — no question needed.
-        _fill_slot(tg, chat_id, job, role, path, p, extra=fidelity)
+        _fill_slot(tg, chat_id, job, role, path, p)
         _maybe_show_manifest(tg, chat_id, job)
         return
 

@@ -194,6 +194,99 @@ class Tg:
         except TgError:
             pass
 
+    def _multipart(self, method: str, fields: dict, files: list[tuple[str, Path, str]],
+                   *, timeout: int = 120) -> dict:
+        """POST one multipart request. `files` is [(field_name, path, mime)].
+
+        Factored out when previews arrived (2026-09-01): sendDocument,
+        sendPhoto and sendMediaGroup all need a hand-built body, and three
+        copies of boundary handling is three places for a missing `\\r\\n` to
+        make Telegram reject a body it cannot explain.
+        """
+        boundary = uuid.uuid4().hex
+        body = bytearray()
+        for key, value in fields.items():
+            body += (f"--{boundary}\r\n"
+                     f'content-disposition: form-data; name="{key}"\r\n\r\n'
+                     f"{value}\r\n").encode()
+        for name, path, mime in files:
+            body += (f"--{boundary}\r\n"
+                     f'content-disposition: form-data; name="{name}"; '
+                     f'filename="{path.name}"\r\n'
+                     f"content-type: {mime}\r\n\r\n").encode()
+            body += path.read_bytes() + b"\r\n"
+        body += f"--{boundary}--\r\n".encode()
+        try:
+            req = urllib.request.Request(
+                self._url(method), data=bytes(body),
+                headers={"content-type": f"multipart/form-data; boundary={boundary}"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read()
+        except urllib.error.HTTPError as exc:
+            with exc:
+                raw = exc.read()        # Telegram's JSON error body lives here
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            raise TgError(self._scrub(f"{method} failed: {exc!r}")) from exc
+        try:
+            result = json.loads(raw)
+        except ValueError as exc:
+            raise TgError(self._scrub(f"{method} returned non-JSON: {raw[:200]!r}")) from exc
+        if not result.get("ok"):
+            raise TgError(self._scrub(f"{method} rejected: "
+                                      f"{result.get('description', result)}"))
+        return result.get("result")
+
+    def send_photo(self, chat_id: int, path: Path, *, caption: str = "",
+                   buttons: list[list[tuple[str, str]]] | None = None,
+                   parse_mode: str | None = None) -> None:
+        """Upload one image so the user can SEE it, with the question attached.
+
+        A fresh upload, never a stored file_id: measured 2026-09-01 that a
+        file_id belonging to a Document cannot be re-sent as a Photo
+        ("can't use file of type Document as Photo"), and every file this bot
+        receives arrives as a Document by design (§4.1). So a preview costs one
+        upload of a downscaled copy — which is also why the copy is downscaled
+        and never the staged original: this image is for looking at, and the
+        job still runs on the untouched bytes.
+        """
+        fields = {"chat_id": str(chat_id)}
+        if caption:
+            fields["caption"] = caption
+        if parse_mode:
+            fields["parse_mode"] = parse_mode
+        if buttons:
+            fields["reply_markup"] = json.dumps(self.keyboard(buttons))
+        self._multipart("sendPhoto", fields, [("photo", path, "image/jpeg")])
+
+    def send_media_group(self, chat_id: int, items: list[tuple[Path, str]], *,
+                         parse_mode: str | None = None) -> None:
+        """One album of uploaded images — `items` is [(path, caption)].
+
+        An album, not N separate sends: the whole point is that the material
+        for one job reads as one thing. The Bot API caps a group at 10, which
+        no pipeline in this repo can reach (4 roles).
+
+        No `buttons` parameter, deliberately. `sendMediaGroup` accepted a
+        `reply_markup` without complaint when probed on 2026-09-01, which is
+        not the same as honouring it — the documented shape has no such field.
+        The keyboard belongs on the panel that follows, where it is verified to
+        work, rather than on an album where it might silently vanish.
+        """
+        media = []
+        files = []
+        for i, (path, caption) in enumerate(items):
+            entry = {"type": "photo", "media": f"attach://f{i}"}
+            if caption:
+                entry["caption"] = caption
+                if parse_mode:
+                    entry["parse_mode"] = parse_mode
+            media.append(entry)
+            files.append((f"f{i}", path, "image/jpeg"))
+        self._multipart("sendMediaGroup",
+                        {"chat_id": str(chat_id),
+                         "media": json.dumps(media, ensure_ascii=False)},
+                        files)
+
     def send_document(self, chat_id: int, path: Path, caption: str = "") -> None:
         """sendDocument, never sendVideo.
 

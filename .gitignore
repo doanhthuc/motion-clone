@@ -52,3 +52,8 @@ scripts/vps/bot-api.env
 # (bot.py:STAGING_DIR_NAME). Personal media, and the paths it replaces contain
 # the bot token — neither belongs in a public repo.
 batch/tg-staging/
+
+# Downscaled JPEGs the bot builds so a slot question can be answered by eye
+# (tgbot/preview.py). Throwaways, but they are still the user's own photographs
+# and this repo is public.
+batch/tg-preview/
