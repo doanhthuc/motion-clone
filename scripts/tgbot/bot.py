@@ -38,6 +38,7 @@ from drain import failed_job_ids
 # the path, which is what makes the absolute form work from either entry point.
 from tgbot.tgclient import Tg, TgError
 from tgbot.ingest import (Probe, describe, probe, quality_warning,
+                         quality_warning_html,
                          to_png_if_heic)
 from tgbot.job import Job, missing_slots, slot_for, write_manifest
 from tgbot.preview import slot_preview, strip
@@ -1110,6 +1111,11 @@ def _details_block(chat_id: int, job: Job) -> str:
         fidelity = (_FIDELITY.get(chat_id) or {}).get(str(job.slots[role]))
         if fidelity:
             lines.append(_esc(fidelity))
+        # The PLAIN form inside the block, while the panel shows the laid-out
+        # one outside it. Not a technical limit — measured 2026-09-01 that
+        # <pre> nests inside <blockquote expandable> without complaint — but
+        # the same table twice on one screen is noise, and this copy exists so
+        # the reason survives when the collapsed block is read on its own.
         warning = quality_warning(pr)
         if warning:
             lines.append(f"{ICON_WARN} {_esc(warning)}")
@@ -1201,9 +1207,10 @@ def _panel_text(chat_id: int, job: Job) -> str:
     # that needs a tap to reveal is something that gets skipped.
     for role in sorted(job.slots):
         pr = job.probes.get(role)
-        warning = quality_warning(pr) if pr else ""
+        # _html, and NOT passed through _esc: it returns markup on purpose.
+        warning = quality_warning_html(pr) if pr else ""
         if warning:
-            lines += ["", f"{ICON_WARN} <b>{_esc(role)}</b>: {_esc(warning)}"]
+            lines += ["", f"{ICON_WARN} <b>{_esc(role)}</b> — {warning}"]
 
     note = _PANEL_NOTE.get(chat_id)
     if note:
@@ -1300,7 +1307,7 @@ def _maybe_send_album(tg: Tg, chat_id: int, job: Job) -> bool:
     # built in — nothing is drawn onto the image itself (see preview.strip), so
     # this line is the only thing that says which panel is which.
     names = " · ".join(f"{ROLE_ICON.get(r, '')} <b>{_esc(r)}</b>" for r in roles)
-    warnings = [f"{ICON_WARN} <b>{_esc(r)}</b>: {_esc(quality_warning(job.probes[r]))}"
+    warnings = [f"{ICON_WARN} <b>{_esc(r)}</b> — {quality_warning_html(job.probes[r])}"
                 for r in roles
                 if job.probes.get(r) and quality_warning(job.probes[r])]
     caption = "\n".join([names, *warnings])

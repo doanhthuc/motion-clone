@@ -157,25 +157,49 @@ started" — which is true, but useless in the state `/status` is most often ask
 
 ### The low-bitrate warning
 
-`ingest.quality_warning` flags a video whose bitrate is too low to be original material, in kbps
-per megapixel so resolutions are comparable. It never blocks.
+`ingest.quality_warning` judges an arriving video against
+`LOW_BITRATE_KBPS_PER_MPX = 1000`, chosen from a survey of all 64 videos on the
+user's machine (2026-08-31). It never blocks — it is a heuristic from one
+person's files, and on the day it was written the user kept a flagged driver
+deliberately, which is the outcome the design should allow.
 
-The threshold, 1000, comes from measuring all 64 videos on this machine on 2026-08-31:
+**Every figure in that survey is kbps PER MEGAPIXEL**, and getting that wrong
+is the interesting part. The message used to read:
 
-| kbps/Mpx | file | |
-|---|---|---|
-| 417 | `IMG_6783.MP4` | sent as a File, so Telegram preserved it exactly — it was already a re-compressed copy before it was sent |
-| 1397 | `s1.mp4` | the **lowest legitimate driver** in the set |
-| 3227 | — | median of the 64 |
-| 8421 | `nhanvat3__dandong8.mp4` | highest |
+> low bitrate for 1080x1920: 865 kbps (417 per megapixel). Real drivers here
+> measure 1400-8400; this looks like an already-compressed copy.
 
-1000 sits between the two that matter: 1.4x below the lowest real driver, 2.4x above the known-bad
-one. A first attempt at 1500 was rejected by this same survey because it flags `s1.mp4`, and a
-warning that cries wolf on real material gets ignored on the file that matters.
+Correct numbers, wrong claim: `865` is raw kbps, `1400-8400` is per megapixel,
+and putting them one clause apart invites exactly the comparison that means
+nothing. The honest comparison is **417 against 1400-8400**. This surfaced only
+when the user asked for the warning to be laid out more clearly (2026-09-01) —
+aligning the figures into columns would have made it worse, because alignment
+is itself a claim that two numbers are comparable.
 
-This closes a gap spec section 4.3 left open. "Measure on arrival, do not trust the channel" was
-implemented as far as `describe()` — the numbers were shown, and nothing judged them. The File rule
-guarantees Telegram did no damage; it cannot guarantee the bytes were good before they were sent.
+So `quality_warning_html` states the unit once, as a heading over both rows, and
+keeps the raw figure below as context rather than as a comparison:
+
+```
+⚠️ driver — low bitrate
+    bitrate per megapixel
+      this file        417
+      normal     1400-8400
+    865 kbps at 1080x1920 · probably an already-compressed
+    copy · it will still run
+```
+
+Two functions, one judgment: `quality_warning` (plain, for logs and non-HTML
+callers) and `quality_warning_html` (returns markup — callers must **not**
+escape it). Both derive from `_per_megapixel`, and a test asserts they can never
+disagree about whether a file is bad, because one saying "fine" while the other
+says "compressed" is worse than either message alone. Further tests pin the raw
+kbps figure *out* of the aligned block and check that the quoted range still
+brackets the threshold it explains.
+
+The laid-out form appears on the panel and on the strip caption; the collapsed
+detail block keeps the plain sentence. Not a technical limit — `<pre>` nests
+inside `<blockquote expandable>` without complaint, measured 2026-09-01 — but
+the same table twice on one screen is noise.
 
 ### The control panel
 

@@ -199,25 +199,72 @@ def to_png_if_heic(path: Path) -> Path:
 LOW_BITRATE_KBPS_PER_MPX = 1000
 
 
+# The survey figures above, as they are shown to the user. Named rather than
+# inlined so the message can never drift from the threshold it explains.
+REAL_DRIVER_LOW_PER_MPX = 1400      # s1.mp4, the lowest legitimate driver
+REAL_DRIVER_HIGH_PER_MPX = 8400     # nhanvat3__dandong8, the highest
+
+
+def _per_megapixel(p: Probe) -> float | None:
+    """kbps per megapixel, or None when the check does not apply.
+
+    The whole judgment lives here so the two renderings below cannot disagree
+    about whether a file is bad, or by how much.
+    """
+    if p.kind != "video" or p.width <= 0 or p.height <= 0:
+        return None
+    mpx = p.width * p.height / 1_000_000
+    if not mpx:
+        return None
+    return p.bitrate_kbps / mpx
+
+
 def quality_warning(p: Probe) -> str:
     """A note when a video's bitrate is too low to be original material.
 
-    Empty string when nothing is wrong, so callers can concatenate it.
+    Empty string when nothing is wrong, so callers can concatenate it. Plain
+    text: this is the form for logs and for any caller not sending HTML.
+    `quality_warning_html` is what the bot shows.
 
     Why this exists: spec section 4.3 is "measure on arrival, do not trust the
     channel", and describe() did the measuring — but nothing judged the result.
     On 2026-08-31 a driver arrived at 865 kbps for 1080x1920, 15x below the
     file it was standing in for, and the bot printed the number and accepted it
-    without comment. The File rule guarantees Telegram did not damage the bytes;
-    it cannot guarantee the bytes were good before they were sent.
+    without comment. The File rule guarantees Telegram did not damage the
+    bytes; it cannot guarantee the bytes were good before they were sent.
     """
-    if p.kind != "video" or p.width <= 0 or p.height <= 0:
+    per_mpx = _per_megapixel(p)
+    if per_mpx is None or per_mpx >= LOW_BITRATE_KBPS_PER_MPX:
         return ""
-    mpx = p.width * p.height / 1_000_000
-    per_mpx = p.bitrate_kbps / mpx if mpx else 0
-    if per_mpx >= LOW_BITRATE_KBPS_PER_MPX:
+    return (f"low bitrate: {per_mpx:.0f} per megapixel, where real drivers here "
+            f"measure {REAL_DRIVER_LOW_PER_MPX}-{REAL_DRIVER_HIGH_PER_MPX} "
+            f"({p.bitrate_kbps} kbps at {p.width}x{p.height}). Probably an "
+            f"already-compressed copy. It will still run.")
+
+
+def quality_warning_html(p: Probe) -> str:
+    """The same judgment, laid out so the two numbers can be compared.
+
+    Returns HTML — the caller must NOT escape it — or an empty string.
+
+    The layout was chosen by the user from four candidates rendered on their
+    own phone (2026-09-01). Building it exposed a real defect in the sentence
+    it replaces: that one read "865 kbps (417 per megapixel). Real drivers here
+    measure 1400-8400", placing a RAW kbps figure beside a PER-MEGAPIXEL range,
+    so the comparison a reader naturally makes — 865 against 1400 — is between
+    two different units and means nothing. Every figure in the survey behind
+    LOW_BITRATE_KBPS_PER_MPX is per megapixel. Aligning them into columns would
+    have made that worse rather than better, because alignment is itself a
+    claim that two numbers are comparable. So the unit moved into a heading and
+    only like-for-like figures sit in the table; the raw kbps stays, below, as
+    context rather than as a comparison.
+    """
+    per_mpx = _per_megapixel(p)
+    if per_mpx is None or per_mpx >= LOW_BITRATE_KBPS_PER_MPX:
         return ""
-    return (f"low bitrate for {p.width}x{p.height}: {p.bitrate_kbps} kbps "
-            f"({per_mpx:.0f} per megapixel). Real drivers here measure "
-            f"1400-8400; this looks like an already-compressed copy. It will "
-            f"still run if you want it to.")
+    return (f"low bitrate\n"
+            f"<pre>bitrate per megapixel\n"
+            f"  this file  {per_mpx:>9.0f}\n"
+            f"  normal     {REAL_DRIVER_LOW_PER_MPX}-{REAL_DRIVER_HIGH_PER_MPX}</pre>"
+            f"<i>{p.bitrate_kbps} kbps at {p.width}x{p.height} · probably an "
+            f"already-compressed copy · it will still run</i>")

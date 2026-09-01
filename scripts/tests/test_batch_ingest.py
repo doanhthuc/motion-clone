@@ -7,7 +7,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tgbot.ingest import Probe, describe, probe, suggest_preset, to_png_if_heic
+from tgbot import ingest
+from tgbot.ingest import (Probe, describe, probe, quality_warning,
+                         quality_warning_html, suggest_preset, to_png_if_heic)
 
 
 class TestSuggestPreset(unittest.TestCase):
@@ -128,3 +130,75 @@ class TestToPngIfHeic(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestBitrateWarning(unittest.TestCase):
+    """The judgment, and the units it is stated in.
+
+    Every figure behind LOW_BITRATE_KBPS_PER_MPX is kbps PER MEGAPIXEL — 417
+    for the known-bad file, 1400-8400 for real drivers. The sentence this
+    replaced read "865 kbps (417 per megapixel). Real drivers here measure
+    1400-8400", which puts a raw figure next to a per-megapixel range so the
+    comparison a reader naturally makes, 865 against 1400, is between two
+    different units. Nothing caught it: it is a wrong claim made entirely out
+    of correct numbers.
+    """
+
+    # 865 kbps at 1080x1920 = 2.07 Mpx, so 417 per megapixel: the real file
+    # from 2026-08-31 that the threshold was chosen around.
+    BAD = Probe(kind="video", width=1080, height=1920, duration_s=15.0,
+                bitrate_kbps=865, size_bytes=1_622_500)
+    GOOD = Probe(kind="video", width=1080, height=1920, duration_s=15.0,
+                 bitrate_kbps=7000, size_bytes=13_000_000)
+
+    def _table(self, html):
+        start = html.index("<pre>") + len("<pre>")
+        return html[start:html.index("</pre>", start)]
+
+    def test_the_table_compares_per_megapixel_figures_only(self):
+        table = self._table(quality_warning_html(self.BAD))
+        self.assertIn("417", table)
+        self.assertIn("1400-8400", table)
+        # The raw kbps must NOT sit in the aligned block. Alignment is itself a
+        # claim that the numbers are comparable, and 865 is not comparable to
+        # 1400 — it is the same file measured a different way.
+        self.assertNotIn("865", table,
+                         "a raw kbps figure is aligned against a per-megapixel range")
+
+    def test_the_raw_bitrate_is_still_reported_as_context(self):
+        """Dropping it would lose the number the user recognises from ffprobe."""
+        html = quality_warning_html(self.BAD)
+        self.assertIn("865 kbps", html)
+        self.assertIn("1080x1920", html)
+
+    def test_the_unit_is_stated_once_where_it_governs_both_rows(self):
+        self.assertIn("bitrate per megapixel", self._table(quality_warning_html(self.BAD)))
+
+    def test_both_renderings_agree_on_the_verdict(self):
+        """Two views of one judgment. If they can disagree, one of them is
+        telling the user a file is fine while the other says it is not."""
+        for probe_obj in (self.BAD, self.GOOD,
+                          Probe(kind="image", width=1024, height=1024,
+                                duration_s=0.0, bitrate_kbps=0, size_bytes=1),
+                          Probe(kind="video", width=0, height=0, duration_s=1.0,
+                                bitrate_kbps=100, size_bytes=1)):
+            with self.subTest(probe=probe_obj):
+                self.assertEqual(bool(quality_warning(probe_obj)),
+                                 bool(quality_warning_html(probe_obj)))
+
+    def test_a_healthy_driver_draws_nothing_at_all(self):
+        self.assertEqual(quality_warning(self.GOOD), "")
+        self.assertEqual(quality_warning_html(self.GOOD), "")
+
+    def test_the_quoted_range_is_the_threshold_it_explains(self):
+        """The prose and the constant must not drift apart.
+
+        The survey put the lowest legitimate driver at 1397 and the threshold
+        at 1000, deliberately below it. A message quoting a range that no
+        longer brackets the threshold would be explaining a rule the code does
+        not follow.
+        """
+        self.assertLess(ingest.LOW_BITRATE_KBPS_PER_MPX,
+                        ingest.REAL_DRIVER_LOW_PER_MPX)
+        self.assertLess(ingest.REAL_DRIVER_LOW_PER_MPX,
+                        ingest.REAL_DRIVER_HIGH_PER_MPX)
