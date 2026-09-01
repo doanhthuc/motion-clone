@@ -109,7 +109,8 @@ def reset_bot_state():
     """
     for name in ("_STATE", "_LOADED", "_PENDING", "_LAST_VALIDATE",
                  "_CONFIRM_WARNED", "_PANEL", "_PANEL_NOTE", "_LAST_SEEN",
-                 "_FRAME", "_ANIM_PAUSE", "_ALBUM_KEY", "_FIDELITY"):
+                 "_FRAME", "_ANIM_PAUSE", "_ALBUM_KEY", "_FIDELITY",
+                 "_PANEL_IS_PHOTO", "_STRIP"):
         # getattr, not bot._STATE etc: a name that disappears from bot.py
         # should fail here loudly rather than be silently skipped.
         getattr(bot, name).clear()
@@ -127,6 +128,10 @@ class FakeTg:
         # a job is ready to spend on.
         self.photos: list[tuple] = []
         self.albums: list[list] = []
+        # Caption edits are separate from text edits: editMessageText cannot
+        # touch a photo and editMessageCaption cannot touch text, so mixing
+        # them up is a real failure mode the tests have to be able to see.
+        self.caption_edits: list[tuple] = []
         self.file_paths: dict[str, str] = {}   # file_id -> local path, set by the test
         # Buttons are recorded per message, so a test can assert what was
         # offered as well as what was said. `answered` records every
@@ -254,6 +259,17 @@ class FakeTg:
         self.screen.append(caption)
         self.buttons.append(buttons)
         self.parse_modes.append(parse_mode)
+        # An id, because a photo can BE the panel once the whole thing fits in
+        # a caption — and the bot then keeps editing that message.
+        return next_message_id()
+
+    def edit_message_caption(self, chat_id, message_id, caption, *, buttons=None,
+                             parse_mode=None):
+        self._check_markup(caption, parse_mode)
+        self.caption_edits.append((message_id, caption))
+        self.screen.append(caption)
+        self.edit_buttons.append(buttons)
+        return self.edit_ok
 
     def send_media_group(self, chat_id, items, *, parse_mode=None):
         for _, caption in items:
@@ -1999,78 +2015,155 @@ class TestPreviews(unittest.TestCase):
         self.assertIn("Which slot is this?", self.tg.messages[-1])
         self.assertIn(bot._CB_SLOT + "character", self.tg.callback_data())
 
-    def test_the_strip_names_every_slot_once_the_job_is_ready(self):
-        """One wide image, and its caption is the ONLY thing saying which panel
-        is which — nothing is drawn onto the strip (preview.strip explains why),
-        so the roles must be listed in the order they were stacked."""
+    def test_a_ready_job_is_ONE_message_carrying_the_run_button(self):
+        """The merge the user asked for: "1 lần xác nhận là gửi 2 tin như này
+        luôn à, k gộp lại 1 tin được à".
+
+        It had been ruled out on a bad measurement — the 1024 caption cap
+        applies to the PARSED text, not the raw markup, so counting HTML gave
+        1,060 for three slots and the wrong answer while the visible text is
+        930 with four.
+        """
         job = self._ready_job()
         with mock.patch("tgbot.bot.strip", return_value=self.shot):
-            self.assertTrue(bot._maybe_send_album(self.tg, ME, job))
+            bot._show_panel(self.tg, ME)
         self.assertEqual(len(self.tg.photos), 1)
+        self.assertEqual(self.tg.messages, [], "a second message was sent too")
         caption = self.tg.photos[0][1]
-        self.assertLess(caption.index("character"), caption.index("driver"),
-                        "the caption order does not match sorted(job.slots)")
-        # The warning rides with the picture: a low-bitrate driver is exactly
-        # what a preview is most likely to make obvious.
-        self.assertIn("x below", caption)
+        self.assertIn("character", caption)
+        self.assertIn("ready", caption)
+        self.assertIn(bot._CB_RUN_ASK, self.tg.callback_data())
+        self.assertIn(ME, bot._PANEL_IS_PHOTO)
 
-    def test_the_strip_is_built_from_every_slot_in_caption_order(self):
+    def test_a_redraw_edits_the_caption_rather_than_resending_the_picture(self):
+        job = self._ready_job()
+        with mock.patch("tgbot.bot.strip", return_value=self.shot):
+            bot._show_panel(self.tg, ME)
+            bot._show_panel(self.tg, ME, note="something changed")
+        self.assertEqual(len(self.tg.photos), 1, "the picture was re-uploaded")
+        self.assertEqual(len(self.tg.caption_edits), 1)
+        self.assertIn("something changed", self.tg.caption_edits[0][1])
+        # And never through editMessageText, which cannot touch a photo.
+        self.assertEqual(self.tg.edits, [])
+
+    def test_new_material_replaces_the_message_because_a_photo_cannot_be_swapped(self):
+        job = self._ready_job()
+        with mock.patch("tgbot.bot.strip", return_value=self.shot):
+            bot._show_panel(self.tg, ME)
+            first = bot._PANEL[ME]
+            job.slots["character"] = Path("c2.png")
+            bot._show_panel(self.tg, ME)
+        self.assertEqual(len(self.tg.photos), 2)
+        self.assertIn(first, self.tg.deleted)
+        self.assertNotEqual(bot._PANEL[ME], first)
+
+    def test_a_caption_too_long_to_fit_falls_back_to_two_messages(self):
+        """Filenames come from the user's own files and nothing bounds them.
+        Truncating would drop the arrival digests, so it splits instead."""
+        job = self._ready_job()
+        with mock.patch("tgbot.bot.strip", return_value=self.shot), \
+             mock.patch("tgbot.bot._caption_fits", return_value=False):
+            bot._show_panel(self.tg, ME)
+        self.assertEqual(len(self.tg.photos), 1)     # the strip on its own
+        self.assertEqual(len(self.tg.messages), 1)   # the panel below it
+        self.assertNotIn(ME, bot._PANEL_IS_PHOTO)
+        self.assertIn(bot._CB_RUN_ASK, self.tg.callback_data())
+
+    def test_the_caption_cap_is_measured_on_parsed_text_not_markup(self):
+        """The measurement that reversed the design.
+
+        Counting the raw HTML said a merge was impossible. Telegram counts what
+        is left after the tags are parsed away.
+        """
+        markup = "<b>" + "x" * 1020 + "</b> &lt;&gt;"
+        # 1020 x's, one space, and the two entities as one character each.
+        self.assertEqual(bot._visible_length(markup), 1023)
+        self.assertTrue(bot._caption_fits(markup))
+        self.assertFalse(bot._caption_fits("y" * (bot.CAPTION_LIMIT + 1)))
+
+    def test_freezing_a_merged_panel_edits_the_caption_and_drops_the_button(self):
+        """Getting this wrong leaves Run live on a job already given to a drain."""
+        job = self._ready_job()
+        with mock.patch("tgbot.bot.strip", return_value=self.shot):
+            bot._show_panel(self.tg, ME)
+        bot._freeze_panel(self.tg, ME, "submitted 12:30")
+        self.assertEqual(len(self.tg.caption_edits), 1)
+        self.assertIn("submitted", self.tg.caption_edits[0][1])
+        self.assertIsNone(self.tg.edit_buttons[-1])
+        self.assertEqual(self.tg.edits, [], "editMessageText was used on a photo")
+        self.assertNotIn(ME, bot._PANEL)
+        self.assertNotIn(ME, bot._PANEL_IS_PHOTO)
+
+    def test_the_strip_is_built_from_every_slot_in_panel_order(self):
         job = self._ready_job()
         seen = {}
         def fake_strip(sources, *, into):
             seen["sources"] = list(sources)
             return self.shot
         with mock.patch("tgbot.bot.strip", side_effect=fake_strip):
-            bot._maybe_send_album(self.tg, ME, job)
+            bot._show_panel(self.tg, ME)
         self.assertEqual([p for p, _ in seen["sources"]],
                          [job.slots[r] for r in sorted(job.slots)])
         # The driver is the video, and only it may be seeked as one.
         self.assertEqual([is_vid for _, is_vid in seen["sources"]], [False, True])
 
-    def test_a_strip_that_could_not_be_built_is_skipped_not_fatal(self):
+    def test_the_strip_is_built_once_per_set_of_material(self):
+        """_show_panel runs on every change; three ffmpeg frames per redraw
+        would put a courtesy feature in the way of the poll loop."""
+        job = self._ready_job()
+        calls = []
+        def counting_strip(sources, *, into):
+            calls.append(1)
+            return self.shot
+        with mock.patch("tgbot.bot.strip", side_effect=counting_strip):
+            bot._show_panel(self.tg, ME)
+            bot._show_panel(self.tg, ME, note="a")
+            bot._show_panel(self.tg, ME, note="b")
+        self.assertEqual(len(calls), 1)
+
+    def test_a_strip_that_could_not_be_built_leaves_a_working_text_panel(self):
         job = self._ready_job()
         with mock.patch("tgbot.bot.strip", return_value=None):
-            self.assertFalse(bot._maybe_send_album(self.tg, ME, job))
+            bot._show_panel(self.tg, ME)
         self.assertEqual(self.tg.photos, [])
-        self.assertNotIn(ME, bot._ALBUM_KEY)
+        self.assertEqual(len(self.tg.messages), 1)
+        self.assertIn(bot._CB_RUN_ASK, self.tg.callback_data())
 
-    def test_the_album_is_not_resent_for_material_that_has_not_changed(self):
-        """The panel is re-edited on every change; an album per edit would
-        rebuild the wall of messages the panel exists to remove."""
+    def test_a_rejected_upload_still_leaves_a_panel(self):
+        from tgbot.tgclient import TgError
         job = self._ready_job()
+        self.tg.photo_raises = TgError("Bad Request: image is too big")
         with mock.patch("tgbot.bot.strip", return_value=self.shot):
-            self.assertTrue(bot._maybe_send_album(self.tg, ME, job))
-            self.assertFalse(bot._maybe_send_album(self.tg, ME, job))
-            self.assertFalse(bot._maybe_send_album(self.tg, ME, job))
-        self.assertEqual(len(self.tg.photos), 1)
-
-    def test_replacing_a_file_sends_a_fresh_album(self):
-        job = self._ready_job()
-        with mock.patch("tgbot.bot.strip", return_value=self.shot):
-            bot._maybe_send_album(self.tg, ME, job)
-            job.slots["character"] = Path("c2.png")
-            self.assertTrue(bot._maybe_send_album(self.tg, ME, job))
-        self.assertEqual(len(self.tg.photos), 2)
+            bot._show_panel(self.tg, ME)
+        self.assertEqual(len(self.tg.messages), 1)
+        self.assertNotIn(ME, bot._PANEL_IS_PHOTO)
+        self.assertIn(bot._CB_RUN_ASK, self.tg.callback_data())
 
     def test_nothing_is_shown_before_the_manifest_has_validated(self):
-        """Pictures say "this is what will run". Showing them next to a
+        """Pictures say "this is what will run". Showing them beside a
         manifest that cannot run says the wrong thing."""
         job = self._ready_job()
-        bot._LAST_VALIDATE[ME] = False
-        with mock.patch("tgbot.bot.strip", return_value=self.shot):
-            self.assertFalse(bot._maybe_send_album(self.tg, ME, job))
-        bot._LAST_VALIDATE.pop(ME)
-        with mock.patch("tgbot.bot.strip", return_value=self.shot):
-            self.assertFalse(bot._maybe_send_album(self.tg, ME, job))
-        self.assertEqual(self.tg.photos, [])
+        for verdict in (False, None):
+            with self.subTest(verdict=verdict):
+                self.tg = FakeTg()
+                if verdict is None:
+                    bot._LAST_VALIDATE.pop(ME, None)
+                else:
+                    bot._LAST_VALIDATE[ME] = verdict
+                with mock.patch("tgbot.bot.strip", return_value=self.shot):
+                    bot._show_panel(self.tg, ME)
+                self.assertEqual(self.tg.photos, [])
 
     def test_an_incomplete_job_shows_nothing(self):
         job = bot._job_for(ME)
         job.pipeline = "character-swap-enhance"
         job.slots["character"] = Path("c.png")
+        job.probes["character"] = self.img
         bot._LAST_VALIDATE[ME] = True
         with mock.patch("tgbot.bot.strip", return_value=self.shot):
-            self.assertFalse(bot._maybe_send_album(self.tg, ME, job))
+            bot._show_panel(self.tg, ME)
+        self.assertEqual(self.tg.photos, [])
+        self.assertEqual(len(self.tg.messages), 1)   # the text panel only
 
 
 def _dimensions(path):

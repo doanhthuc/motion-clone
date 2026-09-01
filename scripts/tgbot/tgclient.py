@@ -181,6 +181,32 @@ class Tg:
             raise
         return True
 
+    def edit_message_caption(self, chat_id: int, message_id: int, caption: str, *,
+                             buttons: list[list[tuple[str, str]]] | None = None,
+                             parse_mode: str | None = None) -> bool:
+        """`edit_message` for a message that is a photo. False if it is gone.
+
+        A separate call because editMessageText cannot touch a photo message
+        and editMessageCaption cannot touch a text one — so the caller has to
+        know which kind of panel it is holding. Same contract otherwise,
+        including that omitting `buttons` strips the keyboard, which is how the
+        panel is frozen at /confirm.
+        """
+        try:
+            self.call("editMessageCaption", chat_id=chat_id, message_id=message_id,
+                      caption=caption, parse_mode=parse_mode,
+                      reply_markup=self.keyboard(buttons) if buttons else None)
+        except TgError as exc:
+            reason = str(exc)
+            if "message is not modified" in reason:
+                return True
+            if ("message to edit not found" in reason
+                    or "message can't be edited" in reason
+                    or "MESSAGE_ID_INVALID" in reason):
+                return False
+            raise
+        return True
+
     def delete_message(self, chat_id: int, message_id: int) -> None:
         """Best-effort delete of one of the bot's own messages.
 
@@ -238,7 +264,7 @@ class Tg:
 
     def send_photo(self, chat_id: int, path: Path, *, caption: str = "",
                    buttons: list[list[tuple[str, str]]] | None = None,
-                   parse_mode: str | None = None) -> None:
+                   parse_mode: str | None = None) -> int:
         """Upload one image so the user can SEE it, with the question attached.
 
         A fresh upload, never a stored file_id: measured 2026-09-01 that a
@@ -256,7 +282,12 @@ class Tg:
             fields["parse_mode"] = parse_mode
         if buttons:
             fields["reply_markup"] = json.dumps(self.keyboard(buttons))
-        self._multipart("sendPhoto", fields, [("photo", path, "image/jpeg")])
+        result = self._multipart("sendPhoto", fields,
+                                 [("photo", path, "image/jpeg")])
+        # Returns the id because a photo can BE the control panel: when the
+        # whole panel fits in a caption the bot sends one message instead of a
+        # picture plus a panel, and it then has to keep editing that message.
+        return int(result["message_id"])
 
     def send_media_group(self, chat_id: int, items: list[tuple[Path, str]], *,
                          parse_mode: str | None = None) -> None:

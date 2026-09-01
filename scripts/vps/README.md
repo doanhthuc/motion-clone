@@ -319,12 +319,30 @@ candidates rendered on their own phone:
 | the slot question | one image on a 2:1 canvas, filled with a **blurred copy of itself** (`slot_preview`) | a flat black pad was rejected as waste (*"nền đen thừa nhiều quá"*); a 3:2 or 1:1 crop removes the padding entirely but cannot know whether the hem, the shoes or the face is the part that distinguishes this outfit from the next one |
 | the confirmation | **all slots in ONE wide strip**, side by side (`strip`) | an album of separate photos is a tall grid, and height is the whole problem. The accepted trade is that each picture gets a third of the width |
 
-**The strip is not merged into the panel as a caption**, though a single photo
-can carry one and that would save a bubble. Measured: the panel is **1,060
-characters** with the three required slots filled and **1,164** with four,
-against a caption cap of **1,024**. Merging would mean truncating, and what
-truncates first is the collapsed block holding the arrival digests — the
-evidence acceptance A6 exists to compare against.
+**Once a job is ready, the panel IS the picture.** One message: the strip, the
+whole panel as its caption, and the Run button on it. The user asked for the
+merge on seeing two — *"1 lần xác nhận là gửi 2 tin như này luôn à, k gộp lại 1
+tin được à"* — and the two were visibly redundant, the caption repeating the
+role list and the warning that the panel below restated.
+
+It had been ruled out here on a **bad measurement**, which is worth recording
+because the mistake is easy to repeat: the 1024-character caption cap applies to
+the **parsed text, not the raw markup**. Counting the HTML gave 1,060 characters
+for a three-slot panel and the wrong conclusion; the visible text is **930 with
+four slots**, and Telegram accepts it with the keyboard attached. `_caption_fits`
+now measures the parsed length on every render rather than trusting either
+number — staged filenames are the user's own and nothing bounds them — and a
+panel that does not fit falls back to the two-message shape instead of being
+truncated, because what truncates first is the collapsed block holding the
+arrival digests.
+
+The consequence for the code: a merged panel is a **photo**, and
+`editMessageText` cannot touch a photo while `editMessageCaption` cannot touch
+text. `_PANEL_IS_PHOTO` records which kind is live and is persisted with the
+draft — a restart that forgot it would send the wrong edit, read "message can't
+be edited" as "the user deleted it", and post a second panel below the first.
+Changing the material replaces the message rather than editing it, since a
+photo's image cannot be swapped by an edit.
 
 Nothing is drawn onto the strip. Burning labels in needs a font file whose path
 differs per platform, and a preview that fails on the VPS because DejaVu moved

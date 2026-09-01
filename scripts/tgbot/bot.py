@@ -773,6 +773,7 @@ def _save_draft(chat_id: int) -> None:
         # above it with live buttons — two keyboards for one job, which is how
         # a tap lands on a job that no longer exists.
         "panel": _PANEL.get(chat_id),
+        "panel_is_photo": chat_id in _PANEL_IS_PHOTO,
         "note": _PANEL_NOTE.get(chat_id),
         "last_seen": _LAST_SEEN.get(chat_id),
         # Acceptance A6 evidence. Recomputable from the staged file, but only
@@ -826,6 +827,11 @@ def _load_draft(chat_id: int) -> str | None:
     panel = payload.get("panel")
     if panel is not None:
         _PANEL[chat_id] = int(panel)
+    if payload.get("panel_is_photo"):
+        # Which edit call to use on it. A restart that forgot this would send
+        # editMessageText at a photo, get "message can't be edited", treat the
+        # panel as deleted and post a second one below the first.
+        _PANEL_IS_PHOTO.add(chat_id)
     note = payload.get("note")
     if note:
         _PANEL_NOTE[chat_id] = str(note)
@@ -1255,6 +1261,36 @@ def _preview_dir(chat_id: int) -> Path:
 _FIDELITY: dict[int, dict[str, str]] = {}
 
 
+# Panels that are a PHOTO rather than a text message. A ready job becomes one
+# message — the strip of material with the whole panel as its caption — and
+# editMessageText cannot touch a photo while editMessageCaption cannot touch
+# text, so the bot has to know which kind it is holding.
+_PANEL_IS_PHOTO: set[int] = set()
+
+# The built strip, kept per material set so a redraw does not re-run ffmpeg.
+_STRIP: dict[int, tuple] = {}
+
+# Telegram caps a caption at 1024 characters — of the PARSED text, not the raw
+# HTML. Measured 2026-09-01, and the distinction decided the design: counting
+# the markup gave 1,060 for a three-slot panel and the wrong conclusion that a
+# merge was impossible, when the visible text is 930 with FOUR slots and
+# Telegram accepts it. Names come from the user's own files, so the margin is
+# not guaranteed — _caption_fits is checked every time rather than assumed.
+CAPTION_LIMIT = 1024
+
+
+def _visible_length(markup: str) -> int:
+    """Characters Telegram will count once the HTML has been parsed away."""
+    text = re.sub(r"<[^>]+>", "", markup)
+    for entity, char in (("&lt;", "<"), ("&gt;", ">"), ("&amp;", "&")):
+        text = text.replace(entity, char)
+    return len(text)
+
+
+def _caption_fits(markup: str) -> bool:
+    return _visible_length(markup) <= CAPTION_LIMIT
+
+
 # The material an album was last sent for. Keyed on the slot->path mapping, so
 # replacing one file sends a fresh album and re-uploading the same job does not.
 _ALBUM_KEY: dict[int, tuple] = {}
@@ -1264,70 +1300,65 @@ def _material_key(job: Job) -> tuple:
     return tuple(sorted((r, str(pth)) for r, pth in job.slots.items()))
 
 
-def _maybe_send_album(tg: Tg, chat_id: int, job: Job) -> bool:
-    """Show the material itself once the job is ready to spend on.
+def _strip_for(chat_id: int, job: Job) -> Path | None:
+    """The built strip for this job's material, or None if it is not ready.
 
-    The user's objection, 2026-09-01: *"hỏi xác nhận thì không có preview ảnh
-    hay video đó để trực quan cho người dùng mà gửi một loạt text khó hiểu"*.
-    They were right, and it was a direct consequence of §4.1 — everything
-    arrives as a Document so the bytes survive, and a Document renders as a
-    filename. The confirmation screen therefore described $0.99/hour of
-    material entirely in resolutions and byte counts.
-
-    ONE wide strip, not an album of separate photos. Both were built and shown
-    on the user's phone and they chose the strip: an album of portraits is a
-    tall grid, and height is the whole problem (see preview.py — shrinking the
-    images does nothing, Telegram scales to the bubble width). The trade they
-    accepted is that each picture gets a third of the width.
-
-    The strip is NOT merged into the panel as a caption, though a single photo
-    can carry one. Measured 2026-09-01: the panel is 1,060 characters with the
-    three required slots filled and 1,164 with four, against a caption cap of
-    1,024. Merging would mean truncating, and what truncates first is the
-    collapsed block holding the arrival digests — the evidence acceptance A6
-    exists to compare against.
-
-    Sent once per distinct set of material, not on every redraw: the panel is
-    re-edited on every change, and a picture per edit would rebuild the wall of
-    messages the panel exists to remove.
+    Memoised on the material set: `_show_panel` runs on every change, and
+    rebuilding three ffmpeg frames each time would put a courtesy feature in
+    the way of the poll loop.
     """
     if missing_slots(job) or _LAST_VALIDATE.get(chat_id) is not True:
-        return False
+        return None
     key = _material_key(job)
-    if _ALBUM_KEY.get(chat_id) == key:
-        return False
-
+    cached = _STRIP.get(chat_id)
+    if cached is not None and cached[0] == key and cached[1].exists():
+        return cached[1]
     roles = sorted(job.slots)
-    sources = [(job.slots[r], bool((job.probes.get(r) or None)
-                                   and job.probes[r].kind == "video")) for r in roles]
+    sources = [(job.slots[role],
+                bool(job.probes.get(role) and job.probes[role].kind == "video"))
+               for role in roles]
     shot = strip(sources, into=_preview_dir(chat_id))
     if shot is None:
-        return False
-    # The caption names the roles in the SAME left-to-right order the strip was
-    # built in — nothing is drawn onto the image itself (see preview.strip), so
-    # this line is the only thing that says which panel is which.
+        return None
+    _STRIP[chat_id] = (key, shot)
+    return shot
+
+
+def _strip_caption(chat_id: int, job: Job) -> str:
+    """What goes under the strip when it CANNOT carry the whole panel.
+
+    The fallback shape: a picture with the roles named in the order they were
+    stacked, and the panel as a separate message below it.
+    """
+    roles = sorted(job.slots)
     names = " · ".join(f"{ROLE_ICON.get(r, '')} <b>{_esc(r)}</b>" for r in roles)
     warnings = [f"{ICON_WARN} <b>{_esc(r)}</b> — {quality_warning_html(job.probes[r])}"
                 for r in roles
                 if job.probes.get(r) and quality_warning(job.probes[r])]
-    caption = "\n".join([names, *warnings])
-    try:
-        tg.send_photo(chat_id, shot, caption=caption, parse_mode=PARSE_HTML)
-    except TgError as exc:
-        # Never fatal. The panel below carries the same facts in text, and a
-        # failed courtesy must not block a job the user has assembled.
-        log(f"preview strip failed, continuing without it: {exc}")
-        return False
-    _ALBUM_KEY[chat_id] = key
-    return True
+    return "\n".join([names, *warnings])
 
 
 def _show_panel(tg: Tg, chat_id: int, *, note: str = "",
                 bump: bool = False) -> None:
     """Render the panel: edit it in place, or move it back to the bottom.
 
-    `bump` forces the move — used by /job, where the user has explicitly asked
-    to see the thing now and a silent edit somewhere above would look like the
+    Once the job is ready to run the panel becomes ONE message — the strip of
+    material carrying the whole panel as its caption, Run button and all —
+    rather than a picture followed by a separate panel. The user asked for the
+    merge after seeing the two ("1 lần xác nhận là gửi 2 tin như này luôn à"),
+    and they were also visibly redundant: the caption repeated the role list
+    and the warning that the panel below restated.
+
+    A merge had been ruled out earlier on a bad measurement. The 1024-character
+    caption cap applies to the PARSED text, not the raw markup: counting the
+    HTML gave 1,060 for three slots and the wrong answer, while the visible
+    text is 930 with four. It is still checked per render rather than assumed —
+    filenames come from the user's own files and nothing bounds them — and a
+    panel that does not fit falls back to the two-message shape instead of
+    being truncated.
+
+    `bump` forces a move — used by /job, where the user has explicitly asked to
+    see the thing now and a silent edit somewhere above would look like the
     command did nothing at all.
     """
     job = _STATE.get(chat_id)
@@ -1336,24 +1367,60 @@ def _show_panel(tg: Tg, chat_id: int, *, note: str = "",
         return
     if note:
         _PANEL_NOTE[chat_id] = note
-    # Before the panel is drawn, so the pictures land ABOVE it and the Run
-    # button stays the last thing on screen.
-    sent_album = _maybe_send_album(tg, chat_id, job)
     text = _panel_text(chat_id, job)
     buttons = _panel_buttons(chat_id, job)
-
     message_id = _PANEL.get(chat_id)
-    drifted = bump or sent_album or (
+    was_photo = chat_id in _PANEL_IS_PHOTO
+
+    shot = _strip_for(chat_id, job)
+    key = _material_key(job) if shot is not None else None
+    merged = shot is not None and _caption_fits(text)
+
+    log(f"panel chat={chat_id} pipeline={job.pipeline} slots={sorted(job.slots)} "
+        f"id={message_id} photo={was_photo} strip={shot is not None} "
+        f"merged={merged} caption={_visible_length(text)}")
+
+    if merged:
+        # Same picture, same message: only the words changed.
+        if (was_photo and message_id is not None and not bump
+                and _ALBUM_KEY.get(chat_id) == key):
+            if tg.edit_message_caption(chat_id, message_id, text, buttons=buttons,
+                                       parse_mode=PARSE_HTML):
+                return
+        # New material (or no photo panel yet) needs a new message, because a
+        # photo cannot be swapped into a text message and its image cannot be
+        # replaced by an edit.
+        if message_id is not None:
+            tg.delete_message(chat_id, message_id)
+        try:
+            _PANEL[chat_id] = tg.send_photo(chat_id, shot, caption=text,
+                                            buttons=buttons, parse_mode=PARSE_HTML)
+        except TgError as exc:
+            # A rejected upload must not cost the user the panel itself.
+            log(f"merged panel failed, falling back to text: {exc}")
+            _PANEL_IS_PHOTO.discard(chat_id)
+            _PANEL[chat_id] = tg.send_message(chat_id, text, buttons=buttons,
+                                              parse_mode=PARSE_HTML)
+            return
+        _PANEL_IS_PHOTO.add(chat_id)
+        _ALBUM_KEY[chat_id] = key
+        return
+
+    # Not ready, or too long to be a caption: the picture (if any) goes above a
+    # text panel, once per set of material.
+    sent_strip = False
+    if shot is not None and _ALBUM_KEY.get(chat_id) != key:
+        try:
+            tg.send_photo(chat_id, shot, caption=_strip_caption(chat_id, job),
+                          parse_mode=PARSE_HTML)
+            _ALBUM_KEY[chat_id] = key
+            sent_strip = True
+        except TgError as exc:
+            log(f"preview strip failed, continuing without it: {exc}")
+
+    drifted = bump or sent_strip or was_photo or (
         message_id is not None
         and _LAST_SEEN.get(chat_id, 0) - message_id > _PANEL_DRIFT_MAX)
-    # Logged because the panel failed to appear once on the user's phone
-    # (2026-09-01) and the state that would have explained it — pipeline, panel
-    # id, how far it had drifted — was in memory and gone by the time it was
-    # reported. One line per redraw is cheap; a second unexplained disappearance
-    # is not.
-    log(f"panel chat={chat_id} pipeline={job.pipeline} slots={sorted(job.slots)} "
-        f"id={message_id} last_seen={_LAST_SEEN.get(chat_id)} "
-        f"drifted={drifted} album={sent_album}")
     if message_id is not None and not drifted:
         if tg.edit_message(chat_id, message_id, text, buttons=buttons,
                            parse_mode=PARSE_HTML):
@@ -1362,6 +1429,7 @@ def _show_panel(tg: Tg, chat_id: int, *, note: str = "",
         # rather than leaving the chat with no panel at all.
     elif message_id is not None:
         tg.delete_message(chat_id, message_id)
+    _PANEL_IS_PHOTO.discard(chat_id)
     _PANEL[chat_id] = tg.send_message(chat_id, text, buttons=buttons,
                                       parse_mode=PARSE_HTML)
 
@@ -1370,6 +1438,8 @@ def _drop_panel(tg: Tg, chat_id: int) -> None:
     """Remove the panel entirely — only for /clear, where the job is gone."""
     message_id = _PANEL.pop(chat_id, None)
     _PANEL_NOTE.pop(chat_id, None)
+    _PANEL_IS_PHOTO.discard(chat_id)
+    _STRIP.pop(chat_id, None)
     if message_id is not None:
         tg.delete_message(chat_id, message_id)
 
@@ -1388,12 +1458,20 @@ def _freeze_panel(tg: Tg, chat_id: int, stamp: str) -> None:
     """
     message_id = _PANEL.pop(chat_id, None)
     _PANEL_NOTE.pop(chat_id, None)
+    was_photo = chat_id in _PANEL_IS_PHOTO
+    _PANEL_IS_PHOTO.discard(chat_id)
+    _STRIP.pop(chat_id, None)
     job = _STATE.get(chat_id)
     if message_id is None or job is None:
         return
-    tg.edit_message(chat_id, message_id,
-                    _panel_text(chat_id, job) + f"\n\n🚀 <b>{_esc(stamp)}</b>",
-                    parse_mode=PARSE_HTML)
+    frozen = _panel_text(chat_id, job) + f"\n\n🚀 <b>{_esc(stamp)}</b>"
+    # A merged panel is a photo, and editMessageText cannot touch one. Getting
+    # this wrong would leave the Run button live on a job already handed to a
+    # drain — the exact thing the freeze exists to prevent.
+    if was_photo:
+        tg.edit_message_caption(chat_id, message_id, frozen, parse_mode=PARSE_HTML)
+    else:
+        tg.edit_message(chat_id, message_id, frozen, parse_mode=PARSE_HTML)
 
 
 _PROGRESS_SUFFIX = ".progress.json"
@@ -1618,13 +1696,21 @@ def _clear_job(tg: Tg, chat_id: int) -> None:
             "Send a file as a <b>File</b> to start again.")
     message_id = _PANEL.pop(chat_id, None)
     _PANEL_NOTE.pop(chat_id, None)
+    was_photo = chat_id in _PANEL_IS_PHOTO
+    _PANEL_IS_PHOTO.discard(chat_id)
+    _STRIP.pop(chat_id, None)
     # Replaced in place, not deleted (2026-09-01). Deleting it left the chat
     # holding only the loose messages around it, which is exactly the debris
     # the panel exists to prevent — and the user photographed that state and
     # reported it as the panel never having appeared. One line where the panel
     # was reads as "this is finished"; a hole reads as a bug.
-    if message_id is None or not tg.edit_message(chat_id, message_id, done,
-                                                 parse_mode=PARSE_HTML):
+    replaced = False
+    if message_id is not None:
+        replaced = (tg.edit_message_caption(chat_id, message_id, done,
+                                            parse_mode=PARSE_HTML) if was_photo
+                    else tg.edit_message(chat_id, message_id, done,
+                                         parse_mode=PARSE_HTML))
+    if not replaced:
         tg.send_message(chat_id, done, parse_mode=PARSE_HTML)
 
 
@@ -1780,6 +1866,7 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
     _CONFIRM_WARNED.discard(chat_id)
     _ALBUM_KEY.pop(chat_id, None)
     _FIDELITY.pop(chat_id, None)
+    _STRIP.pop(chat_id, None)
     if dropped:
         tg.send_message(chat_id, f"running without {dropped} unassigned file(s)")
     tg.send_message(chat_id, "🚀 <b>Started.</b> Renting a GPU pod at "
