@@ -364,10 +364,42 @@ wide, so it is always tall in the chat; a 2:1 landscape is half its own width.
 Both shapes are therefore wide ones, and both were chosen by the user from
 candidates rendered on their own phone:
 
-| where | shape | why not the alternatives |
-|---|---|---|
-| the slot question | one image on a 2:1 canvas, filled with a **blurred copy of itself** (`slot_preview`) | a flat black pad was rejected as waste (*"nền đen thừa nhiều quá"*); a 3:2 or 1:1 crop removes the padding entirely but cannot know whether the hem, the shoes or the face is the part that distinguishes this outfit from the next one |
-| the confirmation | **all slots in ONE wide strip**, side by side (`strip`) | an album of separate photos is a tall grid, and height is the whole problem. The accepted trade is that each picture gets a third of the width |
+| where | shape |
+|---|---|
+| the slot question | one image on a 2:1 canvas, filled with a **blurred copy of itself** (`slot_preview`). A flat black pad was rejected as waste (*"nền đen thừa nhiều quá"*); a 3:2 or 1:1 crop removes the padding but cannot know whether the hem, the shoes or the face is the part that distinguishes this outfit from the next one |
+| the confirmation | a **contact sheet**: one row per queued job, one column per role (`sheet`) |
+
+#### The contact sheet
+
+Every dimension in it was picked by the user from variants rendered on their
+phone, over five rounds. What each one is for:
+
+- **Uniform tiles, blur-filled.** Portraits and video frames have different
+  aspect ratios, so cells of natural width left the columns ragged. Every tile
+  is now 186×248 and the columns line up.
+- **A rounded card per job, and a row gap wider than the column gap.** With even
+  gaps the eye reads twelve separate pictures; with these it reads three jobs of
+  four slots, which is what the sheet is for.
+- **A thin rim and a small offset shadow per tile**, so a picture lifts off the
+  card instead of merging into it.
+- **A missing role leaves its column blank.** Columns are roles, so a shorter
+  row would shift every cell to its right — and a blank cell says *this slot is
+  empty*, which a missing one does not. Measured: mixing three- and four-slot
+  jobs does not change the sheet's shape at all.
+- **Tiles keep one size however many jobs are queued.** Squashing them holds the
+  aspect but shows less of each picture; asked directly, the user preferred a
+  batch that has to be scrolled to one that cannot be seen. Three jobs come to
+  808×872 (aspect 0.93), six to 808×1730 (0.47).
+
+Rounding is done with a `geq` alpha mask, which sounds expensive and is not:
+**0.038s per tile against 0.043s without it** — inside the noise — and a
+six-job sheet builds in under a second. Worth measuring rather than assuming,
+since it runs in the synchronous poll loop.
+
+**Nothing is drawn onto the image.** `drawtext` is not compiled into this
+ffmpeg (checked — the earlier note blaming per-platform font paths was a weaker
+reason than the real one), so the column legend and the row order live in the
+caption, using the same role icons the panel already uses.
 
 **Once a job is ready, the panel IS the picture.** One message: the strip, the
 whole panel as its caption, and the Run button on it. The user asked for the

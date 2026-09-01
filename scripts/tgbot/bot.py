@@ -41,7 +41,7 @@ from tgbot.ingest import (Probe, describe, probe, quality_warning,
                          quality_warning_html,
                          to_png_if_heic)
 from tgbot.job import Job, missing_slots, slot_for, write_manifest
-from tgbot.preview import slot_preview, strip
+from tgbot.preview import sheet, slot_preview
 from tgbot.run import (drain_running, estimate_minutes, final_files, lease_for,
                        progress_text, start_drain, summary_text)
 
@@ -1388,42 +1388,59 @@ def _material_key(job: Job) -> tuple:
     return tuple(sorted((r, str(pth)) for r, pth in job.slots.items()))
 
 
-def _strip_for(chat_id: int, job: Job) -> Path | None:
-    """The built strip for this job's material, or None if it is not ready.
+def _sheet_key(chat_id: int) -> tuple:
+    """Every queued job's material, so the sheet rebuilds when ANY of them moves."""
+    return tuple(_material_key(job) for job in _jobs_for(chat_id))
 
-    Memoised on the material set: `_show_panel` runs on every change, and
-    rebuilding three ffmpeg frames each time would put a courtesy feature in
-    the way of the poll loop.
+
+def _sheet_columns(jobs: list[Job]) -> list[str]:
+    """One column per role any queued job uses, in the panel's own order.
+
+    Sorted, and the UNION rather than one job's slots: a batch where job 1 has
+    a background and job 2 does not still needs four columns, or job 2's cells
+    would shift left and the sheet would stop being readable down a column.
     """
-    if missing_slots(job) or _LAST_VALIDATE.get(chat_id) is not True:
+    return sorted({role for job in jobs for role in job.slots})
+
+
+def _sheet_for(chat_id: int) -> Path | None:
+    """The contact sheet of everything Run would submit — one row per job.
+
+    Memoised on the material of every queued job: `_show_panel` runs on each
+    change and a six-job sheet is twenty-four ffmpeg invocations. That is under
+    a second, but not worth repeating for a redraw that changed a word.
+    """
+    jobs = _jobs_for(chat_id)
+    if not jobs or _LAST_VALIDATE.get(chat_id) is not True:
         return None
-    key = _material_key(job)
+    key = _sheet_key(chat_id)
     cached = _STRIP.get(chat_id)
     if cached is not None and cached[0] == key and cached[1].exists():
         return cached[1]
-    roles = sorted(job.slots)
-    sources = [(job.slots[role],
-                bool(job.probes.get(role) and job.probes[role].kind == "video"))
-               for role in roles]
-    shot = strip(sources, into=_preview_dir(chat_id))
+    columns = _sheet_columns(jobs)
+    rows = [[(job.slots[role],
+              bool(job.probes.get(role) and job.probes[role].kind == "video"))
+             if role in job.slots else None
+             for role in columns]
+            for job in jobs]
+    shot = sheet(rows, into=_preview_dir(chat_id))
     if shot is None:
         return None
     _STRIP[chat_id] = (key, shot)
     return shot
 
 
-def _strip_caption(chat_id: int, job: Job) -> str:
-    """What goes under the strip when it CANNOT carry the whole panel.
+def _sheet_caption(chat_id: int) -> str:
+    """The legend for the sheet when it cannot carry the whole panel.
 
-    The fallback shape: a picture with the roles named in the order they were
-    stacked, and the panel as a separate message below it.
+    Names the columns, because nothing is drawn onto the image — `drawtext` is
+    not compiled into the ffmpeg this runs against — using the same role icons
+    the panel does, which the reader already knows.
     """
-    roles = sorted(job.slots)
-    names = " · ".join(f"{ROLE_ICON.get(r, '')} <b>{_esc(r)}</b>" for r in roles)
-    warnings = [f"{ICON_WARN} <b>{_esc(r)}</b> — {quality_warning_html(job.probes[r])}"
-                for r in roles
-                if job.probes.get(r) and quality_warning(job.probes[r])]
-    return "\n".join([names, *warnings])
+    jobs = _jobs_for(chat_id)
+    columns = " · ".join(f"{ROLE_ICON.get(r, '')} {_esc(r)}"
+                         for r in _sheet_columns(jobs))
+    return f"{len(jobs)} job(s) · {columns}" if len(jobs) > 1 else columns
 
 
 def _show_panel(tg: Tg, chat_id: int, *, note: str = "",
@@ -1460,8 +1477,8 @@ def _show_panel(tg: Tg, chat_id: int, *, note: str = "",
     message_id = _PANEL.get(chat_id)
     was_photo = chat_id in _PANEL_IS_PHOTO
 
-    shot = _strip_for(chat_id, job)
-    key = _material_key(job) if shot is not None else None
+    shot = _sheet_for(chat_id)
+    key = _sheet_key(chat_id) if shot is not None else None
     merged = shot is not None and _caption_fits(text)
 
     log(f"panel chat={chat_id} pipeline={job.pipeline} slots={sorted(job.slots)} "
@@ -1499,7 +1516,7 @@ def _show_panel(tg: Tg, chat_id: int, *, note: str = "",
     sent_strip = False
     if shot is not None and _ALBUM_KEY.get(chat_id) != key:
         try:
-            tg.send_photo(chat_id, shot, caption=_strip_caption(chat_id, job),
+            tg.send_photo(chat_id, shot, caption=_sheet_caption(chat_id),
                           parse_mode=PARSE_HTML)
             _ALBUM_KEY[chat_id] = key
             sent_strip = True

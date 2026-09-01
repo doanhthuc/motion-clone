@@ -829,7 +829,7 @@ class TestFlow(unittest.TestCase):
         # costs a process per ambiguous image (17s across the suite when this
         # was left live). Preview BEHAVIOUR is asserted in TestPreviews, where
         # `make` is patched to return a real file.
-        for name in ("slot_preview", "strip"):
+        for name in ("slot_preview", "sheet"):
             patcher = mock.patch(f"tgbot.bot.{name}", return_value=None)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -2211,7 +2211,7 @@ class TestPreviews(unittest.TestCase):
         930 with four.
         """
         job = self._ready_job()
-        with mock.patch("tgbot.bot.strip", return_value=self.shot):
+        with mock.patch("tgbot.bot.sheet", return_value=self.shot):
             bot._show_panel(self.tg, ME)
         self.assertEqual(len(self.tg.photos), 1)
         self.assertEqual(self.tg.messages, [], "a second message was sent too")
@@ -2223,7 +2223,7 @@ class TestPreviews(unittest.TestCase):
 
     def test_a_redraw_edits_the_caption_rather_than_resending_the_picture(self):
         job = self._ready_job()
-        with mock.patch("tgbot.bot.strip", return_value=self.shot):
+        with mock.patch("tgbot.bot.sheet", return_value=self.shot):
             bot._show_panel(self.tg, ME)
             bot._show_panel(self.tg, ME, note="something changed")
         self.assertEqual(len(self.tg.photos), 1, "the picture was re-uploaded")
@@ -2234,7 +2234,7 @@ class TestPreviews(unittest.TestCase):
 
     def test_new_material_replaces_the_message_because_a_photo_cannot_be_swapped(self):
         job = self._ready_job()
-        with mock.patch("tgbot.bot.strip", return_value=self.shot):
+        with mock.patch("tgbot.bot.sheet", return_value=self.shot):
             bot._show_panel(self.tg, ME)
             first = bot._PANEL[ME]
             job.slots["character"] = Path("c2.png")
@@ -2247,7 +2247,7 @@ class TestPreviews(unittest.TestCase):
         """Filenames come from the user's own files and nothing bounds them.
         Truncating would drop the arrival digests, so it splits instead."""
         job = self._ready_job()
-        with mock.patch("tgbot.bot.strip", return_value=self.shot), \
+        with mock.patch("tgbot.bot.sheet", return_value=self.shot), \
              mock.patch("tgbot.bot._caption_fits", return_value=False):
             bot._show_panel(self.tg, ME)
         self.assertEqual(len(self.tg.photos), 1)     # the strip on its own
@@ -2270,7 +2270,7 @@ class TestPreviews(unittest.TestCase):
     def test_freezing_a_merged_panel_edits_the_caption_and_drops_the_button(self):
         """Getting this wrong leaves Run live on a job already given to a drain."""
         job = self._ready_job()
-        with mock.patch("tgbot.bot.strip", return_value=self.shot):
+        with mock.patch("tgbot.bot.sheet", return_value=self.shot):
             bot._show_panel(self.tg, ME)
         bot._freeze_panel(self.tg, ME, "submitted 12:30")
         self.assertEqual(len(self.tg.caption_edits), 1)
@@ -2280,28 +2280,52 @@ class TestPreviews(unittest.TestCase):
         self.assertNotIn(ME, bot._PANEL)
         self.assertNotIn(ME, bot._PANEL_IS_PHOTO)
 
-    def test_the_strip_is_built_from_every_slot_in_panel_order(self):
+    def test_the_sheet_is_one_row_per_job_and_one_column_per_role(self):
         job = self._ready_job()
         seen = {}
-        def fake_strip(sources, *, into):
-            seen["sources"] = list(sources)
+        def fake_sheet(rows, *, into):
+            seen["rows"] = [list(r) for r in rows]
             return self.shot
-        with mock.patch("tgbot.bot.strip", side_effect=fake_strip):
+        with mock.patch("tgbot.bot.sheet", side_effect=fake_sheet):
             bot._show_panel(self.tg, ME)
-        self.assertEqual([p for p, _ in seen["sources"]],
-                         [job.slots[r] for r in sorted(job.slots)])
-        # The driver is the video, and only it may be seeked as one.
-        self.assertEqual([is_vid for _, is_vid in seen["sources"]], [False, True])
+        self.assertEqual(len(seen["rows"]), 1)
+        columns = sorted(job.slots)
+        self.assertEqual([cell[0] for cell in seen["rows"][0]],
+                         [job.slots[r] for r in columns])
+        # Only the driver is a video, and only it may be seeked as one.
+        self.assertEqual([cell[1] for cell in seen["rows"][0]], [False, True])
+
+    def test_a_job_missing_a_role_leaves_that_column_empty(self):
+        """Columns are roles. A shorter row would shift every cell to its right
+        and the sheet would stop being readable down a column — and a missing
+        cell does not say "this slot is empty", which a blank one does."""
+        job = self._ready_job()
+        job.slots["background"] = Path("b.png")
+        job.probes["background"] = self.img
+        bot._BASKET[ME] = [bot._copy_job(job)]
+        bot._STATE[ME].slots.pop("background")
+        bot._STATE[ME].probes.pop("background")
+        seen = {}
+        def fake_sheet(rows, *, into):
+            seen["rows"] = [list(r) for r in rows]
+            return self.shot
+        with mock.patch("tgbot.bot.sheet", side_effect=fake_sheet):
+            bot._show_panel(self.tg, ME)
+        self.assertEqual(len(seen["rows"]), 2)
+        self.assertEqual(len(seen["rows"][0]), len(seen["rows"][1]))
+        # background sorts first, so it is column 0 in both rows.
+        self.assertIsNotNone(seen["rows"][0][0])
+        self.assertIsNone(seen["rows"][1][0], "the missing role did not leave a gap")
 
     def test_the_strip_is_built_once_per_set_of_material(self):
         """_show_panel runs on every change; three ffmpeg frames per redraw
         would put a courtesy feature in the way of the poll loop."""
         job = self._ready_job()
         calls = []
-        def counting_strip(sources, *, into):
+        def counting_sheet(rows, *, into):
             calls.append(1)
             return self.shot
-        with mock.patch("tgbot.bot.strip", side_effect=counting_strip):
+        with mock.patch("tgbot.bot.sheet", side_effect=counting_sheet):
             bot._show_panel(self.tg, ME)
             bot._show_panel(self.tg, ME, note="a")
             bot._show_panel(self.tg, ME, note="b")
@@ -2309,7 +2333,7 @@ class TestPreviews(unittest.TestCase):
 
     def test_a_strip_that_could_not_be_built_leaves_a_working_text_panel(self):
         job = self._ready_job()
-        with mock.patch("tgbot.bot.strip", return_value=None):
+        with mock.patch("tgbot.bot.sheet", return_value=None):
             bot._show_panel(self.tg, ME)
         self.assertEqual(self.tg.photos, [])
         self.assertEqual(len(self.tg.messages), 1)
@@ -2319,7 +2343,7 @@ class TestPreviews(unittest.TestCase):
         from tgbot.tgclient import TgError
         job = self._ready_job()
         self.tg.photo_raises = TgError("Bad Request: image is too big")
-        with mock.patch("tgbot.bot.strip", return_value=self.shot):
+        with mock.patch("tgbot.bot.sheet", return_value=self.shot):
             bot._show_panel(self.tg, ME)
         self.assertEqual(len(self.tg.messages), 1)
         self.assertNotIn(ME, bot._PANEL_IS_PHOTO)
@@ -2336,7 +2360,7 @@ class TestPreviews(unittest.TestCase):
                     bot._LAST_VALIDATE.pop(ME, None)
                 else:
                     bot._LAST_VALIDATE[ME] = verdict
-                with mock.patch("tgbot.bot.strip", return_value=self.shot):
+                with mock.patch("tgbot.bot.sheet", return_value=self.shot):
                     bot._show_panel(self.tg, ME)
                 self.assertEqual(self.tg.photos, [])
 
@@ -2346,7 +2370,7 @@ class TestPreviews(unittest.TestCase):
         job.slots["character"] = Path("c.png")
         job.probes["character"] = self.img
         bot._LAST_VALIDATE[ME] = True
-        with mock.patch("tgbot.bot.strip", return_value=self.shot):
+        with mock.patch("tgbot.bot.sheet", return_value=self.shot):
             bot._show_panel(self.tg, ME)
         self.assertEqual(self.tg.photos, [])
         self.assertEqual(len(self.tg.messages), 1)   # the text panel only
@@ -2408,29 +2432,35 @@ class TestPreviewBuilder(unittest.TestCase):
         self.assertIsNone(preview.slot_preview(junk, is_video=False,
                                                into=self.tmp / "out3"))
 
-    def test_the_strip_is_one_image_as_wide_as_its_panels_combined(self):
+    def test_one_job_is_a_single_wide_row(self):
         from tgbot import preview
-        out = preview.strip([(self.video, True)] * 3, into=self.tmp / "out4")
+        out = preview.sheet([[(self.video, True)] * 4], into=self.tmp / "out4")
         self.assertIsNotNone(out)
         width, height = _dimensions(out)
-        self.assertEqual(height, preview.STRIP_H)
-        self.assertGreater(width, height, "the strip is not a wide image")
+        self.assertGreater(width, height, "a one-job sheet is not a wide image")
 
-    def test_one_slot_gets_the_wide_treatment_rather_than_a_lone_portrait(self):
-        """hstack of one input is legal and pointless — it would leave exactly
-        the tall shape this module exists to avoid."""
+    def test_rows_stack_and_columns_stay_aligned(self):
         from tgbot import preview
-        out = preview.strip([(self.video, True)], into=self.tmp / "out5")
+        rows = [[(self.video, True)] * 3, [None, (self.video, True), None]]
+        out = preview.sheet(rows, into=self.tmp / "out5")
         self.assertIsNotNone(out)
-        self.assertEqual(_dimensions(out), (preview.SLOT_W, preview.SLOT_H))
+        width, height = _dimensions(out)
+        self.assertEqual(width, 3 * preview.TILE_W + 4 * preview.COL_GAP
+                         + 2 * preview.CARD_PAD)
+        self.assertEqual(height, 2 * (preview.TILE_H + 2 * preview.CARD_PAD)
+                         + 3 * preview.ROW_GAP)
 
-    def test_a_strip_is_all_or_nothing(self):
-        """A strip missing a slot reads as the job missing that slot."""
+    def test_a_sheet_is_all_or_nothing(self):
+        """A sheet missing a cell reads as a job missing that slot."""
         from tgbot import preview
         junk = self.tmp / "junk2.png"
         junk.write_bytes(b"not an image")
-        self.assertIsNone(preview.strip([(self.video, True), (junk, False)],
+        self.assertIsNone(preview.sheet([[(self.video, True), (junk, False)]],
                                         into=self.tmp / "out6"))
+
+    def test_no_rows_is_no_sheet(self):
+        from tgbot import preview
+        self.assertIsNone(preview.sheet([], into=self.tmp / "out7"))
 
 
 class TestNoDuplicateDefinitions(unittest.TestCase):
