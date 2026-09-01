@@ -243,28 +243,38 @@ def quality_warning(p: Probe) -> str:
 
 
 def quality_warning_html(p: Probe) -> str:
-    """The same judgment, laid out so the two numbers can be compared.
+    """The same judgment as one glanceable line. Returns HTML, or "".
 
-    Returns HTML — the caller must NOT escape it — or an empty string.
+    The caller must NOT escape it.
 
-    The layout was chosen by the user from four candidates rendered on their
-    own phone (2026-09-01). Building it exposed a real defect in the sentence
-    it replaces: that one read "865 kbps (417 per megapixel). Real drivers here
-    measure 1400-8400", placing a RAW kbps figure beside a PER-MEGAPIXEL range,
-    so the comparison a reader naturally makes — 865 against 1400 — is between
-    two different units and means nothing. Every figure in the survey behind
-    LOW_BITRATE_KBPS_PER_MPX is per megapixel. Aligning them into columns would
-    have made that worse rather than better, because alignment is itself a
-    claim that two numbers are comparable. So the unit moved into a heading and
-    only like-for-like figures sit in the table; the raw kbps stays, below, as
-    context rather than as a comparison.
+    Shortened to a single ratio on 2026-09-01, after a laid-out table was built
+    and rejected as too long: four of its six lines were either restating
+    `describe()`, which sits directly beside it, or explaining a unit.
+
+    A ratio between two figures in the SAME unit is what makes this safe. The
+    sentence this descends from read "865 kbps ... real drivers here measure
+    1400-8400", putting raw kbps beside a per-megapixel range so the comparison
+    a reader naturally makes was between different units — a false claim built
+    entirely from correct numbers, which no test caught and no reader could
+    see. A ratio cannot express that mistake at all: the units cancel. The
+    exact figures stay one tap away in the panel's collapsed block, and in
+    `quality_warning` for the logs.
+
+    "your call" rather than "it will still run": this threshold is a heuristic
+    from one person's 64 files and it never blocks, so the sentence should say
+    whose decision it is rather than merely report that the software is not
+    stopping them. On 2026-08-31 the user kept a flagged driver deliberately
+    after being shown the number, which is the outcome the design exists to
+    allow.
     """
     per_mpx = _per_megapixel(p)
     if per_mpx is None or per_mpx >= LOW_BITRATE_KBPS_PER_MPX:
         return ""
-    return (f"low bitrate\n"
-            f"<pre>bitrate per megapixel\n"
-            f"  this file  {per_mpx:>9.0f}\n"
-            f"  normal     {REAL_DRIVER_LOW_PER_MPX}-{REAL_DRIVER_HIGH_PER_MPX}</pre>"
-            f"<i>{p.bitrate_kbps} kbps at {p.width}x{p.height} · probably an "
-            f"already-compressed copy · it will still run</i>")
+    if per_mpx <= 0:
+        # ffprobe reports no bitrate for some containers, and Probe carries the
+        # 0 through faithfully. A ratio against 0 is infinity, which would
+        # render as "inf x below" — so say the true thing instead: nothing was
+        # measured, which is itself worth knowing before spending.
+        return "<b>no bitrate reported</b> — cannot check this file · your call"
+    return (f"bitrate <b>{REAL_DRIVER_LOW_PER_MPX / per_mpx:.1f}x below</b> the "
+            f"lowest real driver here · your call")

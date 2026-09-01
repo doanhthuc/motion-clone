@@ -136,47 +136,57 @@ class TestBitrateWarning(unittest.TestCase):
     """The judgment, and the units it is stated in.
 
     Every figure behind LOW_BITRATE_KBPS_PER_MPX is kbps PER MEGAPIXEL — 417
-    for the known-bad file, 1400-8400 for real drivers. The sentence this
-    replaced read "865 kbps (417 per megapixel). Real drivers here measure
-    1400-8400", which puts a raw figure next to a per-megapixel range so the
-    comparison a reader naturally makes, 865 against 1400, is between two
-    different units. Nothing caught it: it is a wrong claim made entirely out
-    of correct numbers.
+    for the known-bad file, 1400-8400 for real drivers. An earlier message read
+    "865 kbps (417 per megapixel). Real drivers here measure 1400-8400", which
+    puts a raw figure next to a per-megapixel range, so the comparison a reader
+    naturally makes — 865 against 1400 — is between two different units.
+    Nothing caught it: a false claim assembled entirely from true measurements.
+
+    The glanceable form is now a RATIO, which cannot express that mistake at
+    all, because the units cancel. These tests hold that property rather than
+    any particular wording.
     """
 
     # 865 kbps at 1080x1920 = 2.07 Mpx, so 417 per megapixel: the real file
-    # from 2026-08-31 that the threshold was chosen around.
+    # from 2026-08-31 the threshold was chosen around.
     BAD = Probe(kind="video", width=1080, height=1920, duration_s=15.0,
                 bitrate_kbps=865, size_bytes=1_622_500)
     GOOD = Probe(kind="video", width=1080, height=1920, duration_s=15.0,
                  bitrate_kbps=7000, size_bytes=13_000_000)
 
-    def _table(self, html):
-        start = html.index("<pre>") + len("<pre>")
-        return html[start:html.index("</pre>", start)]
-
-    def test_the_table_compares_per_megapixel_figures_only(self):
-        table = self._table(quality_warning_html(self.BAD))
-        self.assertIn("417", table)
-        self.assertIn("1400-8400", table)
-        # The raw kbps must NOT sit in the aligned block. Alignment is itself a
-        # claim that the numbers are comparable, and 865 is not comparable to
-        # 1400 — it is the same file measured a different way.
-        self.assertNotIn("865", table,
-                         "a raw kbps figure is aligned against a per-megapixel range")
-
-    def test_the_raw_bitrate_is_still_reported_as_context(self):
-        """Dropping it would lose the number the user recognises from ffprobe."""
+    def test_the_short_form_quotes_no_absolute_figure_to_be_misread(self):
         html = quality_warning_html(self.BAD)
-        self.assertIn("865 kbps", html)
-        self.assertIn("1080x1920", html)
+        for raw in ("865", "1400", "8400", "417", "1080x1920"):
+            self.assertNotIn(raw, html,
+                             f"{raw!r} is in the glance line — an absolute "
+                             "figure there can be compared against the wrong unit")
 
-    def test_the_unit_is_stated_once_where_it_governs_both_rows(self):
-        self.assertIn("bitrate per megapixel", self._table(quality_warning_html(self.BAD)))
+    def test_the_ratio_is_the_real_one(self):
+        html = quality_warning_html(self.BAD)
+        expected = ingest.REAL_DRIVER_LOW_PER_MPX / (865 / (1080 * 1920 / 1_000_000))
+        self.assertIn(f"{expected:.1f}x below", html)
+
+    def test_a_video_with_no_reported_bitrate_does_not_render_infinity(self):
+        """ffprobe omits bit_rate for some containers and Probe carries the 0
+        through faithfully; a ratio against it is infinite."""
+        none_reported = Probe(kind="video", width=1080, height=1920,
+                              duration_s=15.0, bitrate_kbps=0, size_bytes=1)
+        html = quality_warning_html(none_reported)
+        self.assertNotIn("inf", html)
+        self.assertIn("no bitrate reported", html)
+
+    def test_the_plain_form_keeps_every_figure_for_the_logs(self):
+        """The short line is for the phone. Nothing is lost — the log form
+        still carries what a later investigation would need."""
+        plain = quality_warning(self.BAD)
+        self.assertIn("417", plain)
+        self.assertIn("1400-8400", plain)
+        self.assertIn("865 kbps", plain)
+        self.assertIn("1080x1920", plain)
 
     def test_both_renderings_agree_on_the_verdict(self):
-        """Two views of one judgment. If they can disagree, one of them is
-        telling the user a file is fine while the other says it is not."""
+        """Two views of one judgment. If they can disagree, one is telling the
+        user a file is fine while the other says it is not."""
         for probe_obj in (self.BAD, self.GOOD,
                           Probe(kind="image", width=1024, height=1024,
                                 duration_s=0.0, bitrate_kbps=0, size_bytes=1),
@@ -193,10 +203,11 @@ class TestBitrateWarning(unittest.TestCase):
     def test_the_quoted_range_is_the_threshold_it_explains(self):
         """The prose and the constant must not drift apart.
 
-        The survey put the lowest legitimate driver at 1397 and the threshold
-        at 1000, deliberately below it. A message quoting a range that no
-        longer brackets the threshold would be explaining a rule the code does
-        not follow.
+        The survey put the lowest legitimate driver at 1397 and the threshold at
+        1000, deliberately below it. A message quoting a range that no longer
+        brackets the threshold would explain a rule the code does not follow —
+        and the ratio is computed FROM that range, so a drift would silently
+        change every number the user sees.
         """
         self.assertLess(ingest.LOW_BITRATE_KBPS_PER_MPX,
                         ingest.REAL_DRIVER_LOW_PER_MPX)

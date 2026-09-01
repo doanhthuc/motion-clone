@@ -1448,7 +1448,10 @@ class TestFlow(unittest.TestCase):
             bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME)
         review = panel_text(self.tg)
         before_block = review.split("<blockquote")[0]
-        self.assertIn("low bitrate", before_block)
+        # The glance form is a ratio, not the words "low bitrate" — those stay
+        # in the plain sentence inside the collapsed block.
+        self.assertIn("x below", before_block)
+        self.assertIn(bot.ICON_WARN, before_block)
 
     def test_the_fix_buttons_are_two_per_row(self):
         # Four stacked full-width buttons pushed the message they belong to off
@@ -2009,7 +2012,7 @@ class TestPreviews(unittest.TestCase):
                         "the caption order does not match sorted(job.slots)")
         # The warning rides with the picture: a low-bitrate driver is exactly
         # what a preview is most likely to make obvious.
-        self.assertIn("low bitrate", caption)
+        self.assertIn("x below", caption)
 
     def test_the_strip_is_built_from_every_slot_in_caption_order(self):
         job = self._ready_job()

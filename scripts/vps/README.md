@@ -176,25 +176,34 @@ when the user asked for the warning to be laid out more clearly (2026-09-01) —
 aligning the figures into columns would have made it worse, because alignment
 is itself a claim that two numbers are comparable.
 
-So `quality_warning_html` states the unit once, as a heading over both rows, and
-keeps the raw figure below as context rather than as a comparison:
+So the glance line quotes **no absolute figure at all** — just the ratio
+between two per-megapixel numbers, where the units cancel and the mistake
+cannot be expressed:
 
 ```
-⚠️ driver — low bitrate
-    bitrate per megapixel
-      this file        417
-      normal     1400-8400
-    865 kbps at 1080x1920 · probably an already-compressed
-    copy · it will still run
+⚠️ driver — bitrate 3.4x below the lowest real driver here · your call
 ```
 
-Two functions, one judgment: `quality_warning` (plain, for logs and non-HTML
-callers) and `quality_warning_html` (returns markup — callers must **not**
-escape it). Both derive from `_per_megapixel`, and a test asserts they can never
-disagree about whether a file is bad, because one saying "fine" while the other
-says "compressed" is worse than either message alone. Further tests pin the raw
-kbps figure *out* of the aligned block and check that the quoted range still
-brackets the threshold it explains.
+A laid-out table was built first and rejected as too long: four of its six
+lines either restated `describe()`, which sits directly beside it, or explained
+a unit. The exact figures are not lost — `quality_warning` keeps every one of
+them for the logs, and the panel's collapsed block carries that sentence.
+
+"your call", not "it will still run": the threshold is a heuristic from one
+person's 64 files and it never blocks, so the line should say whose decision it
+is rather than report that the software is not stopping them. The user kept a
+flagged driver deliberately on 2026-08-31 after being shown the number, which
+is the outcome the design exists to allow.
+
+Two functions, one judgment: `quality_warning` (plain, every figure, for logs
+and non-HTML callers) and `quality_warning_html` (returns markup — callers must
+**not** escape it). Both derive from `_per_megapixel`, and a test asserts they
+can never disagree about whether a file is bad, because one saying "fine" while
+the other says "compressed" is worse than either message alone. Further tests
+keep every absolute figure *out* of the glance line, pin the ratio to the real
+arithmetic, check the quoted range still brackets the threshold it explains,
+and cover the video whose container reports no bitrate at all — where a ratio
+would otherwise render as "inf x below".
 
 The laid-out form appears on the panel and on the strip caption; the collapsed
 detail block keeps the plain sentence. Not a technical limit — `<pre>` nests
