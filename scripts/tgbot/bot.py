@@ -942,11 +942,22 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
         if data.startswith(_CB_SLOT):
             role = data[len(_CB_SLOT):]
             job = _job_for(chat_id)
+            queue = _PENDING.get(chat_id) or []
             if role not in _askable_roles(job.pipeline):
                 # Reachable from a keyboard minted before a /pipeline switch.
-                tg.send_message(chat_id,
-                                f"{role} is not a slot for {job.pipeline}")
-            elif not (_PENDING.get(chat_id) or []):
+                # The file is still waiting — re-ask with the buttons that
+                # match the pipeline now in effect instead of dead-ending on
+                # an error the user has no button to recover from.
+                if queue:
+                    path, p = queue[0]
+                    tg.send_message(chat_id,
+                                    f"{role} is not a slot for {job.pipeline} "
+                                    f"— asking again:")
+                    _ask_about(tg, chat_id, p, job.pipeline, path=path)
+                else:
+                    tg.send_message(chat_id,
+                                    f"{role} is not a slot for {job.pipeline}")
+            elif not queue:
                 tg.send_message(chat_id, "no file is waiting for a slot — that "
                                          "button is from an earlier question")
             else:
@@ -1322,7 +1333,7 @@ def _panel_text(chat_id: int, job: Job, *, with_pictures: bool = True) -> str:
         # material; what a picture cannot show is the flow, so that is what the
         # text carries, one line per job. Stems come back only when there is no
         # picture to identify anything by.
-        lines.append(f"🎬 <b>{len(queued)} jobs</b> · one pod")
+        lines.append(f"🎬 <b>{len(queued)} job(s)</b> · one pod")
         for index, other in enumerate(basket):
             line = f"{_row_mark(index)} {_flow(other.pipeline)}"
             if not with_pictures:
