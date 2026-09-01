@@ -1025,27 +1025,30 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
 
 
 def _offer_pipelines(tg: Tg, chat_id: int) -> None:
-    """List the pipelines with one button each, for the job on screen.
+    """Pick the flow for the job on screen — buttons only, no wall of text.
 
-    Listing beats guessing: the names are close enough to each other that
-    "swap-character-enhance" — what the user actually asked for on 2026-08-31
-    — is not any of them.
+    The first version printed all five pipelines with their stages and then
+    repeated the same five as buttons underneath, which is the same list twice
+    and neither copy readable. The button now carries the stages, because the
+    stages ARE the choice; the canonical name is what `/pipeline <name>` takes
+    and is not what anyone reads when deciding.
 
-    Shared by `/pipeline` and the ⚙️ button (2026-09-01). The button exists
-    because the choice is now PER JOB: open a queued job with its coloured
-    square, tap ⚙️, pick. Everything it changes lands on `_STATE`, which is
-    whichever job is open, so one flow serves the whole batch and nothing had
-    to be built for it beyond the button itself.
+    Shared by `/pipeline` and the ⚙️ button (2026-09-01). The choice is per
+    job: open a queued job with its coloured square, tap ⚙️, pick. Everything
+    it changes lands on `_STATE`, which is whichever job is open, so one flow
+    serves the whole batch.
     """
     job = _job_for(chat_id)
+    basket = _BASKET.get(chat_id) or []
+    # Which row of the sheet is being changed, when there is more than one.
+    where = f" {_row_mark(len(basket))}" if _jobs_for(chat_id)[1:] else ""
     tg.send_message(
         chat_id,
-        f"pipeline for the job on screen: {job.pipeline}\n\n" +
-        "\n".join(f"{'* ' if n == job.pipeline else '  '}{n}"
-                  f"  ({' -> '.join(PIPELINES[n])})"
-                  for n in sorted(PIPELINES)),
-        buttons=[[(n, _CB_PIPE + n)] for n in sorted(PIPELINES)
-                 if n != job.pipeline])
+        f"⚙️ <b>Flow for{where}</b>\n"
+        f"now: {_flow(job.pipeline)}  <i>({_esc(job.pipeline)})</i>",
+        buttons=[[(" → ".join(PIPELINES[name]), _CB_PIPE + name)]
+                 for name in sorted(PIPELINES) if name != job.pipeline],
+        parse_mode=PARSE_HTML)
 
 
 def _switch_pipeline_and_report(tg: Tg, chat_id: int, name: str) -> None:
@@ -1282,29 +1285,51 @@ def _panel_next_line(chat_id: int, job: Job) -> str:
     return f"{head} · not checked yet — see the message above"
 
 
-def _panel_text(chat_id: int, job: Job) -> str:
+def _flow(pipeline: str) -> str:
+    """A pipeline as its stages — what the run does, rather than its name.
+
+    `tryon → character-swap → enhance` instead of
+    `tryon-character-swap-enhance`: the same length, but the arrows say it is a
+    sequence, which is the thing actually being chosen.
+    """
+    return _esc(" → ".join(PIPELINES[pipeline]))
+
+
+def _panel_text(chat_id: int, job: Job, *, with_pictures: bool = True) -> str:
     """The panel body. Same vocabulary as the old review screen, one message."""
-    lines = [f"🎬 <b>{_esc(job.pipeline)}</b>", ""]
+    basket = _BASKET.get(chat_id) or []
+    queued = _jobs_for(chat_id)
+    lines: list[str] = []
+
+    if basket:
+        # The batch first, because it is what the money is mostly for: one pod,
+        # N videos.
+        #
+        # FILENAMES are deliberately not here (2026-09-01). Everything arrives
+        # from a phone, so they are all IMG_6781, IMG_6783 — the line cost a
+        # whole row and said nothing. The picture above identifies the
+        # material; what a picture cannot show is the flow, so that is what the
+        # text carries, one line per job. Stems come back only when there is no
+        # picture to identify anything by.
+        lines.append(f"🎬 <b>{len(queued)} jobs</b> · one pod")
+        for index, other in enumerate(basket):
+            line = f"{_row_mark(index)} {_flow(other.pipeline)}"
+            if not with_pictures:
+                line += "  <i>" + _esc(", ".join(Path(other.slots[role]).stem
+                                                 for role in sorted(other.slots))) + "</i>"
+            lines.append(line)
+        if len(queued) > len(basket):
+            # The job being edited is the LAST row of the sheet, so it takes
+            # the next square. Without this the picture has one more coloured
+            # bar than the list has squares and the mapping silently breaks.
+            lines.append(f"▸{_row_mark(len(basket))} {_flow(job.pipeline)}"
+                         "  <i>← open</i>")
+        lines.append("")
+    else:
+        lines += [f"🎬 <b>{_esc(job.pipeline)}</b>", ""]
+
     for role in sorted(required_roles(job.pipeline) | optional_roles(job.pipeline)):
         lines.append(_role_line(role, job))
-    basket = _BASKET.get(chat_id) or []
-    if basket:
-        # Listed above the slots, because it is what the money is mostly for:
-        # one pod, N videos. Each line names the material so a wrong entry is
-        # visible without opening anything.
-        lines += [""]
-        for index, other in enumerate(basket):
-            names = " · ".join(f"{ROLE_ICON.get(r, '')}{_esc(Path(other.slots[r]).stem)}"
-                               for r in sorted(other.slots))
-            lines.append(f"{_row_mark(index)} {names}")
-            if other.pipeline != job.pipeline:
-                lines.append(f"    <i>{_esc(other.pipeline)}</i>")
-        queued_now = _jobs_for(chat_id)
-        if len(queued_now) > len(basket):
-            # The job being edited is the LAST row of the sheet, so it gets the
-            # next square. Without this the picture has one more coloured bar
-            # than the list has squares, and the mapping silently breaks.
-            lines.append(f"{_row_mark(len(basket))} <i>this one</i>")
     lines += ["", _panel_next_line(chat_id, job)]
 
     if basket and _STATE.get(chat_id) is not None and not missing_slots(job) \
@@ -1314,10 +1339,10 @@ def _panel_text(chat_id: int, job: Job) -> str:
         # changes something — and running it would pay twice for one video.
         lines.append("<i>same as an entry above — change something, or just Run</i>")
 
-    queued = _PENDING.get(chat_id) or []
-    if queued:
+    pending = _PENDING.get(chat_id) or []
+    if pending:
         lines += ["", f"⏳ waiting for a label: "
-                      f"{_esc(', '.join(q[0].name for q in queued))}"]
+                      f"{_esc(', '.join(q[0].name for q in pending))}"]
     # Repeated OUTSIDE the collapsed block, as the review screen already did:
     # this is the last thing read before $0.99/hour is committed, and anything
     # that needs a tap to reveal is something that gets skipped.
@@ -1670,12 +1695,14 @@ def _show_panel(tg: Tg, chat_id: int, *, note: str = "",
         return
     if note:
         _PANEL_NOTE[chat_id] = note
-    text = _panel_text(chat_id, job)
-    buttons = _panel_buttons(chat_id, job)
     message_id = _PANEL.get(chat_id)
     was_photo = chat_id in _PANEL_IS_PHOTO
 
+    # The sheet is built BEFORE the text, because the text says less when there
+    # is a picture: filenames only come back when nothing else identifies a job.
     shot = _sheet_for(chat_id)
+    text = _panel_text(chat_id, job, with_pictures=shot is not None)
+    buttons = _panel_buttons(chat_id, job)
     key = _sheet_key(chat_id) if shot is not None else None
     merged = shot is not None and _caption_fits(text)
 

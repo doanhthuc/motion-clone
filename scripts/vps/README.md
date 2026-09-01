@@ -208,8 +208,29 @@ the only thing pinning the bot to one.
   with the bars down the picture. The slot buttons are icon-only for the same
   budget: four named buttons two per row cost half the keyboard, and the icons
   are the ones already printed beside each role name a few lines above.
+- **The batch list names flows, not files.** Every upload from a phone is
+  `IMG_6781`, so listing filenames cost a row per job and said nothing. The
+  picture identifies the material; what a picture cannot show is the flow, so
+  that is what the text carries — one line per job, with the open one marked:
+
+  ```
+  🎬 3 jobs · one pod
+  🟦 tryon → motion → enhance
+  🟧 tryon → motion → enhance
+  ▸🟩 tryon → character-swap → enhance  ← open
+  ```
+
+  Stems come back only when no sheet could be built, since then the text is the
+  only thing telling the jobs apart.
 - **Each job carries its own pipeline.** Open a job with its square, tap `⚙️`,
   pick — the choice lands on whichever job is open, so a batch can mix flows.
+  The chooser is buttons carrying the **stages**, because the stages are the
+  choice; it used to print all five pipelines as prose and then repeat the same
+  five as buttons, which is one list twice and neither copy readable. The
+  pipeline in force is still named in the header, so `/pipeline <name>` stays
+  usable — and the test that guarded against inventing a name now asserts that
+  every real pipeline is *offered by tap*, which is the protection that
+  actually mattered.
   That is this repo's own A/B method: the same material through
   `tryon-motion-enhance` and `tryon-character-swap-enhance`, on one pod, for one
   provisioning. Nothing was built for it beyond the button; `_switch_pipeline`

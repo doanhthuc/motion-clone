@@ -447,8 +447,17 @@ class TestPipelineCommand(unittest.TestCase):
         # "swap-character-enhance", which is not any of them.
         tg = FakeTg()
         bot.handle(tg, cmd_from(ME, "/pipeline"), allowed_user_id=ME)
-        self.assertIn("tryon-motion-enhance", tg.messages[0])
-        self.assertIn("character-swap-enhance", tg.messages[0])
+        # The protection this test was written for is that a real pipeline is
+        # never something you have to GUESS the name of — the user once asked
+        # for "swap-character-enhance", which is none of them. Since 2026-09-01
+        # the buttons carry the stages rather than the names, so the assertion
+        # is on the affordance: every pipeline is offered, by tap.
+        offered = {d[len(bot._CB_PIPE):] for d in tg.callback_data()
+                   if d.startswith(bot._CB_PIPE)}
+        current = bot._STATE[ME].pipeline if ME in bot._STATE else bot._DEFAULT_PIPELINE
+        self.assertEqual(offered, set(bot.PIPELINES) - {current})
+        # And the one in force is named, so /pipeline <name> stays usable.
+        self.assertIn(current, tg.messages[0])
         self.assertNotIn("swap-character-enhance", tg.messages[0])
 
     def test_an_unknown_name_is_refused_and_changes_nothing(self):
@@ -668,7 +677,8 @@ class TestDraftPersistence(unittest.TestCase):
         self._restart()
         tg = FakeTg()
         bot.handle(tg, cmd_from(ME, "/pipeline"), allowed_user_id=ME)
-        self.assertIn("tryon-character-swap-enhance", tg.messages[0])
+        self.assertIn("tryon-character-swap-enhance", tg.messages[0],
+                      "the pipeline in force is not named")
 
     def test_handle_saves_even_when_the_handler_raises(self):
         # main() logs and continues past a failing update, so a draft change
