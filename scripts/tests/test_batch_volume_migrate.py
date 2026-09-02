@@ -117,5 +117,117 @@ class TestMainDryRun(unittest.TestCase):
         self.assertEqual(rc, 1)
 
 
+class TestCountPendingChanges(unittest.TestCase):
+    def test_a_clean_verify_with_only_the_directory_line_is_zero(self):
+        # Real rsync -avnc output when nothing differs: -a always lists the
+        # top-level directory itself even when its contents are identical.
+        output = "./\n\nsent 123 bytes  received 45 bytes  336.00 bytes/sec\n" \
+                "total size is 79000000000  speedup is 999999.00 (DRY RUN)\n"
+        self.assertEqual(volume_migrate.count_pending_changes(output), 0)
+
+    def test_one_changed_file_counts_as_one(self):
+        output = "./\nmodel1.safetensors\n\nsent 123 bytes  received 45 bytes\n"
+        self.assertEqual(volume_migrate.count_pending_changes(output), 1)
+
+    def test_several_changed_files_and_a_nested_path_all_count(self):
+        output = ("./\nmodel1.safetensors\nsubdir/\nsubdir/model2.gguf\n\n"
+                  "sent 123 bytes  received 45 bytes\n")
+        self.assertEqual(volume_migrate.count_pending_changes(output), 3)
+
+    def test_completely_empty_output_is_zero_not_an_error(self):
+        self.assertEqual(volume_migrate.count_pending_changes(""), 0)
+
+    def test_real_gnu_rsync_3_2_7_clean_output_is_zero(self):
+        # Captured verbatim from `rsync -avnc` (GNU rsync 3.2.7, Debian 12,
+        # 2026-09-02) on two identical directories. Unlike the hand-written
+        # fixture above, real rsync's default incremental-recursion sender
+        # prints "sending incremental file list" FIRST, and in this run
+        # never even printed "./" at all — both must be handled.
+        output = ("sending incremental file list\n\n"
+                  "sent 164 bytes  received 13 bytes  354.00 bytes/sec\n"
+                  "total size is 12  speedup is 0.07 (DRY RUN)\n")
+        self.assertEqual(volume_migrate.count_pending_changes(output), 0)
+
+    def test_real_gnu_rsync_header_line_with_one_changed_file(self):
+        # Same real-rsync capture, this time with one file actually changed.
+        output = ("sending incremental file list\n"
+                  "file1.txt\n\n"
+                  "sent 179 bytes  received 20 bytes  398.00 bytes/sec\n"
+                  "total size is 14  speedup is 0.07 (DRY RUN)\n")
+        self.assertEqual(volume_migrate.count_pending_changes(output), 1)
+
+    def test_header_line_and_directory_line_together_do_not_double_count(self):
+        output = ("sending incremental file list\n"
+                  "./\n"
+                  "model1.safetensors\n\n"
+                  "sent 123 bytes  received 45 bytes\n")
+        self.assertEqual(volume_migrate.count_pending_changes(output), 1)
+
+    def test_an_extra_blank_line_before_the_summary_does_not_undercount(self):
+        # Nothing guarantees rsync only ever emits exactly one blank line
+        # right before "sent" — a parser that stops at the FIRST blank line
+        # would silently drop every change reported after an earlier one.
+        output = ("sending incremental file list\n"
+                  "model1.safetensors\n\n"
+                  "subdir/model2.gguf\n\n"
+                  "sent 123 bytes  received 45 bytes\n")
+        self.assertEqual(volume_migrate.count_pending_changes(output), 2)
+
+    def test_windows_style_line_endings_are_handled(self):
+        output = ("./\r\nmodel1.safetensors\r\n\r\n"
+                  "sent 123 bytes  received 45 bytes\r\n")
+        self.assertEqual(volume_migrate.count_pending_changes(output), 1)
+
+
+class TestSyncAndVerify(unittest.TestCase):
+    def test_sync_runs_one_ssh_per_subdir_from_pod_a(self):
+        fake_proc = mock.Mock()
+        fake_proc.wait.return_value = 0
+        with mock.patch("subprocess.Popen", return_value=fake_proc) as mock_popen:
+            volume_migrate.sync("host-a", 1001, "host-b", 1002, ["loras", "checkpoints"])
+        self.assertEqual(mock_popen.call_count, 2)
+        first_call_argv = mock_popen.call_args_list[0].args[0]
+        self.assertIn("root@host-a", first_call_argv)
+
+    def test_sync_raises_if_any_leg_exits_non_zero(self):
+        fake_proc = mock.Mock()
+        fake_proc.wait.return_value = 1
+        with mock.patch("subprocess.Popen", return_value=fake_proc):
+            with self.assertRaises(RuntimeError):
+                volume_migrate.sync("host-a", 1001, "host-b", 1002, ["loras"])
+
+    def test_verify_sums_pending_changes_across_every_subdir(self):
+        clean = mock.Mock(stdout="./\n\nsent 1 bytes\n")
+        dirty = mock.Mock(stdout="./\nfile.gguf\n\nsent 1 bytes\n")
+        with mock.patch("subprocess.run", side_effect=[clean, dirty]):
+            total = volume_migrate.verify("host-a", 1001, "host-b", 1002,
+                                          ["loras", "checkpoints"])
+        self.assertEqual(total, 1)
+
+
+class TestKeyExchange(unittest.TestCase):
+    def test_make_temp_keypair_creates_a_private_and_public_file(self):
+        priv, pub = volume_migrate.make_temp_keypair()
+        self.assertTrue(priv.is_file())
+        self.assertTrue(pub.is_file())
+        self.assertEqual(pub.name, priv.name + ".pub")
+
+    def test_install_key_on_pipes_the_public_key_over_stdin(self):
+        priv, pub = volume_migrate.make_temp_keypair()
+        with mock.patch("subprocess.run") as mock_run:
+            volume_migrate.install_key_on("host-b", 1002, pub)
+        self.assertEqual(mock_run.call_args.kwargs.get("input"), pub.read_text())
+
+
+class TestExistingSubdirs(unittest.TestCase):
+    def test_only_returns_subdirs_that_are_actually_present(self):
+        listing = mock.Mock(stdout="loras\ncheckpoints\nsome_other_dir\n")
+        with mock.patch("subprocess.run", return_value=listing):
+            present = volume_migrate.existing_subdirs("host-a", 1001)
+        self.assertIn("loras", present)
+        self.assertIn("checkpoints", present)
+        self.assertNotIn("some_other_dir", present)
+
+
 if __name__ == "__main__":
     unittest.main()
