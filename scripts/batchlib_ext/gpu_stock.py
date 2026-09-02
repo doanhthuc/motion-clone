@@ -42,7 +42,11 @@ def volume_datacenter(volume_id: str) -> str | None:
         if out.returncode != 0:
             return None
         data = json.loads(out.stdout or "{}")
-    except (subprocess.SubprocessError, json.JSONDecodeError):
+    # OSError (FileNotFoundError if runpodctl itself is missing from PATH,
+    # PermissionError, ...) is a SIBLING of subprocess.SubprocessError, not
+    # a subclass — catching only the latter let a missing binary raise
+    # straight through this "never raises" function.
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
         return None
     return data.get("dataCenterId") or data.get("datacenterId") or None
 
@@ -57,8 +61,16 @@ def stock_at(gpu_ids: list[str]) -> dict[str, list[Stock]]:
     how to rank/highlight them. A gpu_id runpodctl does not currently list
     at all is simply absent from the result.
     """
-    out = subprocess.run(["runpodctl", "gpu", "list", "-o", "json"],
-                         capture_output=True, text=True, timeout=_TIMEOUT_SEC)
+    try:
+        out = subprocess.run(["runpodctl", "gpu", "list", "-o", "json"],
+                             capture_output=True, text=True, timeout=_TIMEOUT_SEC)
+    except (OSError, subprocess.SubprocessError) as exc:
+        # Same OSError-vs-SubprocessError split as volume_datacenter above,
+        # but this function DOES raise on failure (its callers decide how
+        # to degrade) — so a missing/hung runpodctl has to become the same
+        # RuntimeError the returncode/JSON checks below already raise,
+        # rather than a different exception type callers didn't ask for.
+        raise RuntimeError(f"could not run runpodctl: {exc}") from exc
     if out.returncode != 0:
         raise RuntimeError(f"runpodctl gpu list failed: {out.stderr.strip()}")
     try:

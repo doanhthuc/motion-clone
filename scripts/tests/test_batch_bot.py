@@ -3,6 +3,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from batchlib.config import env_get
 from batchlib.manifest import state_path_for
 from batchlib_ext.gpu_stock import Stock
 import tgbot.bot as bot
@@ -1250,7 +1251,9 @@ class TestFlow(unittest.TestCase):
 
     def test_the_run_button_needs_a_second_tap_before_it_spends(self):
         with mock.patch("tgbot.bot.start_drain") as start_drain, \
-             mock.patch("tgbot.bot.drain_running", return_value=False):
+             mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value=None), \
+             mock.patch("tgbot.bot.stock_at", return_value={}):
             self._fill_required_slots()
             bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
             start_drain.assert_not_called()     # first tap only asks
@@ -1260,6 +1263,102 @@ class TestFlow(unittest.TestCase):
                        allowed_user_id=ME)
             start_drain.assert_called_once()
             self.assertIs(start_drain.call_args.kwargs["dry_run"], False)
+
+    # ---- [Run]'s GPU-stock check (added 2026-09-02) -----------------------
+
+    def _stock_5090_low_4090_ok(self):
+        return {
+            "NVIDIA GeForce RTX 5090": [
+                Stock(gpu_id="NVIDIA GeForce RTX 5090",
+                                   display_name="RTX 5090", price_per_hr=0.99,
+                                   datacenter_id="EU-RO-1", stock_status="Low"),
+            ],
+            "NVIDIA GeForce RTX 4090": [
+                Stock(gpu_id="NVIDIA GeForce RTX 4090",
+                                   display_name="RTX 4090", price_per_hr=0.74,
+                                   datacenter_id="EU-RO-1", stock_status="Medium"),
+            ],
+            "NVIDIA RTX PRO 4500 Blackwell": [
+                Stock(gpu_id="NVIDIA RTX PRO 4500 Blackwell",
+                                   display_name="RTX PRO 4500", price_per_hr=0.72,
+                                   datacenter_id="EU-RO-1", stock_status="Low"),
+            ],
+        }
+
+    def test_a_low_configured_gpu_offers_a_same_datacenter_switch(self):
+        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at",
+                       return_value=self._stock_5090_low_4090_ok()):
+            self._fill_required_slots()
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
+        text = self.tg.messages[-1]
+        self.assertIn("Low", text)
+        self.assertIn("EU-RO-1", text)
+        offered = self.tg.buttons[-1]
+        flat_data = [data for row in offered for _, data in row]
+        self.assertIn(bot._CB_RUN_SWITCH + "4090", flat_data)
+        # PRO 4500 is ALSO Low at home — not offered as a switch target.
+        self.assertNotIn(bot._CB_RUN_SWITCH + "pro4500", flat_data)
+        self.assertTrue(any(d.startswith(bot._CB_RUN_GO) for d in flat_data))
+        self.assertIn(bot._CB_RUN_NO, flat_data)
+
+    def test_tapping_switch_writes_env_and_shows_the_new_price(self):
+        (self.root / ".env").write_text(
+            "GPU=NVIDIA GeForce RTX 5090\nPOD_VOLUME_ID=vol-1\n", encoding="utf-8")
+        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at",
+                       return_value=self._stock_5090_low_4090_ok()):
+            self._fill_required_slots()
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_SWITCH + "4090"),
+                      allowed_user_id=ME)
+        self.assertEqual(env_get(self.root / ".env", "GPU"),
+                         "NVIDIA GeForce RTX 4090")
+        # 4090 is Medium at home, so the re-offer lands on the plain
+        # $-confirm, not another switch prompt.
+        self.assertIn("$0.74/hour", self.tg.messages[-1])
+        self.assertIn("Yes, spend $0.74/h",
+                      [label for row in self.tg.buttons[-1] for label, _ in row])
+
+    def test_rent_anyway_still_starts_the_drain_at_the_original_price(self):
+        with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at",
+                       return_value=self._stock_5090_low_4090_ok()):
+            self._fill_required_slots()
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
+            token = bot._run_token(ME)
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_GO + token),
+                       allowed_user_id=ME)
+        start_drain.assert_called_once()
+
+    def test_no_stock_anywhere_at_home_mentions_the_other_region_not_a_button(self):
+        no_stock = {
+            gpu: [Stock(gpu_id=gpu, display_name=gpu, price_per_hr=0.5,
+                       datacenter_id="EU-RO-1", stock_status="Low")]
+            for gpu in (bot._PRIMARY_GPU_ID, *bot._FALLBACK_GPU_IDS)
+        }
+        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at", return_value=no_stock):
+            self._fill_required_slots()
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
+        text = self.tg.messages[-1]
+        self.assertIn("EU-CZ-1", text)
+        self.assertIn("25-30 min", text)
+        flat_data = [data for row in self.tg.buttons[-1] for _, data in row]
+        self.assertFalse(any(d.startswith(bot._CB_RUN_SWITCH) for d in flat_data))
+
+    def test_a_stock_check_failure_fails_open_to_the_plain_confirm(self):
+        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at", side_effect=RuntimeError("boom")):
+            self._fill_required_slots()
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
+        self.assertIn("$0.99/hour", self.tg.messages[-1])
 
     def test_a_run_button_from_a_changed_job_cannot_spend(self):
         """The stale-keyboard guard, and the reason _run_token exists.

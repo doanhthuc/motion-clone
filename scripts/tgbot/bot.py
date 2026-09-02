@@ -25,7 +25,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from batchlib.config import env_get
+from batchlib.config import env_get, env_set
 from batchlib.manifest import load_state, state_path_for
 from batchlib.pipelines import PIPELINES, optional_roles, required_roles
 # Not `from batchlib_ext...` or `scripts/batchlib/...` — drain.py itself lives
@@ -1058,6 +1058,7 @@ _CB_PIPE = "pipe:"
 _CB_RUN_ASK = "run:ask"
 _CB_RUN_GO = "run:go:"      # + the manifest's mtime_ns, see _run_token
 _CB_RUN_NO = "run:no"
+_CB_RUN_SWITCH = "run:sw:"  # + a key from _GPU_SHORT
 _CB_REDO = "redo:"
 _CB_CLEAR_ASK = "clr:ask"
 _CB_CLEAR_GO = "clr:go"
@@ -1146,12 +1147,18 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
             else:
                 # The second step. Deliberately a separate tap: the first one
                 # is next to the manifest and easy to hit by accident.
-                tg.send_message(
-                    chat_id,
-                    "This rents a GPU pod at $0.99/hour and starts the job.\n"
-                    "Confirm?",
-                    buttons=[[("Yes, spend $0.99/h", _CB_RUN_GO + _run_token(chat_id)),
-                              ("Cancel", _CB_RUN_NO)]])
+                _offer_run_confirm(tg, chat_id)
+
+        elif data.startswith(_CB_RUN_SWITCH):
+            gpu_id = _GPU_BY_SHORT.get(data[len(_CB_RUN_SWITCH):])
+            if gpu_id is None:
+                tg.send_message(chat_id, "that button is from an older "
+                                         "version of the bot; tap Run again")
+            else:
+                env_set(ROOT / ".env", "GPU", gpu_id)
+                tg.send_message(chat_id, f"switched — GPU is now {_esc(gpu_id)}",
+                                parse_mode=PARSE_HTML)
+                _offer_run_confirm(tg, chat_id)
 
         elif data.startswith(_CB_RUN_GO):
             if data[len(_CB_RUN_GO):] != _run_token(chat_id):
@@ -2389,6 +2396,12 @@ _PRIMARY_GPU_ID = "NVIDIA GeForce RTX 5090"
 # observed as noticeably slower in real use.
 _FALLBACK_GPU_IDS = ("NVIDIA GeForce RTX 4090", "NVIDIA RTX PRO 4500 Blackwell")
 
+# callback_data stays short (Bot API caps it at 64 bytes) — a switch button
+# carries one of these keys, never the full gpuId string.
+_GPU_SHORT = {_PRIMARY_GPU_ID: "5090", "NVIDIA GeForce RTX 4090": "4090",
+             "NVIDIA RTX PRO 4500 Blackwell": "pro4500"}
+_GPU_BY_SHORT = {v: k for k, v in _GPU_SHORT.items()}
+
 # runpodctl's own stock words, ranked best-first — used only to sort the
 # "other regions" list so the most promising alternative surfaces first.
 _STOCK_RANK = {"high": 0, "medium": 1, "low": 2, "none": 3}
@@ -2465,6 +2478,80 @@ def _report_gpu_stock(tg: Tg, chat_id: int) -> None:
         lines.extend(other_lines)
 
     tg.send_message(chat_id, "\n".join(lines), parse_mode=PARSE_HTML)
+
+
+def _gpu_price(gpu_id: str, stock: dict) -> float:
+    """The configured GPU's own $/h, from the stock check just made —
+    never a second runpodctl round trip. $0.99 (the 5090's own price) is
+    the fallback for when the check itself failed or the id is unlisted,
+    matching what [Run] has always quoted rather than inventing a new
+    default.
+    """
+    entries = stock.get(gpu_id)
+    return entries[0].price_per_hr if entries and entries[0].price_per_hr else 0.99
+
+
+def _offer_run_confirm(tg: Tg, chat_id: int) -> None:
+    """The step between [Run] and spending money (2026-09-02): checks stock
+    for the GPU that would actually be rented, and offers a same-datacenter
+    switch when it reads Low/none, instead of finding out only after
+    [Confirm] has already started the drain.
+
+    Deliberately does NOT try to move the rental to a different
+    DATACENTER automatically, even though the 5090 does exist at EU-CZ-1
+    (docs/gpu-pod.md) — that needs the Network Volume synced there first,
+    a ~25-30 minute, multi-pod runbook with no safe one-tap version. /gpu
+    already surfaces it as information; this only ever switches the GPU
+    TYPE, never the datacenter, so it only ever rewrites .env's GPU= to
+    something the SAME pod-provision.sh call would already rent correctly.
+
+    A stock-check failure fails OPEN (falls through to the plain
+    confirm): an informational check must never be the reason [Run]
+    itself stops working.
+    """
+    configured = env_get(ROOT / ".env", "GPU") or _PRIMARY_GPU_ID
+    volume_id = env_get(ROOT / ".env", "POD_VOLUME_ID")
+    home_dc = volume_datacenter(volume_id)
+    try:
+        stock = stock_at([configured, *_FALLBACK_GPU_IDS])
+    except RuntimeError:
+        stock = {}
+
+    price = _gpu_price(configured, stock)
+    home = next((e for e in (stock.get(configured) or [])
+                if home_dc and e.datacenter_id == home_dc), None)
+    if home is None or home.stock_status.lower() in ("high", "medium"):
+        tg.send_message(
+            chat_id,
+            f"This rents a GPU pod at ${price:.2f}/hour and starts the job.\n"
+            "Confirm?",
+            buttons=[[(f"Yes, spend ${price:.2f}/h", _CB_RUN_GO + _run_token(chat_id)),
+                      ("Cancel", _CB_RUN_NO)]])
+        return
+
+    icon = _STOCK_ICON.get(home.stock_status.lower(), "⬜")
+    lines = [f"{icon} <b>{_esc(configured)}</b> is {_esc(home.stock_status)} "
+            f"at {_esc(home_dc)} right now — renting may queue or fail."]
+    switch_row = []
+    for gpu_id in _FALLBACK_GPU_IDS:
+        if gpu_id == configured:
+            continue
+        alt = next((e for e in (stock.get(gpu_id) or [])
+                    if e.datacenter_id == home_dc), None)
+        short = _GPU_SHORT.get(gpu_id)
+        if alt is not None and short and alt.stock_status.lower() in ("high", "medium"):
+            switch_row.append((f"Switch to {alt.display_name} "
+                              f"(${alt.price_per_hr:.2f}/h)",
+                              _CB_RUN_SWITCH + short))
+    if not switch_row:
+        lines.append("No fallback has better stock at this datacenter either. "
+                     "5090 is also at EU-CZ-1, but that needs the volume "
+                     "synced there first (~25-30 min) — see docs/gpu-pod.md.")
+
+    buttons = [switch_row] if switch_row else []
+    buttons.append([(f"Rent anyway (${price:.2f}/h)", _CB_RUN_GO + _run_token(chat_id)),
+                    ("Cancel", _CB_RUN_NO)])
+    tg.send_message(chat_id, "\n".join(lines), parse_mode=PARSE_HTML, buttons=buttons)
 
 
 def _ask_kill(tg: Tg, chat_id: int) -> None:

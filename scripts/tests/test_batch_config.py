@@ -2,7 +2,7 @@ import sys, unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from batchlib.config import ConfigError, Settings, env_get, load_settings
+from batchlib.config import ConfigError, Settings, env_get, env_set, load_settings
 
 
 def _write(root: Path, root_env: str, motions_env: str = "") -> None:
@@ -44,6 +44,49 @@ class TestEnvGet(unittest.TestCase):
 
     def test_file_khong_ton_tai_tra_rong_khong_no(self):
         self.assertEqual(env_get(Path("/khong/co/that/.env"), "DOMAIN"), "")
+
+
+class TestEnvSet(unittest.TestCase):
+    """env_set — added 2026-09-02 so /gpu's Run-time flow can switch GPU=
+    itself, mirroring pod-provision.sh's own env_set (its only prior
+    implementation)."""
+
+    def test_replaces_an_existing_key_in_place(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / ".env"
+            p.write_text("A=one\nGPU=NVIDIA GeForce RTX 5090\nB=two\n",
+                        encoding="utf-8")
+            env_set(p, "GPU", "NVIDIA GeForce RTX 4090")
+            self.assertEqual(env_get(p, "GPU"), "NVIDIA GeForce RTX 4090")
+            # Neighbouring keys untouched, same order.
+            self.assertEqual(p.read_text(encoding="utf-8"),
+                            "A=one\nGPU=NVIDIA GeForce RTX 4090\nB=two\n")
+
+    def test_appends_when_the_key_is_missing(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / ".env"
+            p.write_text("A=one\n", encoding="utf-8")
+            env_set(p, "GPU", "NVIDIA GeForce RTX 4090")
+            self.assertEqual(env_get(p, "GPU"), "NVIDIA GeForce RTX 4090")
+            self.assertEqual(p.read_text(encoding="utf-8"),
+                            "A=one\nGPU=NVIDIA GeForce RTX 4090\n")
+
+    def test_works_against_a_file_that_does_not_exist_yet(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / ".env"
+            env_set(p, "GPU", "NVIDIA GeForce RTX 4090")
+            self.assertEqual(env_get(p, "GPU"), "NVIDIA GeForce RTX 4090")
+
+    def test_no_leftover_tmp_file(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / ".env"
+            p.write_text("A=one\n", encoding="utf-8")
+            env_set(p, "GPU", "NVIDIA GeForce RTX 4090")
+            self.assertFalse((Path(d) / ".env.tmp").exists())
 
 
 class TestLoadSettings(unittest.TestCase):
