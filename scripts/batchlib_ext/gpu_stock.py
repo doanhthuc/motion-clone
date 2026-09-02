@@ -21,6 +21,7 @@ class Stock:
     gpu_id: str
     display_name: str
     price_per_hr: float | None
+    datacenter_id: str
     stock_status: str   # runpodctl's own spelling: "High" / "Medium" / "Low" / "none"
 
 
@@ -46,16 +47,15 @@ def volume_datacenter(volume_id: str) -> str | None:
     return data.get("dataCenterId") or data.get("datacenterId") or None
 
 
-def stock_at(gpu_ids: list[str], datacenter_id: str | None) -> dict[str, Stock]:
-    """One Stock per requested gpu_id.
+def stock_at(gpu_ids: list[str]) -> dict[str, list[Stock]]:
+    """Every datacenter each requested gpu_id is listed at, stock included.
 
-    `stock_status` is narrowed to `datacenter_id` when one is given — a GPU
-    can read High overall while being `none` at the one datacenter that
-    actually matters, which is exactly the case the volume-locked deploy
-    (docs/gpu-pod.md) needs to see rather than the marketing-page number.
-    A gpu_id runpodctl does not currently list at all is simply absent from
-    the result — the caller decides how to word that, this module only
-    reports what it saw.
+    One entry per (gpu, datacenter) pair rather than a single collapsed
+    status: renting outside the Network Volume's own datacenter is a real
+    option here (docs/gpu-pod.md's EU-CZ-1 failover), so the caller needs
+    to see every candidate, not just the one that matters most, and decide
+    how to rank/highlight them. A gpu_id runpodctl does not currently list
+    at all is simply absent from the result.
     """
     out = subprocess.run(["runpodctl", "gpu", "list", "-o", "json"],
                          capture_output=True, text=True, timeout=_TIMEOUT_SEC)
@@ -67,18 +67,17 @@ def stock_at(gpu_ids: list[str], datacenter_id: str | None) -> dict[str, Stock]:
         raise RuntimeError(f"runpodctl returned invalid JSON: {exc}") from exc
 
     wanted = set(gpu_ids)
-    result: dict[str, Stock] = {}
+    result: dict[str, list[Stock]] = {}
     for row in rows:
         gpu_id = row.get("gpuId")
         if gpu_id not in wanted:
             continue
-        status = row.get("stockStatus", "none")
-        if datacenter_id:
-            per_dc = {d.get("dataCenterId"): d.get("stockStatus")
-                     for d in row.get("dataCenterAvailability") or []}
-            status = per_dc.get(datacenter_id, "none")
-        result[gpu_id] = Stock(gpu_id=gpu_id,
-                               display_name=row.get("displayName", gpu_id),
-                               price_per_hr=row.get("securePricePerHr"),
-                               stock_status=status)
+        entries = [
+            Stock(gpu_id=gpu_id, display_name=row.get("displayName", gpu_id),
+                 price_per_hr=row.get("securePricePerHr"),
+                 datacenter_id=dc.get("dataCenterId", "?"),
+                 stock_status=dc.get("stockStatus", "none"))
+            for dc in row.get("dataCenterAvailability") or []
+        ]
+        result[gpu_id] = entries
     return result

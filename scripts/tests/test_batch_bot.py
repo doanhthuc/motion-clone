@@ -3038,26 +3038,65 @@ class TestGpuStockCommand(unittest.TestCase):
         (self.root / ".env").write_text(
             f"GPU={gpu}\nPOD_VOLUME_ID=vol-1\n", encoding="utf-8")
 
-    def test_reports_the_configured_gpu_and_the_fallback(self):
-        self._write_env()
-        stock = {
-            "NVIDIA GeForce RTX 5090": Stock(
-                gpu_id="NVIDIA GeForce RTX 5090", display_name="RTX 5090",
-                price_per_hr=0.99, stock_status="Low"),
-            bot._FALLBACK_GPU_ID: Stock(
-                gpu_id=bot._FALLBACK_GPU_ID, display_name="RTX PRO 4500",
-                price_per_hr=0.72, stock_status="High"),
+    def _stock(self):
+        return {
+            "NVIDIA GeForce RTX 5090": [
+                Stock(gpu_id="NVIDIA GeForce RTX 5090", display_name="RTX 5090",
+                     price_per_hr=0.99, datacenter_id="EU-RO-1", stock_status="Low"),
+                Stock(gpu_id="NVIDIA GeForce RTX 5090", display_name="RTX 5090",
+                     price_per_hr=0.99, datacenter_id="EU-CZ-1", stock_status="High"),
+            ],
+            "NVIDIA GeForce RTX 4090": [
+                Stock(gpu_id="NVIDIA GeForce RTX 4090", display_name="RTX 4090",
+                     price_per_hr=0.74, datacenter_id="EU-RO-1", stock_status="Medium"),
+            ],
+            "NVIDIA RTX PRO 4500 Blackwell": [
+                Stock(gpu_id="NVIDIA RTX PRO 4500 Blackwell",
+                     display_name="RTX PRO 4500", price_per_hr=0.72,
+                     datacenter_id="EU-RO-1", stock_status="High"),
+            ],
         }
+
+    def test_reports_the_configured_gpu_and_both_fallbacks_at_home(self):
+        self._write_env()
         with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
-             mock.patch("tgbot.bot.stock_at", return_value=stock) as stock_at:
+             mock.patch("tgbot.bot.stock_at", return_value=self._stock()) as stock_at:
             bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
         stock_at.assert_called_once_with(
-            ["NVIDIA GeForce RTX 5090", bot._FALLBACK_GPU_ID], "EU-RO-1")
+            ["NVIDIA GeForce RTX 5090", "NVIDIA GeForce RTX 4090",
+             "NVIDIA RTX PRO 4500 Blackwell"])
         text = self.tg.messages[-1]
+        self.assertIn("📍", text)
         self.assertIn("EU-RO-1", text)
         self.assertIn("Low", text)
+        self.assertIn("RTX 4090", text)
+        self.assertIn("Medium", text)
         self.assertIn("RTX PRO 4500", text)
         self.assertIn("High", text)
+
+    def test_a_better_region_elsewhere_is_listed_and_captioned_as_not_instant(self):
+        self._write_env()
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at", return_value=self._stock()):
+            bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
+        text = self.tg.messages[-1]
+        self.assertIn("Other regions", text)
+        self.assertIn("EU-CZ-1", text)
+        # ~25-30 min sync — this is not a same-speed alternative.
+        self.assertIn("25-30 min", text)
+
+    def test_unknown_home_datacenter_shows_every_region_without_a_false_claim(self):
+        self._write_env()
+        with mock.patch("tgbot.bot.volume_datacenter", return_value=None), \
+             mock.patch("tgbot.bot.stock_at", return_value=self._stock()):
+            bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
+        text = self.tg.messages[-1]
+        self.assertIn("volume datacenter unknown", text)
+        # Never claims a region was checked and found absent when the home
+        # datacenter itself was never known.
+        self.assertNotIn("not offered here", text)
+        self.assertIn("EU-RO-1", text)
+        self.assertIn("EU-CZ-1", text)
 
     def test_missing_gpu_id_from_env_refuses_up_front(self):
         (self.root / ".env").write_text("", encoding="utf-8")

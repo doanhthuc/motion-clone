@@ -2369,42 +2369,83 @@ def _wipe_chat(tg: Tg, chat_id: int) -> None:
     tg.send_message(chat_id, report, parse_mode=PARSE_HTML)
 
 
-# The fallback card (2026-09-02): half the price of the 5090 and roughly 2x
-# slower on a real render, picked by hand in .env when EU-RO-1 reads Low/none
-# — docs/gpu-pod.md's own measured comparison. Reported here unconditionally
-# so a Low reading on the primary card comes with the one alternative that
-# actually mounts the volume, not just a bare warning.
-_FALLBACK_GPU_ID = "NVIDIA RTX PRO 4500 Blackwell"
+# Fallback cards (2026-09-02), picked by hand in .env — pod-provision.sh
+# dropped GPU_FALLBACK on purpose, so /gpu exists to inform that hand-pick
+# rather than let it be a guess. RTX 4090 first: docs/gpu-pod.md's own
+# measured comparison (10/08/2026) found it only 1.48x slower on the same
+# real job (443.75s -> 656s) and confirmed it runs Wan2.2 Animate correctly
+# — a measured number, not an assumption. RTX PRO 4500 second: half the
+# 5090's price, but its render time has never been measured in this repo,
+# only observed as noticeably slower in real use.
+_FALLBACK_GPU_IDS = ("NVIDIA GeForce RTX 4090", "NVIDIA RTX PRO 4500 Blackwell")
+
+# runpodctl's own stock words, ranked best-first — used only to sort the
+# "other regions" list so the most promising alternative surfaces first.
+_STOCK_RANK = {"high": 0, "medium": 1, "low": 2, "none": 3}
 
 
 def _report_gpu_stock(tg: Tg, chat_id: int) -> None:
-    """Live RunPod stock for the configured GPU and its fallback — free,
-    no pod rented. Narrowed to the Network Volume's own datacenter, because
-    that is the only place a pod using it can actually land (pod-provision.sh
-    pins --data-center-ids to it); "High somewhere else" is not an answer to
-    "can I rent it".
+    """Live RunPod stock for the configured GPU and its fallbacks, at every
+    datacenter that carries them — free, no pod rented.
+
+    The Network Volume's own datacenter is marked and listed first: it is
+    the only one a pod can rent in and still mount the volume
+    (pod-provision.sh pins --data-center-ids to it). Renting anywhere else
+    is a real option (docs/gpu-pod.md's EU-CZ-1 failover) but not an
+    instant switch — a fresh pod there has no database and re-downloads
+    ~33GB of models until the volume is synced or migrated to it — so
+    "other regions" is worded as a fallback with a cost, not a same-speed
+    alternative.
     """
     gpu_id = env_get(ROOT / ".env", "GPU")
     if not gpu_id:
         tg.send_message(chat_id, "GPU is not set in .env — nothing to check")
         return
     volume_id = env_get(ROOT / ".env", "POD_VOLUME_ID")
-    dc = volume_datacenter(volume_id)
+    home_dc = volume_datacenter(volume_id)
+    wanted = [gpu_id] + [g for g in _FALLBACK_GPU_IDS if g != gpu_id]
     try:
-        stock = stock_at([gpu_id, _FALLBACK_GPU_ID], dc)
+        stock = stock_at(wanted)
     except RuntimeError as exc:
         tg.send_message(chat_id, f"couldn't reach runpodctl: {exc}")
         return
 
-    where = f"at <b>{_esc(dc)}</b>" if dc else "(volume datacenter unknown — showing overall stock)"
-    lines = [f"📦 <b>GPU stock</b> {where}"]
-    for wanted_id in (gpu_id, _FALLBACK_GPU_ID):
-        found = stock.get(wanted_id)
-        if found is None:
-            lines.append(f"{_esc(wanted_id)}: not listed by runpodctl right now")
+    lines = ["📦 <b>GPU stock</b>"]
+    if home_dc:
+        lines.append(f"📍 <b>{_esc(home_dc)}</b> (your volume)")
+    else:
+        lines.append("(volume datacenter unknown — showing every region)")
+
+    other_lines: list[str] = []
+    for wanted_id in wanted:
+        entries = stock.get(wanted_id)
+        if not entries:
+            lines.append(f"  {_esc(wanted_id)}: not listed by runpodctl right now")
             continue
-        price = f"${found.price_per_hr:.2f}/h" if found.price_per_hr else "?"
-        lines.append(f"{_esc(found.display_name)}: <b>{_esc(found.stock_status)}</b> · {price}")
+        price = f"${entries[0].price_per_hr:.2f}/h" if entries[0].price_per_hr else "?"
+        # None, not "not offered here", when home_dc itself is unknown — that
+        # reads as "checked and absent", which is a claim this branch has no
+        # basis for.
+        home = next((e for e in entries if home_dc and e.datacenter_id == home_dc),
+                    None)
+        if home is not None:
+            lines.append(f"  {_esc(entries[0].display_name)}: "
+                         f"<b>{_esc(home.stock_status)}</b> · {price}")
+        else:
+            lines.append(f"  <b>{_esc(entries[0].display_name)}</b> · {price}")
+
+        elsewhere = sorted(
+            (e for e in entries if e is not home and e.stock_status.lower() != "none"),
+            key=lambda e: _STOCK_RANK.get(e.stock_status.lower(), 9))
+        for e in elsewhere[:2]:
+            other_lines.append(f"  {_esc(e.display_name)} — {_esc(e.datacenter_id)}: "
+                               f"{_esc(e.stock_status)}")
+
+    if other_lines:
+        lines.append("\n<b>Other regions</b> (need the volume synced there "
+                     "first, ~25-30 min — not an instant switch):")
+        lines.extend(other_lines)
+
     tg.send_message(chat_id, "\n".join(lines), parse_mode=PARSE_HTML)
 
 
