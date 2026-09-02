@@ -1483,6 +1483,13 @@ cứng (exit 1) — và manifest cố ý **không** bị ghi đè lúc đó, đ�
 > vẫn giữ lại làm tài liệu tham khảo / phương án khi script không chạy được (thiếu RUNPOD_API_KEY,
 > muốn kiểm soát từng bước bằng tay, …). Thiết kế: docs/superpowers/specs/2026-09-02-volume-
 > region-migration-design.md.
+>
+> **This script's own throughput has never been measured.** The "Tốc độ đo thật (29/08/2026)" table
+> immediately below measures `dd|ssh cat` (~427MB/s, ~3 min for 79GB) — NOT `rsync`, and not this
+> script: it runs `rsync -aR` at 8 threads on a 4-vCPU CPU pod, a configuration nobody has timed
+> (the one `rsync` measurement, ~94MB/s at 4 threads, was on a 2-vCPU pod and was CPU-bound, which
+> is exactly what the extra vCPUs are meant to fix). Do not attribute ~427MB/s to this script. The
+> first real run must have its measured number written in here.
 
 ### Thu nhỏ hoặc đổi datacenter volume — không resize tại chỗ được
 

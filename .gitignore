@@ -33,6 +33,23 @@ batch/*.state.json
 batch/*.mcp.*
 # Pod lease written by drain.py/watchdog — machine state about a rented pod, not repo content.
 batch/pod-lease.json
+# The same thing for a volume migration's two TEMPORARY CPU pods
+# (scripts/volume_migrate.py). Its own file, so its own line: the pattern above
+# is an exact name, not a glob, and does not cover this one.
+batch/volume-migrate-lease.json
+# The bot's marker for a migration it has launched but whose lease has not been
+# written yet (tgbot/bot.py _migrate_launch_marker).
+batch/volume-migrate.launching.json
+# Which message the bot keeps edited for a migration. NOT covered by
+# `batch/*.progress.json` above — that glob needs a literal ".progress.json"
+# and this suffix is "-progress.json" — and the filename embeds the user's
+# Telegram chat id, which is exactly the kind of thing a public repo must not
+# grow by accident.
+batch/*.migrate-progress.json
+# Run logs written beside a manifest: `<manifest>.drain.log` (tgbot/run.py
+# start_drain) and batch/volume-migrate.log (bot _start_migration). Output of a
+# machine's own runs, and a drain log quotes material paths.
+batch/*.log
 # bản nháp job của bot Telegram — chứa đường dẫn material cá nhân
 batch/*.draft.json
 # job vừa gửi, giữ lại cho /again — cùng lý do như draft

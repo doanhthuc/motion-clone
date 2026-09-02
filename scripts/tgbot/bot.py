@@ -1082,10 +1082,30 @@ _CB_WIPE_NO = "wipe:no"
 _CB_KILL_ASK = "kill:ask"
 _CB_KILL_GO = "kill:go"
 _CB_KILL_NO = "kill:no"
-_CB_MIGRATE_ASK = "mig:ask:"    # + "<gpu_short>,<to_dc>"
+# Both carry ONLY the destination datacenter. A migration moves the Network
+# Volume; it has nothing to say about which GPU is rented afterwards, and the
+# `<gpu_short>,` prefix this used to carry was never read by _ask_migrate —
+# it was decoded back into a gpu_id that the function's body ignored. Worse,
+# minting the button needed a _GPU_SHORT entry to build that prefix, so a GPU
+# missing from that table silently got no migrate button at all.
+_CB_MIGRATE_ASK = "mig:ask:"    # + "<to_dc>"
 _CB_MIGRATE_GO = "mig:go:"      # + "<to_dc>"
 _CB_MIGRATE_NO = "mig:no"
-_MIGRATE_LEASE_PATH = ROOT / "batch" / "volume-migrate-lease.json"
+
+# ONE number, everywhere a migration's duration is quoted: the /gpu listing,
+# the [Run] picker's "Other regions" note, the destructive confirm, and the
+# "started" reply. They said "~25-30 min" in two of those places and "15-25
+# minutes" in the other two, for the same operation on the same screen.
+#
+# 15-25 min is the number docs/gpu-pod.md#volume-migrate actually stands
+# behind: the older ~25-30 was extrapolated from a single-thread ~57MB/s
+# measurement and was explicitly retired there on 30/08/2026, after the
+# 29/08/2026 measurement table put the sync itself at ~3 min and located the
+# rest of the time in booting two temp pods, the checksum verify, and
+# provisioning the real GPU pod afterwards.
+MIGRATE_DURATION_PLAIN = "15-25 minutes"
+MIGRATE_DURATION_SHORT = "~15-25 min"
+MIGRATE_DURATION_TEXT = f"Estimated {MIGRATE_DURATION_PLAIN}"
 _CB_ADD = "add"
 _CB_JOB_EDIT = "bj:e:"   # + _job_digest
 _CB_JOB_DROP = "bj:d:"   # + _job_digest
@@ -1241,9 +1261,7 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
             tg.send_message(chat_id, "left running — nothing killed")
 
         elif data.startswith(_CB_MIGRATE_ASK):
-            gpu_short, to_dc = data[len(_CB_MIGRATE_ASK):].split(",", 1)
-            gpu_id = _GPU_BY_SHORT.get(gpu_short, gpu_short)
-            _ask_migrate(tg, chat_id, gpu_id, to_dc)
+            _ask_migrate(tg, chat_id, data[len(_CB_MIGRATE_ASK):])
 
         elif data.startswith(_CB_MIGRATE_GO):
             _start_migration(tg, chat_id, data[len(_CB_MIGRATE_GO):])
@@ -2072,15 +2090,25 @@ def _freeze_panel(tg: Tg, chat_id: int, stamp: str) -> None:
 
 _PROGRESS_SUFFIX = ".progress.json"
 
-# The migration counterpart to _progress_path below, but system-wide rather
-# than per-chat: volume_migrate.py's write_progress() writes ONE file no
-# matter who is watching, because only one migration can run at a time (see
-# migration_running / _MIGRATE_LEASE_PATH) and this bot only ever serves one
-# allowed user. Deliberately a separate constant from _MIGRATE_LEASE_PATH
-# (Task 8): the lease marks "a migration is in flight" for the /run picker to
-# refuse a second one, while this file is volume_migrate.py's phase-by-phase
-# progress, read by tick_migration_progress below.
-_MIGRATE_PROGRESS_PATH = ROOT / "batch" / "volume-migrate.progress.json"
+def _migrate_progress_path() -> Path:
+    """The migration counterpart to _progress_path below, but system-wide
+    rather than per-chat: volume_migrate.py's write_progress() writes ONE file
+    no matter who is watching, because only one migration can run at a time
+    (see migration_running) and this bot only ever serves one allowed user.
+    Deliberately a separate file from the migration LEASE: the lease marks "a
+    migration is in flight" for the /run picker to refuse a second one, while
+    this is volume_migrate.py's phase-by-phase progress, read by
+    tick_migration_progress below.
+
+    A function, not a module constant bound at import time (fixed 2026-09-02).
+    Its sibling `_migrate_progress_message_path` always resolved ROOT at call
+    time, so the two diverged the moment a test reassigned `bot.ROOT` to a
+    tempdir: tick_migration_progress then read and DELETED the real repo's
+    batch/volume-migrate.progress.json while writing the message id into the
+    tempdir. Tests that touch the live repo's migration state are the one
+    thing a migration test must not do.
+    """
+    return ROOT / "batch" / "volume-migrate.progress.json"
 
 
 def _migrate_progress_message_path(chat_id: int) -> Path:
@@ -2273,16 +2301,17 @@ def tick_migration_progress(tg: Tg, chat_id: int) -> None:
     progress text itself). Called every poll tick alongside tick_progress;
     harmless no-op when no migration is running.
     """
-    if not _MIGRATE_PROGRESS_PATH.exists():
+    progress_path = _migrate_progress_path()
+    if not progress_path.exists():
         return
     try:
-        payload = json.loads(_MIGRATE_PROGRESS_PATH.read_text(encoding="utf-8"))
+        payload = json.loads(progress_path.read_text(encoding="utf-8"))
         phase = str(payload["phase"])
     except (ValueError, KeyError, TypeError) as exc:
         # Stop trying rather than raise every 50s forever, same as
         # tick_progress does for its own unreadable progress file.
         log(f"migration progress file unreadable, dropping it: {exc!r}")
-        _MIGRATE_PROGRESS_PATH.unlink(missing_ok=True)
+        progress_path.unlink(missing_ok=True)
         return
 
     text = {
@@ -2304,8 +2333,14 @@ def tick_migration_progress(tg: Tg, chat_id: int) -> None:
         msg_path.write_text(json.dumps({"message_id": message_id}), encoding="utf-8")
 
     if phase in ("done", "failed"):
-        _MIGRATE_PROGRESS_PATH.unlink(missing_ok=True)
+        progress_path.unlink(missing_ok=True)
         msg_path.unlink(missing_ok=True)
+        # The launch marker is this bot's own "a migration is starting" flag
+        # (see _start_migration). A migration that has reached done/failed is
+        # over whatever the marker says, and leaving it would refuse the next
+        # one for the rest of its staleness window.
+        _migrate_launch_marker().unlink(missing_ok=True)
+        _MIGRATE_PROC.pop(_MIGRATE_PROC_KEY, None)
 
 
 _LAST_SUFFIX = ".last.json"
@@ -2616,7 +2651,7 @@ def _report_gpu_stock(tg: Tg, chat_id: int) -> None:
 
     if other_lines:
         lines.append("\n<b>Other regions</b> (need the volume synced there "
-                     "first, ~25-30 min — not an instant switch):")
+                     f"first, {MIGRATE_DURATION_SHORT} — not an instant switch):")
         lines.extend(other_lines)
 
     tg.send_message(chat_id, "\n".join(lines), parse_mode=PARSE_HTML)
@@ -2633,13 +2668,101 @@ def _gpu_price(gpu_id: str, stock: dict) -> float:
     return entries[0].price_per_hr if entries and entries[0].price_per_hr else 0.99
 
 
+def _migrate_lease_path() -> Path:
+    """volume_migrate.py's own LEASE_PATH. A function, not a constant, for
+    the same reason _migrate_progress_path is one: a test that reassigns
+    bot.ROOT must not reach the live repo's migration state."""
+    return ROOT / "batch" / "volume-migrate-lease.json"
+
+
+def _migrate_launch_marker() -> Path:
+    """This bot's own "a migration is starting" flag, distinct from the lease.
+
+    volume_migrate.py writes its lease only AFTER create_volume plus two REST
+    pod-create round trips have all succeeded — tens of seconds at best,
+    minutes when RunPod is slow. `Popen` returns in milliseconds. Everything
+    in between is a window where the lease does not exist yet, so
+    `migration_running()` answered False and a second tap of "Yes, migrate"
+    launched a SECOND migration.
+
+    That is not a cosmetic race. The loser's lease write overwrites the
+    winner's, so the winner's two temp pods stop being claimed by anything —
+    and its destination VOLUME is never claimed by anything at all, because
+    pod_watchdog reconciles pods and has no concept of a volume. An orphaned
+    volume is a permanent monthly charge that nothing in this repo will ever
+    notice (docs/gpu-pod.md: ~$0.07/GB/month).
+    """
+    return ROOT / "batch" / "volume-migrate.launching.json"
+
+
+def _migrate_log_path() -> Path:
+    """Where the migration subprocess's stdout/stderr go — beside the
+    manifests, exactly as tgbot/run.py's start_drain does for a drain, and
+    for both of its reasons: a failed run has to be debuggable afterwards,
+    and its output must not interleave into the bot's own journald stream."""
+    return ROOT / "batch" / "volume-migrate.log"
+
+
+# Popen handle for a migration THIS process started, so a finished one stops
+# blocking the next. Same shape and same limits as tgbot/run.py's _RUNNING:
+# process memory, empty again after a bot restart — which is exactly why the
+# marker file below carries a timestamp the restarted process can still read.
+_MIGRATE_PROC_KEY = "migration"
+_MIGRATE_PROC: dict[str, subprocess.Popen] = {}
+
+# How long the marker alone may hold the gate shut. It has to cover
+# create_volume + two REST pod creates (the window before volume_migrate.py's
+# own lease appears) and no more: past that, either the lease exists and
+# answers for itself, or the launch died and the gate must reopen. Generous
+# on purpose — the cost of being too long is "wait a few minutes before
+# retrying", the cost of being too short is an orphaned volume nobody bills
+# you for out loud.
+_MIGRATE_LAUNCH_GRACE_SEC = 300
+
+
+def _migration_launching() -> bool:
+    """True between `_start_migration`'s decision to launch and the lease."""
+    marker = _migrate_launch_marker()
+    if not marker.exists():
+        return False
+
+    proc = _MIGRATE_PROC.get(_MIGRATE_PROC_KEY)
+    if proc is not None:
+        # .poll() also reaps, so a finished child stops looking alive — an
+        # os.kill(pid, 0) check would see a zombie and say yes forever.
+        if proc.poll() is None:
+            return True
+        marker.unlink(missing_ok=True)
+        return False
+
+    # No handle: a different bot process wrote this (motion-bot.service is
+    # Restart=always). Nothing here can poll that child, so the clock is the
+    # only bound available.
+    try:
+        started_at = float(json.loads(marker.read_text(encoding="utf-8"))["at"])
+    except (OSError, ValueError, KeyError, TypeError):
+        marker.unlink(missing_ok=True)
+        return False
+    if time.time() - started_at > _MIGRATE_LAUNCH_GRACE_SEC:
+        marker.unlink(missing_ok=True)
+        return False
+    return True
+
+
 def migration_running() -> bool:
     """A volume migration currently in flight — checked before offering a
     NEW migration button, and before letting /confirm rent at the OLD
-    datacenter mid-copy. The lease existing is proof enough; nothing here
-    needs to reach the pods themselves.
+    datacenter mid-copy.
+
+    Two sources, and neither alone is enough — the same OR, for the same
+    reason, as tgbot/run.py's drain_running. The lease is the durable record
+    once volume_migrate.py has provisioned both temp pods; the launch marker
+    covers the window BEFORE that, which is wide enough to lose a volume in
+    (see _migrate_launch_marker).
     """
-    return read_migrate_lease(_MIGRATE_LEASE_PATH) is not None
+    if read_migrate_lease(_migrate_lease_path()) is not None:
+        return True
+    return _migration_launching()
 
 
 def _offer_run_confirm(tg: Tg, chat_id: int) -> None:
@@ -2653,9 +2776,11 @@ def _offer_run_confirm(tg: Tg, chat_id: int) -> None:
     Deliberately does NOT try to move the rental to a different
     DATACENTER automatically, even though the 5090 does exist at EU-CZ-1
     (docs/gpu-pod.md) — that needs the Network Volume synced there first,
-    a ~25-30 minute, multi-pod runbook with no safe one-tap version. /gpu
-    already surfaces it as information; this only ever switches the GPU
-    TYPE, never the datacenter, so it only ever rewrites .env's GPU= to
+    a 15-25 minute, multi-pod runbook. Since 2026-09-02 it does have a
+    one-tap version (the migrate button below, behind its own destructive
+    confirm), but it is still a separate, destructive operation and never
+    something [Confirm] does implicitly: this path only ever switches the
+    GPU TYPE, never the datacenter, so it only ever rewrites .env's GPU= to
     something the SAME pod-provision.sh call would already rent correctly.
 
     A stock-check failure, or an unknown home datacenter, fails OPEN
@@ -2703,11 +2828,12 @@ def _offer_run_confirm(tg: Tg, chat_id: int) -> None:
     switch_row: list[tuple[str, str]] = []
     # Every OTHER datacenter each GPU is stocked at, not just the home one
     # (2026-09-02) — "5090 is out, why not check other regions" was a fair
-    # question: the switch buttons only ever move GPU TYPE within the pinned
+    # question: the GPU-TYPE switch buttons only ever move within the pinned
     # home datacenter, but that is not a reason to hide where else the 5090
-    # itself is doing fine. Purely informational, same wording as /gpu:
-    # renting there means syncing the Network Volume first, ~25-30 min, not
-    # a same-speed alternative — so it gets text, never a button.
+    # itself is doing fine. Renting there means migrating the Network Volume
+    # first, which is why each row also gets a MIGRATE button (Task 8) — a
+    # destructive operation, so the button only opens the confirm screen,
+    # never starts anything.
     other_lines: list[str] = []
     for gpu_id in wanted:
         entries = stock.get(gpu_id) or []
@@ -2736,15 +2862,21 @@ def _offer_run_confirm(tg: Tg, chat_id: int) -> None:
             # temp pods; migration_running() is the same guard _ask_migrate
             # and _start_migration re-check themselves, so a stale button
             # tapped after a migration already started still fails safely.
-            short = _GPU_SHORT.get(gpu_id)
-            if short and not migration_running():
+            #
+            # NOT gated on _GPU_SHORT any more. The payload only needs the
+            # DATACENTER — a migration moves the volume and says nothing about
+            # which GPU is rented afterwards — and requiring a short code to
+            # build a prefix nobody read meant a GPU absent from that table
+            # silently offered no migrate button at all.
+            if not migration_running():
                 switch_row.append((f"Switch to {e.display_name} ({e.datacenter_id})",
-                                  _CB_MIGRATE_ASK + f"{short},{e.datacenter_id}"))
+                                  _CB_MIGRATE_ASK + e.datacenter_id))
     if alt_lines:
         lines += ["", "Switch to:", *alt_lines]
     if other_lines:
-        lines += ["", "Other regions (needs the volume synced there first, "
-                      "~25-30 min — not an instant switch):", *other_lines]
+        lines += ["", "Other regions (needs the volume migrated there first, "
+                      f"{MIGRATE_DURATION_SHORT} — not an instant switch):",
+                  *other_lines]
     elif not switch_row:
         # Nothing else at this datacenter, and no other region has it
         # either — the manual EU-CZ-1 runbook is the only remaining option.
@@ -2840,10 +2972,14 @@ def _do_kill(tg: Tg, chat_id: int) -> None:
                         parse_mode=PARSE_HTML)
 
 
-def _ask_migrate(tg: Tg, chat_id: int, gpu_id: str, to_dc: str) -> None:
+def _ask_migrate(tg: Tg, chat_id: int, to_dc: str) -> None:
     """The confirm step for a Network Volume migration — destructive, unlike
     [Run]'s Yes/Cancel, because this one deletes the SOURCE volume once the
     copy verifies, not just spends money going forward.
+
+    Takes only the destination datacenter. It used to take a `gpu_id` too,
+    decoded from the callback payload and then never read — a migration moves
+    a volume and has nothing to do with which GPU gets rented afterwards.
     """
     if migration_running():
         tg.send_message(chat_id, "a volume migration is already in progress — "
@@ -2853,7 +2989,7 @@ def _ask_migrate(tg: Tg, chat_id: int, gpu_id: str, to_dc: str) -> None:
         chat_id,
         f"This copies your Network Volume to {_esc(to_dc)}: ~2 temporary CPU pods "
         f"for the duration, then <b>deletes the current volume</b> once the copy is "
-        f"verified byte-for-byte. Estimated 15-25 minutes. "
+        f"verified byte-for-byte. {MIGRATE_DURATION_TEXT}. "
         f"<b>Cannot be undone</b> once the old volume is deleted.",
         parse_mode=PARSE_HTML,
         buttons=[[("Yes, migrate", _CB_MIGRATE_GO + to_dc),
@@ -2861,13 +2997,44 @@ def _ask_migrate(tg: Tg, chat_id: int, gpu_id: str, to_dc: str) -> None:
 
 
 def _start_migration(tg: Tg, chat_id: int, to_dc: str) -> None:
+    """Launch scripts/volume_migrate.py, once.
+
+    The marker is written BEFORE Popen and synchronously, not after: the whole
+    point is to close the window between deciding to launch and
+    volume_migrate.py writing its own lease minutes later. See
+    _migrate_launch_marker for what a second migration in that window costs.
+    """
     if migration_running():
         tg.send_message(chat_id, "a volume migration is already in progress")
         return
-    subprocess.Popen(["python3", "scripts/volume_migrate.py", "--to-dc", to_dc, "--yes"],
-                     cwd=_REPO_ROOT)
+
+    marker = _migrate_launch_marker()
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps({"at": time.time(), "to_dc": to_dc}),
+                      encoding="utf-8")
+    try:
+        # Output to a log file, not a pipe and not inherited (I3): a migration
+        # runs for tens of minutes, an unread Popen pipe deadlocks the child
+        # when its OS buffer fills, and inheriting the bot's own stdout puts
+        # the script's traceback into journald interleaved with the bot's.
+        # Same shape as tgbot/run.py's start_drain.
+        with open(_migrate_log_path(), "ab") as log_file:
+            proc = subprocess.Popen(
+                ["python3", "scripts/volume_migrate.py", "--to-dc", to_dc, "--yes"],
+                cwd=_REPO_ROOT, stdout=log_file, stderr=subprocess.STDOUT)
+    except OSError as exc:
+        # The launch itself failed, so nothing will ever clear this marker by
+        # finishing. Remove it now rather than make the user wait out
+        # _MIGRATE_LAUNCH_GRACE_SEC for a migration that never started.
+        marker.unlink(missing_ok=True)
+        log(f"could not start volume_migrate.py: {exc!r}")
+        tg.send_message(chat_id, "could not start the migration — check the box. "
+                                 "Nothing was created.")
+        return
+    _MIGRATE_PROC[_MIGRATE_PROC_KEY] = proc
+
     tg.send_message(chat_id, f"🚀 Migration to {_esc(to_dc)} started — this will take "
-                             "15-25 minutes. I will report progress here.",
+                             f"{MIGRATE_DURATION_PLAIN}. I will report progress here.",
                     parse_mode=PARSE_HTML)
 
 

@@ -7,6 +7,7 @@ from batchlib.config import env_get
 from batchlib.manifest import state_path_for
 from batchlib_ext.gpu_stock import Stock
 from batchlib_ext.handoff import Handoff, handoff_path, mailbox_path, write_handoff
+from batchlib_ext.migrate_lease import MigrateLease, write_migrate_lease
 import tgbot.bot as bot
 from tgbot.bot import allowed
 from tgbot.ingest import Probe
@@ -114,7 +115,7 @@ def reset_bot_state():
                  "_CONFIRM_WARNED", "_PANEL", "_PANEL_NOTE", "_LAST_SEEN",
                  "_FRAME", "_ANIM_PAUSE", "_ALBUM_KEY", "_FIDELITY",
                  "_PANEL_IS_PHOTO", "_STRIP", "_BASKET",
-                 "_LEDGER", "_LEDGER_LOADED"):
+                 "_LEDGER", "_LEDGER_LOADED", "_MIGRATE_PROC"):
         # getattr, not bot._STATE etc: a name that disappears from bot.py
         # should fail here loudly rather than be silently skipped.
         getattr(bot, name).clear()
@@ -1338,7 +1339,10 @@ class TestFlow(unittest.TestCase):
         text = self.tg.messages[-1]
         self.assertIn("Other regions", text)
         self.assertIn("EU-CZ-1", text)
-        self.assertIn("25-30 min", text)
+        # ONE duration everywhere (2026-09-02): this screen, the destructive
+        # confirm and docs/gpu-pod.md used to disagree with each other.
+        self.assertIn(bot.MIGRATE_DURATION_SHORT, text)
+        self.assertIn("15-25", text)
         # Still a same-datacenter switch to 4090/PRO 4500 too — the other-
         # region note is additive, not a replacement for the local options.
         flat_data = [data for row in self.tg.buttons[-1] for _, data in row]
@@ -1368,18 +1372,50 @@ class TestFlow(unittest.TestCase):
             self._fill_required_slots()
             bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
         flat_data = [data for row in self.tg.buttons[-1] for _, data in row]
-        self.assertTrue(any(d.startswith(bot._CB_MIGRATE_ASK) for d in flat_data))
+        self.assertIn(bot._CB_MIGRATE_ASK + "EU-CZ-1", flat_data)
+
+    def test_a_gpu_missing_from_gpu_short_still_gets_a_migrate_button(self):
+        # The migrate button used to be minted only when _GPU_SHORT had an
+        # entry for the GPU, because the callback payload carried a short
+        # code that _ask_migrate then decoded and never used. A migration
+        # depends on the DATACENTER alone, so a card this repo has not
+        # tabulated must not silently cost the user the button.
+        unknown = "NVIDIA H200 NVL"
+        stock = {
+            "NVIDIA GeForce RTX 5090": [
+                Stock(gpu_id="NVIDIA GeForce RTX 5090", display_name="RTX 5090",
+                     price_per_hr=0.99, datacenter_id="EU-RO-1", stock_status="none"),
+            ],
+            "NVIDIA GeForce RTX 4090": [],
+            "NVIDIA RTX PRO 4500 Blackwell": [],
+        }
+        with mock.patch("tgbot.bot._FALLBACK_GPU_IDS", (unknown,)), \
+             mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at", return_value={
+                 "NVIDIA GeForce RTX 5090": stock["NVIDIA GeForce RTX 5090"],
+                 unknown: [Stock(gpu_id=unknown, display_name="H200 NVL",
+                                 price_per_hr=3.99, datacenter_id="EU-CZ-1",
+                                 stock_status="High")],
+             }), \
+             mock.patch("tgbot.bot.migration_running", return_value=False):
+            self._fill_required_slots()
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
+        self.assertNotIn(unknown, bot._GPU_SHORT)
+        flat_data = [data for row in self.tg.buttons[-1] for _, data in row]
+        self.assertIn(bot._CB_MIGRATE_ASK + "EU-CZ-1", flat_data)
 
     def test_tapping_migrate_ask_shows_the_destructive_confirm(self):
         with mock.patch("tgbot.bot.migration_running", return_value=False):
             bot.handle(self.tg,
-                      cb_from(ME, bot._CB_MIGRATE_ASK + "5090,EU-CZ-1"),
+                      cb_from(ME, bot._CB_MIGRATE_ASK + "EU-CZ-1"),
                       allowed_user_id=ME)
         text = self.tg.messages[-1]
         self.assertIn("cannot be undone", text.lower())
         self.assertIn("EU-CZ-1", text)
+        self.assertIn("15-25", text)
         flat_data = [data for row in self.tg.buttons[-1] for _, data in row]
-        self.assertTrue(any(d.startswith(bot._CB_MIGRATE_GO) for d in flat_data))
+        self.assertIn(bot._CB_MIGRATE_GO + "EU-CZ-1", flat_data)
         self.assertIn(bot._CB_MIGRATE_NO, flat_data)
 
     def test_migrate_go_launches_the_script_exactly_once(self):
@@ -1393,13 +1429,109 @@ class TestFlow(unittest.TestCase):
         self.assertIn("scripts/volume_migrate.py", argv)
         self.assertIn("EU-CZ-1", argv)
         self.assertIn("--yes", argv)
+        self.assertIn("15-25", self.tg.messages[-1])
+
+    def test_the_migration_subprocess_writes_to_a_log_file_not_the_bots_stdout(self):
+        # I3. start_drain (tgbot/run.py) redirects for two reasons — a failed
+        # run has to be debuggable afterwards, and a long-running child must
+        # not deadlock on an unread pipe. Neither reason is weaker here.
+        with mock.patch("tgbot.bot.subprocess.Popen") as mock_popen, \
+             mock.patch("tgbot.bot.migration_running", return_value=False):
+            bot.handle(self.tg,
+                      cb_from(ME, bot._CB_MIGRATE_GO + "EU-CZ-1"),
+                      allowed_user_id=ME)
+        kwargs = mock_popen.call_args.kwargs
+        self.assertIsNotNone(kwargs.get("stdout"))
+        self.assertEqual(kwargs.get("stderr"), subprocess.STDOUT)
+        self.assertEqual(Path(kwargs["stdout"].name), bot._migrate_log_path())
+        self.assertTrue(bot._migrate_log_path().exists())
 
     def test_a_second_migrate_attempt_while_one_runs_is_refused(self):
         with mock.patch("tgbot.bot.migration_running", return_value=True):
             bot.handle(self.tg,
-                      cb_from(ME, bot._CB_MIGRATE_ASK + "5090,EU-CZ-1"),
+                      cb_from(ME, bot._CB_MIGRATE_ASK + "EU-CZ-1"),
                       allowed_user_id=ME)
         self.assertIn("already", self.tg.messages[-1].lower())
+
+    # ---- the launch-window race (I9) --------------------------------------
+
+    def test_a_second_tap_before_the_lease_exists_is_refused(self):
+        # THE race this marker exists for. volume_migrate.py writes its lease
+        # only after create_volume + two REST pod creates, so between Popen
+        # and that write `migration_running()` saw no lease and would happily
+        # launch a second migration — whose lease write then overwrites the
+        # first's, orphaning two pods AND a destination volume that nothing
+        # in this repo ever reconciles.
+        alive = mock.Mock()
+        alive.poll.return_value = None
+        with mock.patch("tgbot.bot.subprocess.Popen", return_value=alive) as popen:
+            bot.handle(self.tg, cb_from(ME, bot._CB_MIGRATE_GO + "EU-CZ-1"),
+                       allowed_user_id=ME)
+            # No lease on disk yet — exactly the window.
+            self.assertFalse(bot._migrate_lease_path().exists())
+            bot.handle(self.tg, cb_from(ME, bot._CB_MIGRATE_GO + "EU-CZ-1"),
+                       allowed_user_id=ME)
+        popen.assert_called_once()
+        self.assertIn("already", self.tg.messages[-1].lower())
+
+    def test_the_migrate_button_disappears_during_the_launch_window(self):
+        alive = mock.Mock()
+        alive.poll.return_value = None
+        with mock.patch("tgbot.bot.subprocess.Popen", return_value=alive):
+            bot.handle(self.tg, cb_from(ME, bot._CB_MIGRATE_GO + "EU-CZ-1"),
+                       allowed_user_id=ME)
+        self.assertTrue(bot.migration_running())
+
+    def test_a_failed_launch_removes_the_marker_rather_than_locking_it_out(self):
+        with mock.patch("tgbot.bot.subprocess.Popen",
+                        side_effect=OSError("no python3")):
+            bot.handle(self.tg, cb_from(ME, bot._CB_MIGRATE_GO + "EU-CZ-1"),
+                       allowed_user_id=ME)
+        self.assertFalse(bot._migrate_launch_marker().exists())
+        self.assertFalse(bot.migration_running())
+
+    def test_a_finished_migration_stops_blocking_the_next_one(self):
+        finished = mock.Mock()
+        finished.poll.return_value = 0
+        with mock.patch("tgbot.bot.subprocess.Popen", return_value=finished):
+            bot.handle(self.tg, cb_from(ME, bot._CB_MIGRATE_GO + "EU-CZ-1"),
+                       allowed_user_id=ME)
+        self.assertFalse(bot.migration_running())
+        self.assertFalse(bot._migrate_launch_marker().exists())
+
+    def test_a_marker_left_by_a_restarted_bot_expires_instead_of_sticking(self):
+        # motion-bot.service is Restart=always, so the process that wrote the
+        # marker is often not the one that reads it, and _MIGRATE_PROC is
+        # empty again. Nothing can poll that child, so the clock is the only
+        # bound — a marker that outlived its window must not refuse migrations
+        # forever.
+        marker = bot._migrate_launch_marker()
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        stale = time.time() - bot._MIGRATE_LAUNCH_GRACE_SEC - 1
+        marker.write_text(json.dumps({"at": stale, "to_dc": "EU-CZ-1"}),
+                          encoding="utf-8")
+        self.assertFalse(bot.migration_running())
+        self.assertFalse(marker.exists())
+
+    def test_a_fresh_marker_from_a_restarted_bot_still_blocks(self):
+        marker = bot._migrate_launch_marker()
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({"at": time.time(), "to_dc": "EU-CZ-1"}),
+                          encoding="utf-8")
+        self.assertTrue(bot.migration_running())
+
+    def test_an_unreadable_marker_is_dropped_rather_than_jamming_the_gate(self):
+        marker = bot._migrate_launch_marker()
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("{ not json", encoding="utf-8")
+        self.assertFalse(bot.migration_running())
+        self.assertFalse(marker.exists())
+
+    def test_the_lease_alone_still_reports_a_running_migration(self):
+        write_migrate_lease(bot._migrate_lease_path(), MigrateLease(
+            pod_a_id="tmp-a", pod_b_id="tmp-b", started_at=time.time(),
+            to_dc="EU-CZ-1"))
+        self.assertTrue(bot.migration_running())
 
     def test_confirm_is_refused_while_a_migration_is_in_flight(self):
         with mock.patch("tgbot.bot.migration_running", return_value=True):
@@ -1409,8 +1541,25 @@ class TestFlow(unittest.TestCase):
 
     # ---- migration progress ticks (Task 9) --------------------------------
 
+    def test_every_migration_state_file_resolves_under_the_same_root(self):
+        # I6. _MIGRATE_PROGRESS_PATH was a module constant bound at import
+        # time from the REAL repo root, while _migrate_progress_message_path
+        # resolved ROOT at call time — so this class's own tests below read
+        # and DELETED the live repo's batch/volume-migrate.progress.json while
+        # writing the message id into a tempdir. Any divergence here means a
+        # test is touching real migration state, so assert every one of them
+        # lands under the tempdir this test class installed.
+        paths = [bot._migrate_progress_path(),
+                 bot._migrate_progress_message_path(ME),
+                 bot._migrate_lease_path(),
+                 bot._migrate_launch_marker(),
+                 bot._migrate_log_path()]
+        for path in paths:
+            self.assertTrue(path.is_relative_to(self.root),
+                            f"{path} escapes bot.ROOT ({self.root})")
+
     def test_tick_migration_progress_edits_one_message_across_phases(self):
-        prog_path = bot._MIGRATE_PROGRESS_PATH
+        prog_path = bot._migrate_progress_path()
         prog_path.parent.mkdir(parents=True, exist_ok=True)
         prog_path.write_text(json.dumps({"phase": "sync", "at": 0.0}), encoding="utf-8")
         bot.tick_migration_progress(self.tg, ME)
@@ -1425,7 +1574,7 @@ class TestFlow(unittest.TestCase):
         self.assertEqual(first_message_id, second_message_id)   # edited, not re-sent
 
     def test_tick_migration_progress_delivers_a_final_message_on_done(self):
-        prog_path = bot._MIGRATE_PROGRESS_PATH
+        prog_path = bot._migrate_progress_path()
         prog_path.parent.mkdir(parents=True, exist_ok=True)
         prog_path.write_text(json.dumps({"phase": "sync", "at": 0.0}), encoding="utf-8")
         bot.tick_migration_progress(self.tg, ME)
@@ -1440,7 +1589,7 @@ class TestFlow(unittest.TestCase):
         self.assertFalse(bot._migrate_progress_message_path(ME).exists())
 
     def test_tick_migration_progress_reports_a_failed_phase(self):
-        prog_path = bot._MIGRATE_PROGRESS_PATH
+        prog_path = bot._migrate_progress_path()
         prog_path.parent.mkdir(parents=True, exist_ok=True)
         prog_path.write_text(json.dumps(
             {"phase": "failed", "at": 0.0, "reason": "2 file(s) still differ"}),
@@ -1453,7 +1602,7 @@ class TestFlow(unittest.TestCase):
         self.assertEqual(self.tg.messages, [])
 
     def test_an_unreadable_migration_progress_file_is_dropped_and_logged(self):
-        prog_path = bot._MIGRATE_PROGRESS_PATH
+        prog_path = bot._migrate_progress_path()
         prog_path.parent.mkdir(parents=True, exist_ok=True)
         prog_path.write_text("{ not json", encoding="utf-8")
         with mock.patch.object(bot, "log") as logged:
@@ -1494,10 +1643,13 @@ class TestFlow(unittest.TestCase):
                        allowed_user_id=ME)
         start_drain.assert_called_once()
 
-    def test_nothing_offered_at_home_mentions_the_other_region_not_a_button(self):
+    def test_nothing_offered_at_home_mentions_the_other_region(self):
         # Every GPU exists only at a DIFFERENT datacenter — none has an
-        # entry at the home one at all, so there is no in-datacenter switch
-        # to offer, only the manual EU-CZ-1 pointer.
+        # entry at the home one at all, so there is no in-datacenter GPU-TYPE
+        # switch to offer. The only route there is a volume migration, which
+        # since Task 8 does have a button (behind its own destructive
+        # confirm) — so this asserts the ABSENCE of a _CB_RUN_SWITCH, not the
+        # absence of every button.
         elsewhere_only = {
             gpu: [Stock(gpu_id=gpu, display_name=gpu, price_per_hr=0.5,
                        datacenter_id="EU-CZ-1", stock_status="High")]
@@ -1510,7 +1662,7 @@ class TestFlow(unittest.TestCase):
             bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
         text = self.tg.messages[-1]
         self.assertIn("EU-CZ-1", text)
-        self.assertIn("25-30 min", text)
+        self.assertIn(bot.MIGRATE_DURATION_SHORT, text)
         self.assertIn("not offered at EU-RO-1", text)
         flat_data = [data for row in self.tg.buttons[-1] for _, data in row]
         self.assertFalse(any(d.startswith(bot._CB_RUN_SWITCH) for d in flat_data))
@@ -3418,8 +3570,9 @@ class TestGpuStockCommand(unittest.TestCase):
         text = self.tg.messages[-1]
         self.assertIn("Other regions", text)
         self.assertIn("EU-CZ-1", text)
-        # ~25-30 min sync — this is not a same-speed alternative.
-        self.assertIn("25-30 min", text)
+        # A migration first — not a same-speed alternative. One duration
+        # constant, shared with the [Run] picker and the destructive confirm.
+        self.assertIn(bot.MIGRATE_DURATION_SHORT, text)
 
     def test_unknown_home_datacenter_shows_every_region_without_a_false_claim(self):
         self._write_env()
