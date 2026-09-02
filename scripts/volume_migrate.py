@@ -55,9 +55,71 @@ def create_volume(source_volume_id: str, to_dc: str) -> tuple[str, int, str]:
     return created["id"], size_gb, source_dc
 
 
-def provision_temp_pod() -> None:
-    """Placeholder for phases 2-6 in later tasks."""
-    pass
+def _cpu_pod_body(name: str, volume_id: str, dc: str, disk_gb: int) -> dict:
+    return {
+        "name": name,
+        "computeType": "CPU",
+        "cpuFlavorIds": ["cpu5c"],
+        "vcpuCount": 4,
+        "imageName": "runpod/base:0.6.2-cpu",
+        "containerDiskInGb": disk_gb,
+        "ports": ["22/tcp"],
+        "networkVolumeId": volume_id,
+        "volumeMountPath": "/workspace",
+        "dataCenterIds": [dc],
+    }
+
+
+def provision_temp_pod(name: str, volume_id: str, dc: str, disk_gb: int) -> str:
+    """A temp CPU pod via REST — same reason pod-provision.sh's own CPU
+    branch goes through REST instead of `runpodctl pod create`: that CLI has
+    no flag for cpuFlavorIds/vcpuCount, only a fixed 2 vCPU/4GB default.
+    Returns the pod id.
+    """
+    api_key = env_get(ENV_PATH, "RUNPOD_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "RUNPOD_API_KEY not set in .env — required for the REST pod-create call")
+    body = _cpu_pod_body(name, volume_id, dc, disk_gb)
+    result = subprocess.run(
+        ["curl", "-sS", "-X", "POST", "https://rest.runpod.io/v1/pods",
+         "-H", f"Authorization: Bearer {api_key}",
+         "-H", "Content-Type: application/json",
+         "-d", json.dumps(body)],
+        capture_output=True, text=True, check=True)
+    data = json.loads(result.stdout)
+    pod_id = data.get("id") or data.get("podId")
+    if not pod_id:
+        raise RuntimeError(f"pod create for {name!r} did not return an id: {result.stdout}")
+    return pod_id
+
+
+def wait_for_ssh(pod_id: str, timeout_min: int = 10) -> tuple[str, int]:
+    """Poll `runpodctl ssh info` until it carries a host+port AND a real SSH
+    handshake succeeds — status strings alone are not proof (pod-wait.sh's
+    own docstring: RunPod reports RUNNING well before sshd is listening).
+    Key names are read permissively, matching pod-wait.sh's probe(): this
+    CLI's JSON shape has moved across releases.
+    """
+    deadline = time.time() + timeout_min * 60
+    while time.time() < deadline:
+        raw = sh("runpodctl", "ssh", "info", pod_id, "-o", "json").stdout
+        try:
+            data = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            data = {}
+        host = (data.get("host") or data.get("hostname")
+               or data.get("publicIp") or data.get("ip"))
+        port = data.get("port") or data.get("sshPort") or data.get("publicPort")
+        if host and port:
+            probe = subprocess.run(
+                ["ssh", "-o", "StrictHostKeyChecking=accept-new",
+                 "-o", "ConnectTimeout=5", "-p", str(port), f"root@{host}", "true"],
+                capture_output=True)
+            if probe.returncode == 0:
+                return host, int(port)
+        time.sleep(10)
+    raise RuntimeError(f"pod {pod_id} did not accept SSH within {timeout_min} min")
 
 
 def main(argv: list[str]) -> int:
