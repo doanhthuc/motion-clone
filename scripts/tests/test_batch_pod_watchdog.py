@@ -399,6 +399,26 @@ class TestMigrationTiers(unittest.TestCase):
         self.assertEqual(pods_api.destroyed, ["pod-old"])
         self.assertFalse(self.lease_path.is_file())
 
+    def test_migration_branch_cannot_disable_tier_3_for_the_real_pod(self):
+        # I2's twin for the migration branch: a raise inside it (decide_migration,
+        # or destroy_verified via RunpodCtl.destroy raising RuntimeError on a
+        # non-zero exit) must not take tiers 3 down with it — same bug class as
+        # TestLeaseBranchCannotDisableTierThree.test_a_raising_decide_still_reaches_reconciliation,
+        # now guarded by the migration block's own try/except.
+        write_migrate_lease(self.migrate_lease_path, MigrateLease(
+            pod_a_id="tmp-a", pod_b_id="tmp-b", started_at=0.0, to_dc="EU-CZ-1"))
+        pods_api = FakePods()
+        pods_api.pods = [PodInfo("stray", "motion-transfer")]
+
+        with patch.object(pod_watchdog, "decide_migration",
+                          side_effect=RuntimeError("boom")):
+            pod_watchdog.tick(pods_api, {"stray": 0.0}, now=11 * 60.0,
+                              dry_run=False)
+
+        self.assertEqual(pods_api.destroyed, ["stray"])
+        self.assertIn("migration tier 1/2 failed, falling through to tier 3",
+                      "\n".join(self.logs))
+
 
 class TestOnceExitCode(unittest.TestCase):
     """Minor: --once must fail loudly. make watchdog-dry is acceptance step A1."""

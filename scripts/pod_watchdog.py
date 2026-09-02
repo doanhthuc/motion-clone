@@ -91,23 +91,38 @@ def tick(pods_api, first_seen: dict[str, float], *, now: float,
     # rents (scripts/volume_migrate.py, not part of this task). Separate
     # lease file, separate ceiling (MIGRATE_CEILING_MIN, no per-stage journal
     # to dead-man's-switch against) — see batchlib_ext/watchdog.py. Unlike
-    # the real GPU pod's branch above, this one does not return: falling
-    # through to tier 3 below is what also catches the case where the
-    # destroy above was not confirmed.
-    migrate_lease = read_migrate_lease(MIGRATE_LEASE_PATH)
-    if migrate_lease is not None:
-        verdict = decide_migration(lease=migrate_lease, now=now)
-        if verdict.kill:
-            log(f"KILL migration temp pods {migrate_lease.pod_a_id},"
-                f"{migrate_lease.pod_b_id} — {verdict.reason}")
-            if not dry_run:
-                ok_a = destroy_verified(pods_api, migrate_lease.pod_a_id)
-                ok_b = destroy_verified(pods_api, migrate_lease.pod_b_id)
-                if ok_a and ok_b:
-                    clear_migrate_lease(MIGRATE_LEASE_PATH)
-                else:
-                    log("DESTROY NOT CONFIRMED for one or both migration temp "
-                        "pods — still billing, retrying next tick")
+    # the real GPU pod's branch above, this one does not return on a kill:
+    # falling through to tier 3 below is what also catches the case where
+    # the destroy above was not confirmed. It gets the SAME try/except guard
+    # as the real pod's branch above, for the same reason: a raise in here
+    # (decide_migration, or destroy_verified via RunpodCtl.destroy raising
+    # RuntimeError on a non-zero exit) must not take tier 3 down with it —
+    # "the outermost net must never be downstream of an inner one."
+    try:
+        migrate_lease = read_migrate_lease(MIGRATE_LEASE_PATH)
+        if migrate_lease is not None:
+            verdict = decide_migration(lease=migrate_lease, now=now)
+            if verdict.kill:
+                log(f"KILL migration temp pods {migrate_lease.pod_a_id}, "
+                    f"{migrate_lease.pod_b_id} — {verdict.reason}")
+                if not dry_run:
+                    ok_a = destroy_verified(pods_api, migrate_lease.pod_a_id)
+                    ok_b = destroy_verified(pods_api, migrate_lease.pod_b_id)
+                    if ok_a and ok_b:
+                        clear_migrate_lease(MIGRATE_LEASE_PATH)
+                    else:
+                        log("DESTROY NOT CONFIRMED for one or both migration temp "
+                            "pods — still billing, retrying next tick")
+    except Exception as exc:
+        # Same fall-through as the real pod's tier 1/2 above: tier 3 is the
+        # net for everything the inner tiers cannot express, including their
+        # own bugs. migrate_lease may be undefined if read_migrate_lease
+        # itself raised (it shouldn't — it catches its own I/O/parse errors —
+        # but this guard does not depend on that), so default it to None:
+        # reconcile_migration then treats the two temp pods as ordinary
+        # orphans, the safe direction to fail in.
+        migrate_lease = None
+        log(f"migration tier 1/2 failed, falling through to tier 3: {exc!r}")
 
     try:
         pods = pods_api.list_pods()
