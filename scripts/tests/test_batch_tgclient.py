@@ -106,7 +106,12 @@ class TestTg(unittest.TestCase):
             def capture_request(req, **kwargs):
                 nonlocal captured_request
                 captured_request = req
-                return FakeResponse({"ok": True, "result": {"file_id": "abc123"}})
+                # The real sendDocument response's `result` is the full sent
+                # Message, not just the document — message_id is what
+                # send_document (tgclient.py) now returns, for _track_sends
+                # (bot.py) to ledger for /wipe.
+                return FakeResponse({"ok": True, "result": {
+                    "message_id": 314, "document": {"file_id": "abc123"}}})
 
             with patch("urllib.request.urlopen", side_effect=capture_request):
                 self.tg.send_document(chat_id=42, path=temp_path, caption="test caption")

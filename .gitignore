@@ -37,6 +37,8 @@ batch/*.last.json
 batch/*.progress.json
 # draft không đọc được, dọn sang một bên để còn dựng lại tay
 batch/*.json.bad
+# /wipe's per-chat message-id ledger — tracks the user's own chat history
+batch/*.ledger.json
 
 # IDE junk — repo public, config cá nhân không vào đây (cùng lý do .DS_Store)
 .idea/

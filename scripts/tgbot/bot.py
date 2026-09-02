@@ -10,6 +10,7 @@ Reads TG_BOT_TOKEN, TG_ALLOWED_USER_ID and TG_API_BASE from the root .env.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import html
 import json
@@ -17,6 +18,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import unicodedata
 from dataclasses import asdict
@@ -43,8 +45,11 @@ from tgbot.ingest import (Probe, describe, probe, quality_warning,
 from tgbot.job import (Job, missing_slots, run_id_for, slot_for,
                        write_manifest)
 from tgbot.preview import sheet, slot_preview
-from tgbot.run import (drain_running, estimate_minutes, final_files, lease_for,
-                       progress_text, start_drain, summary_text)
+from tgbot.run import (LEASE_PATH, _RUNNING, drain_running, estimate_minutes,
+                       final_files, lease_for, progress_text, start_drain,
+                       summary_text)
+from batchlib_ext.gpu_stock import stock_at, volume_datacenter
+from batchlib_ext.lease import clear_lease
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -561,6 +566,50 @@ def _job_manifest_path(chat_id: int) -> Path:
     return ROOT / "batch" / f"tg-{chat_id}.yaml"
 
 
+_SPIN_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+_SPIN_INTERVAL_SEC = 0.5
+
+
+@contextlib.contextmanager
+def _spinner(tg: Tg, chat_id: int, label: str):
+    """A real animated "working" message for the duration of the `with` block,
+    deleted the instant it ends.
+
+    The bot is otherwise single-threaded and fully sequential (main()'s poll
+    loop only calls `handle()` and `tick_progress` back to back) — nothing
+    can redraw a message while the getFile/probe/ffmpeg chain below runs on
+    the main thread, so an animation needs a thread of its own. This is the
+    only one in the file. It never touches per-chat state (`_STATE`,
+    `_PENDING`, ...) — only this one Telegram message — so it cannot race
+    the main thread's own bookkeeping; the two are joined again (`thread.
+    join()`) before the caller does anything else with `tg`.
+
+    A throttled edit just skips a frame (2026-09-02): the spin is cosmetic,
+    and this thread has no way to report a raised exception to anyone.
+    """
+    message_id = tg.send_message(chat_id, f"{_SPIN_FRAMES[0]} {label}")
+    stop = threading.Event()
+
+    def spin() -> None:
+        i = 0
+        while not stop.wait(_SPIN_INTERVAL_SEC):
+            i += 1
+            frame = _SPIN_FRAMES[i % len(_SPIN_FRAMES)]
+            try:
+                tg.edit_message(chat_id, message_id, f"{frame} {label}")
+            except TgError as exc:
+                log(f"spinner edit throttled, skipping a frame: {exc}")
+
+    thread = threading.Thread(target=spin, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join(timeout=_SPIN_INTERVAL_SEC + 1)
+        tg.delete_message(chat_id, message_id)
+
+
 def _askable_roles(pipeline: str) -> list[str]:
     """Slot names a user can be asked to name — every material role except
     `driver`, which is structural (job.slot_for never asks about a video)."""
@@ -586,6 +635,12 @@ def _ask_about(tg: Tg, chat_id: int, p: Probe, pipeline: str,
                _CB_SLOT + r) for r in roles]
     rows = [labels[i:i + 2] for i in range(0, len(labels), 2)]
     question = f"{describe(p)}\nWhich slot is this?"
+    if filled & set(roles):
+        # The ✅ on a role's button says it's filled, but not what tapping it
+        # does — a user wanting to swap that file out has no other button to
+        # reach for, so the answer has to live right next to the question
+        # (2026-09-02, reported as "didn't tell me how to change outfit").
+        question += f"\n({ICON_OK} = already set — tap it again to replace)"
 
     # With the picture, when there is one (2026-09-01). This question used to
     # be asked about an image the user could not see — the File rule that keeps
@@ -699,7 +754,8 @@ def _render_and_validate(tg: Tg, chat_id: int) -> bool:
     return True
 
 
-def _maybe_show_manifest(tg: Tg, chat_id: int, job: Job) -> None:
+def _maybe_show_manifest(tg: Tg, chat_id: int, job: Job, *,
+                         bump: bool = False) -> None:
     """Redraw the panel, validating for free first if the job is complete.
 
     This is the plan's "[Run]" step (docs/superpowers/plans/2026-08-31-…
@@ -720,7 +776,7 @@ def _maybe_show_manifest(tg: Tg, chat_id: int, job: Job) -> None:
     """
     if _jobs_for(chat_id):
         _render_and_validate(tg, chat_id)
-    _show_panel(tg, chat_id)
+    _show_panel(tg, chat_id, bump=bump)
 
 
 _DRAFT_SUFFIX = ".draft.json"
@@ -849,6 +905,109 @@ def _load_draft(chat_id: int) -> str | None:
     return None
 
 
+_LEDGER: dict[int, list[int]] = {}
+_LEDGER_LOADED: set[int] = set()
+
+
+def _ledger_path(chat_id: int) -> Path:
+    """Its own file, not folded into the draft (2026-09-02): _save_draft
+    deletes the draft the moment a job finishes or is cleared, which is
+    exactly when a user is likely to want /wipe — the record of what to
+    delete must outlive the job it has nothing to do with.
+    """
+    return ROOT / "batch" / f"tg-{chat_id}.ledger.json"
+
+
+def _ledger_for(chat_id: int) -> list[int]:
+    """Every message_id /wipe is allowed to ask Telegram to delete.
+
+    Telegram exposes no "list this chat's history" call, so this is built up
+    one send/receive at a time as messages happen — anything from before this
+    existed, or from a message this bot never saw pass through `handle` or
+    `_track_sends`, is simply unreachable. Loaded once per process per chat,
+    same as `_LOADED` for drafts.
+    """
+    if chat_id not in _LEDGER_LOADED:
+        _LEDGER_LOADED.add(chat_id)
+        path = _ledger_path(chat_id)
+        try:
+            _LEDGER[chat_id] = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            pass
+        except (ValueError, TypeError) as exc:
+            log(f"ledger for chat {chat_id} is unreadable, starting over: {exc!r}")
+    return _LEDGER.setdefault(chat_id, [])
+
+
+def _record_message(chat_id: int | None, message_id: int | None) -> None:
+    """Note one message_id as belonging to this chat, for /wipe.
+
+    Idempotent by construction (`in` before `append`) rather than because
+    duplicates would be harmful — deleteMessage on an already-deleted id just
+    fails quietly — but a ledger that only grows is easier to reason about
+    than one that might not.
+    """
+    if chat_id is None or message_id is None:
+        return
+    ids = _ledger_for(chat_id)
+    if message_id in ids:
+        return
+    ids.append(message_id)
+    path = _ledger_path(chat_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(ids), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _track_sends(tg: Tg) -> Tg:
+    """Patch every id-producing send method on THIS instance so /wipe's
+    ledger sees each one before the caller does.
+
+    The alternative was recording at each of the dozens of call sites across
+    this file that send something — one more added later without the same
+    care would be a message /wipe quietly cannot reach. Patched once, on the
+    single Tg main() constructs (2026-09-02) — not per `handle()` call, or
+    each update would wrap the previous wrapper again and record every id
+    once per layer.
+
+    send_document and send_media_group are here too, covering a delivered
+    result and a preview album — the two message shapes that are not text
+    or a single photo, so a wipe used to leave exactly those behind.
+    """
+    real_send_message = tg.send_message
+    real_send_photo = tg.send_photo
+    real_send_document = tg.send_document
+    real_send_media_group = tg.send_media_group
+
+    def send_message(chat_id, *a, **kw):
+        message_id = real_send_message(chat_id, *a, **kw)
+        _record_message(chat_id, message_id)
+        return message_id
+
+    def send_photo(chat_id, *a, **kw):
+        message_id = real_send_photo(chat_id, *a, **kw)
+        _record_message(chat_id, message_id)
+        return message_id
+
+    def send_document(chat_id, *a, **kw):
+        message_id = real_send_document(chat_id, *a, **kw)
+        _record_message(chat_id, message_id)
+        return message_id
+
+    def send_media_group(chat_id, *a, **kw):
+        message_ids = real_send_media_group(chat_id, *a, **kw)
+        for message_id in message_ids:
+            _record_message(chat_id, message_id)
+        return message_ids
+
+    tg.send_message = send_message
+    tg.send_photo = send_photo
+    tg.send_document = send_document
+    tg.send_media_group = send_media_group
+    return tg
+
+
 def handle(tg: Tg, update: dict, *, allowed_user_id: int,
            dry_run: bool = False) -> None:
     """Load the draft, handle the update, save the draft.
@@ -865,6 +1024,12 @@ def handle(tg: Tg, update: dict, *, allowed_user_id: int,
     # From _identify, not update["message"], so a button press does not KeyError
     # here before its own branch in _handle ever runs.
     _, chat_id = _identify(update)
+    # The other half of the ledger _track_sends builds for the bot's own
+    # messages — a callback_query carries no new message of its own, so
+    # there is nothing to record for that case.
+    incoming = update.get("message")
+    if incoming is not None:
+        _record_message(chat_id, incoming.get("message_id"))
     if chat_id not in _LOADED:
         _LOADED.add(chat_id)
         salvaged = _load_draft(chat_id)
@@ -897,6 +1062,11 @@ _CB_REDO = "redo:"
 _CB_CLEAR_ASK = "clr:ask"
 _CB_CLEAR_GO = "clr:go"
 _CB_CLEAR_NO = "clr:no"
+_CB_WIPE_GO = "wipe:go"
+_CB_WIPE_NO = "wipe:no"
+_CB_KILL_ASK = "kill:ask"
+_CB_KILL_GO = "kill:go"
+_CB_KILL_NO = "kill:no"
 _CB_ADD = "add"
 _CB_JOB_EDIT = "bj:e:"   # + _job_digest
 _CB_JOB_DROP = "bj:d:"   # + _job_digest
@@ -964,7 +1134,9 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
                 _answer_slot(tg, chat_id, role)
 
         elif data.startswith(_CB_PIPE):
-            _switch_pipeline_and_report(tg, chat_id, data[len(_CB_PIPE):])
+            msg_id = (query.get("message") or {}).get("message_id")
+            _switch_pipeline_and_report(tg, chat_id, data[len(_CB_PIPE):],
+                                        chooser_message_id=msg_id)
 
         elif data == _CB_RUN_ASK:
             job = _STATE.get(chat_id)
@@ -1028,6 +1200,21 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
         elif data == _CB_CLEAR_NO:
             tg.send_message(chat_id, "kept — nothing deleted")
 
+        elif data == _CB_WIPE_GO:
+            _wipe_chat(tg, chat_id)
+
+        elif data == _CB_WIPE_NO:
+            tg.send_message(chat_id, "kept — nothing deleted")
+
+        elif data == _CB_KILL_ASK:
+            _ask_kill(tg, chat_id)
+
+        elif data == _CB_KILL_GO:
+            _do_kill(tg, chat_id)
+
+        elif data == _CB_KILL_NO:
+            tg.send_message(chat_id, "left running — nothing killed")
+
         else:
             tg.send_message(chat_id, "that button is from an older version of "
                                      "the bot; send /start for the commands")
@@ -1062,7 +1249,8 @@ def _offer_pipelines(tg: Tg, chat_id: int) -> None:
         parse_mode=PARSE_HTML)
 
 
-def _switch_pipeline_and_report(tg: Tg, chat_id: int, name: str) -> None:
+def _switch_pipeline_and_report(tg: Tg, chat_id: int, name: str, *,
+                                chooser_message_id: int | None = None) -> None:
     """The /pipeline body, shared by the typed command and the buttons."""
     job = _job_for(chat_id)
     if name not in PIPELINES:
@@ -1082,8 +1270,23 @@ def _switch_pipeline_and_report(tg: Tg, chat_id: int, name: str) -> None:
         + (f" · dropped {', '.join(dropped)} — no stage in {name} uses it"
            if dropped else ""))
     # Re-render against the new pipeline rather than leaving the manifest the
-    # user last saw on screen: that file is what /confirm submits.
-    _maybe_show_manifest(tg, chat_id, job)
+    # user last saw on screen: that file is what /confirm submits. bump=True
+    # for the same reason /job uses it: this is an explicit user action, and
+    # a silent edit somewhere above the chooser would look like the switch
+    # dropped the panel entirely (2026-09-02).
+    _maybe_show_manifest(tg, chat_id, job, bump=True)
+    if chooser_message_id is not None:
+        # The chooser message otherwise sits untouched after the tap — its
+        # buttons still say "now: <old pipeline>", so the switch looks like
+        # it did nothing unless the reader also notices the panel changed
+        # further down the chat (2026-09-02, reported as "no feedback").
+        # Editing it in place, with no buttons, closes the loop right where
+        # the tap happened and retires that keyboard so it can't be reused.
+        tg.edit_message(
+            chat_id, chooser_message_id,
+            f"⚙️ <b>Flow switched</b>\n"
+            f"now: {_flow(job.pipeline)}  <i>({_esc(job.pipeline)})</i>",
+            parse_mode=PARSE_HTML)
 
 
 def _answer_slot(tg: Tg, chat_id: int, role: str) -> None:
@@ -1724,6 +1927,11 @@ def _show_panel(tg: Tg, chat_id: int, *, note: str = "",
     # is a picture: filenames only come back when nothing else identifies a job.
     shot = _sheet_for(chat_id)
     text = _panel_text(chat_id, job, with_pictures=shot is not None)
+    # One render, then gone: left in place, a note about THIS change (e.g.
+    # "took X out of outfit") would keep resurfacing on every later redraw
+    # that has nothing to do with it — reported 2026-09-02 as a confusing
+    # note reappearing next to an unrelated slot question.
+    _PANEL_NOTE.pop(chat_id, None)
     buttons = _panel_buttons(chat_id, job)
     key = _sheet_key(chat_id) if shot is not None else None
     merged = shot is not None and _caption_fits(text)
@@ -2116,6 +2324,173 @@ def _clear_job(tg: Tg, chat_id: int) -> None:
         tg.send_message(chat_id, done, parse_mode=PARSE_HTML)
 
 
+def _ask_to_wipe(tg: Tg, chat_id: int) -> None:
+    """The confirm step for /wipe — mirrors /clear's, and for a stronger
+    reason: this also removes the messages that would tell you what was
+    running, or how to /again it.
+    """
+    n = len(_ledger_for(chat_id))
+    tg.send_message(
+        chat_id,
+        f"Delete all {n} message(s) in this chat — yours and mine — and "
+        "clear the job being assembled?\nTelegram will not let anything "
+        "older than 48h be removed; those are reported, not silently left.",
+        buttons=[[("Yes, wipe it", _CB_WIPE_GO), ("Keep it", _CB_WIPE_NO)]])
+
+
+def _wipe_chat(tg: Tg, chat_id: int) -> None:
+    """Delete every tracked message in this chat and the job being
+    assembled, in one action (2026-09-02) — a chat clean enough to restart in.
+
+    Shares /clear's drain guard rather than repeating it: the staged files
+    ARE a running job's inputs, and its progress message is the one thing
+    telling the user it is still going, so a live drain refuses the whole
+    thing, not only the file half.
+    """
+    if drain_running(_job_manifest_path(chat_id)):
+        tg.send_message(chat_id, "a drain is running for this chat's job — "
+                                 "wiping now would delete the files it is "
+                                 "reading, and the message that tells you "
+                                 "when it's done. Wait for it, then /wipe.")
+        return
+    _clear_job(tg, chat_id)
+    ids = _ledger_for(chat_id)
+    removed = sum(1 for message_id in ids if tg.delete_message(chat_id, message_id))
+    failed = len(ids) - removed
+    _LEDGER[chat_id] = []
+    _ledger_path(chat_id).unlink(missing_ok=True)
+    report = f"🧹 <b>Wiped.</b> Deleted {removed} message(s)."
+    if failed:
+        report += (f" {failed} couldn't be removed — Telegram won't delete "
+                   "anything older than 48h.")
+    # This message is not itself in `ids` — it is sent, and recorded by
+    # _track_sends, only after the sweep above already ran — so it is the
+    # one survivor: the clean, empty-feeling chat /wipe promised.
+    tg.send_message(chat_id, report, parse_mode=PARSE_HTML)
+
+
+# The fallback card (2026-09-02): half the price of the 5090 and roughly 2x
+# slower on a real render, picked by hand in .env when EU-RO-1 reads Low/none
+# — docs/gpu-pod.md's own measured comparison. Reported here unconditionally
+# so a Low reading on the primary card comes with the one alternative that
+# actually mounts the volume, not just a bare warning.
+_FALLBACK_GPU_ID = "NVIDIA RTX PRO 4500 Blackwell"
+
+
+def _report_gpu_stock(tg: Tg, chat_id: int) -> None:
+    """Live RunPod stock for the configured GPU and its fallback — free,
+    no pod rented. Narrowed to the Network Volume's own datacenter, because
+    that is the only place a pod using it can actually land (pod-provision.sh
+    pins --data-center-ids to it); "High somewhere else" is not an answer to
+    "can I rent it".
+    """
+    gpu_id = env_get(ROOT / ".env", "GPU")
+    if not gpu_id:
+        tg.send_message(chat_id, "GPU is not set in .env — nothing to check")
+        return
+    volume_id = env_get(ROOT / ".env", "POD_VOLUME_ID")
+    dc = volume_datacenter(volume_id)
+    try:
+        stock = stock_at([gpu_id, _FALLBACK_GPU_ID], dc)
+    except RuntimeError as exc:
+        tg.send_message(chat_id, f"couldn't reach runpodctl: {exc}")
+        return
+
+    where = f"at <b>{_esc(dc)}</b>" if dc else "(volume datacenter unknown — showing overall stock)"
+    lines = [f"📦 <b>GPU stock</b> {where}"]
+    for wanted_id in (gpu_id, _FALLBACK_GPU_ID):
+        found = stock.get(wanted_id)
+        if found is None:
+            lines.append(f"{_esc(wanted_id)}: not listed by runpodctl right now")
+            continue
+        price = f"${found.price_per_hr:.2f}/h" if found.price_per_hr else "?"
+        lines.append(f"{_esc(found.display_name)}: <b>{_esc(found.stock_status)}</b> · {price}")
+    tg.send_message(chat_id, "\n".join(lines), parse_mode=PARSE_HTML)
+
+
+def _ask_kill(tg: Tg, chat_id: int) -> None:
+    """The confirm step for /kill — mirrors [Run]'s Yes/Cancel, for the
+    opposite reason: this one forfeits money already spent instead of
+    committing new money.
+    """
+    manifest_path = _job_manifest_path(chat_id)
+    if not drain_running(manifest_path):
+        tg.send_message(chat_id, "nothing is running for this chat right now — "
+                                 "there is no pod to kill")
+        return
+    lease = lease_for(manifest_path)
+    spent = ""
+    if lease is not None:
+        mins = int((time.time() - lease.provisioned_at) / 60)
+        spent = f" — already {mins} min (${mins / 60 * 0.99:.2f}) on the pod"
+    tg.send_message(
+        chat_id,
+        f"⚠️ This destroys the pod right now{spent}. Whatever is mid-render "
+        "is lost — no output, no resume. Are you sure?",
+        buttons=[[("Yes, kill it", _CB_KILL_GO), ("Leave it running", _CB_KILL_NO)]])
+
+
+def _do_kill(tg: Tg, chat_id: int) -> None:
+    """The emergency stop (2026-09-02): destroy the pod right now, on request.
+
+    Two layers, because neither alone is trustworthy. Terminating the Popen
+    (only present when THIS bot process is the one that started the drain)
+    stops batch_run.py from moving on to its next stage, but SIGTERM does not
+    run drain.py's `finally: teardown()` — Python's default handler kills the
+    process outright rather than raising something `finally` could catch — so
+    `make gpu-destroy` is always run here directly afterwards too, exactly as
+    pod_watchdog.py's tier 3 does not trust a runner to clean up after itself.
+    `make gpu-destroy` already re-lists and verifies the pod is actually gone
+    (Makefile:161-167) rather than trusting its own exit code, so this reuses
+    that rather than re-deriving it.
+    """
+    manifest_path = _job_manifest_path(chat_id)
+    proc = _RUNNING.get(manifest_path.resolve())
+    if proc is not None and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+    tg.send_message(chat_id, "🛑 destroying the pod…")
+    try:
+        result = subprocess.run(["make", "gpu-destroy"], cwd=_REPO_ROOT,
+                                capture_output=True, text=True, timeout=180)
+        destroyed = result.returncode == 0
+        output = (result.stdout + result.stderr).strip()[-TAIL_CHARS:]
+        detail = "" if destroyed else f"\n<blockquote expandable>{_esc(output)}</blockquote>"
+    except subprocess.TimeoutExpired:
+        destroyed = False
+        detail = "\n`make gpu-destroy` did not finish within 180s — check the box by hand."
+
+    # Cleared regardless of whether the destroy itself succeeded: a lease for
+    # a pod that may or may not be gone is worse than none, because it is the
+    # one thing that makes drain_running() (and therefore a second /confirm)
+    # believe a dead job is still live.
+    clear_lease(LEASE_PATH)
+    prog = _progress_path(chat_id)
+    if prog.exists():
+        try:
+            payload = json.loads(prog.read_text(encoding="utf-8"))
+            tg.edit_message(chat_id, int(payload["message_id"]),
+                            "🛑 <b>Killed by request</b> — nothing left running.",
+                            parse_mode=PARSE_HTML)
+        except (ValueError, KeyError, TypeError, TgError):
+            pass
+        prog.unlink(missing_ok=True)
+    _FRAME.pop(chat_id, None)
+    _ANIM_PAUSE.pop(chat_id, None)
+
+    if destroyed:
+        tg.send_message(chat_id, "🛑 Killed. Pod destroyed and verified gone.")
+    else:
+        tg.send_message(chat_id,
+                        f"⚠️ <b>gpu-destroy may not have worked</b> — check "
+                        f"manually, it may still be billing.{detail}",
+                        parse_mode=PARSE_HTML)
+
+
 def _again(tg: Tg, chat_id: int) -> None:
     """Rebuild the last submitted job so it can be re-run with one thing changed.
 
@@ -2352,21 +2727,25 @@ def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
         # mkdir/stat on the way there can still surface as a plain OSError.
         # Before the slow part, not after: ffprobe on a 25MB video plus the
         # staging copy is long enough that a silent bot reads as a stuck one.
-        tg.send_chat_action(chat_id, "upload_document")
+        # A spinner rather than send_chat_action (2026-09-02): Telegram's own
+        # "uploading" indicator disappears after ~5s and nothing here ever
+        # refreshed it, so anything slower than that read as stuck again.
         try:
-            src = Path(tg.call("getFile", file_id=doc["file_id"])["file_path"])
-            path = _stage_file(chat_id, src, doc.get("file_name"))
-            path = to_png_if_heic(path)
-            p = probe(path)
-            # Inside the try, not one line below it (finding D, 2026-08-31).
-            # Its open()/stat() on a just-written file is near-certain to
-            # succeed, but "near-certain" was the whole of the guarantee: an
-            # OSError here escaped handle() into main()'s blanket
-            # `except Exception: log(...)` and the user got nothing back —
-            # exactly the silence finding I1 existed to remove.
-            # Acceptance A6 compares this against the delivered file's digest.
-            fidelity = _fidelity_line(path)
-            _FIDELITY.setdefault(chat_id, {})[str(path)] = fidelity
+            with _spinner(tg, chat_id,
+                         f"checking {doc.get('file_name') or 'the file'}"):
+                src = Path(tg.call("getFile", file_id=doc["file_id"])["file_path"])
+                path = _stage_file(chat_id, src, doc.get("file_name"))
+                path = to_png_if_heic(path)
+                p = probe(path)
+                # Inside the try, not one line below it (finding D, 2026-08-31).
+                # Its open()/stat() on a just-written file is near-certain to
+                # succeed, but "near-certain" was the whole of the guarantee: an
+                # OSError here escaped handle() into main()'s blanket
+                # `except Exception: log(...)` and the user got nothing back —
+                # exactly the silence finding I1 existed to remove.
+                # Acceptance A6 compares this against the delivered file's digest.
+                fidelity = _fidelity_line(path)
+                _FIDELITY.setdefault(chat_id, {})[str(path)] = fidelity
         except (RuntimeError, TgError, KeyError, OSError) as exc:
             # ffprobe raises rather than guessing (ingest.probe's own
             # contract) — the file never enters a job, so it can never
@@ -2544,6 +2923,18 @@ def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
         _ask_to_clear(tg, chat_id)
         return
 
+    if text.startswith("/wipe"):
+        _ask_to_wipe(tg, chat_id)
+        return
+
+    if text.startswith("/gpu"):
+        _report_gpu_stock(tg, chat_id)
+        return
+
+    if text.startswith("/kill"):
+        _ask_kill(tg, chat_id)
+        return
+
     if text.startswith("/again"):
         _again(tg, chat_id)
         return
@@ -2560,15 +2951,11 @@ def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
     if text.startswith("/start"):
         tg.send_message(
             chat_id,
-            "📤 <b>Send files as Files</b> (picker → \"...\" → Send as File)\n"
-            "🎬 Videos are the driver. For images, I'll ask which slot — "
-            "just tap the answer.\n\n"
-            "✅ When every slot is filled, I'll show the job and a "
-            "▶️ Run button.\n"
+            "📎 <b>File, not Photo</b> — picker → \"...\" → Send as File\n"
+            "🎬 Videos are the driver. For images, I'll ask — just tap.\n\n"
+            "✅ Full job shown before anything runs.\n"
             "💸 <b>Nothing spends money until you tap Run and confirm.</b>\n\n"
-            "Buttons below, or type:\n"
-            "/pipeline · /status · /result &lt;name&gt;.yaml · "
-            "/tryon &lt;batch-id&gt;",
+            "Buttons below, or type the commands.",
             parse_mode=PARSE_HTML,
             reply_keyboard=START_KEYBOARD)
         return
@@ -2602,6 +2989,9 @@ BOT_COMMANDS = [
     ("confirm", "SPENDS MONEY - rents a GPU at $0.99/h and starts"),
     ("result", "the finished video, or the failure logs"),
     ("tryon", "just the try-on image, when the result looks wrong"),
+    ("wipe", "delete every message in this chat, yours and mine"),
+    ("gpu", "check RunPod 5090 stock before you rent — free"),
+    ("kill", "EMERGENCY STOP - destroys the pod right now, abandons the run"),
 ]
 
 
@@ -2629,7 +3019,7 @@ def main() -> int:
             return 2
         _DEFAULT_PIPELINE = configured
 
-    tg = Tg(token=token, base_url=base)
+    tg = _track_sends(Tg(token=token, base_url=base))
     allowed_user_id = int(raw_id)
     offset = 0
     # Best-effort: a failure here costs a menu, not the bot. Raising would stop

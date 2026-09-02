@@ -230,18 +230,21 @@ class Tg:
             raise
         return True
 
-    def delete_message(self, chat_id: int, message_id: int) -> None:
-        """Best-effort delete of one of the bot's own messages.
+    def delete_message(self, chat_id: int, message_id: int) -> bool:
+        """Best-effort delete of a message in this chat. True on success.
 
-        Used only to move the control panel back to the bottom of the chat
-        after it has drifted up. Failure is not worth surfacing: a bot may not
-        delete its own message after 48 hours, and the panel it could not
-        remove is stale text, not a wrong action.
+        Originally used only to move the control panel back to the bottom of
+        the chat, where the caller had no use for the outcome — a bot may not
+        delete a message after 48 hours, and the panel it could not remove is
+        stale text, not a wrong action. /wipe (2026-09-02) is a second caller
+        that does care: it reports how many of the chat's messages Telegram
+        refused, rather than claiming a clean sweep it did not do.
         """
         try:
             self.call("deleteMessage", chat_id=chat_id, message_id=message_id)
+            return True
         except TgError:
-            pass
+            return False
 
     def _multipart(self, method: str, fields: dict, files: list[tuple[str, Path, str]],
                    *, timeout: int = 120) -> dict:
@@ -313,7 +316,7 @@ class Tg:
         return int(result["message_id"])
 
     def send_media_group(self, chat_id: int, items: list[tuple[Path, str]], *,
-                         parse_mode: str | None = None) -> None:
+                         parse_mode: str | None = None) -> list[int]:
         """One album of uploaded images — `items` is [(path, caption)].
 
         An album, not N separate sends: the whole point is that the material
@@ -336,12 +339,15 @@ class Tg:
                     entry["parse_mode"] = parse_mode
             media.append(entry)
             files.append((f"f{i}", path, "image/jpeg"))
-        self._multipart("sendMediaGroup",
-                        {"chat_id": str(chat_id),
-                         "media": json.dumps(media, ensure_ascii=False)},
-                        files)
+        result = self._multipart("sendMediaGroup",
+                                 {"chat_id": str(chat_id),
+                                  "media": json.dumps(media, ensure_ascii=False)},
+                                 files)
+        # sendMediaGroup's "result" is a list, one Message per photo — /wipe
+        # (2026-09-02) needs every id in the album, not just the first.
+        return [int(m["message_id"]) for m in result]
 
-    def send_document(self, chat_id: int, path: Path, caption: str = "") -> None:
+    def send_document(self, chat_id: int, path: Path, caption: str = "") -> int:
         """sendDocument, never sendVideo.
 
         sendVideo may let Telegram re-encode for streaming, and the quality work
@@ -380,6 +386,9 @@ class Tg:
             raise TgError(self._scrub(f"sendDocument returned non-JSON: {raw[:200]!r}")) from exc
         if not result.get("ok"):
             raise TgError(self._scrub(f"sendDocument rejected: {result.get('description', result)}"))
+        # /wipe (2026-09-02) needs this to delete a delivered result later —
+        # everything else that has ever called send_document ignores it.
+        return int(result["result"]["message_id"])
 
     def get_updates(self, offset: int, timeout: int = 50) -> list[dict]:
         return self.call("getUpdates", offset=offset, timeout=timeout) or []
