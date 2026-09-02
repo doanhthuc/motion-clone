@@ -195,10 +195,15 @@ def sync(host_a: str, port_a: int, host_b: str, port_b: int, subdirs: list[str],
                  f"root@{host_a}", _rsync_cmd(mount, d, host_b, port_b, dry_run=False)])
             for d in batch
         ]
-        for p in procs:
-            rc = p.wait()
-            if rc != 0:
-                raise RuntimeError(f"rsync leg exited {rc} — see pod A's own stderr above")
+        # Wait on EVERY process already launched in this batch before
+        # raising anything. A previous version returned/raised on the FIRST
+        # non-zero .wait(), leaving any OTHER Popen in the same batch
+        # running untracked in the background — flagged in the Task 6
+        # review and deferred to here, the task that first wires sync()
+        # into main()'s real flow.
+        bad_rcs = [rc for rc in (p.wait() for p in procs) if rc != 0]
+        if bad_rcs:
+            raise RuntimeError(f"rsync leg exited {bad_rcs[0]} — see pod A's own stderr above")
 
 
 #  real GNU rsync 3.2.7 (verified locally via `docker run debian:12-slim`,
@@ -260,28 +265,89 @@ def verify(host_a: str, port_a: int, host_b: str, port_b: int, subdirs: list[str
     return total
 
 
+def teardown_temp_pods(pod_a: str | None, pod_b: str | None) -> None:
+    """ALWAYS called, success or failure — same discipline as
+    drain.py::teardown. A pod_id of None means it was never provisioned
+    (an earlier phase failed first) and is simply skipped, not an error.
+    """
+    for pod_id in (pod_a, pod_b):
+        if pod_id is not None:
+            subprocess.run(["runpodctl", "pod", "delete", pod_id], check=False)
+    clear_migrate_lease(LEASE_PATH)
+
+
+def swap(*, new_volume_id: str, old_volume_id: str) -> None:
+    """Only ever called after verify() has reported exactly 0 pending
+    changes — the caller (main) is where that gate lives."""
+    env_set(ENV_PATH, "POD_VOLUME_ID", new_volume_id)
+    delete = subprocess.run(["runpodctl", "network-volume", "delete", old_volume_id],
+                            capture_output=True, text=True)
+    if delete.returncode != 0:
+        write_progress("done",
+                       warning=f"copied and swapped .env, but could not delete "
+                               f"{old_volume_id}: {delete.stderr.strip()}")
+        return
+    write_progress("done")
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--to-dc", required=True)
     ap.add_argument("--yes", action="store_true")
     args = ap.parse_args(argv)
 
-    old_volume_id = env_get(ENV_PATH, "POD_VOLUME_ID")
-    if not old_volume_id:
-        print("✗ POD_VOLUME_ID not set in .env — nothing to migrate", file=sys.stderr)
-        return 1
+    try:
+        old_volume_id = env_get(ENV_PATH, "POD_VOLUME_ID")
+        if not old_volume_id:
+            print("✗ POD_VOLUME_ID not set in .env — nothing to migrate", file=sys.stderr)
+            return 1
 
-    new_volume_id, size_gb, source_dc = create_volume(old_volume_id, args.to_dc)
-    if not args.yes:
-        print(f"DRY RUN. Would migrate {size_gb}GB from POD_VOLUME_ID={old_volume_id} "
-             f"({source_dc}) to {args.to_dc} (created {new_volume_id} already — "
-             f"delete it by hand if you do not proceed: "
-             f"runpodctl network-volume delete {new_volume_id}).")
-        print("Re-run with --yes to actually copy and swap.")
+        new_volume_id, size_gb, source_dc = create_volume(old_volume_id, args.to_dc)
+        if not args.yes:
+            print(f"DRY RUN. Would migrate {size_gb}GB from POD_VOLUME_ID={old_volume_id} "
+                 f"({source_dc}) to {args.to_dc} (created {new_volume_id} already — "
+                 f"delete it by hand if you do not proceed: "
+                 f"runpodctl network-volume delete {new_volume_id}).")
+            print("Re-run with --yes to actually copy and swap.")
+            return 0
+
+        write_progress("create", to_dc=args.to_dc, new_volume_id=new_volume_id)
+        pod_a: str | None = None
+        pod_b: str | None = None
+        try:
+            pod_a = provision_temp_pod("migrate-tmp-a", old_volume_id, source_dc, size_gb + 20)
+            pod_b = provision_temp_pod("migrate-tmp-b", new_volume_id, args.to_dc, size_gb + 20)
+            write_migrate_lease(LEASE_PATH, MigrateLease(
+                pod_a_id=pod_a, pod_b_id=pod_b, started_at=time.time(), to_dc=args.to_dc))
+
+            write_progress("sync", pod_a=pod_a, pod_b=pod_b)
+            host_a, port_a = wait_for_ssh(pod_a)
+            host_b, port_b = wait_for_ssh(pod_b)
+            priv, pub = make_temp_keypair()
+            install_key_on(host_b, port_b, pub)
+            place_key_on(host_a, port_a, priv)
+            subdirs = existing_subdirs(host_a, port_a)
+            sync(host_a, port_a, host_b, port_b, subdirs)
+
+            write_progress("verify", pod_a=pod_a, pod_b=pod_b)
+            total_changes = verify(host_a, port_a, host_b, port_b, subdirs)
+        finally:
+            teardown_temp_pods(pod_a, pod_b)
+
+        if total_changes != 0:
+            write_progress("failed",
+                           reason=f"{total_changes} file(s) still differ after sync — "
+                                  f"NOT deleting {old_volume_id}. Both volumes kept: "
+                                  f"{old_volume_id} (original), {new_volume_id} (partial copy).")
+            print(f"✗ verify found {total_changes} pending change(s) — aborting, "
+                 f"both volumes kept", file=sys.stderr)
+            return 1
+
+        swap(new_volume_id=new_volume_id, old_volume_id=old_volume_id)
         return 0
-
-    # Phases 2-6 land in later tasks of this plan.
-    return 0
+    except Exception as exc:
+        write_progress("failed", reason=repr(exc))
+        raise
 
 
 if __name__ == "__main__":

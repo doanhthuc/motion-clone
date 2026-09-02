@@ -7,6 +7,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import volume_migrate
+from batchlib.config import env_get
 
 
 class TestCreateVolume(unittest.TestCase):
@@ -196,6 +197,23 @@ class TestSyncAndVerify(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 volume_migrate.sync("host-a", 1001, "host-b", 1002, ["loras"])
 
+    def test_a_failing_leg_does_not_leave_a_sibling_leg_unwaited(self):
+        # Task 6 review finding: the first non-zero .wait() used to raise
+        # immediately, leaving any OTHER Popen already launched in that same
+        # batch running untracked in the background. Two legs, launched in
+        # the same batch — the first one's failure must not skip waiting on
+        # the second.
+        proc_fail = mock.Mock()
+        proc_fail.wait.return_value = 1
+        proc_ok = mock.Mock()
+        proc_ok.wait.return_value = 0
+        with mock.patch("subprocess.Popen", side_effect=[proc_fail, proc_ok]):
+            with self.assertRaises(RuntimeError):
+                volume_migrate.sync("host-a", 1001, "host-b", 1002,
+                                    ["loras", "checkpoints"])
+        proc_fail.wait.assert_called_once()
+        proc_ok.wait.assert_called_once()
+
     def test_verify_sums_pending_changes_across_every_subdir(self):
         clean = mock.Mock(stdout="./\n\nsent 1 bytes\n")
         dirty = mock.Mock(stdout="./\nfile.gguf\n\nsent 1 bytes\n")
@@ -227,6 +245,131 @@ class TestExistingSubdirs(unittest.TestCase):
         self.assertIn("loras", present)
         self.assertIn("checkpoints", present)
         self.assertNotIn("some_other_dir", present)
+
+
+class TestTeardownTempPods(unittest.TestCase):
+    def test_deletes_both_and_clears_the_lease(self):
+        with mock.patch("subprocess.run") as mock_run, \
+             mock.patch("volume_migrate.clear_migrate_lease") as mock_clear:
+            volume_migrate.teardown_temp_pods("pod-a", "pod-b")
+        deleted = [c.args[0][-1] for c in mock_run.call_args_list]
+        self.assertEqual(set(deleted), {"pod-a", "pod-b"})
+        mock_clear.assert_called_once()
+
+    def test_tolerates_one_pod_never_having_been_provisioned(self):
+        with mock.patch("subprocess.run") as mock_run, \
+             mock.patch("volume_migrate.clear_migrate_lease"):
+            volume_migrate.teardown_temp_pods("pod-a", None)
+        self.assertEqual(mock_run.call_count, 1)
+
+
+class TestSwap(unittest.TestCase):
+    def test_writes_env_and_deletes_the_old_volume(self):
+        env_path = Path(tempfile.mkdtemp()) / ".env"
+        env_path.write_text("POD_VOLUME_ID=vol-old\n", encoding="utf-8")
+        ok = mock.Mock(returncode=0, stderr="")
+        with mock.patch.object(volume_migrate, "ENV_PATH", env_path), \
+             mock.patch.object(volume_migrate, "PROGRESS_PATH",
+                               env_path.parent / "p.json"), \
+             mock.patch("subprocess.run", return_value=ok) as mock_run:
+            volume_migrate.swap(new_volume_id="vol-new", old_volume_id="vol-old")
+        self.assertEqual(env_get(env_path, "POD_VOLUME_ID"), "vol-new")
+        self.assertIn("vol-old", mock_run.call_args.args[0])
+
+    def test_a_failed_delete_is_reported_but_env_is_still_swapped(self):
+        env_path = Path(tempfile.mkdtemp()) / ".env"
+        env_path.write_text("POD_VOLUME_ID=vol-old\n", encoding="utf-8")
+        failed = mock.Mock(returncode=1, stderr="still referenced")
+        with mock.patch.object(volume_migrate, "ENV_PATH", env_path), \
+             mock.patch.object(volume_migrate, "PROGRESS_PATH",
+                               env_path.parent / "p.json"), \
+             mock.patch("subprocess.run", return_value=failed):
+            volume_migrate.swap(new_volume_id="vol-new", old_volume_id="vol-old")
+        self.assertEqual(env_get(env_path, "POD_VOLUME_ID"), "vol-new")
+        payload = json.loads((env_path.parent / "p.json").read_text())
+        self.assertIn("still referenced", payload["warning"])
+
+
+class TestMainEndToEnd(unittest.TestCase):
+    def _env(self, tmpdir):
+        env_path = tmpdir / ".env"
+        env_path.write_text("POD_VOLUME_ID=vol-old\n", encoding="utf-8")
+        return env_path
+
+    def test_a_verify_mismatch_aborts_without_deleting_anything(self):
+        tmpdir = Path(tempfile.mkdtemp())
+        with mock.patch.object(volume_migrate, "ENV_PATH", self._env(tmpdir)), \
+             mock.patch.object(volume_migrate, "PROGRESS_PATH", tmpdir / "p.json"), \
+             mock.patch.object(volume_migrate, "LEASE_PATH", tmpdir / "lease.json"), \
+             mock.patch.object(volume_migrate, "create_volume",
+                               return_value=("vol-new", 10, "EU-RO-1")), \
+             mock.patch.object(volume_migrate, "provision_temp_pod",
+                               side_effect=["pod-a", "pod-b"]), \
+             mock.patch.object(volume_migrate, "wait_for_ssh",
+                               side_effect=[("host-a", 1), ("host-b", 2)]), \
+             mock.patch.object(volume_migrate, "make_temp_keypair",
+                               return_value=(Path("/tmp/k"), Path("/tmp/k.pub"))), \
+             mock.patch.object(volume_migrate, "install_key_on"), \
+             mock.patch.object(volume_migrate, "place_key_on"), \
+             mock.patch.object(volume_migrate, "existing_subdirs", return_value=["loras"]), \
+             mock.patch.object(volume_migrate, "sync"), \
+             mock.patch.object(volume_migrate, "verify", return_value=2), \
+             mock.patch.object(volume_migrate, "teardown_temp_pods") as mock_teardown, \
+             mock.patch("subprocess.run") as mock_run:
+            rc = volume_migrate.main(["--to-dc", "EU-CZ-1", "--yes"])
+        self.assertEqual(rc, 1)
+        mock_teardown.assert_called_once_with("pod-a", "pod-b")
+        # Nothing may call network-volume delete when verify found a mismatch.
+        for call in mock_run.call_args_list:
+            self.assertNotIn("delete", call.args[0])
+
+    def test_a_provisioning_failure_still_tears_down_whatever_was_created(self):
+        tmpdir = Path(tempfile.mkdtemp())
+        with mock.patch.object(volume_migrate, "ENV_PATH", self._env(tmpdir)), \
+             mock.patch.object(volume_migrate, "PROGRESS_PATH", tmpdir / "p.json"), \
+             mock.patch.object(volume_migrate, "LEASE_PATH", tmpdir / "lease.json"), \
+             mock.patch.object(volume_migrate, "create_volume",
+                               return_value=("vol-new", 10, "EU-RO-1")), \
+             mock.patch.object(volume_migrate, "provision_temp_pod",
+                               side_effect=["pod-a", RuntimeError("no capacity")]), \
+             mock.patch.object(volume_migrate, "teardown_temp_pods") as mock_teardown:
+            with self.assertRaises(RuntimeError):
+                volume_migrate.main(["--to-dc", "EU-CZ-1", "--yes"])
+        # pod-a was created before pod-b failed — it must still be torn down,
+        # and pod-b (never assigned) must be passed as None, not omitted.
+        mock_teardown.assert_called_once_with("pod-a", None)
+
+    def test_a_clean_verify_swaps_env_and_reports_done(self):
+        tmpdir = Path(tempfile.mkdtemp())
+        env_path = self._env(tmpdir)
+        # env_path is captured here, and read again AFTER the with-block
+        # below exits — mock.patch.object restores volume_migrate.ENV_PATH
+        # to its pre-patch value on __exit__, so asserting via
+        # `volume_migrate.ENV_PATH` at that point would silently read the
+        # real repo .env instead of the tmp one main() actually wrote to.
+        with mock.patch.object(volume_migrate, "ENV_PATH", env_path), \
+             mock.patch.object(volume_migrate, "PROGRESS_PATH", tmpdir / "p.json"), \
+             mock.patch.object(volume_migrate, "LEASE_PATH", tmpdir / "lease.json"), \
+             mock.patch.object(volume_migrate, "create_volume",
+                               return_value=("vol-new", 10, "EU-RO-1")), \
+             mock.patch.object(volume_migrate, "provision_temp_pod",
+                               side_effect=["pod-a", "pod-b"]), \
+             mock.patch.object(volume_migrate, "wait_for_ssh",
+                               side_effect=[("host-a", 1), ("host-b", 2)]), \
+             mock.patch.object(volume_migrate, "make_temp_keypair",
+                               return_value=(Path("/tmp/k"), Path("/tmp/k.pub"))), \
+             mock.patch.object(volume_migrate, "install_key_on"), \
+             mock.patch.object(volume_migrate, "place_key_on"), \
+             mock.patch.object(volume_migrate, "existing_subdirs", return_value=["loras"]), \
+             mock.patch.object(volume_migrate, "sync"), \
+             mock.patch.object(volume_migrate, "verify", return_value=0), \
+             mock.patch.object(volume_migrate, "teardown_temp_pods"), \
+             mock.patch("subprocess.run", return_value=mock.Mock(returncode=0, stderr="")):
+            rc = volume_migrate.main(["--to-dc", "EU-CZ-1", "--yes"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(env_get(env_path, "POD_VOLUME_ID"), "vol-new")
+        payload = json.loads((tmpdir / "p.json").read_text())
+        self.assertEqual(payload["phase"], "done")
 
 
 if __name__ == "__main__":
