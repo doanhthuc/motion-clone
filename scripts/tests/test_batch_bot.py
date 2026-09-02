@@ -2268,6 +2268,29 @@ class TestFlow(unittest.TestCase):
         payload = json.loads(bot._progress_path(ME).read_text())
         self.assertEqual(Path(payload["manifest"]), live)
 
+    def test_a_stale_handoff_from_a_previous_cycle_is_not_replayed(self):
+        """Found live 2026-09-02: tick_progress read the handoff file but
+        never deleted it, so a chat whose SECOND, unrelated job never queued
+        anything replayed the FIRST job's old "running" handoff and closed
+        the second job out immediately, on its very first tick."""
+        self._confirm_and_start()
+        live = bot._job_manifest_path(ME)
+        stale_picked_up = live.with_name("tg-99999-111.yaml")
+        stale_picked_up.write_text(live.read_text(encoding="utf-8"), encoding="utf-8")
+        write_handoff(handoff_path(live), Handoff(status="running", manifest=str(stale_picked_up)))
+        with mock.patch("tgbot.bot.deliver_result"):
+            bot.tick_progress(self.tg, ME)   # consumes the (here, legitimate) handoff
+        self.assertFalse(handoff_path(live).exists())
+
+        # A brand new, unrelated confirm for the same chat.
+        reset_bot_state()
+        bot._LAST_VALIDATE.clear()
+        self._confirm_and_start()
+        with mock.patch("tgbot.bot.drain_running", return_value=True), \
+             mock.patch("tgbot.bot.deliver_result") as deliver:
+            bot.tick_progress(self.tg, ME)
+        deliver.assert_not_called()   # must NOT replay the stale handoff
+
     def test_confirm_calls_start_drain_once_with_dry_run_false(self):
         # Renamed from "...and_nothing_else_does": with drain_running mocked
         # to False, this test is identical with or without that guard — it

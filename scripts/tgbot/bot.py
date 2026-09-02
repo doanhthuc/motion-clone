@@ -2136,7 +2136,8 @@ def tick_progress(tg: Tg, chat_id: int) -> None:
         path.unlink(missing_ok=True)
         return
 
-    handoff = read_handoff(handoff_path(_job_manifest_path(chat_id)))
+    hpath = handoff_path(_job_manifest_path(chat_id))
+    handoff = read_handoff(hpath)
     if handoff is not None and handoff.status in ("running", "failed") \
             and Path(handoff.manifest).resolve() != manifest_path.resolve():
         # drain.py's chain_or_teardown only ever writes "running" or "failed"
@@ -2146,6 +2147,14 @@ def tick_progress(tg: Tg, chat_id: int) -> None:
         # Close the finished link out exactly like the ordinary "Finished"
         # tail below, then either continue with what got picked up or say
         # why it didn't — a silent handoff is worse than the wait it saves.
+        #
+        # hpath is consumed here rather than left for the next drain to
+        # overwrite: a chat whose NEXT job never queues anything (an
+        # ordinary, unrelated confirm days later) goes straight from
+        # claim_mailbox()=None to teardown() without ever touching this
+        # file — found live 2026-09-02, replaying this exact branch against
+        # a brand new job that had nothing to do with the old handoff.
+        hpath.unlink(missing_ok=True)
         final_text = progress_text(manifest_path, lease=lease_for(manifest_path),
                                    stages=stages)
         tg.edit_message(chat_id, message_id, final_text, parse_mode=PARSE_HTML)
