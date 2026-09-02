@@ -7,6 +7,10 @@
 __pycache__/
 *.pyc
 
+# Scratch workspace for superpowers:subagent-driven-development (ledgers,
+# briefs, review packages) — not part of the shipped repo.
+.superpowers/
+
 # Bản theo dõi upstream nằm NGOÀI repo (~/Desktop/motion-upstream-tracking/)
 # — liệt kê ở đây để nếu ai đó copy vào trong thì cũng không lọt vào git.
 motions-studio-upstream/
