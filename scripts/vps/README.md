@@ -120,6 +120,13 @@ make drain FILE=batch/2026-08-30.yaml CONFIRM=yes   # rents, runs, destroys
 3. `ffmpeg` (for `ffprobe`) is in the `apt install` line above. The bot refuses any file it cannot
    probe, so a missing `ffprobe` means nothing is ever accepted.
 
+4. `runpodctl` (top of this file) is now called by `bot.py` itself, not only by `drain.py` — `/gpu`
+   and the stock check before [Run] (2026-09-02) shell out to it directly, the same way
+   `pod_watchdog.py` already does. No service-file change needed: `pod-watchdog.service` already
+   runs `runpodctl` fine under systemd's default `PATH`, and `motion-bot.service` inherits the same
+   default. Both callers fail open (a warning, never a crash) if it is missing — but `/gpu` and the
+   pre-Run check are then useless, so install it before relying on either.
+
 ### Bring it up
 
 ```bash
