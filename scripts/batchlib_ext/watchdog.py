@@ -43,8 +43,13 @@ DESTROYABLE_NAMES = frozenset({"motion-transfer"})
 MIGRATE_DESTROYABLE_NAMES = frozenset({"migrate-tmp-a", "migrate-tmp-b"})
 
 # Spec estimate is 15-25 min end-to-end (docs/superpowers/specs/2026-09-02-
-# volume-region-migration-design.md §4) — doubled for margin, same
-# reasoning as GRACE_MIN's own margin over the provisioning window it covers.
+# volume-region-migration-design.md §4). This is the 25-minute TOP of that
+# range plus a 15-minute margin — 60% headroom on the worst case, not
+# "doubled", which the comment used to claim while stating 40 (2 x 25 is 50).
+# Same shape of margin as GRACE_MIN's own over the provisioning window it
+# covers. The two pods this bounds cost ~$0.07/h each, so the cost of the
+# ceiling being generous is cents; the cost of it being tight is killing a
+# migration mid-copy, which wastes the whole run.
 MIGRATE_CEILING_MIN = 40
 
 # How long a pod may exist unclaimed before tier 3 treats it as an orphan. It has

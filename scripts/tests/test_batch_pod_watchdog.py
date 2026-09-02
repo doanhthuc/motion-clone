@@ -399,6 +399,43 @@ class TestMigrationTiers(unittest.TestCase):
         self.assertEqual(pods_api.destroyed, ["pod-old"])
         self.assertFalse(self.lease_path.is_file())
 
+    def test_leased_migration_pods_are_not_reported_as_unclaimed(self):
+        # I4: `untouched` excluded the real GPU pod's leased id but not the
+        # migration lease's two, so a normal, legitimate, ONE-HOUR migration
+        # logged "leaving migrate-tmp-a alone — unclaimed but only 62 min old,
+        # inside the 10 min grace window" every single tick. Both halves of
+        # that sentence are false: the pod IS claimed, and 62 is not inside 10.
+        write_migrate_lease(self.migrate_lease_path, MigrateLease(
+            pod_a_id="tmp-a", pod_b_id="tmp-b", started_at=0.0, to_dc="EU-CZ-1"))
+        pods_api = FakePods()
+        pods_api.pods = [PodInfo("tmp-a", "migrate-tmp-a"),
+                         PodInfo("tmp-b", "migrate-tmp-b")]
+
+        # Well inside MIGRATE_CEILING_MIN so tier 1/2 does not kill them, and
+        # well PAST GRACE_MIN so the false line would definitely have fired.
+        pod_watchdog.tick(pods_api, {"tmp-a": 0.0, "tmp-b": 0.0},
+                          now=20 * 60.0, dry_run=True)
+
+        joined = "\n".join(self.logs)
+        self.assertNotIn("grace window", joined)
+        self.assertIn("claimed by an active migration lease", joined)
+        self.assertIn("tmp-a", joined)
+        self.assertIn("tmp-b", joined)
+        self.assertEqual(pods_api.destroyed, [])
+
+    def test_an_unleased_migration_pod_still_gets_the_grace_window_line(self):
+        # The other side of the same boundary: with no migration lease, a
+        # young migrate-tmp pod really IS unclaimed and inside the grace
+        # window, and that line must still be printed.
+        pods_api = FakePods()
+        pods_api.pods = [PodInfo("tmp-a", "migrate-tmp-a")]
+
+        pod_watchdog.tick(pods_api, {"tmp-a": 0.0}, now=60.0, dry_run=True)
+
+        joined = "\n".join(self.logs)
+        self.assertIn("grace window", joined)
+        self.assertNotIn("claimed by an active migration lease", joined)
+
     def test_migration_branch_cannot_disable_tier_3_for_the_real_pod(self):
         # I2's twin for the migration branch: a raise inside it (decide_migration,
         # or destroy_verified via RunpodCtl.destroy raising RuntimeError on a

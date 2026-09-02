@@ -153,8 +153,26 @@ def tick(pods_api, first_seen: dict[str, float], *, now: float,
     # same, and reporting the wrong one is worse than reporting nothing. Silent
     # inaction on a $0.99/hour box is the thing this daemon exists to prevent, so
     # naming them costs one log line and makes the boundary auditable.
+    #
+    # THREE reasons now, not two. The migration lease's two pod ids have to be
+    # excluded the same way the real pod's leased id already is: without it, a
+    # perfectly normal migration made this loop print "leaving migrate-tmp-a
+    # alone — unclaimed but only 62 min old, inside the 10 min grace window"
+    # on every 60s tick, in which both halves are false (the pod IS claimed,
+    # and 62 is not inside 10). A watchdog log that cries wolf on the healthy
+    # case is worth less than no log, which is the same argument the two
+    # existing branches were split for.
+    migrating = ({migrate_lease.pod_a_id, migrate_lease.pod_b_id}
+                 if migrate_lease is not None else set())
+    for p in pods:
+        if p.pod_id in migrating and p.pod_id not in kill:
+            log(f"leaving {p.pod_id} ({p.name!r}) alone — claimed by an active "
+                f"migration lease (to {migrate_lease.to_dc})")
+
     untouched = [p for p in pods
-                 if p.pod_id not in kill and (lease is None or p.pod_id != lease.pod_id)]
+                 if p.pod_id not in kill
+                 and (lease is None or p.pod_id != lease.pod_id)
+                 and p.pod_id not in migrating]
     for p in untouched:
         if p.name in DESTROYABLE_NAMES or p.name in MIGRATE_DESTROYABLE_NAMES:
             age_min = (now - seen[p.pod_id]) / 60.0
