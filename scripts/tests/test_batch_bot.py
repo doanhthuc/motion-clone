@@ -1407,6 +1407,47 @@ class TestFlow(unittest.TestCase):
             bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
         self.assertIn("migrat", self.tg.messages[-1].lower())
 
+    # ---- migration progress ticks (Task 9) --------------------------------
+
+    def test_tick_migration_progress_edits_one_message_across_phases(self):
+        prog_path = bot._MIGRATE_PROGRESS_PATH
+        prog_path.parent.mkdir(parents=True, exist_ok=True)
+        prog_path.write_text(json.dumps({"phase": "sync", "at": 0.0}), encoding="utf-8")
+        bot.tick_migration_progress(self.tg, ME)
+        self.assertTrue(bot._migrate_progress_message_path(ME).exists())
+        first_message_id = json.loads(
+            bot._migrate_progress_message_path(ME).read_text())["message_id"]
+
+        prog_path.write_text(json.dumps({"phase": "verify", "at": 1.0}), encoding="utf-8")
+        bot.tick_migration_progress(self.tg, ME)
+        second_message_id = json.loads(
+            bot._migrate_progress_message_path(ME).read_text())["message_id"]
+        self.assertEqual(first_message_id, second_message_id)   # edited, not re-sent
+
+    def test_tick_migration_progress_delivers_a_final_message_on_done(self):
+        prog_path = bot._MIGRATE_PROGRESS_PATH
+        prog_path.parent.mkdir(parents=True, exist_ok=True)
+        prog_path.write_text(json.dumps({"phase": "sync", "at": 0.0}), encoding="utf-8")
+        bot.tick_migration_progress(self.tg, ME)
+
+        prog_path.write_text(json.dumps({"phase": "done", "at": 1.0}), encoding="utf-8")
+        bot.tick_migration_progress(self.tg, ME)
+        self.assertIn("done", self.tg.messages[-1].lower())
+        self.assertFalse(prog_path.exists())   # consumed, like the drain progress file
+
+    def test_tick_migration_progress_reports_a_failed_phase(self):
+        prog_path = bot._MIGRATE_PROGRESS_PATH
+        prog_path.parent.mkdir(parents=True, exist_ok=True)
+        prog_path.write_text(json.dumps(
+            {"phase": "failed", "at": 0.0, "reason": "2 file(s) still differ"}),
+            encoding="utf-8")
+        bot.tick_migration_progress(self.tg, ME)
+        self.assertIn("2 file(s) still differ", self.tg.messages[-1])
+
+    def test_a_tick_with_no_migration_in_progress_does_nothing(self):
+        bot.tick_migration_progress(self.tg, ME)
+        self.assertEqual(self.tg.messages, [])
+
     def test_tapping_switch_writes_env_and_shows_the_new_price(self):
         (self.root / ".env").write_text(
             "GPU=NVIDIA GeForce RTX 5090\nPOD_VOLUME_ID=vol-1\n", encoding="utf-8")

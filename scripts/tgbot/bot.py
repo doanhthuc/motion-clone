@@ -2072,6 +2072,25 @@ def _freeze_panel(tg: Tg, chat_id: int, stamp: str) -> None:
 
 _PROGRESS_SUFFIX = ".progress.json"
 
+# The migration counterpart to _progress_path below, but system-wide rather
+# than per-chat: volume_migrate.py's write_progress() writes ONE file no
+# matter who is watching, because only one migration can run at a time (see
+# migration_running / _MIGRATE_LEASE_PATH) and this bot only ever serves one
+# allowed user. Deliberately a separate constant from _MIGRATE_LEASE_PATH
+# (Task 8): the lease marks "a migration is in flight" for the /run picker to
+# refuse a second one, while this file is volume_migrate.py's phase-by-phase
+# progress, read by tick_migration_progress below.
+_MIGRATE_PROGRESS_PATH = ROOT / "batch" / "volume-migrate.progress.json"
+
+
+def _migrate_progress_message_path(chat_id: int) -> Path:
+    """Which message this bot process is keeping edited for a migration in
+    progress — mirrors _progress_path's own reasoning (a migration can
+    outlive a bot restart) but is its OWN file: a migration is a single
+    system-wide operation, not one per chat, and must never be confused with
+    a per-chat batch drain's progress file."""
+    return ROOT / "batch" / f"tg-{chat_id}.migrate-progress.json"
+
 # The progress message is re-edited on every poll — roughly every 50s, since
 # that is what get_updates long-polls for.
 #
@@ -2242,6 +2261,49 @@ def tick_progress(tg: Tg, chat_id: int) -> None:
     _ANIM_PAUSE.pop(chat_id, None)
     tg.edit_message(chat_id, message_id, text, parse_mode=PARSE_HTML)
     deliver_result(tg, chat_id, manifest_path)
+
+
+def tick_migration_progress(tg: Tg, chat_id: int) -> None:
+    """Re-render the migration progress message, same shape as tick_progress
+    for a drain — one message, edited in place while it runs, and a final
+    delivery — a fresh send, not a silent edit — on done/failed, so the user
+    gets a notification even if the in-progress message scrolled out of view
+    (mirrors deliver_result's own separate send at the end of a drain).
+    Called every poll tick alongside tick_progress; harmless no-op when no
+    migration is running.
+    """
+    if not _MIGRATE_PROGRESS_PATH.exists():
+        return
+    try:
+        payload = json.loads(_MIGRATE_PROGRESS_PATH.read_text(encoding="utf-8"))
+        phase = str(payload["phase"])
+    except (ValueError, KeyError, TypeError) as exc:
+        log(f"migration progress file unreadable, ignoring: {exc!r}")
+        return
+
+    text = {
+        "create": "🔄 <b>Migrating volume</b> — creating the destination volume…",
+        "sync": "🔄 <b>Migrating volume</b> — copying data between temp pods…",
+        "verify": "🔄 <b>Migrating volume</b> — verifying checksums…",
+        "done": "✅ Migration done.",
+        "failed": f"⚠️ Migration failed: {_esc(payload.get('reason', 'unknown error'))}",
+    }.get(phase, f"🔄 <b>Migrating volume</b> — {_esc(phase)}")
+    if phase == "done" and payload.get("warning"):
+        text += f"\n{_esc(payload['warning'])}"
+
+    msg_path = _migrate_progress_message_path(chat_id)
+    if phase in ("done", "failed"):
+        tg.send_message(chat_id, text, parse_mode=PARSE_HTML)
+        _MIGRATE_PROGRESS_PATH.unlink(missing_ok=True)
+        msg_path.unlink(missing_ok=True)
+        return
+
+    if msg_path.exists():
+        message_id = json.loads(msg_path.read_text(encoding="utf-8"))["message_id"]
+        tg.edit_message(chat_id, message_id, text, parse_mode=PARSE_HTML)
+    else:
+        message_id = tg.send_message(chat_id, text, parse_mode=PARSE_HTML)
+        msg_path.write_text(json.dumps({"message_id": message_id}), encoding="utf-8")
 
 
 _LAST_SUFFIX = ".last.json"
@@ -3393,6 +3455,7 @@ def main() -> int:
             # After the updates, not instead of them.
             # One chat, because the allowlist is one user (spec section 2).
             tick_progress(tg, allowed_user_id)
+            tick_migration_progress(tg, allowed_user_id)
         except TgError as exc:
             log(f"poll failed, continuing: {exc}")
             time.sleep(5)
