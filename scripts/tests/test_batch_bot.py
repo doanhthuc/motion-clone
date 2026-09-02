@@ -1344,6 +1344,69 @@ class TestFlow(unittest.TestCase):
         flat_data = [data for row in self.tg.buttons[-1] for _, data in row]
         self.assertIn(bot._CB_RUN_SWITCH + "4090", flat_data)
 
+    def test_other_regions_offer_a_migrate_button(self):
+        stock = {
+            "NVIDIA GeForce RTX 5090": [
+                Stock(gpu_id="NVIDIA GeForce RTX 5090", display_name="RTX 5090",
+                     price_per_hr=0.99, datacenter_id="EU-RO-1", stock_status="none"),
+                Stock(gpu_id="NVIDIA GeForce RTX 5090", display_name="RTX 5090",
+                     price_per_hr=0.99, datacenter_id="EU-CZ-1", stock_status="High"),
+            ],
+            "NVIDIA GeForce RTX 4090": [
+                Stock(gpu_id="NVIDIA GeForce RTX 4090", display_name="RTX 4090",
+                     price_per_hr=0.74, datacenter_id="EU-RO-1", stock_status="Medium"),
+            ],
+            "NVIDIA RTX PRO 4500 Blackwell": [
+                Stock(gpu_id="NVIDIA RTX PRO 4500 Blackwell", display_name="RTX PRO 4500",
+                     price_per_hr=0.72, datacenter_id="EU-RO-1", stock_status="Medium"),
+            ],
+        }
+        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at", return_value=stock), \
+             mock.patch("tgbot.bot.migration_running", return_value=False):
+            self._fill_required_slots()
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
+        flat_data = [data for row in self.tg.buttons[-1] for _, data in row]
+        self.assertTrue(any(d.startswith(bot._CB_MIGRATE_ASK) for d in flat_data))
+
+    def test_tapping_migrate_ask_shows_the_destructive_confirm(self):
+        with mock.patch("tgbot.bot.migration_running", return_value=False):
+            bot.handle(self.tg,
+                      cb_from(ME, bot._CB_MIGRATE_ASK + "5090,EU-CZ-1"),
+                      allowed_user_id=ME)
+        text = self.tg.messages[-1]
+        self.assertIn("cannot be undone", text.lower())
+        self.assertIn("EU-CZ-1", text)
+        flat_data = [data for row in self.tg.buttons[-1] for _, data in row]
+        self.assertTrue(any(d.startswith(bot._CB_MIGRATE_GO) for d in flat_data))
+        self.assertIn(bot._CB_MIGRATE_NO, flat_data)
+
+    def test_migrate_go_launches_the_script_exactly_once(self):
+        with mock.patch("tgbot.bot.subprocess.Popen") as mock_popen, \
+             mock.patch("tgbot.bot.migration_running", return_value=False):
+            bot.handle(self.tg,
+                      cb_from(ME, bot._CB_MIGRATE_GO + "EU-CZ-1"),
+                      allowed_user_id=ME)
+        mock_popen.assert_called_once()
+        argv = mock_popen.call_args.args[0]
+        self.assertIn("scripts/volume_migrate.py", argv)
+        self.assertIn("EU-CZ-1", argv)
+        self.assertIn("--yes", argv)
+
+    def test_a_second_migrate_attempt_while_one_runs_is_refused(self):
+        with mock.patch("tgbot.bot.migration_running", return_value=True):
+            bot.handle(self.tg,
+                      cb_from(ME, bot._CB_MIGRATE_ASK + "5090,EU-CZ-1"),
+                      allowed_user_id=ME)
+        self.assertIn("already", self.tg.messages[-1].lower())
+
+    def test_confirm_is_refused_while_a_migration_is_in_flight(self):
+        with mock.patch("tgbot.bot.migration_running", return_value=True):
+            self._fill_required_slots()
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+        self.assertIn("migrat", self.tg.messages[-1].lower())
+
     def test_tapping_switch_writes_env_and_shows_the_new_price(self):
         (self.root / ".env").write_text(
             "GPU=NVIDIA GeForce RTX 5090\nPOD_VOLUME_ID=vol-1\n", encoding="utf-8")

@@ -51,6 +51,7 @@ from tgbot.run import (LEASE_PATH, _RUNNING, drain_running, estimate_minutes,
 from batchlib_ext.gpu_stock import stock_at, volume_datacenter
 from batchlib_ext.handoff import handoff_path, mailbox_path, read_handoff
 from batchlib_ext.lease import clear_lease
+from batchlib_ext.migrate_lease import read_migrate_lease
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -1081,6 +1082,10 @@ _CB_WIPE_NO = "wipe:no"
 _CB_KILL_ASK = "kill:ask"
 _CB_KILL_GO = "kill:go"
 _CB_KILL_NO = "kill:no"
+_CB_MIGRATE_ASK = "mig:ask:"    # + "<gpu_short>,<to_dc>"
+_CB_MIGRATE_GO = "mig:go:"      # + "<to_dc>"
+_CB_MIGRATE_NO = "mig:no"
+_MIGRATE_LEASE_PATH = ROOT / "batch" / "volume-migrate-lease.json"
 _CB_ADD = "add"
 _CB_JOB_EDIT = "bj:e:"   # + _job_digest
 _CB_JOB_DROP = "bj:d:"   # + _job_digest
@@ -1234,6 +1239,17 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
 
         elif data == _CB_KILL_NO:
             tg.send_message(chat_id, "left running — nothing killed")
+
+        elif data.startswith(_CB_MIGRATE_ASK):
+            gpu_short, to_dc = data[len(_CB_MIGRATE_ASK):].split(",", 1)
+            gpu_id = _GPU_BY_SHORT.get(gpu_short, gpu_short)
+            _ask_migrate(tg, chat_id, gpu_id, to_dc)
+
+        elif data.startswith(_CB_MIGRATE_GO):
+            _start_migration(tg, chat_id, data[len(_CB_MIGRATE_GO):])
+
+        elif data == _CB_MIGRATE_NO:
+            tg.send_message(chat_id, "kept — nothing migrated")
 
         else:
             tg.send_message(chat_id, "that button is from an older version of "
@@ -2553,6 +2569,15 @@ def _gpu_price(gpu_id: str, stock: dict) -> float:
     return entries[0].price_per_hr if entries and entries[0].price_per_hr else 0.99
 
 
+def migration_running() -> bool:
+    """A volume migration currently in flight — checked before offering a
+    NEW migration button, and before letting /confirm rent at the OLD
+    datacenter mid-copy. The lease existing is proof enough; nothing here
+    needs to reach the pods themselves.
+    """
+    return read_migrate_lease(_MIGRATE_LEASE_PATH) is not None
+
+
 def _offer_run_confirm(tg: Tg, chat_id: int) -> None:
     """The step between [Run] and spending money: always lists every known
     GPU's live stock/price at the home datacenter and lets [Confirm] switch
@@ -2642,6 +2667,15 @@ def _offer_run_confirm(tg: Tg, chat_id: int) -> None:
             icon = _STOCK_ICON.get(e.stock_status.lower(), "⬜")
             other_lines.append(f"  {icon} {_esc(e.display_name)} — "
                                f"{_esc(e.datacenter_id)}: {_esc(e.stock_status)}")
+            # Only offered when nothing is already mid-copy (2026-09-02) — a
+            # second migration racing the first would fight it for the same
+            # temp pods; migration_running() is the same guard _ask_migrate
+            # and _start_migration re-check themselves, so a stale button
+            # tapped after a migration already started still fails safely.
+            short = _GPU_SHORT.get(gpu_id)
+            if short and not migration_running():
+                switch_row.append((f"Switch to {e.display_name} ({e.datacenter_id})",
+                                  _CB_MIGRATE_ASK + f"{short},{e.datacenter_id}"))
     if alt_lines:
         lines += ["", "Switch to:", *alt_lines]
     if other_lines:
@@ -2742,6 +2776,37 @@ def _do_kill(tg: Tg, chat_id: int) -> None:
                         parse_mode=PARSE_HTML)
 
 
+def _ask_migrate(tg: Tg, chat_id: int, gpu_id: str, to_dc: str) -> None:
+    """The confirm step for a Network Volume migration — destructive, unlike
+    [Run]'s Yes/Cancel, because this one deletes the SOURCE volume once the
+    copy verifies, not just spends money going forward.
+    """
+    if migration_running():
+        tg.send_message(chat_id, "a volume migration is already in progress — "
+                                 "wait for it to finish before starting another")
+        return
+    tg.send_message(
+        chat_id,
+        f"This copies your Network Volume to {_esc(to_dc)}: ~2 temporary CPU pods "
+        f"for the duration, then <b>deletes the current volume</b> once the copy is "
+        f"verified byte-for-byte. Estimated 15-25 minutes. "
+        f"<b>Cannot be undone</b> once the old volume is deleted.",
+        parse_mode=PARSE_HTML,
+        buttons=[[("Yes, migrate", _CB_MIGRATE_GO + to_dc),
+                  ("Cancel", _CB_MIGRATE_NO)]])
+
+
+def _start_migration(tg: Tg, chat_id: int, to_dc: str) -> None:
+    if migration_running():
+        tg.send_message(chat_id, "a volume migration is already in progress")
+        return
+    subprocess.Popen(["python3", "scripts/volume_migrate.py", "--to-dc", to_dc, "--yes"],
+                     cwd=_REPO_ROOT)
+    tg.send_message(chat_id, f"🚀 Migration to {_esc(to_dc)} started — this will take "
+                             "15-25 minutes. I will report progress here.",
+                    parse_mode=PARSE_HTML)
+
+
 def _again(tg: Tg, chat_id: int) -> None:
     """Rebuild the last submitted job so it can be re-run with one thing changed.
 
@@ -2808,6 +2873,13 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
     `grep -rn "start_drain" scripts/tgbot/bot.py` must show exactly one
     call site, and it must be in here.
     """
+    # Checked before anything else, including completeness — a migration mid-
+    # copy is moving the Network Volume this pod would mount, so renting must
+    # not be allowed to race it regardless of how complete the job is.
+    if migration_running():
+        tg.send_message(chat_id, "a volume migration is in progress for this pod's "
+                                 "datacenter — wait for it to finish before renting")
+        return
     # `dry_run` is threaded from the caller (main()'s --dry-run; False for real
     # usage and for every call in this file's own tests) all the way to the one
     # start_drain below. The CLI flag has to actually reach that line, or
