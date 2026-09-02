@@ -2393,6 +2393,13 @@ _FALLBACK_GPU_IDS = ("NVIDIA GeForce RTX 4090", "NVIDIA RTX PRO 4500 Blackwell")
 # "other regions" list so the most promising alternative surfaces first.
 _STOCK_RANK = {"high": 0, "medium": 1, "low": 2, "none": 3}
 
+# A coloured dot reads faster than the word next to it, on a phone screen
+# glanced at before deciding whether to spend $0.99/h. Traffic-light order,
+# extended one step for "none" — Telegram renders all four natively, no
+# custom-emoji entitlement needed (unlike tgbot/run.py's own note on
+# <tg-emoji> being silently stripped).
+_STOCK_ICON = {"high": "🟢", "medium": "🟡", "low": "🟠", "none": "🔴"}
+
 
 def _report_gpu_stock(tg: Tg, chat_id: int) -> None:
     """Live RunPod stock for the 5090 and its fallbacks, at every datacenter
@@ -2418,11 +2425,8 @@ def _report_gpu_stock(tg: Tg, chat_id: int) -> None:
 
     lines = ["📦 <b>GPU stock</b>"]
     configured = env_get(ROOT / ".env", "GPU")
-    if configured and configured != _PRIMARY_GPU_ID:
-        # Explains, in the same breath, why the box right now is slower or
-        # cheaper than the 5090 numbers below suggest.
-        lines.append(f"⚠️ .env is currently set to <b>{_esc(configured)}</b>, "
-                     "not the 5090")
+    if configured:
+        lines.append(f"🖥 Currently selected: <b>{_esc(configured)}</b>")
     if home_dc:
         lines.append(f"📍 <b>{_esc(home_dc)}</b> (your volume)")
     else:
@@ -2434,15 +2438,16 @@ def _report_gpu_stock(tg: Tg, chat_id: int) -> None:
         if not entries:
             lines.append(f"  {_esc(wanted_id)}: not listed by runpodctl right now")
             continue
-        price = f"${entries[0].price_per_hr:.2f}/h" if entries[0].price_per_hr else "?"
+        price = f"💵 ${entries[0].price_per_hr:.2f}/h" if entries[0].price_per_hr else "?"
         # None, not "not offered here", when home_dc itself is unknown — that
         # reads as "checked and absent", which is a claim this branch has no
         # basis for.
         home = next((e for e in entries if home_dc and e.datacenter_id == home_dc),
                     None)
         if home is not None:
+            icon = _STOCK_ICON.get(home.stock_status.lower(), "⬜")
             lines.append(f"  {_esc(entries[0].display_name)}: "
-                         f"<b>{_esc(home.stock_status)}</b> · {price}")
+                         f"{icon} <b>{_esc(home.stock_status)}</b> · {price}")
         else:
             lines.append(f"  <b>{_esc(entries[0].display_name)}</b> · {price}")
 
@@ -2450,8 +2455,9 @@ def _report_gpu_stock(tg: Tg, chat_id: int) -> None:
             (e for e in entries if e is not home and e.stock_status.lower() != "none"),
             key=lambda e: _STOCK_RANK.get(e.stock_status.lower(), 9))
         for e in elsewhere[:2]:
+            icon = _STOCK_ICON.get(e.stock_status.lower(), "⬜")
             other_lines.append(f"  {_esc(e.display_name)} — {_esc(e.datacenter_id)}: "
-                               f"{_esc(e.stock_status)}")
+                               f"{icon} {_esc(e.stock_status)}")
 
     if other_lines:
         lines.append("\n<b>Other regions</b> (need the volume synced there "

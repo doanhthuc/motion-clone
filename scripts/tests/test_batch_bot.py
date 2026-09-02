@@ -3115,21 +3115,43 @@ class TestGpuStockCommand(unittest.TestCase):
         self.assertIn("RTX 5090", text)
         self.assertIn("Low", text)
 
-    def test_a_configured_fallback_is_flagged_as_a_note(self):
+    def test_the_currently_selected_gpu_is_always_named_plainly(self):
+        # No "not the 5090" framing (2026-09-02, user's own wording): just
+        # state what is selected, whatever it is.
         self._write_env(gpu="NVIDIA RTX PRO 4500 Blackwell")
         with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
              mock.patch("tgbot.bot.stock_at", return_value=self._stock()):
             bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
         text = self.tg.messages[-1]
-        self.assertIn("currently set to", text)
+        self.assertIn("Currently selected", text)
         self.assertIn("NVIDIA RTX PRO 4500 Blackwell", text)
+        self.assertNotIn("not the 5090", text)
 
-    def test_no_note_when_env_already_matches_the_5090(self):
+    def test_the_currently_selected_line_shows_even_when_it_is_the_5090(self):
         self._write_env(gpu="NVIDIA GeForce RTX 5090")
         with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
              mock.patch("tgbot.bot.stock_at", return_value=self._stock()):
             bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
-        self.assertNotIn("currently set to", self.tg.messages[-1])
+        text = self.tg.messages[-1]
+        self.assertIn("Currently selected", text)
+        self.assertIn("NVIDIA GeForce RTX 5090", text)
+
+    def test_stock_words_carry_a_coloured_icon(self):
+        self._write_env()
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at", return_value=self._stock()):
+            bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
+        text = self.tg.messages[-1]
+        self.assertIn("🟠", text)   # Low, at home
+        self.assertIn("🟡", text)  # Medium
+        self.assertIn("🟢", text)  # High
+
+    def test_price_carries_a_money_emoji(self):
+        self._write_env()
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at", return_value=self._stock()):
+            bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
+        self.assertIn("💵 $0.99/h", self.tg.messages[-1])
 
     def test_works_even_with_no_env_file_at_all(self):
         with mock.patch("tgbot.bot.volume_datacenter", return_value=None), \
