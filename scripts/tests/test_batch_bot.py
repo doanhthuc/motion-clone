@@ -6,6 +6,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batchlib.config import env_get
 from batchlib.manifest import state_path_for
 from batchlib_ext.gpu_stock import Stock
+from batchlib_ext.handoff import Handoff, handoff_path, mailbox_path, write_handoff
 import tgbot.bot as bot
 from tgbot.bot import allowed
 from tgbot.ingest import Probe
@@ -2213,6 +2214,60 @@ class TestFlow(unittest.TestCase):
         self.assertFalse(bot._progress_path(ME).exists())
         self.assertTrue(logged.called)
 
+    def test_a_successful_handoff_delivers_the_old_job_and_tracks_the_new_one(self):
+        """2026-09-02: drain.py's chain_or_teardown only ever writes a
+        "running" handoff once the link this progress message was tracking
+        has already finished — so closing THAT out (edit + deliver) has to
+        happen before switching over, exactly like an ordinary finish."""
+        self._confirm_and_start()
+        live = bot._job_manifest_path(ME)
+        old_message_id = json.loads(bot._progress_path(ME).read_text())["message_id"]
+        picked_up = live.with_name("tg-99999-111.yaml")
+        picked_up.write_text(live.read_text(encoding="utf-8"), encoding="utf-8")
+        write_handoff(handoff_path(live), Handoff(status="running", manifest=str(picked_up)))
+        with mock.patch("tgbot.bot.deliver_result") as deliver:
+            bot.tick_progress(self.tg, ME)
+        deliver.assert_called_once_with(self.tg, ME, live)
+        self.assertIn("automatically continuing", "\n".join(self.tg.messages))
+        payload = json.loads(bot._progress_path(ME).read_text())
+        self.assertEqual(Path(payload["manifest"]), picked_up)
+        self.assertNotEqual(payload["message_id"], old_message_id)
+
+    def test_a_failed_handoff_still_delivers_the_finished_job_and_says_why(self):
+        self._confirm_and_start()
+        live = bot._job_manifest_path(ME)
+        picked_up = live.with_name("tg-99999-111.yaml")
+        picked_up.write_text(live.read_text(encoding="utf-8"), encoding="utf-8")
+        write_handoff(handoff_path(live),
+                     Handoff(status="failed", manifest=str(picked_up),
+                             reason="batch_run exited 1"))
+        with mock.patch("tgbot.bot.deliver_result") as deliver:
+            bot.tick_progress(self.tg, ME)
+        deliver.assert_called_once_with(self.tg, ME, live)
+        last = "\n".join(self.tg.messages)
+        self.assertIn("could not start", last)
+        self.assertIn("batch_run exited 1", last)
+        self.assertIn("/again", last)
+        # No new progress message was started for the failed pickup — the
+        # pod was destroyed, nothing is running to report on.
+        self.assertFalse(bot._progress_path(ME).exists())
+
+    def test_a_starting_handoff_is_ignored_until_it_resolves(self):
+        # "starting" is the transient moment between claiming the mailbox and
+        # knowing whether it actually ran — switching on it would be a guess
+        # that has not resolved yet.
+        self._confirm_and_start()
+        live = bot._job_manifest_path(ME)
+        picked_up = live.with_name("tg-99999-111.yaml")
+        picked_up.write_text(live.read_text(encoding="utf-8"), encoding="utf-8")
+        write_handoff(handoff_path(live), Handoff(status="starting", manifest=str(picked_up)))
+        with mock.patch("tgbot.bot.drain_running", return_value=True), \
+             mock.patch("tgbot.bot.deliver_result") as deliver:
+            bot.tick_progress(self.tg, ME)
+        deliver.assert_not_called()
+        payload = json.loads(bot._progress_path(ME).read_text())
+        self.assertEqual(Path(payload["manifest"]), live)
+
     def test_confirm_calls_start_drain_once_with_dry_run_false(self):
         # Renamed from "...and_nothing_else_does": with drain_running mocked
         # to False, this test is identical with or without that guard — it
@@ -2264,37 +2319,32 @@ class TestFlow(unittest.TestCase):
             bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
         start_drain.assert_not_called()
 
-    def test_confirm_is_refused_while_a_drain_is_already_running(self):
-        # The slots are filled with drain_running FALSE, so the manifest is
-        # written and validated as normal and /confirm reaches its own guard.
-        # (Before finding C1 was fixed the whole fill happened under
-        # drain_running=True, which meant /confirm was actually being refused
-        # by the _LAST_VALIDATE guard and this test passed without ever
-        # exercising the drain guard it is named for.)
+    def test_confirm_while_a_drain_is_running_queues_instead_of_renting(self):
+        # 2026-09-02: a drain already running no longer refuses /confirm — it
+        # writes the job into the mailbox for drain.py's own chain_or_teardown
+        # to pick up on the pod already rented, instead of renting a second
+        # one. start_drain must still never be called for it.
         with mock.patch("tgbot.bot.start_drain") as start_drain:
             self._fill_required_slots()
             with mock.patch("tgbot.bot.drain_running", return_value=True):
                 bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
         start_drain.assert_not_called()
-        self.assertIn("already running", self.tg.messages[-1])
+        self.assertIn("Queued", self.tg.messages[-1])
+        self.assertTrue(mailbox_path(bot._job_manifest_path(ME)).exists())
 
     def test_confirm_without_a_complete_job_is_refused(self):
         with mock.patch("tgbot.bot.start_drain") as start_drain:
             bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
         start_drain.assert_not_called()
 
-    def test_a_live_drain_blocks_the_next_job_from_overwriting_the_manifest(self):
-        """Regression for finding C1 (2026-08-31): the /confirm chain was
-        guarded but the WRITE path was not.
-
-        scripts/drain.py:220-248 runs batch_run.py as a separate process
-        twice, re-reading batch/tg-<chat>.yaml from disk each time — phase A
-        (--no-start), then provision + bootstrap, then phase B (--resume). For
-        the ~10-35 minutes in between, that one deterministic path is live
-        input. Assembling the next job during the render (the most ordinary
-        thing there is) filled the last slot, _maybe_show_manifest wrote over
-        the file, and phase B loaded job B onto the pod rented for job A with
-        nobody asked. The manifest bytes must not move while a drain owns it.
+    def test_a_live_drain_routes_the_next_job_into_the_mailbox_not_the_live_file(self):
+        """Finding C1 (2026-08-31) was "the live manifest bytes must not move
+        while a drain owns it" — still true, and still the point of this
+        test. What changed 2026-09-02 is what happens to job B instead of
+        being refused outright: it goes into the mailbox
+        (batchlib_ext.handoff.mailbox_path), a different file the running
+        drain never reads, so it gets the same live validation/panel a normal
+        job would rather than a flat "wait" — see _active_manifest_path.
         """
         with mock.patch("tgbot.bot.start_drain"):
             self._fill_required_slots()
@@ -2324,7 +2374,8 @@ class TestFlow(unittest.TestCase):
             bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME)
 
         self.assertEqual(manifest.read_bytes(), before)
-        self.assertIn("drain is still running", self.tg.messages[-1])
+        self.assertTrue(mailbox_path(manifest).exists())
+        self.assertIn("driver2.mp4", mailbox_path(manifest).read_text(encoding="utf-8"))
 
     def test_staged_paths_replace_the_bot_api_path_that_carries_the_token(self):
         """Findings C2 and I5: a local Bot API file path is
@@ -2505,17 +2556,18 @@ class TestFlow(unittest.TestCase):
         self.assertNotEqual(slots["character"], slots["outfit"])
         self.assertTrue(slots["outfit"].is_file())
 
-    def test_confirm_recovers_from_the_write_guard_instead_of_stranding_the_user(self):
-        """Regression for finding B (2026-08-31).
+    def test_confirm_recovers_once_the_mailbox_frees_up(self):
+        """The mailbox-era version of finding B (2026-08-31 / 2026-09-02).
 
-        The C1 write guard refuses to render while a drain is live and says
-        "your files are kept; send /status" — but it left _LAST_VALIDATE
-        unset. The job is already complete at that point, so no further slot
-        fill re-enters _maybe_show_manifest and nothing ever sets it. /confirm
-        then refused with "the manifest hasn't passed validation ... Fix the
-        error already shown" — and no error had ever been shown. The only
-        escape was to re-send a file, which nothing tells the user.
+        The old C1 write guard refused to render while a drain was live and
+        left _LAST_VALIDATE unset — recovery meant retrying, not replaying a
+        stale "fix the error already shown" that nobody had actually shown.
+        The guard that can still leave it unset today is a mailbox already
+        occupied (queue depth 1); the fix has to keep working once that
+        mailbox is claimed and freed, same as it did once a drain finished.
         """
+        live = bot._job_manifest_path(ME)
+        mailbox_path(live).write_text("runs: []\n", encoding="utf-8")
         with mock.patch("tgbot.bot.start_drain") as start_drain, \
              mock.patch("tgbot.bot.drain_running", return_value=True):
             self._fill_required_slots()
@@ -2523,18 +2575,18 @@ class TestFlow(unittest.TestCase):
         # refusal can itself land as a fresh send rather than an edit, once
         # the uploads' own spinner messages have pushed it past the drift
         # threshold — a heuristic this test has no interest in.
-        self.assertIn("drain is still running", "\n".join(self.tg.messages))
+        self.assertIn("already queued next", "\n".join(self.tg.messages))
         self.assertNotIn(ME, bot._LAST_VALIDATE)
 
-        # The drain has since finished, so the write guard now passes.
+        # drain.py's own chain_or_teardown has since claimed the mailbox —
+        # freeing it — while the drain itself may still be running.
+        mailbox_path(live).unlink()
         with mock.patch("tgbot.bot.start_drain") as start_drain, \
-             mock.patch("tgbot.bot.drain_running", return_value=False):
+             mock.patch("tgbot.bot.drain_running", return_value=True):
             bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
-        start_drain.assert_called_once()
-        self.assertIn("started", self.tg.messages[-1])
-        # The manifest was never shown before money was spent — show it now,
-        # so the transcript still records what was paid for.
-        self.assertIn("runs:", "\n".join(self.tg.messages))
+        start_drain.assert_not_called()   # queued, not rented — a drain is still running
+        self.assertIn("Queued", self.tg.messages[-1])
+        self.assertTrue(mailbox_path(live).exists())
 
     def test_confirm_after_a_real_validation_failure_names_the_real_reason(self):
         """The other half of finding B: recovering from the write guard must

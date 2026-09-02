@@ -20,7 +20,8 @@ from batch_run import EXIT_NEEDS_POD
 from batchlib.config import env_get, load_settings
 from batchlib.manifest import Manifest, load_manifest, load_state, state_path_for
 from batchlib.pipelines import PIPELINES, STAGES
-from batchlib_ext.lease import Lease, clear_lease, write_lease
+from batchlib_ext.handoff import Handoff, claim_mailbox, handoff_path, write_handoff
+from batchlib_ext.lease import Lease, clear_lease, read_lease, write_lease
 
 ROOT = Path(__file__).resolve().parents[1]
 LEASE_PATH = ROOT / "batch" / "pod-lease.json"
@@ -164,6 +165,74 @@ def collect_diagnostics(settings, state: dict, out_dir: Path) -> None:
         worker.write_text(f"could not fetch worker log: {exc!r}\n", encoding="utf-8")
 
 
+def chain_or_teardown(original_manifest: Path) -> None:
+    """Destroy the pod — unless a job is already queued for the same chat,
+    in which case run it on this same pod instead of renting a fresh one.
+
+    Checked exactly once per link, right where `teardown()` used to be called
+    unconditionally: no polling, no arbitrary grace period. If the mailbox
+    (batchlib_ext.handoff.mailbox_path) is empty at this exact instant, the
+    pod is destroyed immediately, same as before this existed. If a job IS
+    there, it was already validated by bot.py's own /confirm — this only
+    needs to run it and report what happened, because a silent handoff that
+    nobody heard about is worse than the wait it was meant to save.
+
+    Every exit from this loop funnels through `teardown(current)` — same
+    discipline as `teardown()` itself guards for diagnostics: a bug picking
+    up the next link must never be able to skip destroying the pod.
+    """
+    current = original_manifest
+    while True:
+        try:
+            nxt = claim_mailbox(original_manifest)
+            if nxt is None:
+                teardown(current)
+                return
+            hpath = handoff_path(original_manifest)
+            try:
+                nxt_manifest = load_manifest(nxt)
+            except Exception as exc:
+                write_handoff(hpath, Handoff(status="failed", manifest=str(nxt),
+                                             reason=repr(exc)))
+                teardown(current)
+                return
+            write_handoff(hpath, Handoff(status="starting", manifest=str(nxt)))
+            try:
+                rc = batch_run("--file", str(nxt))
+            except Exception as exc:
+                rc, reason = 1, repr(exc)
+            else:
+                reason = None if rc == 0 else f"batch_run exited {rc}"
+            if rc != 0:
+                write_handoff(hpath, Handoff(status="failed", manifest=str(nxt),
+                                             reason=reason))
+                teardown(current)
+                return
+            # Tier 2's ceiling must keep bounding the TOTAL pod lifetime, not
+            # reset per link — watchdog.py:65-77. provisioned_at stays put;
+            # abs_max_min grows by this link's own ceiling. Tier 1 also needs
+            # `manifest` repointed, or it keeps watching a journal that
+            # stopped moving the moment this link finished.
+            lease = read_lease(LEASE_PATH)
+            if lease is not None:
+                write_lease(LEASE_PATH, Lease(
+                    pod_id=lease.pod_id, provisioned_at=lease.provisioned_at,
+                    manifest=str(nxt.resolve()),
+                    abs_max_min=lease.abs_max_min + abs_max_min(nxt_manifest)))
+            write_handoff(hpath, Handoff(status="running", manifest=str(nxt)))
+            current = nxt
+        except Exception as exc:
+            # Anything unanticipated above must still destroy — the one
+            # invariant this function exists to preserve.
+            try:
+                write_handoff(handoff_path(original_manifest),
+                             Handoff(status="failed", manifest=str(current), reason=repr(exc)))
+            except Exception:
+                pass
+            teardown(current)
+            return
+
+
 def teardown(manifest_path: Path) -> None:
     """Collect diagnostics if anything failed, then destroy the pod. Always runs.
 
@@ -249,7 +318,9 @@ def main() -> int:
     finally:
         # Best effort only. The watchdog is the guarantee, not this block:
         # `finally` does not run when the process is SIGKILLed or the VPS dies.
-        teardown(manifest_path)
+        # chain_or_teardown destroys immediately unless a job is already
+        # queued for this same manifest's mailbox — see its own docstring.
+        chain_or_teardown(manifest_path)
     return rc
 
 

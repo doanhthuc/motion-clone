@@ -26,7 +26,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batchlib.config import env_get, env_set
-from batchlib.manifest import load_state, state_path_for
+from batchlib.manifest import load_manifest, load_state, state_path_for
 from batchlib.pipelines import PIPELINES, optional_roles, required_roles
 # Not `from batchlib_ext...` or `scripts/batchlib/...` — drain.py itself lives
 # at scripts/drain.py, a plain top-level module, same as batch_run.py. scripts/
@@ -49,6 +49,7 @@ from tgbot.run import (LEASE_PATH, _RUNNING, drain_running, estimate_minutes,
                        final_files, lease_for, progress_text, start_drain,
                        summary_text)
 from batchlib_ext.gpu_stock import stock_at, volume_datacenter
+from batchlib_ext.handoff import handoff_path, mailbox_path, read_handoff
 from batchlib_ext.lease import clear_lease
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -566,6 +567,18 @@ def _job_manifest_path(chat_id: int) -> Path:
     return ROOT / "batch" / f"tg-{chat_id}.yaml"
 
 
+def _active_manifest_path(chat_id: int) -> Path:
+    """Where the job being assembled right now actually belongs.
+
+    The live per-chat path while nothing is draining; the mailbox
+    (batchlib_ext.handoff.mailbox_path) while one is — so the panel, the
+    validate call, and the eventual /confirm never disagree about which file
+    this job is going into (2026-09-02, the queue-while-draining feature).
+    """
+    live_path = _job_manifest_path(chat_id)
+    return mailbox_path(live_path) if drain_running(live_path) else live_path
+
+
 _SPIN_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 _SPIN_INTERVAL_SEC = 0.5
 
@@ -702,31 +715,31 @@ def _render_and_validate(tg: Tg, chat_id: int) -> bool:
     sent its own specific message — callers must not add a second, vaguer one
     on top, because burying the real reason is the bug finding B is about.
 
-    One asymmetry is load-bearing: the drain-still-running branch leaves
+    One asymmetry is load-bearing: the mailbox-already-occupied branch leaves
     `_LAST_VALIDATE` UNSET rather than setting it False. Unset means "never
     attempted", which is what /confirm keys off to retry later; False means
     "attempted and the manifest is bad", which /confirm must not retry.
     """
-    manifest_path = _job_manifest_path(chat_id)
-    if drain_running(manifest_path):
-        # The money guard on the WRITE side, not just on /confirm (finding C1,
-        # 2026-08-31). scripts/drain.py:220-248 runs batch_run.py as a separate
-        # process TWICE, each time re-reading this manifest from disk: phase A
-        # (--no-start), then provision + bootstrap, then phase B (--resume). So
-        # for the 10-35 minutes after /confirm the file is still live input, and
-        # _job_manifest_path is one deterministic path per chat. A user
-        # assembling the next job during the render — the most ordinary thing
-        # imaginable — would fill the last slot here and put job B onto the pod
-        # rented for job A, with nobody asked. The journal collides the same
-        # way: state_path_for derives batch/tg-<chat>.state.json from this same
-        # name, so --resume would re-attach to job A's recorded job_ids and
-        # /result for A could never be answered again.
+    live_path = _job_manifest_path(chat_id)
+    running = drain_running(live_path)
+    if running and mailbox_path(live_path).exists():
+        # Queue depth is "current plus at most one next" (2026-09-02) — a
+        # second job can be assembled and validated live while the first
+        # drains, but a third has nowhere safe to land until drain.py's own
+        # chain_or_teardown claims the one already queued, which frees this
+        # same mailbox file again.
         tg.send_message(chat_id,
-                        "a drain is still running for this chat's job — wait for "
-                        "it to finish before starting another. Your files are "
-                        "kept; send /status for progress. Once it has finished, "
-                        "send /confirm and this job will be checked and started.")
+                        "a job is already queued next for this chat — wait for "
+                        "it to start before queuing another. Your files are "
+                        "kept; send /status for progress.")
         return False
+    # While a drain is running, write into its mailbox instead of the live
+    # manifest (2026-09-02) — scripts/drain.py:220-248 runs batch_run.py as a
+    # separate process TWICE, each time re-reading the live manifest from
+    # disk, so overwriting THAT file mid-drain would corrupt input the runner
+    # is actively reading. The mailbox is a different file: safe to write,
+    # validate, and show a live panel for, exactly like an ordinary job.
+    manifest_path = _active_manifest_path(chat_id)
     write_manifest(_jobs_for(chat_id), manifest_path,
                    now=time.strftime("%Y-%m-%d %H:%M:%S"))
 
@@ -1441,7 +1454,7 @@ def _details_block(chat_id: int, job: Job) -> str:
         warning = quality_warning(pr)
         if warning:
             lines.append(f"{ICON_WARN} {_esc(warning)}")
-    lines += ["", f"manifest: {_esc(_job_manifest_path(chat_id).name)}"]
+    lines += ["", f"manifest: {_esc(_active_manifest_path(chat_id).name)}"]
     return "<blockquote expandable>" + "\n".join(lines) + "</blockquote>"
 
 
@@ -2123,6 +2136,46 @@ def tick_progress(tg: Tg, chat_id: int) -> None:
         path.unlink(missing_ok=True)
         return
 
+    handoff = read_handoff(handoff_path(_job_manifest_path(chat_id)))
+    if handoff is not None and handoff.status in ("running", "failed") \
+            and Path(handoff.manifest).resolve() != manifest_path.resolve():
+        # drain.py's chain_or_teardown only ever writes "running" or "failed"
+        # AFTER the link this progress message was tracking has finished —
+        # "starting" is the transient in-between state, deliberately ignored
+        # here rather than switching on a guess that has not resolved yet.
+        # Close the finished link out exactly like the ordinary "Finished"
+        # tail below, then either continue with what got picked up or say
+        # why it didn't — a silent handoff is worse than the wait it saves.
+        final_text = progress_text(manifest_path, lease=lease_for(manifest_path),
+                                   stages=stages)
+        tg.edit_message(chat_id, message_id, final_text, parse_mode=PARSE_HTML)
+        path.unlink(missing_ok=True)
+        _FRAME.pop(chat_id, None)
+        _ANIM_PAUSE.pop(chat_id, None)
+        deliver_result(tg, chat_id, manifest_path)
+        if handoff.status == "running":
+            picked_up = Path(handoff.manifest)
+            next_manifest = load_manifest(picked_up)
+            next_stages: list[str] = []
+            for run in next_manifest.runs:
+                for stage in PIPELINES[run.pipeline]:
+                    if stage not in next_stages:
+                        next_stages.append(stage)
+            tg.send_message(chat_id,
+                            "✅ Finished — automatically continuing with your "
+                            "queued job on the same pod, no extra rental.",
+                            parse_mode=PARSE_HTML)
+            _start_progress(tg, chat_id, picked_up, next_stages)
+        else:
+            tg.send_message(chat_id,
+                            f"⚠️ Finished, but the job you queued next could not "
+                            f"start on the reused pod ({_esc(handoff.reason or 'unknown error')})"
+                            f" — the pod was destroyed as usual, nothing extra "
+                            f"was billed. Nothing is lost: send /again to reload "
+                            f"it, then Run to try it as a fresh rental.",
+                            parse_mode=PARSE_HTML)
+        return
+
     running = drain_running(manifest_path)
     # Checked before the throttle below, never after: a cosmetic rate limit
     # must not be able to delay the delivery of a finished render.
@@ -2750,7 +2803,7 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
         # the manifest now: nothing may spend $0.99/hour without the exact
         # inputs it spent on being in the transcript.
         tg.send_message(chat_id,
-                        _job_manifest_path(chat_id).read_text(encoding="utf-8"))
+                        _active_manifest_path(chat_id).read_text(encoding="utf-8"))
     elif not validated:
         # Attempted and failed. Refuse rather than trust a downstream
         # safety net: drain.py's own Phase A validate would likely catch
@@ -2764,16 +2817,23 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
                         "it named and send the file(s) again.")
         return
 
-    manifest_path = _job_manifest_path(chat_id)
-    if drain_running(manifest_path):
-        # The money guard: a second drain on one manifest corrupts the
-        # journal (two runners, one state.json) and double-books the GPU
-        # (run_enhance's comfy_recycle assumes exclusive use) —
-        # docs/batch-runner.md.
-        tg.send_message(chat_id,
-                        "a drain is already running for this job — wait for it "
-                        "to finish before confirming again")
-        return
+    # A drain already running for this chat is no longer a refusal
+    # (2026-09-02): it means THIS job goes into the mailbox instead of being
+    # rented for on its own — drain.py's own chain_or_teardown claims it and
+    # runs it on the same pod the instant the current job finishes, rather
+    # than destroying and re-renting. The queue-depth-1 guard (a mailbox
+    # already occupied) already ran inside _render_and_validate above.
+    live_path = _job_manifest_path(chat_id)
+    running = drain_running(live_path)
+    manifest_path = mailbox_path(live_path) if running else live_path
+    # Re-written unconditionally, even when `validated` was cached True: the
+    # cache only remembers that the JOB CONTENT was valid, not which file it
+    # was last written to. If a drain started in the seconds between the last
+    # validate and this tap, `manifest_path` above just switched from the live
+    # path to the mailbox, and the mailbox would otherwise sit empty — queued
+    # in every OTHER sense but never actually written to disk. write_manifest
+    # is a plain YAML dump, no subprocess, so redoing it here costs nothing.
+    write_manifest(queued, manifest_path, now=time.strftime("%Y-%m-%d %H:%M:%S"))
     # Every stage any queued job will run, in pipeline order, de-duplicated.
     # The progress bar counts against this: a batch mixing two pipelines has to
     # show the union or the denominator would be wrong for half of it.
@@ -2786,7 +2846,12 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
     # the submitted job exists in memory, and freezing the panel here is what
     # leaves the exact inputs permanently in the transcript.
     _freeze_panel(tg, chat_id, f"submitted {time.strftime('%H:%M')}")
-    start_drain(manifest_path, dry_run=dry_run)
+    if not running:
+        # THE money gate (see docstring) — the only line that may rent a pod.
+        # Queuing (the `running` branch below) never reaches this: the
+        # mailbox file alone is drain.py's signal, claimed by the process
+        # already running, on the pod already paid for.
+        start_drain(manifest_path, dry_run=dry_run)
     # Clear in-memory state so the next file starts a fresh job rather
     # than mutating one already handed to a running drain. The manifest
     # itself, and the drain's own journal, stay on disk regardless.
@@ -2809,12 +2874,22 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
     _STRIP.pop(chat_id, None)
     if dropped:
         tg.send_message(chat_id, f"running without {dropped} unassigned file(s)")
-    tg.send_message(chat_id,
-                    f"🚀 <b>Started.</b> {submitted_count} job(s) on one pod at "
-                    "$0.99/hour.\nI will keep the message below updated and "
-                    "send the results when it finishes — no need to ask.",
-                    parse_mode=PARSE_HTML)
-    _start_progress(tg, chat_id, manifest_path, stages)
+    if running:
+        tg.send_message(chat_id,
+                        f"📥 <b>Queued.</b> {submitted_count} job(s) will start "
+                        "automatically on the same pod the moment the current "
+                        "job finishes — no extra rental. /status shows both.",
+                        parse_mode=PARSE_HTML)
+        # No progress message yet — tick_progress starts one itself once
+        # drain.py's handoff file says this was actually picked up. Sending
+        # one now would claim progress on a job that has not started.
+    else:
+        tg.send_message(chat_id,
+                        f"🚀 <b>Started.</b> {submitted_count} job(s) on one pod at "
+                        "$0.99/hour.\nI will keep the message below updated and "
+                        "send the results when it finishes — no need to ask.",
+                        parse_mode=PARSE_HTML)
+        _start_progress(tg, chat_id, manifest_path, stages)
     return
 
 

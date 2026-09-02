@@ -4,9 +4,11 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batchlib.manifest import load_manifest, state_path_for
+from batchlib_ext.handoff import Handoff, handoff_path, mailbox_path
+from batchlib_ext.lease import Lease
 import drain
-from drain import (abs_max_min, collect_diagnostics, failed_job_ids,
-                   pod_max_hours, teardown)
+from drain import (abs_max_min, chain_or_teardown, collect_diagnostics,
+                   failed_job_ids, pod_max_hours, teardown)
 
 YAML = """
 runs:
@@ -193,6 +195,149 @@ class TestCollectDiagnostics(unittest.TestCase):
         b_log = (out_dir / "runs" / "r2" / "pod-job.log").read_bytes()
         self.assertIn("could not fetch job logs", a_log)
         self.assertEqual(b_log, b"ok")
+
+
+NEXT_YAML = """
+runs:
+  - id: a
+    pipeline: motion-enhance
+    inputs: {character: /tmp/c.png, driver: /tmp/d.mp4}
+"""
+
+
+class TestChainOrTeardown(unittest.TestCase):
+    """Checked exactly once per link, at the spot teardown() used to be
+    called unconditionally — no polling, no arbitrary grace period."""
+
+    def _original(self, tmpdir: Path) -> Path:
+        path = Path(tmpdir) / "tg-1.yaml"
+        path.write_text(YAML, encoding="utf-8")
+        return path
+
+    def test_nothing_queued_destroys_immediately_like_before(self):
+        tmpdir = tempfile.mkdtemp()
+        original = self._original(tmpdir)
+        with mock.patch.object(drain, "claim_mailbox", return_value=None) as mock_claim, \
+             mock.patch.object(drain, "batch_run") as mock_run, \
+             mock.patch.object(drain, "teardown") as mock_teardown:
+            chain_or_teardown(original)
+        mock_claim.assert_called_once_with(original)
+        mock_run.assert_not_called()
+        mock_teardown.assert_called_once_with(original)
+
+    def test_a_queued_job_runs_on_the_same_pod_without_a_teardown_in_between(self):
+        tmpdir = tempfile.mkdtemp()
+        original = self._original(tmpdir)
+        nxt = Path(tmpdir) / "tg-1-999.yaml"
+        nxt.write_text(NEXT_YAML, encoding="utf-8")
+        with mock.patch.object(drain, "claim_mailbox", side_effect=[nxt, None]), \
+             mock.patch.object(drain, "batch_run", return_value=0) as mock_run, \
+             mock.patch.object(drain, "read_lease", return_value=None), \
+             mock.patch.object(drain, "teardown") as mock_teardown:
+            chain_or_teardown(original)
+        mock_run.assert_called_once_with("--file", str(nxt))
+        # Only ever destroyed once the SECOND claim finds nothing — the
+        # picked-up job itself never triggers its own teardown call.
+        mock_teardown.assert_called_once_with(nxt)
+
+    def test_success_reports_a_running_handoff_and_extends_the_lease_total(self):
+        tmpdir = tempfile.mkdtemp()
+        original = self._original(tmpdir)
+        nxt = Path(tmpdir) / "tg-1-999.yaml"
+        nxt.write_text(NEXT_YAML, encoding="utf-8")
+        old_lease = Lease(pod_id="pod-1", provisioned_at=1000.0,
+                          manifest=str(original.resolve()), abs_max_min=330)
+        with mock.patch.object(drain, "claim_mailbox", side_effect=[nxt, None]), \
+             mock.patch.object(drain, "batch_run", return_value=0), \
+             mock.patch.object(drain, "read_lease", return_value=old_lease), \
+             mock.patch.object(drain, "write_lease") as mock_write_lease, \
+             mock.patch.object(drain, "teardown"):
+            chain_or_teardown(original)
+        new_lease = mock_write_lease.call_args[0][1]
+        # provisioned_at untouched (tier 2 bounds TOTAL lifetime, not per link)
+        # and the ceiling grows by the next link's own — never resets.
+        self.assertEqual(new_lease.pod_id, "pod-1")
+        self.assertEqual(new_lease.provisioned_at, 1000.0)
+        self.assertEqual(new_lease.manifest, str(nxt.resolve()))
+        self.assertEqual(new_lease.abs_max_min, 330 + abs_max_min(load_manifest(nxt)))
+        handoff = json.loads(handoff_path(original).read_text(encoding="utf-8"))
+        self.assertEqual(handoff["status"], "running")
+        self.assertEqual(handoff["manifest"], str(nxt))
+
+    def test_no_lease_on_disk_does_not_crash_the_handoff(self):
+        # A missing lease is possible if something else already cleared it —
+        # the handoff must not depend on it existing to report success.
+        tmpdir = tempfile.mkdtemp()
+        original = self._original(tmpdir)
+        nxt = Path(tmpdir) / "tg-1-999.yaml"
+        nxt.write_text(NEXT_YAML, encoding="utf-8")
+        with mock.patch.object(drain, "claim_mailbox", side_effect=[nxt, None]), \
+             mock.patch.object(drain, "batch_run", return_value=0), \
+             mock.patch.object(drain, "read_lease", return_value=None), \
+             mock.patch.object(drain, "write_lease") as mock_write_lease, \
+             mock.patch.object(drain, "teardown"):
+            chain_or_teardown(original)
+        mock_write_lease.assert_not_called()
+
+    def test_batch_run_failure_is_reported_and_the_pod_still_destroyed(self):
+        tmpdir = tempfile.mkdtemp()
+        original = self._original(tmpdir)
+        nxt = Path(tmpdir) / "tg-1-999.yaml"
+        nxt.write_text(NEXT_YAML, encoding="utf-8")
+        with mock.patch.object(drain, "claim_mailbox", return_value=nxt), \
+             mock.patch.object(drain, "batch_run", return_value=1), \
+             mock.patch.object(drain, "teardown") as mock_teardown:
+            chain_or_teardown(original)
+        handoff = json.loads(handoff_path(original).read_text(encoding="utf-8"))
+        self.assertEqual(handoff["status"], "failed")
+        self.assertIn("1", handoff["reason"])
+        # Destroyed for `original` — the job that had actually finished —
+        # not for the one that failed to pick up.
+        mock_teardown.assert_called_once_with(original)
+
+    def test_batch_run_raising_is_reported_rather_than_crashing_the_drain(self):
+        tmpdir = tempfile.mkdtemp()
+        original = self._original(tmpdir)
+        nxt = Path(tmpdir) / "tg-1-999.yaml"
+        nxt.write_text(NEXT_YAML, encoding="utf-8")
+        with mock.patch.object(drain, "claim_mailbox", return_value=nxt), \
+             mock.patch.object(drain, "batch_run", side_effect=OSError("no such file")), \
+             mock.patch.object(drain, "teardown") as mock_teardown:
+            chain_or_teardown(original)
+        handoff = json.loads(handoff_path(original).read_text(encoding="utf-8"))
+        self.assertEqual(handoff["status"], "failed")
+        self.assertIn("no such file", handoff["reason"])
+        mock_teardown.assert_called_once_with(original)
+
+    def test_a_broken_next_manifest_is_reported_without_calling_batch_run(self):
+        tmpdir = tempfile.mkdtemp()
+        original = self._original(tmpdir)
+        nxt = Path(tmpdir) / "tg-1-999.yaml"
+        nxt.write_text("not: [valid, yaml, :::", encoding="utf-8")
+        with mock.patch.object(drain, "claim_mailbox", return_value=nxt), \
+             mock.patch.object(drain, "batch_run") as mock_run, \
+             mock.patch.object(drain, "teardown") as mock_teardown:
+            chain_or_teardown(original)
+        mock_run.assert_not_called()
+        handoff = json.loads(handoff_path(original).read_text(encoding="utf-8"))
+        self.assertEqual(handoff["status"], "failed")
+        mock_teardown.assert_called_once_with(original)
+
+    def test_a_second_link_that_fails_destroys_for_the_first_not_the_original(self):
+        # Chain of two successful hops, then a third link fails to run — the
+        # pod was doing link 2's work, so teardown must name link 2.
+        tmpdir = tempfile.mkdtemp()
+        original = self._original(tmpdir)
+        link2 = Path(tmpdir) / "tg-1-111.yaml"
+        link2.write_text(NEXT_YAML, encoding="utf-8")
+        link3 = Path(tmpdir) / "tg-1-222.yaml"
+        link3.write_text(NEXT_YAML, encoding="utf-8")
+        with mock.patch.object(drain, "claim_mailbox", side_effect=[link2, link3]), \
+             mock.patch.object(drain, "batch_run", side_effect=[0, 1]), \
+             mock.patch.object(drain, "read_lease", return_value=None), \
+             mock.patch.object(drain, "teardown") as mock_teardown:
+            chain_or_teardown(original)
+        mock_teardown.assert_called_once_with(link2)
 
 
 if __name__ == "__main__":
