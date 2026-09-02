@@ -1309,6 +1309,41 @@ class TestFlow(unittest.TestCase):
         self.assertTrue(any(d.startswith(bot._CB_RUN_GO) for d in flat_data))
         self.assertIn(bot._CB_RUN_NO, flat_data)
 
+    def test_the_5090_being_out_at_home_still_surfaces_other_regions(self):
+        # "nếu 5090 hết thì sao không tìm các region khác nữa" (2026-09-02):
+        # the picker used to only ever compare stock AT the home datacenter,
+        # so a 5090 that is out there but fine elsewhere said nothing about
+        # it — even though /gpu already knew how to show exactly this.
+        stock = {
+            "NVIDIA GeForce RTX 5090": [
+                Stock(gpu_id="NVIDIA GeForce RTX 5090", display_name="RTX 5090",
+                     price_per_hr=0.99, datacenter_id="EU-RO-1", stock_status="none"),
+                Stock(gpu_id="NVIDIA GeForce RTX 5090", display_name="RTX 5090",
+                     price_per_hr=0.99, datacenter_id="EU-CZ-1", stock_status="High"),
+            ],
+            "NVIDIA GeForce RTX 4090": [
+                Stock(gpu_id="NVIDIA GeForce RTX 4090", display_name="RTX 4090",
+                     price_per_hr=0.74, datacenter_id="EU-RO-1", stock_status="Medium"),
+            ],
+            "NVIDIA RTX PRO 4500 Blackwell": [
+                Stock(gpu_id="NVIDIA RTX PRO 4500 Blackwell", display_name="RTX PRO 4500",
+                     price_per_hr=0.72, datacenter_id="EU-RO-1", stock_status="Medium"),
+            ],
+        }
+        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at", return_value=stock):
+            self._fill_required_slots()
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
+        text = self.tg.messages[-1]
+        self.assertIn("Other regions", text)
+        self.assertIn("EU-CZ-1", text)
+        self.assertIn("25-30 min", text)
+        # Still a same-datacenter switch to 4090/PRO 4500 too — the other-
+        # region note is additive, not a replacement for the local options.
+        flat_data = [data for row in self.tg.buttons[-1] for _, data in row]
+        self.assertIn(bot._CB_RUN_SWITCH + "4090", flat_data)
+
     def test_tapping_switch_writes_env_and_shows_the_new_price(self):
         (self.root / ".env").write_text(
             "GPU=NVIDIA GeForce RTX 5090\nPOD_VOLUME_ID=vol-1\n", encoding="utf-8")
@@ -1322,9 +1357,10 @@ class TestFlow(unittest.TestCase):
                       allowed_user_id=ME)
         self.assertEqual(env_get(self.root / ".env", "GPU"),
                          "NVIDIA GeForce RTX 4090")
-        # The re-offer is still the full picker — 4090 now marked (current),
-        # and its price is what the Yes button quotes.
-        self.assertIn("RTX 4090</b> (current)", self.tg.messages[-1])
+        # The re-offer is still the full picker — 4090 now the one labelled
+        # "Current:", and its price is what the Yes button quotes.
+        self.assertIn("Current:", self.tg.messages[-1])
+        self.assertIn("RTX 4090", self.tg.messages[-1].split("Current:")[1].splitlines()[0])
         self.assertIn("Yes, spend $0.74/h",
                       [label for row in self.tg.buttons[-1] for label, _ in row])
 

@@ -2594,30 +2594,64 @@ def _offer_run_confirm(tg: Tg, chat_id: int) -> None:
                       ("Cancel", _CB_RUN_NO)]])
         return
 
-    lines = [f"🖥 <b>Choose GPU</b> — renting at {_esc(home_dc)}:"]
+    # "Current" gets its own paragraph rather than an inline "(current)" tag
+    # (2026-09-02) — on a phone, three bold lines that only differ by six
+    # small letters at the end read as one undifferentiated list; a reader
+    # reported not being able to tell which was already selected.
+    lines = [f"🖥 <b>Choose GPU</b> — renting at {_esc(home_dc)}", ""]
+    configured_home = next((e for e in (stock.get(configured) or [])
+                            if e.datacenter_id == home_dc), None)
+    if configured_home is not None:
+        icon = _STOCK_ICON.get(configured_home.stock_status.lower(), "⬜")
+        lines.append(f"Current: {icon} <b>{_esc(configured_home.display_name)}</b> — "
+                     f"{_esc(configured_home.stock_status)} · "
+                     f"💵 ${configured_home.price_per_hr:.2f}/h")
+    else:
+        lines.append(f"Current: <b>{_esc(configured)}</b> — "
+                     f"not offered at {_esc(home_dc)}")
+
+    alt_lines: list[str] = []
     switch_row: list[tuple[str, str]] = []
+    # Every OTHER datacenter each GPU is stocked at, not just the home one
+    # (2026-09-02) — "5090 is out, why not check other regions" was a fair
+    # question: the switch buttons only ever move GPU TYPE within the pinned
+    # home datacenter, but that is not a reason to hide where else the 5090
+    # itself is doing fine. Purely informational, same wording as /gpu:
+    # renting there means syncing the Network Volume first, ~25-30 min, not
+    # a same-speed alternative — so it gets text, never a button.
+    other_lines: list[str] = []
     for gpu_id in wanted:
-        home = next((e for e in (stock.get(gpu_id) or [])
-                    if e.datacenter_id == home_dc), None)
-        marker = " (current)" if gpu_id == configured else ""
-        if home is None:
-            lines.append(f"  {_esc(gpu_id)}{marker}: not offered at {_esc(home_dc)}")
-            continue
-        icon = _STOCK_ICON.get(home.stock_status.lower(), "⬜")
-        lines.append(f"  {icon} <b>{_esc(home.display_name)}</b>{marker} — "
-                     f"{_esc(home.stock_status)} · 💵 ${home.price_per_hr:.2f}/h")
-        short = _GPU_SHORT.get(gpu_id)
-        if gpu_id != configured and short:
-            switch_row.append((f"Switch to {home.display_name} "
-                              f"(${home.price_per_hr:.2f}/h)",
-                              _CB_RUN_SWITCH + short))
-    if not switch_row:
-        # Either nothing else is offered at this datacenter, or the reader
-        # has already seen every alternative is no better — either way there
-        # is no in-datacenter button worth showing, only the manual option.
-        lines.append("No other GPU is offered at this datacenter. 5090 is "
-                     "also at EU-CZ-1, but that needs the volume synced "
-                     "there first (~25-30 min) — see docs/gpu-pod.md.")
+        entries = stock.get(gpu_id) or []
+        home = next((e for e in entries if e.datacenter_id == home_dc), None)
+        if gpu_id != configured:
+            if home is None:
+                alt_lines.append(f"  {_esc(gpu_id)}: not offered at {_esc(home_dc)}")
+            else:
+                icon = _STOCK_ICON.get(home.stock_status.lower(), "⬜")
+                alt_lines.append(f"  {icon} <b>{_esc(home.display_name)}</b> — "
+                                 f"{_esc(home.stock_status)} · 💵 ${home.price_per_hr:.2f}/h")
+                short = _GPU_SHORT.get(gpu_id)
+                if short:
+                    switch_row.append((f"Switch to {home.display_name} "
+                                      f"(${home.price_per_hr:.2f}/h)",
+                                      _CB_RUN_SWITCH + short))
+        elsewhere = sorted(
+            (e for e in entries if e is not home and e.stock_status.lower() != "none"),
+            key=lambda e: _STOCK_RANK.get(e.stock_status.lower(), 9))
+        for e in elsewhere[:2]:
+            icon = _STOCK_ICON.get(e.stock_status.lower(), "⬜")
+            other_lines.append(f"  {icon} {_esc(e.display_name)} — "
+                               f"{_esc(e.datacenter_id)}: {_esc(e.stock_status)}")
+    if alt_lines:
+        lines += ["", "Switch to:", *alt_lines]
+    if other_lines:
+        lines += ["", "Other regions (needs the volume synced there first, "
+                      "~25-30 min — not an instant switch):", *other_lines]
+    elif not switch_row:
+        # Nothing else at this datacenter, and no other region has it
+        # either — the manual EU-CZ-1 runbook is the only remaining option.
+        lines += ["", "No other GPU or region has better stock right now. "
+                      "See docs/gpu-pod.md for the manual EU-CZ-1 runbook."]
 
     buttons = [switch_row[i:i + 2] for i in range(0, len(switch_row), 2)]
     buttons.append([(f"Yes, spend ${price:.2f}/h", _CB_RUN_GO + _run_token(chat_id)),
