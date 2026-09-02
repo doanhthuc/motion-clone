@@ -2369,14 +2369,24 @@ def _wipe_chat(tg: Tg, chat_id: int) -> None:
     tg.send_message(chat_id, report, parse_mode=PARSE_HTML)
 
 
-# Fallback cards (2026-09-02), picked by hand in .env — pod-provision.sh
-# dropped GPU_FALLBACK on purpose, so /gpu exists to inform that hand-pick
-# rather than let it be a guess. RTX 4090 first: docs/gpu-pod.md's own
-# measured comparison (10/08/2026) found it only 1.48x slower on the same
-# real job (443.75s -> 656s) and confirmed it runs Wan2.2 Animate correctly
-# — a measured number, not an assumption. RTX PRO 4500 second: half the
-# 5090's price, but its render time has never been measured in this repo,
-# only observed as noticeably slower in real use.
+# The card this repo is built around — docs/gpu-pod.md's own conclusion is
+# "giữ 5090 làm chính" (keep the 5090 as the main one). Checked unconditionally,
+# NOT read from .env's GPU= (2026-09-02 fix): that value is whatever was last
+# hand-picked to actually rent — often a fallback already, per
+# docs/gpu-pod.md's own "đổi tay" instructions — so treating it as "the
+# primary to check" made /gpu silently drop the 5090 from its own report the
+# moment someone was already running on a fallback, which defeats the point
+# of checking.
+_PRIMARY_GPU_ID = "NVIDIA GeForce RTX 5090"
+
+# Fallback cards, picked by hand in .env — pod-provision.sh dropped
+# GPU_FALLBACK on purpose, so /gpu exists to inform that hand-pick rather
+# than let it be a guess. RTX 4090 first: docs/gpu-pod.md's own measured
+# comparison (10/08/2026) found it only 1.48x slower on the same real job
+# (443.75s -> 656s) and confirmed it runs Wan2.2 Animate correctly — a
+# measured number, not an assumption. RTX PRO 4500 second: half the 5090's
+# price, but its render time has never been measured in this repo, only
+# observed as noticeably slower in real use.
 _FALLBACK_GPU_IDS = ("NVIDIA GeForce RTX 4090", "NVIDIA RTX PRO 4500 Blackwell")
 
 # runpodctl's own stock words, ranked best-first — used only to sort the
@@ -2385,8 +2395,8 @@ _STOCK_RANK = {"high": 0, "medium": 1, "low": 2, "none": 3}
 
 
 def _report_gpu_stock(tg: Tg, chat_id: int) -> None:
-    """Live RunPod stock for the configured GPU and its fallbacks, at every
-    datacenter that carries them — free, no pod rented.
+    """Live RunPod stock for the 5090 and its fallbacks, at every datacenter
+    that carries them — free, no pod rented.
 
     The Network Volume's own datacenter is marked and listed first: it is
     the only one a pod can rent in and still mount the volume
@@ -2397,13 +2407,9 @@ def _report_gpu_stock(tg: Tg, chat_id: int) -> None:
     "other regions" is worded as a fallback with a cost, not a same-speed
     alternative.
     """
-    gpu_id = env_get(ROOT / ".env", "GPU")
-    if not gpu_id:
-        tg.send_message(chat_id, "GPU is not set in .env — nothing to check")
-        return
     volume_id = env_get(ROOT / ".env", "POD_VOLUME_ID")
     home_dc = volume_datacenter(volume_id)
-    wanted = [gpu_id] + [g for g in _FALLBACK_GPU_IDS if g != gpu_id]
+    wanted = [_PRIMARY_GPU_ID, *_FALLBACK_GPU_IDS]
     try:
         stock = stock_at(wanted)
     except RuntimeError as exc:
@@ -2411,6 +2417,12 @@ def _report_gpu_stock(tg: Tg, chat_id: int) -> None:
         return
 
     lines = ["📦 <b>GPU stock</b>"]
+    configured = env_get(ROOT / ".env", "GPU")
+    if configured and configured != _PRIMARY_GPU_ID:
+        # Explains, in the same breath, why the box right now is slower or
+        # cheaper than the 5090 numbers below suggest.
+        lines.append(f"⚠️ .env is currently set to <b>{_esc(configured)}</b>, "
+                     "not the 5090")
     if home_dc:
         lines.append(f"📍 <b>{_esc(home_dc)}</b> (your volume)")
     else:

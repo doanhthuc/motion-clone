@@ -3034,9 +3034,9 @@ class TestGpuStockCommand(unittest.TestCase):
     def tearDown(self):
         bot.ROOT = self._orig_root
 
-    def _write_env(self, gpu="NVIDIA GeForce RTX 5090"):
+    def _write_env(self, gpu="NVIDIA GeForce RTX 5090", volume_id="vol-1"):
         (self.root / ".env").write_text(
-            f"GPU={gpu}\nPOD_VOLUME_ID=vol-1\n", encoding="utf-8")
+            f"GPU={gpu}\nPOD_VOLUME_ID={volume_id}\n", encoding="utf-8")
 
     def _stock(self):
         return {
@@ -3057,7 +3057,7 @@ class TestGpuStockCommand(unittest.TestCase):
             ],
         }
 
-    def test_reports_the_configured_gpu_and_both_fallbacks_at_home(self):
+    def test_reports_the_5090_and_both_fallbacks_at_home(self):
         self._write_env()
         with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
              mock.patch("tgbot.bot.stock_at", return_value=self._stock()) as stock_at:
@@ -3098,12 +3098,44 @@ class TestGpuStockCommand(unittest.TestCase):
         self.assertIn("EU-RO-1", text)
         self.assertIn("EU-CZ-1", text)
 
-    def test_missing_gpu_id_from_env_refuses_up_front(self):
-        (self.root / ".env").write_text("", encoding="utf-8")
-        with mock.patch("tgbot.bot.stock_at") as stock_at:
+    def test_the_5090_is_checked_even_when_env_is_set_to_a_fallback(self):
+        # The actual bug report (2026-09-02): .env's GPU= is whatever was
+        # last hand-picked to rent — often a fallback already — and that
+        # used to be treated as "the primary to check", so /gpu silently
+        # dropped the 5090 from its own report the moment someone was
+        # already running on PRO 4500.
+        self._write_env(gpu="NVIDIA RTX PRO 4500 Blackwell")
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at", return_value=self._stock()) as stock_at:
             bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
-        stock_at.assert_not_called()
-        self.assertIn("nothing to check", self.tg.messages[-1])
+        stock_at.assert_called_once_with(
+            ["NVIDIA GeForce RTX 5090", "NVIDIA GeForce RTX 4090",
+             "NVIDIA RTX PRO 4500 Blackwell"])
+        text = self.tg.messages[-1]
+        self.assertIn("RTX 5090", text)
+        self.assertIn("Low", text)
+
+    def test_a_configured_fallback_is_flagged_as_a_note(self):
+        self._write_env(gpu="NVIDIA RTX PRO 4500 Blackwell")
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at", return_value=self._stock()):
+            bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
+        text = self.tg.messages[-1]
+        self.assertIn("currently set to", text)
+        self.assertIn("NVIDIA RTX PRO 4500 Blackwell", text)
+
+    def test_no_note_when_env_already_matches_the_5090(self):
+        self._write_env(gpu="NVIDIA GeForce RTX 5090")
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at", return_value=self._stock()):
+            bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
+        self.assertNotIn("currently set to", self.tg.messages[-1])
+
+    def test_works_even_with_no_env_file_at_all(self):
+        with mock.patch("tgbot.bot.volume_datacenter", return_value=None), \
+             mock.patch("tgbot.bot.stock_at", return_value=self._stock()):
+            bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
+        self.assertIn("RTX 5090", self.tg.messages[-1])
 
     def test_a_runpodctl_failure_is_reported_rather_than_raised(self):
         self._write_env()
