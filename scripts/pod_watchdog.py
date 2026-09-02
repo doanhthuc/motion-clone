@@ -20,11 +20,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from batchlib.manifest import load_state, state_path_for
 from batchlib_ext.lease import clear_lease, read_lease
+from batchlib_ext.migrate_lease import clear_migrate_lease, read_migrate_lease
 from batchlib_ext.podctl import RunpodCtl
-from batchlib_ext.watchdog import DESTROYABLE_NAMES, GRACE_MIN, decide, reconcile
+from batchlib_ext.watchdog import (DESTROYABLE_NAMES, GRACE_MIN,
+                                   MIGRATE_DESTROYABLE_NAMES, decide,
+                                   decide_migration, reconcile,
+                                   reconcile_migration)
 
 ROOT = Path(__file__).resolve().parents[1]
 LEASE_PATH = ROOT / "batch" / "pod-lease.json"
+MIGRATE_LEASE_PATH = ROOT / "batch" / "volume-migrate-lease.json"
 TICK_SEC = 60
 
 
@@ -82,6 +87,28 @@ def tick(pods_api, first_seen: dict[str, float], *, now: float,
         # everything the inner tiers cannot express, including their own bugs.
         log(f"tier 1/2 failed, falling through to tier 3: {exc!r}")
 
+    # Tier-1/2-equivalent for the two TEMPORARY CPU pods a volume migration
+    # rents (scripts/volume_migrate.py, not part of this task). Separate
+    # lease file, separate ceiling (MIGRATE_CEILING_MIN, no per-stage journal
+    # to dead-man's-switch against) — see batchlib_ext/watchdog.py. Unlike
+    # the real GPU pod's branch above, this one does not return: falling
+    # through to tier 3 below is what also catches the case where the
+    # destroy above was not confirmed.
+    migrate_lease = read_migrate_lease(MIGRATE_LEASE_PATH)
+    if migrate_lease is not None:
+        verdict = decide_migration(lease=migrate_lease, now=now)
+        if verdict.kill:
+            log(f"KILL migration temp pods {migrate_lease.pod_a_id},"
+                f"{migrate_lease.pod_b_id} — {verdict.reason}")
+            if not dry_run:
+                ok_a = destroy_verified(pods_api, migrate_lease.pod_a_id)
+                ok_b = destroy_verified(pods_api, migrate_lease.pod_b_id)
+                if ok_a and ok_b:
+                    clear_migrate_lease(MIGRATE_LEASE_PATH)
+                else:
+                    log("DESTROY NOT CONFIRMED for one or both migration temp "
+                        "pods — still billing, retrying next tick")
+
     try:
         pods = pods_api.list_pods()
     except RuntimeError as exc:
@@ -96,6 +123,9 @@ def tick(pods_api, first_seen: dict[str, float], *, now: float,
     log(f"tier 3: {len(pods)} pod(s) visible")
 
     kill, seen = reconcile(pods=pods, lease=lease, first_seen=first_seen, now=now)
+    migrate_kill, _ = reconcile_migration(pods=pods, lease=migrate_lease,
+                                          first_seen=first_seen, now=now)
+    kill = kill + migrate_kill
     for pod_id in kill:
         log(f"KILL {pod_id} — orphan, no lease claims it")
         if not dry_run:
@@ -111,7 +141,7 @@ def tick(pods_api, first_seen: dict[str, float], *, now: float,
     untouched = [p for p in pods
                  if p.pod_id not in kill and (lease is None or p.pod_id != lease.pod_id)]
     for p in untouched:
-        if p.name in DESTROYABLE_NAMES:
+        if p.name in DESTROYABLE_NAMES or p.name in MIGRATE_DESTROYABLE_NAMES:
             age_min = (now - seen[p.pod_id]) / 60.0
             log(f"leaving {p.pod_id} ({p.name!r}) alone — unclaimed but only "
                 f"{age_min:.0f} min old, inside the {GRACE_MIN} min grace window")

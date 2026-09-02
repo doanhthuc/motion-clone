@@ -7,8 +7,9 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batchlib_ext.lease import Lease, write_lease
+from batchlib_ext.migrate_lease import MigrateLease, write_migrate_lease
 from batchlib_ext.podctl import PodInfo
-from batchlib_ext.watchdog import DESTROYABLE_NAMES
+from batchlib_ext.watchdog import DESTROYABLE_NAMES, MIGRATE_DESTROYABLE_NAMES
 import pod_watchdog
 
 
@@ -279,6 +280,124 @@ class TestLeaseBranchCannotDisableTierThree(unittest.TestCase):
         self.assertIn("grace window", joined)
         self.assertIn("not a name tier 3 may destroy", joined)
         self.assertNotIn("young ('motion-transfer') alone — not a name", joined)
+
+
+class TestMigrationTiers(unittest.TestCase):
+    """The two TEMPORARY CPU pods a volume migration rents get the same
+    tier-1/2 (ceiling) and tier-3 (orphan reconciliation) protection as the
+    real GPU pod, via a SEPARATE lease file (MIGRATE_LEASE_PATH) so the two
+    protections cannot be confused with each other.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        temp_path = Path(self.temp_dir.name)
+        self.lease_path = temp_path / "pod-lease.json"
+        self.migrate_lease_path = temp_path / "migrate-lease.json"
+        self.lease_patcher = patch.object(pod_watchdog, "LEASE_PATH", self.lease_path)
+        self.lease_patcher.start()
+        self.migrate_patcher = patch.object(pod_watchdog, "MIGRATE_LEASE_PATH",
+                                            self.migrate_lease_path)
+        self.migrate_patcher.start()
+        self.logs: list[str] = []
+        self.log_patcher = patch.object(pod_watchdog, "log", self.logs.append)
+        self.log_patcher.start()
+
+    def tearDown(self):
+        self.log_patcher.stop()
+        self.migrate_patcher.stop()
+        self.lease_patcher.stop()
+        self.temp_dir.cleanup()
+
+    def test_a_migration_past_ceiling_is_killed_and_lease_cleared(self):
+        write_migrate_lease(self.migrate_lease_path, MigrateLease(
+            pod_a_id="tmp-a", pod_b_id="tmp-b", started_at=0.0, to_dc="EU-CZ-1"))
+        # No .pods set: list_pods() returns [] (FakePods' hasattr fallback),
+        # i.e. both temp pods are gone by the time destroy_verified re-lists —
+        # same convention as test_kill_destroys_and_clears_the_lease above.
+        pods_api = FakePods()
+
+        pod_watchdog.tick(pods_api, {}, now=100000.0, dry_run=False)
+
+        self.assertIn("tmp-a", pods_api.destroyed)
+        self.assertIn("tmp-b", pods_api.destroyed)
+        self.assertFalse(self.migrate_lease_path.exists())
+
+    def test_migration_dry_run_never_destroys_and_keeps_the_lease(self):
+        write_migrate_lease(self.migrate_lease_path, MigrateLease(
+            pod_a_id="tmp-a", pod_b_id="tmp-b", started_at=0.0, to_dc="EU-CZ-1"))
+        pods_api = FakePods()
+        pods_api.pods = [PodInfo(pod_id="tmp-a", name="migrate-tmp-a"),
+                         PodInfo(pod_id="tmp-b", name="migrate-tmp-b")]
+
+        pod_watchdog.tick(pods_api, {}, now=100000.0, dry_run=True)
+
+        self.assertEqual(pods_api.destroyed, [])
+        self.assertTrue(self.migrate_lease_path.exists())
+
+    def test_migration_within_ceiling_is_left_alone(self):
+        write_migrate_lease(self.migrate_lease_path, MigrateLease(
+            pod_a_id="tmp-a", pod_b_id="tmp-b", started_at=0.0, to_dc="EU-CZ-1"))
+        pods_api = FakePods()
+        pods_api.pods = [PodInfo(pod_id="tmp-a", name="migrate-tmp-a"),
+                         PodInfo(pod_id="tmp-b", name="migrate-tmp-b")]
+
+        # 20 min in, well under the 40 min ceiling.
+        pod_watchdog.tick(pods_api, {}, now=20 * 60.0, dry_run=False)
+
+        self.assertEqual(pods_api.destroyed, [])
+        self.assertTrue(self.migrate_lease_path.exists())
+
+    def test_unverified_migration_destroy_keeps_the_lease(self):
+        write_migrate_lease(self.migrate_lease_path, MigrateLease(
+            pod_a_id="tmp-a", pod_b_id="tmp-b", started_at=0.0, to_dc="EU-CZ-1"))
+        pods_api = NoOpDestroyPods([PodInfo("tmp-a", "migrate-tmp-a"),
+                                   PodInfo("tmp-b", "migrate-tmp-b")])
+
+        pod_watchdog.tick(pods_api, {}, now=100000.0, dry_run=False)
+
+        self.assertEqual(sorted(pods_api.destroy_calls), ["tmp-a", "tmp-b"])
+        self.assertTrue(self.migrate_lease_path.is_file(),
+                        "migrate lease was cleared over a destroy that did nothing")
+        joined = "\n".join(self.logs)
+        self.assertIn("DESTROY NOT CONFIRMED", joined)
+
+    def test_tier_three_reconciles_an_orphaned_migration_pod_past_grace(self):
+        # No migrate lease on disk at all — same as the real GPU pod's tier 3,
+        # an unclaimed pod with a destroyable name past the grace window is an
+        # orphan.
+        pods_api = FakePods()
+        pods_api.pods = [PodInfo(pod_id="orphan-a", name="migrate-tmp-a")]
+
+        first_seen = {"orphan-a": 0.0}
+        pod_watchdog.tick(pods_api, first_seen, now=11 * 60.0, dry_run=False)
+
+        self.assertEqual(pods_api.destroyed, ["orphan-a"])
+
+    def test_tier_three_leaves_a_young_orphaned_migration_pod_alone(self):
+        pods_api = FakePods()
+        pods_api.pods = [PodInfo(pod_id="orphan-a", name="migrate-tmp-a")]
+
+        pod_watchdog.tick(pods_api, {}, now=0.0, dry_run=False)
+
+        self.assertEqual(pods_api.destroyed, [])
+        joined = "\n".join(self.logs)
+        self.assertIn("grace window", joined)
+
+    def test_real_gpu_pod_tiers_are_unaffected_by_an_active_migration_lease(self):
+        # The two protections must not interfere: an active migration lease
+        # must not change what happens to the real GPU pod.
+        write_lease(self.lease_path, Lease(pod_id="pod-old", provisioned_at=0.0,
+                                           manifest="batch/test.yaml", abs_max_min=10))
+        write_migrate_lease(self.migrate_lease_path, MigrateLease(
+            pod_a_id="tmp-a", pod_b_id="tmp-b", started_at=0.0, to_dc="EU-CZ-1"))
+        pods_api = FakePods()
+        pods_api.pods = []
+
+        pod_watchdog.tick(pods_api, {}, now=1000.0 * 60.0, dry_run=False)
+
+        self.assertEqual(pods_api.destroyed, ["pod-old"])
+        self.assertFalse(self.lease_path.is_file())
 
 
 class TestOnceExitCode(unittest.TestCase):
