@@ -30,10 +30,13 @@ A new, generic, bot-independent script — same layering choice as `drain.py`:
 ```
 scripts/volume_migrate.py --to-dc EU-CZ-1 [--yes]
 
+Phase 0  no --yes → describe the source volume (a free read) and stop. Creates NOTHING.
 Phase 1  create-network-volume at --to-dc, same size as the source
 Phase 2  provision 2 temp CPU pods (4 vCPU each — see §5), A=old volume, B=new volume
-Phase 3  temp SSH keypair; rsync -a A→B direct (pod-to-pod IP), 8 threads, one per model subdir
-Phase 4  rsync -avnc (dry-run + checksum) verify; must report 0 files needing sync
+Phase 3  temp SSH keypair; enumerate sync units by listing the volume (never a name
+         list — see §Phase 3); rsync -aR A→B direct (pod-to-pod IP), 8 threads
+Phase 4  rsync -avncR (dry-run + checksum) per unit — must report 0 files needing sync —
+         AND the top-level `ls -A` sets on A and B must be identical
 Phase 5  destroy both temp pods (ALWAYS — success or failure, same discipline as drain.py's teardown)
 Phase 6  Phase 4 passed → env_set(".env", "POD_VOLUME_ID", new_id); delete-network-volume(old_id)
          Phase 4 failed  → leave both volumes, report the diff, exit non-zero — nothing destructive
@@ -55,16 +58,52 @@ migration is more vCPU before more threads).
 
 **Phase 3 — sync.** `ssh-keygen -t ed25519` into a temp file, public key appended to pod B's
 `~/.ssh/authorized_keys` (via `runpodctl ssh info` + the pod's exec/SSH), private key placed on pod
-A. `rsync -a` for each top-level subdirectory under the mount (`diffusion_models`, `text_encoders`,
-`loras`, `checkpoints`, `PGDATA`, `minio`, …) run in parallel, capped at 8 concurrent (measured
+A. `rsync -aR` for each SYNC UNIT, run in parallel, capped at 8 concurrent (measured
 2026-08-29: 16 gets `MaxStartups`-rejected connections). **No throughput number is promised** — the
 doc's ~427MB/s figure was measured for `dd|ssh cat`, not `rsync`; rsync was chosen anyway (see §1)
 and its own real number gets measured and written down the first time this actually runs, not
 guessed here.
 
-**Phase 4 — verify.** `rsync -avnc` (dry-run + checksum, no `-a` alone — checksums, not just
-size/mtime) same source→dest. Parses stdout for a change count; anything other than exactly 0 is a
-hard stop. This is the ONE gate between "copied" and "safe to delete the original."
+**What a sync unit is, and why this paragraph was rewritten (2026-09-02, post-implementation
+review).** The original text here said "each top-level subdirectory under the mount
+(`diffusion_models`, `text_encoders`, `loras`, `checkpoints`, `PGDATA`, `minio`, …)" and the
+implementation copied that list into a `MODEL_SUBDIRS` constant. **Every name in it except `minio`
+is wrong.** Those are the children of `comfy-models/` — they are the eight parallel legs
+`docs/gpu-pod.md#volume-migrate` measured, not volume entries — and `PGDATA` is the shell VARIABLE's
+name in `pod-volume.sh`; the directory is `pgdata`. The volume's real top level, per
+`motions-studio/setup/pod-volume.sh:85-89`, is:
+
+```
+comfy-models/   hf-cache/   ollama-models/   pgdata/   minio/   .motion-volume
+```
+
+Intersecting the old list against that yields exactly `["minio"]`. A real run would have copied
+`minio/` alone, had verify report 0 differences **against that one-entry scope**, and then deleted
+the source volume with every model, the HF cache, ollama-models and pgdata still only on it —
+irreversible, on first real use. Caught in review before any live run.
+
+So sync units are **enumerated, never named**: `ls -A` the mount and make every entry its own unit,
+with exactly one exception — `comfy-models` is expanded one level deeper (`ls -A
+$MOUNT/comfy-models`) so its 33-55GB still gets the 8-way parallelism that was the whole point of
+the measurement. Units are relative paths from the mount (`minio`, `.motion-volume`,
+`comfy-models/loras`), and `rsync -aR` with a `/./` marker in the source path is what makes ONE
+command shape serve all three: verified against real GNU rsync 3.2.7 (docker `debian:12-slim`,
+2026-09-02), the plain trailing-slash form fails with `mkdir "…/comfy-models/loras" failed: No such
+file or directory` because pod B's volume is brand new and the parent does not exist, and it cannot
+express a top-level plain FILE like the sentinel at all.
+
+**Phase 4 — verify.** Two checks, because the first is structurally blind to the failure the second
+catches.
+
+1. `rsync -avncR` (dry-run + checksum, not `-a` alone — checksums, not just size/mtime) per sync
+   unit, source→dest. Anything other than exactly 0 total changes is a hard stop.
+2. A **coverage** check: the SET of top-level entries from `ls -A` on pod A must equal the set on
+   pod B. Check 1 only ever speaks about the units it was GIVEN, so a unit list that missed a whole
+   directory produces the identical clean zero as a perfect copy — which is precisely how the
+   `MODEL_SUBDIRS` bug above could have destroyed the volume while reporting success. An empty unit
+   list raises before sync even runs, for the same reason.
+
+Both must pass. This is the ONE gate between "copied" and "safe to delete the original."
 
 **Phase 5 — teardown.** Mirrors `drain.py::teardown`'s own discipline: wrapped so an exception
 earlier in the phase still reaches pod deletion for both temp pods. Diagnostics (if the copy failed)
