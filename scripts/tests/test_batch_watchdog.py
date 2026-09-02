@@ -3,7 +3,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batchlib_ext.lease import Lease
-from batchlib_ext.watchdog import decide, in_flight_stage
+from batchlib_ext.migrate_lease import MigrateLease
+from batchlib_ext.podctl import PodInfo
+from batchlib_ext.watchdog import (MIGRATE_CEILING_MIN, decide, decide_migration,
+                                    in_flight_stage, reconcile_migration)
 
 MIN = 60.0
 LEASE = Lease(pod_id="p1", provisioned_at=0.0, manifest="batch/x.yaml", abs_max_min=240)
@@ -103,6 +106,43 @@ class TestUnknownStageNeverRaises(unittest.TestCase):
                    journal_mtime=0.0, now=106 * MIN)
         self.assertTrue(v.kill)
         self.assertIn("unknown to pipelines.py", v.reason)
+
+
+class TestDecideMigration(unittest.TestCase):
+    def test_under_ceiling_is_not_killed(self):
+        lease = MigrateLease(pod_a_id="a", pod_b_id="b", started_at=1000.0, to_dc="EU-CZ-1")
+        verdict = decide_migration(lease=lease, now=1000.0 + 10 * MIN)
+        self.assertFalse(verdict.kill)
+
+    def test_over_ceiling_is_killed(self):
+        lease = MigrateLease(pod_a_id="a", pod_b_id="b", started_at=1000.0, to_dc="EU-CZ-1")
+        verdict = decide_migration(
+            lease=lease, now=1000.0 + (MIGRATE_CEILING_MIN + 1) * MIN)
+        self.assertTrue(verdict.kill)
+        self.assertIn("ceiling", verdict.reason)
+
+
+class TestReconcileMigration(unittest.TestCase):
+    def test_leased_pods_are_left_alone(self):
+        pods = [PodInfo(pod_id="a", name="migrate-tmp-a"),
+                PodInfo(pod_id="b", name="migrate-tmp-b")]
+        lease = MigrateLease(pod_a_id="a", pod_b_id="b", started_at=1.0, to_dc="EU-CZ-1")
+        kill, _ = reconcile_migration(pods=pods, lease=lease, first_seen={}, now=1000.0)
+        self.assertEqual(kill, [])
+
+    def test_an_unleased_temp_pod_past_grace_is_killed(self):
+        pods = [PodInfo(pod_id="orphan-a", name="migrate-tmp-a")]
+        kill, _ = reconcile_migration(
+            pods=pods, lease=None, first_seen={"orphan-a": 0.0}, now=999999.0)
+        self.assertEqual(kill, ["orphan-a"])
+
+    def test_a_pod_with_an_unrelated_name_is_never_touched(self):
+        # Same authority scoping as tier 3's own reconcile() for the real GPU
+        # pod — this net only ever reaches pods this script itself creates.
+        pods = [PodInfo(pod_id="someone-elses-box", name="not-ours")]
+        kill, _ = reconcile_migration(
+            pods=pods, lease=None, first_seen={"someone-elses-box": 0.0}, now=999999.0)
+        self.assertEqual(kill, [])
 
 
 if __name__ == "__main__":

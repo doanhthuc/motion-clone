@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batchlib.pipelines import STAGES
 
 from .lease import Lease
+from .migrate_lease import MigrateLease
 from .podctl import PodInfo
 
 # Longest declared stage timeout (enhance, 90 min as of 2026-08-30). Derived,
@@ -20,15 +21,31 @@ from .podctl import PodInfo
 LONGEST_STAGE_MIN = max(s.timeout_min for s in STAGES.values())
 
 # Tier 3 destroys things, so its authority is scoped to the names this repo's
-# own provisioning creates. Anything else in the account — a CPU box, or the two
-# temporary pods docs/gpu-pod.md's EU-CZ-1 failover runbook stands up by hand for
-# 15-25 minutes — is not ours to kill.
+# own provisioning creates. Anything else in the account — a CPU box someone
+# stood up by hand for an unrelated reason — is not ours to kill. The two
+# temporary pods a volume migration rents (scripts/volume_migrate.py) have
+# their OWN names and their own authority list, MIGRATE_DESTROYABLE_NAMES
+# below — kept separate rather than merged into this one, so a lease-shape
+# change for one can never silently change the other's scope.
 #
 # HAND-COPIED LIST. The one place a pod name is created is the `--name` flag at
 # scripts/pod-provision.sh:393, which carries the matching pointer back here.
 # There is no `make check-*` gate tying the two together yet (CLAUDE.md's "four
 # registries" drift class), so changing either one means changing both by hand.
 DESTROYABLE_NAMES = frozenset({"motion-transfer"})
+
+# 2026-09-02: this repo used to stand up these two pods BY HAND for the
+# EU-CZ-1 failover runbook, which is exactly why the DESTROYABLE_NAMES
+# comment above says a CPU box "is not ours to kill" — now that
+# scripts/volume_migrate.py automates that runbook, its own two pod names
+# need the SAME tier-3 authority the real GPU pod already has, or a crashed
+# migration bills forever with nothing watching it.
+MIGRATE_DESTROYABLE_NAMES = frozenset({"migrate-tmp-a", "migrate-tmp-b"})
+
+# Spec estimate is 15-25 min end-to-end (docs/superpowers/specs/2026-09-02-
+# volume-region-migration-design.md §4) — doubled for margin, same
+# reasoning as GRACE_MIN's own margin over the provisioning window it covers.
+MIGRATE_CEILING_MIN = 40
 
 # How long a pod may exist unclaimed before tier 3 treats it as an orphan. It has
 # to cover the window between `pod create` returning and drain.py writing the
@@ -112,5 +129,35 @@ def reconcile(*, pods: list[PodInfo], lease: Lease | None,
     seen = {p.pod_id: first_seen.get(p.pod_id, now) for p in pods}
     kill = [p.pod_id for p in pods
             if p.pod_id != leased and p.name in destroyable_names
+            and (now - seen[p.pod_id]) / 60.0 > grace_min]
+    return kill, seen
+
+
+def decide_migration(*, lease: MigrateLease, now: float) -> Verdict:
+    """Tier-2-equivalent for a migration: there is no per-stage journal to
+    dead-man's-switch against (a migration is six phases, not a stage
+    pipeline), so age alone against a fixed ceiling is the whole check.
+    """
+    age_min = (now - lease.started_at) / 60.0
+    if age_min > MIGRATE_CEILING_MIN:
+        return Verdict(True, f"migration ceiling: alive {age_min:.0f} min "
+                             f"> {MIGRATE_CEILING_MIN} min")
+    return Verdict(False, "")
+
+
+def reconcile_migration(*, pods: list[PodInfo], lease: MigrateLease | None,
+                        first_seen: dict[str, float], now: float,
+                        grace_min: int = GRACE_MIN) -> tuple[list[str], dict[str, float]]:
+    """Tier-3-equivalent for the two temp pods — same shape as reconcile(),
+    kept separate rather than generalizing reconcile() itself: that function
+    is already tested against the real GPU pod's single-pod-id Lease, and a
+    lease shape change there is exactly the kind of edit that should not be
+    able to accidentally affect this migration's authority scope, or vice
+    versa.
+    """
+    leased = {lease.pod_a_id, lease.pod_b_id} if lease else set()
+    seen = {p.pod_id: first_seen.get(p.pod_id, now) for p in pods}
+    kill = [p.pod_id for p in pods
+            if p.pod_id not in leased and p.name in MIGRATE_DESTROYABLE_NAMES
             and (now - seen[p.pod_id]) / 60.0 > grace_min]
     return kill, seen
