@@ -2265,12 +2265,13 @@ def tick_progress(tg: Tg, chat_id: int) -> None:
 
 def tick_migration_progress(tg: Tg, chat_id: int) -> None:
     """Re-render the migration progress message, same shape as tick_progress
-    for a drain — one message, edited in place while it runs, and a final
-    delivery — a fresh send, not a silent edit — on done/failed, so the user
-    gets a notification even if the in-progress message scrolled out of view
-    (mirrors deliver_result's own separate send at the end of a drain).
-    Called every poll tick alongside tick_progress; harmless no-op when no
-    migration is running.
+    for a drain — one message, edited in place throughout, including its
+    final done/failed state ("one last edit so the message ends on the
+    truth" — tick_progress's own reasoning applies unchanged here; there is
+    no migration equivalent of deliver_result's separate send of actual
+    output files, so nothing should be sent as a substitute for editing the
+    progress text itself). Called every poll tick alongside tick_progress;
+    harmless no-op when no migration is running.
     """
     if not _MIGRATE_PROGRESS_PATH.exists():
         return
@@ -2278,7 +2279,10 @@ def tick_migration_progress(tg: Tg, chat_id: int) -> None:
         payload = json.loads(_MIGRATE_PROGRESS_PATH.read_text(encoding="utf-8"))
         phase = str(payload["phase"])
     except (ValueError, KeyError, TypeError) as exc:
-        log(f"migration progress file unreadable, ignoring: {exc!r}")
+        # Stop trying rather than raise every 50s forever, same as
+        # tick_progress does for its own unreadable progress file.
+        log(f"migration progress file unreadable, dropping it: {exc!r}")
+        _MIGRATE_PROGRESS_PATH.unlink(missing_ok=True)
         return
 
     text = {
@@ -2292,18 +2296,16 @@ def tick_migration_progress(tg: Tg, chat_id: int) -> None:
         text += f"\n{_esc(payload['warning'])}"
 
     msg_path = _migrate_progress_message_path(chat_id)
-    if phase in ("done", "failed"):
-        tg.send_message(chat_id, text, parse_mode=PARSE_HTML)
-        _MIGRATE_PROGRESS_PATH.unlink(missing_ok=True)
-        msg_path.unlink(missing_ok=True)
-        return
-
     if msg_path.exists():
         message_id = json.loads(msg_path.read_text(encoding="utf-8"))["message_id"]
         tg.edit_message(chat_id, message_id, text, parse_mode=PARSE_HTML)
     else:
         message_id = tg.send_message(chat_id, text, parse_mode=PARSE_HTML)
         msg_path.write_text(json.dumps({"message_id": message_id}), encoding="utf-8")
+
+    if phase in ("done", "failed"):
+        _MIGRATE_PROGRESS_PATH.unlink(missing_ok=True)
+        msg_path.unlink(missing_ok=True)
 
 
 _LAST_SUFFIX = ".last.json"

@@ -1432,8 +1432,12 @@ class TestFlow(unittest.TestCase):
 
         prog_path.write_text(json.dumps({"phase": "done", "at": 1.0}), encoding="utf-8")
         bot.tick_migration_progress(self.tg, ME)
-        self.assertIn("done", self.tg.messages[-1].lower())
+        # The final state is an EDIT of the same tracked message, not a new
+        # send — `messages` alone would miss it, same reason `screen` exists:
+        # "Every text that reached the chat, sent or edited, in order."
+        self.assertIn("done", self.tg.screen[-1].lower())
         self.assertFalse(prog_path.exists())   # consumed, like the drain progress file
+        self.assertFalse(bot._migrate_progress_message_path(ME).exists())
 
     def test_tick_migration_progress_reports_a_failed_phase(self):
         prog_path = bot._MIGRATE_PROGRESS_PATH
@@ -1447,6 +1451,15 @@ class TestFlow(unittest.TestCase):
     def test_a_tick_with_no_migration_in_progress_does_nothing(self):
         bot.tick_migration_progress(self.tg, ME)
         self.assertEqual(self.tg.messages, [])
+
+    def test_an_unreadable_migration_progress_file_is_dropped_and_logged(self):
+        prog_path = bot._MIGRATE_PROGRESS_PATH
+        prog_path.parent.mkdir(parents=True, exist_ok=True)
+        prog_path.write_text("{ not json", encoding="utf-8")
+        with mock.patch.object(bot, "log") as logged:
+            bot.tick_migration_progress(self.tg, ME)
+        self.assertFalse(prog_path.exists())
+        self.assertTrue(logged.called)
 
     def test_tapping_switch_writes_env_and_shows_the_new_price(self):
         (self.root / ".env").write_text(
