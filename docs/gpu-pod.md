@@ -1476,6 +1476,14 @@ cứng (exit 1) — và manifest cố ý **không** bị ghi đè lúc đó, đ�
   restart nhiều lần trong một job. Phần mềm để `MTC_PREBUILT=1` lo.
 
 <a id="volume-migrate"></a>
+
+> **Từ 2026-09-02 có đường tự động**: `python3 scripts/volume_migrate.py --to-dc EU-CZ-1 --yes`
+> làm đúng 6 bước dưới đây (tạo volume mới, 2 pod CPU tạm, rsync, verify checksum, xoá volume cũ
+> CHỈ khi khớp 100%, luôn destroy 2 pod tạm) và báo tiến độ qua bot Telegram. Runbook tay dưới đây
+> vẫn giữ lại làm tài liệu tham khảo / phương án khi script không chạy được (thiếu RUNPOD_API_KEY,
+> muốn kiểm soát từng bước bằng tay, …). Thiết kế: docs/superpowers/specs/2026-09-02-volume-
+> region-migration-design.md.
+
 ### Thu nhỏ hoặc đổi datacenter volume — không resize tại chỗ được
 
 RunPod chỉ cho **tăng** dung lượng (`network-volume update` báo lỗi nếu size mới nhỏ hơn cũ) và
