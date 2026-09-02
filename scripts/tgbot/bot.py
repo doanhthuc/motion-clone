@@ -2554,10 +2554,12 @@ def _gpu_price(gpu_id: str, stock: dict) -> float:
 
 
 def _offer_run_confirm(tg: Tg, chat_id: int) -> None:
-    """The step between [Run] and spending money (2026-09-02): checks stock
-    for the GPU that would actually be rented, and offers a same-datacenter
-    switch when it reads Low/none, instead of finding out only after
-    [Confirm] has already started the drain.
+    """The step between [Run] and spending money: always lists every known
+    GPU's live stock/price at the home datacenter and lets [Confirm] switch
+    to any of them before renting (2026-09-02, widened from "only offer a
+    switch when the current one reads Low/none" — a picker that only
+    appears when something is already wrong is not a picker, it is a
+    warning, and the user asked to be able to choose regardless of stock).
 
     Deliberately does NOT try to move the rental to a different
     DATACENTER automatically, even though the 5090 does exist at EU-CZ-1
@@ -2567,22 +2569,23 @@ def _offer_run_confirm(tg: Tg, chat_id: int) -> None:
     TYPE, never the datacenter, so it only ever rewrites .env's GPU= to
     something the SAME pod-provision.sh call would already rent correctly.
 
-    A stock-check failure fails OPEN (falls through to the plain
-    confirm): an informational check must never be the reason [Run]
-    itself stops working.
+    A stock-check failure, or an unknown home datacenter, fails OPEN
+    (falls through to the plain confirm): an informational check must
+    never be the reason [Run] itself stops working, and a picker with no
+    datacenter to compare against would be showing numbers that do not
+    mean what they claim to.
     """
     configured = env_get(ROOT / ".env", "GPU") or _PRIMARY_GPU_ID
     volume_id = env_get(ROOT / ".env", "POD_VOLUME_ID")
     home_dc = volume_datacenter(volume_id)
+    wanted = [_PRIMARY_GPU_ID, *_FALLBACK_GPU_IDS]
     try:
-        stock = stock_at([configured, *_FALLBACK_GPU_IDS])
+        stock = stock_at(wanted) if home_dc else {}
     except RuntimeError:
         stock = {}
 
     price = _gpu_price(configured, stock)
-    home = next((e for e in (stock.get(configured) or [])
-                if home_dc and e.datacenter_id == home_dc), None)
-    if home is None or home.stock_status.lower() in ("high", "medium"):
+    if not stock or not home_dc:
         tg.send_message(
             chat_id,
             f"This rents a GPU pod at ${price:.2f}/hour and starts the job.\n"
@@ -2591,27 +2594,33 @@ def _offer_run_confirm(tg: Tg, chat_id: int) -> None:
                       ("Cancel", _CB_RUN_NO)]])
         return
 
-    icon = _STOCK_ICON.get(home.stock_status.lower(), "⬜")
-    lines = [f"{icon} <b>{_esc(configured)}</b> is {_esc(home.stock_status)} "
-            f"at {_esc(home_dc)} right now — renting may queue or fail."]
-    switch_row = []
-    for gpu_id in _FALLBACK_GPU_IDS:
-        if gpu_id == configured:
-            continue
-        alt = next((e for e in (stock.get(gpu_id) or [])
+    lines = [f"🖥 <b>Choose GPU</b> — renting at {_esc(home_dc)}:"]
+    switch_row: list[tuple[str, str]] = []
+    for gpu_id in wanted:
+        home = next((e for e in (stock.get(gpu_id) or [])
                     if e.datacenter_id == home_dc), None)
+        marker = " (current)" if gpu_id == configured else ""
+        if home is None:
+            lines.append(f"  {_esc(gpu_id)}{marker}: not offered at {_esc(home_dc)}")
+            continue
+        icon = _STOCK_ICON.get(home.stock_status.lower(), "⬜")
+        lines.append(f"  {icon} <b>{_esc(home.display_name)}</b>{marker} — "
+                     f"{_esc(home.stock_status)} · 💵 ${home.price_per_hr:.2f}/h")
         short = _GPU_SHORT.get(gpu_id)
-        if alt is not None and short and alt.stock_status.lower() in ("high", "medium"):
-            switch_row.append((f"Switch to {alt.display_name} "
-                              f"(${alt.price_per_hr:.2f}/h)",
+        if gpu_id != configured and short:
+            switch_row.append((f"Switch to {home.display_name} "
+                              f"(${home.price_per_hr:.2f}/h)",
                               _CB_RUN_SWITCH + short))
     if not switch_row:
-        lines.append("No fallback has better stock at this datacenter either. "
-                     "5090 is also at EU-CZ-1, but that needs the volume "
-                     "synced there first (~25-30 min) — see docs/gpu-pod.md.")
+        # Either nothing else is offered at this datacenter, or the reader
+        # has already seen every alternative is no better — either way there
+        # is no in-datacenter button worth showing, only the manual option.
+        lines.append("No other GPU is offered at this datacenter. 5090 is "
+                     "also at EU-CZ-1, but that needs the volume synced "
+                     "there first (~25-30 min) — see docs/gpu-pod.md.")
 
-    buttons = [switch_row] if switch_row else []
-    buttons.append([(f"Rent anyway (${price:.2f}/h)", _CB_RUN_GO + _run_token(chat_id)),
+    buttons = [switch_row[i:i + 2] for i in range(0, len(switch_row), 2)]
+    buttons.append([(f"Yes, spend ${price:.2f}/h", _CB_RUN_GO + _run_token(chat_id)),
                     ("Cancel", _CB_RUN_NO)])
     tg.send_message(chat_id, "\n".join(lines), parse_mode=PARSE_HTML, buttons=buttons)
 

@@ -1286,7 +1286,12 @@ class TestFlow(unittest.TestCase):
             ],
         }
 
-    def test_a_low_configured_gpu_offers_a_same_datacenter_switch(self):
+    def test_the_picker_lists_every_gpu_and_offers_every_alternative(self):
+        # 2026-09-02: widened from "only offer a switch when Low/none" to
+        # always showing every known GPU, so a switch button is offered for
+        # EVERY alternative regardless of its own stock — the user chooses,
+        # informed by the status shown next to each, rather than the bot
+        # deciding an alternative isn't good enough to offer.
         with mock.patch("tgbot.bot.drain_running", return_value=False), \
              mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
              mock.patch("tgbot.bot.stock_at",
@@ -1299,8 +1304,8 @@ class TestFlow(unittest.TestCase):
         offered = self.tg.buttons[-1]
         flat_data = [data for row in offered for _, data in row]
         self.assertIn(bot._CB_RUN_SWITCH + "4090", flat_data)
-        # PRO 4500 is ALSO Low at home — not offered as a switch target.
-        self.assertNotIn(bot._CB_RUN_SWITCH + "pro4500", flat_data)
+        # PRO 4500 is ALSO Low at home — still offered, just labelled as Low.
+        self.assertIn(bot._CB_RUN_SWITCH + "pro4500", flat_data)
         self.assertTrue(any(d.startswith(bot._CB_RUN_GO) for d in flat_data))
         self.assertIn(bot._CB_RUN_NO, flat_data)
 
@@ -1317,9 +1322,9 @@ class TestFlow(unittest.TestCase):
                       allowed_user_id=ME)
         self.assertEqual(env_get(self.root / ".env", "GPU"),
                          "NVIDIA GeForce RTX 4090")
-        # 4090 is Medium at home, so the re-offer lands on the plain
-        # $-confirm, not another switch prompt.
-        self.assertIn("$0.74/hour", self.tg.messages[-1])
+        # The re-offer is still the full picker — 4090 now marked (current),
+        # and its price is what the Yes button quotes.
+        self.assertIn("RTX 4090</b> (current)", self.tg.messages[-1])
         self.assertIn("Yes, spend $0.74/h",
                       [label for row in self.tg.buttons[-1] for label, _ in row])
 
@@ -1336,20 +1341,24 @@ class TestFlow(unittest.TestCase):
                        allowed_user_id=ME)
         start_drain.assert_called_once()
 
-    def test_no_stock_anywhere_at_home_mentions_the_other_region_not_a_button(self):
-        no_stock = {
+    def test_nothing_offered_at_home_mentions_the_other_region_not_a_button(self):
+        # Every GPU exists only at a DIFFERENT datacenter — none has an
+        # entry at the home one at all, so there is no in-datacenter switch
+        # to offer, only the manual EU-CZ-1 pointer.
+        elsewhere_only = {
             gpu: [Stock(gpu_id=gpu, display_name=gpu, price_per_hr=0.5,
-                       datacenter_id="EU-RO-1", stock_status="Low")]
+                       datacenter_id="EU-CZ-1", stock_status="High")]
             for gpu in (bot._PRIMARY_GPU_ID, *bot._FALLBACK_GPU_IDS)
         }
         with mock.patch("tgbot.bot.drain_running", return_value=False), \
              mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
-             mock.patch("tgbot.bot.stock_at", return_value=no_stock):
+             mock.patch("tgbot.bot.stock_at", return_value=elsewhere_only):
             self._fill_required_slots()
             bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
         text = self.tg.messages[-1]
         self.assertIn("EU-CZ-1", text)
         self.assertIn("25-30 min", text)
+        self.assertIn("not offered at EU-RO-1", text)
         flat_data = [data for row in self.tg.buttons[-1] for _, data in row]
         self.assertFalse(any(d.startswith(bot._CB_RUN_SWITCH) for d in flat_data))
 
