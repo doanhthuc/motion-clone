@@ -1,0 +1,3837 @@
+import itertools, json, subprocess, sys, tempfile, time, unittest
+from pathlib import Path
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from batchlib.config import env_get
+from batchlib.manifest import state_path_for
+from batchlib_ext.gpu_stock import Stock
+from batchlib_ext.handoff import Handoff, handoff_path, mailbox_path, write_handoff
+from batchlib_ext.migrate_lease import MigrateLease, write_migrate_lease
+import tgbot.bot as bot
+from tgbot.bot import allowed
+from tgbot.ingest import Probe
+
+ME = 12345
+
+
+def setUpModule():
+    """Silence bot.log for the suite.
+
+    _show_panel logs one line per redraw — deliberate, since a panel that
+    failed to appear on the user's phone (2026-09-01) left no trace to read
+    afterwards. Useful on the VPS, pure noise here, and noise in test output is
+    how a real failure gets scrolled past.
+    """
+    global _QUIET
+    _QUIET = mock.patch("tgbot.bot.log")
+    _QUIET.start()
+
+
+def tearDownModule():
+    _QUIET.stop()
+
+
+_MESSAGE_IDS = itertools.count(1)
+
+
+def next_message_id() -> int:
+    """One id space shared by the user's messages and the bot's.
+
+    That is how a real private chat numbers them, and _show_panel's drift check
+    is arithmetic on those ids — `newest_seen - panel_id`. Two separate
+    counters would have made the difference meaningless and the drift branch
+    untestable, which is precisely the branch that decides whether the panel is
+    still on screen.
+    """
+    return next(_MESSAGE_IDS)
+
+
+def update_from(user_id: int) -> dict:
+    return {"message": {"from": {"id": user_id}, "chat": {"id": user_id},
+                        "message_id": next_message_id(), "text": "/start"}}
+
+
+def cmd_from(user_id: int, text: str) -> dict:
+    return {"message": {"from": {"id": user_id}, "chat": {"id": user_id},
+                        "message_id": next_message_id(), "text": text}}
+
+
+def doc_from(user_id: int, file_id: str, file_name: str | None = None) -> dict:
+    # file_name is genuinely optional in the Bot API — some clients omit it —
+    # and when it is absent the bot falls back to the basename of what getFile
+    # returned. Omitting it here is what makes the staged copies keep the test
+    # fixtures' own names.
+    doc = {"file_id": file_id}
+    if file_name is not None:
+        doc["file_name"] = file_name
+    return {"message": {"from": {"id": user_id}, "chat": {"id": user_id},
+                        "message_id": next_message_id(), "document": doc}}
+
+
+def media_from(user_id: int, kind: str) -> dict:
+    # `photo` is the one kind the Bot API delivers as a list (one entry per
+    # generated thumbnail size); the rest are plain objects. Only the presence
+    # of the key matters to the branch under test.
+    payload = [{"file_id": "x"}] if kind == "photo" else {"file_id": "x"}
+    return {"message": {"from": {"id": user_id}, "chat": {"id": user_id},
+                        "message_id": next_message_id(), kind: payload}}
+
+
+def video_from(user_id: int, file_id: str, file_name: str | None = None) -> dict:
+    video = {"file_id": file_id}
+    if file_name is not None:
+        video["file_name"] = file_name
+    return {"message": {"from": {"id": user_id}, "chat": {"id": user_id},
+                        "message_id": next_message_id(), "video": video}}
+
+
+def photo_from(user_id: int, *sizes: tuple[str, int]) -> dict:
+    """One PhotoSize per (file_id, file_size) pair, smallest first — the same
+    order the Bot API actually sends. The bot is expected to fetch the
+    largest, never the first."""
+    photo = [{"file_id": fid, "file_size": size} for fid, size in sizes]
+    return {"message": {"from": {"id": user_id}, "chat": {"id": user_id},
+                        "message_id": next_message_id(), "photo": photo}}
+
+
+def cb_from(user_id: int, data: str, cb_id: str = "cb1") -> dict:
+    # A callback_query keeps its sender at callback_query.from and its chat at
+    # callback_query.message.chat — NOT at message.from. That difference is
+    # what made every button press fail the allowlist before _identify.
+    return {"callback_query": {"id": cb_id, "from": {"id": user_id},
+                               "message": {"chat": {"id": user_id},
+                                           "message_id": 7},
+                               "data": data}}
+
+
+# The control panel is the only thing that opens with the clapperboard and a
+# bold pipeline name, so this identifies it without the tests having to track
+# message ids through sends, edits, bumps and freezes.
+PANEL_MARK = "🎬 <b>"
+
+
+def panel_text(tg):
+    """The most recent rendering of the control panel, whether sent or edited."""
+    panels = [t for t in tg.screen if t.startswith(PANEL_MARK)]
+    assert panels, "the bot never rendered a control panel"
+    return panels[-1]
+
+
+def reset_bot_state():
+    """Clear every per-chat dict in bot.py between tests.
+
+    One function rather than the three hand-written `.clear()` calls this
+    replaced (2026-09-01). Those were duplicated across five setUp methods, so
+    every dict added to bot.py had five places to be remembered in and none of
+    them failed loudly when it was not — the control-panel dicts would have
+    leaked message ids from one test into the next, which reads as a panel that
+    mysteriously refuses to be created.
+    """
+    for name in ("_STATE", "_LOADED", "_PENDING", "_LAST_VALIDATE",
+                 "_CONFIRM_WARNED", "_PANEL", "_PANEL_NOTE", "_LAST_SEEN",
+                 "_FRAME", "_ANIM_PAUSE", "_ALBUM_KEY", "_FIDELITY",
+                 "_PANEL_IS_PHOTO", "_STRIP", "_BASKET",
+                 "_LEDGER", "_LEDGER_LOADED", "_MIGRATE_PROC"):
+        # getattr, not bot._STATE etc: a name that disappears from bot.py
+        # should fail here loudly rather than be silently skipped.
+        getattr(bot, name).clear()
+
+
+class FakeTg:
+    """Records calls instead of touching the network. `call()` only needs to
+    answer getFile — /tryon, /result and the document-ingest flow (Task 7)
+    are the only handlers that call it, and getFile is the only method any
+    of them use."""
+    def __init__(self):
+        self.messages: list[str] = []
+        self.documents: list[tuple] = []
+        # Previews: one image with the slot question, and the album shown once
+        # a job is ready to spend on.
+        self.photos: list[tuple] = []
+        self.albums: list[list] = []
+        # Caption edits are separate from text edits: editMessageText cannot
+        # touch a photo and editMessageCaption cannot touch text, so mixing
+        # them up is a real failure mode the tests have to be able to see.
+        self.caption_edits: list[tuple] = []
+        self.file_paths: dict[str, str] = {}   # file_id -> local path, set by the test
+        # Buttons are recorded per message, so a test can assert what was
+        # offered as well as what was said. `answered` records every
+        # answerCallbackQuery: skipping it leaves the client spinning, so it
+        # has to be observable.
+        self.buttons: list[list[list[tuple[str, str]]] | None] = []
+        # The persistent under-the-textbox keyboard, sent only by /start —
+        # recorded separately from `buttons` (inline, per-message) since the
+        # two are mutually exclusive and a test asserting on one should not
+        # have to know the other stayed empty.
+        self.reply_keyboards: list[list[list[str]] | None] = []
+        self.answered: list[str] = []
+        self.parse_modes: list[str | None] = []
+        self.actions: list[str] = []
+        # Edits are what the progress message and the control panel do —
+        # recorded separately from `messages`, because the whole point of both
+        # is that they do NOT send a new message on every change.
+        self.edits: list[tuple[int, str]] = []
+        self.edit_buttons: list[list[list[tuple[str, str]]] | None] = []
+        # Every text that reached the chat, sent or edited, in order. `messages`
+        # alone stopped being enough once the control panel arrived: the panel's
+        # first render is a send and every one after it is an edit, so an
+        # assertion against `messages` silently stops seeing the panel from the
+        # second update onwards — which is most of a job.
+        self.screen: list[str] = []
+        self.deleted: list[int] = []
+        # Message ids increment, as they do in a real chat: _show_panel's drift
+        # check is arithmetic on ids, so a fake that returns a constant would
+        # make that logic untestable — and would have hidden a panel that never
+        # moves no matter how far up the chat it goes.
+        # Flipped by a test to simulate the user deleting the message the bot
+        # keeps editing; the real client returns False for that case.
+        self.edit_ok = True
+        # Set to a TgError to make the next edit raise, as a 429 does.
+        self.edit_raises = None
+        # Same, for a rejected preview upload — Telegram refuses images over
+        # 10MB and images whose sides are too lopsided, neither of which the
+        # bot can know before trying.
+        self.photo_raises = None
+        # Message ids /wipe should fail to delete — the real client returns
+        # False rather than raising, for a message older than Telegram's 48h
+        # deletion window.
+        self.delete_fails: set[int] = set()
+
+    # The tags bot.py actually uses. Anything outside this set is either a
+    # typo or unescaped user text, and Telegram rejects the whole message for
+    # either — so the user sees nothing at all.
+    ALLOWED_TAGS = ("<b>", "</b>", "<i>", "</i>", "<code>", "</code>",
+                    "<pre>", "</pre>", "<blockquote expandable>", "<blockquote>",
+                    "</blockquote>")
+
+    def send_message(self, chat_id, text, *, buttons=None, reply_keyboard=None,
+                     parse_mode=None):
+        self._check_markup(text, parse_mode)
+        self.messages.append(text)
+        self.screen.append(text)
+        self.buttons.append(buttons)
+        self.reply_keyboards.append(reply_keyboard)
+        # Recorded so a test can assert that HTML-formatted bodies actually
+        # declare it: HTML sent without parse_mode shows the raw <b> tags,
+        # and HTML declared without escaping makes Telegram reject the whole
+        # message so nothing arrives at all.
+        self.parse_modes.append(parse_mode)
+        return next_message_id()
+
+    def send_chat_action(self, chat_id, action="typing"):
+        self.actions.append(action)
+
+    def edit_message(self, chat_id, message_id, text, *, buttons=None,
+                     parse_mode=None):
+        if self.edit_raises is not None:
+            raise self.edit_raises
+        self._check_markup(text, parse_mode)
+        self.edits.append((message_id, text))
+        self.screen.append(text)
+        self.edit_buttons.append(buttons)
+        return self.edit_ok
+
+    def delete_message(self, chat_id, message_id):
+        if message_id in self.delete_fails:
+            return False
+        self.deleted.append(message_id)
+        return True
+
+    def _check_markup(self, text, parse_mode):
+        """Fail here rather than let Telegram silently reject the message.
+
+        Two failure modes, both invisible in production and both caught by
+        running this on every message the suite produces:
+
+        1. HTML in the body with no parse_mode — the user reads literal
+           "<b>character</b>" instead of bold text.
+        2. parse_mode=HTML with an unescaped `<` or an unknown tag — Telegram
+           rejects the ENTIRE sendMessage, so nothing arrives. That is the same
+           silence class as the NON_FILE_MEDIA bug, and no unit test would see
+           it without this check.
+        """
+        looks_like_html = any(t in text for t in self.ALLOWED_TAGS)
+        if parse_mode is None:
+            assert not looks_like_html, (
+                f"HTML tags sent without parse_mode: {text[:120]!r}")
+            return
+        assert parse_mode == "HTML", f"unexpected parse_mode {parse_mode!r}"
+        stripped = text
+        for tag in self.ALLOWED_TAGS:
+            stripped = stripped.replace(tag, "")
+        # &lt; / &gt; / &amp; are what _esc produces and are legal; bare
+        # brackets are not.
+        for entity in ("&lt;", "&gt;", "&amp;"):
+            stripped = stripped.replace(entity, "")
+        for ch in "<>":
+            assert ch not in stripped, (
+                f"unescaped {ch!r} in an HTML message — Telegram would reject "
+                f"the whole thing: {text[:160]!r}")
+
+    def answer_callback_query(self, callback_id, text=""):
+        self.answered.append(callback_id)
+
+    def callback_data(self):
+        """Every callback_data offered so far, flattened.
+
+        Spans sends AND edits (2026-09-01). The Run button lives on the control
+        panel, which is sent once and edited from then on — so a version of
+        this that read `self.buttons` alone reported that Run had never been
+        offered on any job the user did not build in a single update.
+        """
+        return [d for rows in self.buttons + self.edit_buttons if rows
+                for row in rows for _, d in row]
+
+    def send_document(self, chat_id, path, caption=""):
+        self.documents.append((path, caption))
+        return next_message_id()
+
+    def send_photo(self, chat_id, path, *, caption="", buttons=None,
+                   parse_mode=None):
+        if self.photo_raises is not None:
+            raise self.photo_raises
+        self._check_markup(caption, parse_mode)
+        self.photos.append((path, caption))
+        self.screen.append(caption)
+        self.buttons.append(buttons)
+        self.parse_modes.append(parse_mode)
+        # An id, because a photo can BE the panel once the whole thing fits in
+        # a caption — and the bot then keeps editing that message.
+        return next_message_id()
+
+    def edit_message_caption(self, chat_id, message_id, caption, *, buttons=None,
+                             parse_mode=None):
+        self._check_markup(caption, parse_mode)
+        self.caption_edits.append((message_id, caption))
+        self.screen.append(caption)
+        self.edit_buttons.append(buttons)
+        return self.edit_ok
+
+    def send_media_group(self, chat_id, items, *, parse_mode=None):
+        for _, caption in items:
+            self._check_markup(caption, parse_mode)
+        self.albums.append(list(items))
+        return [next_message_id() for _ in items]
+
+    def call(self, method, **params):
+        if method == "getFile":
+            return {"file_path": self.file_paths[params["file_id"]]}
+        raise AssertionError(f"FakeTg.call: unexpected method {method!r}")
+
+
+class TestAllowed(unittest.TestCase):
+    def test_the_owner_is_allowed(self):
+        self.assertTrue(allowed(update_from(ME), ME))
+
+    def test_anyone_else_is_refused(self):
+        # This whitelist is the only thing between a stranger and a button that
+        # rents a $0.99/hour GPU. It must be an allowlist, never a blocklist.
+        self.assertFalse(allowed(update_from(99999), ME))
+
+    def test_an_update_with_no_sender_is_refused(self):
+        # channel_post, edited_channel_post and service updates have no
+        # message.from. Defaulting those to allowed would open the door.
+        self.assertFalse(allowed({"channel_post": {"chat": {"id": ME}}}, ME))
+
+    def test_a_malformed_update_is_refused_not_crashed(self):
+        self.assertFalse(allowed({}, ME))
+        self.assertFalse(allowed({"message": {}}, ME))
+
+    def test_the_owner_pressing_a_button_is_allowed(self):
+        # Buttons arrived 2026-08-31. Before _identify, allowed() read only
+        # message.from, so this returned False and every press did nothing —
+        # silently, which looks exactly like a broken bot.
+        self.assertTrue(allowed(cb_from(ME, "run:ask"), ME))
+
+    def test_a_stranger_pressing_a_button_is_refused(self):
+        # The button that spends $0.99/hour is reachable by callback_query, so
+        # the allowlist has to be as strict in this shape as in the other.
+        self.assertFalse(allowed(cb_from(99999, "run:go:1"), ME))
+
+    def test_a_button_press_from_a_group_is_refused(self):
+        press = cb_from(ME, "run:ask")
+        press["callback_query"]["message"]["chat"]["id"] = -1001234567890
+        self.assertFalse(allowed(press, ME))
+
+    def test_a_button_press_with_no_sender_is_refused(self):
+        press = cb_from(ME, "run:ask")
+        del press["callback_query"]["from"]
+        self.assertFalse(allowed(press, ME))
+
+    def test_the_owner_speaking_in_a_group_is_refused(self):
+        # A private chat has chat.id == the user's id; a group does not. If the
+        # owner adds this bot to a group, the sender check alone passes and the
+        # bot would reply into the group with manifests, file paths and the
+        # finished video. Tightened 2026-08-31: the reply surface must be as
+        # narrow as the send surface.
+        group = {"message": {"from": {"id": ME}, "chat": {"id": -1001234567890},
+                             "text": "/start"}}
+        self.assertFalse(allowed(group, ME))
+
+
+class TestNonFileMediaIsRefused(unittest.TestCase):
+    """`photo` and `video` moved to TestPhotoVideoAccepted 2026-09-03 — they
+    are no longer refused. What is left here (animation/audio/voice/
+    video_note/sticker) has no accept path at all: there is nothing to
+    ffprobe on a sticker or a voice note.
+    """
+
+    def test_every_refusal_names_send_as_file(self):
+        # Verified 2026-08-31 that the iOS picker offers "Send as File", so the
+        # refusal has an answer that costs one tap. Pointing at Files instead
+        # sends the user off to save the picture first, and that friction is
+        # what makes the rule feel arbitrary enough to argue with.
+        for kind in bot.NON_FILE_MEDIA:
+            with self.subTest(kind=kind):
+                tg = FakeTg()
+                bot.handle(tg, media_from(ME, kind), allowed_user_id=ME)
+                self.assertIn("Send as File", tg.messages[0])
+
+    def test_an_unmeasured_kind_does_not_claim_a_measurement(self):
+        # `voice` has no row in _RECOMPRESSION_COST. Saying "measured" about
+        # something never measured is exactly how this spec's 20-30MB error
+        # got in, so the absence has to stay visible rather than borrow a
+        # neighbouring number.
+        tg = FakeTg()
+        bot.handle(tg, media_from(ME, "voice"), allowed_user_id=ME)
+        self.assertNotIn("measured", tg.messages[0])
+        self.assertIn("outside the File path", tg.messages[0])
+
+    def test_every_non_file_kind_draws_exactly_one_reply(self):
+        # The point is coverage of the whole tuple: any kind added later that
+        # forgets a reply reintroduces the silence this class exists for.
+        for kind in bot.NON_FILE_MEDIA:
+            with self.subTest(kind=kind):
+                tg = FakeTg()
+                bot.handle(tg, media_from(ME, kind), allowed_user_id=ME)
+                self.assertEqual(len(tg.messages), 1, f"{kind} drew no reply")
+                # Ingest must not be reached at all: FakeTg.call() raises on
+                # any method, so a getFile here would fail this test loudly.
+                self.assertEqual(tg.documents, [])
+
+    def test_a_stranger_sending_a_sticker_still_gets_silence(self):
+        # allowed() runs before this branch and must keep doing so — a refusal
+        # message would confirm to a stranger that the bot exists.
+        tg = FakeTg()
+        bot.handle(tg, media_from(99999, "sticker"), allowed_user_id=ME)
+        self.assertEqual(tg.messages, [])
+
+
+class TestPhotoVideoAccepted(unittest.TestCase):
+    """2026-09-03: relaxed at the user's explicit request, after being shown
+    the same 2026-08-31 measurement that used to justify refusing these (see
+    _RECOMPRESSION_COST) — TikTok-sourced drivers get re-sent through the
+    Photo/Video tab often enough that "send it again as a File" was the
+    friction being complained about, not a one-off mistake.
+    """
+
+    def setUp(self):
+        self._orig_root = bot.ROOT
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "batch").mkdir()
+        (self.root / "out").mkdir()
+        bot.ROOT = self.root
+        reset_bot_state()
+        bot._LAST_VALIDATE.clear()
+        bot._CONFIRM_WARNED.clear()
+        self.addCleanup(setattr, bot, "ROOT", self._orig_root)
+        self.addCleanup(reset_bot_state)
+
+        self.driver_path = self.root / "driver.mp4"
+        self.driver_path.write_bytes(b"d")
+        self.image_path = self.root / "photo.jpg"
+        self.image_path.write_bytes(b"i")
+
+        self.tg = FakeTg()
+        self.tg.file_paths = {"vid-id": str(self.driver_path),
+                              "photo-id": str(self.image_path)}
+        self.driver_probe = Probe(kind="video", width=1080, height=1920, duration_s=5.0,
+                                  bitrate_kbps=3000, size_bytes=1_500_000)
+        self.image_probe = Probe(kind="image", width=1024, height=1024, duration_s=0.0,
+                                 bitrate_kbps=0, size_bytes=800_000)
+        for name in ("slot_preview", "sheet"):
+            patcher = mock.patch(f"tgbot.bot.{name}", return_value=None)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_a_video_is_accepted_with_a_recompression_warning(self):
+        with mock.patch("tgbot.bot.probe", return_value=self.driver_probe):
+            bot.handle(self.tg, video_from(ME, "vid-id"), allowed_user_id=ME)
+        warning = next(m for m in self.tg.messages if "not a File" in m)
+        self.assertIn("video", warning)
+        self.assertIn("6,603", warning)
+        self.assertIn("Accepted anyway", warning)
+
+    def test_a_video_is_staged_and_filled_as_the_driver_slot(self):
+        # A video needs no question (job.slot_for: "structural, always
+        # driver") — the same behaviour as a document, unaffected by which
+        # picker sent it.
+        with mock.patch("tgbot.bot.probe", return_value=self.driver_probe):
+            bot.handle(self.tg, video_from(ME, "vid-id"), allowed_user_id=ME)
+        self.assertEqual(bot._STATE[ME].slots["driver"].parent,
+                         self.root / "batch" / bot.STAGING_DIR_NAME / str(ME))
+
+    def test_a_photo_is_accepted_with_a_recompression_warning(self):
+        with mock.patch("tgbot.bot.probe", return_value=self.image_probe):
+            bot.handle(self.tg, photo_from(ME, ("photo-id", 100)), allowed_user_id=ME)
+        warning = next(m for m in self.tg.messages if "not a File" in m)
+        self.assertIn("photo", warning)
+        self.assertIn("1445x2560", warning)
+        self.assertIn("Accepted anyway", warning)
+        # Images are damaged differently from video — downscaled AND
+        # converted PNG->JPEG — so quoting the video bitrate figure here, as
+        # the first version of the old refusal did, is a wrong claim.
+        self.assertNotIn("6,603", warning)
+
+    def test_the_largest_photo_size_is_the_one_fetched(self):
+        # Smallest first, as the Bot API actually sends them. "small-id" is
+        # deliberately absent from file_paths: if the bot ever fetched it
+        # instead, FakeTg.call's dict lookup raises KeyError and the reply
+        # below becomes "that file was not accepted: ...", not a warning.
+        msg = photo_from(ME, ("small-id", 10), ("photo-id", 999))
+        with mock.patch("tgbot.bot.probe", return_value=self.image_probe):
+            bot.handle(self.tg, msg, allowed_user_id=ME)
+        self.assertFalse(any("not accepted" in m for m in self.tg.messages))
+
+    def test_a_document_draws_no_recompression_warning(self):
+        with mock.patch("tgbot.bot.probe", return_value=self.driver_probe):
+            bot.handle(self.tg, doc_from(ME, "vid-id", file_name="driver.mp4"),
+                       allowed_user_id=ME)
+        self.assertFalse(any("not a File" in m for m in self.tg.messages))
+
+
+class TestPipelineCommand(unittest.TestCase):
+    """Added 2026-08-31 after the first real run from the phone: the user
+    assembled a job, read the manifest, and wanted character-swap instead of
+    motion — the other feature this repo has. The pipeline was a module
+    constant, so the phone could reach every part of the flow except the
+    choice of what the flow is.
+    """
+
+    def setUp(self):
+        reset_bot_state()
+        bot._LAST_VALIDATE.clear()
+        bot._CONFIRM_WARNED.clear()
+        self._orig_default = bot._DEFAULT_PIPELINE
+        bot._DEFAULT_PIPELINE = "tryon-motion-enhance"
+        # ROOT must move: handle() persists the draft on every update now, and
+        # without this the suite wrote batch/tg-12345.draft.json into the real
+        # repo — which a later run would then rehydrate, making these tests
+        # pass or fail on a leftover from a previous run.
+        self._orig_root = bot.ROOT
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "batch").mkdir()
+        bot.ROOT = self.root
+
+    def tearDown(self):
+        bot._DEFAULT_PIPELINE = self._orig_default
+        bot.ROOT = self._orig_root
+
+    def test_bare_pipeline_lists_the_real_names(self):
+        # The names are close enough that guessing fails: the user asked for
+        # "swap-character-enhance", which is not any of them.
+        tg = FakeTg()
+        bot.handle(tg, cmd_from(ME, "/pipeline"), allowed_user_id=ME)
+        # The protection this test was written for is that a real pipeline is
+        # never something you have to GUESS the name of — the user once asked
+        # for "swap-character-enhance", which is none of them. Since 2026-09-01
+        # the buttons carry the stages rather than the names, so the assertion
+        # is on the affordance: every pipeline is offered, by tap.
+        offered = {d[len(bot._CB_PIPE):] for d in tg.callback_data()
+                   if d.startswith(bot._CB_PIPE)}
+        current = bot._STATE[ME].pipeline if ME in bot._STATE else bot._DEFAULT_PIPELINE
+        self.assertEqual(offered, set(bot.PIPELINES) - {current})
+        # And the one in force is named, so /pipeline <name> stays usable.
+        self.assertIn(current, tg.messages[0])
+        self.assertNotIn("swap-character-enhance", tg.messages[0])
+
+    def test_an_unknown_name_is_refused_and_changes_nothing(self):
+        tg = FakeTg()
+        bot.handle(tg, cmd_from(ME, "/pipeline swap-character-enhance"),
+                   allowed_user_id=ME)
+        self.assertIn("no pipeline called that", tg.messages[0])
+        self.assertEqual(bot._job_for(ME).pipeline, "tryon-motion-enhance")
+
+    def test_switching_keeps_slots_the_new_pipeline_still_uses(self):
+        # Both of these need character/driver/outfit, so a switch between them
+        # must not throw away material the user already labelled.
+        job = bot._job_for(ME)
+        job.slots.update({"character": Path("c.png"), "driver": Path("d.mp4"),
+                          "outfit": Path("o.png")})
+        with mock.patch.object(bot, "_maybe_show_manifest"):
+            tg = FakeTg()
+            bot.handle(tg, cmd_from(ME, "/pipeline tryon-character-swap-enhance"),
+                       allowed_user_id=ME)
+        self.assertEqual(bot._job_for(ME).pipeline, "tryon-character-swap-enhance")
+        self.assertEqual(sorted(bot._job_for(ME).slots), ["character", "driver", "outfit"])
+
+    def test_switching_drops_a_slot_the_new_pipeline_cannot_consume(self):
+        # character-swap-enhance has no tryon stage, so an outfit would ride
+        # into the manifest with nothing to consume it — a run that silently
+        # ignores a file the user deliberately labelled.
+        job = bot._job_for(ME)
+        job.slots.update({"character": Path("c.png"), "driver": Path("d.mp4"),
+                          "outfit": Path("o.png")})
+        with mock.patch.object(bot, "_maybe_show_manifest"):
+            tg = FakeTg()
+            bot.handle(tg, cmd_from(ME, "/pipeline character-swap-enhance"),
+                       allowed_user_id=ME)
+        self.assertNotIn("outfit", bot._job_for(ME).slots)
+        # _maybe_show_manifest is patched out, so the note is asserted where it
+        # is written rather than where it would have been drawn.
+        self.assertIn("dropped outfit", bot._PANEL_NOTE[ME])
+
+    def test_switching_bumps_the_panel_to_the_bottom(self):
+        # A plain in-place edit can land far above the chooser/confirmation
+        # exchange the user is looking at, so a switch — an explicit action —
+        # must move the panel down with it rather than editing silently
+        # wherever it happens to sit (2026-09-02).
+        with mock.patch.object(bot, "_maybe_show_manifest") as show:
+            bot.handle(FakeTg(), cmd_from(ME, "/pipeline character-swap-enhance"),
+                       allowed_user_id=ME)
+        self.assertTrue(show.call_args.kwargs.get("bump"))
+
+    def test_switching_invalidates_the_cached_validation(self):
+        # _LAST_VALIDATE is what /confirm trusts. Left set across a switch, a
+        # /confirm would act on a validation that never ran against the
+        # manifest about to be submitted.
+        bot._LAST_VALIDATE[ME] = True
+        with mock.patch.object(bot, "_maybe_show_manifest"):
+            bot.handle(FakeTg(), cmd_from(ME, "/pipeline character-swap-enhance"),
+                       allowed_user_id=ME)
+        self.assertNotIn(ME, bot._LAST_VALIDATE)
+
+    def test_the_listing_offers_a_button_per_other_pipeline(self):
+        tg = FakeTg()
+        bot.handle(tg, cmd_from(ME, "/pipeline"), allowed_user_id=ME)
+        offered = tg.callback_data()
+        self.assertIn(bot._CB_PIPE + "character-swap-enhance", offered)
+        # Not the current one: a button that does nothing is worse than absent,
+        # and the text already marks which is active.
+        self.assertNotIn(bot._CB_PIPE + "tryon-motion-enhance", offered)
+
+    def test_tapping_a_pipeline_button_switches_like_the_command_does(self):
+        with mock.patch.object(bot, "_maybe_show_manifest"):
+            tg = FakeTg()
+            bot.handle(tg, cb_from(ME, bot._CB_PIPE + "character-swap-enhance"),
+                       allowed_user_id=ME)
+        self.assertEqual(bot._job_for(ME).pipeline, "character-swap-enhance")
+        self.assertEqual(tg.answered, ["cb1"])
+
+    def test_tapping_a_pipeline_button_edits_the_chooser_message_itself(self):
+        # Before this, the chooser message sat untouched after the tap — its
+        # button still read "now: <old pipeline>" — so the switch looked like
+        # it did nothing unless the reader also noticed the panel change
+        # further down the chat (2026-09-02).
+        with mock.patch.object(bot, "_maybe_show_manifest"):
+            tg = FakeTg()
+            bot.handle(tg, cb_from(ME, bot._CB_PIPE + "character-swap-enhance"),
+                       allowed_user_id=ME)
+        self.assertEqual(len(tg.edits), 1)
+        message_id, text = tg.edits[0]
+        self.assertEqual(message_id, 7)  # cb_from's hardcoded message_id
+        self.assertIn("character-swap-enhance", text)
+        # No buttons on the edit: the choice is done, so the old keyboard
+        # should not survive to be tapped again.
+        self.assertIsNone(tg.edit_buttons[0])
+
+    def test_typing_pipeline_leaves_no_chooser_message_to_edit(self):
+        # The typed command has no button-bearing message in play, so it must
+        # not try to edit one.
+        tg = FakeTg()
+        with mock.patch.object(bot, "_maybe_show_manifest"):
+            bot.handle(tg, cmd_from(ME, "/pipeline character-swap-enhance"),
+                       allowed_user_id=ME)
+        self.assertEqual(tg.edits, [])
+
+    def test_every_pipeline_name_fits_in_callback_data(self):
+        # The 64-byte cap is on the DATA, and a single over-long button makes
+        # the whole listing message fail to send — i.e. /pipeline would answer
+        # nothing. A pipeline added later with a long name breaks this here
+        # rather than silently on the phone.
+        from tgbot.tgclient import Tg as RealTg
+        RealTg.keyboard([[(n, bot._CB_PIPE + n)] for n in bot.PIPELINES])
+
+    def test_switching_to_the_current_pipeline_is_a_no_op(self):
+        tg = FakeTg()
+        bot.handle(tg, cmd_from(ME, "/pipeline tryon-motion-enhance"),
+                   allowed_user_id=ME)
+        self.assertIn("already on", tg.messages[0])
+
+
+class TestDraftPersistence(unittest.TestCase):
+    """Added 2026-08-31 after this bit three times in one session.
+
+    `_STATE` and `_PENDING` were memory-only, so an ordinary restart discarded
+    every slot LABEL while leaving the staged FILES on disk. Material the user
+    had already answered questions about became unreachable — no message, and
+    no way to re-attach it short of sending it again. motion-bot.service is
+    `Restart=always`, so on the VPS nobody has to restart it by hand for this
+    to happen.
+
+    "Restart" in these tests is exactly what the process loses: `_STATE`,
+    `_PENDING` and `_LOADED` cleared, ROOT left alone.
+    """
+
+    def setUp(self):
+        self._orig_root = bot.ROOT
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "batch").mkdir()
+        bot.ROOT = self.root
+        self._restart()
+        self.driver = Probe(kind="video", width=1080, height=1920, duration_s=15.0,
+                            bitrate_kbps=865, size_bytes=1_622_500)
+        self.image = Probe(kind="image", width=1536, height=2720, duration_s=0.0,
+                           bitrate_kbps=0, size_bytes=4_873_992)
+
+    def tearDown(self):
+        bot.ROOT = self._orig_root
+        self._restart()
+
+    def _restart(self):
+        reset_bot_state()
+        bot._LAST_VALIDATE.clear()
+        bot._CONFIRM_WARNED.clear()
+
+    def _seed(self):
+        job = bot._job_for(ME)
+        job.pipeline = "tryon-character-swap-enhance"
+        job.slots.update({"character": Path("/s/c.png"), "driver": Path("/s/d.mp4")})
+        job.probes.update({"character": self.image, "driver": self.driver})
+        bot._PENDING[ME] = [(Path("/s/o.png"), self.image)]
+        bot._save_draft(ME)
+
+    def test_a_draft_survives_a_restart(self):
+        self._seed()
+        self._restart()
+        bot._load_draft(ME)
+        job = bot._STATE[ME]
+        self.assertEqual(job.pipeline, "tryon-character-swap-enhance")
+        self.assertEqual(sorted(job.slots), ["character", "driver"])
+        self.assertEqual(job.slots["driver"], Path("/s/d.mp4"))
+        # The probes must come back too: estimate_minutes and the manifest's
+        # preset are derived from the driver's duration, so a job restored
+        # without them is not restored.
+        self.assertEqual(job.probes["driver"], self.driver)
+
+    def test_the_unanswered_queue_survives_a_restart(self):
+        # The queue is the half that mattered most in the real incident: a file
+        # parked awaiting its label is staged on disk but reachable only
+        # through _PENDING.
+        self._seed()
+        self._restart()
+        bot._load_draft(ME)
+        self.assertEqual(bot._PENDING[ME], [(Path("/s/o.png"), self.image)])
+
+    def test_the_validation_verdict_is_deliberately_not_persisted(self):
+        # /confirm treats a missing verdict as "never attempted" and re-runs
+        # the free validate, re-sending the manifest before anything spends. A
+        # cached pass carried across a restart is a verdict about a process
+        # that no longer exists.
+        self._seed()
+        bot._LAST_VALIDATE[ME] = True
+        bot._save_draft(ME)
+        self._restart()
+        bot._load_draft(ME)
+        self.assertNotIn(ME, bot._LAST_VALIDATE)
+
+    def test_clearing_the_state_removes_the_file(self):
+        # /confirm clears _STATE after submitting. If the draft outlived it,
+        # the next restart would resurrect a job that is already running.
+        self._seed()
+        self.assertTrue(bot._draft_path(ME).exists())
+        bot._STATE.pop(ME)
+        bot._PENDING.pop(ME)
+        bot._save_draft(ME)
+        self.assertFalse(bot._draft_path(ME).exists())
+
+    def test_a_corrupt_draft_is_reported_and_does_not_crash(self):
+        bot._draft_path(ME).write_text("{ not json", encoding="utf-8")
+        with mock.patch.object(bot, "log") as logged:
+            bot._load_draft(ME)
+        self.assertNotIn(ME, bot._STATE)
+        self.assertTrue(logged.called)
+        self.assertIn("unreadable", logged.call_args[0][0])
+
+    def test_a_corrupt_draft_is_moved_aside_not_left_to_be_deleted(self):
+        """The destructive interaction, found 2026-08-31.
+
+        _load_draft used to log and skip. Skipping leaves _STATE empty, and
+        handle()'s `finally: _save_draft` then sees no state and unlinks the
+        file — so the ONE record of the job was destroyed by the line after the
+        one that failed to read it. Reconstructing a draft by hand from the
+        staged files is possible (it was done once, earlier the same day) but
+        only while the file still exists.
+        """
+        path = bot._draft_path(ME)
+        path.write_text('{"pipeline": "tryon-motion-enhance", "slots": {', encoding="utf-8")
+        tg = FakeTg()
+        with mock.patch.object(bot, "log"):
+            bot.handle(tg, cmd_from(ME, "/status"), allowed_user_id=ME)
+        self.assertFalse(path.exists())
+        salvaged = path.with_suffix(path.suffix + ".bad")
+        self.assertTrue(salvaged.exists(), "the unreadable draft was destroyed")
+        self.assertIn("slots", salvaged.read_text())
+        # And the user is told, not only the log: otherwise /job answers
+        # "nothing assembled yet" for a job they know they built.
+        self.assertIn("could not be read", tg.messages[0])
+        self.assertIn(salvaged.name, tg.messages[0])
+
+    def test_a_draft_naming_an_unknown_pipeline_is_refused(self):
+        # A pipeline renamed or removed between restarts would otherwise be
+        # loaded and then fail much later, during manifest validation.
+        self._seed()
+        import json
+        path = bot._draft_path(ME)
+        payload = json.loads(path.read_text())
+        payload["pipeline"] = "swap-character-enhance"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        self._restart()
+        with mock.patch.object(bot, "log"):
+            bot._load_draft(ME)
+        self.assertNotIn(ME, bot._STATE)
+
+    def test_handle_loads_the_draft_before_acting_on_the_update(self):
+        # The end-to-end property: after a restart, the first message must see
+        # the restored job rather than a fresh empty one.
+        self._seed()
+        self._restart()
+        tg = FakeTg()
+        bot.handle(tg, cmd_from(ME, "/pipeline"), allowed_user_id=ME)
+        self.assertIn("tryon-character-swap-enhance", tg.messages[0],
+                      "the pipeline in force is not named")
+
+    def test_handle_saves_even_when_the_handler_raises(self):
+        # main() logs and continues past a failing update, so a draft change
+        # made before the raise must not be lost.
+        self._seed()
+        self._restart()
+        with mock.patch.object(bot, "_handle", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                bot.handle(FakeTg(), cmd_from(ME, "/status"), allowed_user_id=ME)
+        self.assertTrue(bot._draft_path(ME).exists())
+
+    def test_a_stranger_never_creates_a_draft(self):
+        bot.handle(FakeTg(), cmd_from(99999, "/status"), allowed_user_id=ME)
+        self.assertFalse(bot._draft_path(99999).exists())
+
+
+class TestSafeName(unittest.TestCase):
+    """Finding C (2026-08-31): _safe_name re-spelled the whole basename in one
+    pass, so a stem made entirely of characters outside the alphabet collapsed
+    and the strip("._-") then ate the dot in front of the extension.
+    `_safe_name('写真.heic')` returned `'heic'` — a name with NO suffix, so
+    to_png_if_heic never fired and probe() rejected the file. The user's
+    material comes from a Vietnamese-language workflow, so non-Latin filenames
+    are the ordinary case, not the exotic one.
+    """
+
+    def test_a_non_ascii_stem_keeps_its_extension(self):
+        self.assertEqual(bot._safe_name("写真.heic"), "file.heic")
+
+    def test_a_dotfile_keeps_its_name(self):
+        # Path('.hidden').suffix is '' — the whole thing is a stem, so the
+        # result is a plain stem too, not an extension promoted to a name.
+        self.assertEqual(bot._safe_name(".hidden"), "hidden")
+
+    def test_a_name_stripped_to_nothing_falls_back(self):
+        self.assertEqual(bot._safe_name("写真"), "file")
+        self.assertEqual(bot._safe_name("___"), "file")
+
+    def test_an_ordinary_name_is_unchanged_apart_from_the_alphabet(self):
+        self.assertEqual(bot._safe_name("my driver:v1.mp4"), "my_driver_v1.mp4")
+
+
+class TestResultAndTryonPathSafety(unittest.TestCase):
+    """Regression tests for the path-containment finding: the allowlist
+    restricts WHO can message the bot, not WHAT they type — a single
+    mistyped or pasted path must never let /result or /tryon read or send a
+    file outside batch/ or out/.
+    """
+
+    def setUp(self):
+        self._orig_root = bot.ROOT
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "batch").mkdir()
+        (self.root / "out").mkdir()
+        # One level above batch/ — reachable via "../" or an absolute path if
+        # /result does not reject either, and must never be reachable.
+        (self.root / "secret.yaml").write_text("runs: []", encoding="utf-8")
+        # One level above out/, shaped like a real try-on image — reachable
+        # via "../" if /tryon's batch id is not rejected.
+        evil_run = self.root / "evil" / "runs" / "job"
+        evil_run.mkdir(parents=True)
+        (evil_run / "01-tryon.png").write_bytes(b"not a real png, just a probe")
+        bot.ROOT = self.root
+
+    def tearDown(self):
+        bot.ROOT = self._orig_root
+
+    def test_result_refuses_an_absolute_path(self):
+        tg = FakeTg()
+        payload = str(self.root / "secret.yaml")
+        bot.handle(tg, cmd_from(ME, f"/result {payload}"), allowed_user_id=ME)
+        self.assertEqual(tg.documents, [])
+        self.assertEqual(len(tg.messages), 1)
+        self.assertIn("not allowed", tg.messages[0])
+        self.assertNotIn(payload, tg.messages[0])
+
+    def test_result_refuses_dotdot_traversal(self):
+        tg = FakeTg()
+        bot.handle(tg, cmd_from(ME, "/result ../secret.yaml"), allowed_user_id=ME)
+        self.assertEqual(tg.documents, [])
+        self.assertEqual(len(tg.messages), 1)
+        self.assertIn("not allowed", tg.messages[0])
+
+    def test_tryon_refuses_dotdot_traversal(self):
+        tg = FakeTg()
+        bot.handle(tg, cmd_from(ME, "/tryon ../evil"), allowed_user_id=ME)
+        # Pre-fix, this sent evil/runs/job/01-tryon.png — a real file one
+        # level above out/ — straight to send_document.
+        self.assertEqual(tg.documents, [])
+        self.assertEqual(len(tg.messages), 1)
+        self.assertIn("not allowed", tg.messages[0])
+
+    def test_result_reports_not_found_for_a_valid_but_missing_name(self):
+        tg = FakeTg()
+        bot.handle(tg, cmd_from(ME, "/result does-not-exist.yaml"),
+                  allowed_user_id=ME)
+        self.assertEqual(tg.documents, [])
+        self.assertEqual(len(tg.messages), 1)
+        # A valid (bare) name that just doesn't exist is a plain "not found",
+        # never the safety refusal.
+        self.assertNotIn("not allowed", tg.messages[0])
+
+    def test_refusal_does_not_echo_the_offending_input(self):
+        tg = FakeTg()
+        payload = "../../../../etc/passwd"
+        bot.handle(tg, cmd_from(ME, f"/result {payload}"), allowed_user_id=ME)
+        self.assertEqual(tg.documents, [])
+        self.assertNotIn(payload, tg.messages[0])
+        self.assertNotIn("passwd", tg.messages[0])
+
+
+class TestFlow(unittest.TestCase):
+    """The state machine Task 7 adds: files in, an ambiguous image asked
+    about (never guessed), the manifest shown once every required slot is
+    filled, and /confirm as the only reachable path to start_drain.
+
+    Real files on disk, real `make batch-validate`: only `probe()` is faked
+    (no real ffprobe/media needed) — everything downstream of it, including
+    the manifest text and the free validation gate, runs for real, against
+    the real repo (`bot._REPO_ROOT`), so a passing test here is evidence the
+    generated manifest actually validates, not just that a string was built.
+    """
+
+    def setUp(self):
+        self._orig_root = bot.ROOT
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "batch").mkdir()
+        (self.root / "out").mkdir()
+        bot.ROOT = self.root
+        reset_bot_state()
+        bot._LAST_VALIDATE.clear()
+        bot._CONFIRM_WARNED.clear()
+
+        # Real, if empty, files: validate_manifest checks path.is_file().
+        # These stand in for what the Bot API server wrote — the bot copies
+        # them into batch/tg-staging/<chat>/ before touching them (findings
+        # C2/I5), so every assertion below about a slot is about the STAGED
+        # path, never this one.
+        self.driver_path = self.root / "driver.mp4"
+        self.driver_path.write_bytes(b"d")
+        self.character_path = self.root / "character.jpg"
+        self.character_path.write_bytes(b"c")
+        self.outfit_path = self.root / "outfit.jpg"
+        self.outfit_path.write_bytes(b"o")
+
+        self.tg = FakeTg()
+        self.tg.file_paths = {
+            "driver-id": str(self.driver_path),
+            "character-id": str(self.character_path),
+            "outfit-id": str(self.outfit_path),
+        }
+        self.driver_probe = Probe(kind="video", width=1080, height=1920, duration_s=5.0,
+                                  bitrate_kbps=3000, size_bytes=1_500_000)
+        self.image_probe = Probe(kind="image", width=1024, height=1024, duration_s=0.0,
+                                 bitrate_kbps=0, size_bytes=800_000)
+        # No previews by default. The fixtures are 1-byte files, so a real
+        # `make` shells out to ffmpeg, fails, and returns None anyway — it just
+        # costs a process per ambiguous image (17s across the suite when this
+        # was left live). Preview BEHAVIOUR is asserted in TestPreviews, where
+        # `make` is patched to return a real file.
+        for name in ("slot_preview", "sheet"):
+            patcher = mock.patch(f"tgbot.bot.{name}", return_value=None)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        bot.ROOT = self._orig_root
+        reset_bot_state()
+        bot._LAST_VALIDATE.clear()
+        bot._CONFIRM_WARNED.clear()
+
+    def staged(self, name: str) -> Path:
+        """Where _stage_file puts a file of this name for this chat."""
+        return self.root / "batch" / bot.STAGING_DIR_NAME / str(ME) / name
+
+    def _probe_for(self, mapping):
+        # Keyed by NAME, not by the source path: probe() now runs on the
+        # staged copy, so the path it is handed is not the one the test wrote.
+        def fake_probe(path):
+            return mapping[Path(path).name]
+        return fake_probe
+
+    def _fill_required_slots(self):
+        """driver (auto), character and outfit (each an ambiguous image,
+        answered by name) — every required role of the pipeline the bot
+        hardcodes, per docs/superpowers/specs/2026-08-30-…: "four labelled
+        slots". Background is optional and deliberately left unfilled."""
+        probe_fn = self._probe_for({
+            self.driver_path.name: self.driver_probe,
+            self.character_path.name: self.image_probe,
+            self.outfit_path.name: self.image_probe,
+        })
+        with mock.patch("tgbot.bot.probe", side_effect=probe_fn):
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+            bot.handle(self.tg, doc_from(ME, "character-id"), allowed_user_id=ME)
+            bot.handle(self.tg, cmd_from(ME, "character"), allowed_user_id=ME)
+            bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME)
+            bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME)
+
+    # ---- the control panel (2026-09-01) ------------------------------------
+    #
+    # One message per chat, edited in place. Everything below guards a
+    # property that has no other enforcement: the suite was fully green
+    # immediately after the panel was written and before any of these existed,
+    # which says only that nothing OLD broke.
+
+    def _send_driver(self):
+        with mock.patch("tgbot.bot.probe", return_value=self.driver_probe):
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+
+    def test_a_second_file_edits_the_panel_rather_than_sending_another(self):
+        """The whole reason the panel exists: no growing pile of fragments."""
+        probe_fn = self._probe_for({
+            self.driver_path.name: self.driver_probe,
+            self.character_path.name: self.image_probe,
+        })
+        with mock.patch("tgbot.bot.probe", side_effect=probe_fn):
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+            bot.handle(self.tg, doc_from(ME, "character-id"), allowed_user_id=ME)
+        sent = [t for t in self.tg.messages if t.startswith(PANEL_MARK)]
+        self.assertEqual(len(sent), 1, "a second panel was SENT, not edited")
+        self.assertTrue(any(t.startswith(PANEL_MARK) for _, t in self.tg.edits))
+
+    def test_the_panel_is_moved_down_once_it_has_drifted_off_screen(self):
+        """Editing is silent and preferred — but not at any distance.
+
+        A panel five messages up is a panel the user has to scroll to find,
+        which is the exact complaint the panel was built to answer.
+        """
+        self._send_driver()
+        first = bot._PANEL[ME]
+        # Counted from here, not from 0: the upload's own spinner message
+        # (2026-09-02) is sent and deleted before the panel is ever drawn,
+        # which is a delete this test has no interest in.
+        before = len(self.tg.deleted)
+        bot._LAST_SEEN[ME] = first + bot._PANEL_DRIFT_MAX + 1
+        bot._show_panel(self.tg, ME)
+        self.assertIn(first, self.tg.deleted)
+        self.assertNotEqual(bot._PANEL[ME], first)
+        # Exactly one panel survives: the old one is deleted, not just orphaned
+        # with its buttons still live.
+        self.assertEqual(len(self.tg.deleted), before + 1)
+
+    def test_a_panel_the_user_deleted_is_rebuilt_rather_than_edited_into_the_void(self):
+        self._send_driver()
+        first = bot._PANEL[ME]
+        self.tg.edit_ok = False          # what the real client returns for a gone message
+        bot._show_panel(self.tg, ME)
+        self.assertNotEqual(bot._PANEL[ME], first)
+
+    def test_job_bumps_the_panel_to_the_bottom(self):
+        """/job is an explicit "show me now" — a silent edit above would read
+        as the command having done nothing."""
+        self._send_driver()
+        first = bot._PANEL[ME]
+        bot.handle(self.tg, cmd_from(ME, "/job"), allowed_user_id=ME)
+        self.assertIn(first, self.tg.deleted)
+        self.assertNotEqual(bot._PANEL[ME], first)
+
+    def test_run_is_not_offered_until_the_manifest_has_actually_validated(self):
+        """Stricter than the screen it replaced, which offered Run beside a
+        manifest that had just failed and leaned on _do_confirm to refuse."""
+        job = bot._job_for(ME)
+        job.slots.update({"character": Path("c.png"), "outfit": Path("o.png"),
+                          "driver": Path("d.mp4")})
+        flat = lambda rows: [d for row in rows for _, d in row]
+        bot._LAST_VALIDATE.pop(ME, None)
+        self.assertNotIn(bot._CB_RUN_ASK, flat(bot._panel_buttons(ME, job)))
+        bot._LAST_VALIDATE[ME] = False
+        self.assertNotIn(bot._CB_RUN_ASK, flat(bot._panel_buttons(ME, job)))
+        bot._LAST_VALIDATE[ME] = True
+        self.assertIn(bot._CB_RUN_ASK, flat(bot._panel_buttons(ME, job)))
+
+    def test_confirm_freezes_the_panel_with_the_inputs_and_no_buttons(self):
+        """The transcript invariant, under the new shape.
+
+        Nothing may spend $0.99/hour without the exact inputs it spent on
+        being in the transcript. An edited message keeps only its latest
+        version, so the panel has to STOP being edited at the moment money is
+        committed — otherwise the record of what was submitted would be
+        overwritten by whatever the user assembled next.
+        """
+        self._confirm_and_start()
+        frozen = panel_text(self.tg)
+        self.assertIn("submitted", frozen)
+        for name in ("character.jpg", "outfit.jpg", "driver.mp4"):
+            self.assertIn(name, frozen)
+        # The keyboard goes with it: a Run button on an already-running job is
+        # a second line of defence behind _run_token, not a decoration.
+        index = [i for i, (_, t) in enumerate(self.tg.edits)
+                 if "submitted" in t][-1]
+        self.assertIsNone(self.tg.edit_buttons[index])
+        # And it is untracked, so nothing can edit that record afterwards.
+        self.assertNotIn(ME, bot._PANEL)
+
+    def test_a_later_job_cannot_overwrite_the_frozen_record(self):
+        """The property the freeze exists for, exercised end to end."""
+        self._confirm_and_start()
+        frozen_id = [mid for mid, t in self.tg.edits if "submitted" in t][-1]
+        touched = sum(1 for mid, _ in self.tg.edits if mid == frozen_id)
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._send_driver()
+        # The next job builds its own panel and never reaches back to this id.
+        self.assertEqual(sum(1 for mid, _ in self.tg.edits if mid == frozen_id),
+                         touched)
+        self.assertNotEqual(bot._PANEL.get(ME), frozen_id)
+
+    def test_clear_replaces_the_panel_in_place_rather_than_leaving_a_hole(self):
+        """Deleting it left only the loose messages around it — the debris the
+        panel exists to prevent, and the state the user photographed and
+        reported as the panel never having appeared (2026-09-01)."""
+        self._send_driver()
+        first = bot._PANEL[ME]
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._CB_CLEAR_GO), allowed_user_id=ME)
+        self.assertNotIn(first, self.tg.deleted)
+        cleared = [t for mid, t in self.tg.edits if mid == first and "Cleared" in t]
+        self.assertEqual(len(cleared), 1, "the panel was not replaced in place")
+        self.assertNotIn(ME, bot._PANEL)
+
+    def test_clear_still_says_so_when_there_is_no_panel_to_replace(self):
+        bot._STATE[ME] = bot._job_for(ME)
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._CB_CLEAR_GO), allowed_user_id=ME)
+        self.assertIn("Cleared", self.tg.messages[-1])
+
+    def test_the_panel_id_survives_a_restart(self):
+        """motion-bot.service is Restart=always. A bot that came back without
+        the id would send a SECOND panel while the first sat above it with
+        live buttons — two keyboards for one job."""
+        self._send_driver()
+        saved = bot._PANEL[ME]
+        for holder in (bot._STATE, bot._PENDING, bot._PANEL, bot._PANEL_NOTE,
+                       bot._LOADED):
+            holder.clear()
+        self.assertIsNone(bot._load_draft(ME))
+        self.assertEqual(bot._PANEL[ME], saved)
+
+    def test_a_draft_written_before_the_panel_existed_still_loads(self):
+        """Forward compatibility, and the reason `panel` is read with .get().
+
+        A draft from yesterday's bot has no "panel" key. Refusing to load an
+        otherwise perfectly good job over a missing COSMETIC field would set it
+        aside as corrupt — the single outcome _load_draft exists to prevent.
+        """
+        self._send_driver()
+        path = bot._draft_path(ME)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        for key in ("panel", "note", "last_seen"):
+            payload.pop(key, None)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        for holder in (bot._STATE, bot._PENDING, bot._PANEL, bot._LOADED):
+            holder.clear()
+        self.assertIsNone(bot._load_draft(ME), "an older draft was set aside")
+        self.assertIn("driver", bot._STATE[ME].slots)
+
+    def test_the_slot_question_stacks_its_buttons_and_marks_what_is_filled(self):
+        """Three buttons on one row have their labels truncated on a phone,
+        and an unmarked role gives no warning that tapping it overwrites."""
+        probe_fn = self._probe_for({
+            self.character_path.name: self.image_probe,
+            self.outfit_path.name: self.image_probe,
+        })
+        with mock.patch("tgbot.bot.probe", side_effect=probe_fn):
+            bot.handle(self.tg, doc_from(ME, "character-id"), allowed_user_id=ME)
+            bot.handle(self.tg, cmd_from(ME, "character"), allowed_user_id=ME)
+            bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME)
+        rows = [b for b in self.tg.buttons if b
+                and any(d.startswith(bot._CB_SLOT) for row in b for _, d in row)][-1]
+        self.assertTrue(all(len(row) <= 2 for row in rows), rows)
+        labels = {d: label for row in rows for label, d in row}
+        self.assertIn(bot.ICON_OK, labels[bot._CB_SLOT + "character"])
+        self.assertNotIn(bot.ICON_OK, labels[bot._CB_SLOT + "outfit"])
+
+    def test_the_slot_question_hints_that_a_checked_role_can_be_replaced(self):
+        # A checkmark alone doesn't say what tapping it does — the fix for
+        # "didn't tell me how to change outfit" (2026-09-02).
+        probe_fn = self._probe_for({
+            self.character_path.name: self.image_probe,
+            self.outfit_path.name: self.image_probe,
+        })
+        with mock.patch("tgbot.bot.probe", side_effect=probe_fn):
+            bot.handle(self.tg, doc_from(ME, "character-id"), allowed_user_id=ME)
+            first_ask = self.tg.messages[-1]
+            bot.handle(self.tg, cmd_from(ME, "character"), allowed_user_id=ME)
+            bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME)
+        self.assertNotIn("already set", first_ask)
+        self.assertIn("already set", self.tg.messages[-1])
+
+    def test_successive_ticks_actually_move_the_progress_message(self):
+        """Otherwise the 2s poll is 25x the API calls for no visible change.
+
+        Every edit would be swallowed as "message is not modified", and the
+        cost of the fast cadence would buy nothing at all.
+        """
+        self._confirm_and_start()
+        with mock.patch("tgbot.bot.drain_running", return_value=True):
+            bot.tick_progress(self.tg, ME)
+            bot.tick_progress(self.tg, ME)
+        self.assertNotEqual(self.tg.edits[-2][1], self.tg.edits[-1][1])
+
+    def test_a_throttled_edit_pauses_the_animation_but_never_delivery(self):
+        """Telegram's own backoff is honoured, and it cannot hold up a result.
+
+        A cosmetic rate limit delaying the delivery of a finished render would
+        be the animation costing the user the thing they paid for.
+        """
+        from tgbot.tgclient import TgError
+        self._confirm_and_start()
+        self.tg.edit_raises = TgError("Too Many Requests", retry_after=42.0)
+        with mock.patch("tgbot.bot.drain_running", return_value=True):
+            bot.tick_progress(self.tg, ME)
+        self.assertGreater(bot._ANIM_PAUSE[ME], time.time() + 40)
+        # Still paused: a second tick must not argue with flood control.
+        edits = len(self.tg.edits)
+        with mock.patch("tgbot.bot.drain_running", return_value=True):
+            bot.tick_progress(self.tg, ME)
+        self.assertEqual(len(self.tg.edits), edits)
+        # But the finished job is delivered regardless of the pause.
+        self.tg.edit_raises = None
+        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.deliver_result") as deliver:
+            bot.tick_progress(self.tg, ME)
+        deliver.assert_called_once()
+
+    def test_a_deleted_progress_message_is_rebuilt_with_its_new_id(self):
+        self._confirm_and_start()
+        before = json.loads(bot._progress_path(ME).read_text())["message_id"]
+        self.tg.edit_ok = False
+        with mock.patch("tgbot.bot.drain_running", return_value=True):
+            bot.tick_progress(self.tg, ME)
+        after = json.loads(bot._progress_path(ME).read_text())["message_id"]
+        self.assertNotEqual(after, before)
+
+    def test_a_video_fills_the_driver_slot_without_asking(self):
+        with mock.patch("tgbot.bot.probe", return_value=self.driver_probe):
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+        self.assertIn("driver", panel_text(self.tg))
+        self.assertNotIn("which", panel_text(self.tg).lower())
+        self.assertEqual(bot._STATE[ME].slots.get("driver"), self.staged("driver.mp4"))
+
+    def test_an_image_is_asked_about_and_the_answer_fills_the_slot(self):
+        with mock.patch("tgbot.bot.probe", return_value=self.image_probe):
+            bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME)
+        self.assertIn("which", self.tg.messages[-1].lower())
+        self.assertNotIn("outfit", bot._STATE[ME].slots)
+
+        bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME)
+        self.assertEqual(bot._STATE[ME].slots.get("outfit"), self.staged("outfit.jpg"))
+        self.assertIn("outfit", panel_text(self.tg))
+
+    def test_an_unrecognised_slot_answer_is_re_asked_not_guessed(self):
+        with mock.patch("tgbot.bot.probe", return_value=self.image_probe):
+            bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME)
+        bot.handle(self.tg, cmd_from(ME, "banana"), allowed_user_id=ME)
+        self.assertNotIn("outfit", bot._STATE[ME].slots)
+        self.assertNotIn("character", bot._STATE[ME].slots)
+        self.assertEqual(len(bot._PENDING[ME]), 1)   # still parked, never guessed
+        last = self.tg.messages[-1].lower()
+        self.assertIn("didn't recognise", last)
+        self.assertIn("outfit", last)          # re-asks with the same options, not silence
+
+    def test_the_manifest_is_shown_before_anything_is_confirmed(self):
+        with mock.patch("tgbot.bot.start_drain") as start_drain:
+            self._fill_required_slots()
+            start_drain.assert_not_called()
+        # `screen`, not `messages`: the panel is sent once and edited after.
+        joined = "\n".join(self.tg.screen)
+        # Asserts the REVIEW CONTENT, not the YAML syntax it used to be echoed
+        # in (changed 2026-08-31 with _manifest_summary). The rule this guards
+        # is "nothing may spend $0.99/hour without the exact inputs it spent on
+        # being in the transcript", so what has to be present is the pipeline,
+        # every role, and the file name in each — not the word "runs:".
+        self.assertIn("tryon-motion-enhance", joined)
+        for role, name in (("character", "character.jpg"), ("outfit", "outfit.jpg"),
+                           ("driver", "driver.mp4")):
+            self.assertIn(role, joined)
+            self.assertIn(name, joined)
+        self.assertIn("$0.99/hour", joined)
+        # And the Run button, since that is now the offered way to spend.
+        self.assertIn(bot._CB_RUN_ASK, self.tg.callback_data())
+
+    def test_the_slot_question_offers_a_button_per_role(self):
+        with mock.patch("tgbot.bot.probe", return_value=self.image_probe):
+            bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME)
+        offered = self.tg.callback_data()
+        for role in bot._askable_roles(bot._job_for(ME).pipeline):
+            self.assertIn(bot._CB_SLOT + role, offered)
+
+    def test_tapping_a_slot_button_fills_the_slot_like_typing_does(self):
+        # _answer_slot is the single body both paths run; this pins that the
+        # button path actually reaches it, including finding I7's overwrite
+        # handling inside _fill_slot.
+        with mock.patch("tgbot.bot.probe", return_value=self.image_probe):
+            bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME)
+        bot.handle(self.tg, cb_from(ME, bot._CB_SLOT + "character"),
+                   allowed_user_id=ME)
+        # The file sent was outfit.jpg and the button tapped was `character`,
+        # and the slot holds outfit.jpg: the label is the user's answer, never
+        # inferred from the filename. That is job.slot_for's refusal to guess,
+        # and the button path must not quietly reintroduce a name heuristic.
+        self.assertEqual(bot._STATE[ME].slots["character"],
+                         self.staged("outfit.jpg"))
+        self.assertNotIn(ME, bot._PENDING)
+        # Acknowledged, or the client spins on the button forever.
+        self.assertEqual(self.tg.answered, ["cb1"])
+
+    def test_a_slot_button_tapped_with_nothing_queued_says_so(self):
+        # Telegram keeps old keyboards tappable forever, with no expiry and no
+        # way to make one single-use, so this arrives in normal use.
+        bot.handle(self.tg, cb_from(ME, bot._CB_SLOT + "character"),
+                   allowed_user_id=ME)
+        self.assertIn("no file is waiting", self.tg.messages[-1])
+        self.assertEqual(self.tg.answered, ["cb1"])
+
+    def test_the_run_button_needs_a_second_tap_before_it_spends(self):
+        with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value=None), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value={}):
+            self._fill_required_slots()
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
+            start_drain.assert_not_called()     # first tap only asks
+            self.assertIn("$0.99/hour", self.tg.messages[-1])
+            token = bot._run_token(ME)
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_GO + token),
+                       allowed_user_id=ME)
+            start_drain.assert_called_once()
+            self.assertIs(start_drain.call_args.kwargs["dry_run"], False)
+
+    # ---- [Run]'s GPU-stock check (added 2026-09-02) -----------------------
+
+    def _stock_5090_low_4090_ok(self):
+        return {
+            "NVIDIA GeForce RTX 5090": [
+                Stock(gpu_id="NVIDIA GeForce RTX 5090",
+                                   display_name="RTX 5090", price_per_hr=0.99,
+                                   datacenter_id="EU-RO-1", stock_status="Low"),
+            ],
+            "NVIDIA GeForce RTX 4090": [
+                Stock(gpu_id="NVIDIA GeForce RTX 4090",
+                                   display_name="RTX 4090", price_per_hr=0.74,
+                                   datacenter_id="EU-RO-1", stock_status="Medium"),
+            ],
+            "NVIDIA RTX PRO 4500 Blackwell": [
+                Stock(gpu_id="NVIDIA RTX PRO 4500 Blackwell",
+                                   display_name="RTX PRO 4500", price_per_hr=0.72,
+                                   datacenter_id="EU-RO-1", stock_status="Low"),
+            ],
+        }
+
+    def test_the_picker_lists_every_gpu_and_offers_every_alternative(self):
+        # 2026-09-02: widened from "only offer a switch when Low/none" to
+        # always showing every known GPU, so a switch button is offered for
+        # EVERY alternative regardless of its own stock — the user chooses,
+        # informed by the status shown next to each, rather than the bot
+        # deciding an alternative isn't good enough to offer.
+        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached",
+                       return_value=self._stock_5090_low_4090_ok()):
+            self._fill_required_slots()
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
+        text = self.tg.messages[-1]
+        self.assertIn("Low", text)
+        self.assertIn("EU-RO-1", text)
+        offered = self.tg.buttons[-1]
+        flat_data = [data for row in offered for _, data in row]
+        self.assertIn(bot._CB_RUN_SWITCH + "4090", flat_data)
+        # PRO 4500 is ALSO Low at home — still offered, just labelled as Low.
+        self.assertIn(bot._CB_RUN_SWITCH + "pro4500", flat_data)
+        self.assertTrue(any(d.startswith(bot._CB_RUN_GO) for d in flat_data))
+        self.assertIn(bot._CB_RUN_NO, flat_data)
+
+    def test_the_5090_being_out_at_home_still_surfaces_other_regions(self):
+        # "nếu 5090 hết thì sao không tìm các region khác nữa" (2026-09-02):
+        # the picker used to only ever compare stock AT the home datacenter,
+        # so a 5090 that is out there but fine elsewhere said nothing about
+        # it — even though /gpu already knew how to show exactly this.
+        stock = {
+            "NVIDIA GeForce RTX 5090": [
+                Stock(gpu_id="NVIDIA GeForce RTX 5090", display_name="RTX 5090",
+                     price_per_hr=0.99, datacenter_id="EU-RO-1", stock_status="none"),
+                Stock(gpu_id="NVIDIA GeForce RTX 5090", display_name="RTX 5090",
+                     price_per_hr=0.99, datacenter_id="EU-CZ-1", stock_status="High"),
+            ],
+            "NVIDIA GeForce RTX 4090": [
+                Stock(gpu_id="NVIDIA GeForce RTX 4090", display_name="RTX 4090",
+                     price_per_hr=0.74, datacenter_id="EU-RO-1", stock_status="Medium"),
+            ],
+            "NVIDIA RTX PRO 4500 Blackwell": [
+                Stock(gpu_id="NVIDIA RTX PRO 4500 Blackwell", display_name="RTX PRO 4500",
+                     price_per_hr=0.72, datacenter_id="EU-RO-1", stock_status="Medium"),
+            ],
+        }
+        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=stock):
+            self._fill_required_slots()
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
+        text = self.tg.messages[-1]
+        self.assertIn("Other regions", text)
+        self.assertIn("EU-CZ-1", text)
+        # ONE duration everywhere (2026-09-02): this screen, the destructive
+        # confirm and docs/gpu-pod.md used to disagree with each other.
+        self.assertIn(bot.MIGRATE_DURATION_SHORT, text)
+        self.assertIn("15-25", text)
+        # Still a same-datacenter switch to 4090/PRO 4500 too — the other-
+        # region note is additive, not a replacement for the local options.
+        flat_data = [data for row in self.tg.buttons[-1] for _, data in row]
+        self.assertIn(bot._CB_RUN_SWITCH + "4090", flat_data)
+
+    def test_other_regions_offer_a_migrate_button(self):
+        stock = {
+            "NVIDIA GeForce RTX 5090": [
+                Stock(gpu_id="NVIDIA GeForce RTX 5090", display_name="RTX 5090",
+                     price_per_hr=0.99, datacenter_id="EU-RO-1", stock_status="none"),
+                Stock(gpu_id="NVIDIA GeForce RTX 5090", display_name="RTX 5090",
+                     price_per_hr=0.99, datacenter_id="EU-CZ-1", stock_status="High"),
+            ],
+            "NVIDIA GeForce RTX 4090": [
+                Stock(gpu_id="NVIDIA GeForce RTX 4090", display_name="RTX 4090",
+                     price_per_hr=0.74, datacenter_id="EU-RO-1", stock_status="Medium"),
+            ],
+            "NVIDIA RTX PRO 4500 Blackwell": [
+                Stock(gpu_id="NVIDIA RTX PRO 4500 Blackwell", display_name="RTX PRO 4500",
+                     price_per_hr=0.72, datacenter_id="EU-RO-1", stock_status="Medium"),
+            ],
+        }
+        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=stock), \
+             mock.patch("tgbot.bot.migration_running", return_value=False):
+            self._fill_required_slots()
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
+        flat_data = [data for row in self.tg.buttons[-1] for _, data in row]
+        self.assertIn(bot._CB_MIGRATE_ASK + "EU-CZ-1", flat_data)
+
+    def test_a_gpu_missing_from_gpu_short_still_gets_a_migrate_button(self):
+        # The migrate button used to be minted only when _GPU_SHORT had an
+        # entry for the GPU, because the callback payload carried a short
+        # code that _ask_migrate then decoded and never used. A migration
+        # depends on the DATACENTER alone, so a card this repo has not
+        # tabulated must not silently cost the user the button.
+        unknown = "NVIDIA H200 NVL"
+        stock = {
+            "NVIDIA GeForce RTX 5090": [
+                Stock(gpu_id="NVIDIA GeForce RTX 5090", display_name="RTX 5090",
+                     price_per_hr=0.99, datacenter_id="EU-RO-1", stock_status="none"),
+            ],
+            "NVIDIA GeForce RTX 4090": [],
+            "NVIDIA RTX PRO 4500 Blackwell": [],
+        }
+        with mock.patch("tgbot.bot._FALLBACK_GPU_IDS", (unknown,)), \
+             mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value={
+                 "NVIDIA GeForce RTX 5090": stock["NVIDIA GeForce RTX 5090"],
+                 unknown: [Stock(gpu_id=unknown, display_name="H200 NVL",
+                                 price_per_hr=3.99, datacenter_id="EU-CZ-1",
+                                 stock_status="High")],
+             }), \
+             mock.patch("tgbot.bot.migration_running", return_value=False):
+            self._fill_required_slots()
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
+        self.assertNotIn(unknown, bot._GPU_SHORT)
+        flat_data = [data for row in self.tg.buttons[-1] for _, data in row]
+        self.assertIn(bot._CB_MIGRATE_ASK + "EU-CZ-1", flat_data)
+
+    def test_tapping_migrate_ask_shows_the_destructive_confirm(self):
+        with mock.patch("tgbot.bot.migration_running", return_value=False):
+            bot.handle(self.tg,
+                      cb_from(ME, bot._CB_MIGRATE_ASK + "EU-CZ-1"),
+                      allowed_user_id=ME)
+        text = self.tg.messages[-1]
+        self.assertIn("cannot be undone", text.lower())
+        self.assertIn("EU-CZ-1", text)
+        self.assertIn("15-25", text)
+        flat_data = [data for row in self.tg.buttons[-1] for _, data in row]
+        self.assertIn(bot._CB_MIGRATE_GO + "EU-CZ-1", flat_data)
+        self.assertIn(bot._CB_MIGRATE_NO, flat_data)
+
+    def test_migrate_go_launches_the_script_exactly_once(self):
+        with mock.patch("tgbot.bot.subprocess.Popen") as mock_popen, \
+             mock.patch("tgbot.bot.migration_running", return_value=False):
+            bot.handle(self.tg,
+                      cb_from(ME, bot._CB_MIGRATE_GO + "EU-CZ-1"),
+                      allowed_user_id=ME)
+        mock_popen.assert_called_once()
+        argv = mock_popen.call_args.args[0]
+        self.assertIn("scripts/volume_migrate.py", argv)
+        self.assertIn("EU-CZ-1", argv)
+        self.assertIn("--yes", argv)
+        self.assertIn("15-25", self.tg.messages[-1])
+
+    def test_the_migration_subprocess_writes_to_a_log_file_not_the_bots_stdout(self):
+        # I3. start_drain (tgbot/run.py) redirects for two reasons — a failed
+        # run has to be debuggable afterwards, and a long-running child must
+        # not deadlock on an unread pipe. Neither reason is weaker here.
+        with mock.patch("tgbot.bot.subprocess.Popen") as mock_popen, \
+             mock.patch("tgbot.bot.migration_running", return_value=False):
+            bot.handle(self.tg,
+                      cb_from(ME, bot._CB_MIGRATE_GO + "EU-CZ-1"),
+                      allowed_user_id=ME)
+        kwargs = mock_popen.call_args.kwargs
+        self.assertIsNotNone(kwargs.get("stdout"))
+        self.assertEqual(kwargs.get("stderr"), subprocess.STDOUT)
+        self.assertEqual(Path(kwargs["stdout"].name), bot._migrate_log_path())
+        self.assertTrue(bot._migrate_log_path().exists())
+
+    def test_a_second_migrate_attempt_while_one_runs_is_refused(self):
+        with mock.patch("tgbot.bot.migration_running", return_value=True):
+            bot.handle(self.tg,
+                      cb_from(ME, bot._CB_MIGRATE_ASK + "EU-CZ-1"),
+                      allowed_user_id=ME)
+        self.assertIn("already", self.tg.messages[-1].lower())
+
+    # ---- the launch-window race (I9) --------------------------------------
+
+    def test_a_second_tap_before_the_lease_exists_is_refused(self):
+        # THE race this marker exists for. volume_migrate.py writes its lease
+        # only after create_volume + two REST pod creates, so between Popen
+        # and that write `migration_running()` saw no lease and would happily
+        # launch a second migration — whose lease write then overwrites the
+        # first's, orphaning two pods AND a destination volume that nothing
+        # in this repo ever reconciles.
+        alive = mock.Mock()
+        alive.poll.return_value = None
+        with mock.patch("tgbot.bot.subprocess.Popen", return_value=alive) as popen:
+            bot.handle(self.tg, cb_from(ME, bot._CB_MIGRATE_GO + "EU-CZ-1"),
+                       allowed_user_id=ME)
+            # No lease on disk yet — exactly the window.
+            self.assertFalse(bot._migrate_lease_path().exists())
+            bot.handle(self.tg, cb_from(ME, bot._CB_MIGRATE_GO + "EU-CZ-1"),
+                       allowed_user_id=ME)
+        popen.assert_called_once()
+        self.assertIn("already", self.tg.messages[-1].lower())
+
+    def test_the_migrate_button_disappears_during_the_launch_window(self):
+        alive = mock.Mock()
+        alive.poll.return_value = None
+        with mock.patch("tgbot.bot.subprocess.Popen", return_value=alive):
+            bot.handle(self.tg, cb_from(ME, bot._CB_MIGRATE_GO + "EU-CZ-1"),
+                       allowed_user_id=ME)
+        self.assertTrue(bot.migration_running())
+
+    def test_a_failed_launch_removes_the_marker_rather_than_locking_it_out(self):
+        with mock.patch("tgbot.bot.subprocess.Popen",
+                        side_effect=OSError("no python3")):
+            bot.handle(self.tg, cb_from(ME, bot._CB_MIGRATE_GO + "EU-CZ-1"),
+                       allowed_user_id=ME)
+        self.assertFalse(bot._migrate_launch_marker().exists())
+        self.assertFalse(bot.migration_running())
+
+    def test_a_finished_migration_stops_blocking_the_next_one(self):
+        finished = mock.Mock()
+        finished.poll.return_value = 0
+        with mock.patch("tgbot.bot.subprocess.Popen", return_value=finished):
+            bot.handle(self.tg, cb_from(ME, bot._CB_MIGRATE_GO + "EU-CZ-1"),
+                       allowed_user_id=ME)
+        self.assertFalse(bot.migration_running())
+        self.assertFalse(bot._migrate_launch_marker().exists())
+
+    def test_a_marker_left_by_a_restarted_bot_expires_instead_of_sticking(self):
+        # motion-bot.service is Restart=always, so the process that wrote the
+        # marker is often not the one that reads it, and _MIGRATE_PROC is
+        # empty again. Nothing can poll that child, so the clock is the only
+        # bound — a marker that outlived its window must not refuse migrations
+        # forever.
+        marker = bot._migrate_launch_marker()
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        stale = time.time() - bot._MIGRATE_LAUNCH_GRACE_SEC - 1
+        marker.write_text(json.dumps({"at": stale, "to_dc": "EU-CZ-1"}),
+                          encoding="utf-8")
+        self.assertFalse(bot.migration_running())
+        self.assertFalse(marker.exists())
+
+    def test_a_fresh_marker_from_a_restarted_bot_still_blocks(self):
+        marker = bot._migrate_launch_marker()
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({"at": time.time(), "to_dc": "EU-CZ-1"}),
+                          encoding="utf-8")
+        self.assertTrue(bot.migration_running())
+
+    def test_an_unreadable_marker_is_dropped_rather_than_jamming_the_gate(self):
+        marker = bot._migrate_launch_marker()
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("{ not json", encoding="utf-8")
+        self.assertFalse(bot.migration_running())
+        self.assertFalse(marker.exists())
+
+    def test_the_lease_alone_still_reports_a_running_migration(self):
+        write_migrate_lease(bot._migrate_lease_path(), MigrateLease(
+            pod_a_id="tmp-a", pod_b_id="tmp-b", started_at=time.time(),
+            to_dc="EU-CZ-1"))
+        self.assertTrue(bot.migration_running())
+
+    def test_confirm_is_refused_while_a_migration_is_in_flight(self):
+        with mock.patch("tgbot.bot.migration_running", return_value=True):
+            self._fill_required_slots()
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+        self.assertIn("migrat", self.tg.messages[-1].lower())
+
+    # ---- migration progress ticks (Task 9) --------------------------------
+
+    def test_every_migration_state_file_resolves_under_the_same_root(self):
+        # I6. _MIGRATE_PROGRESS_PATH was a module constant bound at import
+        # time from the REAL repo root, while _migrate_progress_message_path
+        # resolved ROOT at call time — so this class's own tests below read
+        # and DELETED the live repo's batch/volume-migrate.progress.json while
+        # writing the message id into a tempdir. Any divergence here means a
+        # test is touching real migration state, so assert every one of them
+        # lands under the tempdir this test class installed.
+        paths = [bot._migrate_progress_path(),
+                 bot._migrate_progress_message_path(ME),
+                 bot._migrate_lease_path(),
+                 bot._migrate_launch_marker(),
+                 bot._migrate_log_path()]
+        for path in paths:
+            self.assertTrue(path.is_relative_to(self.root),
+                            f"{path} escapes bot.ROOT ({self.root})")
+
+    def test_tick_migration_progress_edits_one_message_across_phases(self):
+        prog_path = bot._migrate_progress_path()
+        prog_path.parent.mkdir(parents=True, exist_ok=True)
+        prog_path.write_text(json.dumps({"phase": "sync", "at": 0.0}), encoding="utf-8")
+        bot.tick_migration_progress(self.tg, ME)
+        self.assertTrue(bot._migrate_progress_message_path(ME).exists())
+        first_message_id = json.loads(
+            bot._migrate_progress_message_path(ME).read_text())["message_id"]
+
+        prog_path.write_text(json.dumps({"phase": "verify", "at": 1.0}), encoding="utf-8")
+        bot.tick_migration_progress(self.tg, ME)
+        second_message_id = json.loads(
+            bot._migrate_progress_message_path(ME).read_text())["message_id"]
+        self.assertEqual(first_message_id, second_message_id)   # edited, not re-sent
+
+    def test_tick_migration_progress_delivers_a_final_message_on_done(self):
+        prog_path = bot._migrate_progress_path()
+        prog_path.parent.mkdir(parents=True, exist_ok=True)
+        prog_path.write_text(json.dumps({"phase": "sync", "at": 0.0}), encoding="utf-8")
+        bot.tick_migration_progress(self.tg, ME)
+
+        prog_path.write_text(json.dumps({"phase": "done", "at": 1.0}), encoding="utf-8")
+        bot.tick_migration_progress(self.tg, ME)
+        # The final state is an EDIT of the same tracked message, not a new
+        # send — `messages` alone would miss it, same reason `screen` exists:
+        # "Every text that reached the chat, sent or edited, in order."
+        self.assertIn("done", self.tg.screen[-1].lower())
+        self.assertFalse(prog_path.exists())   # consumed, like the drain progress file
+        self.assertFalse(bot._migrate_progress_message_path(ME).exists())
+
+    def test_tick_migration_progress_reports_a_failed_phase(self):
+        prog_path = bot._migrate_progress_path()
+        prog_path.parent.mkdir(parents=True, exist_ok=True)
+        prog_path.write_text(json.dumps(
+            {"phase": "failed", "at": 0.0, "reason": "2 file(s) still differ"}),
+            encoding="utf-8")
+        bot.tick_migration_progress(self.tg, ME)
+        self.assertIn("2 file(s) still differ", self.tg.messages[-1])
+
+    def test_a_tick_with_no_migration_in_progress_does_nothing(self):
+        bot.tick_migration_progress(self.tg, ME)
+        self.assertEqual(self.tg.messages, [])
+
+    def test_an_unreadable_migration_progress_file_is_dropped_and_logged(self):
+        prog_path = bot._migrate_progress_path()
+        prog_path.parent.mkdir(parents=True, exist_ok=True)
+        prog_path.write_text("{ not json", encoding="utf-8")
+        with mock.patch.object(bot, "log") as logged:
+            bot.tick_migration_progress(self.tg, ME)
+        self.assertFalse(prog_path.exists())
+        self.assertTrue(logged.called)
+
+    def test_tapping_switch_writes_env_and_shows_the_new_price(self):
+        (self.root / ".env").write_text(
+            "GPU=NVIDIA GeForce RTX 5090\nPOD_VOLUME_ID=vol-1\n", encoding="utf-8")
+        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached",
+                       return_value=self._stock_5090_low_4090_ok()):
+            self._fill_required_slots()
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_SWITCH + "4090"),
+                      allowed_user_id=ME)
+        self.assertEqual(env_get(self.root / ".env", "GPU"),
+                         "NVIDIA GeForce RTX 4090")
+        # The re-offer is still the full picker — 4090 now the one labelled
+        # "Current:", and its price is what the Yes button quotes.
+        self.assertIn("Current:", self.tg.messages[-1])
+        self.assertIn("RTX 4090", self.tg.messages[-1].split("Current:")[1].splitlines()[0])
+        self.assertIn("Yes, spend $0.74/h",
+                      [label for row in self.tg.buttons[-1] for label, _ in row])
+
+    def test_rent_anyway_still_starts_the_drain_at_the_original_price(self):
+        with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached",
+                       return_value=self._stock_5090_low_4090_ok()):
+            self._fill_required_slots()
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
+            token = bot._run_token(ME)
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_GO + token),
+                       allowed_user_id=ME)
+        start_drain.assert_called_once()
+
+    def test_nothing_offered_at_home_mentions_the_other_region(self):
+        # Every GPU exists only at a DIFFERENT datacenter — none has an
+        # entry at the home one at all, so there is no in-datacenter GPU-TYPE
+        # switch to offer. The only route there is a volume migration, which
+        # since Task 8 does have a button (behind its own destructive
+        # confirm) — so this asserts the ABSENCE of a _CB_RUN_SWITCH, not the
+        # absence of every button.
+        elsewhere_only = {
+            gpu: [Stock(gpu_id=gpu, display_name=gpu, price_per_hr=0.5,
+                       datacenter_id="EU-CZ-1", stock_status="High")]
+            for gpu in (bot._PRIMARY_GPU_ID, *bot._FALLBACK_GPU_IDS)
+        }
+        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=elsewhere_only):
+            self._fill_required_slots()
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
+        text = self.tg.messages[-1]
+        self.assertIn("EU-CZ-1", text)
+        self.assertIn(bot.MIGRATE_DURATION_SHORT, text)
+        self.assertIn("not offered at EU-RO-1", text)
+        flat_data = [data for row in self.tg.buttons[-1] for _, data in row]
+        self.assertFalse(any(d.startswith(bot._CB_RUN_SWITCH) for d in flat_data))
+
+    def test_a_stock_check_failure_fails_open_to_the_plain_confirm(self):
+        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", side_effect=RuntimeError("boom")):
+            self._fill_required_slots()
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
+        self.assertIn("$0.99/hour", self.tg.messages[-1])
+
+    def test_a_run_button_from_a_changed_job_cannot_spend(self):
+        """The stale-keyboard guard, and the reason _run_token exists.
+
+        Telegram never expires an inline keyboard. Without the token, a Run
+        button offered for one manifest stays live after the job changes, and
+        tapping it would rent a $0.99/hour GPU for inputs the user never
+        reviewed.
+        """
+        with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+            stale = bot._CB_RUN_GO + "1"       # never this manifest's mtime_ns
+            bot.handle(self.tg, cb_from(ME, stale), allowed_user_id=ME)
+            start_drain.assert_not_called()
+        self.assertIn("changed since that button was sent", self.tg.messages[-1])
+
+    def test_cancelling_spends_nothing(self):
+        with mock.patch("tgbot.bot.start_drain") as start_drain:
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_NO), allowed_user_id=ME)
+            start_drain.assert_not_called()
+        self.assertIn("cancelled", self.tg.messages[-1])
+
+    def test_an_unknown_callback_is_answered_not_ignored(self):
+        bot.handle(self.tg, cb_from(ME, "nonsense:42"), allowed_user_id=ME)
+        self.assertIn("older version", self.tg.messages[-1])
+        self.assertEqual(self.tg.answered, ["cb1"])
+
+    def test_every_command_in_the_menu_actually_answers(self):
+        """Drift guard for BOT_COMMANDS, in the spirit of make check-job-types.
+
+        setMyCommands publishes these names to Telegram, so they appear as
+        tappable suggestions. One that no branch handles falls through to the
+        text handlers, matches nothing, and answers NOTHING — the same silence
+        that NON_FILE_MEDIA was added to fix, except advertised by the bot
+        itself.
+        """
+        for name, _desc in bot.BOT_COMMANDS:
+            with self.subTest(command=name):
+                tg = FakeTg()
+                bot.handle(tg, cmd_from(ME, f"/{name}"), allowed_user_id=ME)
+                self.assertTrue(tg.messages, f"/{name} answered nothing")
+
+    # ---- /job, re-label, /clear, /again (added 2026-08-31) ---------------
+
+    def test_job_with_nothing_assembled_says_so(self):
+        bot.handle(self.tg, cmd_from(ME, "/job"), allowed_user_id=ME)
+        self.assertIn("Nothing assembled yet", self.tg.messages[-1])
+
+    def test_job_names_what_is_filled_and_what_is_missing(self):
+        # The gap this closes: on 2026-08-31 a slot label went missing and the
+        # only way to find out what the bot held was a screenshot of the chat.
+        with mock.patch("tgbot.bot.probe", return_value=self.driver_probe):
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+        bot.handle(self.tg, cmd_from(ME, "/job"), allowed_user_id=ME)
+        body = self.tg.messages[-1]
+        # Every role of the pipeline appears, filled or not: listing only what
+        # is present hides the empty required slot, which is the single thing
+        # the user most needs to see.
+        self.assertIn(f"{bot.ICON_OK} {bot.ROLE_ICON['driver']} driver", body)
+        for role in ("character", "outfit"):
+            self.assertIn(f"{bot.ICON_EMPTY} {bot.ROLE_ICON[role]} {role}", body)
+        # An optional slot is marked as such, so an empty one is not mistaken
+        # for something still owed.
+        self.assertIn("background — optional", body)
+        # The filename lives in the collapsed detail block, not the headline.
+        self.assertIn("driver.mp4", body)
+        self.assertEqual(self.tg.parse_modes[-1], bot.PARSE_HTML)
+
+    def test_job_lists_files_still_waiting_for_a_label(self):
+        with mock.patch("tgbot.bot.probe", return_value=self.image_probe):
+            bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME)
+        bot.handle(self.tg, cmd_from(ME, "/job"), allowed_user_id=ME)
+        self.assertIn("waiting for a label", self.tg.messages[-1])
+        self.assertIn("outfit.jpg", self.tg.messages[-1])
+
+    def test_job_offers_a_relabel_button_per_filled_slot(self):
+        with mock.patch("tgbot.bot.probe", return_value=self.driver_probe):
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+        self.tg.buttons.clear()
+        bot.handle(self.tg, cmd_from(ME, "/job"), allowed_user_id=ME)
+        offered = self.tg.callback_data()
+        self.assertIn(bot._CB_REDO + "driver", offered)
+        self.assertIn(bot._CB_CLEAR_ASK, offered)
+
+    def test_relabelling_moves_a_file_back_to_the_queue_and_re_asks(self):
+        with mock.patch("tgbot.bot.probe", return_value=self.image_probe):
+            bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME)
+        bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME)
+        self.assertIn("outfit", bot._STATE[ME].slots)
+        bot.handle(self.tg, cb_from(ME, bot._CB_REDO + "outfit"), allowed_user_id=ME)
+        self.assertNotIn("outfit", bot._STATE[ME].slots)
+        self.assertEqual(len(bot._PENDING[ME]), 1)
+        self.assertIn("Which slot is this?", self.tg.messages[-1])
+        # And it may be answered straight into a different role.
+        bot.handle(self.tg, cb_from(ME, bot._CB_SLOT + "character"), allowed_user_id=ME)
+        self.assertEqual(bot._STATE[ME].slots["character"],
+                         self.staged("outfit.jpg"))
+
+    def test_relabelling_invalidates_the_cached_validation(self):
+        # _LAST_VALIDATE is what /confirm trusts; the job just changed.
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+        self.assertTrue(bot._LAST_VALIDATE.get(ME))
+        bot.handle(self.tg, cb_from(ME, bot._CB_REDO + "outfit"), allowed_user_id=ME)
+        self.assertNotIn(ME, bot._LAST_VALIDATE)
+
+    def test_relabelling_a_video_explains_instead_of_re_asking(self):
+        # slot_for gives a video to `driver` structurally, so the question
+        # would have exactly one answer.
+        with mock.patch("tgbot.bot.probe", return_value=self.driver_probe):
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+        bot.handle(self.tg, cb_from(ME, bot._CB_REDO + "driver"), allowed_user_id=ME)
+        self.assertIn("only be the driver", self.tg.messages[-1])
+        self.assertIn("driver", bot._STATE[ME].slots)   # unchanged
+
+    def test_relabelling_an_empty_slot_says_so(self):
+        bot.handle(self.tg, cb_from(ME, bot._CB_REDO + "outfit"), allowed_user_id=ME)
+        self.assertIn("nothing is in outfit", self.tg.messages[-1])
+
+    def test_clear_asks_before_deleting_anything(self):
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+        bot.handle(self.tg, cmd_from(ME, "/clear"), allowed_user_id=ME)
+        self.assertIn("Delete this job", self.tg.messages[-1])
+        self.assertIn(bot._CB_CLEAR_GO, self.tg.callback_data())
+        self.assertIn(ME, bot._STATE)                   # nothing gone yet
+        self.assertTrue(self.staged("driver.mp4").exists())
+
+    def test_confirming_clear_deletes_the_staged_files_and_the_draft(self):
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._CB_CLEAR_GO), allowed_user_id=ME)
+        self.assertNotIn(ME, bot._STATE)
+        self.assertFalse(self.staged("driver.mp4").exists())
+        self.assertFalse(bot._draft_path(ME).exists())
+        # `screen`, not `messages`: the confirmation now REPLACES the panel
+        # rather than being posted underneath it.
+        self.assertTrue(any("Cleared" in t for t in self.tg.screen),
+                        "nothing in the chat said the job was cleared")
+
+    def test_clear_is_refused_while_a_drain_is_running(self):
+        """The staged files ARE the running job's inputs.
+
+        The manifest points straight at batch/tg-staging/<chat>/, so deleting
+        them mid-drain breaks a run already being paid for at $0.99/hour.
+        """
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+        with mock.patch("tgbot.bot.drain_running", return_value=True):
+            bot.handle(self.tg, cb_from(ME, bot._CB_CLEAR_GO), allowed_user_id=ME)
+        self.assertIn("a drain is running", self.tg.messages[-1])
+        self.assertTrue(self.staged("driver.mp4").exists())
+        self.assertIn(ME, bot._STATE)
+
+    def test_clear_with_nothing_to_clear_does_not_ask(self):
+        bot.handle(self.tg, cmd_from(ME, "/clear"), allowed_user_id=ME)
+        self.assertIn("nothing to clear", self.tg.messages[-1])
+
+    def test_wipe_asks_before_deleting_anything(self):
+        bot.handle(self.tg, cmd_from(ME, "/wipe"), allowed_user_id=ME)
+        self.assertIn("Delete all", self.tg.messages[-1])
+        self.assertIn(bot._CB_WIPE_GO, self.tg.callback_data())
+
+    def test_confirming_wipe_deletes_every_tracked_message_and_the_job(self):
+        # _track_sends is what main() applies once in production; applied
+        # here so the ledger actually fills, the same way a real chat's does.
+        self.tg = bot._track_sends(self.tg)
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._CB_WIPE_GO), allowed_user_id=ME)
+        self.assertNotIn(ME, bot._STATE)
+        self.assertFalse(self.staged("driver.mp4").exists())
+        # Not empty: the report itself is a real, trackable message — sent,
+        # and only then recorded, after the sweep already ran — so it is the
+        # ledger's sole entry going into the chat's next /wipe.
+        self.assertEqual(len(bot._ledger_for(ME)), 1)
+        self.assertTrue(self.tg.deleted, "nothing was actually deleted")
+        self.assertIn("Wiped", self.tg.messages[-1])
+
+    def test_wipe_reports_messages_telegram_refuses_to_delete(self):
+        # Telegram will not delete anything older than 48h — that has to be
+        # named, not folded into a "Wiped." that overstates what happened.
+        self.tg = bot._track_sends(self.tg)
+        bot.handle(self.tg, cmd_from(ME, "/start"), allowed_user_id=ME)
+        old_id = bot._ledger_for(ME)[0]
+        self.tg.delete_fails.add(old_id)
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._CB_WIPE_GO), allowed_user_id=ME)
+        self.assertIn("couldn't be removed", self.tg.messages[-1])
+        self.assertNotIn(old_id, self.tg.deleted)
+
+    def test_wipe_is_refused_while_a_drain_is_running(self):
+        # Same reasoning as /clear's guard, for both halves at once: the
+        # staged files are the running job's inputs, and its progress
+        # message is the only thing telling the user it is still going.
+        self.tg = bot._track_sends(self.tg)
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+        with mock.patch("tgbot.bot.drain_running", return_value=True):
+            bot.handle(self.tg, cb_from(ME, bot._CB_WIPE_GO), allowed_user_id=ME)
+        self.assertIn("a drain is running", self.tg.messages[-1])
+        self.assertTrue(self.staged("driver.mp4").exists())
+        self.assertIn(ME, bot._STATE)
+        self.assertTrue(bot._ledger_for(ME),
+                        "the ledger was cleared despite the refusal")
+
+    def test_tracking_also_covers_documents_and_albums(self):
+        # A delivered result (send_document) and a preview album
+        # (send_media_group) are the two message shapes that are neither
+        # plain text nor a single photo — /wipe used to leave exactly those
+        # behind (2026-09-02).
+        self.tg = bot._track_sends(self.tg)
+        doc_id = self.tg.send_document(ME, self.driver_path, caption="result.mp4")
+        self.assertIn(doc_id, bot._ledger_for(ME))
+        album_ids = self.tg.send_media_group(
+            ME, [(self.driver_path, "a"), (self.character_path, "b")])
+        self.assertEqual(len(album_ids), 2)
+        for message_id in album_ids:
+            self.assertIn(message_id, bot._ledger_for(ME))
+
+    def test_the_ledger_survives_a_restart(self):
+        # motion-bot.service is Restart=always — the same reason drafts and
+        # the panel id are persisted, not kept in memory alone.
+        self.tg = bot._track_sends(self.tg)
+        bot.handle(self.tg, cmd_from(ME, "/start"), allowed_user_id=ME)
+        saved = list(bot._ledger_for(ME))
+        for holder in (bot._LEDGER, bot._LEDGER_LOADED):
+            holder.clear()
+        self.assertEqual(bot._ledger_for(ME), saved)
+
+    def test_confirm_records_the_job_so_again_can_reuse_it(self):
+        with mock.patch("tgbot.bot.start_drain"), \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+        self.assertNotIn(ME, bot._STATE)                # submitted, cleared
+        self.assertFalse(bot._draft_path(ME).exists())  # cannot be resurrected
+        self.assertTrue(bot._last_path(ME).exists())    # but is repeatable
+
+    def test_again_rebuilds_the_last_job_from_the_same_files(self):
+        with mock.patch("tgbot.bot.start_drain"), \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+            bot.handle(self.tg, cmd_from(ME, "/again"), allowed_user_id=ME)
+        self.assertEqual(sorted(bot._STATE[ME].slots),
+                         ["character", "driver", "outfit"])
+        # And the probes come back, or the manifest's preset and the estimate
+        # would both be wrong.
+        self.assertEqual(bot._STATE[ME].probes["driver"], self.driver_probe)
+
+    def test_again_refuses_to_overwrite_a_job_in_progress(self):
+        with mock.patch("tgbot.bot.start_drain"), \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+        with mock.patch("tgbot.bot.probe", return_value=self.driver_probe):
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+        bot.handle(self.tg, cmd_from(ME, "/again"), allowed_user_id=ME)
+        self.assertIn("job in progress", self.tg.messages[-1])
+
+    def test_again_names_the_files_that_have_gone_missing(self):
+        # `make batch-clean` and /clear both remove staged files, so a recorded
+        # job can outlive its inputs. "some files are missing" is not
+        # actionable; the role and the filename are.
+        with mock.patch("tgbot.bot.start_drain"), \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+        self.staged("driver.mp4").unlink()
+        bot.handle(self.tg, cmd_from(ME, "/again"), allowed_user_id=ME)
+        self.assertIn("no longer on disk", self.tg.messages[-1])
+        self.assertIn("driver.mp4", self.tg.messages[-1])
+        self.assertNotIn(ME, bot._STATE)
+
+    def test_again_with_nothing_recorded_says_so(self):
+        bot.handle(self.tg, cmd_from(ME, "/again"), allowed_user_id=ME)
+        self.assertIn("nothing to repeat", self.tg.messages[-1])
+
+    def test_a_low_bitrate_driver_is_flagged_on_arrival_and_at_the_gate(self):
+        """The gap spec section 4.3 left open: it measured but never judged.
+
+        On 2026-08-31 a driver arrived at 865 kbps for 1080x1920 — 15x below
+        the file it stood in for — and the bot printed the number and accepted
+        it in silence. Sent as a File, so Telegram had not touched it: the rule
+        guarantees the channel did no damage, not that the bytes were good.
+        """
+        weak = Probe(kind="video", width=1080, height=1920, duration_s=15.0,
+                     bitrate_kbps=865, size_bytes=1_622_500)
+        with mock.patch("tgbot.bot.probe", return_value=weak):
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+        self.assertIn("low bitrate", panel_text(self.tg))
+        # And again once the job is complete: the panel is one message, so the
+        # warning has to still be on it at the moment the money decision is
+        # made — it cannot rely on an earlier message still being in view.
+        with mock.patch("tgbot.bot.probe", return_value=self.image_probe), \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, doc_from(ME, "character-id"), allowed_user_id=ME)
+            bot.handle(self.tg, cmd_from(ME, "character"), allowed_user_id=ME)
+            bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME)
+            bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME)
+        self.assertIn("low bitrate", panel_text(self.tg))
+        self.assertIn("$0.99/hour", panel_text(self.tg))
+
+    def test_a_normal_driver_is_not_flagged(self):
+        # The threshold has to leave real material alone: s1.mp4, the lowest
+        # legitimate driver in the 64-file survey, measures 1397 kbps/Mpx.
+        with mock.patch("tgbot.bot.probe", return_value=self.driver_probe):
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+        self.assertNotIn("low bitrate", self.tg.messages[-1])
+
+
+    def test_a_filename_with_a_bracket_cannot_break_the_message(self):
+        """_esc is the guard, and this is why it is applied to everything.
+
+        A `<` reaching Telegram inside parse_mode=HTML makes it reject the
+        WHOLE sendMessage, so the user gets nothing. _safe_name already strips
+        brackets from staged names, so this is defence in depth rather than a
+        live hole — and the point is that it stays defended when _safe_name
+        changes.
+        """
+        job = bot._job_for(ME)
+        job.slots["character"] = Path("we<ird>.png")
+        job.probes["character"] = self.image_probe
+        self.assertNotIn("<ird", bot._panel_text(ME, job))
+        # FakeTg._check_markup would have failed the send; assert the escape
+        # directly too, so the reason is visible when this breaks.
+        self.assertIn("&lt;ird&gt;", bot._details_block(ME, job))
+
+    def test_uploading_a_file_shows_a_spinner_before_the_slow_part(self):
+        # ffprobe on a 25MB video plus the staging copy takes long enough that
+        # a silent bot reads as a stuck one. Replaced send_chat_action
+        # (2026-09-02): Telegram stops showing that indicator after ~5s and
+        # nothing here ever refreshed it.
+        with mock.patch("tgbot.bot.probe", return_value=self.driver_probe):
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+        self.assertIn(f"{bot._SPIN_FRAMES[0]} checking", self.tg.messages[0])
+        # And it does not linger once the real reply is ready: something got
+        # deleted, and it was not the panel that is still on screen.
+        self.assertNotIn(bot._SPIN_FRAMES[0], panel_text(self.tg))
+        self.assertTrue(self.tg.deleted, "the spinner message was never removed")
+        self.assertNotIn(bot._PANEL[ME], self.tg.deleted)
+
+    def test_a_rejected_file_still_removes_the_spinner(self):
+        # The spinner covers the whole try, including the failure paths — a
+        # rejected file must not leave "checking..." sitting on screen
+        # forever next to the refusal (2026-09-02).
+        with mock.patch("tgbot.bot.probe",
+                        side_effect=RuntimeError("ffprobe is not installed")):
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+        self.assertIn("not accepted", self.tg.messages[-1])
+        self.assertTrue(self.tg.deleted, "the spinner message was never removed")
+
+    def test_validating_shows_a_chat_action(self):
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+        self.assertIn("typing", self.tg.actions)
+
+    def test_the_review_screen_shows_a_warning_outside_the_collapsed_block(self):
+        # On /job the detail is one tap away; here it must not be. This is the
+        # last thing read before $0.99/hour is committed, and anything needing
+        # a tap to reveal is something that gets skipped.
+        weak = Probe(kind="video", width=1080, height=1920, duration_s=15.0,
+                     bitrate_kbps=865, size_bytes=1_622_500)
+        with mock.patch("tgbot.bot.probe", return_value=weak):
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+        with mock.patch("tgbot.bot.probe", return_value=self.image_probe), \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, doc_from(ME, "character-id"), allowed_user_id=ME)
+            bot.handle(self.tg, cmd_from(ME, "character"), allowed_user_id=ME)
+            bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME)
+            bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME)
+        review = panel_text(self.tg)
+        before_block = review.split("<blockquote")[0]
+        # The glance form is a ratio, not the words "low bitrate" — those stay
+        # in the plain sentence inside the collapsed block.
+        self.assertIn("x below", before_block)
+        self.assertIn(bot.ICON_WARN, before_block)
+
+    def test_the_fix_buttons_are_one_icon_row(self):
+        """Four named buttons two per row cost half the keyboard.
+
+        The panel's keyboard has to stay a fixed height as the batch grows, and
+        the icons are the ones already printed beside each role name a few
+        lines above, so the mapping is on screen.
+        """
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+        rows = bot._fix_buttons(bot._STATE[ME])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0][1], bot._CB_PIPE_ASK)
+        for label, data in rows[0][1:]:
+            self.assertTrue(data.startswith(bot._CB_REDO))
+            self.assertNotIn(data[len(bot._CB_REDO):], label,
+                             "the role name is still spelled out")
+
+    def test_the_pipeline_can_be_picked_per_job_from_the_panel(self):
+        """Each run carries its own pipeline in the manifest, so a batch can mix
+        them — the repo's own A/B method is the same material through two
+        flows. Open a job with its square, tap ⚙️, pick."""
+        self._add_second_job()
+        first = bot._BASKET[ME][0]
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._CB_JOB_EDIT + bot._job_digest(first)),
+                       allowed_user_id=ME)
+            bot.handle(self.tg, cb_from(ME, bot._CB_PIPE_ASK), allowed_user_id=ME)
+            self.assertIn(bot._CB_PIPE + "tryon-character-swap-enhance",
+                          self.tg.callback_data())
+            bot.handle(self.tg, cb_from(ME, bot._CB_PIPE + "tryon-character-swap-enhance"),
+                       allowed_user_id=ME)
+        pipelines = sorted(job.pipeline for job in bot._jobs_for(ME))
+        self.assertEqual(pipelines, ["tryon-character-swap-enhance",
+                                     "tryon-motion-enhance"])
+
+    def test_a_mixed_batch_writes_each_pipeline_into_its_own_run(self):
+        import yaml
+        self._add_second_job()
+        first = bot._BASKET[ME][0]
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._CB_JOB_EDIT + bot._job_digest(first)),
+                       allowed_user_id=ME)
+            bot.handle(self.tg, cb_from(ME, bot._CB_PIPE + "tryon-character-swap-enhance"),
+                       allowed_user_id=ME)
+        with mock.patch("tgbot.bot.start_drain"), \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+        data = yaml.safe_load(bot._job_manifest_path(ME).read_text(encoding="utf-8"))
+        self.assertEqual(sorted(r["pipeline"] for r in data["runs"]),
+                         ["tryon-character-swap-enhance", "tryon-motion-enhance"])
+
+    def test_the_keyboard_does_not_grow_with_the_batch(self):
+        """Measured before the change: six jobs came to nine rows and
+        seventeen buttons — "menu dài hơn nữa à, làm vậy không được quá dài"."""
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+        job = bot._STATE[ME]
+        bot._LAST_VALIDATE[ME] = True
+        heights = []
+        for extra in range(8):
+            bot._BASKET[ME] = [bot._copy_job(job) for _ in range(extra)]
+            for index, other in enumerate(bot._BASKET[ME]):
+                other.slots["outfit"] = Path(f"/s/o{index}.png")
+            heights.append(len(bot._panel_buttons(ME, job)))
+        self.assertLessEqual(max(heights), 4, f"keyboard heights: {heights}")
+
+
+    # ---- the completion poll (added 2026-08-31) --------------------------
+
+    def _confirm_and_start(self):
+        with mock.patch("tgbot.bot.start_drain"), \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+
+    # ---- the batch (spec section 5's basket, built 2026-09-01) -------------
+    #
+    # "chúng ta đang muốn chạy theo batch tạo 1 lượt nhiều video ... tận dụng
+    # tối đa thời gian thuê gpu tránh chờ gpu khởi động tốn thời gian chờ và
+    # tiền trong lúc chờ nữa". Provisioning is paid once per drain, not once
+    # per job.
+
+    def _add_second_job(self):
+        """Complete one job, add it, then swap the outfit for a real second."""
+        self._fill_required_slots()
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._CB_ADD), allowed_user_id=ME)
+            other = self.root / "outfit2.jpg"
+            other.write_bytes(b"o2")
+            self.tg.file_paths["outfit2-id"] = str(other)
+            with mock.patch("tgbot.bot.probe", return_value=self.image_probe):
+                bot.handle(self.tg, doc_from(ME, "outfit2-id"), allowed_user_id=ME)
+                bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME)
+
+    def test_add_keeps_every_slot_so_only_one_thing_need_change(self):
+        """The user's answer when asked what varies between runs: "không cố
+        định — giữ hết, tôi tự thay"."""
+        self._fill_required_slots()
+        before = dict(bot._STATE[ME].slots)
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._CB_ADD), allowed_user_id=ME)
+        self.assertEqual(len(bot._BASKET[ME]), 1)
+        self.assertEqual(bot._STATE[ME].slots, before)
+        self.assertEqual(bot._STATE[ME].pipeline, bot._BASKET[ME][0].pipeline)
+
+    def test_the_basket_entry_is_detached_from_the_job_still_being_edited(self):
+        """Job holds plain dicts. Appending the live object would let a later
+        edit silently rewrite an entry already committed to the batch."""
+        self._fill_required_slots()
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._CB_ADD), allowed_user_id=ME)
+        bot._STATE[ME].slots["outfit"] = Path("/somewhere/else.png")
+        self.assertNotEqual(bot._BASKET[ME][0].slots["outfit"],
+                            Path("/somewhere/else.png"))
+
+    def test_an_unchanged_duplicate_is_not_queued_twice(self):
+        """Straight after Add the job on screen IS the entry just added.
+        Running both would render one video twice and bill for both."""
+        self._fill_required_slots()
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._CB_ADD), allowed_user_id=ME)
+        self.assertEqual(len(bot._jobs_for(ME)), 1)
+        # And it says so rather than quietly dropping it.
+        self.assertIn("same as an entry above", panel_text(self.tg))
+
+    def test_adding_the_same_job_twice_is_refused(self):
+        self._fill_required_slots()
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._CB_ADD), allowed_user_id=ME)
+            bot.handle(self.tg, cb_from(ME, bot._CB_ADD), allowed_user_id=ME)
+        self.assertEqual(len(bot._BASKET[ME]), 1)
+        self.assertIn("already in the batch", self.tg.messages[-1])
+
+    def test_changing_one_file_makes_it_a_real_second_job(self):
+        self._add_second_job()
+        self.assertEqual(len(bot._jobs_for(ME)), 2)
+
+    def test_confirm_submits_every_job_in_one_manifest(self):
+        """The whole point: one pod, N runs, provisioning paid once."""
+        import yaml
+        self._add_second_job()
+        with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+            start_drain.assert_called_once()
+        data = yaml.safe_load(bot._job_manifest_path(ME).read_text(encoding="utf-8"))
+        self.assertEqual(len(data["runs"]), 2)
+        self.assertNotEqual(data["runs"][0]["inputs"]["outfit"],
+                            data["runs"][1]["inputs"]["outfit"])
+        self.assertNotIn(ME, bot._BASKET)
+
+    def test_the_progress_stage_list_is_the_union_across_pipelines(self):
+        """A batch may mix pipelines. Counting against one of them would give
+        the wrong denominator for every run of the other."""
+        self._fill_required_slots()
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._CB_ADD), allowed_user_id=ME)
+            bot.handle(self.tg, cmd_from(ME, "/pipeline tryon-character-swap-enhance"),
+                       allowed_user_id=ME)
+        with mock.patch("tgbot.bot.start_drain"), \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+        stages = json.loads(bot._progress_path(ME).read_text())["stages"]
+        for stage in ("tryon", "motion", "enhance", "character-swap"):
+            self.assertIn(stage, stages)
+
+    def test_the_basket_survives_a_restart(self):
+        self._add_second_job()
+        for holder in (bot._STATE, bot._PENDING, bot._BASKET, bot._PANEL,
+                       bot._LOADED):
+            holder.clear()
+        self.assertIsNone(bot._load_draft(ME))
+        self.assertEqual(len(bot._BASKET[ME]), 1)
+        self.assertEqual(len(bot._jobs_for(ME)), 2)
+
+    def test_clear_empties_the_batch_too(self):
+        """/clear deletes the staged files every queued job points at."""
+        self._add_second_job()
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._CB_CLEAR_GO), allowed_user_id=ME)
+        self.assertNotIn(ME, bot._BASKET)
+        self.assertEqual(bot._jobs_for(ME), [])
+
+    def test_again_restores_the_whole_batch_not_just_the_last_run(self):
+        self._add_second_job()
+        with mock.patch("tgbot.bot.start_drain"), \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+            bot.handle(self.tg, cmd_from(ME, "/again"), allowed_user_id=ME)
+        self.assertEqual(len(bot._jobs_for(ME)), 2)
+
+    def test_the_estimate_covers_every_queued_job(self):
+        self._fill_required_slots()
+        one = bot._panel_next_line(ME, bot._STATE[ME])
+        self._add_second_job()
+        two = bot._panel_next_line(ME, bot._STATE[ME])
+        self.assertIn("2 job(s)", two)
+        self.assertNotEqual(one, two, "the estimate did not grow with the batch")
+
+    def test_tryon_finds_every_run_not_a_hardcoded_one(self):
+        """Manifests used to have exactly one run called "job", so the id was a
+        constant here. A batch names each run after its material, and a /tryon
+        still looking for `runs/job/` would answer "no try-on image found" for
+        every batch the bot now produces."""
+        batch = self.root / "out" / "2026-09-01-1200"
+        for run_id in ("c1-o4-m1", "c1-o8-m1"):
+            (batch / "runs" / run_id).mkdir(parents=True)
+            (batch / "runs" / run_id / "01-tryon.png").write_bytes(b"p")
+        bot.handle(self.tg, cmd_from(ME, "/tryon 2026-09-01-1200"), allowed_user_id=ME)
+        sent = [c for _, c in self.tg.documents]
+        self.assertEqual(len(sent), 2)
+        self.assertTrue(any("c1-o4-m1" in c for c in sent))
+        self.assertTrue(any("c1-o8-m1" in c for c in sent))
+
+    def test_a_big_batch_lists_its_runs_instead_of_sending_all_of_them(self):
+        batch = self.root / "out" / "2026-09-01-1300"
+        for i in range(bot.TRYON_MAX_SENT + 1):
+            (batch / "runs" / f"run{i}").mkdir(parents=True)
+            (batch / "runs" / f"run{i}" / "01-tryon.png").write_bytes(b"p")
+        bot.handle(self.tg, cmd_from(ME, "/tryon 2026-09-01-1300"), allowed_user_id=ME)
+        self.assertEqual(self.tg.documents, [])
+        self.assertIn("name one", self.tg.messages[-1])
+
+    def test_one_run_can_be_asked_for_by_name(self):
+        batch = self.root / "out" / "2026-09-01-1400"
+        for run_id in ("c1-o4-m1", "c1-o8-m1"):
+            (batch / "runs" / run_id).mkdir(parents=True)
+            (batch / "runs" / run_id / "01-tryon.png").write_bytes(b"p")
+        bot.handle(self.tg, cmd_from(ME, "/tryon 2026-09-01-1400/c1-o8-m1"),
+                   allowed_user_id=ME)
+        self.assertEqual(len(self.tg.documents), 1)
+        self.assertIn("c1-o8-m1", self.tg.documents[0][1])
+
+    def test_a_run_name_cannot_escape_the_batch_directory(self):
+        batch = self.root / "out" / "2026-09-01-1500"
+        (batch / "runs" / "ok").mkdir(parents=True)
+        (batch / "runs" / "ok" / "01-tryon.png").write_bytes(b"p")
+        bot.handle(self.tg, cmd_from(ME, "/tryon 2026-09-01-1500/../../.."),
+                   allowed_user_id=ME)
+        self.assertEqual(self.tg.documents, [])
+
+    def test_a_video_slot_shows_its_duration_on_the_panel(self):
+        """Not diagnostic — an input to the decision.
+
+        Duration picks the preset (ingest.suggest_preset), the preset sets how
+        much work the pod does, and that is what $0.99/hour buys. A 30-second
+        driver where a 15-second one was meant is the difference the estimate
+        on the same screen is computed from, and it used to be one tap away.
+        """
+        with mock.patch("tgbot.bot.probe", return_value=self.driver_probe):
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+        line = bot._role_line("driver", bot._STATE[ME])
+        self.assertIn("5.0s", line)
+        self.assertIn("1080×1920", line)
+
+    def test_an_image_slot_shows_no_duration(self):
+        """Every image has duration 0.0; printing it would be noise on three
+        lines out of four."""
+        self.assertNotIn("s ·", bot._compact(self.image_probe))
+        self.assertNotIn("0.0s", bot._compact(self.image_probe))
+
+    def test_every_sheet_row_has_a_matching_square_in_the_panel(self):
+        """Nothing can be written onto the sheet, so colour is the whole legend.
+
+        The bar down the left of row 2 has to be the square printed beside
+        entry 2 in the text. If the picture grows a row the list does not, the
+        mapping breaks silently — and it is the mapping that lets someone say
+        "job 3 is wrong" before spending.
+        """
+        self._add_second_job()
+        text = panel_text(self.tg)
+        rows = len(bot._jobs_for(ME))
+        self.assertEqual(rows, 2)
+        for index in range(rows):
+            self.assertIn(bot._row_mark(index), text,
+                          f"row {index + 1} has no square in the panel")
+        self.assertNotIn(bot._row_mark(rows), text, "one square too many")
+
+    def test_the_squares_and_the_bars_are_the_same_sequence(self):
+        from tgbot import preview
+        self.assertGreaterEqual(len(bot.ROW_MARK), len(preview.ROW_ACCENTS))
+        # Both cycle, so a seventh job reuses the first colour in both places
+        # rather than one wrapping while the other runs off the end.
+        self.assertEqual(bot._row_mark(len(bot.ROW_MARK)), bot.ROW_MARK[0])
+
+    # ---- editing and removing one job of a batch --------------------------
+
+    def _digest_of_first(self):
+        return bot._job_digest(bot._BASKET[ME][0])
+
+    def test_a_job_can_be_taken_out_of_the_batch(self):
+        """Before this the only way to drop one wrong job was /clear, which
+        threw away the whole batch and every staged file with it."""
+        self._add_second_job()
+        digest = self._digest_of_first()
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._CB_JOB_DROP + digest),
+                       allowed_user_id=ME)
+        self.assertEqual(len(bot._jobs_for(ME)), 1)
+        self.assertIsNone(bot._find_in_batch(ME, digest))
+
+    def test_removing_a_job_keeps_the_files_the_others_still_use(self):
+        """Material is shared across a batch by design — the character appears
+        in every run. Deleting one run must not take it from the rest."""
+        self._add_second_job()
+        character = bot._STATE[ME].slots["character"]
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._CB_JOB_DROP + self._digest_of_first()),
+                       allowed_user_id=ME)
+        self.assertTrue(character.is_file())
+
+    def test_a_job_can_be_pulled_back_out_for_editing_and_stays_queued(self):
+        """`_jobs_for` is the basket PLUS the job being edited, so the moment
+        it leaves the basket it is already counted again — there is no "add it
+        back" step to forget."""
+        self._add_second_job()
+        first = bot._BASKET[ME][0]
+        before = len(bot._jobs_for(ME))
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._job_digest(first)
+                                        and bot._CB_JOB_EDIT + bot._job_digest(first)),
+                       allowed_user_id=ME)
+        self.assertEqual(len(bot._jobs_for(ME)), before, "the batch changed size")
+        self.assertEqual(bot._signature(bot._STATE[ME]), bot._signature(first))
+
+    def test_editing_a_slot_of_a_pulled_job_changes_only_that_job(self):
+        self._add_second_job()
+        first = bot._BASKET[ME][0]
+        other_signature = bot._signature(bot._BASKET[ME][-1]) if len(bot._BASKET[ME]) > 1 \
+            else bot._signature(bot._STATE[ME])
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._CB_JOB_EDIT + bot._job_digest(first)),
+                       allowed_user_id=ME)
+            third = self.root / "outfit3.jpg"
+            third.write_bytes(b"o3")
+            self.tg.file_paths["outfit3-id"] = str(third)
+            with mock.patch("tgbot.bot.probe", return_value=self.image_probe):
+                bot.handle(self.tg, doc_from(ME, "outfit3-id"), allowed_user_id=ME)
+                bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME)
+        self.assertEqual(bot._STATE[ME].slots["outfit"], self.staged("outfit3.jpg"))
+        self.assertIn(other_signature,
+                      [bot._signature(j) for j in bot._jobs_for(ME)],
+                      "the other job was changed too")
+        self.assertEqual(len(bot._jobs_for(ME)), 2)
+
+    def test_editing_refuses_while_a_half_built_job_is_open(self):
+        """A half-built job is work already done and nothing else recovers it."""
+        self._add_second_job()
+        first = bot._BASKET[ME][0]
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._CB_JOB_EDIT + bot._job_digest(first)),
+                       allowed_user_id=ME)
+            bot.handle(self.tg, cb_from(ME, bot._CB_REDO + "outfit"), allowed_user_id=ME)
+            second = bot._BASKET[ME][0]
+            bot.handle(self.tg, cb_from(ME, bot._CB_JOB_EDIT + bot._job_digest(second)),
+                       allowed_user_id=ME)
+        self.assertIn("finish or /clear", self.tg.messages[-1])
+
+    def test_a_stale_batch_button_names_itself_rather_than_hitting_the_wrong_job(self):
+        """Telegram never expires an inline keyboard, so a panel from before
+        the batch changed is still tappable. An index would delete whatever is
+        second NOW; a digest simply fails to match."""
+        self._add_second_job()
+        digest = self._digest_of_first()
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._CB_JOB_DROP + digest), allowed_user_id=ME)
+            remaining = len(bot._jobs_for(ME))
+            bot.handle(self.tg, cb_from(ME, bot._CB_JOB_DROP + digest), allowed_user_id=ME)
+        self.assertEqual(len(bot._jobs_for(ME)), remaining, "a stale tap hit a job")
+        self.assertIn("no longer in the batch", self.tg.messages[-1])
+
+    def test_every_batch_entry_gets_a_square_and_the_open_one_is_marked(self):
+        """One row of squares whatever the batch size, and the squares in the
+        keyboard stay one-to-one with the bars down the picture."""
+        self._add_second_job()
+        offered = self.tg.callback_data()
+        self.assertIn(bot._CB_JOB_EDIT + self._digest_of_first(), offered)
+        # The job being edited is the last row of the sheet; it is marked
+        # rather than left out, or the squares and the bars would not match.
+        self.assertIn(bot._CB_JOB_OPEN, offered)
+        self.assertIn(bot._CB_JOB_HERE, offered)
+
+    def test_removing_the_open_job_opens_the_next_one(self):
+        """Something has to stay on screen, or the panel shows an empty job
+        while the batch still has entries — which reads as "everything gone"."""
+        self._add_second_job()
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, bot._CB_JOB_HERE), allowed_user_id=ME)
+        self.assertEqual(len(bot._jobs_for(ME)), 1)
+        self.assertIsNotNone(bot._STATE.get(ME))
+        from tgbot.job import missing_slots
+        self.assertFalse(missing_slots(bot._STATE[ME]))
+
+    def test_confirm_records_a_progress_message_to_keep_editing(self):
+        self._confirm_and_start()
+        self.assertTrue(bot._progress_path(ME).exists())
+        import json
+        payload = json.loads(bot._progress_path(ME).read_text())
+        # The stage list is captured HERE, from the pipeline, because the
+        # journal only records stages that have already begun — without a
+        # denominator the bar would read 1/1 at the first stage and never move.
+        self.assertEqual(payload["stages"], ["tryon", "motion", "enhance"])
+
+    def test_a_tick_edits_the_message_instead_of_sending_a_new_one(self):
+        """The whole point: one message, updated in place, never a stream.
+
+        A 5-minute throttle sat here briefly and was removed on the user's
+        instruction — an edit sends no notification and adds no message to the
+        chat, so there is nothing to be spammed by. Every poll re-edits.
+        """
+        self._confirm_and_start()
+        before = len(self.tg.messages)
+        edits_before = len(self.tg.edits)
+        with mock.patch("tgbot.bot.drain_running", return_value=True):
+            bot.tick_progress(self.tg, ME)
+            bot.tick_progress(self.tg, ME)
+        self.assertEqual(len(self.tg.messages), before)   # nothing new sent
+        # Sliced from `edits_before`: confirming the job now freezes the panel,
+        # which is itself an edit, so a count over the whole list would be
+        # asserting about the panel rather than about the progress message.
+        ticked = self.tg.edits[edits_before:]
+        self.assertEqual(len(ticked), 2)
+        self.assertEqual(len({mid for mid, _ in ticked}), 1)  # the same one
+        self.assertTrue(bot._progress_path(ME).exists())
+
+    def test_when_the_drain_ends_the_result_is_delivered_unasked(self):
+        """The gap deliver_result's own docstring described.
+
+        It said: "nothing in this bot polls a drain to completion and fires a
+        callback when it finishes ... This is the reachable close-the-loop hook
+        until a completion poll exists." Until now the user had to remember to
+        type /result, with nothing telling them the job had finished — or
+        failed.
+        """
+        self._confirm_and_start()
+        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.deliver_result") as deliver:
+            bot.tick_progress(self.tg, ME)
+            deliver.assert_called_once()
+        # And the tracking file is gone, so it cannot deliver twice.
+        self.assertFalse(bot._progress_path(ME).exists())
+
+    def test_a_finished_drain_is_never_delivered_twice(self):
+        self._confirm_and_start()
+        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.deliver_result") as deliver:
+            bot.tick_progress(self.tg, ME)
+            bot.tick_progress(self.tg, ME)
+            self.assertEqual(deliver.call_count, 1)
+
+    def test_the_progress_file_is_dropped_if_delivery_raises(self):
+        # Removed BEFORE delivery on purpose: a raising deliver_result must not
+        # leave a file that re-delivers everything on the next tick, every 50
+        # seconds, for as long as the bot runs.
+        self._confirm_and_start()
+        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.deliver_result", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                bot.tick_progress(self.tg, ME)
+        self.assertFalse(bot._progress_path(ME).exists())
+
+    def test_a_tick_with_no_drain_tracked_does_nothing(self):
+        bot.tick_progress(self.tg, ME)
+        self.assertEqual(self.tg.edits, [])
+
+    def test_an_unreadable_progress_file_is_dropped_and_logged(self):
+        bot._progress_path(ME).write_text("{ not json", encoding="utf-8")
+        with mock.patch.object(bot, "log") as logged:
+            bot.tick_progress(self.tg, ME)
+        self.assertFalse(bot._progress_path(ME).exists())
+        self.assertTrue(logged.called)
+
+    def test_a_successful_handoff_delivers_the_old_job_and_tracks_the_new_one(self):
+        """2026-09-02: drain.py's chain_or_teardown only ever writes a
+        "running" handoff once the link this progress message was tracking
+        has already finished — so closing THAT out (edit + deliver) has to
+        happen before switching over, exactly like an ordinary finish."""
+        self._confirm_and_start()
+        live = bot._job_manifest_path(ME)
+        old_message_id = json.loads(bot._progress_path(ME).read_text())["message_id"]
+        picked_up = live.with_name("tg-99999-111.yaml")
+        picked_up.write_text(live.read_text(encoding="utf-8"), encoding="utf-8")
+        write_handoff(handoff_path(live), Handoff(status="running", manifest=str(picked_up)))
+        with mock.patch("tgbot.bot.deliver_result") as deliver:
+            bot.tick_progress(self.tg, ME)
+        deliver.assert_called_once_with(self.tg, ME, live)
+        self.assertIn("automatically continuing", "\n".join(self.tg.messages))
+        payload = json.loads(bot._progress_path(ME).read_text())
+        self.assertEqual(Path(payload["manifest"]), picked_up)
+        self.assertNotEqual(payload["message_id"], old_message_id)
+
+    def test_a_failed_handoff_still_delivers_the_finished_job_and_says_why(self):
+        self._confirm_and_start()
+        live = bot._job_manifest_path(ME)
+        picked_up = live.with_name("tg-99999-111.yaml")
+        picked_up.write_text(live.read_text(encoding="utf-8"), encoding="utf-8")
+        write_handoff(handoff_path(live),
+                     Handoff(status="failed", manifest=str(picked_up),
+                             reason="batch_run exited 1"))
+        with mock.patch("tgbot.bot.deliver_result") as deliver:
+            bot.tick_progress(self.tg, ME)
+        deliver.assert_called_once_with(self.tg, ME, live)
+        last = "\n".join(self.tg.messages)
+        self.assertIn("could not start", last)
+        self.assertIn("batch_run exited 1", last)
+        self.assertIn("/again", last)
+        # No new progress message was started for the failed pickup — the
+        # pod was destroyed, nothing is running to report on.
+        self.assertFalse(bot._progress_path(ME).exists())
+
+    def test_a_starting_handoff_is_ignored_until_it_resolves(self):
+        # "starting" is the transient moment between claiming the mailbox and
+        # knowing whether it actually ran — switching on it would be a guess
+        # that has not resolved yet.
+        self._confirm_and_start()
+        live = bot._job_manifest_path(ME)
+        picked_up = live.with_name("tg-99999-111.yaml")
+        picked_up.write_text(live.read_text(encoding="utf-8"), encoding="utf-8")
+        write_handoff(handoff_path(live), Handoff(status="starting", manifest=str(picked_up)))
+        with mock.patch("tgbot.bot.drain_running", return_value=True), \
+             mock.patch("tgbot.bot.deliver_result") as deliver:
+            bot.tick_progress(self.tg, ME)
+        deliver.assert_not_called()
+        payload = json.loads(bot._progress_path(ME).read_text())
+        self.assertEqual(Path(payload["manifest"]), live)
+
+    def test_a_stale_handoff_from_a_previous_cycle_is_not_replayed(self):
+        """Found live 2026-09-02: tick_progress read the handoff file but
+        never deleted it, so a chat whose SECOND, unrelated job never queued
+        anything replayed the FIRST job's old "running" handoff and closed
+        the second job out immediately, on its very first tick."""
+        self._confirm_and_start()
+        live = bot._job_manifest_path(ME)
+        stale_picked_up = live.with_name("tg-99999-111.yaml")
+        stale_picked_up.write_text(live.read_text(encoding="utf-8"), encoding="utf-8")
+        write_handoff(handoff_path(live), Handoff(status="running", manifest=str(stale_picked_up)))
+        with mock.patch("tgbot.bot.deliver_result"):
+            bot.tick_progress(self.tg, ME)   # consumes the (here, legitimate) handoff
+        self.assertFalse(handoff_path(live).exists())
+
+        # A brand new, unrelated confirm for the same chat.
+        reset_bot_state()
+        bot._LAST_VALIDATE.clear()
+        self._confirm_and_start()
+        with mock.patch("tgbot.bot.drain_running", return_value=True), \
+             mock.patch("tgbot.bot.deliver_result") as deliver:
+            bot.tick_progress(self.tg, ME)
+        deliver.assert_not_called()   # must NOT replay the stale handoff
+
+    def test_confirm_calls_start_drain_once_with_dry_run_false(self):
+        # Renamed from "...and_nothing_else_does": with drain_running mocked
+        # to False, this test is identical with or without that guard — it
+        # does NOT pin the guard (see
+        # test_confirm_is_refused_while_a_drain_is_already_running for
+        # that). What this pins is the call itself: exactly once, with the
+        # right dry_run value, only reachable after /confirm.
+        with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+            start_drain.assert_not_called()
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+        start_drain.assert_called_once()
+        _, kwargs = start_drain.call_args
+        self.assertEqual(kwargs.get("dry_run"), False)
+
+    def test_two_ambiguous_images_sent_back_to_back_do_not_clobber_each_other(self):
+        """Regression (Task 7 fix round 1, Finding 1): Telegram delivers a
+        multi-file send as consecutive updates inside one get_updates()
+        batch, with no chance to answer between them — the natural way to
+        do the Goal line's "send four files". Pre-fix, `_PENDING_SLOT` held
+        a single Path, so parking a second ambiguous image before the first
+        was answered silently discarded the first: answering "character"
+        then assigned the SECOND file to it, and the answer meant for the
+        first file's real slot went nowhere (no pending entry left to
+        consume, and no error). This pins the fix: a queue, where only the
+        head is ever asked about and answers apply in arrival order.
+        """
+        with mock.patch("tgbot.bot.probe", return_value=self.image_probe):
+            bot.handle(self.tg, doc_from(ME, "character-id"), allowed_user_id=ME)
+            bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME)
+
+        bot.handle(self.tg, cmd_from(ME, "character"), allowed_user_id=ME)
+        bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME)
+
+        self.assertEqual(bot._STATE[ME].slots.get("character"), self.staged("character.jpg"))
+        self.assertEqual(bot._STATE[ME].slots.get("outfit"), self.staged("outfit.jpg"))
+
+    def test_confirm_is_refused_after_a_failed_validation(self):
+        """Regression (Task 7 fix round 1, Finding 2): _maybe_show_manifest
+        only skipped the confirm PROMPT on a failed `make batch-validate` —
+        /confirm's own guard never re-checked, so a user who ignored the
+        failure message and typed /confirm anyway reached start_drain on a
+        manifest already known to be invalid. Forcing the cached outcome to
+        False (as if the last render failed validation) must refuse."""
+        with mock.patch("tgbot.bot.start_drain") as start_drain:
+            self._fill_required_slots()
+            bot._LAST_VALIDATE[ME] = False
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+        start_drain.assert_not_called()
+
+    def test_confirm_while_a_drain_is_running_queues_instead_of_renting(self):
+        # 2026-09-02: a drain already running no longer refuses /confirm — it
+        # writes the job into the mailbox for drain.py's own chain_or_teardown
+        # to pick up on the pod already rented, instead of renting a second
+        # one. start_drain must still never be called for it.
+        with mock.patch("tgbot.bot.start_drain") as start_drain:
+            self._fill_required_slots()
+            with mock.patch("tgbot.bot.drain_running", return_value=True):
+                bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+        start_drain.assert_not_called()
+        self.assertIn("Queued", self.tg.messages[-1])
+        self.assertTrue(mailbox_path(bot._job_manifest_path(ME)).exists())
+
+    def test_confirm_without_a_complete_job_is_refused(self):
+        with mock.patch("tgbot.bot.start_drain") as start_drain:
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+        start_drain.assert_not_called()
+
+    def test_a_live_drain_routes_the_next_job_into_the_mailbox_not_the_live_file(self):
+        """Finding C1 (2026-08-31) was "the live manifest bytes must not move
+        while a drain owns it" — still true, and still the point of this
+        test. What changed 2026-09-02 is what happens to job B instead of
+        being refused outright: it goes into the mailbox
+        (batchlib_ext.handoff.mailbox_path), a different file the running
+        drain never reads, so it gets the same live validation/panel a normal
+        job would rather than a flat "wait" — see _active_manifest_path.
+        """
+        with mock.patch("tgbot.bot.start_drain"):
+            self._fill_required_slots()
+        manifest = bot._job_manifest_path(ME)
+        before = manifest.read_bytes()
+
+        # A visibly DIFFERENT second job, so "unchanged" cannot pass by
+        # coincidence: a 20-second driver renders a different comment line and
+        # a different preset from the 5-second one above.
+        reset_bot_state()
+        bot._LAST_VALIDATE.clear()
+        second_driver = self.root / "driver2.mp4"
+        second_driver.write_bytes(b"dd")
+        self.tg.file_paths["driver2-id"] = str(second_driver)
+        long_probe = Probe(kind="video", width=1080, height=1920, duration_s=20.0,
+                           bitrate_kbps=9000, size_bytes=9_000_000)
+        # Matched by prefix, not by exact name: staging never overwrites, so
+        # the second copy of character.jpg lands as character-1.jpg.
+        def probe_fn(path):
+            return long_probe if Path(path).name.startswith("driver2") else self.image_probe
+        with mock.patch("tgbot.bot.drain_running", return_value=True), \
+             mock.patch("tgbot.bot.probe", side_effect=probe_fn):
+            bot.handle(self.tg, doc_from(ME, "driver2-id"), allowed_user_id=ME)
+            bot.handle(self.tg, doc_from(ME, "character-id"), allowed_user_id=ME)
+            bot.handle(self.tg, cmd_from(ME, "character"), allowed_user_id=ME)
+            bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME)
+            bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME)
+
+        self.assertEqual(manifest.read_bytes(), before)
+        self.assertTrue(mailbox_path(manifest).exists())
+        self.assertIn("driver2.mp4", mailbox_path(manifest).read_text(encoding="utf-8"))
+
+    def test_staged_paths_replace_the_bot_api_path_that_carries_the_token(self):
+        """Findings C2 and I5: a local Bot API file path is
+        /var/lib/telegram-bot-api/<TOKEN>/documents/file_5.mp4 — the token is
+        a directory component. That path used to go into Job.slots, then into
+        the manifest, then back over Telegram verbatim.
+        """
+        token_path = self.root / "telegram-bot-api" / "SECRETTOKEN" / "documents"
+        token_path.mkdir(parents=True)
+        arrival = token_path / "file_5.mp4"
+        arrival.write_bytes(b"d")
+        self.tg.file_paths["tok-id"] = str(arrival)
+
+        with mock.patch("tgbot.bot.probe", return_value=self.driver_probe):
+            bot.handle(self.tg, doc_from(ME, "tok-id", file_name="my driver:v1.mp4"),
+                       allowed_user_id=ME)
+
+        staged = bot._STATE[ME].slots["driver"]
+        self.assertEqual(staged.parent, self.root / "batch" / bot.STAGING_DIR_NAME / str(ME))
+        self.assertNotIn("SECRETTOKEN", str(staged))
+        self.assertNotIn("SECRETTOKEN", "\n".join(self.tg.messages))
+        # The user's own name survives, minus anything that would break the
+        # plain (unquoted) YAML scalar job.py emits — job.py is protected, so
+        # the quoting has to happen by never producing a name that needs it.
+        self.assertEqual(staged.name, "my_driver_v1.mp4")
+        self.assertTrue(staged.is_file())
+
+    def test_the_accepted_file_reply_carries_the_sha256_and_byte_count(self):
+        # Finding I4: /sha was removed by Task 7, which left the README's
+        # acceptance procedure unrunnable. A6 compares this digest against
+        # out/<batch>/_final/<run>.mp4.
+        import hashlib
+        with mock.patch("tgbot.bot.probe", return_value=self.driver_probe):
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+        # 12 hex chars, not 64 (shortened 2026-08-31): the full digest took two
+        # lines on a phone and pushed resolution/bitrate/size — the numbers
+        # that actually reveal recompression — off the top of the message.
+        # The panel, not messages[0] (2026-09-02): that slot is now the
+        # spinner's own ack, sent and deleted before the panel is drawn.
+        text = panel_text(self.tg)
+        self.assertIn(hashlib.sha256(b"d").hexdigest()[:12], text)
+        self.assertNotIn(hashlib.sha256(b"d").hexdigest(), text)
+        self.assertIn("1 bytes", text)
+
+    def test_a_failing_conversion_is_reported_not_swallowed(self):
+        """Finding I1: to_png_if_heic and getFile were outside the try, so
+        every message they raise escaped handle(), was swallowed by main()'s
+        `except Exception: log(...)`, and the user got nothing at all."""
+        with mock.patch("tgbot.bot.to_png_if_heic",
+                        side_effect=RuntimeError("ffmpeg is not installed")):
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+        self.assertIn("ffmpeg is not installed", self.tg.messages[-1])
+        self.assertNotIn(ME, bot._STATE)
+
+    def test_a_getfile_failure_is_reported_not_swallowed(self):
+        from tgbot.tgclient import TgError
+        with mock.patch.object(self.tg, "call", side_effect=TgError("getFile rejected")):
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+        self.assertIn("getFile rejected", self.tg.messages[-1])
+
+    def test_resending_a_video_says_it_is_replacing_the_driver(self):
+        # Finding I7: the second video silently replaced the first.
+        with mock.patch("tgbot.bot.probe", return_value=self.driver_probe):
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+        self.assertIn("replaced the previous driver", panel_text(self.tg))
+
+    def test_answering_a_filled_role_says_it_is_replacing_it(self):
+        # Finding I7: this path pops the queue head AND overwrites the slot,
+        # so the displaced file is unrecoverable — it must at least be named.
+        with mock.patch("tgbot.bot.probe", return_value=self.image_probe):
+            bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME)
+            bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME)
+            bot.handle(self.tg, doc_from(ME, "character-id"), allowed_user_id=ME)
+            bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME)
+        self.assertIn("replaced the previous outfit", panel_text(self.tg))
+
+    def test_a_note_does_not_survive_into_the_next_unrelated_redraw(self):
+        # Left in _PANEL_NOTE, "replaced the previous outfit" would keep
+        # resurfacing on every later redraw that has nothing to do with it —
+        # reported 2026-09-02 as a stale note next to an unrelated question.
+        with mock.patch("tgbot.bot.probe", return_value=self.image_probe):
+            bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME)
+            bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME)
+            bot.handle(self.tg, doc_from(ME, "character-id"), allowed_user_id=ME)
+            bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME)
+        self.assertIn("replaced the previous outfit", panel_text(self.tg))
+        with mock.patch("tgbot.bot.probe", return_value=self.driver_probe):
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+        self.assertNotIn("replaced the previous outfit", panel_text(self.tg))
+
+    def test_confirm_with_files_still_unassigned_refuses_once_then_runs(self):
+        """Finding I6: /confirm succeeded with files still queued and dropped
+        them silently on the state clear. Refuse once naming the count; a
+        second /confirm runs without them, and says so."""
+        with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+            with mock.patch("tgbot.bot.probe", return_value=self.image_probe):
+                bot.handle(self.tg, doc_from(ME, "character-id"), allowed_user_id=ME)
+
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+            start_drain.assert_not_called()
+            self.assertIn("1 file(s) still unassigned", self.tg.messages[-1])
+
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+        start_drain.assert_called_once()
+        self.assertIn("running without 1 unassigned file(s)",
+                      "\n".join(self.tg.messages))
+
+    def test_status_reports_progress_from_the_journal(self):
+        # Finding I3: progress_text existed, was tested, and had no caller —
+        # after /confirm the user got one message and then silence.
+        import json
+        with mock.patch("tgbot.bot.start_drain"), \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+        manifest = bot._job_manifest_path(ME)
+        state_path_for(manifest).write_text(json.dumps(
+            {"batch": "2026-08-31-2140",
+             "runs": {"job": {"status": "running",
+                              "stages": {"motion": {"status": "done", "sec": 247}}}}}),
+            encoding="utf-8")
+        bot.handle(self.tg, cmd_from(ME, "/status"), allowed_user_id=ME)
+        self.assertIn("2026-08-31-2140", self.tg.messages[-1])
+        self.assertIn("motion", self.tg.messages[-1])
+
+    def test_status_before_anything_started_is_reported_not_crashed(self):
+        bot.handle(self.tg, cmd_from(ME, "/status"), allowed_user_id=ME)
+        # Reworded 2026-08-31: /status now falls through to the assembly state
+        # instead of dead-ending on "nothing started", which is true but
+        # useless while a job is being put together — the state /status is
+        # most often asked in.
+        self.assertIn("Nothing running", self.tg.messages[-1])
+        self.assertIn("Nothing assembled yet", self.tg.messages[-1])
+
+    def test_a_heic_upload_never_overwrites_an_already_accepted_png(self):
+        """Regression for finding A (2026-08-31).
+
+        _stage_file's never-overwrite counter only ever checked the INCOMING
+        file's own staged name. ingest.to_png_if_heic then writes
+        `path.with_suffix('.png')` (ingest.py:145) with no collision check of
+        its own, so `photo.png` (already accepted, already sitting in
+        Job.slots) had its bytes replaced by the conversion of a later
+        `photo.heic`. No message, no manifest change, and both slots then
+        pointed at the same file — the wrong image inside a $0.99/hour render.
+        Created by the staging change: before it, conversion happened against
+        Telegram's unique `file_N.heic` names.
+        """
+        png_src = self.root / "photo.png"
+        png_src.write_bytes(b"the original png the user accepted")
+        heic_src = self.root / "photo.heic"
+        heic_src.write_bytes(b"heic bytes")
+        self.tg.file_paths["png-id"] = str(png_src)
+        self.tg.file_paths["heic-id"] = str(heic_src)
+
+        def fake_convert(path: Path) -> Path:
+            # Mirrors ingest.to_png_if_heic's naming rule exactly (it writes
+            # `dest = path.with_suffix('.png')`), without needing sips/ffmpeg
+            # or a real HEIC file. The naming rule IS the bug.
+            if path.suffix.lower() not in (".heic", ".heif"):
+                return path
+            dest = path.with_suffix(".png")
+            dest.write_bytes(b"converted from heic")
+            return dest
+
+        with mock.patch("tgbot.bot.probe", return_value=self.image_probe), \
+             mock.patch("tgbot.bot.to_png_if_heic", side_effect=fake_convert):
+            bot.handle(self.tg, doc_from(ME, "png-id"), allowed_user_id=ME)
+            bot.handle(self.tg, cmd_from(ME, "character"), allowed_user_id=ME)
+            bot.handle(self.tg, doc_from(ME, "heic-id"), allowed_user_id=ME)
+            bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME)
+
+        slots = bot._STATE[ME].slots
+        self.assertEqual(self.staged("photo.png").read_bytes(),
+                         b"the original png the user accepted")
+        self.assertEqual(slots["character"], self.staged("photo.png"))
+        self.assertNotEqual(slots["character"], slots["outfit"])
+        self.assertTrue(slots["outfit"].is_file())
+
+    def test_confirm_recovers_once_the_mailbox_frees_up(self):
+        """The mailbox-era version of finding B (2026-08-31 / 2026-09-02).
+
+        The old C1 write guard refused to render while a drain was live and
+        left _LAST_VALIDATE unset — recovery meant retrying, not replaying a
+        stale "fix the error already shown" that nobody had actually shown.
+        The guard that can still leave it unset today is a mailbox already
+        occupied (queue depth 1); the fix has to keep working once that
+        mailbox is claimed and freed, same as it did once a drain finished.
+        """
+        live = bot._job_manifest_path(ME)
+        mailbox_path(live).write_text("runs: []\n", encoding="utf-8")
+        with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot.drain_running", return_value=True):
+            self._fill_required_slots()
+        # Not messages[-1] (2026-09-02): the panel redraw that follows this
+        # refusal can itself land as a fresh send rather than an edit, once
+        # the uploads' own spinner messages have pushed it past the drift
+        # threshold — a heuristic this test has no interest in.
+        self.assertIn("already queued next", "\n".join(self.tg.messages))
+        self.assertNotIn(ME, bot._LAST_VALIDATE)
+
+        # drain.py's own chain_or_teardown has since claimed the mailbox —
+        # freeing it — while the drain itself may still be running.
+        mailbox_path(live).unlink()
+        with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot.drain_running", return_value=True):
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+        start_drain.assert_not_called()   # queued, not rented — a drain is still running
+        self.assertIn("Queued", self.tg.messages[-1])
+        self.assertTrue(mailbox_path(live).exists())
+
+    def test_confirm_after_a_real_validation_failure_names_the_real_reason(self):
+        """The other half of finding B: recovering from the write guard must
+        not turn into "retry until it runs". A manifest that genuinely fails
+        `make batch-validate` is still refused, and the refusal describes what
+        actually happened rather than pointing at an error nobody was sent."""
+        failed = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="run 'job': character: not a file", stderr="")
+        with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.subprocess.run", return_value=failed):
+            self._fill_required_slots()
+            # Not messages[-1] (2026-09-02) — see the write-guard test above.
+            self.assertIn("character: not a file", "\n".join(self.tg.messages))
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+        start_drain.assert_not_called()
+        last = self.tg.messages[-1]
+        self.assertIn("batch-validate", last)
+        # Must not claim an error was shown when the point of finding B is
+        # that sometimes none was.
+        self.assertNotIn("already shown", last)
+
+    def test_a_fidelity_read_failure_is_reported_not_swallowed(self):
+        """Finding D (2026-08-31): _fidelity_line sat one line below the try
+        that finding I1 widened, so an OSError from its open()/stat() escaped
+        handle() into main()'s blanket `except Exception: log(...)` — exactly
+        the silence I1 existed to remove."""
+        with mock.patch("tgbot.bot.probe", return_value=self.driver_probe), \
+             mock.patch("tgbot.bot._fidelity_line",
+                        side_effect=OSError("Input/output error")):
+            bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
+        self.assertIn("Input/output error", self.tg.messages[-1])
+        self.assertNotIn(ME, bot._STATE)
+
+
+class TestSafeNameFoldsDiacritics(unittest.TestCase):
+    """Vietnamese names survive staging instead of being deleted down to the
+    separators between their letters.
+
+    Before this, `_SAFE_NAME_RE` deleted every accented letter outright:
+    `áo dài.jpg` became `o_d_i.jpg`. That is not tidiness — the manifest is
+    what the user reads on a phone before confirming a $0.99/hour render, and
+    a filename they cannot recognise is a file they cannot check is the right
+    one. Staging exists partly to make those names readable.
+    """
+
+    def test_accents_fold_to_their_base_letter(self):
+        self.assertEqual(bot._safe_name("áo dài.jpg"), "ao_dai.jpg")
+        self.assertEqual(bot._safe_name("Nguyễn.png"), "Nguyen.png")
+        self.assertEqual(bot._safe_name("cà phê sữa đá.mov"), "ca_phe_sua_da.mov")
+
+    def test_d_with_stroke_is_mapped_by_hand(self):
+        # đ (U+0111) is a distinct letter, not d + a combining mark, so NFD
+        # leaves it whole and the filter would delete it. It is the only
+        # Vietnamese letter needing an explicit mapping.
+        self.assertEqual(bot._safe_name("đầm dạ hội.MP4"), "dam_da_hoi.MP4")
+        self.assertEqual(bot._safe_name("Đ.jpg"), "D.jpg")
+
+    def test_a_script_with_no_latin_base_still_falls_back(self):
+        # Folding must not rescue what has no Latin base — the finding-C
+        # fallback still applies, and the extension still survives.
+        self.assertEqual(bot._safe_name("写真.heic"), "file.heic")
+
+    def test_normalisation_never_manufactures_a_path_separator(self):
+        # The regression guard for the ONE way this fold could be made unsafe.
+        # NFKD applies compatibility mappings: normalize("NFKD", "／") is "/"
+        # and normalize("NFKD", "．") is "." (measured 2026-08-31). Folding
+        # with NFKD would therefore create separators and dots out of input
+        # that had none, upstream of _SAFE_NAME_RE and of every reason
+        # _safe_child() refuses them. NFD does not, and this pins that.
+        self.assertEqual(bot._fold_diacritics("／"), "／")
+        self.assertEqual(bot._fold_diacritics("．"), "．")
+        self.assertEqual(bot._safe_name("..／..／etc／passwd.jpg"), "etc_passwd.jpg")
+        for hostile in ("a／b.jpg", "ｄ．．/x.jpg", "..／x.png"):
+            out = bot._safe_name(hostile)
+            self.assertNotIn("/", out)
+            self.assertNotIn("\\", out)
+            self.assertNotIn("..", out)
+
+
+class TestPreviews(unittest.TestCase):
+    """Pictures, added 2026-09-01 on the user's objection.
+
+    *"hỏi xác nhận thì không có preview ảnh hay video đó để trực quan cho người
+    dùng mà gửi một loạt text khó hiểu"* — and they were right. It is a direct
+    consequence of the File rule: everything arrives as a Document so the bytes
+    survive, and a Document renders as a filename, so the bot was asking "Which
+    slot is this?" about an image nobody could see and offering to spend
+    $0.99/hour on a list of resolutions.
+    """
+
+    def setUp(self):
+        self._orig_root = bot.ROOT
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "batch").mkdir()
+        bot.ROOT = self.root
+        reset_bot_state()
+        self.tg = FakeTg()
+        # A stand-in for what ffmpeg would have written. Its CONTENT never
+        # matters here — every assertion is about whether a picture was offered
+        # and what it was captioned, which is the part that was missing.
+        self.shot = self.root / "preview.jpg"
+        self.shot.write_bytes(b"\xff\xd8\xff")
+        self.img = Probe(kind="image", width=1536, height=2720, duration_s=0.0,
+                         bitrate_kbps=0, size_bytes=4_873_992)
+        self.vid = Probe(kind="video", width=1080, height=1920, duration_s=15.0,
+                         bitrate_kbps=865, size_bytes=1_622_500)
+
+    def tearDown(self):
+        bot.ROOT = self._orig_root
+        reset_bot_state()
+
+    def _ready_job(self):
+        job = bot._job_for(ME)
+        job.pipeline = "character-swap-enhance"
+        job.slots.update({"character": Path("c.png"), "driver": Path("d.mp4")})
+        job.probes.update({"character": self.img, "driver": self.vid})
+        bot._LAST_VALIDATE[ME] = True
+        return job
+
+    def test_the_slot_question_carries_the_picture_and_the_same_buttons(self):
+        with mock.patch("tgbot.bot.slot_preview", return_value=self.shot):
+            bot._ask_about(self.tg, ME, self.img, "tryon-motion-enhance",
+                           path=Path("c.png"))
+        self.assertEqual(len(self.tg.photos), 1)
+        self.assertEqual(self.tg.messages, [])          # not asked twice
+        self.assertIn("Which slot is this?", self.tg.photos[0][1])
+        offered = self.tg.callback_data()
+        for role in ("character", "outfit", "background"):
+            self.assertIn(bot._CB_SLOT + role, offered)
+
+    def test_no_preview_still_asks_the_question(self):
+        """A courtesy must never be able to swallow the question itself."""
+        with mock.patch("tgbot.bot.slot_preview", return_value=None):
+            bot._ask_about(self.tg, ME, self.img, "tryon-motion-enhance",
+                           path=Path("c.png"))
+        self.assertEqual(self.tg.photos, [])
+        self.assertIn("Which slot is this?", self.tg.messages[-1])
+        self.assertIn(bot._CB_SLOT + "character", self.tg.callback_data())
+
+    def test_a_failed_upload_falls_back_to_the_text_question(self):
+        from tgbot.tgclient import TgError
+        self.tg.photo_raises = TgError("Bad Request: image is too big")
+        with mock.patch("tgbot.bot.slot_preview", return_value=self.shot):
+            bot._ask_about(self.tg, ME, self.img, "tryon-motion-enhance",
+                           path=Path("c.png"))
+        self.assertIn("Which slot is this?", self.tg.messages[-1])
+        self.assertIn(bot._CB_SLOT + "character", self.tg.callback_data())
+
+    def test_a_ready_job_is_ONE_message_carrying_the_run_button(self):
+        """The merge the user asked for: "1 lần xác nhận là gửi 2 tin như này
+        luôn à, k gộp lại 1 tin được à".
+
+        It had been ruled out on a bad measurement — the 1024 caption cap
+        applies to the PARSED text, not the raw markup, so counting HTML gave
+        1,060 for three slots and the wrong answer while the visible text is
+        930 with four.
+        """
+        job = self._ready_job()
+        with mock.patch("tgbot.bot.sheet", return_value=self.shot):
+            bot._show_panel(self.tg, ME)
+        self.assertEqual(len(self.tg.photos), 1)
+        self.assertEqual(self.tg.messages, [], "a second message was sent too")
+        caption = self.tg.photos[0][1]
+        self.assertIn("character", caption)
+        self.assertIn("ready", caption)
+        self.assertIn(bot._CB_RUN_ASK, self.tg.callback_data())
+        self.assertIn(ME, bot._PANEL_IS_PHOTO)
+
+    def test_a_redraw_edits_the_caption_rather_than_resending_the_picture(self):
+        job = self._ready_job()
+        with mock.patch("tgbot.bot.sheet", return_value=self.shot):
+            bot._show_panel(self.tg, ME)
+            bot._show_panel(self.tg, ME, note="something changed")
+        self.assertEqual(len(self.tg.photos), 1, "the picture was re-uploaded")
+        self.assertEqual(len(self.tg.caption_edits), 1)
+        self.assertIn("something changed", self.tg.caption_edits[0][1])
+        # And never through editMessageText, which cannot touch a photo.
+        self.assertEqual(self.tg.edits, [])
+
+    def test_new_material_replaces_the_message_because_a_photo_cannot_be_swapped(self):
+        job = self._ready_job()
+        with mock.patch("tgbot.bot.sheet", return_value=self.shot):
+            bot._show_panel(self.tg, ME)
+            first = bot._PANEL[ME]
+            job.slots["character"] = Path("c2.png")
+            bot._show_panel(self.tg, ME)
+        self.assertEqual(len(self.tg.photos), 2)
+        self.assertIn(first, self.tg.deleted)
+        self.assertNotEqual(bot._PANEL[ME], first)
+
+    def test_a_caption_too_long_to_fit_falls_back_to_two_messages(self):
+        """Filenames come from the user's own files and nothing bounds them.
+        Truncating would drop the arrival digests, so it splits instead."""
+        job = self._ready_job()
+        with mock.patch("tgbot.bot.sheet", return_value=self.shot), \
+             mock.patch("tgbot.bot._caption_fits", return_value=False):
+            bot._show_panel(self.tg, ME)
+        self.assertEqual(len(self.tg.photos), 1)     # the strip on its own
+        self.assertEqual(len(self.tg.messages), 1)   # the panel below it
+        self.assertNotIn(ME, bot._PANEL_IS_PHOTO)
+        self.assertIn(bot._CB_RUN_ASK, self.tg.callback_data())
+
+    def test_the_caption_cap_is_measured_on_parsed_text_not_markup(self):
+        """The measurement that reversed the design.
+
+        Counting the raw HTML said a merge was impossible. Telegram counts what
+        is left after the tags are parsed away.
+        """
+        markup = "<b>" + "x" * 1020 + "</b> &lt;&gt;"
+        # 1020 x's, one space, and the two entities as one character each.
+        self.assertEqual(bot._visible_length(markup), 1023)
+        self.assertTrue(bot._caption_fits(markup))
+        self.assertFalse(bot._caption_fits("y" * (bot.CAPTION_LIMIT + 1)))
+
+    def test_freezing_a_merged_panel_edits_the_caption_and_drops_the_button(self):
+        """Getting this wrong leaves Run live on a job already given to a drain."""
+        job = self._ready_job()
+        with mock.patch("tgbot.bot.sheet", return_value=self.shot):
+            bot._show_panel(self.tg, ME)
+        bot._freeze_panel(self.tg, ME, "submitted 12:30")
+        self.assertEqual(len(self.tg.caption_edits), 1)
+        self.assertIn("submitted", self.tg.caption_edits[0][1])
+        self.assertIsNone(self.tg.edit_buttons[-1])
+        self.assertEqual(self.tg.edits, [], "editMessageText was used on a photo")
+        self.assertNotIn(ME, bot._PANEL)
+        self.assertNotIn(ME, bot._PANEL_IS_PHOTO)
+
+    def test_the_sheet_is_one_row_per_job_and_one_column_per_role(self):
+        job = self._ready_job()
+        seen = {}
+        def fake_sheet(rows, *, into):
+            seen["rows"] = [list(r) for r in rows]
+            return self.shot
+        with mock.patch("tgbot.bot.sheet", side_effect=fake_sheet):
+            bot._show_panel(self.tg, ME)
+        self.assertEqual(len(seen["rows"]), 1)
+        columns = sorted(job.slots)
+        self.assertEqual([cell[0] for cell in seen["rows"][0]],
+                         [job.slots[r] for r in columns])
+        # Only the driver is a video, and only it may be seeked as one.
+        self.assertEqual([cell[1] for cell in seen["rows"][0]], [False, True])
+
+    def test_a_job_missing_a_role_leaves_that_column_empty(self):
+        """Columns are roles. A shorter row would shift every cell to its right
+        and the sheet would stop being readable down a column — and a missing
+        cell does not say "this slot is empty", which a blank one does."""
+        job = self._ready_job()
+        job.slots["background"] = Path("b.png")
+        job.probes["background"] = self.img
+        bot._BASKET[ME] = [bot._copy_job(job)]
+        bot._STATE[ME].slots.pop("background")
+        bot._STATE[ME].probes.pop("background")
+        seen = {}
+        def fake_sheet(rows, *, into):
+            seen["rows"] = [list(r) for r in rows]
+            return self.shot
+        with mock.patch("tgbot.bot.sheet", side_effect=fake_sheet):
+            bot._show_panel(self.tg, ME)
+        self.assertEqual(len(seen["rows"]), 2)
+        self.assertEqual(len(seen["rows"][0]), len(seen["rows"][1]))
+        # background sorts first, so it is column 0 in both rows.
+        self.assertIsNotNone(seen["rows"][0][0])
+        self.assertIsNone(seen["rows"][1][0], "the missing role did not leave a gap")
+
+    def test_the_strip_is_built_once_per_set_of_material(self):
+        """_show_panel runs on every change; three ffmpeg frames per redraw
+        would put a courtesy feature in the way of the poll loop."""
+        job = self._ready_job()
+        calls = []
+        def counting_sheet(rows, *, into):
+            calls.append(1)
+            return self.shot
+        with mock.patch("tgbot.bot.sheet", side_effect=counting_sheet):
+            bot._show_panel(self.tg, ME)
+            bot._show_panel(self.tg, ME, note="a")
+            bot._show_panel(self.tg, ME, note="b")
+        self.assertEqual(len(calls), 1)
+
+    def test_a_strip_that_could_not_be_built_leaves_a_working_text_panel(self):
+        job = self._ready_job()
+        with mock.patch("tgbot.bot.sheet", return_value=None):
+            bot._show_panel(self.tg, ME)
+        self.assertEqual(self.tg.photos, [])
+        self.assertEqual(len(self.tg.messages), 1)
+        self.assertIn(bot._CB_RUN_ASK, self.tg.callback_data())
+
+    def test_a_rejected_upload_still_leaves_a_panel(self):
+        from tgbot.tgclient import TgError
+        job = self._ready_job()
+        self.tg.photo_raises = TgError("Bad Request: image is too big")
+        with mock.patch("tgbot.bot.sheet", return_value=self.shot):
+            bot._show_panel(self.tg, ME)
+        self.assertEqual(len(self.tg.messages), 1)
+        self.assertNotIn(ME, bot._PANEL_IS_PHOTO)
+        self.assertIn(bot._CB_RUN_ASK, self.tg.callback_data())
+
+    def test_nothing_is_shown_before_the_manifest_has_validated(self):
+        """Pictures say "this is what will run". Showing them beside a
+        manifest that cannot run says the wrong thing."""
+        job = self._ready_job()
+        for verdict in (False, None):
+            with self.subTest(verdict=verdict):
+                self.tg = FakeTg()
+                if verdict is None:
+                    bot._LAST_VALIDATE.pop(ME, None)
+                else:
+                    bot._LAST_VALIDATE[ME] = verdict
+                with mock.patch("tgbot.bot.sheet", return_value=self.shot):
+                    bot._show_panel(self.tg, ME)
+                self.assertEqual(self.tg.photos, [])
+
+    def test_an_incomplete_job_shows_nothing(self):
+        job = bot._job_for(ME)
+        job.pipeline = "character-swap-enhance"
+        job.slots["character"] = Path("c.png")
+        job.probes["character"] = self.img
+        bot._LAST_VALIDATE[ME] = True
+        with mock.patch("tgbot.bot.sheet", return_value=self.shot):
+            bot._show_panel(self.tg, ME)
+        self.assertEqual(self.tg.photos, [])
+        self.assertEqual(len(self.tg.messages), 1)   # the text panel only
+
+
+def _dimensions(path):
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", str(path)],
+        capture_output=True, text=True).stdout.strip()
+    w, h = out.split("x")
+    return int(w), int(h)
+
+
+class TestPreviewBuilder(unittest.TestCase):
+    """`preview.make` against real ffmpeg on a real file.
+
+    Generated rather than taken from `out/`: that directory is gitignored
+    personal media, so a test reading it passes here and fails on any clean
+    checkout.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp())
+        cls.video = cls.tmp / "clip.mp4"
+        made = subprocess.run(
+            ["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+             "-i", "testsrc=duration=3:size=320x240:rate=10",
+             "-pix_fmt", "yuv420p", str(cls.video)],
+            capture_output=True)
+        if made.returncode != 0 or not cls.video.exists():
+            raise unittest.SkipTest("ffmpeg unavailable")
+
+    def test_a_video_yields_a_wide_jpeg(self):
+        from tgbot import preview
+        shot = preview.slot_preview(self.video, is_video=True, into=self.tmp / "out")
+        self.assertIsNotNone(shot)
+        self.assertGreater(shot.stat().st_size, 0)
+        # Wide is the whole point: shrinking the pixels does nothing because
+        # Telegram scales to the bubble width, so the shape is the only lever.
+        self.assertEqual(_dimensions(shot), (preview.SLOT_W, preview.SLOT_H))
+
+    def test_a_clip_shorter_than_the_seek_still_yields_a_frame(self):
+        """The 1s seek is a preference, not a requirement — a 0.4s driver has
+        no frame there, and `make` must fall back rather than give up."""
+        from tgbot import preview
+        short = self.tmp / "short.mp4"
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+                        "-i", "testsrc=duration=0.4:size=160x120:rate=10",
+                        "-pix_fmt", "yuv420p", str(short)], capture_output=True)
+        shot = preview.slot_preview(short, is_video=True, into=self.tmp / "out2")
+        self.assertIsNotNone(shot, "no frame recovered from a sub-second clip")
+
+    def test_a_file_ffmpeg_cannot_read_returns_none_rather_than_raising(self):
+        from tgbot import preview
+        junk = self.tmp / "junk.png"
+        junk.write_bytes(b"not an image")
+        self.assertIsNone(preview.slot_preview(junk, is_video=False,
+                                               into=self.tmp / "out3"))
+
+    def test_one_job_is_a_single_wide_row(self):
+        from tgbot import preview
+        out = preview.sheet([[(self.video, True)] * 4], into=self.tmp / "out4")
+        self.assertIsNotNone(out)
+        width, height = _dimensions(out)
+        self.assertGreater(width, height, "a one-job sheet is not a wide image")
+
+    def test_rows_stack_and_columns_stay_aligned(self):
+        from tgbot import preview
+        rows = [[(self.video, True)] * 3, [None, (self.video, True), None]]
+        out = preview.sheet(rows, into=self.tmp / "out5")
+        self.assertIsNotNone(out)
+        width, height = _dimensions(out)
+        # The lead gutter holds the coloured bar that identifies the row.
+        self.assertEqual(width, preview.ACCENT_BAR_W + 10
+                         + 3 * preview.TILE_W + 4 * preview.COL_GAP
+                         + 2 * preview.CARD_PAD)
+        self.assertEqual(height, 2 * (preview.TILE_H + 2 * preview.CARD_PAD)
+                         + 3 * preview.ROW_GAP)
+
+    def test_a_sheet_is_all_or_nothing(self):
+        """A sheet missing a cell reads as a job missing that slot."""
+        from tgbot import preview
+        junk = self.tmp / "junk2.png"
+        junk.write_bytes(b"not an image")
+        self.assertIsNone(preview.sheet([[(self.video, True), (junk, False)]],
+                                        into=self.tmp / "out6"))
+
+    def test_no_rows_is_no_sheet(self):
+        from tgbot import preview
+        self.assertIsNone(preview.sheet([], into=self.tmp / "out7"))
+
+
+class TestNoDuplicateDefinitions(unittest.TestCase):
+    """A file cannot define the same name twice and still mean one thing.
+
+    Added 2026-08-31 after a patch inserted an entire block of functions that
+    was already present. Python simply re-binds each name, so the LATER
+    definition wins and every test kept passing — 151 duplicated lines,
+    including a second copy of the job-clearing logic, invisible to the whole
+    suite. Editing the earlier copy would have changed nothing at runtime,
+    which is the kind of bug that costs an afternoon.
+    """
+
+    MODULES = ["tgbot/bot.py", "tgbot/job.py", "tgbot/ingest.py",
+               "tgbot/run.py", "tgbot/tgclient.py"]
+
+    def test_no_callback_key_is_a_prefix_of_another(self):
+        """The dispatch matches callback_data with startswith.
+
+        So a key that is a prefix of another one is silently swallowed by
+        whichever branch comes first. That happened on 2026-09-01: `pipe:ask`
+        began with `pipe:`, so tapping the pipeline button was read as a
+        request to switch to a pipeline named "ask". A test caught it on its
+        first run; nothing in the code could have. The rule is easy to lose
+        sight of when a key is added months after the ones it collides with.
+        """
+        keys = {name: value for name, value in vars(bot).items()
+                if name.startswith("_CB_") and isinstance(value, str)}
+        for name, value in sorted(keys.items()):
+            for other_name, other in sorted(keys.items()):
+                if name == other_name or len(other) <= len(value):
+                    continue
+                self.assertFalse(
+                    other.startswith(value),
+                    f"{other_name}={other!r} starts with {name}={value!r} — the "
+                    f"{name} branch will swallow it")
+
+    def test_no_module_reaches_for_a_custom_emoji_entity(self):
+        """`<tg-emoji>` does nothing here, and does it silently.
+
+        Measured 2026-09-01 against this bot on the real API: sendMessage
+        returns ok:true, and the message comes back with entities:null and only
+        the fallback glyph. The Bot API grants custom emoji to bots that bought
+        a username on Fragment, and this one has not — so there is no error to
+        catch, no rejected send, and nothing renders wrong. It just never
+        animates. That is invisible to every test that asserts on the text the
+        bot BUILT rather than on what Telegram kept, which is all of them.
+        """
+        import ast
+        root = Path(__file__).resolve().parents[1]
+        for rel in self.MODULES:
+            with self.subTest(module=rel):
+                tree = ast.parse((root / rel).read_text(encoding="utf-8"))
+                # String literals only, not raw file text: both modules carry a
+                # `#` comment recording WHY this is forbidden, and a grep-style
+                # check would fire on the explanation rather than on a use.
+                literals = [n.value for n in ast.walk(tree)
+                            if isinstance(n, ast.Constant)
+                            and isinstance(n.value, str)]
+                for text in literals:
+                    self.assertNotIn("<tg-emoji", text,
+                                     f"{rel} builds a custom-emoji entity — it is "
+                                     "stripped for this bot; motion comes from "
+                                     "re-editing (run._SPIN)")
+
+    def test_no_module_defines_a_top_level_name_twice(self):
+        import ast
+        root = Path(__file__).resolve().parents[1]
+        for rel in self.MODULES:
+            with self.subTest(module=rel):
+                tree = ast.parse((root / rel).read_text(encoding="utf-8"))
+                names = []
+                for node in tree.body:
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                         ast.ClassDef)):
+                        names.append(node.name)
+                    elif isinstance(node, ast.Assign):
+                        names += [t.id for t in node.targets
+                                  if isinstance(t, ast.Name)]
+                    elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                        names.append(node.target.id)
+                dupes = sorted({n for n in names if names.count(n) > 1})
+                self.assertEqual(dupes, [], f"{rel} defines {dupes} more than once")
+
+
+class TestDeliverResult(unittest.TestCase):
+    """What the user is shown when a job ends.
+
+    Never covered before 2026-08-31, when this stopped being something the
+    user had to ask for: tick_progress now calls it the moment the drain
+    finishes, so its wording is the whole report on both success and failure.
+    """
+
+    def setUp(self):
+        self._orig_root = bot.ROOT
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "batch").mkdir()
+        (self.root / "out").mkdir()
+        bot.ROOT = self.root
+        self.manifest = self.root / "batch" / "tg-1.yaml"
+        self.manifest.write_text("runs: []\n", encoding="utf-8")
+        self.tg = FakeTg()
+
+    def tearDown(self):
+        bot.ROOT = self._orig_root
+
+    def _write_state(self, payload):
+        state_path_for(self.manifest).write_text(json.dumps(payload),
+                                                encoding="utf-8")
+
+    def _batch_dir(self, batch_id):
+        d = self.root / "out" / batch_id
+        (d / "_final").mkdir(parents=True)
+        (d / "runs" / "job").mkdir(parents=True)
+        return d
+
+    def test_success_names_the_batch_and_sends_every_final_file(self):
+        d = self._batch_dir("2026-08-31-2140")
+        (d / "_final" / "job.mp4").write_bytes(b"video")
+        self._write_state({"batch": "2026-08-31-2140",
+                           "runs": {"job": {"status": "done", "stages": {
+                               "enhance": {"status": "done", "sec": 114}}}}})
+        bot.deliver_result(self.tg, ME, self.manifest)
+        joined = "\n".join(self.tg.messages)
+        self.assertIn("Done", joined)
+        self.assertIn("2026-08-31-2140", joined)
+        self.assertEqual([c for _, c in self.tg.documents], ["job.mp4"])
+
+    def test_failure_names_the_stage_that_broke(self):
+        # "the run failed" sends the user off to read a log for something the
+        # journal already knows.
+        d = self._batch_dir("2026-08-31-2200")
+        (d / "runs" / "job" / "pod-job.log").write_text(
+            "loading model\nCUDA out of memory\n", encoding="utf-8")
+        self._write_state({"batch": "2026-08-31-2200",
+                           "runs": {"job": {"status": "error", "stages": {
+                               "tryon": {"status": "done", "sec": 351},
+                               "enhance": {"status": "error", "job_id": "j-9"}}}}})
+        bot.deliver_result(self.tg, ME, self.manifest)
+        joined = "\n".join(self.tg.messages)
+        self.assertIn("job failed", joined)
+        self.assertIn("enhance", joined)
+        # The tail is inlined, because opening a .log on a phone is several
+        # taps and an app switch.
+        self.assertIn("CUDA out of memory", joined)
+        # And still attached, for the whole thing.
+        self.assertIn("job/pod-job.log", [c for _, c in self.tg.documents])
+
+    def test_a_drain_that_never_started_says_so_instead_of_going_quiet(self):
+        self._write_state({"runs": {}})
+        bot.deliver_result(self.tg, ME, self.manifest)
+        self.assertIn("No batch was ever recorded", self.tg.messages[0])
+        self.assertIn("drain.log", self.tg.messages[0])
+
+    def test_no_outputs_and_no_recorded_failure_is_still_reported(self):
+        # The silent case: a batch directory exists, nothing was produced, and
+        # nothing is marked failed. Saying nothing would leave the user
+        # waiting on a job that has already ended.
+        self._batch_dir("2026-08-31-2300")
+        self._write_state({"batch": "2026-08-31-2300", "runs": {}})
+        bot.deliver_result(self.tg, ME, self.manifest)
+        self.assertIn("Nothing to send", "\n".join(self.tg.messages))
+
+    def test_the_log_tail_is_capped_so_the_send_cannot_fail(self):
+        # A Telegram message is 4096 characters and a pod log is megabytes.
+        # Sending the whole thing would make the send fail — an error report
+        # that becomes a second error.
+        big = self.root / "big.log"
+        big.write_text("x" * 100_000, encoding="utf-8")
+        self.assertEqual(len(bot._tail(big)), bot.TAIL_CHARS)
+
+    def test_an_unreadable_log_reports_itself_rather_than_raising(self):
+        self.assertIn("could not read", bot._tail(self.root / "missing.log"))
+
+
+class TestGpuStockCommand(unittest.TestCase):
+    """/gpu — a free stock check before renting (2026-09-02)."""
+
+    def setUp(self):
+        self._orig_root = bot.ROOT
+        self.root = Path(tempfile.mkdtemp())
+        bot.ROOT = self.root
+        self.tg = FakeTg()
+
+    def tearDown(self):
+        bot.ROOT = self._orig_root
+
+    def _write_env(self, gpu="NVIDIA GeForce RTX 5090", volume_id="vol-1"):
+        (self.root / ".env").write_text(
+            f"GPU={gpu}\nPOD_VOLUME_ID={volume_id}\n", encoding="utf-8")
+
+    def _stock(self):
+        return {
+            "NVIDIA GeForce RTX 5090": [
+                Stock(gpu_id="NVIDIA GeForce RTX 5090", display_name="RTX 5090",
+                     price_per_hr=0.99, datacenter_id="EU-RO-1", stock_status="Low"),
+                Stock(gpu_id="NVIDIA GeForce RTX 5090", display_name="RTX 5090",
+                     price_per_hr=0.99, datacenter_id="EU-CZ-1", stock_status="High"),
+            ],
+            "NVIDIA GeForce RTX 4090": [
+                Stock(gpu_id="NVIDIA GeForce RTX 4090", display_name="RTX 4090",
+                     price_per_hr=0.74, datacenter_id="EU-RO-1", stock_status="Medium"),
+            ],
+            "NVIDIA RTX PRO 4500 Blackwell": [
+                Stock(gpu_id="NVIDIA RTX PRO 4500 Blackwell",
+                     display_name="RTX PRO 4500", price_per_hr=0.72,
+                     datacenter_id="EU-RO-1", stock_status="High"),
+            ],
+        }
+
+    def test_reports_the_5090_and_both_fallbacks_at_home(self):
+        self._write_env()
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()) as stock_at:
+            bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
+        stock_at.assert_called_once_with(
+            ["NVIDIA GeForce RTX 5090", "NVIDIA GeForce RTX 4090",
+             "NVIDIA RTX PRO 4500 Blackwell"])
+        text = self.tg.messages[-1]
+        self.assertIn("📍", text)
+        self.assertIn("EU-RO-1", text)
+        self.assertIn("Low", text)
+        self.assertIn("RTX 4090", text)
+        self.assertIn("Medium", text)
+        self.assertIn("RTX PRO 4500", text)
+        self.assertIn("High", text)
+
+    def test_a_better_region_elsewhere_is_listed_and_captioned_as_not_instant(self):
+        self._write_env()
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
+            bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
+        text = self.tg.messages[-1]
+        self.assertIn("Other regions", text)
+        self.assertIn("EU-CZ-1", text)
+        # A migration first — not a same-speed alternative. One duration
+        # constant, shared with the [Run] picker and the destructive confirm.
+        self.assertIn(bot.MIGRATE_DURATION_SHORT, text)
+
+    def test_unknown_home_datacenter_shows_every_region_without_a_false_claim(self):
+        self._write_env()
+        with mock.patch("tgbot.bot.volume_datacenter", return_value=None), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
+            bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
+        text = self.tg.messages[-1]
+        self.assertIn("volume datacenter unknown", text)
+        # Never claims a region was checked and found absent when the home
+        # datacenter itself was never known.
+        self.assertNotIn("not offered here", text)
+        self.assertIn("EU-RO-1", text)
+        self.assertIn("EU-CZ-1", text)
+
+    def test_the_5090_is_checked_even_when_env_is_set_to_a_fallback(self):
+        # The actual bug report (2026-09-02): .env's GPU= is whatever was
+        # last hand-picked to rent — often a fallback already — and that
+        # used to be treated as "the primary to check", so /gpu silently
+        # dropped the 5090 from its own report the moment someone was
+        # already running on PRO 4500.
+        self._write_env(gpu="NVIDIA RTX PRO 4500 Blackwell")
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()) as stock_at:
+            bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
+        stock_at.assert_called_once_with(
+            ["NVIDIA GeForce RTX 5090", "NVIDIA GeForce RTX 4090",
+             "NVIDIA RTX PRO 4500 Blackwell"])
+        text = self.tg.messages[-1]
+        self.assertIn("RTX 5090", text)
+        self.assertIn("Low", text)
+
+    def test_the_currently_selected_gpu_is_always_named_plainly(self):
+        # No "not the 5090" framing (2026-09-02, user's own wording): just
+        # state what is selected, whatever it is.
+        self._write_env(gpu="NVIDIA RTX PRO 4500 Blackwell")
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
+            bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
+        text = self.tg.messages[-1]
+        self.assertIn("Currently selected", text)
+        self.assertIn("NVIDIA RTX PRO 4500 Blackwell", text)
+        self.assertNotIn("not the 5090", text)
+
+    def test_the_currently_selected_line_shows_even_when_it_is_the_5090(self):
+        self._write_env(gpu="NVIDIA GeForce RTX 5090")
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
+            bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
+        text = self.tg.messages[-1]
+        self.assertIn("Currently selected", text)
+        self.assertIn("NVIDIA GeForce RTX 5090", text)
+
+    def test_stock_words_carry_a_coloured_icon(self):
+        self._write_env()
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
+            bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
+        text = self.tg.messages[-1]
+        self.assertIn("🟠", text)   # Low, at home
+        self.assertIn("🟡", text)  # Medium
+        self.assertIn("🟢", text)  # High
+
+    def test_price_carries_a_money_emoji(self):
+        self._write_env()
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
+            bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
+        self.assertIn("💵 $0.99/h", self.tg.messages[-1])
+
+    def test_works_even_with_no_env_file_at_all(self):
+        with mock.patch("tgbot.bot.volume_datacenter", return_value=None), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
+            bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
+        self.assertIn("RTX 5090", self.tg.messages[-1])
+
+    def test_a_runpodctl_failure_is_reported_rather_than_raised(self):
+        self._write_env()
+        with mock.patch("tgbot.bot.volume_datacenter", return_value=None), \
+             mock.patch("tgbot.bot.stock_at_cached", side_effect=RuntimeError("boom")):
+            bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
+        self.assertIn("couldn't reach runpodctl", self.tg.messages[-1])
+
+    def test_an_unlisted_gpu_says_so_rather_than_going_silent(self):
+        self._write_env()
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value={}):
+            bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
+        self.assertIn("not listed", self.tg.messages[-1])
+
+
+class TestKillCommand(unittest.TestCase):
+    """/kill — the emergency stop that forfeits a running job (2026-09-02)."""
+
+    def setUp(self):
+        self._orig_root = bot.ROOT
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "batch").mkdir()
+        bot.ROOT = self.root
+        self.manifest = bot._job_manifest_path(ME)
+        self.manifest.write_text("runs: []\n", encoding="utf-8")
+        self.tg = FakeTg()
+        reset_bot_state()
+
+    def tearDown(self):
+        bot.ROOT = self._orig_root
+        bot._RUNNING.pop(self.manifest.resolve(), None)
+
+    def test_ask_refuses_when_nothing_is_running(self):
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cmd_from(ME, "/kill"), allowed_user_id=ME)
+        self.assertIn("nothing is running", self.tg.messages[-1])
+        self.assertIsNone(self.tg.buttons[-1])
+
+    def test_ask_offers_yes_cancel_and_names_money_already_spent(self):
+        lease = mock.Mock(provisioned_at=time.time() - 600)   # 10 min ago
+        with mock.patch("tgbot.bot.drain_running", return_value=True), \
+             mock.patch("tgbot.bot.lease_for", return_value=lease):
+            bot.handle(self.tg, cmd_from(ME, "/kill"), allowed_user_id=ME)
+        text = self.tg.messages[-1]
+        self.assertIn("destroys the pod right now", text)
+        self.assertIn("10 min", text)
+        offered = [data for row in self.tg.buttons[-1] for _, data in row]
+        self.assertEqual(offered, [bot._CB_KILL_GO, bot._CB_KILL_NO])
+
+    def test_confirming_terminates_a_tracked_popen_then_destroys_the_pod(self):
+        proc = mock.Mock()
+        proc.poll.return_value = None   # still alive
+        bot._RUNNING[self.manifest.resolve()] = proc
+        ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="destroyed",
+                                         stderr="")
+        with mock.patch("tgbot.bot.subprocess.run", return_value=ok) as run, \
+             mock.patch("tgbot.bot.clear_lease") as clear_lease:
+            bot.handle(self.tg, cb_from(ME, bot._CB_KILL_GO), allowed_user_id=ME)
+        proc.terminate.assert_called_once()
+        self.assertEqual(run.call_args.args[0], ["make", "gpu-destroy"])
+        clear_lease.assert_called_once()
+        self.assertIn("Killed. Pod destroyed", self.tg.messages[-1])
+
+    def test_a_dead_tracked_process_is_left_alone(self):
+        proc = mock.Mock()
+        proc.poll.return_value = 0   # already exited
+        bot._RUNNING[self.manifest.resolve()] = proc
+        ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with mock.patch("tgbot.bot.subprocess.run", return_value=ok), \
+             mock.patch("tgbot.bot.clear_lease"):
+            bot.handle(self.tg, cb_from(ME, bot._CB_KILL_GO), allowed_user_id=ME)
+        proc.terminate.assert_not_called()
+
+    def test_a_hung_process_is_escalated_to_a_hard_kill(self):
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        proc.wait.side_effect = subprocess.TimeoutExpired(cmd="make", timeout=5)
+        bot._RUNNING[self.manifest.resolve()] = proc
+        ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with mock.patch("tgbot.bot.subprocess.run", return_value=ok), \
+             mock.patch("tgbot.bot.clear_lease"):
+            bot.handle(self.tg, cb_from(ME, bot._CB_KILL_GO), allowed_user_id=ME)
+        proc.kill.assert_called_once()
+
+    def test_a_failed_destroy_is_reported_honestly_not_claimed_as_success(self):
+        failed = subprocess.CompletedProcess(
+            args=[], returncode=1,
+            stdout="STILL ALIVE — pod ... STILL BILLING", stderr="")
+        with mock.patch("tgbot.bot.subprocess.run", return_value=failed), \
+             mock.patch("tgbot.bot.clear_lease") as clear_lease:
+            bot.handle(self.tg, cb_from(ME, bot._CB_KILL_GO), allowed_user_id=ME)
+        last = self.tg.messages[-1]
+        self.assertIn("may not have worked", last)
+        self.assertIn("STILL BILLING", last)
+        # Cleared regardless: a lease for a pod that might be gone is worse
+        # than none, since it is what makes drain_running() believe a dead
+        # job is still live.
+        clear_lease.assert_called_once()
+
+    def test_the_progress_message_is_edited_to_say_killed_and_the_file_removed(self):
+        prog = bot._progress_path(ME)
+        prog.write_text(json.dumps({"manifest": str(self.manifest),
+                                    "message_id": 777, "stages": ["motion"]}),
+                        encoding="utf-8")
+        ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with mock.patch("tgbot.bot.subprocess.run", return_value=ok), \
+             mock.patch("tgbot.bot.clear_lease"):
+            bot.handle(self.tg, cb_from(ME, bot._CB_KILL_GO), allowed_user_id=ME)
+        self.assertIn(
+            (777, "🛑 <b>Killed by request</b> — nothing left running."),
+            self.tg.edits)
+        self.assertFalse(prog.exists())
+
+    def test_cancel_leaves_everything_running(self):
+        with mock.patch("tgbot.bot.subprocess.run") as run:
+            bot.handle(self.tg, cb_from(ME, bot._CB_KILL_NO), allowed_user_id=ME)
+        run.assert_not_called()
+        self.assertIn("left running", self.tg.messages[-1])
+
+
+if __name__ == "__main__":
+    unittest.main()

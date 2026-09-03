@@ -181,6 +181,24 @@ if [ "$GPU_PROVIDER" = "runpod" ]; then
     Or clear POD_VOLUME in .env to rent without one (models re-download every pod, ~33GB)." ;;
   esac
 
+  # runpodctl 2.12.0 dropped --stop-after from 'pod create' entirely (measured 03/09/2026,
+  # against the REST v2 API too via the same field list) — the flag this repo's own safety net
+  # relies on no longer exists, so a create built with it fails outright with usage_error before
+  # anything is rented. Gate on the flag like --network-volume-id above, rather than let every
+  # future rental (including the bot's own /confirm) hard-fail on this. Degrading to "no stop-after"
+  # is not degrading to "no safety net": pod-watchdog.service's tier-3 orphan check kills any
+  # 'motion-transfer' pod no lease claims, after a grace window, independently of RunPod's own API —
+  # see scripts/batchlib_ext/watchdog.py. That service must be running for the fallback to apply.
+  if [ ${#STOP_AFTER_ARG[@]} -gt 0 ]; then
+    case "$RP_CREATE_HELP" in
+      *--stop-after*) ;;
+      *) warn "this runpodctl has no --stop-after — the POD_MAX_HOURS safety net is OFF for this rental.
+    Falls back to pod-watchdog.service's orphan check (tier 3) IF it is running on this box.
+    Otherwise nothing auto-stops this pod — destroy it by hand when done."
+         STOP_AFTER_ARG=() ;;
+    esac
+  fi
+
   runpodctl user -o json >/dev/null 2>&1 \
     || die "runpodctl has no API key. Get one at runpod.io/console/user/settings, then:  runpodctl doctor"
 
@@ -384,6 +402,12 @@ $RAW"
   # whose driver is too old, instead of finding out from a warn line 30 minutes into setup.
   build_create() {
     CREATE=(runpodctl pod create
+      # This name is the ONLY thing that makes a pod destroyable by the watchdog:
+      # it must stay in DESTROYABLE_NAMES (scripts/batchlib_ext/watchdog.py:31).
+      # Renaming it here and not there silently disarms tier 3 — the pod becomes
+      # "not ours to kill" and bills $0.99/hour unattended. Changing it the other
+      # way round makes tier 3 destroy pods it did not rent. No check-* gate ties
+      # the two yet, so change both by hand.
       --name motion-transfer
       --gpu-id "$1" --gpu-count 1
       --image "$IMAGE"

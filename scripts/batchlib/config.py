@@ -75,6 +75,32 @@ def env_get(path: Path, key: str) -> str:
     return " ".join(values)
 
 
+def env_set(path: Path, key: str, value: str) -> None:
+    """Write `key=value` into an .env file, replacing the line if `key=`
+    already appears, appending one otherwise. Mirrors pod-provision.sh's
+    own `env_set` — its only prior implementation — so the two never
+    disagree about how a key is written, only which process does it.
+
+    Written atomically (temp file + rename) so a reader (env_get, or a
+    concurrent shell script) never observes a half-written file.
+    """
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    except OSError:
+        lines = []
+    pattern = re.compile(rf"^{re.escape(key)}=")
+    new_line = f"{key}={value}\n"
+    for i, line in enumerate(lines):
+        if pattern.match(line):
+            lines[i] = new_line
+            break
+    else:
+        lines.append(new_line)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text("".join(lines), encoding="utf-8")
+    tmp.replace(path)
+
+
 @dataclass(frozen=True)
 class Settings:
     domain: str

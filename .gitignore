@@ -7,6 +7,10 @@
 __pycache__/
 *.pyc
 
+# Scratch workspace for superpowers:subagent-driven-development (ledgers,
+# briefs, review packages) — not part of the shipped repo.
+.superpowers/
+
 # Bản theo dõi upstream nằm NGOÀI repo (~/Desktop/motion-upstream-tracking/)
 # — liệt kê ở đây để nếu ai đó copy vào trong thì cũng không lọt vào git.
 motions-studio-upstream/
@@ -27,6 +31,52 @@ batch/*.state.json
 # MCP server ghi pid/argv/log/mã thoát của lượt chạy nền cạnh manifest (*.mcp.json,
 # *.mcp.log, *.mcp.rc). Dữ liệu của máy này, không của repo.
 batch/*.mcp.*
+# Pod lease written by drain.py/watchdog — machine state about a rented pod, not repo content.
+batch/pod-lease.json
+# The same thing for a volume migration's two TEMPORARY CPU pods
+# (scripts/volume_migrate.py). Its own file, so its own line: the pattern above
+# is an exact name, not a glob, and does not cover this one.
+batch/volume-migrate-lease.json
+# The bot's marker for a migration it has launched but whose lease has not been
+# written yet (tgbot/bot.py _migrate_launch_marker).
+batch/volume-migrate.launching.json
+# Which message the bot keeps edited for a migration. NOT covered by
+# `batch/*.progress.json` above — that glob needs a literal ".progress.json"
+# and this suffix is "-progress.json" — and the filename embeds the user's
+# Telegram chat id, which is exactly the kind of thing a public repo must not
+# grow by accident.
+batch/*.migrate-progress.json
+# Run logs written beside a manifest: `<manifest>.drain.log` (tgbot/run.py
+# start_drain) and batch/volume-migrate.log (bot _start_migration). Output of a
+# machine's own runs, and a drain log quotes material paths.
+batch/*.log
+# bản nháp job của bot Telegram — chứa đường dẫn material cá nhân
+batch/*.draft.json
+# job vừa gửi, giữ lại cho /again — cùng lý do như draft
+batch/*.last.json
+# tin nhắn tiến độ đang được sửa tại chỗ
+batch/*.progress.json
+# draft không đọc được, dọn sang một bên để còn dựng lại tay
+batch/*.json.bad
+# /wipe's per-chat message-id ledger — tracks the user's own chat history
+batch/*.ledger.json
 
 # IDE junk — repo public, config cá nhân không vào đây (cùng lý do .DS_Store)
 .idea/
+
+# Telegram bot API — local secrets. The server's storage moved out of the repo
+# entirely on 2026-08-31: it is now bind-mounted at /var/lib/telegram-bot-api on
+# both sides (scripts/vps/telegram-bot-api.yml), because getFile returns a
+# container path that bot.py has to be able to open on the host. Nothing under
+# scripts/vps/ holds media any more.
+scripts/vps/bot-api.env
+
+# Uploads the Telegram bot accepted, copied out of the Bot API server's storage
+# (bot.py:STAGING_DIR_NAME). Personal media, and the paths it replaces contain
+# the bot token — neither belongs in a public repo.
+batch/tg-staging/
+
+# Downscaled JPEGs the bot builds so a slot question can be answered by eye
+# (tgbot/preview.py). Throwaways, but they are still the user's own photographs
+# and this repo is public.
+batch/tg-preview/

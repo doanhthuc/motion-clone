@@ -1,0 +1,17 @@
+# scripts/vps/motion-bot.service
+# Install: cp to /etc/systemd/system/, then
+#   systemctl daemon-reload && systemctl enable --now motion-bot
+[Unit]
+Description=Motion Telegram bot
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/motion-clone
+ExecStart=/usr/bin/python3 /opt/motion-clone/scripts/tgbot/bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

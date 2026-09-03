@@ -268,6 +268,44 @@ if [ "$provider" = "runpod" ]; then
   fi
 fi
 
+# Pod ownership. Since 2026-08-30 the VPS is the sole owner of pod lifecycle
+# (see docs/superpowers/specs/2026-08-30-telegram-batch-control-design.md).
+# Two machines both provisioning is the same drift class check-job-types.mjs
+# exists to stop — and here it costs $0.99/hour, not a confusing error.
+#
+# Ask RunPod, not the lease file. This guard checked `[ -f batch/pod-lease.json ]`
+# until 2026-08-31, but that file is written by drain.py ON THE VPS and is
+# gitignored — it can never exist on the Mac, which is the only machine this
+# guard runs on. It had therefore never fired once. RunPod is the single piece of
+# state both machines share, and it needs no synchronisation to read.
+#
+# Non-blocking and silent on any failure: gpu-preflight is the FREE check that
+# runs before spending, so it must never be the thing that breaks. A missing or
+# unauthenticated runpodctl already has its own blocking check above.
+#
+# "motion-transfer" below is the same literal as pod-provision.sh:393 and
+# DESTROYABLE_NAMES in scripts/batchlib_ext/watchdog.py:31 — a rename means all
+# three. Getting it wrong here costs a missing warning, not a wrong destroy.
+if [ "$provider" = "runpod" ] && command -v runpodctl >/dev/null 2>&1; then
+  LIVE_PODS="$(runpodctl pod list -o json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    pods = json.load(sys.stdin)
+except Exception:
+    pods = []
+if not isinstance(pods, list):
+    pods = []
+print(" ".join(str(p.get("id", "?")) for p in pods
+                if isinstance(p, dict) and p.get("name") == "motion-transfer"))
+' 2>/dev/null)" || LIVE_PODS=""
+  if [ -n "$LIVE_PODS" ]; then
+    echo -e "${Y}! a live 'motion-transfer' pod already exists: $LIVE_PODS${X}"
+    echo -e "${D}   The VPS owns pod lifecycle. If the VPS rented this, do NOT run gpu-provision${X}"
+    echo -e "${D}   or gpu-destroy here — you would double-rent, or kill a batch mid-run.${X}"
+    echo -e "${D}   Check first:  ssh <vps> 'cd /opt/motion-clone && make watchdog-dry'${X}"
+  fi
+fi
+
 if [ "$blocking" -gt 0 ]; then
   echo
   echo -e "${R}${blocking} blocking issue(s) — fix before renting. Everything above is free to fix now.${X}"

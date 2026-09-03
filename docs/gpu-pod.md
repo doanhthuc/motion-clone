@@ -1476,6 +1476,21 @@ cứng (exit 1) — và manifest cố ý **không** bị ghi đè lúc đó, đ�
   restart nhiều lần trong một job. Phần mềm để `MTC_PREBUILT=1` lo.
 
 <a id="volume-migrate"></a>
+
+> **Từ 2026-09-02 có đường tự động**: `python3 scripts/volume_migrate.py --to-dc EU-CZ-1 --yes`
+> làm đúng 6 bước dưới đây (tạo volume mới, 2 pod CPU tạm, rsync, verify checksum, xoá volume cũ
+> CHỈ khi khớp 100%, luôn destroy 2 pod tạm) và báo tiến độ qua bot Telegram. Runbook tay dưới đây
+> vẫn giữ lại làm tài liệu tham khảo / phương án khi script không chạy được (thiếu RUNPOD_API_KEY,
+> muốn kiểm soát từng bước bằng tay, …). Thiết kế: docs/superpowers/specs/2026-09-02-volume-
+> region-migration-design.md.
+>
+> **This script's own throughput has never been measured.** The "Tốc độ đo thật (29/08/2026)" table
+> immediately below measures `dd|ssh cat` (~427MB/s, ~3 min for 79GB) — NOT `rsync`, and not this
+> script: it runs `rsync -aR` at 8 threads on a 4-vCPU CPU pod, a configuration nobody has timed
+> (the one `rsync` measurement, ~94MB/s at 4 threads, was on a 2-vCPU pod and was CPU-bound, which
+> is exactly what the extra vCPUs are meant to fix). Do not attribute ~427MB/s to this script. The
+> first real run must have its measured number written in here.
+
 ### Thu nhỏ hoặc đổi datacenter volume — không resize tại chỗ được
 
 RunPod chỉ cho **tăng** dung lượng (`network-volume update` báo lỗi nếu size mới nhỏ hơn cũ) và
@@ -1546,8 +1561,16 @@ giá trị cũ — lúc đó `delete-network-volume` mới thành công.
 **Vì sao không giữ sẵn volume dự phòng ở EU-CZ-1.** Với tần suất hết 5090 ở EU-RO-1 **hiếm** (vài
 lần/tháng hoặc ít hơn — đo bằng cảm nhận thực tế, không phải số liệu RunPod), giữ volume dự phòng
 thường trực tốn ~$7/tháng ([giá thật](#network-volume) ~$0,07/GB/tháng) **cộng** phải nhớ đồng bộ
-lại mỗi lần đổi model ở volume chính — trong khi chờ ~25-30 phút di chuyển theo yêu cầu (có giới
-hạn rõ ràng, khác hẳn kiểu chờ vô thời hạn của serverless `throttled`) chỉ xảy ra vài lần/tháng.
+lại mỗi lần đổi model ở volume chính — trong khi di chuyển theo yêu cầu chỉ mất **~15-25 phút
+end-to-end**, và chỉ xảy ra vài lần/tháng. Cả hai đều có giới hạn rõ ràng, khác hẳn kiểu chờ vô
+thời hạn của serverless `throttled`.
+
+> Con số cũ ở đoạn này là **~25-30 phút**, ngoại suy từ phép đo 1 luồng (~57MB/s) và đã bị chính
+> [bảng đo 29/08/2026](#volume-migrate) ở trên thay thế: **sync 79GB chỉ ~3 phút** ở 8 luồng
+> `dd|ssh cat` (~427MB/s). Phần còn lại của ~15-25 phút **không phải đường truyền** mà là boot 2 pod
+> CPU tạm, verify `rsync -avnc` checksum trên 79GB, rồi provision + bootstrap pod GPU thật. Sửa
+> 30/08/2026 sau khi đoạn văn này bị dùng để ra quyết định bằng số cũ.
+
 Quyết định: **on-demand**, không standing backup. Chạy xong việc thì xoá luôn volume tạm ở
 EU-CZ-1 — output đã tải về laptop, không cần giữ lại data đã chạy.
 
