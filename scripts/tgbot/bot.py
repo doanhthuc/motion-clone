@@ -48,7 +48,7 @@ from tgbot.preview import sheet, slot_preview
 from tgbot.run import (LEASE_PATH, _RUNNING, drain_running, estimate_minutes,
                        final_files, lease_for, progress_text, start_drain,
                        summary_text)
-from batchlib_ext.gpu_stock import stock_at, volume_datacenter
+from batchlib_ext.gpu_stock import stock_at, stock_at_cached, volume_datacenter
 from batchlib_ext.handoff import handoff_path, mailbox_path, read_handoff
 from batchlib_ext.lease import clear_lease
 from batchlib_ext.migrate_lease import read_migrate_lease
@@ -145,38 +145,34 @@ _CONFIRM_WARNED: set[int] = set()
 # a phone is readable.
 STAGING_DIR_NAME = "tg-staging"
 
-# Every message kind that is NOT the File path, and so must be refused.
+# Message kinds with no accept path at all: no width/height/bitrate ffprobe
+# can read from a sticker or a voice note, so there is nothing to warn about,
+# only refuse.
 #
-# Measured 2026-08-31, sending out/2026-08-23-1540/_final/nhanvat1__dandong-3.mp4
-# from the iPhone client twice. As a File: 24,558,897 bytes in, 24,558,897 out,
-# sha256 identical. Through the Photo/Video tab with its "1080p" option: the
-# frame (1088x1920) and the frame count (444) both survive untouched, but the
-# bitrate is HALVED — 13,196 -> 6,603 kbps — and 49.8% of the bytes are gone.
-# So the loss this refusal prevents is not a smaller picture, it is every frame
-# re-compressed: invisible in a file listing, invisible in a still, and exactly
-# what this repo's chroma/exposure/jitter measurements are sensitive to.
-#
-# `video` is why this list exists rather than a bare `msg.get("photo")` check.
-# The Photo/Video tab is the iOS default and its "1080p" label reads as
-# lossless, so it is the first mistake a real user makes — it was the first
-# mistake made while measuring the above. A `video` matched neither the photo
-# branch nor the document branch, fell through to the text handlers as "",
-# matched no command, and the bot replied NOTHING AT ALL. Silence on the most
-# likely wrong move is worse than the quality loss it hides.
-NON_FILE_MEDIA = ("photo", "video", "animation", "audio",
-                  "voice", "video_note", "sticker")
+# `photo` and `video` used to be refused here too — see _RECOMPRESSION_COST
+# for the 2026-08-31 measurement that justified it, and git history for the
+# refusal text. Relaxed 2026-09-03 at the user's explicit request, after being
+# shown that same measurement again: TikTok-sourced drivers are re-sent often
+# enough that "send it again as a File" was the friction complained about, not
+# a one-off mistake. `video` is still handled explicitly rather than falling
+# through to the document branch, for the same reason it was ever added to
+# this list: it is the iOS Photo/Video tab's default for a driver, and a kind
+# neither branch recognises answers with silence, not a refusal.
+NON_FILE_MEDIA = ("animation", "audio", "voice", "video_note", "sticker")
 
-# What each wrong path actually costs, so the refusal argues from a number
-# instead of from authority. Measured 2026-08-31 from the iPhone client, one
-# file sent every available way.
+# What arriving as `photo` or `video` instead of a File actually costs, so the
+# warning below argues from a number instead of from authority. Measured
+# 2026-08-31 from the iPhone client, one file sent every available way.
 #
 # Images come out worse than video, and in three ways at once: Telegram caps
 # the long edge at 2560 (the source was 2720, so even "high quality" shrinks
 # it), converts PNG to JPEG — lossless to lossy, with chroma subsampling — and
-# compresses ~50x. That last part is why relaxing this rule for images was
-# considered and rejected: try-on consumes the character image directly, and
-# this repo's background-chroma measurements assume the colour was not
-# subsampled on the way in.
+# compresses ~50x. That is also why a recompressed PHOTO gets no OTHER
+# warning: quality_warning()/quality_warning_html() only ever measure video
+# bitrate (ingest.py's _per_megapixel), so this inline notice is the only
+# signal a photo recompression ever produces — try-on consumes the character
+# image directly, and this repo's background-chroma measurements assume the
+# colour was not subsampled on the way in.
 #
 # Kinds with no row here get a claim with no number attached, deliberately:
 # saying "measured" about something never measured is how the 20-30MB error in
@@ -1557,7 +1553,7 @@ def _panel_next_line(chat_id: int, job: Job) -> str:
         # (measured once, on one batch) — this function only computes the
         # number". Carried here verbatim when _manifest_summary was folded into
         # the panel (2026-09-01) rather than dropped as clutter.
-        return (f"{head} · ready · ⏱ ~{minutes} min · 💸 $0.99/hour"
+        return (f"{head} · ready · ⏱ ~{minutes} min · {_panel_cost_str()}"
                 "\n<i>estimate measured once on one batch — not a promise</i>")
     if verdict is False:
         return f"{head} · {ICON_WARN} did not pass <code>batch-validate</code>"
@@ -1655,8 +1651,9 @@ def _panel_buttons(chat_id: int, job: Job) -> list[list[tuple[str, str]]]:
     queued = _jobs_for(chat_id)
     basket = _BASKET.get(chat_id) or []
     if queued and not (_PENDING.get(chat_id) or []) and _LAST_VALIDATE.get(chat_id) is True:
-        run = [(f"▶️ Run {len(queued)} · $0.99/h" if len(queued) > 1
-                else "▶️ Run · $0.99/h", _CB_RUN_ASK)]
+        price = _panel_price()
+        run = [(f"▶️ Run {len(queued)} · ${price:.2f}/h" if len(queued) > 1
+                else f"▶️ Run · ${price:.2f}/h", _CB_RUN_ASK)]
         # Offered beside Run, not instead of it: one pod runs everything in the
         # manifest, so adding another job costs nothing but the render itself.
         if not missing_slots(job):
@@ -2608,7 +2605,7 @@ def _report_gpu_stock(tg: Tg, chat_id: int) -> None:
     home_dc = volume_datacenter(volume_id)
     wanted = [_PRIMARY_GPU_ID, *_FALLBACK_GPU_IDS]
     try:
-        stock = stock_at(wanted)
+        stock = stock_at_cached(wanted)
     except RuntimeError as exc:
         tg.send_message(chat_id, f"couldn't reach runpodctl: {exc}")
         return
@@ -2666,6 +2663,57 @@ def _gpu_price(gpu_id: str, stock: dict) -> float:
     """
     entries = stock.get(gpu_id)
     return entries[0].price_per_hr if entries and entries[0].price_per_hr else 0.99
+
+
+def _panel_cost_str() -> str:
+    """Price + live stock for whichever GPU is configured right now, for the
+    panel's ready-line (_panel_next_line) and its Run button (_panel_buttons)
+    — replacing the flat assumed "$0.99/hour" both used to show with no GPU
+    or region attached (2026-09-03: "hiện run nhưng không thấy có thông tin
+    nào về gpu nào đang chọn ở vùng nào cùng stock").
+
+    Backed by stock_at_cached (60s TTL) rather than stock_at — the panel
+    redraws on nearly every action while a batch is assembled, and a live
+    check with no caching would mean a runpodctl round trip per file upload,
+    per slot answer, per pipeline switch. Fails open to the old flat
+    placeholder on any lookup failure or missing config, exactly like
+    _offer_run_confirm: an informational number must never be the reason the
+    panel itself breaks.
+    """
+    configured = env_get(ROOT / ".env", "GPU") or _PRIMARY_GPU_ID
+    volume_id = env_get(ROOT / ".env", "POD_VOLUME_ID")
+    home_dc = volume_datacenter(volume_id)
+    if not home_dc:
+        return "💸 $0.99/hour"
+    wanted = [_PRIMARY_GPU_ID, *_FALLBACK_GPU_IDS]
+    try:
+        stock = stock_at_cached(wanted)
+    except RuntimeError:
+        return "💸 $0.99/hour"
+    price = _gpu_price(configured, stock)
+    entries = stock.get(configured) or []
+    home = next((e for e in entries if e.datacenter_id == home_dc), None)
+    if home is None:
+        return f"💸 ${price:.2f}/hour ({_esc(configured)} not listed at {_esc(home_dc)})"
+    icon = _STOCK_ICON.get(home.stock_status.lower(), "⬜")
+    return f"💸 ${price:.2f}/h · {icon} {_esc(home.display_name)} @ {_esc(home_dc)}"
+
+
+def _panel_price() -> float:
+    """Just the $/h number behind _panel_cost_str, for the Run button's label
+    — a Telegram inline button can't carry the icon/region detail, and the
+    button's price must never drift from what the ready-line above it says.
+    """
+    configured = env_get(ROOT / ".env", "GPU") or _PRIMARY_GPU_ID
+    volume_id = env_get(ROOT / ".env", "POD_VOLUME_ID")
+    if not volume_datacenter(volume_id):
+        return 0.99
+    wanted = [_PRIMARY_GPU_ID, *_FALLBACK_GPU_IDS]
+    try:
+        stock = stock_at_cached(wanted)
+    except RuntimeError:
+        return 0.99
+    return _gpu_price(configured, stock)
 
 
 def _migrate_lease_path() -> Path:
@@ -2794,7 +2842,7 @@ def _offer_run_confirm(tg: Tg, chat_id: int) -> None:
     home_dc = volume_datacenter(volume_id)
     wanted = [_PRIMARY_GPU_ID, *_FALLBACK_GPU_IDS]
     try:
-        stock = stock_at(wanted) if home_dc else {}
+        stock = stock_at_cached(wanted) if home_dc else {}
     except RuntimeError:
         stock = {}
 
@@ -3270,8 +3318,8 @@ def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
     _LAST_SEEN[chat_id] = max(_LAST_SEEN.get(chat_id, 0), msg.get("message_id") or 0)
 
     # Accepting any of these would put a silently degraded input into a
-    # $0.99/hour render; ignoring them leaves the user watching a chat that
-    # never answers. See NON_FILE_MEDIA for the measurement.
+    # $0.99/hour render, with no answer this bot could ever give — there is
+    # nothing to probe on a sticker or a voice note. See NON_FILE_MEDIA.
     kind = next((k for k in NON_FILE_MEDIA if msg.get(k)), None)
     if kind:
         cost = _RECOMPRESSION_COST.get(kind)
@@ -3290,7 +3338,27 @@ def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
         return
 
     doc = msg.get("document")
-    if doc:
+    photo = msg.get("photo")
+    video = msg.get("video")
+    # photo/video are accepted despite the recompression measured above —
+    # relaxed 2026-09-03 (see NON_FILE_MEDIA's comment). `recompressed` names
+    # which one, purely so the warning after staging can quote the right cost;
+    # it changes nothing else about how the file is handled from here on.
+    recompressed: str | None = None
+    if video:
+        media, file_name = video, video.get("file_name")
+        recompressed = "video"
+    elif photo:
+        # Every size Telegram generated for this photo, smallest first — take
+        # the largest so an accepted photo is at least the best copy Telegram
+        # kept, never the ~0.6%-of-original default. Photos carry no
+        # file_name; _stage_file falls back to the getFile path's own name.
+        media, file_name = max(photo, key=lambda ps: ps.get("file_size") or 0), None
+        recompressed = "photo"
+    else:
+        media, file_name = doc, (doc.get("file_name") if doc else None)
+
+    if media:
         # Every step from getFile to probe is inside this try (finding I1,
         # 2026-08-31). Only probe() used to be: a TgError from getFile, a
         # KeyError on a missing file_path, and every carefully worded message
@@ -3307,10 +3375,9 @@ def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
         # "uploading" indicator disappears after ~5s and nothing here ever
         # refreshed it, so anything slower than that read as stuck again.
         try:
-            with _spinner(tg, chat_id,
-                         f"checking {doc.get('file_name') or 'the file'}"):
-                src = Path(tg.call("getFile", file_id=doc["file_id"])["file_path"])
-                path = _stage_file(chat_id, src, doc.get("file_name"))
+            with _spinner(tg, chat_id, f"checking {file_name or 'the file'}"):
+                src = Path(tg.call("getFile", file_id=media["file_id"])["file_path"])
+                path = _stage_file(chat_id, src, file_name)
                 path = to_png_if_heic(path)
                 p = probe(path)
                 # Inside the try, not one line below it (finding D, 2026-08-31).
@@ -3328,6 +3395,14 @@ def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
             # silently pick a wrong preset or a wrong slot.
             tg.send_message(chat_id, f"that file was not accepted: {exc}")
             return
+
+        if recompressed:
+            cost = _RECOMPRESSION_COST.get(recompressed)
+            tg.send_message(chat_id,
+                            f"⚠️ that arrived as a {recompressed}, not a File — "
+                            f"measured 2026-08-31, {cost}. Accepted anyway; "
+                            "send it again as a File if this run doesn't come "
+                            "out right.")
 
         _CONFIRM_WARNED.discard(chat_id)
 

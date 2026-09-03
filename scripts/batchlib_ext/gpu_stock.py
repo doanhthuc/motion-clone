@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
 from dataclasses import dataclass
 
 _TIMEOUT_SEC = 30   # a stock query is one HTTP round trip behind runpodctl;
@@ -92,4 +93,47 @@ def stock_at(gpu_ids: list[str]) -> dict[str, list[Stock]]:
             for dc in row.get("dataCenterAvailability") or []
         ]
         result[gpu_id] = entries
+    return result
+
+
+_CACHE_TTL_SEC = 60.0
+# keyed on the exact gpu_ids tuple asked for, so bot.py's three call sites
+# (the panel, /confirm, /gpu) share one warm entry as long as they all ask
+# for the same list — which they do, [_PRIMARY_GPU_ID, *_FALLBACK_GPU_IDS].
+_cache: dict[tuple[str, ...], tuple[float, dict[str, list[Stock]]]] = {}
+
+
+def stock_at_cached(gpu_ids: list[str], *, ttl: float = _CACHE_TTL_SEC
+                    ) -> dict[str, list[Stock]]:
+    """stock_at, but skips the runpodctl round trip if the same gpu_ids were
+    asked for within the last `ttl` seconds.
+
+    Exists because the Telegram bot's panel redraws on nearly every action
+    while a batch is assembled — a file upload, a slot answer, a pipeline
+    switch — and stock_at() has no caching of its own: each call is a real
+    subprocess + HTTP round trip, up to _TIMEOUT_SEC before it even times
+    out. Without this, showing live GPU/price/stock on the panel (rather
+    than the flat assumed price it used to show, see bot.py's
+    _panel_cost_str) would hammer runpodctl on every keystroke-equivalent
+    edit. ttl=60 (2026-09-03): a batch is normally assembled in well under a
+    minute, and a price/stock swing inside 60s has never been observed in
+    this repo's own usage.
+
+    A cold cache still raises stock_at's own RuntimeError — there is
+    nothing to fall back to. A WARM cache is returned even when the live
+    call currently fails, on the theory that a slightly stale number beats
+    turning a working panel into a broken one because RunPod hiccuped.
+    """
+    key = tuple(gpu_ids)
+    now = time.monotonic()
+    cached = _cache.get(key)
+    if cached is not None and now - cached[0] < ttl:
+        return cached[1]
+    try:
+        result = stock_at(gpu_ids)
+    except RuntimeError:
+        if cached is not None:
+            return cached[1]
+        raise
+    _cache[key] = (now, result)
     return result

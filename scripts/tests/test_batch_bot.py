@@ -78,6 +78,23 @@ def media_from(user_id: int, kind: str) -> dict:
                         "message_id": next_message_id(), kind: payload}}
 
 
+def video_from(user_id: int, file_id: str, file_name: str | None = None) -> dict:
+    video = {"file_id": file_id}
+    if file_name is not None:
+        video["file_name"] = file_name
+    return {"message": {"from": {"id": user_id}, "chat": {"id": user_id},
+                        "message_id": next_message_id(), "video": video}}
+
+
+def photo_from(user_id: int, *sizes: tuple[str, int]) -> dict:
+    """One PhotoSize per (file_id, file_size) pair, smallest first — the same
+    order the Bot API actually sends. The bot is expected to fetch the
+    largest, never the first."""
+    photo = [{"file_id": fid, "file_size": size} for fid, size in sizes]
+    return {"message": {"from": {"id": user_id}, "chat": {"id": user_id},
+                        "message_id": next_message_id(), "photo": photo}}
+
+
 def cb_from(user_id: int, data: str, cb_id: str = "cb1") -> dict:
     # A callback_query keeps its sender at callback_query.from and its chat at
     # callback_query.message.chat — NOT at message.from. That difference is
@@ -354,31 +371,11 @@ class TestAllowed(unittest.TestCase):
 
 
 class TestNonFileMediaIsRefused(unittest.TestCase):
-    """Measured 2026-08-31 by sending the same driver from the same iPhone
-    twice. As a File: 24,558,897 bytes in and out, sha256 identical. Through
-    the Photo/Video tab's "1080p" option: 1088x1920 and 444 frames both
-    survive, the bitrate is halved (13,196 -> 6,603 kbps) and 49.8% of the
-    bytes are gone — a loss invisible in a file listing and in a still.
-
-    Before NON_FILE_MEDIA only `photo` was checked. A `video` — which is what
-    that tab produces for a driver, and the first mistake made while taking
-    the measurement above — matched neither media branch, fell through to the
-    text handlers as "", matched no command, and drew NO reply at all. The
-    user waits on a bot that never saw the file.
+    """`photo` and `video` moved to TestPhotoVideoAccepted 2026-09-03 — they
+    are no longer refused. What is left here (animation/audio/voice/
+    video_note/sticker) has no accept path at all: there is nothing to
+    ffprobe on a sticker or a voice note.
     """
-
-    def test_a_video_is_refused_rather_than_silently_ignored(self):
-        tg = FakeTg()
-        bot.handle(tg, media_from(ME, "video"), allowed_user_id=ME)
-        self.assertEqual(len(tg.messages), 1)
-        self.assertIn("not a File", tg.messages[0])
-        self.assertIn("video", tg.messages[0])
-
-    def test_a_photo_is_still_refused(self):
-        tg = FakeTg()
-        bot.handle(tg, media_from(ME, "photo"), allowed_user_id=ME)
-        self.assertEqual(len(tg.messages), 1)
-        self.assertIn("paperclip", tg.messages[0])
 
     def test_every_refusal_names_send_as_file(self):
         # Verified 2026-08-31 that the iOS picker offers "Send as File", so the
@@ -390,21 +387,6 @@ class TestNonFileMediaIsRefused(unittest.TestCase):
                 tg = FakeTg()
                 bot.handle(tg, media_from(ME, kind), allowed_user_id=ME)
                 self.assertIn("Send as File", tg.messages[0])
-
-    def test_the_photo_refusal_quotes_the_image_measurement(self):
-        # Images are damaged differently from video — downscaled AND converted
-        # PNG->JPEG — so quoting the video bitrate figure at them, as the first
-        # version of this branch did, is a wrong claim in a user-facing string.
-        tg = FakeTg()
-        bot.handle(tg, media_from(ME, "photo"), allowed_user_id=ME)
-        self.assertIn("1445x2560", tg.messages[0])
-        self.assertNotIn("6,603", tg.messages[0])
-
-    def test_the_video_refusal_quotes_the_video_measurement(self):
-        tg = FakeTg()
-        bot.handle(tg, media_from(ME, "video"), allowed_user_id=ME)
-        self.assertIn("6,603", tg.messages[0])
-        self.assertNotIn("1445x2560", tg.messages[0])
 
     def test_an_unmeasured_kind_does_not_claim_a_measurement(self):
         # `voice` has no row in _RECOMPRESSION_COST. Saying "measured" about
@@ -428,12 +410,95 @@ class TestNonFileMediaIsRefused(unittest.TestCase):
                 # any method, so a getFile here would fail this test loudly.
                 self.assertEqual(tg.documents, [])
 
-    def test_a_stranger_sending_a_video_still_gets_silence(self):
+    def test_a_stranger_sending_a_sticker_still_gets_silence(self):
         # allowed() runs before this branch and must keep doing so — a refusal
         # message would confirm to a stranger that the bot exists.
         tg = FakeTg()
-        bot.handle(tg, media_from(99999, "video"), allowed_user_id=ME)
+        bot.handle(tg, media_from(99999, "sticker"), allowed_user_id=ME)
         self.assertEqual(tg.messages, [])
+
+
+class TestPhotoVideoAccepted(unittest.TestCase):
+    """2026-09-03: relaxed at the user's explicit request, after being shown
+    the same 2026-08-31 measurement that used to justify refusing these (see
+    _RECOMPRESSION_COST) — TikTok-sourced drivers get re-sent through the
+    Photo/Video tab often enough that "send it again as a File" was the
+    friction being complained about, not a one-off mistake.
+    """
+
+    def setUp(self):
+        self._orig_root = bot.ROOT
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "batch").mkdir()
+        (self.root / "out").mkdir()
+        bot.ROOT = self.root
+        reset_bot_state()
+        bot._LAST_VALIDATE.clear()
+        bot._CONFIRM_WARNED.clear()
+        self.addCleanup(setattr, bot, "ROOT", self._orig_root)
+        self.addCleanup(reset_bot_state)
+
+        self.driver_path = self.root / "driver.mp4"
+        self.driver_path.write_bytes(b"d")
+        self.image_path = self.root / "photo.jpg"
+        self.image_path.write_bytes(b"i")
+
+        self.tg = FakeTg()
+        self.tg.file_paths = {"vid-id": str(self.driver_path),
+                              "photo-id": str(self.image_path)}
+        self.driver_probe = Probe(kind="video", width=1080, height=1920, duration_s=5.0,
+                                  bitrate_kbps=3000, size_bytes=1_500_000)
+        self.image_probe = Probe(kind="image", width=1024, height=1024, duration_s=0.0,
+                                 bitrate_kbps=0, size_bytes=800_000)
+        for name in ("slot_preview", "sheet"):
+            patcher = mock.patch(f"tgbot.bot.{name}", return_value=None)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_a_video_is_accepted_with_a_recompression_warning(self):
+        with mock.patch("tgbot.bot.probe", return_value=self.driver_probe):
+            bot.handle(self.tg, video_from(ME, "vid-id"), allowed_user_id=ME)
+        warning = next(m for m in self.tg.messages if "not a File" in m)
+        self.assertIn("video", warning)
+        self.assertIn("6,603", warning)
+        self.assertIn("Accepted anyway", warning)
+
+    def test_a_video_is_staged_and_filled_as_the_driver_slot(self):
+        # A video needs no question (job.slot_for: "structural, always
+        # driver") — the same behaviour as a document, unaffected by which
+        # picker sent it.
+        with mock.patch("tgbot.bot.probe", return_value=self.driver_probe):
+            bot.handle(self.tg, video_from(ME, "vid-id"), allowed_user_id=ME)
+        self.assertEqual(bot._STATE[ME].slots["driver"].parent,
+                         self.root / "batch" / bot.STAGING_DIR_NAME / str(ME))
+
+    def test_a_photo_is_accepted_with_a_recompression_warning(self):
+        with mock.patch("tgbot.bot.probe", return_value=self.image_probe):
+            bot.handle(self.tg, photo_from(ME, ("photo-id", 100)), allowed_user_id=ME)
+        warning = next(m for m in self.tg.messages if "not a File" in m)
+        self.assertIn("photo", warning)
+        self.assertIn("1445x2560", warning)
+        self.assertIn("Accepted anyway", warning)
+        # Images are damaged differently from video — downscaled AND
+        # converted PNG->JPEG — so quoting the video bitrate figure here, as
+        # the first version of the old refusal did, is a wrong claim.
+        self.assertNotIn("6,603", warning)
+
+    def test_the_largest_photo_size_is_the_one_fetched(self):
+        # Smallest first, as the Bot API actually sends them. "small-id" is
+        # deliberately absent from file_paths: if the bot ever fetched it
+        # instead, FakeTg.call's dict lookup raises KeyError and the reply
+        # below becomes "that file was not accepted: ...", not a warning.
+        msg = photo_from(ME, ("small-id", 10), ("photo-id", 999))
+        with mock.patch("tgbot.bot.probe", return_value=self.image_probe):
+            bot.handle(self.tg, msg, allowed_user_id=ME)
+        self.assertFalse(any("not accepted" in m for m in self.tg.messages))
+
+    def test_a_document_draws_no_recompression_warning(self):
+        with mock.patch("tgbot.bot.probe", return_value=self.driver_probe):
+            bot.handle(self.tg, doc_from(ME, "vid-id", file_name="driver.mp4"),
+                       allowed_user_id=ME)
+        self.assertFalse(any("not a File" in m for m in self.tg.messages))
 
 
 class TestPipelineCommand(unittest.TestCase):
@@ -1255,7 +1320,7 @@ class TestFlow(unittest.TestCase):
         with mock.patch("tgbot.bot.start_drain") as start_drain, \
              mock.patch("tgbot.bot.drain_running", return_value=False), \
              mock.patch("tgbot.bot.volume_datacenter", return_value=None), \
-             mock.patch("tgbot.bot.stock_at", return_value={}):
+             mock.patch("tgbot.bot.stock_at_cached", return_value={}):
             self._fill_required_slots()
             bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
             start_drain.assert_not_called()     # first tap only asks
@@ -1295,7 +1360,7 @@ class TestFlow(unittest.TestCase):
         # deciding an alternative isn't good enough to offer.
         with mock.patch("tgbot.bot.drain_running", return_value=False), \
              mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
-             mock.patch("tgbot.bot.stock_at",
+             mock.patch("tgbot.bot.stock_at_cached",
                        return_value=self._stock_5090_low_4090_ok()):
             self._fill_required_slots()
             bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
@@ -1333,7 +1398,7 @@ class TestFlow(unittest.TestCase):
         }
         with mock.patch("tgbot.bot.drain_running", return_value=False), \
              mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
-             mock.patch("tgbot.bot.stock_at", return_value=stock):
+             mock.patch("tgbot.bot.stock_at_cached", return_value=stock):
             self._fill_required_slots()
             bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
         text = self.tg.messages[-1]
@@ -1367,7 +1432,7 @@ class TestFlow(unittest.TestCase):
         }
         with mock.patch("tgbot.bot.drain_running", return_value=False), \
              mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
-             mock.patch("tgbot.bot.stock_at", return_value=stock), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=stock), \
              mock.patch("tgbot.bot.migration_running", return_value=False):
             self._fill_required_slots()
             bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
@@ -1392,7 +1457,7 @@ class TestFlow(unittest.TestCase):
         with mock.patch("tgbot.bot._FALLBACK_GPU_IDS", (unknown,)), \
              mock.patch("tgbot.bot.drain_running", return_value=False), \
              mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
-             mock.patch("tgbot.bot.stock_at", return_value={
+             mock.patch("tgbot.bot.stock_at_cached", return_value={
                  "NVIDIA GeForce RTX 5090": stock["NVIDIA GeForce RTX 5090"],
                  unknown: [Stock(gpu_id=unknown, display_name="H200 NVL",
                                  price_per_hr=3.99, datacenter_id="EU-CZ-1",
@@ -1615,7 +1680,7 @@ class TestFlow(unittest.TestCase):
             "GPU=NVIDIA GeForce RTX 5090\nPOD_VOLUME_ID=vol-1\n", encoding="utf-8")
         with mock.patch("tgbot.bot.drain_running", return_value=False), \
              mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
-             mock.patch("tgbot.bot.stock_at",
+             mock.patch("tgbot.bot.stock_at_cached",
                        return_value=self._stock_5090_low_4090_ok()):
             self._fill_required_slots()
             bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
@@ -1634,7 +1699,7 @@ class TestFlow(unittest.TestCase):
         with mock.patch("tgbot.bot.start_drain") as start_drain, \
              mock.patch("tgbot.bot.drain_running", return_value=False), \
              mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
-             mock.patch("tgbot.bot.stock_at",
+             mock.patch("tgbot.bot.stock_at_cached",
                        return_value=self._stock_5090_low_4090_ok()):
             self._fill_required_slots()
             bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
@@ -1657,7 +1722,7 @@ class TestFlow(unittest.TestCase):
         }
         with mock.patch("tgbot.bot.drain_running", return_value=False), \
              mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
-             mock.patch("tgbot.bot.stock_at", return_value=elsewhere_only):
+             mock.patch("tgbot.bot.stock_at_cached", return_value=elsewhere_only):
             self._fill_required_slots()
             bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
         text = self.tg.messages[-1]
@@ -1670,7 +1735,7 @@ class TestFlow(unittest.TestCase):
     def test_a_stock_check_failure_fails_open_to_the_plain_confirm(self):
         with mock.patch("tgbot.bot.drain_running", return_value=False), \
              mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
-             mock.patch("tgbot.bot.stock_at", side_effect=RuntimeError("boom")):
+             mock.patch("tgbot.bot.stock_at_cached", side_effect=RuntimeError("boom")):
             self._fill_required_slots()
             bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
         self.assertIn("$0.99/hour", self.tg.messages[-1])
@@ -3548,7 +3613,7 @@ class TestGpuStockCommand(unittest.TestCase):
     def test_reports_the_5090_and_both_fallbacks_at_home(self):
         self._write_env()
         with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
-             mock.patch("tgbot.bot.stock_at", return_value=self._stock()) as stock_at:
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()) as stock_at:
             bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
         stock_at.assert_called_once_with(
             ["NVIDIA GeForce RTX 5090", "NVIDIA GeForce RTX 4090",
@@ -3565,7 +3630,7 @@ class TestGpuStockCommand(unittest.TestCase):
     def test_a_better_region_elsewhere_is_listed_and_captioned_as_not_instant(self):
         self._write_env()
         with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
-             mock.patch("tgbot.bot.stock_at", return_value=self._stock()):
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
             bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
         text = self.tg.messages[-1]
         self.assertIn("Other regions", text)
@@ -3577,7 +3642,7 @@ class TestGpuStockCommand(unittest.TestCase):
     def test_unknown_home_datacenter_shows_every_region_without_a_false_claim(self):
         self._write_env()
         with mock.patch("tgbot.bot.volume_datacenter", return_value=None), \
-             mock.patch("tgbot.bot.stock_at", return_value=self._stock()):
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
             bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
         text = self.tg.messages[-1]
         self.assertIn("volume datacenter unknown", text)
@@ -3595,7 +3660,7 @@ class TestGpuStockCommand(unittest.TestCase):
         # already running on PRO 4500.
         self._write_env(gpu="NVIDIA RTX PRO 4500 Blackwell")
         with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
-             mock.patch("tgbot.bot.stock_at", return_value=self._stock()) as stock_at:
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()) as stock_at:
             bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
         stock_at.assert_called_once_with(
             ["NVIDIA GeForce RTX 5090", "NVIDIA GeForce RTX 4090",
@@ -3609,7 +3674,7 @@ class TestGpuStockCommand(unittest.TestCase):
         # state what is selected, whatever it is.
         self._write_env(gpu="NVIDIA RTX PRO 4500 Blackwell")
         with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
-             mock.patch("tgbot.bot.stock_at", return_value=self._stock()):
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
             bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
         text = self.tg.messages[-1]
         self.assertIn("Currently selected", text)
@@ -3619,7 +3684,7 @@ class TestGpuStockCommand(unittest.TestCase):
     def test_the_currently_selected_line_shows_even_when_it_is_the_5090(self):
         self._write_env(gpu="NVIDIA GeForce RTX 5090")
         with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
-             mock.patch("tgbot.bot.stock_at", return_value=self._stock()):
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
             bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
         text = self.tg.messages[-1]
         self.assertIn("Currently selected", text)
@@ -3628,7 +3693,7 @@ class TestGpuStockCommand(unittest.TestCase):
     def test_stock_words_carry_a_coloured_icon(self):
         self._write_env()
         with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
-             mock.patch("tgbot.bot.stock_at", return_value=self._stock()):
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
             bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
         text = self.tg.messages[-1]
         self.assertIn("🟠", text)   # Low, at home
@@ -3638,27 +3703,27 @@ class TestGpuStockCommand(unittest.TestCase):
     def test_price_carries_a_money_emoji(self):
         self._write_env()
         with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
-             mock.patch("tgbot.bot.stock_at", return_value=self._stock()):
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
             bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
         self.assertIn("💵 $0.99/h", self.tg.messages[-1])
 
     def test_works_even_with_no_env_file_at_all(self):
         with mock.patch("tgbot.bot.volume_datacenter", return_value=None), \
-             mock.patch("tgbot.bot.stock_at", return_value=self._stock()):
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
             bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
         self.assertIn("RTX 5090", self.tg.messages[-1])
 
     def test_a_runpodctl_failure_is_reported_rather_than_raised(self):
         self._write_env()
         with mock.patch("tgbot.bot.volume_datacenter", return_value=None), \
-             mock.patch("tgbot.bot.stock_at", side_effect=RuntimeError("boom")):
+             mock.patch("tgbot.bot.stock_at_cached", side_effect=RuntimeError("boom")):
             bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
         self.assertIn("couldn't reach runpodctl", self.tg.messages[-1])
 
     def test_an_unlisted_gpu_says_so_rather_than_going_silent(self):
         self._write_env()
         with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
-             mock.patch("tgbot.bot.stock_at", return_value={}):
+             mock.patch("tgbot.bot.stock_at_cached", return_value={}):
             bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
         self.assertIn("not listed", self.tg.messages[-1])
 

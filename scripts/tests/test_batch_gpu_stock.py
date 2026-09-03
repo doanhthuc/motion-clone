@@ -6,7 +6,8 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from batchlib_ext.gpu_stock import Stock, stock_at, volume_datacenter
+from batchlib_ext import gpu_stock
+from batchlib_ext.gpu_stock import Stock, stock_at, stock_at_cached, volume_datacenter
 
 _GPU_LIST_JSON = json.dumps([
     {"gpuId": "NVIDIA GeForce RTX 5090", "displayName": "RTX 5090",
@@ -118,6 +119,47 @@ class TestStockAt(unittest.TestCase):
     def test_a_hung_runpodctl_raises_runtime_error(self, _run):
         with self.assertRaises(RuntimeError):
             stock_at(["NVIDIA GeForce RTX 5090"])
+
+
+class TestStockAtCached(unittest.TestCase):
+    def setUp(self):
+        gpu_stock._cache.clear()
+
+    @patch("subprocess.run")
+    def test_a_second_call_within_ttl_skips_the_subprocess(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout=_GPU_LIST_JSON, stderr="")
+        first = stock_at_cached(["NVIDIA GeForce RTX 5090"])
+        second = stock_at_cached(["NVIDIA GeForce RTX 5090"])
+        self.assertEqual(mock_run.call_count, 1)
+        self.assertEqual(first, second)
+
+    @patch("subprocess.run")
+    def test_a_different_gpu_id_list_is_a_separate_cache_key(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout=_GPU_LIST_JSON, stderr="")
+        stock_at_cached(["NVIDIA GeForce RTX 5090"])
+        stock_at_cached(["NVIDIA GeForce RTX 4090"])
+        self.assertEqual(mock_run.call_count, 2)
+
+    @patch("subprocess.run")
+    def test_a_call_past_ttl_hits_the_subprocess_again(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout=_GPU_LIST_JSON, stderr="")
+        stock_at_cached(["NVIDIA GeForce RTX 5090"], ttl=0.0)
+        stock_at_cached(["NVIDIA GeForce RTX 5090"], ttl=0.0)
+        self.assertEqual(mock_run.call_count, 2)
+
+    @patch("subprocess.run")
+    def test_a_failure_with_no_prior_cache_raises(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="down")
+        with self.assertRaises(RuntimeError):
+            stock_at_cached(["NVIDIA GeForce RTX 5090"])
+
+    @patch("subprocess.run")
+    def test_a_failure_after_a_warm_cache_serves_the_stale_entry(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout=_GPU_LIST_JSON, stderr="")
+        warm = stock_at_cached(["NVIDIA GeForce RTX 5090"], ttl=0.0)
+        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="down")
+        stale = stock_at_cached(["NVIDIA GeForce RTX 5090"], ttl=0.0)
+        self.assertEqual(warm, stale)
 
 
 if __name__ == "__main__":
