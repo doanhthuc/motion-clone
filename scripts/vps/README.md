@@ -5,9 +5,23 @@ The Mac is a laptop that sleeps and travels, so it cannot be that something.
 
 ## Box
 
-Hetzner CX22 or equivalent — 2 vCPU / 4 GB / 40 GB, ~EUR 4/month. Cheaper than any RunPod CPU pod,
-and not billed by the hour. 40 GB is enough for material plus `out/`; keep it that way with
-`make batch-clean KEEP=3`.
+Actual box (checked 2026-09-04): DigitalOcean `s-1vcpu-1gb` (`motion-vps`, sgp1) — 1 vCPU / 1 GB RAM /
+25 GB disk. Smaller than the Hetzner CX22 this section used to describe; whichever box you use,
+size for the same shape: cheap, not billed by the hour, no GPU (the pod is the only thing that needs
+one). 25 GB is enough for staged material plus `out/` as long as something ages tg-staging/ out —
+`STAGING_MAX_AGE_DAYS` in `tgbot/bot.py` does that automatically now; `make batch-clean KEEP=3` is the
+separate, manual one for `out/runs/`.
+
+**2 GB swapfile, added 2026-09-04.** 1 GB RAM leaves ~525 MB "available" with `telegram-bot-api`,
+`motion-bot` and `pod-watchdog` all resident, and there was no swap at all — any spike (yt-dlp having
+to transcode instead of remux, e.g.) had no cushion and would go straight to the OOM killer. No OOM
+had actually happened in the 30 days checked, so this is a safety margin, not a fix for an observed
+crash. `vm.swappiness=10` keeps it a last resort rather than something the box reaches for early:
+```bash
+fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+echo '/swapfile none swap sw 0 0' >> /etc/fstab
+echo 'vm.swappiness=10' > /etc/sysctl.d/99-swappiness.conf && sysctl vm.swappiness=10
+```
 
 ## Install
 
