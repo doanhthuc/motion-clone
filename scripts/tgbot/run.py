@@ -76,14 +76,17 @@ def estimate_minutes(job: Job) -> int:
     return max(1, round(total_sec / 60))
 
 
-# Motion inside a message can ONLY come from re-editing it. Measured against
-# the real Bot API on 2026-09-01: a `<tg-emoji>` custom-emoji entity is
-# accepted with ok:true and then silently STRIPPED (the message comes back with
-# entities:null and a plain fallback glyph) — the Bot API grants custom emoji
-# only to bots that bought a username on Fragment, and there is no error to
-# catch. Animated .tgs stickers do work, but a sticker message cannot be edited
-# at all ("message can't be edited"), so it can never be a progress display.
-# Re-editing measured at 0.48/s, 0.91/s and 2.02/s with zero rejections.
+# Motion INSIDE a progress message still can only come from re-editing it —
+# a sticker (the other thing that genuinely animates) cannot be edited at all
+# ("message can't be edited"), so it can never be a progress display, and
+# that has not changed. What DID change (re-measured 2026-09-04): a
+# `<tg-emoji>` custom-emoji entity used to come back stripped on this bot
+# (entities:null, plain fallback glyph, no error to catch) because the only
+# entitlement path known at the time was buying a username on Fragment. It
+# turns out the bot owner's own Telegram Premium subscription is a second,
+# far cheaper path — with it active, the entity survives and animates for
+# real (see bot.py's ICON_*_CE constants for where that gets used). Re-editing
+# measured at 0.48/s, 0.91/s and 2.02/s with zero rejections.
 #
 # Braille, chosen by the user on 2026-09-01 after watching BOTH options animate
 # on their own phone — braille first, then ◐◓◑◒ — not from a screenshot. Worth
@@ -92,26 +95,47 @@ def estimate_minutes(job: Job) -> int:
 # rendering check ("is it tofu?") passes them while a legibility check does
 # not. The person watching the screen for forty minutes preferred them, and
 # that is the measurement that counts here.
-#
-# Ten frames at one tick per 2s means a full cycle takes 20s and each tick
-# shifts by one dot. Advancing by a stride of 3 would make each change larger
-# while keeping the look; left alone unless the motion reads as too subtle in
-# use.
-_SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-_HOURGLASS = ("⏳", "⌛")
+# Defined locally rather than imported from tgbot.bot — bot.py imports FROM
+# this module, so the reverse import would be circular. Same
+# custom_emoji_ids as bot.py's ICON_ASK_CE / ICON_EYES_CE (NewsEmoji#76,
+# NewsEmoji#0); see bot.py's own comment for why the entity now survives
+# (Premium on the bot owner's account, re-measured 2026-09-04).
+_ICON_ASK_CE = '<tg-emoji emoji-id="5341715473882955310">⚙️</tg-emoji>'
+_ICON_EYES_CE = '<tg-emoji emoji-id="5210956306952758910">👀</tg-emoji>'
+# LoadingEmoji#40 (verified animated against the real pack 2026-09-04) — used
+# everywhere this file used to hand-cycle _SPIN/_HOURGLASS characters. It
+# spins on its own, client-side, whether or not this bot ever edits the
+# message again, which is exactly why it is decoration only now — see
+# `_elapsed()` below for what actually proves the process is still alive.
+_ICON_LOADING_CE = '<tg-emoji emoji-id="5328089410963513796">💠</tg-emoji>'
+
+
+def _elapsed(lease) -> str:
+    """mm:ss since the pod was provisioned, or "" if there is no lease yet.
+
+    This — not a moving glyph — is what proves the process is still alive.
+    An animated custom emoji spins forever once sent, dead process or not
+    (2026-09-04 finding: it animates client-side, independent of whether this
+    bot ever edits the message again), so the thing the old _SPIN/_HOURGLASS
+    cycling actually protected against — a drain that died mid-stage leaving
+    the same `running` record as one still working — now has to come from a
+    real, still-ticking number instead. mm:ss rather than whole minutes so it
+    visibly moves at roughly the cadence tick_progress itself polls at (2s
+    while a drain runs), not just once a minute.
+    """
+    if lease is None:
+        return ""
+    total = int(time.time() - lease.provisioned_at)
+    return f"{total // 60}m{total % 60:02d}s"
 
 
 def progress_text(manifest_path: Path, *, lease,
-                  stages: list[str] | None = None, frame: int = 0) -> str:
+                  stages: list[str] | None = None) -> str:
     """Render one progress message from the journal alone. Returns HTML.
 
-    `frame` advances the animation only — it must never change a number. The
-    spinner and the flipping hourglass are the whole of it, deliberately: a bar
-    of `done/len(planned)` cells is discrete because the journal is discrete,
-    and smoothing it into a percentage would be inventing progress the runner
-    never reported. The moving parts say "this process is alive", which is the
-    thing a journal genuinely cannot say, since a drain that died mid-stage
-    leaves exactly the same `running` record as one still working.
+    A bar of `done/len(planned)` cells is discrete because the journal is
+    discrete, and smoothing it into a percentage would be inventing progress
+    the runner never reported.
 
     `lease` (batchlib_ext.lease.Lease | None) is used only for its own
     fields (pod_id, provisioned_at) already written to disk at provision
@@ -119,6 +143,8 @@ def progress_text(manifest_path: Path, *, lease,
     the thing that may already be destroyed by the time this renders, while
     the journal (load_state) is written by the runner on every stage
     transition and outlives the pod, same as batch_status already relies on.
+    It is also the source of `_elapsed()`, the one number in this message
+    that has to be real (see its own docstring for why).
 
     `stages` is the pipeline's full stage list, captured when the drain starts.
     Without it there is no denominator: the journal records only stages that
@@ -136,18 +162,18 @@ def progress_text(manifest_path: Path, *, lease,
     # they sit next to each other: the frozen panel and the progress message
     # are adjacent in the chat for the whole of a render, and they mean
     # different things — what was submitted, versus what is happening.
-    lines = [f"⚙️ <b>{html.escape(str(batch), quote=False)}</b>"]
+    lines = [f"{_ICON_ASK_CE} <b>{html.escape(str(batch), quote=False)}</b>"]
 
+    elapsed = _elapsed(lease)
     runs = state.get("runs") or {}
     if not runs:
-        # The spinner belongs HERE most of all: this is the provision +
-        # bootstrap window, the longest stretch (~10 min) in which the journal
-        # says nothing whatsoever. Without it the text is byte-identical every
-        # frame, so the message never moves during the one phase where the
-        # only real question is whether anything is happening at all — and
-        # every edit would be swallowed as "message is not modified".
-        lines.append(f"{_SPIN[frame % len(_SPIN)]} waiting for the pod — "
-                     "nothing recorded yet")
+        # This is the provision + bootstrap window, the longest stretch
+        # (~10 min) in which the journal says nothing whatsoever — the one
+        # phase where the only real question is whether anything is
+        # happening at all, which `elapsed` answers and the journal cannot.
+        tail = f" ({elapsed})" if elapsed else ""
+        lines.append(f"{_ICON_EYES_CE} waiting for the pod — "
+                     f"nothing recorded yet{tail}")
     for run_id in sorted(runs):
         run = runs[run_id]
         seen = run.get("stages") or {}
@@ -161,17 +187,14 @@ def progress_text(manifest_path: Path, *, lease,
                         if (seen.get(n) or {}).get("status") == "running"), None)
         if planned:
             filled = "▰" * done + "▱" * max(0, len(planned) - done)
-            # The spinner rides beside the bar rather than inside it: a cell
-            # that blinked between ▰ and ▱ would read as the bar losing and
-            # regaining a stage, which is a lie about the journal.
-            tail = (f" {_SPIN[frame % len(_SPIN)]} {html.escape(current, quote=False)}"
+            tail = (f" {_ICON_LOADING_CE} {html.escape(current, quote=False)}"
                     if current else "")
             lines.append(f"{filled} {done}/{len(planned)}{tail}")
         for stage_name in planned:
             stage = seen.get(stage_name) or {}
             status = stage.get("status")
-            running = _HOURGLASS[frame % len(_HOURGLASS)]
-            icon = {"done": "✅", "running": running, "error": "❌"}.get(status, "⬜")
+            icon = {"done": "✅", "running": _ICON_LOADING_CE,
+                    "error": "❌"}.get(status, "⬜")
             sec = stage.get("sec")
             suffix = f" · {sec}s" if sec is not None else ""
             lines.append(f"{icon} {html.escape(stage_name, quote=False)}{suffix}")
@@ -179,10 +202,10 @@ def progress_text(manifest_path: Path, *, lease,
             lines.append("❌ <b>this run failed</b>")
 
     if lease is not None:
-        mins = int((time.time() - lease.provisioned_at) / 60)
+        mins = (time.time() - lease.provisioned_at) / 60
         # Elapsed, not a prediction: the pod bills from provisioned_at whether
         # or not a stage is moving, so this is the number that costs money.
-        lines.append(f"\n⏱ {mins} min on the pod · 💸 ${mins / 60 * 0.99:.2f} so far")
+        lines.append(f"\n⏱ {elapsed} on the pod · 💸 ${mins / 60 * 0.99:.2f} so far")
 
     return "\n".join(lines)
 

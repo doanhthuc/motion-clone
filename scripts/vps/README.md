@@ -651,15 +651,15 @@ what is happening.
 
 #### Animation: what is actually possible
 
-Measured against this bot on the real API, 2026-09-01. The conclusion is narrow
-and worth not re-deriving:
+First measured against this bot on the real API, 2026-09-01; the custom-emoji
+row was re-measured 2026-09-04 and reversed:
 
 | Approach | Works? | Why it matters |
 |---|---|---|
-| `<tg-emoji>` custom emoji | **No — silently** | `sendMessage` returns `ok:true`; the message comes back with `entities:null` and only the fallback glyph. The Bot API grants custom emoji to bots that bought a username on Fragment. There is no error to catch and nothing renders wrong; the animation simply never exists. A test gates the string literal so it cannot be reached for again. |
+| `<tg-emoji>` custom emoji | **Yes, if the bot owner has Telegram Premium** | 2026-09-01: `sendMessage` returned `ok:true` but the entity came back stripped (`entities:null`, plain fallback glyph) — the only entitlement path known then was buying a username on Fragment (~5000 TON). 2026-09-04: with Premium active on the owning account, the entity survives and renders as a real animated icon — confirmed both in the API response and visually on the phone. Still degrades silently to the plain fallback glyph if that subscription lapses. Used throughout `bot.py`'s `ICON_*_CE` constants. |
 | Animated `.tgs` stickers | Yes, but | `getStickerSet("AnimatedEmojies")` has 599 animated stickers including ⏳ ✅ ❌ 🎬. But a sticker message **cannot be edited** (`message can't be edited`) — only deleted — so it can never carry state. |
 | `sendDice` | Yes | Genuinely animated, semantically wrong for progress. |
-| **Re-editing the text** | **Yes** | The only way to get motion *inside* a message. This is what the bot does. |
+| **Re-editing the text** | **Yes** | The only way to get motion *inside* a single message as it progresses. This is still what the bot does for progress; static icons elsewhere now also use custom emoji. |
 
 Rate, measured the same day. Short bursts first: 0.48, 0.91 and 2.02 edits/s all
 completed with **zero** rejections. Then the question those did not answer —
@@ -676,32 +676,32 @@ Telegram's own number, `_ANIM_PAUSE` honours it, and the pause is checked
 a result. One chat, one day, one self-hosted server is not a guarantee about a
 limit that can change without notice.
 
-**The spinner glyph was chosen on a real phone, not from a Unicode table.**
-Seven candidate sets were sent to the user's iPhone on 2026-09-01; none rendered
-as tofu, so "does it render" settled nothing. `_SPIN` is the braille spinner
-`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`, picked by the user after watching both it and `◐◓◑◒` animate live
-in the chat. The case against it — on a dark background those dots are markedly
-fainter than quarter-circles, so a legibility check fails where a rendering
-check passes — was put and did not win. The person who watches that message for
-forty minutes is the right judge of it.
+**The spinner glyph was chosen on a real phone, not from a Unicode table —
+history, superseded 2026-09-04.** Seven candidate sets were sent to the user's
+iPhone on 2026-09-01; none rendered as tofu, so "does it render" settled
+nothing. `_SPIN` was the braille spinner `⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`, picked by the user after
+watching both it and `◐◓◑◒` animate live in the chat. The case against it — on
+a dark background those dots are markedly fainter than quarter-circles, so a
+legibility check fails where a rendering check passes — was put and did not
+win. The person who watches that message for forty minutes was the right judge
+of it, then and now.
 
-Ten frames at 2s each means a 20s cycle, one dot of movement per tick. A stride
-of 3 would enlarge each step while keeping the look, if the motion ever reads as
-too subtle in use.
+That whole hand-cycled mechanism (`_SPIN`, `_HOURGLASS`, the `frame` parameter)
+is gone as of 2026-09-04, not because the reasoning above was wrong but because
+its premise changed: custom emoji now render animated for this bot (Telegram
+Premium on the owner's account — see the table above), and an animated custom
+emoji spins on its own, client-side, with no edit required. That is nicer to
+look at but it also means the glyph can no longer prove the process behind it
+is alive — it keeps spinning after a drain dies mid-stage exactly as it did
+before dying. `run._elapsed()` carries that proof now instead: a real,
+still-ticking mm:ss since the pod was provisioned (`Lease.provisioned_at`),
+shown next to the decorative icon. It is the one figure in the message that
+still has to change through a real edit; the icons are decoration only.
 
-`frame` may change the spinner and the hourglass and **nothing else**. A test
-strips those glyphs from two consecutive frames and asserts the remainder is
-byte-identical. The bar stays discrete (`done/len(planned)`) because the journal
-is discrete; smoothing it into a percentage would be inventing progress the
-runner never reported. What the motion says is "this process is alive", which is
-the one thing a journal genuinely cannot say — a drain that died mid-stage
-leaves exactly the same `running` record as one still working.
-
-The spinner also rides the `waiting for the pod` line. That is the ~10-minute
-provision-and-bootstrap window where the journal says nothing at all: without it
-the text is byte-identical every poll, every edit is swallowed as `message is
-not modified`, and the fast cadence costs 25× the API calls to show nothing —
-during the one phase where the only real question is whether it is alive.
+The spinner used to also ride the `waiting for the pod` line, for the same
+"prove it's alive" reason — that ~10-minute provision-and-bootstrap window
+where the journal says nothing at all. `run._elapsed()` covers that line too
+now, for the same reason.
 
 If the user deletes the progress message, `edit_message` returns `False` and the
 next tick rebuilds it and records the new id, rather than editing into the void

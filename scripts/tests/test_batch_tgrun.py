@@ -234,51 +234,65 @@ class TestProgressBar(unittest.TestCase):
         self.assertIn("1/3", text)
         self.assertIn("▰▱▱", text)
         # The running stage is named beside the bar. Since 2026-09-01 a spinner
-        # stands where the word "running" used to, so the assertion is on the
-        # name plus a spinner frame rather than on the old phrasing.
+        # stood where the word "running" used to; since 2026-09-04 that is an
+        # animated custom emoji instead (see run._ICON_LOADING_CE), but the
+        # assertion's point is unchanged — the name plus a moving icon, not
+        # the old phrasing.
         self.assertIn("motion", text)
-        self.assertTrue(any(ch in text for ch in run_mod._SPIN),
-                        f"no spinner frame beside the bar: {text!r}")
+        self.assertIn(run_mod._ICON_LOADING_CE, text)
         # A stage not started yet is listed, not omitted — otherwise the user
         # cannot see what is still to come.
         self.assertIn("enhance", text)
 
-    def test_the_frame_animates_the_message_without_changing_a_single_number(self):
-        """The line between animation and lying.
+    def test_elapsed_is_the_only_thing_that_changes_between_two_real_ticks(self):
+        """The line between animation and lying, redrawn 2026-09-04.
 
-        `frame` exists to say "this process is alive" — the one thing a
-        journal genuinely cannot say, since a drain that died mid-stage leaves
-        exactly the same `running` record as one still working. It must never
-        reach any figure: strip the animated glyphs and two frames have to be
+        The animated custom emoji icons (run._ICON_LOADING_CE etc.) move on
+        their own, client-side — they need no edit to do that, and staying
+        static between two `progress_text` calls is correct, not a bug. What
+        has to change is `run._elapsed()`: a real, still-ticking mm:ss, the
+        one thing here that still says "this process is alive" the way the
+        old hand-cycled frame used to, since a drain that died mid-stage
+        leaves exactly the same `running` record as one still working. Strip
+        the elapsed figure and two calls two real seconds apart must be
         byte-identical.
         """
         self._state({"batch": "b", "runs": {"job": {"status": "running", "stages": {
             "tryon": {"status": "done", "sec": 351},
             "motion": {"status": "running"}}}}})
         stages = ["tryon", "motion", "enhance"]
-        a = progress_text(self.manifest, lease=None, stages=stages, frame=0)
-        b = progress_text(self.manifest, lease=None, stages=stages, frame=1)
+        now = time.time()
+        lease = Lease(pod_id="p1", provisioned_at=now - 10.0,
+                      manifest=str(self.manifest), abs_max_min=240)
+        with mock.patch("time.time", return_value=now):
+            a = progress_text(self.manifest, lease=lease, stages=stages)
+        with mock.patch("time.time", return_value=now + 2.0):
+            b = progress_text(self.manifest, lease=lease, stages=stages)
         self.assertNotEqual(a, b, "the message does not animate at all")
+        self.assertEqual(a.replace("0m10s", ""), b.replace("0m12s", ""),
+                         "something other than the elapsed figure changed")
 
-        animated = run_mod._SPIN + "".join(run_mod._HOURGLASS)
-        strip = lambda t: "".join(ch for ch in t if ch not in animated)
-        self.assertEqual(strip(a), strip(b),
-                         "a frame changed something other than the animation")
-
-    def test_the_waiting_for_the_pod_line_animates_too(self):
+    def test_the_waiting_for_the_pod_line_shows_elapsed_time(self):
         """The longest silent stretch of the whole render.
 
         Provision + bootstrap is ~10 minutes in which the journal says nothing
-        whatsoever. Without a moving frame here the text is byte-identical
-        every poll, every edit is swallowed as "message is not modified", and
-        the fast 2s cadence costs 25x the API calls to show nothing — during
-        the one phase where the only real question is whether it is alive.
+        whatsoever — the one phase where the only real question is whether it
+        is alive, which `run._elapsed()` (not a hand-cycled frame, since
+        2026-09-04) answers.
         """
         self._state({"batch": "b", "runs": {}})
-        a = progress_text(self.manifest, lease=None, stages=["tryon"], frame=0)
-        b = progress_text(self.manifest, lease=None, stages=["tryon"], frame=1)
-        self.assertIn("waiting for the pod", a)
-        self.assertNotEqual(a, b)
+        lease = Lease(pod_id="p1", provisioned_at=time.time() - 90.0,
+                      manifest=str(self.manifest), abs_max_min=240)
+        text = progress_text(self.manifest, lease=lease, stages=["tryon"])
+        self.assertIn("waiting for the pod", text)
+        self.assertIn("1m30s", text)
+
+    def test_the_waiting_for_the_pod_line_survives_no_lease_yet(self):
+        """No lease on disk yet must not raise — it means "not provisioned",
+        not "unreadable"; run._elapsed returns "" for exactly this case."""
+        self._state({"batch": "b", "runs": {}})
+        text = progress_text(self.manifest, lease=None, stages=["tryon"])
+        self.assertIn("waiting for the pod", text)
 
     def test_a_failed_stage_is_marked_and_the_run_is_called_failed(self):
         self._state({"batch": "b", "runs": {"job": {"status": "error", "stages": {
@@ -297,12 +311,11 @@ class TestProgressBar(unittest.TestCase):
     def test_the_lease_line_reports_money_already_spent(self):
         # Elapsed, not predicted: the pod bills from provisioned_at whether or
         # not a stage is moving, so this is the number that costs money.
-        from batchlib_ext.lease import Lease
         self._state({"batch": "b", "runs": {}})
         lease = Lease(pod_id="p1", provisioned_at=time.time() - 3600,
                       manifest=str(self.manifest), abs_max_min=240)
         text = progress_text(self.manifest, lease=lease, stages=["tryon"])
-        self.assertIn("60 min on the pod", text)
+        self.assertIn("60m00s on the pod", text)
         self.assertIn("$0.99", text)
 
 
