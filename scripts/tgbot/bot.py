@@ -523,7 +523,7 @@ def deliver_result(tg: Tg, chat_id: int, manifest_path: Path) -> None:
     state = load_state(state_path_for(manifest_path))
     batch_id = state.get("batch") or ""
     if not batch_id:
-        tg.send_message(chat_id, "❌ <b>No batch was ever recorded</b> for "
+        tg.send_message(chat_id, f"{ICON_ERROR_CE} <b>No batch was ever recorded</b> for "
                                  f"<code>{_esc(manifest_path.name)}</code> — the "
                                  "drain failed before it started. The log is "
                                  f"<code>{_esc(manifest_path.stem)}.drain.log</code> "
@@ -534,7 +534,7 @@ def deliver_result(tg: Tg, chat_id: int, manifest_path: Path) -> None:
     outputs = final_files(batch_dir)
 
     if outputs:
-        tg.send_message(chat_id, f"✅ <b>Done</b> · {_esc(batch_id)} · "
+        tg.send_message(chat_id, f"{ICON_ANNOUNCE_CE} <b>Done</b> · {_esc(batch_id)} · "
                                  f"{len(outputs)} file(s)", parse_mode=PARSE_HTML)
         for path in outputs:
             tg.send_chat_action(chat_id, "upload_document")
@@ -546,7 +546,7 @@ def deliver_result(tg: Tg, chat_id: int, manifest_path: Path) -> None:
         stages = ((state.get("runs") or {}).get(run_id) or {}).get("stages") or {}
         broke = [n for n, st in stages.items() if st.get("status") == "error"]
         where = f" at <b>{_esc(broke[0])}</b>" if broke else ""
-        tg.send_message(chat_id, f"❌ <b>{_esc(run_id)} failed</b>{where}",
+        tg.send_message(chat_id, f"{ICON_ERROR_CE} <b>{_esc(run_id)} failed</b>{where}",
                         parse_mode=PARSE_HTML)
         # On failure, attach exactly what scripts/drain.py's teardown() already
         # pulled onto local disk BEFORE destroying the pod. Never reach for the
@@ -1355,9 +1355,9 @@ def _offer_pipelines(tg: Tg, chat_id: int) -> None:
     where = f" {_row_mark(len(basket))}" if _jobs_for(chat_id)[1:] else ""
     tg.send_message(
         chat_id,
-        f"⚙️ <b>Flow for{where}</b>\n"
+        f"{ICON_ASK_CE} <b>Flow for{where}</b>\n"
         f"now: {_flow(job.pipeline)}  <i>({_esc(job.pipeline)})</i>",
-        buttons=[[(" → ".join(PIPELINES[name]), _CB_PIPE + name)]
+        buttons=[[("🎬 " + " → ".join(PIPELINES[name]), _CB_PIPE + name)]
                  for name in sorted(PIPELINES) if name != job.pipeline],
         parse_mode=PARSE_HTML)
 
@@ -1397,7 +1397,7 @@ def _switch_pipeline_and_report(tg: Tg, chat_id: int, name: str, *,
         # the tap happened and retires that keyboard so it can't be reused.
         tg.edit_message(
             chat_id, chooser_message_id,
-            f"⚙️ <b>Flow switched</b>\n"
+            f"{ICON_EDIT_CE} <b>Flow switched</b>\n"
             f"now: {_flow(job.pipeline)}  <i>({_esc(job.pipeline)})</i>",
             parse_mode=PARSE_HTML)
 
@@ -1432,19 +1432,38 @@ def _answer_slot(tg: Tg, chat_id: int, role: str) -> None:
 
 
 
-# One icon per role, one per state. Ordinary emoji, not Telegram's animated
-# custom emoji — measured 2026-09-01 against this bot on the real API, because
-# the reason recorded here before ("a Premium feature, renders as a
-# placeholder") was wrong about both the cause and the symptom: a
-# `<tg-emoji emoji-id="...">` entity is accepted with ok:true and then STRIPPED,
-# the message coming back with entities:null and only the fallback glyph. The
-# Bot API grants custom emoji to bots that bought a username on Fragment, and
-# this one has not. There is no error to catch and nothing renders wrong — the
-# animation simply never exists, which is why reading the docs was never going
-# to settle it. Animated .tgs stickers DO work (getStickerSet "AnimatedEmojies"
-# has ⏳ ✅ ❌ 🎬), but a sticker message cannot be edited, so it can never
-# carry state. Motion in this bot comes from re-editing text; see run._SPIN.
+# Measured 2026-09-04, after enabling Telegram Premium on this bot's owner
+# account: a `<tg-emoji emoji-id="...">` entity now survives — sendMessage's
+# own response carries the entity back instead of stripping it, and it
+# renders as a real animated icon on the phone. The earlier note here only
+# knew of one path to that entitlement (a Fragment-bought username, ~5000
+# TON); the owning account's Premium subscription is a second, far cheaper
+# one. Every `_CE` glyph below degrades to its own plain fallback character
+# if that subscription ever lapses — Telegram strips the entity silently,
+# same as before — so lapsing costs the animation, never a broken render.
+#
+# This changes where motion inside a message comes from. It used to be ONLY
+# re-editing (run._SPIN's hand-cycled braille, run._HOURGLASS's flip) because
+# nothing else could move without a fresh HTTP call. An animated custom
+# emoji moves on its own, client-side, for as long as the message exists —
+# which is nicer to look at but means it can no longer prove the process
+# behind it is still alive (it keeps spinning after a drain dies mid-stage,
+# same as before it died). run.py's `_elapsed()` carries that proof now: a
+# real, still-ticking mm:ss is the one thing in run.progress_text that still
+# has to change through an edit, not the icons.
+def _ce(emoji_id: str, glyph: str) -> str:
+    return f'<tg-emoji emoji-id="{emoji_id}">{glyph}</tg-emoji>'
+
+
+# Role icons are shown in two kinds of place: button labels (_ask_about's
+# rows, the redo button) and HTML message text (_role_line, _sheet_caption).
+# Buttons cannot carry entities — Telegram renders their text literally, no
+# parsing — so ROLE_ICON stays plain for those, and ROLE_ICON_CE (HTML text
+# only) carries the animated version. Only "driver" differs from its plain
+# counterpart: the driver slot is always a TikTok download now (tgbot/tiktok.py),
+# so its message icon is that app's real logo, not a generic clapper.
 ROLE_ICON = {"character": "👤", "outfit": "👗", "driver": "🎬", "background": "🖼"}
+ROLE_ICON_CE = {**ROLE_ICON, "driver": _ce("5327982530702359565", "📱")}
 
 # One square per job, in the same order as preview.ROW_ACCENTS and the same
 # colours. Nothing can be written onto the contact sheet — `drawtext` is not
@@ -1456,9 +1475,43 @@ ROW_MARK = ["🟦", "🟧", "🟩", "🟪", "🟥", "🟨"]
 
 def _row_mark(index: int) -> str:
     return ROW_MARK[index % len(ROW_MARK)]
+
+
+# ICON_OK has the same button/text split as ROLE_ICON — it is used both in
+# _ask_about's button label and in the unformatted `question` text (neither
+# gets parse_mode=HTML) — so it stays plain, and ICON_OK_CE is the animated
+# version _role_line uses instead.
 ICON_OK = "✅"
-ICON_WARN = "⚠️"
-ICON_EMPTY = "⬜"
+ICON_OK_CE = _ce("5980930633298350051", "✅")
+ICON_WARN = _ce("5420323339723881652", "⚠️")
+ICON_EMPTY = _ce("5884089033558070257", "⬜️")
+
+# One HTML-only animated icon per message-text moment that used to carry a
+# plain glyph (or none). Named for the moment, not the picture, because the
+# picture is exactly what would make a future swap look like a typo.
+ICON_ERROR_CE = _ce("5210952531676504517", "❌")
+ICON_TRASH_CE = _ce("5445267414562389170", "🗑")
+ICON_CLIP_CE = _ce("5305265301917549162", "📎")
+ICON_ASK_CE = _ce("5341715473882955310", "⚙️")
+ICON_EDIT_CE = _ce("5395444784611480792", "✏️")
+ICON_ROCKET_CE = _ce("5188481279963715781", "🚀")
+ICON_DEPART_CE = _ce("5201691993775818138", "🛫")
+ICON_MONEY_CE = _ce("5201873447554145566", "💵")
+ICON_ANNOUNCE_CE = _ce("5424818078833715060", "📣")
+ICON_ALERT_CE = _ce("5440660757194744323", "‼️")
+ICON_FLAG_CE = _ce("5460755126761312667", "🚩")
+ICON_EYES_CE = _ce("5210956306952758910", "👀")
+ICON_CRITICAL_CE = _ce("5395695537687123235", "🚨")
+ICON_SPEAK_CE = _ce("5460795800101594035", "🗣️")
+# The Nvidia logo (EmojiTechPack#158) — every GPU this repo has ever rented
+# is Nvidia (RTX 5090/4090, RTX PRO 4500), so it stands in for "GPU" wherever
+# 🖥 used to, in message text. Fallback glyph is 💻 (the pack's own fallback
+# tag, not what it depicts — same mismatch as ROLE_ICON_CE's TikTok logo).
+ICON_NVIDIA_CE = _ce("4994617077676376661", "💻")
+# A generic GPU/hardware icon (nedonews#39), distinct from the Nvidia brand
+# logo above — not wired to any message yet; kept alongside ICON_NVIDIA_CE
+# since both came out of the same round of icon picks (2026-09-04).
+ICON_GPU_CE = _ce("5269375507220165755", "👊")
 
 PARSE_HTML = "HTML"
 
@@ -1506,12 +1559,12 @@ def _compact(p: Probe) -> str:
 
 def _role_line(role: str, job: Job) -> str:
     """One line per slot: state, role icon, name, the two headline numbers."""
-    icon_role = ROLE_ICON.get(role, "")
+    icon_role = ROLE_ICON_CE.get(role, "")
     if role not in job.slots:
         tail = "" if role in required_roles(job.pipeline) else " — optional"
         return f"{ICON_EMPTY} {icon_role} {_esc(role)}{tail}"
     pr = job.probes.get(role)
-    state = ICON_WARN if (pr and quality_warning(pr)) else ICON_OK
+    state = ICON_WARN if (pr and quality_warning(pr)) else ICON_OK_CE
     detail = f" · {_compact(pr)}" if pr else ""
     return f"{state} {icon_role} {_esc(role)}{detail}"
 
@@ -2000,7 +2053,7 @@ def _sheet_caption(chat_id: int) -> str:
     the panel does, which the reader already knows.
     """
     jobs = _jobs_for(chat_id)
-    columns = " · ".join(f"{ROLE_ICON.get(r, '')} {_esc(r)}"
+    columns = " · ".join(f"{ROLE_ICON_CE.get(r, '')} {_esc(r)}"
                          for r in _sheet_columns(jobs))
     return f"{len(jobs)} job(s) · {columns}" if len(jobs) > 1 else columns
 
@@ -2138,7 +2191,7 @@ def _freeze_panel(tg: Tg, chat_id: int, stamp: str) -> None:
     job = _STATE.get(chat_id)
     if message_id is None or job is None:
         return
-    frozen = _panel_text(chat_id, job) + f"\n\n🚀 <b>{_esc(stamp)}</b>"
+    frozen = _panel_text(chat_id, job) + f"\n\n{ICON_ROCKET_CE} <b>{_esc(stamp)}</b>"
     # A merged panel is a photo, and editMessageText cannot touch one. Getting
     # this wrong would leave the Run button live on a job already handed to a
     # drain — the exact thing the freeze exists to prevent.
@@ -2191,11 +2244,6 @@ def _migrate_progress_message_path(chat_id: int) -> Path:
 # modified" no-ops that edit_message swallows.
 
 
-# Animation state, in memory on purpose: a frame number is cosmetic, and a
-# restart that resets it to 0 costs one visual stutter. Putting it in the
-# progress file would mean a disk write every 2 seconds for the length of a
-# render, to persist something nobody would notice being wrong.
-_FRAME: dict[int, int] = {}
 _ANIM_PAUSE: dict[int, float] = {}      # chat_id -> time.time() to resume at
 
 # While a drain runs the poll drops from a 50s long-poll to 2s, and each spin
@@ -2282,7 +2330,6 @@ def tick_progress(tg: Tg, chat_id: int) -> None:
                                    stages=stages)
         tg.edit_message(chat_id, message_id, final_text, parse_mode=PARSE_HTML)
         path.unlink(missing_ok=True)
-        _FRAME.pop(chat_id, None)
         _ANIM_PAUSE.pop(chat_id, None)
         deliver_result(tg, chat_id, manifest_path)
         if handoff.status == "running":
@@ -2314,9 +2361,8 @@ def tick_progress(tg: Tg, chat_id: int) -> None:
     if running and time.time() < _ANIM_PAUSE.get(chat_id, 0.0):
         return
 
-    frame = _FRAME[chat_id] = _FRAME.get(chat_id, 0) + 1
     text = progress_text(manifest_path, lease=lease_for(manifest_path),
-                         stages=stages, frame=frame)
+                         stages=stages)
     if running:
         try:
             if not tg.edit_message(chat_id, message_id, text,
@@ -2345,7 +2391,6 @@ def tick_progress(tg: Tg, chat_id: int) -> None:
     # files. The progress file goes first: if delivery raises, the next tick
     # must not deliver a second copy of everything.
     path.unlink(missing_ok=True)
-    _FRAME.pop(chat_id, None)
     _ANIM_PAUSE.pop(chat_id, None)
     tg.edit_message(chat_id, message_id, text, parse_mode=PARSE_HTML)
     deliver_result(tg, chat_id, manifest_path)
@@ -2513,7 +2558,7 @@ def _ask_to_clear(tg: Tg, chat_id: int) -> None:
         chat_id,
         f"Delete this job and its {n} staged file(s)? The originals in "
         "Telegram are untouched — only the copies here go.",
-        buttons=[[("Yes, start over", _CB_CLEAR_GO), ("Keep it", _CB_CLEAR_NO)]])
+        buttons=[[("✅ Yes, start over", _CB_CLEAR_GO), ("↩️ Keep it", _CB_CLEAR_NO)]])
 
 
 def _clear_job(tg: Tg, chat_id: int) -> None:
@@ -2546,7 +2591,7 @@ def _clear_job(tg: Tg, chat_id: int) -> None:
     # stalest thing in the chat. Nothing spent, so nothing to keep a record of.
     # handle()'s finally calls _save_draft, which deletes the draft file itself
     # now that there is no state left to write.
-    done = (f"🗑 <b>Cleared.</b> {removed} staged file(s) deleted.\n"
+    done = (f"{ICON_TRASH_CE} <b>Cleared.</b> {removed} staged file(s) deleted.\n"
             "Send a file as a <b>File</b> to start again.")
     message_id = _PANEL.pop(chat_id, None)
     _PANEL_NOTE.pop(chat_id, None)
@@ -2579,7 +2624,7 @@ def _ask_to_wipe(tg: Tg, chat_id: int) -> None:
         f"Delete all {n} message(s) in this chat — yours and mine — and "
         "clear the job being assembled?\nTelegram will not let anything "
         "older than 48h be removed; those are reported, not silently left.",
-        buttons=[[("Yes, wipe it", _CB_WIPE_GO), ("Keep it", _CB_WIPE_NO)]])
+        buttons=[[("✅ Yes, wipe it", _CB_WIPE_GO), ("↩️ Keep it", _CB_WIPE_NO)]])
 
 
 def _wipe_chat(tg: Tg, chat_id: int) -> None:
@@ -2592,10 +2637,11 @@ def _wipe_chat(tg: Tg, chat_id: int) -> None:
     thing, not only the file half.
     """
     if drain_running(_job_manifest_path(chat_id)):
-        tg.send_message(chat_id, "a drain is running for this chat's job — "
+        tg.send_message(chat_id, f"{ICON_ALERT_CE} a drain is running for this chat's job — "
                                  "wiping now would delete the files it is "
                                  "reading, and the message that tells you "
-                                 "when it's done. Wait for it, then /wipe.")
+                                 "when it's done. Wait for it, then /wipe.",
+                        parse_mode=PARSE_HTML)
         return
     _clear_job(tg, chat_id)
     ids = _ledger_for(chat_id)
@@ -2645,10 +2691,20 @@ _STOCK_RANK = {"high": 0, "medium": 1, "low": 2, "none": 3}
 
 # A coloured dot reads faster than the word next to it, on a phone screen
 # glanced at before deciding whether to spend $0.99/h. Traffic-light order,
-# extended one step for "none" — Telegram renders all four natively, no
-# custom-emoji entitlement needed (unlike tgbot/run.py's own note on
-# <tg-emoji> being silently stripped).
+# extended one step for "none". Plain Unicode, deliberately — no matching
+# custom emoji square exists in any pack checked 2026-09-04 (see ICON_*_CE
+# above), and a plain dot renders identically with or without one.
 _STOCK_ICON = {"high": "🟢", "medium": "🟡", "low": "🟠", "none": "🔴"}
+
+
+def _stock_icon(status: str) -> str:
+    """The dot, plus a loud animated flag when there is truly nothing to rent.
+
+    "none" is the one status where a glance at the dot alone risks being read
+    as "loading" rather than "empty" — the siren removes that ambiguity.
+    """
+    dot = _STOCK_ICON.get(status, "⬜")
+    return f"{ICON_CRITICAL_CE} {dot}" if status == "none" else dot
 
 
 def _report_gpu_stock(tg: Tg, chat_id: int) -> None:
@@ -2676,7 +2732,7 @@ def _report_gpu_stock(tg: Tg, chat_id: int) -> None:
     lines = ["📦 <b>GPU stock</b>"]
     configured = env_get(ROOT / ".env", "GPU")
     if configured:
-        lines.append(f"🖥 Currently selected: <b>{_esc(configured)}</b>")
+        lines.append(f"{ICON_NVIDIA_CE} Currently selected: <b>{_esc(configured)}</b>")
     if home_dc:
         lines.append(f"📍 <b>{_esc(home_dc)}</b> (your volume)")
     else:
@@ -2688,14 +2744,14 @@ def _report_gpu_stock(tg: Tg, chat_id: int) -> None:
         if not entries:
             lines.append(f"  {_esc(wanted_id)}: not listed by runpodctl right now")
             continue
-        price = f"💵 ${entries[0].price_per_hr:.2f}/h" if entries[0].price_per_hr else "?"
+        price = f"{ICON_MONEY_CE} ${entries[0].price_per_hr:.2f}/h" if entries[0].price_per_hr else "?"
         # None, not "not offered here", when home_dc itself is unknown — that
         # reads as "checked and absent", which is a claim this branch has no
         # basis for.
         home = next((e for e in entries if home_dc and e.datacenter_id == home_dc),
                     None)
         if home is not None:
-            icon = _STOCK_ICON.get(home.stock_status.lower(), "⬜")
+            icon = _stock_icon(home.stock_status.lower())
             lines.append(f"  {_esc(entries[0].display_name)}: "
                          f"{icon} <b>{_esc(home.stock_status)}</b> · {price}")
         else:
@@ -2705,7 +2761,7 @@ def _report_gpu_stock(tg: Tg, chat_id: int) -> None:
             (e for e in entries if e is not home and e.stock_status.lower() != "none"),
             key=lambda e: _STOCK_RANK.get(e.stock_status.lower(), 9))
         for e in elsewhere[:2]:
-            icon = _STOCK_ICON.get(e.stock_status.lower(), "⬜")
+            icon = _stock_icon(e.stock_status.lower())
             other_lines.append(f"  {_esc(e.display_name)} — {_esc(e.datacenter_id)}: "
                                f"{icon} {_esc(e.stock_status)}")
 
@@ -2758,7 +2814,7 @@ def _panel_cost_str() -> str:
     home = next((e for e in entries if e.datacenter_id == home_dc), None)
     if home is None:
         return f"💸 ${price:.2f}/hour ({_esc(configured)} not listed at {_esc(home_dc)})"
-    icon = _STOCK_ICON.get(home.stock_status.lower(), "⬜")
+    icon = _stock_icon(home.stock_status.lower())
     return f"💸 ${price:.2f}/h · {icon} {_esc(home.display_name)} @ {_esc(home_dc)}"
 
 
@@ -2915,7 +2971,7 @@ def _offer_run_confirm(tg: Tg, chat_id: int) -> None:
             chat_id,
             f"This rents a GPU pod at ${price:.2f}/hour and starts the job.\n"
             "Confirm?",
-            buttons=[[(f"Yes, spend ${price:.2f}/h", _CB_RUN_GO + _run_token(chat_id)),
+            buttons=[[(f"🚀 Yes, spend ${price:.2f}/h", _CB_RUN_GO + _run_token(chat_id)),
                       ("Cancel", _CB_RUN_NO)]])
         return
 
@@ -2923,14 +2979,14 @@ def _offer_run_confirm(tg: Tg, chat_id: int) -> None:
     # (2026-09-02) — on a phone, three bold lines that only differ by six
     # small letters at the end read as one undifferentiated list; a reader
     # reported not being able to tell which was already selected.
-    lines = [f"🖥 <b>Choose GPU</b> — renting at {_esc(home_dc)}", ""]
+    lines = [f"{ICON_NVIDIA_CE} <b>Choose GPU</b> — renting at {_esc(home_dc)}", ""]
     configured_home = next((e for e in (stock.get(configured) or [])
                             if e.datacenter_id == home_dc), None)
     if configured_home is not None:
-        icon = _STOCK_ICON.get(configured_home.stock_status.lower(), "⬜")
+        icon = _stock_icon(configured_home.stock_status.lower())
         lines.append(f"Current: {icon} <b>{_esc(configured_home.display_name)}</b> — "
                      f"{_esc(configured_home.stock_status)} · "
-                     f"💵 ${configured_home.price_per_hr:.2f}/h")
+                     f"{ICON_MONEY_CE} ${configured_home.price_per_hr:.2f}/h")
     else:
         lines.append(f"Current: <b>{_esc(configured)}</b> — "
                      f"not offered at {_esc(home_dc)}")
@@ -2953,19 +3009,19 @@ def _offer_run_confirm(tg: Tg, chat_id: int) -> None:
             if home is None:
                 alt_lines.append(f"  {_esc(gpu_id)}: not offered at {_esc(home_dc)}")
             else:
-                icon = _STOCK_ICON.get(home.stock_status.lower(), "⬜")
+                icon = _stock_icon(home.stock_status.lower())
                 alt_lines.append(f"  {icon} <b>{_esc(home.display_name)}</b> — "
-                                 f"{_esc(home.stock_status)} · 💵 ${home.price_per_hr:.2f}/h")
+                                 f"{_esc(home.stock_status)} · {ICON_MONEY_CE} ${home.price_per_hr:.2f}/h")
                 short = _GPU_SHORT.get(gpu_id)
                 if short:
-                    switch_row.append((f"Switch to {home.display_name} "
+                    switch_row.append((f"🖥 Switch to {home.display_name} "
                                       f"(${home.price_per_hr:.2f}/h)",
                                       _CB_RUN_SWITCH + short))
         elsewhere = sorted(
             (e for e in entries if e is not home and e.stock_status.lower() != "none"),
             key=lambda e: _STOCK_RANK.get(e.stock_status.lower(), 9))
         for e in elsewhere[:2]:
-            icon = _STOCK_ICON.get(e.stock_status.lower(), "⬜")
+            icon = _stock_icon(e.stock_status.lower())
             other_lines.append(f"  {icon} {_esc(e.display_name)} — "
                                f"{_esc(e.datacenter_id)}: {_esc(e.stock_status)}")
             # Only offered when nothing is already mid-copy (2026-09-02) — a
@@ -2980,7 +3036,7 @@ def _offer_run_confirm(tg: Tg, chat_id: int) -> None:
             # build a prefix nobody read meant a GPU absent from that table
             # silently offered no migrate button at all.
             if not migration_running():
-                switch_row.append((f"Switch to {e.display_name} ({e.datacenter_id})",
+                switch_row.append((f"🛫 Switch to {e.display_name} ({e.datacenter_id})",
                                   _CB_MIGRATE_ASK + e.datacenter_id))
     if alt_lines:
         lines += ["", "Switch to:", *alt_lines]
@@ -2995,7 +3051,7 @@ def _offer_run_confirm(tg: Tg, chat_id: int) -> None:
                       "See docs/gpu-pod.md for the manual EU-CZ-1 runbook."]
 
     buttons = [switch_row[i:i + 2] for i in range(0, len(switch_row), 2)]
-    buttons.append([(f"Yes, spend ${price:.2f}/h", _CB_RUN_GO + _run_token(chat_id)),
+    buttons.append([(f"🚀 Yes, spend ${price:.2f}/h", _CB_RUN_GO + _run_token(chat_id)),
                     ("Cancel", _CB_RUN_NO)])
     tg.send_message(chat_id, "\n".join(lines), parse_mode=PARSE_HTML, buttons=buttons)
 
@@ -3019,7 +3075,7 @@ def _ask_kill(tg: Tg, chat_id: int) -> None:
         chat_id,
         f"⚠️ This destroys the pod right now{spent}. Whatever is mid-render "
         "is lost — no output, no resume. Are you sure?",
-        buttons=[[("Yes, kill it", _CB_KILL_GO), ("Leave it running", _CB_KILL_NO)]])
+        buttons=[[("🛑 Yes, kill it", _CB_KILL_GO), ("↩️ Leave it running", _CB_KILL_NO)]])
 
 
 def _do_kill(tg: Tg, chat_id: int) -> None:
@@ -3071,7 +3127,6 @@ def _do_kill(tg: Tg, chat_id: int) -> None:
         except (ValueError, KeyError, TypeError, TgError):
             pass
         prog.unlink(missing_ok=True)
-    _FRAME.pop(chat_id, None)
     _ANIM_PAUSE.pop(chat_id, None)
 
     if destroyed:
@@ -3103,7 +3158,7 @@ def _ask_migrate(tg: Tg, chat_id: int, to_dc: str) -> None:
         f"verified byte-for-byte. {MIGRATE_DURATION_TEXT}. "
         f"<b>Cannot be undone</b> once the old volume is deleted.",
         parse_mode=PARSE_HTML,
-        buttons=[[("Yes, migrate", _CB_MIGRATE_GO + to_dc),
+        buttons=[[("🛫 Yes, migrate", _CB_MIGRATE_GO + to_dc),
                   ("Cancel", _CB_MIGRATE_NO)]])
 
 
@@ -3144,7 +3199,7 @@ def _start_migration(tg: Tg, chat_id: int, to_dc: str) -> None:
         return
     _MIGRATE_PROC[_MIGRATE_PROC_KEY] = proc
 
-    tg.send_message(chat_id, f"🚀 Migration to {_esc(to_dc)} started — this will take "
+    tg.send_message(chat_id, f"{ICON_DEPART_CE} Migration to {_esc(to_dc)} started — this will take "
                              f"{MIGRATE_DURATION_PLAIN}. I will report progress here.",
                     parse_mode=PARSE_HTML)
 
@@ -3242,8 +3297,9 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
         # express it.
         _CONFIRM_WARNED.add(chat_id)
         tg.send_message(chat_id,
-                        f"{len(pending)} file(s) still unassigned — answer "
-                        f"them, or send /confirm again to run without them")
+                        f"{ICON_FLAG_CE} {len(pending)} file(s) still unassigned — answer "
+                        f"them, or send /confirm again to run without them",
+                        parse_mode=PARSE_HTML)
         return
 
     # Ordered AFTER the pending check on purpose: the render below writes
@@ -3351,7 +3407,7 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
         # one now would claim progress on a job that has not started.
     else:
         tg.send_message(chat_id,
-                        f"🚀 <b>Started.</b> {submitted_count} job(s) on one pod at "
+                        f"{ICON_ROCKET_CE} <b>Started.</b> {submitted_count} job(s) on one pod at "
                         "$0.99/hour.\nI will keep the message below updated and "
                         "send the results when it finishes — no need to ask.",
                         parse_mode=PARSE_HTML)
@@ -3726,7 +3782,8 @@ def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
     if text.startswith("/start"):
         tg.send_message(
             chat_id,
-            "📎 <b>File, not Photo</b> — picker → \"...\" → Send as File\n"
+            f"{ICON_SPEAK_CE} <b>Here's how this works:</b>\n\n"
+            f"{ICON_CLIP_CE} <b>File, not Photo</b> — picker → \"...\" → Send as File\n"
             "🎬 Videos are the driver. For images, I'll ask — just tap.\n\n"
             "✅ Full job shown before anything runs.\n"
             "💸 <b>Nothing spends money until you tap Run and confirm.</b>\n\n"
@@ -3807,10 +3864,13 @@ def main() -> int:
     log(f"started, api={base}, dry_run={args.dry_run}, pipeline={_DEFAULT_PIPELINE}")
     while True:
         try:
-            # The long-poll IS the animation timer (2026-09-01). While a drain
-            # is running the poll shortens to 2s so the loop comes round often
-            # enough to redraw a moving frame; the rest of the time it stays at
-            # 50s, which costs one request per 50s and no timer of its own.
+            # The long-poll IS the progress message's own refresh timer
+            # (2026-09-01). While a drain is running the poll shortens to 2s so
+            # the loop comes round often enough to keep run._elapsed() — the
+            # real, still-ticking mm:ss that proves the process is alive —
+            # roughly in step with wall-clock time; the rest of the time it
+            # stays at 50s, which costs one request per 50s and no timer of
+            # its own.
             # Keyed on the progress file rather than a flag, so a bot restarted
             # mid-render picks the fast cadence straight back up.
             animating = _progress_path(allowed_user_id).exists()

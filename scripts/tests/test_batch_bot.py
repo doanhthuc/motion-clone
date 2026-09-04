@@ -1,4 +1,4 @@
-import itertools, json, shutil, subprocess, sys, tempfile, time, unittest
+import itertools, json, re, shutil, subprocess, sys, tempfile, time, unittest
 from pathlib import Path
 from unittest import mock
 
@@ -130,7 +130,7 @@ def reset_bot_state():
     """
     for name in ("_STATE", "_LOADED", "_PENDING", "_LAST_VALIDATE",
                  "_CONFIRM_WARNED", "_PANEL", "_PANEL_NOTE", "_LAST_SEEN",
-                 "_FRAME", "_ANIM_PAUSE", "_ALBUM_KEY", "_FIDELITY",
+                 "_ANIM_PAUSE", "_ALBUM_KEY", "_FIDELITY",
                  "_PANEL_IS_PHOTO", "_STRIP", "_BASKET",
                  "_LEDGER", "_LEDGER_LOADED", "_MIGRATE_PROC"):
         # getattr, not bot._STATE etc: a name that disappears from bot.py
@@ -205,6 +205,11 @@ class FakeTg:
                     "<pre>", "</pre>", "<blockquote expandable>", "<blockquote>",
                     "</blockquote>")
 
+    # <tg-emoji emoji-id="…"> carries a variable attribute, so it cannot be a
+    # literal in ALLOWED_TAGS above — matched separately (confirmed working
+    # against the real API 2026-09-04, see bot.py's ICON_*_CE constants).
+    _TG_EMOJI_TAG = re.compile(r'<tg-emoji emoji-id="\d+">|</tg-emoji>')
+
     def send_message(self, chat_id, text, *, buttons=None, reply_keyboard=None,
                      parse_mode=None):
         self._check_markup(text, parse_mode)
@@ -251,13 +256,14 @@ class FakeTg:
            silence class as the NON_FILE_MEDIA bug, and no unit test would see
            it without this check.
         """
-        looks_like_html = any(t in text for t in self.ALLOWED_TAGS)
+        looks_like_html = (any(t in text for t in self.ALLOWED_TAGS)
+                           or "<tg-emoji" in text)
         if parse_mode is None:
             assert not looks_like_html, (
                 f"HTML tags sent without parse_mode: {text[:120]!r}")
             return
         assert parse_mode == "HTML", f"unexpected parse_mode {parse_mode!r}"
-        stripped = text
+        stripped = self._TG_EMOJI_TAG.sub("", text)
         for tag in self.ALLOWED_TAGS:
             stripped = stripped.replace(tag, "")
         # &lt; / &gt; / &amp; are what _esc produces and are legal; bare
@@ -1326,13 +1332,23 @@ class TestFlow(unittest.TestCase):
     def test_successive_ticks_actually_move_the_progress_message(self):
         """Otherwise the 2s poll is 25x the API calls for no visible change.
 
-        Every edit would be swallowed as "message is not modified", and the
-        cost of the fast cadence would buy nothing at all.
+        The moving part is `run._elapsed()` now (2026-09-04) — a real,
+        still-ticking mm:ss — not a hand-cycled spinner character, so this
+        needs a real Lease and wall-clock time actually advancing between
+        ticks to see it move; with neither, two ticks would legitimately
+        render identical text (an animated custom emoji spins on its own and
+        needs no edit to do so), and that is correct, not the bug this test
+        exists to catch.
         """
+        from batchlib_ext.lease import Lease
         self._confirm_and_start()
-        with mock.patch("tgbot.bot.drain_running", return_value=True):
+        lease = Lease(pod_id="p1", provisioned_at=time.time() - 10.0,
+                      manifest=str(bot._job_manifest_path(ME)), abs_max_min=60)
+        with mock.patch("tgbot.bot.drain_running", return_value=True), \
+             mock.patch("tgbot.bot.lease_for", return_value=lease):
             bot.tick_progress(self.tg, ME)
-            bot.tick_progress(self.tg, ME)
+            with mock.patch("time.time", return_value=time.time() + 2.0):
+                bot.tick_progress(self.tg, ME)
         self.assertNotEqual(self.tg.edits[-2][1], self.tg.edits[-1][1])
 
     def test_a_throttled_edit_pauses_the_animation_but_never_delivery(self):
@@ -1825,7 +1841,7 @@ class TestFlow(unittest.TestCase):
         # "Current:", and its price is what the Yes button quotes.
         self.assertIn("Current:", self.tg.messages[-1])
         self.assertIn("RTX 4090", self.tg.messages[-1].split("Current:")[1].splitlines()[0])
-        self.assertIn("Yes, spend $0.74/h",
+        self.assertIn("🚀 Yes, spend $0.74/h",
                       [label for row in self.tg.buttons[-1] for label, _ in row])
 
     def test_rent_anyway_still_starts_the_drain_at_the_original_price(self):
@@ -1931,7 +1947,7 @@ class TestFlow(unittest.TestCase):
         # Every role of the pipeline appears, filled or not: listing only what
         # is present hides the empty required slot, which is the single thing
         # the user most needs to see.
-        self.assertIn(f"{bot.ICON_OK} {bot.ROLE_ICON['driver']} driver", body)
+        self.assertIn(f"{bot.ICON_OK_CE} {bot.ROLE_ICON_CE['driver']} driver", body)
         for role in ("character", "outfit"):
             self.assertIn(f"{bot.ICON_EMPTY} {bot.ROLE_ICON[role]} {role}", body)
         # An optional slot is marked as such, so an empty one is not mistaken
@@ -3570,33 +3586,72 @@ class TestNoDuplicateDefinitions(unittest.TestCase):
                     f"{other_name}={other!r} starts with {name}={value!r} — the "
                     f"{name} branch will swallow it")
 
-    def test_no_module_reaches_for_a_custom_emoji_entity(self):
-        """`<tg-emoji>` does nothing here, and does it silently.
+    def test_every_custom_emoji_entity_has_a_well_formed_id_and_glyph(self):
+        """`<tg-emoji>` entities now render (Premium on the owner's account,
+        confirmed 2026-09-04 — see bot.py's ICON_*_CE constants and comment).
 
-        Measured 2026-09-01 against this bot on the real API: sendMessage
-        returns ok:true, and the message comes back with entities:null and only
-        the fallback glyph. The Bot API grants custom emoji to bots that bought
-        a username on Fragment, and this one has not — so there is no error to
-        catch, no rejected send, and nothing renders wrong. It just never
-        animates. That is invisible to every test that asserts on the text the
-        bot BUILT rather than on what Telegram kept, which is all of them.
+        This used to be a test FORBIDDING the literal outright, because it was
+        silently stripped for this bot at the time. Now that it works, the
+        risk worth catching is a hand-typed id or an empty fallback glyph —
+        either would still send `ok:true` and either look fine (real id, wrong
+        glyph) or degrade to nothing (empty glyph) if Premium ever lapses, with
+        no error either way to catch it at. Two shapes are checked: bot.py
+        builds every tag through the `_ce(id, glyph)` helper (a call, not a
+        literal — its own f-string template is not itself a usage and is
+        skipped), while run.py (which cannot import bot.py's helper without a
+        circular import) writes the tag out as one whole string literal.
         """
         import ast
         root = Path(__file__).resolve().parents[1]
+        full_pattern = re.compile(r'<tg-emoji emoji-id="(\d+)">(.+)</tg-emoji>')
         for rel in self.MODULES:
             with self.subTest(module=rel):
                 tree = ast.parse((root / rel).read_text(encoding="utf-8"))
-                # String literals only, not raw file text: both modules carry a
-                # `#` comment recording WHY this is forbidden, and a grep-style
-                # check would fire on the explanation rather than on a use.
-                literals = [n.value for n in ast.walk(tree)
-                            if isinstance(n, ast.Constant)
-                            and isinstance(n.value, str)]
-                for text in literals:
-                    self.assertNotIn("<tg-emoji", text,
-                                     f"{rel} builds a custom-emoji entity — it is "
-                                     "stripped for this bot; motion comes from "
-                                     "re-editing (run._SPIN)")
+                # f-string pieces (e.g. _ce's own template) are ast.Constant
+                # too, but they are fragments of a JoinedStr, not a usage —
+                # excluded here rather than matched and rejected below.
+                fstring_pieces = {id(c) for node in ast.walk(tree)
+                                  if isinstance(node, ast.JoinedStr)
+                                  for c in node.values
+                                  if isinstance(c, ast.Constant)}
+                checked = 0
+                for node in ast.walk(tree):
+                    if id(node) in fstring_pieces:
+                        continue
+                    if (isinstance(node, ast.Call)
+                            and isinstance(node.func, ast.Name)
+                            and node.func.id == "_ce"
+                            and len(node.args) == 2
+                            and all(isinstance(a, ast.Constant)
+                                    and isinstance(a.value, str) for a in node.args)):
+                        emoji_id, glyph = node.args[0].value, node.args[1].value
+                        checked += 1
+                        self.assertTrue(
+                            emoji_id.isdigit(),
+                            f"{rel}: _ce({emoji_id!r}, {glyph!r}) — id is not "
+                            "purely numeric, likely a typo")
+                        self.assertTrue(
+                            glyph.strip(),
+                            f"{rel}: _ce({emoji_id!r}, {glyph!r}) — empty fallback "
+                            "glyph, that is what Premium lapsing degrades to")
+                    elif (isinstance(node, ast.Constant)
+                          and isinstance(node.value, str)
+                          and node.value.startswith("<tg-emoji")):
+                        match = full_pattern.fullmatch(node.value)
+                        checked += 1
+                        self.assertIsNotNone(
+                            match,
+                            f"{rel} has a malformed custom-emoji entity: "
+                            f"{node.value!r} — expected exactly <tg-emoji "
+                            'emoji-id="DIGITS">GLYPH</tg-emoji>')
+                        self.assertTrue(
+                            match.group(2).strip(),
+                            f"{rel}: {node.value!r} has an empty fallback glyph "
+                            "— that is what Premium lapsing degrades to")
+                if rel == "tgbot/bot.py":
+                    self.assertGreater(checked, 0,
+                                        "no _ce(...) call found — did the helper "
+                                        "get renamed?")
 
     def test_no_module_defines_a_top_level_name_twice(self):
         import ast
@@ -3838,7 +3893,7 @@ class TestGpuStockCommand(unittest.TestCase):
         with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
              mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
             bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
-        self.assertIn("💵 $0.99/h", self.tg.messages[-1])
+        self.assertIn(f"{bot.ICON_MONEY_CE} $0.99/h", self.tg.messages[-1])
 
     def test_works_even_with_no_env_file_at_all(self):
         with mock.patch("tgbot.bot.volume_datacenter", return_value=None), \

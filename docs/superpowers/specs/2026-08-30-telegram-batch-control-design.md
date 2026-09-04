@@ -558,13 +558,18 @@ Bot API server.
 2. **How long does `gpu-bootstrap` take when models are already on the Network Volume?** It is added
    to every single drain and is currently unmeasured. It also sets the floor for the stockout
    economics table in §9.
-3. ~~**Can the bot put animated emoji in a message?**~~ **Answered 2026-09-01: not the way it is
-   usually meant, and the failure is silent.** A `<tg-emoji emoji-id="…">` entity is accepted with
-   `ok:true` and then **stripped** — the message comes back with `entities:null` and only the
-   fallback glyph. The Bot API grants custom emoji to bots that bought a username on Fragment, and
-   this one has not. There is no error, no rejected send, and nothing renders wrong; the animation
-   just never exists, which is invisible to any test asserting on the text the bot *built* rather
-   than on what Telegram *kept*. `TestNoDuplicateDefinitions` now gates the string literal.
+3. ~~**Can the bot put animated emoji in a message?**~~ **Answered 2026-09-01, reversed 2026-09-04.**
+   2026-09-01: a `<tg-emoji emoji-id="…">` entity was accepted with `ok:true` and then **stripped** —
+   the message came back with `entities:null` and only the fallback glyph. The only entitlement path
+   known at the time was a bot-assignable username bought on Fragment (~5000 TON, a flat platform fee
+   on top of the username's own price — not something this personal-use bot needed). 2026-09-04:
+   enabling **Telegram Premium on the bot owner's account** turned out to be a second, far cheaper
+   entitlement path — with it active, `sendMessage`'s own response carries the entity back instead of
+   stripping it, confirmed both in the API response and visually (a real animated icon on the phone).
+   It still degrades silently to the plain fallback glyph if that subscription lapses — no error either
+   way — so `bot.py`'s `ICON_*_CE` constants are all chosen to keep their plain fallback meaningful on
+   its own. The guard test that used to forbid the `<tg-emoji` string literal was removed for the same
+   reason.
 
    What does work, measured the same day against the running server:
 
