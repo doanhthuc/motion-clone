@@ -9,6 +9,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/motion-clone
+Environment=HOME=/root
 ExecStart=/usr/bin/python3 /opt/motion-clone/scripts/tgbot/bot.py
 Restart=always
 RestartSec=10
