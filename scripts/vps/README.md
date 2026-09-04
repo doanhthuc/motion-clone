@@ -127,6 +127,20 @@ make drain FILE=batch/2026-08-30.yaml CONFIRM=yes   # rents, runs, destroys
    default. Both callers fail open (a warning, never a crash) if it is missing — but `/gpu` and the
    pre-Run check are then useless, so install it before relying on either.
 
+5. `yt-dlp` (2026-09-04, `tgbot/tiktok.py`) downloads a TikTok video when a link is pasted into the
+   chat — a plain binary called via `subprocess`, the same pattern as `ffmpeg`/`ffprobe` above, not a
+   pip package (this bot has zero third-party Python dependencies by design). `apt`'s version lags
+   TikTok's site changes badly, so install the standalone binary instead and re-run this whenever a
+   download starts failing — yt-dlp needs updating almost as often as sites it targets change:
+   ```bash
+   curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+   chmod a+rx /usr/local/bin/yt-dlp
+   yt-dlp --version   # confirm it runs before relying on it
+   ```
+   `deploy-bot.sh` never installs anything (it only `git reset --hard`s and restarts), so this is a
+   one-time manual step on the VPS, like `ffmpeg` and `runpodctl` above — not something a future
+   deploy will set up for you.
+
 ### Bring it up
 
 ```bash

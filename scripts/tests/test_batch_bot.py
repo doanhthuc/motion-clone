@@ -1,4 +1,4 @@
-import itertools, json, subprocess, sys, tempfile, time, unittest
+import itertools, json, shutil, subprocess, sys, tempfile, time, unittest
 from pathlib import Path
 from unittest import mock
 
@@ -499,6 +499,139 @@ class TestPhotoVideoAccepted(unittest.TestCase):
             bot.handle(self.tg, doc_from(ME, "vid-id", file_name="driver.mp4"),
                        allowed_user_id=ME)
         self.assertFalse(any("not a File" in m for m in self.tg.messages))
+
+
+class TestTikTokLinkDownload(unittest.TestCase):
+    """2026-09-04: a pasted TikTok link downloads via yt-dlp (tgbot/tiktok.py)
+    and fills `driver` exactly like an uploaded video — most driver material
+    starts life as a TikTok video in practice (see TestPhotoVideoAccepted's
+    2026-09-03 note), and re-downloading a link by hand before uploading it
+    was the same friction one step earlier.
+    """
+
+    def setUp(self):
+        self._orig_root = bot.ROOT
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "batch").mkdir()
+        (self.root / "out").mkdir()
+        bot.ROOT = self.root
+        reset_bot_state()
+        bot._LAST_VALIDATE.clear()
+        bot._CONFIRM_WARNED.clear()
+        self.addCleanup(setattr, bot, "ROOT", self._orig_root)
+        self.addCleanup(reset_bot_state)
+
+        # Stands in for tiktok.download()'s real return: a file inside a
+        # dedicated temp dir, exactly what bot.py's cleanup `finally` expects
+        # to be able to shutil.rmtree.
+        self.tmp_download_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp_download_dir, ignore_errors=True)
+        self.downloaded_path = self.tmp_download_dir / "video.mp4"
+        self.downloaded_path.write_bytes(b"d")
+
+        self.tg = FakeTg()
+        self.driver_probe = Probe(kind="video", width=1080, height=1920, duration_s=5.0,
+                                  bitrate_kbps=3000, size_bytes=1_500_000)
+        for name in ("slot_preview", "sheet"):
+            patcher = mock.patch(f"tgbot.bot.{name}", return_value=None)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_a_tiktok_link_is_downloaded_and_fills_the_driver_slot(self):
+        with mock.patch("tgbot.bot.tiktok.download",
+                        return_value=self.downloaded_path) as download, \
+             mock.patch("tgbot.bot.probe", return_value=self.driver_probe):
+            bot.handle(self.tg, cmd_from(ME, "https://vt.tiktok.com/ZS8abcde/"),
+                       allowed_user_id=ME)
+        download.assert_called_once()
+        self.assertEqual(download.call_args.args[0], "https://vt.tiktok.com/ZS8abcde/")
+        self.assertEqual(bot._STATE[ME].slots["driver"].parent,
+                         self.root / "batch" / bot.STAGING_DIR_NAME / str(ME))
+
+    def test_the_progress_message_is_deleted_once_staged(self):
+        with mock.patch("tgbot.bot.tiktok.download",
+                        return_value=self.downloaded_path), \
+             mock.patch("tgbot.bot.probe", return_value=self.driver_probe):
+            bot.handle(self.tg, cmd_from(ME, "https://vt.tiktok.com/ZS8abcde/"),
+                       allowed_user_id=ME)
+        self.assertEqual(len(self.tg.deleted), 1)
+
+    def test_text_with_no_tiktok_link_is_unaffected(self):
+        with mock.patch("tgbot.bot.tiktok.download") as download:
+            bot.handle(self.tg, cmd_from(ME, "hello there"), allowed_user_id=ME)
+        download.assert_not_called()
+
+    def test_a_download_failure_is_reported_without_touching_the_job(self):
+        with mock.patch("tgbot.bot.tiktok.download",
+                        side_effect=RuntimeError("yt-dlp failed: boom")):
+            bot.handle(self.tg, cmd_from(ME, "https://vt.tiktok.com/ZS8abcde/"),
+                       allowed_user_id=ME)
+        self.assertIn("couldn't download", "".join(self.tg.screen))
+        self.assertTrue(ME not in bot._STATE or "driver" not in bot._STATE[ME].slots)
+
+    def test_a_pasted_link_wins_over_a_pending_slot_question(self):
+        # An ambiguous image queued a question ("character/outfit/background")
+        # before the link arrived. The link must still be treated as a new
+        # driver, not as a wrong answer to that question — the same priority
+        # already given to a recognised slash command over the _PENDING
+        # fallthrough, which only ever runs last (bot.py:3618).
+        image_path = self.root / "photo.jpg"
+        image_path.write_bytes(b"i")
+        image_probe = Probe(kind="image", width=1024, height=1024, duration_s=0.0,
+                            bitrate_kbps=0, size_bytes=800_000)
+        bot._PENDING[ME] = [(image_path, image_probe)]
+        with mock.patch("tgbot.bot.tiktok.download",
+                        return_value=self.downloaded_path), \
+             mock.patch("tgbot.bot.probe", return_value=self.driver_probe):
+            bot.handle(self.tg, cmd_from(ME, "https://vt.tiktok.com/ZS8abcde/"),
+                       allowed_user_id=ME)
+        self.assertFalse(any("didn't recognise" in m for m in self.tg.messages))
+        self.assertEqual(bot._STATE[ME].slots["driver"].parent,
+                         self.root / "batch" / bot.STAGING_DIR_NAME / str(ME))
+
+
+class TestStagingPrune(unittest.TestCase):
+    """batch/tg-staging/ has no cleanup otherwise (2026-09-04) — not /clear
+    (user-triggered only) and not `make batch-clean` (out/runs/ only, see
+    scripts/batch_clean.py) — so files accumulate forever on the VPS's fixed
+    40GB disk (scripts/vps/README.md "Box") unless something ages them out.
+    """
+
+    def setUp(self):
+        self._orig_root = bot.ROOT
+        self.root = Path(tempfile.mkdtemp())
+        bot.ROOT = self.root
+        self.addCleanup(setattr, bot, "ROOT", self._orig_root)
+        self.staging = self.root / "batch" / bot.STAGING_DIR_NAME / str(ME)
+        self.staging.mkdir(parents=True)
+        bot._LAST_STAGING_PRUNE = 0.0
+        self.addCleanup(setattr, bot, "_LAST_STAGING_PRUNE", 0.0)
+
+    def _touch_with_age(self, name: str, age_days: float) -> Path:
+        path = self.staging / name
+        path.write_bytes(b"x")
+        import os
+        old = time.time() - age_days * 86400
+        os.utime(path, (old, old))
+        return path
+
+    def test_a_file_older_than_the_threshold_is_removed(self):
+        old = self._touch_with_age("old.mp4", bot.STAGING_MAX_AGE_DAYS + 1)
+        removed = bot._prune_old_staged_files(now=time.time())
+        self.assertEqual(removed, [old])
+        self.assertFalse(old.exists())
+
+    def test_a_file_within_the_threshold_is_kept(self):
+        recent = self._touch_with_age("recent.mp4", bot.STAGING_MAX_AGE_DAYS - 1)
+        removed = bot._prune_old_staged_files(now=time.time())
+        self.assertEqual(removed, [])
+        self.assertTrue(recent.exists())
+
+    def test_tick_runs_at_most_once_per_interval(self):
+        with mock.patch("tgbot.bot._prune_old_staged_files") as prune:
+            bot._tick_staging_prune()
+            bot._tick_staging_prune()
+        prune.assert_called_once()
 
 
 class TestPipelineCommand(unittest.TestCase):

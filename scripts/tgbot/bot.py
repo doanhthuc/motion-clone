@@ -39,6 +39,7 @@ from drain import failed_job_ids
 # raises ImportError regardless of sys.path. The insert above puts scripts/ on
 # the path, which is what makes the absolute form work from either entry point.
 from tgbot.tgclient import Tg, TgError
+from tgbot import tiktok
 from tgbot.ingest import (Probe, describe, probe, quality_warning,
                          quality_warning_html,
                          to_png_if_heic)
@@ -144,6 +145,14 @@ _CONFIRM_WARNED: set[int] = set()
 # ("blue-dress.jpg"), not Telegram's opaque "file_5.jpg", so a manifest read on
 # a phone is readable.
 STAGING_DIR_NAME = "tg-staging"
+
+# tg-staging/ has no cleanup of any other kind (added 2026-09-04): /clear
+# only runs when a user explicitly asks (_clear_job), and `make batch-clean`
+# only ever touches out/runs/, never this directory (scripts/batch_clean.py).
+# Left alone, every upload AND every TikTok download below sits forever on
+# the VPS's fixed 40GB disk (scripts/vps/README.md "Box"). 7 days covers the
+# normal "send material, confirm, run" session with margin.
+STAGING_MAX_AGE_DAYS = 7
 
 # Message kinds with no accept path at all: no width/height/bitrate ffprobe
 # can read from a sticker or a voice note, so there is nothing to warn about,
@@ -391,6 +400,60 @@ def _stage_file(chat_id: int, src: Path, file_name: str | None) -> Path:
             f"On the VPS, check that telegram-bot-api.yml mounts "
             f"/var/lib/telegram-bot-api at the identical host path.") from exc
     return dest
+
+
+def _prune_old_staged_files(now: float | None = None) -> list[Path]:
+    """Delete files under batch/tg-staging/*/ older than STAGING_MAX_AGE_DAYS.
+
+    Age-based and blind to which chat or job a file belongs to — the
+    directory carries no other record of that once a job is cleared or
+    confirmed (job.py's Job only tracks the CURRENT assembly). Returns what
+    it removed, so the caller can log it.
+    """
+    now = time.time() if now is None else now
+    cutoff = now - STAGING_MAX_AGE_DAYS * 86400
+    staging_root = ROOT / "batch" / STAGING_DIR_NAME
+    removed: list[Path] = []
+    if not staging_root.is_dir():
+        return removed
+    for chat_dir in staging_root.iterdir():
+        if not chat_dir.is_dir():
+            continue
+        for path in chat_dir.iterdir():
+            if path.is_file() and path.stat().st_mtime < cutoff:
+                path.unlink()
+                removed.append(path)
+    return removed
+
+
+# How often main()'s poll loop actually runs the sweep above. Once a day
+# rather than every ~50s poll round (2026-09-04): the sweep stats every file
+# under tg-staging/, and the whole point of piggybacking on the poll loop
+# instead of a systemd timer (see _tick_staging_prune) is to cost nothing
+# most of the time.
+_STAGING_PRUNE_INTERVAL_SEC = 24 * 60 * 60
+_LAST_STAGING_PRUNE = 0.0
+
+
+def _tick_staging_prune() -> None:
+    """Runs `_prune_old_staged_files` at most once per _STAGING_PRUNE_INTERVAL_SEC.
+
+    Called from main()'s poll loop rather than a separate thread or a
+    systemd timer: deploy-bot.sh only ever does `git reset --hard` + restart
+    (scripts/vps/README.md), so anything needing its own VPS provisioning
+    step is a second thing to remember to set up there and keep working
+    after every deploy. The poll loop already runs forever, so this
+    piggybacks on it instead.
+    """
+    global _LAST_STAGING_PRUNE
+    now = time.time()
+    if now - _LAST_STAGING_PRUNE < _STAGING_PRUNE_INTERVAL_SEC:
+        return
+    _LAST_STAGING_PRUNE = now
+    removed = _prune_old_staged_files(now)
+    if removed:
+        log(f"pruned {len(removed)} staged file(s) older than "
+            f"{STAGING_MAX_AGE_DAYS}d: {', '.join(p.name for p in removed)}")
 
 
 def _fidelity_line(path: Path) -> str:
@@ -3439,6 +3502,67 @@ def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
 
     text = msg.get("text") or ""
 
+    tiktok_url = tiktok.find_url(text)
+    if tiktok_url:
+        # Checked before every /command below AND before the _PENDING
+        # fallthrough at the end of this function (2026-09-04): a pasted
+        # link must win over "reply character/outfit/background" the same
+        # way an uploaded video does — job.slot_for is structural for
+        # kind=="video", no question ever attaches to it.
+        #
+        # Not `_spinner`: that thread redraws a fixed label on a timer and
+        # has no channel for yt-dlp's own percentage, which is the whole
+        # reason this got its own progress message instead of reusing it.
+        message_id = tg.send_message(chat_id, "⬇️ downloading tiktok video… 0%")
+        last_shown = 0.0
+        last_edit_ts = 0.0
+
+        def on_progress(pct: float) -> None:
+            nonlocal last_shown, last_edit_ts
+            now = time.monotonic()
+            # Throttled on BOTH size and time (2026-09-04): yt-dlp reports a
+            # new percentage many times a second, and editMessageText has
+            # the same real-world throttling _spinner's own docstring
+            # measured — an edit every frame would burn through it for a
+            # number nobody can read that fast anyway.
+            if (pct - last_shown < 5.0) and (now - last_edit_ts < 2.0):
+                return
+            last_shown, last_edit_ts = pct, now
+            try:
+                tg.edit_message(chat_id, message_id,
+                                f"⬇️ downloading tiktok video… {pct:.0f}%")
+            except TgError as exc:
+                log(f"tiktok progress edit throttled, skipping: {exc}")
+
+        try:
+            tmp_path = tiktok.download(tiktok_url, on_progress=on_progress)
+        except (RuntimeError, OSError) as exc:
+            tg.edit_message(chat_id, message_id,
+                            f"couldn't download that TikTok video: {exc}")
+            return
+
+        try:
+            path = _stage_file(chat_id, tmp_path, f"tiktok-{int(time.time())}.mp4")
+            p = probe(path)
+            fidelity = _fidelity_line(path)
+            _FIDELITY.setdefault(chat_id, {})[str(path)] = fidelity
+        except (RuntimeError, TgError, KeyError, OSError) as exc:
+            tg.edit_message(chat_id, message_id, f"that file was not accepted: {exc}")
+            return
+        finally:
+            # tiktok.download() only cleans up after itself when IT raises
+            # (its own contract) — on success the caller owns the temp dir,
+            # and this is the only path that ever reaches here with one.
+            shutil.rmtree(tmp_path.parent, ignore_errors=True)
+
+        tg.delete_message(chat_id, message_id)
+        _CONFIRM_WARNED.discard(chat_id)
+        job = _job_for(chat_id)
+        role = slot_for(p, job)   # a video: structural, always `driver`
+        _fill_slot(tg, chat_id, job, role, path, p)
+        _maybe_show_manifest(tg, chat_id, job)
+        return
+
     if text.startswith("/tryon"):
         # On request, not by default: sending 01-tryon.png with every job would
         # be noise, but when the final video looks wrong, what try-on produced
@@ -3700,6 +3824,7 @@ def main() -> int:
             # One chat, because the allowlist is one user (spec section 2).
             tick_progress(tg, allowed_user_id)
             tick_migration_progress(tg, allowed_user_id)
+            _tick_staging_prune()
         except TgError as exc:
             log(f"poll failed, continuing: {exc}")
             time.sleep(5)
