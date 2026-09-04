@@ -143,6 +143,24 @@ cp scripts/vps/motion-bot.service /etc/systemd/system/
 systemctl daemon-reload && systemctl enable --now motion-bot
 ```
 
+### Deploying new code
+
+`.github/workflows/deploy-bot.yml` fires on every push to `main` that touches `scripts/**`: it
+SSHes into the VPS and the connection runs exactly one thing, `scripts/vps/deploy-bot.sh`
+(`git fetch && git reset --hard origin/main && systemctl restart motion-bot`). The deploy key's
+`authorized_keys` entry carries a `command=` restriction pinned to that script, so the CI secret
+leaking is not equivalent to root SSH access — it can restart the bot, nothing else.
+
+Two consequences worth knowing:
+
+- **Never hand-edit `/opt/motion-clone` on the VPS.** `git reset --hard` throws away anything not
+  committed to `main` on the next deploy. Land changes through a normal PR.
+- **`motion-bot.service` itself is not redeployed by this.** It's installed once to
+  `/etc/systemd/system/`; editing `scripts/vps/motion-bot.service` in the repo needs a manual
+  `cp` + `daemon-reload` on the VPS, same as the initial bring-up above.
+
+Manual trigger (skip the wait for a push): `gh workflow run deploy-bot.yml -R doanhthuc/motion-clone`.
+
 ### Commands
 
 | Command | What it does |
