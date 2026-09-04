@@ -1,0 +1,43 @@
+# .github/workflows/deploy-bot.yml
+#
+# On push to main touching scripts/, SSH into the always-on VPS and fast-forward it to
+# origin/main, then restart the motion-bot service. bot.py (scripts/tgbot/bot.py) imports from
+# batchlib, batchlib_ext and drain.py, so the path filter covers all of scripts/, not just
+# scripts/tgbot/.
+#
+# The deploy key can only ever run scripts/vps/deploy-bot.sh: its authorized_keys entry on the
+# VPS carries a `command=` restriction, so this secret leaking is not equivalent to root SSH
+# access. The workflow itself never runs `git reset --hard` or `systemctl restart` — that logic
+# lives only on the VPS, in the one script the key is allowed to invoke.
+name: Deploy bot to VPS
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - scripts/**
+      - .github/workflows/deploy-bot.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-bot
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: SSH deploy (remote command is ignored — the VPS forces deploy-bot.sh)
+        env:
+          SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          SSH_HOST: ${{ secrets.VPS_HOST }}
+        run: |
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+              root@"$SSH_HOST" true
