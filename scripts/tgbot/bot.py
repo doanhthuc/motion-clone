@@ -2750,7 +2750,7 @@ def _report_gpu_stock(tg: Tg, chat_id: int) -> None:
         entries = stock.get(wanted_id)
         if not entries:
             short = _GPU_DISPLAY_SHORT.get(wanted_id, wanted_id)
-            lines.append(f"  🔴 <b>{_esc(short)}</b>: sold out everywhere")
+            lines.append(f"  <b>{_esc(short)}</b>: 🔴 sold out everywhere")
             continue
         price = f"{ICON_MONEY_CE} ${entries[0].price_per_hr:.2f}/h" if entries[0].price_per_hr else "?"
         # None, not "not offered here", when home_dc itself is unknown — that
