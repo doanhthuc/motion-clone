@@ -2762,8 +2762,9 @@ def _report_gpu_stock(tg: Tg, chat_id: int) -> None:
             key=lambda e: _STOCK_RANK.get(e.stock_status.lower(), 9))
         for e in elsewhere[:2]:
             icon = _stock_icon(e.stock_status.lower())
+            e_price = f"{ICON_MONEY_CE} ${e.price_per_hr:.2f}/h" if e.price_per_hr else "?"
             other_lines.append(f"  {_esc(e.display_name)} — {_esc(e.datacenter_id)}: "
-                               f"{icon} {_esc(e.stock_status)}")
+                               f"{icon} {_esc(e.stock_status)} · {e_price}")
 
     if other_lines:
         lines.append("\n<b>Other regions</b> (need the volume synced there "
