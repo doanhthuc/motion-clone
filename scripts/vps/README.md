@@ -145,15 +145,50 @@ make drain FILE=batch/2026-08-30.yaml CONFIRM=yes   # rents, runs, destroys
    chat — a plain binary called via `subprocess`, the same pattern as `ffmpeg`/`ffprobe` above, not a
    pip package (this bot has zero third-party Python dependencies by design). `apt`'s version lags
    TikTok's site changes badly, so install the standalone binary instead and re-run this whenever a
-   download starts failing — yt-dlp needs updating almost as often as sites it targets change:
+   download starts failing — yt-dlp needs updating almost as often as sites it targets change.
+   Use the `yt-dlp_linux` asset (PyInstaller build), **not** the bare `yt-dlp` one: the bare asset is a
+   zipimport script that needs a system Python and does not bundle `curl_cffi`, so TikTok's
+   impersonation requirement fails with "no impersonate target is available" (hit 2026-09-06).
+   `yt-dlp_linux` bundles `curl_cffi` already — still zero pip packages, just the right binary:
    ```bash
-   curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+   curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux -o /usr/local/bin/yt-dlp
    chmod a+rx /usr/local/bin/yt-dlp
-   yt-dlp --version   # confirm it runs before relying on it
+   yt-dlp --version                        # confirm it runs before relying on it
+   yt-dlp --list-impersonate-targets       # must list curl_cffi targets, not "(unavailable)"
    ```
-   `deploy-bot.sh` never installs anything (it only `git reset --hard`s and restarts), so this is a
-   one-time manual step on the VPS, like `ffmpeg` and `runpodctl` above — not something a future
-   deploy will set up for you.
+   If TikTok extraction still errors on the *latest stable* release, try `yt-dlp --update-to nightly`
+   first — TikTok changes its site often enough that the fix can land in nightly days before the next
+   stable cut. Separately, a specific video can come back with only an audio format (no video track) —
+   confirmed 2026-09-06 by inspecting the raw TikTok response directly: `privateItem: false`,
+   `downloadSetting: 0` (not actually restricted), but `playAddr` and `downloadAddr` were both `""`.
+   TikTok blanks the real CDN url for traffic that isn't a signed native-app request — cookies, a
+   different IP, or a yt-dlp version bump don't change that, since the request still isn't the app.
+   (Verified 2026-09-06: a real logged-in session's cookies were tested against the exact video this
+   was found on and made no difference — still audio-only. So this repo doesn't wire up `--cookies`
+   support: it would mean keeping a real account's session on the VPS for a problem it doesn't fix.
+   The fallback below is what actually fixes this case.)
+
+   **Third-party fallback** (added 2026-09-06): when yt-dlp fails for *any* reason, `download()`
+   automatically tries [tikwm.com](https://www.tikwm.com)'s public API next — an unofficial service
+   that replicates TikTok's signed mobile-app request, so it gets a real CDN url in the exact
+   blanked-`playAddr` case above (verified against the video that started this: yt-dlp got audio-only,
+   tikwm returned a working 576x1024 h264+aac file). No setup needed, no dependency added (plain
+   `urllib`) — but it is unofficial with no docs or SLA, so treat it as a bonus, not something to
+   depend on: if it silently starts failing everywhere, that's tikwm changing its response shape or
+   disappearing, not this repo's code breaking.
+
+   tikwm's free tier throttles rather than hard-fails, so the lookup retries up to
+   `_TIKWM_LOOKUP_ATTEMPTS` (3) times with a short backoff before giving up — a lone rate-limit hit
+   resolves itself instead of failing the whole download. Looked for a second unofficial provider to
+   chain after tikwm (2026-09-06) so a real API outage, not just a rate limit, would still have a way
+   out — tiklydown.eu.org, tikmate.app, and musicaldown.com were each tried by hand and either timed
+   out or didn't match their assumed request shape, so none were wired in. Only add a second one here
+   after confirming by hand that it actually returns a playable url for a real video — this repo's own
+   rule against claims without a measured run applies to picking scraping targets too.
+
+   `deploy-bot.sh` never installs anything (it only `git reset --hard`s and restarts), so the yt-dlp
+   binary and cookies file are one-time manual steps on the VPS, like `ffmpeg` and `runpodctl` above —
+   not something a future deploy will set up for you.
 
 ### Bring it up
 
