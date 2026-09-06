@@ -2676,21 +2676,33 @@ _PRIMARY_GPU_ID = "NVIDIA GeForce RTX 5090"
 # (443.75s -> 656s) and confirmed it runs Wan2.2 Animate correctly — a
 # measured number, not an assumption. RTX PRO 4500 second: half the 5090's
 # price, but its render time has never been measured in this repo, only
-# observed as noticeably slower in real use.
-_FALLBACK_GPU_IDS = ("NVIDIA GeForce RTX 4090", "NVIDIA RTX PRO 4500 Blackwell")
+# observed as noticeably slower in real use. L40S third: same Ada Lovelace
+# die/compute-capability (sm_89) as the RTX 4090 above, so it takes the
+# identical, already-working setup path (lib-gpu.sh detects capability via
+# nvidia-smi, not by GPU name), only ~$0.10/h above the 5090 (checked live
+# 2026-09-06). RTX PRO 6000 Blackwell Server Edition fourth: same
+# architecture family as the 5090 itself (Blackwell, cc >= 10), but ~2x its
+# price ($2.09/h vs ~$0.99/h) — no Blackwell card sits close to the 5090's
+# price, so this is offered for when architecture match matters more than
+# staying cheap, not as a budget option.
+_FALLBACK_GPU_IDS = ("NVIDIA GeForce RTX 4090", "NVIDIA RTX PRO 4500 Blackwell",
+                     "NVIDIA L40S", "NVIDIA RTX PRO 6000 Blackwell Server Edition")
 
 # callback_data stays short (Bot API caps it at 64 bytes) — a switch button
 # carries one of these keys, never the full gpuId string.
 _GPU_SHORT = {_PRIMARY_GPU_ID: "5090", "NVIDIA GeForce RTX 4090": "4090",
-             "NVIDIA RTX PRO 4500 Blackwell": "pro4500"}
+             "NVIDIA RTX PRO 4500 Blackwell": "pro4500", "NVIDIA L40S": "l40s",
+             "NVIDIA RTX PRO 6000 Blackwell Server Edition": "pro6000"}
 _GPU_BY_SHORT = {v: k for k, v in _GPU_SHORT.items()}
 
 # Human-facing name for a GPU runpodctl doesn't list at all right now (so
 # there is no entries[0].display_name to read one from) — matches the
-# "RTX 4090" / "RTX PRO 4500" shape runpodctl's own display_name uses for
-# the other two, confirmed live 2026-09-06.
+# "RTX 4090" / "RTX PRO 4500" / "L40S" / "RTX PRO 6000" shape runpodctl's
+# own display_name uses for the others, confirmed live 2026-09-06.
 _GPU_DISPLAY_SHORT = {_PRIMARY_GPU_ID: "RTX 5090", "NVIDIA GeForce RTX 4090": "RTX 4090",
-                     "NVIDIA RTX PRO 4500 Blackwell": "RTX PRO 4500"}
+                     "NVIDIA RTX PRO 4500 Blackwell": "RTX PRO 4500",
+                     "NVIDIA L40S": "L40S",
+                     "NVIDIA RTX PRO 6000 Blackwell Server Edition": "RTX PRO 6000"}
 
 # runpodctl's own stock words, ranked best-first — used only to sort the
 # "other regions" list so the most promising alternative surfaces first.

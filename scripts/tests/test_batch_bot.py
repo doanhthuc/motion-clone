@@ -3805,7 +3805,8 @@ class TestGpuStockCommand(unittest.TestCase):
             bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
         stock_at.assert_called_once_with(
             ["NVIDIA GeForce RTX 5090", "NVIDIA GeForce RTX 4090",
-             "NVIDIA RTX PRO 4500 Blackwell"])
+             "NVIDIA RTX PRO 4500 Blackwell", "NVIDIA L40S",
+             "NVIDIA RTX PRO 6000 Blackwell Server Edition"])
         text = self.tg.messages[-1]
         self.assertIn("📍", text)
         self.assertIn("EU-RO-1", text)
@@ -3852,7 +3853,8 @@ class TestGpuStockCommand(unittest.TestCase):
             bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
         stock_at.assert_called_once_with(
             ["NVIDIA GeForce RTX 5090", "NVIDIA GeForce RTX 4090",
-             "NVIDIA RTX PRO 4500 Blackwell"])
+             "NVIDIA RTX PRO 4500 Blackwell", "NVIDIA L40S",
+             "NVIDIA RTX PRO 6000 Blackwell Server Edition"])
         text = self.tg.messages[-1]
         self.assertIn("RTX 5090", text)
         self.assertIn("Low", text)
