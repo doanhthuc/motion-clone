@@ -2685,6 +2685,13 @@ _GPU_SHORT = {_PRIMARY_GPU_ID: "5090", "NVIDIA GeForce RTX 4090": "4090",
              "NVIDIA RTX PRO 4500 Blackwell": "pro4500"}
 _GPU_BY_SHORT = {v: k for k, v in _GPU_SHORT.items()}
 
+# Human-facing name for a GPU runpodctl doesn't list at all right now (so
+# there is no entries[0].display_name to read one from) — matches the
+# "RTX 4090" / "RTX PRO 4500" shape runpodctl's own display_name uses for
+# the other two, confirmed live 2026-09-06.
+_GPU_DISPLAY_SHORT = {_PRIMARY_GPU_ID: "RTX 5090", "NVIDIA GeForce RTX 4090": "RTX 4090",
+                     "NVIDIA RTX PRO 4500 Blackwell": "RTX PRO 4500"}
+
 # runpodctl's own stock words, ranked best-first — used only to sort the
 # "other regions" list so the most promising alternative surfaces first.
 _STOCK_RANK = {"high": 0, "medium": 1, "low": 2, "none": 3}
@@ -2742,7 +2749,8 @@ def _report_gpu_stock(tg: Tg, chat_id: int) -> None:
     for wanted_id in wanted:
         entries = stock.get(wanted_id)
         if not entries:
-            lines.append(f"  {_esc(wanted_id)}: not listed by runpodctl right now")
+            short = _GPU_DISPLAY_SHORT.get(wanted_id, wanted_id)
+            lines.append(f"  🔴 <b>{_esc(short)}</b>: sold out everywhere")
             continue
         price = f"{ICON_MONEY_CE} ${entries[0].price_per_hr:.2f}/h" if entries[0].price_per_hr else "?"
         # None, not "not offered here", when home_dc itself is unknown — that

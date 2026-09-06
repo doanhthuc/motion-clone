@@ -3913,7 +3913,7 @@ class TestGpuStockCommand(unittest.TestCase):
         with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
              mock.patch("tgbot.bot.stock_at_cached", return_value={}):
             bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
-        self.assertIn("not listed", self.tg.messages[-1])
+        self.assertIn("sold out everywhere", self.tg.messages[-1])
 
 
 class TestKillCommand(unittest.TestCase):
