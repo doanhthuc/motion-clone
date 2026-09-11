@@ -142,12 +142,26 @@ runs:
 | `tryon-motion-enhance` | tryon → motion → enhance | `character`, `outfit`, `driver` | `background` |
 | `character-swap-enhance` | character-swap → enhance | `character`, `driver` | — |
 | `tryon-character-swap-enhance` | tryon → character-swap → enhance | `character`, `outfit`, `driver` | `background` |
+| `tryon-camera-motion-enhance` | camera-tryon → camera-motion → enhance | `character`, `outfit`, `background`, `driver` | none |
 
 Hai pipeline `character-swap`: `driver` = video nguồn **chứa người sẽ bị thay**, `character` = ảnh
 người mẫu sẽ thế vào (ở `tryon-character-swap-enhance`, `character` là ảnh sau khi tryon).
 
 Khối param tên **đúng bằng tên chặng**: `tryon:` · `motion:` · `enhance:` · `character-swap:`
 (nhận `engine: wananimate|scail2`).
+
+### 2.2.1 Camera-aware try-on motion
+
+`tryon-camera-motion-enhance` is a separate flow; existing
+`tryon-motion-enhance` behavior is unchanged. `camera-tryon` performs the ordinary garment edit,
+then makes a second billable image-edit call. It takes only the midpoint of the selected driver
+segment as a framing guide. The supplied scene is preserved, though background geometry may be
+regenerated lightly for the requested camera angle or perspective.
+
+This representative frame does not reproduce full camera movement, and it does not use Character
+Swap's replacement mask. `character`, `outfit`, `background`, and `driver` are all required. A
+missing or unreadable driver, missing background, or failed composition stops the run before Motion
+Control; it never falls back silently to ordinary try-on.
 
 Timeout riêng từng chặng (`batchlib/pipelines.py`): tryon 20 phút · motion 60 · character-swap 60 ·
 enhance 90. enhance 1080p60 nội suy RIFE rồi encode lại nên **luôn lâu hơn** chặng sinh ra nó.
