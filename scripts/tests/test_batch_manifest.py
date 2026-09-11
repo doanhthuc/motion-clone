@@ -60,6 +60,38 @@ class TestLoad(unittest.TestCase):
             self.assertEqual(run.stage_params["camera-motion"]["driverStartSec"], 5)
             self.assertEqual(run.stage_params["camera-tryon"]["driverDurSec"], 15)
             self.assertEqual(run.stage_params["camera-motion"]["driverDurSec"], 15)
+            self.assertEqual(run.stage_params["camera-motion"]["preset"], "drv-15s")
+
+    def test_camera_duration_derives_the_matching_driver_preset_for_both_stages(self):
+        text = CAMERA.replace("preset: drv-15s, quality: 720p", "driverDurSec: 20, quality: 720p")
+        with tempfile.TemporaryDirectory() as d:
+            run = load_manifest(_fixture(Path(d), text)).runs[0]
+            guide = run.stage_params["camera-tryon"]
+            motion = run.stage_params["camera-motion"]
+            self.assertEqual(guide["driverDurSec"], 20)
+            self.assertEqual(motion["driverDurSec"], 20)
+            self.assertEqual(motion["preset"], "drv-20s")
+
+    def test_camera_segment_requires_one_supported_duration_source(self):
+        text = CAMERA.replace("preset: drv-15s, quality: 720p", "quality: 720p")
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(ManifestError) as cm:
+                load_manifest(_fixture(Path(d), text))
+            self.assertIn("camera-motion", str(cm.exception))
+            self.assertIn("driverDurSec", str(cm.exception))
+
+    def test_camera_segment_rejects_mismatched_or_unsupported_duration_sources(self):
+        cases = (
+            "preset: drv-15s, driverDurSec: 10, quality: 720p",
+            "preset: drv-15s, driverDurSec: 15.5, quality: 720p",
+            "preset: drv-7s, quality: 720p",
+        )
+        for params in cases:
+            with self.subTest(params=params), tempfile.TemporaryDirectory() as d:
+                text = CAMERA.replace("preset: drv-15s, quality: 720p", params)
+                with self.assertRaises(ManifestError) as cm:
+                    load_manifest(_fixture(Path(d), text))
+                self.assertIn("camera-motion", str(cm.exception))
 
     def test_conflicting_camera_segments_are_rejected_before_gpu(self):
         text = CAMERA.replace("preset: drv-15s, quality: 720p",

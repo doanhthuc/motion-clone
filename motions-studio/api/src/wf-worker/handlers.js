@@ -7,7 +7,7 @@ import { putObject, browserUrl, getObjectStream } from "../storage.js"
 import path from "node:path"
 import { scheduleSocialPosts } from "./social-scheduler.js"
 import { enforceMotionResolution } from "../motion-resolution.js"
-import { enforceMotionFitPolicy } from "../motion-camera-policy.js"
+import { enforceMotionFitPolicy, isCameraAwareMotion } from "../motion-camera-policy.js"
 import { detectGpuVramGb, WAN_DANCER_MIN_VRAM_GB } from "../gpu-vram.js"
 import { enforceTaskCloudEnhancePolicy } from "../task-cloud/enhance-policy.js"
 
@@ -168,12 +168,12 @@ export function normalizeMotionDriverSegment(type, params) {
 
   // ALD 28/06/2026 - Multi-outfit legacy compatibility: some saved/run snapshots
   // used driverDurSec as endSec (5/10, 10/15). Worker expects duration.
-  if (start > 0 && Math.abs(dur - (start + 5)) < 0.001) {
+  if (!isCameraAwareMotion(out) && start > 0 && Math.abs(dur - (start + 5)) < 0.001) {
     out.driverDurSec = 5
     out.driver_dur_sec = 5
   }
   const fixedDur = Number(out.driverDurSec ?? out.driver_dur_sec ?? dur)
-  if (Math.abs(fixedDur - 5) < 0.001 && start % 5 === 0) {
+  if (!isCameraAwareMotion(out) && Math.abs(fixedDur - 5) < 0.001 && start % 5 === 0) {
     out.preset = "5s-720p"
     out.frames = 81
     out.steps = 4

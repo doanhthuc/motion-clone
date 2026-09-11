@@ -142,7 +142,10 @@ class TestCameraAlias(unittest.TestCase):
     def manifest(self, tmp):
         (tmp / "bg.png").write_bytes(b"background")
         text = MANIFEST_TRYON_GEMINI.replace("tryon-motion-enhance", "tryon-camera-motion-enhance").replace(
-            "    tryon:", "    camera-tryon:").replace("      outfit:", "      background: bg.png\n      outfit:")
+            "    tryon:", "    camera-tryon:").replace("      outfit:", "      background: bg.png\n      outfit:").replace(
+            "camera-tryon: { provider: gemini }",
+            "camera-tryon: { provider: gemini }\n    camera-motion: { preset: drv-15s }",
+        )
         return load_manifest(_fixture_tryon(tmp, text))
 
     def test_camera_alias_resolves_same_driver(self):
@@ -181,6 +184,9 @@ class TestCameraAlias(unittest.TestCase):
                     state_file=tmp / "state.json", resume=False, log=lambda _: None)
             self.assertIs(pod.submitted[0][1].get("cameraAware"), True)
             self.assertIs(pod.submitted[1][1].get("cameraAwareMotion"), True)
+            self.assertEqual(pod.submitted[0][1].get("driverDurSec"), 15)
+            self.assertEqual(pod.submitted[1][1].get("driverDurSec"), 15)
+            self.assertEqual(pod.submitted[1][1].get("preset"), "drv-15s")
 
 
 class FakePod:

@@ -43,10 +43,10 @@ runs:
   - id: model-a__outfit-a__camera-motion
     pipeline: tryon-camera-motion-enhance
     inputs:
-      character:  .smoke/model-a.jpg
-      outfit:     .smoke/outfit-a.jpg
-      background: .smoke/scene-a.jpg
-      driver:     .smoke/driver-a.mp4
+      character:  ../.smoke/model-a.jpg
+      outfit:     ../.smoke/outfit-a.jpg
+      background: ../.smoke/scene-a.jpg
+      driver:     ../.smoke/driver-a.mp4
     camera-tryon:
       provider: gemini
       driverStartSec: 0

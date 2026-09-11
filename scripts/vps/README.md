@@ -134,6 +134,11 @@ make drain FILE=batch/2026-08-30.yaml CONFIRM=yes   # rents, runs, destroys
    `camera-motion`. The default remains `tryon-motion-enhance` unless
    `TG_PIPELINE=tryon-camera-motion-enhance` is explicitly configured.
 
+   Camera-aware try-on runs one additional billable image-edit pass to compose
+   the dressed person, supplied scene, and driver midpoint. A missing or
+   unreadable guide, or a failed camera composition, stops the job before
+   Motion Control; it never falls back to ordinary try-on framing.
+
 2. The server's storage is bind-mounted at `/var/lib/telegram-bot-api` **on both sides**. With
    `TELEGRAM_LOCAL=1`, `getFile` returns an absolute path on the container's filesystem and `bot.py`
    opens that exact string on the host, so the two namespaces have to agree — see the comment in

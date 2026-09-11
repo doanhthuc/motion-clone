@@ -4,14 +4,14 @@ import { enforceMotionResolution } from "./motion-resolution.js"
 import { normalizeMotionDriverSegment as normalizeDirectMotion } from "./routes/jobs.js"
 import { normalizeMotionDriverSegment as normalizeWorkflowMotion } from "./wf-worker/handlers.js"
 
-assert.equal(isCameraAwareMotion({ cameraAwareMotion: true }), true)
-assert.equal(isCameraAwareMotion({ cameraAwareMotion: "true" }), true)
-assert.equal(isCameraAwareMotion({ cameraAwareMotion: "1" }), true)
-assert.equal(isCameraAwareMotion({ camera_aware_motion: "yes" }), true)
-assert.equal(isCameraAwareMotion({ camera_aware_motion: "on" }), true)
-assert.equal(isCameraAwareMotion({ cameraAwareMotion: "0" }), false)
-assert.equal(isCameraAwareMotion({ cameraAwareMotion: 1 }), false)
-assert.equal(isCameraAwareMotion({ cameraAwareMotion: ["true"] }), false)
+for (const key of ["cameraAwareMotion", "camera_aware_motion"]) {
+  for (const value of [true, "1", "true", "yes", "on"]) {
+    assert.equal(isCameraAwareMotion({ [key]: value }), true, `${key} accepts ${JSON.stringify(value)}`)
+  }
+  for (const value of [false, "0", 1, ["true"], "enabled"]) {
+    assert.equal(isCameraAwareMotion({ [key]: value }), false, `${key} rejects ${JSON.stringify(value)}`)
+  }
+}
 assert.equal(isCameraAwareMotion({}), false)
 
 for (const unsupported of [null, undefined, 0, "motion", true]) {
@@ -41,6 +41,20 @@ for (const [name, normalize] of [
 
   const characterSwap = { preset: "drv-15s", fitDriver: true }
   assert.equal(normalize("character-swap", characterSwap), characterSwap, `${name} leaves Character Swap untouched`)
+
+  const cameraSegment = normalize("motion", {
+    preset: "drv-15s", camera_aware_motion: "on",
+    driverStartSec: 10, driverDurSec: 15,
+  })
+  assert.equal(cameraSegment.driverDurSec, 15, `${name} preserves the camera guide duration`)
+  assert.equal(cameraSegment.preset, "drv-15s", `${name} preserves the camera driver preset`)
+
+  const legacySegment = normalize("motion", {
+    preset: "drv-15s", driverStartSec: 10, driverDurSec: 15,
+  })
+  assert.equal(legacySegment.driverDurSec, 5, `${name} keeps the legacy end-time correction`)
+  assert.equal(legacySegment.driver_dur_sec, 5, `${name} mirrors the legacy corrected duration`)
+  assert.equal(legacySegment.preset, "5s-720p", `${name} keeps the legacy five-second preset`)
 }
 
 const directCamera = enforceMotionResolution("motion", enforceMotionFitPolicy({

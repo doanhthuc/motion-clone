@@ -27,17 +27,28 @@ from worker_runtime import linux  # noqa: E402
 
 
 class CameraCompositionTests(unittest.TestCase):
-    def test_motion_normalization_preserves_driver_fitting_only_for_camera_aware_motion(self):
-        camera = linux._normalize_motion_params({
-            "preset": "drv-15s", "cameraAwareMotion": True,
-            "bodyProportionLock": False, "poseStrength": 0.9,
-            "clipStrength": 1.2, "fitDriver": True,
-        })
-        self.assertTrue(camera["fitDriver"])
-        self.assertTrue(camera["fit_driver"])
-        self.assertFalse(camera["bodyProportionLock"])
-        self.assertEqual(camera["poseStrength"], 0.9)
-        self.assertEqual(camera["clipStrength"], 1.2)
+    def test_motion_normalization_uses_the_api_camera_flag_contract(self):
+        for key in ("cameraAwareMotion", "camera_aware_motion"):
+            for value in (True, "1", "true", "yes", "on"):
+                with self.subTest(key=key, value=value):
+                    camera = linux._normalize_motion_params({
+                        "preset": "drv-15s", key: value,
+                        "bodyProportionLock": False, "poseStrength": 0.9,
+                        "clipStrength": 1.2, "fitDriver": True,
+                    })
+                    self.assertTrue(camera["fitDriver"])
+                    self.assertTrue(camera["fit_driver"])
+                    self.assertFalse(camera["bodyProportionLock"])
+                    self.assertEqual(camera["poseStrength"], 0.9)
+                    self.assertEqual(camera["clipStrength"], 1.2)
+
+            for value in (False, "0", 1, ["true"], "enabled"):
+                with self.subTest(key=key, value=value):
+                    rejected = linux._normalize_motion_params({
+                        "preset": "drv-15s", key: value, "fitDriver": True,
+                    })
+                    self.assertFalse(rejected["fitDriver"])
+                    self.assertFalse(rejected["fit_driver"])
 
         ordinary = linux._normalize_motion_params({"preset": "drv-15s", "fitDriver": True})
         self.assertFalse(ordinary["fitDriver"])
@@ -47,6 +58,98 @@ class CameraCompositionTests(unittest.TestCase):
             "preset": "drv-15s", "fitDriver": True, "_swapEngine": "wananimate",
         })
         self.assertTrue(character_swap["fitDriver"])
+
+    def test_worker_camera_predicate_matches_api_policy(self):
+        cases = [
+            {"key": "cameraAwareMotion", "value": True},
+            {"key": "cameraAwareMotion", "value": "1"},
+            {"key": "camera_aware_motion", "value": "true"},
+            {"key": "camera_aware_motion", "value": "yes"},
+            {"key": "camera_aware_motion", "value": "on"},
+            {"key": "cameraAwareMotion", "value": 1},
+            {"key": "cameraAwareMotion", "value": ["true"]},
+            {"key": "camera_aware_motion", "value": "enabled"},
+        ]
+        policy = Path(linux.__file__).resolve().parents[2] / "api" / "src" / "motion-camera-policy.js"
+        script = (
+            f"import {{ isCameraAwareMotion }} from {json.dumps(policy.as_uri())};"
+            "const cases = JSON.parse(process.argv.at(-1));"
+            "console.log(JSON.stringify(cases.map(({ key, value }) => "
+            "isCameraAwareMotion({ [key]: value }))));"
+        )
+        api = subprocess.run(
+            ["node", "--input-type=module", "-e", script, json.dumps(cases)],
+            check=True, capture_output=True, text=True,
+        )
+        worker = [linux._is_camera_aware_motion({case["key"]: case["value"]}) for case in cases]
+        self.assertEqual(worker, json.loads(api.stdout))
+
+
+class CameraMotionWorkflowBoundaryTests(unittest.TestCase):
+    def _submit_motion(self, driver_dims, *, camera_aware):
+        with tempfile.TemporaryDirectory() as d, ExitStack() as stack:
+            tmp = Path(d)
+            ref = tmp / "ref.png"
+            driver = tmp / "driver.mp4"
+            rendered = tmp / "rendered.mp4"
+            for path in (ref, driver, rendered):
+                path.write_bytes(b"fixture")
+            submitted = []
+
+            def fake_subprocess(cmd, **kwargs):
+                if cmd[0] == "ffprobe":
+                    return mock.Mock(returncode=0, stdout="30/1\n", stderr="")
+                raise subprocess.CalledProcessError(1, cmd)
+
+            for name, replacement in {
+                "api_download": lambda key, dest: shutil.copyfile(key, dest),
+                "api_log": lambda *args, **kwargs: None,
+                "api_progress": lambda *args, **kwargs: None,
+                "api_upload_output": lambda *args, **kwargs: None,
+                "_ensure_vram_for_motion": lambda *args, **kwargs: None,
+                "_cut_motion_driver_segment": lambda src, *args, **kwargs: src,
+                "_img_dims": lambda *args, **kwargs: driver_dims,
+                "_audio_dur": lambda *args, **kwargs: 15.0,
+                "_video_nframes": lambda *args, **kwargs: 453,
+                "comfy_upload": lambda path: str(path),
+                "comfy_submit": lambda workflow: submitted.append(workflow) or "pid",
+                "comfy_poll": lambda *args, **kwargs: {},
+                "comfy_fetch_output": lambda *args, **kwargs: str(rendered),
+                "_apply_motion_drift_fix": lambda src, *args, **kwargs: src,
+                "_apply_motion_detail_upscale": lambda src, *args, **kwargs: src,
+                "_apply_motion_delivery": lambda src, *args, **kwargs: (src, False),
+                "_apply_face_lock": lambda src, *args, **kwargs: src,
+            }.items():
+                stack.enter_context(mock.patch.object(linux, name, replacement))
+            stack.enter_context(mock.patch.object(linux.subprocess, "run", fake_subprocess))
+            stack.enter_context(mock.patch.dict(
+                os.environ, {"MOTION_FRESH_COMFY": "0", "MOTION_ENABLE_COLOR_ADJUST": "0"},
+            ))
+            linux.run_motion({
+                "id": "camera-fit", "inputs": {"ref": str(ref), "motion": str(driver)},
+                "params": {
+                    "preset": "drv-15s", "quality": "720p", "width": 720, "height": 1280,
+                    "maxRenderEdge": 1280, "driverDurSec": 15,
+                    **({"cameraAwareMotion": True} if camera_aware else {}),
+                },
+            })
+            self.assertEqual(len(submitted), 1)
+            return submitted[0]
+
+    def test_camera_motion_bypasses_api_injected_dimensions_at_workflow_boundary(self):
+        for driver_dims, expected in (((1920, 1080), (1280, 720)), ((900, 1200), (720, 960))):
+            with self.subTest(driver_dims=driver_dims):
+                workflow = self._submit_motion(driver_dims, camera_aware=True)
+                self.assertEqual(
+                    (workflow["12"]["inputs"]["custom_width"], workflow["12"]["inputs"]["custom_height"]),
+                    expected,
+                )
+
+        ordinary = self._submit_motion((1920, 1080), camera_aware=False)
+        self.assertEqual(
+            (ordinary["12"]["inputs"]["custom_width"], ordinary["12"]["inputs"]["custom_height"]),
+            (720, 1280),
+        )
 
     def _assert_camera_clean_requires_product(self, clean_flag):
         job = {"id": "missing-product", "inputs": {

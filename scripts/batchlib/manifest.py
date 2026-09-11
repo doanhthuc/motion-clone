@@ -32,6 +32,7 @@ class ManifestError(Exception):
 _CAMERA_PIPELINE = "tryon-camera-motion-enhance"
 _CAMERA_STAGES = ("camera-tryon", "camera-motion")
 _DRV_PRESET = re.compile(r"^drv-(5|10|15|20|30)s$")
+_CAMERA_DURATIONS = frozenset({5, 10, 15, 20, 30})
 
 
 def synchronize_camera_stage_segments(
@@ -73,12 +74,33 @@ def synchronize_camera_stage_segments(
 
     start = resolve("driverStartSec", "driver_start_sec")
     duration = resolve("driverDurSec", "driver_dur_sec", positive=True)
+    motion = copied.setdefault("camera-motion", {})
+    preset = motion.get("preset")
+    preset_duration: int | None = None
+    if preset is not None:
+        match = _DRV_PRESET.fullmatch(preset) if isinstance(preset, str) else None
+        if not match:
+            supported = ", ".join(f"drv-{n}s" for n in sorted(_CAMERA_DURATIONS))
+            raise ManifestError(f"{prefix}camera-motion.preset must be one of {supported}")
+        preset_duration = int(match.group(1))
+
+    if duration is None and preset_duration is None:
+        raise ManifestError(
+            f"{prefix}camera-motion requires driverDurSec or a supported drv-Ns preset"
+        )
+    if duration is not None:
+        if not duration.is_integer() or int(duration) not in _CAMERA_DURATIONS:
+            supported = ", ".join(map(str, sorted(_CAMERA_DURATIONS)))
+            raise ManifestError(f"{prefix}camera-motion.driverDurSec must be one of {supported}")
+        duration = int(duration)
     if duration is None:
-        preset = copied.get("camera-motion", {}).get("preset")
-        if isinstance(preset, str):
-            match = _DRV_PRESET.fullmatch(preset)
-            if match:
-                duration = float(match.group(1))
+        duration = preset_duration
+    elif preset_duration is None:
+        motion["preset"] = f"drv-{duration}s"
+    elif duration != preset_duration:
+        raise ManifestError(
+            f"{prefix}driverDurSec {duration} conflicts with camera-motion.preset {preset!r}"
+        )
 
     for stage_name in _CAMERA_STAGES:
         params = copied.setdefault(stage_name, {})

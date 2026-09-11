@@ -2358,6 +2358,18 @@ def _motion_bool(p, *keys, default=False):
         return str(v).strip().lower() in ("1", "true", "yes", "on", "enable", "enabled")
     return bool(default)
 
+
+def _is_camera_aware_motion(p):
+    """Match the API's narrow camera-motion flag contract exactly."""
+    if not isinstance(p, dict):
+        return False
+    value = p.get("cameraAwareMotion")
+    if value is None:
+        value = p.get("camera_aware_motion")
+    return value is True or (
+        isinstance(value, str) and value.strip().lower() in ("1", "true", "yes", "on")
+    )
+
 def _wan_cover_frames(seconds, fps):
     """Số frame Wan nhỏ nhất theo lưới 4k+1 nhưng vẫn PHỦ ĐỦ thời lượng yêu cầu.
 
@@ -2650,7 +2662,7 @@ def _normalize_motion_params(p):
         # background + camera của video nguồn, ép về 9:16 mặc định là kéo dãn chính cái video phải giữ.
         # Đo thật trên pod 22/08: driver 3:4 (576×768) ra 544×960, mặt hẹp và dài ra. Ai vẫn muốn ép
         # khung thì truyền fitDriver=0 — nhánh này không đụng vào giá trị người dùng gửi.
-        _camera_aware_motion = _motion_bool(p, "cameraAwareMotion", "camera_aware_motion", default=False)
+        _camera_aware_motion = _is_camera_aware_motion(p)
         if not p.get("_swapEngine") and _camera_aware_motion:
             p["fitDriver"] = True
             p["fit_driver"] = True
@@ -4656,7 +4668,11 @@ def run_motion(job):
     job_id = job["id"]; inputs = job.get("inputs", {})
     # ALD 03/07/2026 - chốt cờ "user ép width/height tay" TRƯỚC normalize (_normalize_motion_params mutate dict
     # tại chỗ rồi tự điền width/height từ preset → sau normalize hết phân biệt được). Dùng cho FIT DRIVER bên dưới.
-    _raw_wh_forced = bool((job.get("params") or {}).get("width") or (job.get("params") or {}).get("height"))
+    _raw_params = job.get("params") or {}
+    _raw_wh_forced = (
+        bool(_raw_params.get("width") or _raw_params.get("height"))
+        and not _is_camera_aware_motion(_raw_params)
+    )
     params = _normalize_motion_params(job.get("params", {}))
     _audio_mode = str(params.get("audioMode", params.get("audio_mode", "")) or "").strip().lower()
     _silent_audio = _audio_mode in ("silent", "mute", "muted", "none", "off")
