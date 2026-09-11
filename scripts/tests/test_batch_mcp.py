@@ -438,7 +438,7 @@ class TestEntryPoint(unittest.TestCase):
              "params": {"name": "batch_validate", "arguments": {"file": "batch/example.yaml"}}})
         ket_qua = replies[1]["result"]
         self.assertIn("ok", ket_qua["structuredContent"])
-        self.assertEqual(ket_qua["structuredContent"]["so_run"], 2)
+        self.assertEqual(ket_qua["structuredContent"]["so_run"], 3)
 
 
 if __name__ == "__main__":

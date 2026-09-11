@@ -443,6 +443,66 @@ class TestPostprocess(unittest.TestCase):
             self.assertEqual(out, p)
 
 
+class TestCameraAwareGuide(unittest.TestCase):
+    def test_camera_prompt_is_loaded_from_the_worker_asset(self):
+        positive, negative = lt.load_camera_compose_prompt()
+        self.assertIn("Image 1", positive)
+        self.assertIn("Image 2", positive)
+        self.assertIn("Image 3", positive)
+        self.assertIn("do not copy", positive.lower())
+        self.assertIn("different location", negative.lower())
+
+    def test_midpoint_respects_selected_segment(self):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[0] == "ffprobe" and "format=duration" in cmd:
+                return mock.Mock(returncode=0, stdout="40.0\n", stderr="")
+            if cmd[0] == "ffprobe":
+                return mock.Mock(returncode=0, stdout="720x1280\n", stderr="")
+            Path(cmd[-1]).write_bytes(b"png")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(lt.subprocess, "run", fake_run):
+            dims = lt.extract_camera_guide_frame(
+                Path("driver.mp4"), Path(d) / "guide.png",
+                {"driverStartSec": 10, "driverDurSec": 12},
+            )
+        ffmpeg = next(cmd for cmd in calls if cmd[0] == "ffmpeg")
+        self.assertEqual(ffmpeg[ffmpeg.index("-ss") + 1], "16.000000")
+        self.assertEqual(dims, (720, 1280))
+
+    def test_empty_or_zero_duration_guide_is_strictly_rejected(self):
+        with mock.patch.object(
+            lt.subprocess, "run", return_value=mock.Mock(returncode=0, stdout="0\n", stderr="")
+        ):
+            with self.assertRaises(JobError) as cm:
+                lt.extract_camera_guide_frame(Path("driver.mp4"), Path("guide.png"), {})
+        self.assertIn("camera guide", str(cm.exception))
+
+    def test_camera_guide_frame_other_than_middle_is_rejected(self):
+        with self.assertRaises(JobError) as cm:
+            lt.extract_camera_guide_frame(
+                Path("driver.mp4"), Path("guide.png"), {"cameraGuideFrame": "start"}
+            )
+        self.assertIn("camera guide", str(cm.exception))
+
+    def test_non_finite_segment_start_is_rejected(self):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return mock.Mock(returncode=0, stdout="40\n", stderr="")
+
+        with mock.patch.object(lt.subprocess, "run", fake_run):
+            with self.assertRaises(JobError):
+                lt.extract_camera_guide_frame(
+                    Path("driver.mp4"), Path("guide.png"), {"driverStartSec": float("nan")}
+                )
+        self.assertFalse(any(cmd[0] == "ffmpeg" for cmd in calls))
+
+
 def _run_gemini(tmp: Path, background: bool = False) -> Run:
     (tmp / "char.jpg").write_bytes(b"char-bytes")
     (tmp / "outfit.jpg").write_bytes(b"outfit-bytes")
@@ -452,6 +512,134 @@ def _run_gemini(tmp: Path, background: bool = False) -> Run:
         inputs["background"] = tmp / "bg.jpg"
     return Run(id="runA", pipeline="tryon-motion-enhance", inputs=inputs,
               stage_params={"tryon": {"provider": "gemini"}})
+
+
+class TestCameraComposition(unittest.TestCase):
+    def test_ordinary_path_ignores_driver_and_preserves_legacy_aspect(self):
+        from PIL import Image
+        for provider in ("gemini", "qwen-max"):
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as d:
+                tmp = Path(d)
+                run = _run_gemini(tmp, background=True)
+                Image.new("RGB", (160, 90), "red").save(run.inputs["character"])
+                run.inputs["driver"] = tmp / "does-not-exist.mp4"
+                calls = []
+                def edit(images, prompt, key, out_path, **kwargs):
+                    calls.append((images, kwargs))
+                    Image.new("RGB", (160, 90), "red").save(out_path)
+                    return out_path
+                with mock.patch.object(lt, "gemini_edit", edit), mock.patch.object(lt, "qwen_max_edit", edit):
+                    lt.run_local_tryon(run, {"provider": provider, "cameraAware": "false"},
+                                      Settings(domain="x", api_key="x", instance_id="x", dashscope_api_key="fake",
+                                               gemini_api_key="AIza" + "x" * 35), tmp / "out.png")
+                self.assertEqual([len(refs) for refs, _ in calls], [2, 2])
+                self.assertEqual(lt.img_size(tmp / "out.png"), (160, 90))
+                if provider == "gemini":
+                    self.assertEqual([kw["aspect_ratio"] for _, kw in calls], ["16:9", "16:9"])
+                else:
+                    self.assertTrue(all("size" not in kw for _, kw in calls))
+
+    def test_qwen_camera_size_is_serialized_and_ordinary_size_is_omitted(self):
+        bodies = []
+        def urlopen(request, **kwargs):
+            response = mock.MagicMock()
+            if isinstance(request, str):
+                response.__enter__.return_value.read.return_value = b"image"
+            else:
+                bodies.append(json.loads(request.data))
+                response.__enter__.return_value.read.return_value = json.dumps({"output": {"choices": [
+                    {"message": {"content": [{"image": "https://example.test/image"}]}}]}}).encode()
+            return response
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(lt.urllib.request, "urlopen", urlopen), \
+             mock.patch.object(lt, "QWEN_IMAGE_BASE", "https://example.test"):
+            self.assertIn("size", __import__("inspect").signature(lt.qwen_max_edit).parameters)
+            lt.qwen_max_edit([(b"x", "image/png")], "prompt", "fake", Path(d) / "camera.png", size="752*1328")
+            lt.qwen_max_edit([(b"x", "image/png")], "prompt", "fake", Path(d) / "ordinary.png")
+        self.assertEqual(bodies[0]["parameters"]["size"], "752*1328")
+        self.assertEqual(bodies[1]["parameters"], {"watermark": False})
+
+    def test_camera_local_three_references_and_guide_aspect(self):
+        from PIL import Image, ImageDraw
+        for provider in ("gemini", "qwen-max"):
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as d:
+                tmp = Path(d)
+                run = _run_gemini(tmp, background=True)
+                driver = tmp / "driver.mp4"
+                lt.subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+                                   "color=c=blue:s=90x160:d=1", str(driver)], check=True)
+                run.inputs["driver"] = driver
+                calls, generated = [], []
+                def edit(images, prompt, key, out_path, **kwargs):
+                    calls.append((images, prompt, kwargs))
+                    picture = Image.new("RGB", (160, 160), "black")
+                    ImageDraw.Draw(picture).rectangle((70, 70, 89, 89), fill="red")
+                    picture.save(out_path)
+                    generated.append(out_path.read_bytes())
+                    return out_path
+                out = tmp / "out.png"
+                settings = Settings(domain="x", api_key="x", instance_id="x",
+                                    gemini_api_key="AIza" + "x" * 35, dashscope_api_key="fake")
+                with mock.patch.object(lt, "gemini_edit", edit), mock.patch.object(lt, "qwen_max_edit", edit):
+                    lt.run_local_tryon(run, {"provider": provider, "cameraAware": True}, settings, out)
+                self.assertEqual(len(calls[0][0]), 2)
+                self.assertEqual(len(calls[1][0]), 3)
+                self.assertEqual(calls[1][0][0][0], generated[0])
+                self.assertEqual(calls[1][0][1][0], b"bg-bytes")
+                import io
+                with Image.open(io.BytesIO(calls[1][0][2][0])) as guide:
+                    self.assertEqual(guide.size, (90, 160))
+                self.assertEqual(calls[1][1], lt.load_camera_compose_prompt()[0])
+                if provider == "gemini":
+                    self.assertEqual(calls[1][2]["aspect_ratio"], "9:16")
+                else:
+                    self.assertEqual(calls[1][2].get("size"), "752*1328")
+                self.assertEqual(lt.img_size(out), (90, 160))
+                with Image.open(out) as picture:
+                    self.assertEqual(picture.getbbox(), (35, 70, 55, 90))
+
+    def test_invalid_guide_prevents_garment_call(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            run = _run_gemini(tmp, background=True)
+            run.inputs["driver"] = tmp / "invalid.mp4"
+            run.inputs["driver"].write_bytes(b"invalid")
+            calls = []
+            def edit(*args, **kwargs):
+                calls.append(args)
+                Path(args[3]).write_bytes(b"bad")
+                return Path(args[3])
+            with mock.patch.object(lt, "gemini_edit", edit):
+                with self.assertRaises(JobError):
+                    lt.run_local_tryon(run, {"provider": "gemini", "cameraAware": True},
+                                      Settings(domain="x", api_key="x", instance_id="x",
+                                               gemini_api_key="AIza" + "x" * 35), tmp / "out.png")
+            self.assertEqual(calls, [])
+            self.assertFalse((tmp / "out.png").exists())
+
+    def test_camera_compose_failure_never_publishes_garment(self):
+        from PIL import Image
+        for mode in ("error", "decode"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as d:
+                tmp = Path(d)
+                run = _run_gemini(tmp, background=True)
+                driver = tmp / "driver.mp4"
+                lt.subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+                                   "color=c=blue:s=90x160:d=1", str(driver)], check=True)
+                run.inputs["driver"] = driver
+                def edit(images, prompt, key, out_path, **kwargs):
+                    if len(images) == 3:
+                        if mode == "error":
+                            raise JobError("compose failed")
+                        out_path.write_bytes(b"not an image")
+                    else:
+                        Image.new("RGB", (160, 160), "red").save(out_path)
+                    return out_path
+                with mock.patch.object(lt, "gemini_edit", edit):
+                    with self.assertRaises(JobError):
+                        lt.run_local_tryon(run, {"provider": "gemini", "cameraAware": True},
+                                          Settings(domain="x", api_key="x", instance_id="x",
+                                                   gemini_api_key="AIza" + "x" * 35), tmp / "out.png")
+                self.assertFalse((tmp / "out.png").exists())
 
 
 class TestRunLocalTryon(GeminiServerCase):

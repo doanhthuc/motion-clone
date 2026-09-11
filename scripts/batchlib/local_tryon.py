@@ -18,6 +18,7 @@ hay chạy trên pod — rõ nhất với ảnh outfit mà món đồ nhỏ so v
 """
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 LOCAL_PROVIDERS = {"gemini", "qwen-max"}
@@ -64,6 +65,61 @@ def img_size(path: Path) -> tuple[int, int] | None:
         return int(w), int(h)
     except Exception:
         return None
+
+
+def load_camera_compose_prompt() -> tuple[str, str]:
+    asset = Path(__file__).resolve().parents[2] / "motions-studio/worker/assets/camera-aware-tryon.json"
+    try:
+        prompt = json.loads(asset.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise JobError(f"camera guide prompt asset {asset}: unreadable") from exc
+    if prompt.get("version") != 1 or not all(
+        isinstance(prompt.get(key), str) and prompt[key].strip() for key in ("positive", "negative")
+    ):
+        raise JobError(f"camera guide prompt asset {asset}: invalid")
+    return prompt["positive"], prompt["negative"]
+
+
+def extract_camera_guide_frame(video_path: Path, out_path: Path, params: dict) -> tuple[int, int]:
+    if params.get("cameraGuideFrame", "middle") != "middle":
+        raise JobError(f"camera guide {video_path}: cameraGuideFrame must be middle")
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
+            capture_output=True, text=True, timeout=30,
+        )
+        source_duration = float((probe.stdout or "").strip())
+        requested_start = float(params.get("driverStartSec") or 0)
+        if not math.isfinite(requested_start):
+            raise ValueError("non-finite start")
+        start = max(0.0, requested_start)
+        available = source_duration - start
+        requested_duration = float(params.get("driverDurSec") or available)
+        if not math.isfinite(requested_duration):
+            raise ValueError("non-finite duration")
+        duration = requested_duration
+        effective_duration = min(duration, available)
+        midpoint = start + effective_duration / 2.0
+        if (probe.returncode != 0 or not all(math.isfinite(value) for value in (
+                source_duration, start, available, duration, effective_duration, midpoint))
+                or source_duration <= 0 or start >= source_duration or effective_duration <= 0):
+            raise ValueError("invalid duration")
+        subprocess.run(
+            ["ffmpeg", "-nostdin", "-y", "-v", "error", "-ss", f"{midpoint:.6f}",
+             "-i", str(video_path), "-frames:v", "1", str(out_path)],
+            check=True, capture_output=True, text=True, timeout=60,
+        )
+        if not out_path.is_file() or out_path.stat().st_size <= 0:
+            raise ValueError("empty extracted frame")
+        dims = img_size(out_path)
+        if not dims or dims[0] <= 0 or dims[1] <= 0:
+            raise ValueError("undecodable extracted frame")
+        return dims
+    except JobError:
+        raise
+    except Exception as exc:
+        raise JobError(f"camera guide {video_path}: {exc}") from exc
 
 
 GARMENT_LABEL = {
@@ -362,7 +418,8 @@ def _qwen_image_url() -> str:
 
 
 def qwen_max_edit(images: list[tuple[bytes, str]], prompt: str, key: str, out_path: Path,
-                  negative_prompt: str | None = None, model: str | None = None) -> Path:
+                  negative_prompt: str | None = None, model: str | None = None,
+                  size: str | None = None) -> Path:
     """Cổng linux.py:_qwen_max_edit — bản urllib (cùng lý do KHÔNG dùng requests đã ghi đầu file). Call ĐỒNG
     BỘ (multimodal-generation trả ảnh ngay, không async submit+poll); ảnh trả về là URL OSS sống 24h → tải
     ngay bằng urllib."""
@@ -373,6 +430,8 @@ def qwen_max_edit(images: list[tuple[bytes, str]], prompt: str, key: str, out_pa
             "parameters": {"watermark": False}}
     if negative_prompt:
         body["parameters"]["negative_prompt"] = negative_prompt
+    if size:
+        body["parameters"]["size"] = size
     req = urllib.request.Request(
         _qwen_image_url(), data=json.dumps(body).encode("utf-8"),
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"}, method="POST")
@@ -469,7 +528,7 @@ def postprocess(out_path: Path, params: dict) -> Path:
 
 
 def _gemini_or_qwen_max(gem_key, qwen_key, images, gem_prompt, qwen_prompt, out_path,
-                        aspect_ratio, qwen_negative=None):
+                        aspect_ratio, qwen_negative=None, qwen_size=None):
     """Cổng linux.py:_tryon_gemini_or_fallback. Gọi Gemini; lỗi + TRYON_GEMINI_FALLBACK bật + có key
     Qwen-Max → tự rớt sang Qwen-Max thay vì fail run. Mặc định TẮT (raise thẳng lỗi Gemini)."""
     try:
@@ -478,7 +537,38 @@ def _gemini_or_qwen_max(gem_key, qwen_key, images, gem_prompt, qwen_prompt, out_
     except Exception:
         if not TRYON_GEMINI_FALLBACK or not qwen_key:
             raise
-        return qwen_max_edit(images, qwen_prompt, qwen_key, out_path, negative_prompt=qwen_negative)
+        return qwen_max_edit(images, qwen_prompt, qwen_key, out_path, negative_prompt=qwen_negative,
+                             **({"size": qwen_size} if qwen_size else {}))
+
+
+def _camera_compose_local(provider, edited, background, guide, prompt, keys, out_path) -> Path:
+    images = [(path.read_bytes(), mime_of(path)) for path in (edited, background, guide)]
+    dims = img_size(guide)
+    if not dims or min(dims) <= 0:
+        raise JobError("camera guide: invalid image dimensions")
+    positive, negative = prompt
+    gem_key, qwen_key = keys
+    scale = math.sqrt(1_000_000 / (dims[0] * dims[1]))
+    qwen_size = "*".join(str(max(16, round(value * scale / 16) * 16)) for value in dims)
+    if provider == "qwen-max":
+        prepared = qwen_max_edit(images, positive, qwen_key, out_path, negative_prompt=negative, size=qwen_size)
+    else:
+        prepared = _gemini_or_qwen_max(gem_key, qwen_key, images, positive, positive,
+                                       out_path, gemini_aspect(dims), qwen_negative=negative, qwen_size=qwen_size)
+    if not prepared or not img_size(prepared):
+        raise JobError("camera composition: provider returned an undecodable image")
+    framed = out_path.with_suffix(".framed.png")
+    w, h = dims
+    try:
+        subprocess.run(["ffmpeg", "-nostdin", "-y", "-v", "error", "-i", str(prepared),
+                        "-vf", f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1",
+                        "-frames:v", "1", str(framed)],
+                       check=True, capture_output=True, timeout=60)
+    except Exception as exc:
+        raise JobError("camera composition: framing failed") from exc
+    if img_size(framed) != dims:
+        raise JobError("camera composition: invalid prepared image")
+    return framed
 
 
 def run_local_tryon(run: Run, params: dict, settings: Settings, out_path: Path) -> tuple[int, int]:
@@ -521,6 +611,9 @@ def run_local_tryon(run: Run, params: dict, settings: Settings, out_path: Path) 
     background_path = run.inputs.get("background")
     if model_path is None or product_path is None:
         raise JobError(f"run {run.id!r}: try-on local cần inputs.character và inputs.outfit")
+    camera_aware = str(params.get("cameraAware") or "").lower().strip() in ("1", "true", "yes", "on")
+    if camera_aware and (background_path is None or run.inputs.get("driver") is None):
+        raise JobError(f"run {run.id!r}: camera-aware try-on requires background and driver")
 
     garment = (str(params.get("garment_type") or params.get("garmentType") or "").lower().strip()
               or "auto")
@@ -536,13 +629,17 @@ def run_local_tryon(run: Run, params: dict, settings: Settings, out_path: Path) 
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp_dir = Path(tmp)
+        if camera_aware:
+            guide = tmp_dir / "guide.png"
+            extract_camera_guide_frame(run.inputs["driver"], guide, params)
+            camera_prompt = load_camera_compose_prompt()
         images = [(model_path.read_bytes(), mime_of(model_path)),
                   (product_path.read_bytes(), mime_of(product_path))]
 
         if provider == "qwen-max":
             pos_q, neg_q = qwen_tryon_prompts(garment, extra=extra_en)
             edited = qwen_max_edit(images, pos_q, qwen_key, tmp_dir / "pass1.png", negative_prompt=neg_q)
-            if background_path is not None:
+            if background_path is not None and not camera_aware:
                 edited = qwen_max_edit(
                     [(edited.read_bytes(), "image/png"),
                      (background_path.read_bytes(), mime_of(background_path))],
@@ -553,7 +650,7 @@ def run_local_tryon(run: Run, params: dict, settings: Settings, out_path: Path) 
             edited = _gemini_or_qwen_max(gem_key, qwen_key, images, prompt, pos_q, tmp_dir / "pass1.png",
                                         gemini_aspect(img_size(model_path)), qwen_negative=neg_q)
 
-            if background_path is not None:
+            if background_path is not None and not camera_aware:
                 edited = _gemini_or_qwen_max(
                     gem_key, qwen_key,
                     [(edited.read_bytes(), "image/png"),
@@ -561,7 +658,12 @@ def run_local_tryon(run: Run, params: dict, settings: Settings, out_path: Path) 
                     TRYON_BG_POS, TRYON_BG_POS, tmp_dir / "pass2.png",
                     gemini_aspect(img_size(edited)), qwen_negative=TRYON_BG_NEG)
 
+        if camera_aware:
+            edited = _camera_compose_local(provider, edited, background_path, guide,
+                                           camera_prompt, (gem_key, qwen_key), tmp_dir / "camera.png")
         final = postprocess(edited, params)
+        if camera_aware and not img_size(final):
+            raise JobError("camera composition: postprocess returned an undecodable image")
         out_path.write_bytes(final.read_bytes())
 
     return int(time.time() - started), out_path.stat().st_size

@@ -1,5 +1,7 @@
 // #region ALD 19/07/2026 - Nguồn sự thật resolution Motion theo lựa chọn chất lượng.
 // Chuẩn hóa ngay ở API trước khi ghi jobs.params để worker đang chạy bản cũ cũng nhận width/height rõ ràng.
+import { enforceMotionFitPolicy } from "./motion-camera-policy.js"
+
 const DRIVER_PRESETS = new Set(["drv-5s", "drv-10s", "drv-15s", "drv-20s", "drv-30s"])
 
 function round16(value) {
@@ -32,10 +34,8 @@ export function enforceMotionResolution(type, params) {
   out.maxRenderEdge = maxEdge
   out.max_render_edge = maxEdge
   out.quality = quality
-  out.fitDriver = false
-  out.fit_driver = false
   out.resolutionPolicy = "quality-v1"
   out.resolution_policy = "quality-v1"
-  return out
+  return enforceMotionFitPolicy(out)
 }
 // #endregion

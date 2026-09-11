@@ -11,6 +11,7 @@ from batchlib_ext.migrate_lease import MigrateLease, write_migrate_lease
 import tgbot.bot as bot
 from tgbot.bot import allowed
 from tgbot.ingest import Probe
+from tgbot.job import missing_slots
 
 ME = 12345
 
@@ -705,6 +706,32 @@ class TestPipelineCommand(unittest.TestCase):
         self.assertEqual(bot._job_for(ME).pipeline, "tryon-character-swap-enhance")
         self.assertEqual(sorted(bot._job_for(ME).slots), ["character", "driver", "outfit"])
 
+    def test_camera_pipeline_is_offered_and_shows_its_alias_flow(self):
+        tg = FakeTg()
+        with mock.patch.object(bot, "_maybe_show_manifest"):
+            bot.handle(tg, cmd_from(ME, "/pipeline tryon-camera-motion-enhance"),
+                       allowed_user_id=ME)
+        chooser = FakeTg()
+        bot.handle(chooser, cmd_from(ME, "/pipeline"), allowed_user_id=ME)
+        self.assertIn("tryon-camera-motion-enhance", chooser.messages[0])
+        self.assertIn("camera-tryon", chooser.messages[0])
+        self.assertIn("camera-motion", chooser.messages[0])
+        offered = {data for data in chooser.callback_data()
+                   if data.startswith(bot._CB_PIPE)}
+        self.assertNotIn(bot._CB_PIPE + "tryon-camera-motion-enhance", offered)
+
+    def test_switching_to_camera_pipeline_keeps_all_compatible_slots(self):
+        tg = FakeTg()
+        job = bot._job_for(ME)
+        job.slots.update({"character": Path("c.png"), "outfit": Path("o.png"),
+                          "background": Path("b.png"), "driver": Path("d.mp4")})
+        with mock.patch.object(bot, "_maybe_show_manifest"):
+            bot.handle(tg, cmd_from(ME, "/pipeline tryon-camera-motion-enhance"),
+                       allowed_user_id=ME)
+        self.assertEqual(set(bot._job_for(ME).slots),
+                         {"character", "outfit", "background", "driver"})
+        self.assertFalse(missing_slots(bot._job_for(ME)))
+
     def test_switching_drops_a_slot_the_new_pipeline_cannot_consume(self):
         # character-swap-enhance has no tryon stage, so an outfit would ride
         # into the manifest with nothing to consume it — a run that silently
@@ -853,6 +880,20 @@ class TestDraftPersistence(unittest.TestCase):
         # preset are derived from the driver's duration, so a job restored
         # without them is not restored.
         self.assertEqual(job.probes["driver"], self.driver)
+
+    def test_camera_pipeline_draft_round_trip_preserves_name_and_slots(self):
+        job = bot._job_for(ME)
+        job.pipeline = "tryon-camera-motion-enhance"
+        job.slots.update({"character": Path("/s/c.png"), "outfit": Path("/s/o.png"),
+                          "background": Path("/s/b.png"), "driver": Path("/s/d.mp4")})
+        job.probes["driver"] = self.driver
+        bot._save_draft(ME)
+        self._restart()
+        bot._load_draft(ME)
+        restored = bot._STATE[ME]
+        self.assertEqual(restored.pipeline, "tryon-camera-motion-enhance")
+        self.assertEqual(set(restored.slots),
+                         {"character", "outfit", "background", "driver"})
 
     def test_the_unanswered_queue_survives_a_restart(self):
         # The queue is the half that mattered most in the real incident: a file

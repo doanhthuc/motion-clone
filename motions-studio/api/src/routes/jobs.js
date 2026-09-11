@@ -5,6 +5,7 @@ import { query } from "../db.js"
 import { putObject, getObjectStream, getObjectRange, presignGet, browserUrl, verifyMediaSig, pipeObjectStream } from "../storage.js"
 import { clientAuth, workerAuth } from "../auth.js"
 import { enforceMotionResolution } from "../motion-resolution.js"
+import { enforceMotionFitPolicy, isCameraAwareMotion } from "../motion-camera-policy.js"
 import { enforceTaskCloudEnhancePolicy } from "../task-cloud/enhance-policy.js"
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200 * 1024 * 1024, files: 20 } })
@@ -12,13 +13,11 @@ const router = Router()
 
 const extOf = (n, fb) => { const i = (n || "").lastIndexOf("."); return i >= 0 ? n.slice(i + 1).toLowerCase() : fb }
 
-function normalizeMotionDriverSegment(type, params) {
+export function normalizeMotionDriverSegment(type, params) {
   if (type !== "motion" || !params || typeof params !== "object") return params
-  const out = { ...params }
+  let out = enforceMotionFitPolicy(params)
   out.deliveryPreset = "source"
   out.delivery_preset = "source"
-  out.fitDriver = false
-  out.fit_driver = false
   delete out.bgAnchor
   delete out.bg_anchor
   delete out.bgAnchorMaskExpand
@@ -55,12 +54,12 @@ function normalizeMotionDriverSegment(type, params) {
   // ALD 28/06/2026 - Legacy multi-outfit bug: some callers stored driverDurSec
   // as endSec (0/5, 5/10, 10/15). Worker expects duration, so node 2 would
   // render 5..15s instead of 5..10s. Normalize the exact 5s slice pattern.
-  if (start > 0 && Math.abs(dur - (start + 5)) < 0.001) {
+  if (!isCameraAwareMotion(out) && start > 0 && Math.abs(dur - (start + 5)) < 0.001) {
     out.driverDurSec = 5
     out.driver_dur_sec = 5
   }
   const fixedDur = Number(out.driverDurSec ?? out.driver_dur_sec ?? dur)
-  if (Math.abs(fixedDur - 5) < 0.001 && start % 5 === 0) {
+  if (!isCameraAwareMotion(out) && Math.abs(fixedDur - 5) < 0.001 && start % 5 === 0) {
     out.preset = "5s-720p"
     out.frames = 81
     out.steps = 4

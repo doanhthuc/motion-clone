@@ -3,7 +3,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tgbot.ingest import Probe
-from tgbot.job import run_id_for, Job, missing_slots, render_manifest, slot_for
+from tgbot.job import (_driver_stage, run_id_for, Job, missing_slots,
+                       render_manifest, slot_for)
 
 VIDEO = Probe(kind="video", width=1080, height=1920, duration_s=14.8,
               bitrate_kbps=12400, size_bytes=22_000_000)
@@ -63,6 +64,23 @@ class TestRenderManifest(unittest.TestCase):
         text = render_manifest([job], now="2026-08-31 21:40")
         self.assertIn("character-swap: { preset: drv-15s }", text)
         self.assertNotIn("motion:", text)
+
+    def test_camera_pipeline_routes_driver_preset_to_camera_motion(self):
+        self.assertEqual(_driver_stage("tryon-camera-motion-enhance"),
+                         "camera-motion")
+        camera_job = Job(
+            slots={"character": Path("/c.png"), "outfit": Path("/o.png"),
+                   "background": Path("/b.png"), "driver": Path("/d.mp4")},
+            probes={"driver": VIDEO},
+            pipeline="tryon-camera-motion-enhance")
+        text = render_manifest([camera_job], now="2026-09-11 10:00:00")
+        self.assertIn("    camera-motion: { preset: drv-15s }", text)
+        self.assertNotIn("    camera-tryon: { preset:", text)
+
+    def test_existing_driver_stage_routing_is_unchanged(self):
+        self.assertEqual(_driver_stage("tryon-motion-enhance"), "motion")
+        self.assertEqual(_driver_stage("tryon-character-swap-enhance"),
+                         "character-swap")
 
 
 class TestMultiRunManifest(unittest.TestCase):

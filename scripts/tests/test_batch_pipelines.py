@@ -2,10 +2,51 @@ import sys, unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from batchlib.pipelines import (PIPELINES, STAGES, PipelineError, optional_roles, required_roles)
+from batchlib.pipelines import (PIPELINES, STAGES, PipelineError, effective_stage_params,
+                                locked_stage_param_errors, optional_roles, required_roles)
 
 
 class TestKhaiBao(unittest.TestCase):
+    def test_camera_pipeline_is_distinct_and_requires_all_four_materials(self):
+        self.assertEqual(
+            PIPELINES["tryon-camera-motion-enhance"],
+            ["camera-tryon", "camera-motion", "enhance"],
+        )
+        self.assertEqual(
+            required_roles("tryon-camera-motion-enhance"),
+            {"character", "outfit", "background", "driver"},
+        )
+        self.assertEqual(optional_roles("tryon-camera-motion-enhance"), set())
+
+    def test_camera_aliases_keep_job_types_and_parameter_schemas_separate(self):
+        self.assertEqual(STAGES["camera-tryon"].job_type, "tryon")
+        self.assertEqual(STAGES["camera-tryon"].param_type, "tryon")
+        self.assertEqual(STAGES["camera-motion"].job_type, "motion")
+        self.assertEqual(STAGES["camera-motion"].param_type, "motion")
+
+    def test_camera_motion_defaults_and_contractual_values(self):
+        got = effective_stage_params(
+            "camera-motion",
+            {"poseStrength": 0.85, "fitDriver": False, "cameraAwareMotion": False},
+        )
+        self.assertEqual(got["poseStrength"], 0.85)
+        self.assertEqual(got["clipStrength"], 1.2)
+        self.assertFalse(got["bodyProportionLock"])
+        self.assertTrue(got["fitDriver"])
+        self.assertTrue(got["cameraAwareMotion"])
+
+    def test_contractual_values_report_an_explicit_conflict(self):
+        errors = locked_stage_param_errors("camera-motion", {"fitDriver": False})
+        self.assertEqual(len(errors), 1)
+        self.assertIn("fitDriver", errors[0])
+        self.assertIn("True", errors[0])
+
+    def test_legacy_pipeline_definitions_are_unchanged(self):
+        self.assertEqual(PIPELINES["tryon-motion-enhance"], ["tryon", "motion", "enhance"])
+        self.assertEqual(required_roles("tryon-motion-enhance"),
+                         {"character", "outfit", "driver"})
+        self.assertEqual(optional_roles("tryon-motion-enhance"), {"background"})
+
     def test_moi_chang_trong_pipeline_deu_co_trong_STAGES(self):
         for name, stages in PIPELINES.items():
             for s in stages:

@@ -123,6 +123,22 @@ make drain FILE=batch/2026-08-30.yaml CONFIRM=yes   # rents, runs, destroys
    the flow you picked, and only a brand-new job starts from this value. Set it
    to whichever flow you use most.
 
+   To select camera-aware try-on motion, use either:
+   ```text
+   /pipeline
+   /pipeline tryon-camera-motion-enhance
+   ```
+   The bot requests all four slots (`character`, `outfit`, `background`, and
+   `driver`), stores this pipeline choice in its draft, and reuses the same
+   driver for the framing guide and motion. Its `drv-Ns` preset is routed to
+   `camera-motion`. The default remains `tryon-motion-enhance` unless
+   `TG_PIPELINE=tryon-camera-motion-enhance` is explicitly configured.
+
+   Camera-aware try-on runs one additional billable image-edit pass to compose
+   the dressed person, supplied scene, and driver midpoint. A missing or
+   unreadable guide, or a failed camera composition, stops the job before
+   Motion Control; it never falls back to ordinary try-on framing.
+
 2. The server's storage is bind-mounted at `/var/lib/telegram-bot-api` **on both sides**. With
    `TELEGRAM_LOCAL=1`, `getFile` returns an absolute path on the container's filesystem and `bot.py`
    opens that exact string on the host, so the two namespaces have to agree — see the comment in
