@@ -130,6 +130,59 @@ GEMINI_SETTINGS = Settings(domain="x.test", api_key="mk_test", instance_id="i-1"
                            gemini_api_key="AIza" + "x" * 35)
 
 
+class TestCameraAlias(unittest.TestCase):
+    def test_camera_only_alias_needs_no_pod_but_clean_only_does(self):
+        with tempfile.TemporaryDirectory() as d:
+            manifest = self.manifest(Path(d))
+            with mock.patch.dict(PIPELINES, {"tryon-camera-motion-enhance": ["camera-tryon"]}):
+                self.assertFalse(needs_pod(manifest))
+                manifest.runs[0].stage_params["camera-tryon"]["cleanOnly"] = "true"
+                self.assertTrue(needs_pod(manifest))
+
+    def manifest(self, tmp):
+        (tmp / "bg.png").write_bytes(b"background")
+        text = MANIFEST_TRYON_GEMINI.replace("tryon-motion-enhance", "tryon-camera-motion-enhance").replace(
+            "    tryon:", "    camera-tryon:").replace("      outfit:", "      background: bg.png\n      outfit:")
+        return load_manifest(_fixture_tryon(tmp, text))
+
+    def test_camera_alias_resolves_same_driver(self):
+        from batchlib.runner import _resolve_files
+        with tempfile.TemporaryDirectory() as d:
+            run = self.manifest(Path(d)).runs[0]
+            self.assertEqual(_resolve_files(run, "camera-tryon", None)["cameraGuide"], run.inputs["driver"])
+            files = _resolve_files(run, "camera-motion", Path("prepared.png"))
+            self.assertEqual(files["motion"], run.inputs["driver"])
+            self.assertEqual(files["ref"], Path("prepared.png"))
+
+    def test_local_phase_keeps_alias_and_effective_params(self):
+        def edit(run, params, settings, dest):
+            self.assertIs(params["cameraAware"], True)
+            dest.write_bytes(b"prepared")
+            return 1, 8
+        with tempfile.TemporaryDirectory() as d, mock.patch("batchlib.runner.run_local_tryon", edit):
+            result = run_local_phase(settings=GEMINI_SETTINGS, manifest=self.manifest(Path(d)),
+                                     out_root=Path(d) / "out", batch_id="test", resume=False, log=lambda _: None)
+            self.assertTrue(result.ran)
+            stages = result.state["runs"]["runA"]["stages"]
+            self.assertIn("camera-tryon", stages)
+            self.assertNotIn("tryon", stages)
+            self.assertTrue((result.out_dir / "runs/runA/01-camera-tryon.png").is_file())
+            self.assertIn("camera-tryon (local):", (result.out_dir / "runs/runA/run.log").read_text())
+
+    def test_pod_submit_uses_effective_alias_params(self):
+        pod = FakePod()
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch("batchlib.runner.submit_job", pod.submit), \
+             mock.patch("batchlib.runner.poll_job", pod.poll), \
+             mock.patch("batchlib.runner.download_output", pod.download):
+            tmp = Path(d)
+            run = self.manifest(tmp).runs[0]
+            run_one(settings=SETTINGS, run=run, out_dir=tmp / "out", state={"runs": {}},
+                    state_file=tmp / "state.json", resume=False, log=lambda _: None)
+            self.assertIs(pod.submitted[0][1].get("cameraAware"), True)
+            self.assertIs(pod.submitted[1][1].get("cameraAwareMotion"), True)
+
+
 class FakePod:
     """Pod giả có HÀNG JOB thật, không phải một hàm "poll gì cũng done".
 

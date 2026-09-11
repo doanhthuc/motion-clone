@@ -28,7 +28,7 @@ from .client import JobError, JobFailed, JobGone, download_output, poll_job, sub
 from .config import ConfigError, Settings
 from .local_tryon import is_local_provider, run_local_tryon
 from .manifest import Manifest, Run, load_state, save_state, state_path_for
-from .pipelines import PIPELINES, STAGES, Stage
+from .pipelines import PIPELINES, STAGES, Stage, effective_stage_params
 
 
 @dataclass
@@ -162,7 +162,7 @@ def run_one(*, settings: Settings, run: Run, out_dir: Path, state: dict,
         stage = STAGES[stage_name]
         dest = stage_dest(run, run_dir, stage_name)
         recorded = entry["stages"].get(stage_name) or {}
-        params = run.stage_params.get(stage_name, {})
+        params = effective_stage_params(stage_name, run.stage_params.get(stage_name))
 
         # Chặng đã "done" VÀ còn file trên đĩa thì bỏ qua — KHÔNG gate theo `resume`.
         # Một lô THẬT SỰ mới (resume=False) luôn khởi tạo state["runs"] rỗng
@@ -376,14 +376,19 @@ def _local_tryon_eligible(run: Run) -> bool:
     (cleanOnly/clean_only) theo đúng quy ước sẵn có của repo — chính linux.py:4751 cũng
     đọc cả hai, và params.py ghi nhận cả hai là param hợp lệ.
     """
-    if "tryon" not in PIPELINES.get(run.pipeline, []):
-        return False
-    params = run.stage_params.get("tryon", {})
-    clean_only = str(params.get("cleanOnly") or params.get("clean_only")
-                     or "").lower().strip() in ("1", "true", "yes", "on")
-    if clean_only:
-        return False
-    return is_local_provider(str(params.get("provider") or ""))
+    return _local_tryon_stage(run) is not None
+
+
+def _local_tryon_stage(run: Run) -> str | None:
+    for stage_name in PIPELINES.get(run.pipeline, []):
+        if STAGES[stage_name].job_type != "tryon":
+            continue
+        params = effective_stage_params(stage_name, run.stage_params.get(stage_name))
+        clean_only = str(params.get("cleanOnly") or params.get("clean_only")
+                         or "").lower().strip() in ("1", "true", "yes", "on")
+        if not clean_only and is_local_provider(str(params.get("provider") or "")):
+            return stage_name
+    return None
 
 
 def needs_pod(manifest: Manifest) -> bool:
@@ -396,7 +401,7 @@ def needs_pod(manifest: Manifest) -> bool:
     """
     for run in manifest.runs:
         for stage_name in PIPELINES.get(run.pipeline, []):
-            if stage_name != "tryon":
+            if STAGES[stage_name].job_type != "tryon":
                 return True
             if not _local_tryon_eligible(run):
                 return True
@@ -427,8 +432,8 @@ def run_local_phase(*, settings: Settings, manifest: Manifest, out_root: Path, b
     """
     # CÙNG một hàm với needs_pod — xem docstring của _local_tryon_eligible: hai chỗ này
     # trả lời khác nhau là lô hoặc gọi Gemini sai run, hoặc đứng chờ pod vô cớ.
-    jobs: list[tuple[Run, dict]] = [(run, run.stage_params.get("tryon", {}))
-                                    for run in manifest.runs if _local_tryon_eligible(run)]
+    jobs = [(run, stage_name, effective_stage_params(stage_name, run.stage_params.get(stage_name)))
+            for run in manifest.runs if (stage_name := _local_tryon_stage(run)) is not None]
 
     if not jobs:
         return LocalPhaseResult(ran=False)
@@ -457,7 +462,7 @@ def run_local_phase(*, settings: Settings, manifest: Manifest, out_root: Path, b
     # entry và dòng này thành race thật.
     lock = threading.Lock()
 
-    def _one(run: Run, params: dict) -> tuple[bool, str | None]:
+    def _one(run: Run, stage_name: str, params: dict) -> tuple[bool, str | None]:
         """Chạy một run trong thread của pool. Trả (có_chạy_mới, lỗi).
 
         "có_chạy_mới" tách riêng khỏi "không lỗi" vì chặng đã xong từ lượt trước cũng
@@ -467,15 +472,15 @@ def run_local_phase(*, settings: Settings, manifest: Manifest, out_root: Path, b
         """
         with lock:
             entry = state["runs"].setdefault(run.id, {"status": "pending", "stages": {}})
-            recorded = entry["stages"].get("tryon") or {}
+            recorded = entry["stages"].get(stage_name) or {}
         run_dir = out_dir / "runs" / run.id
         run_dir.mkdir(parents=True, exist_ok=True)
         log_file = run_dir / "run.log"
-        dest = stage_dest(run, run_dir, "tryon")
+        dest = stage_dest(run, run_dir, stage_name)
         # Hai vế, giống hệt run_one: journal nói "done" VÀ file còn trên đĩa. Tin journal
         # suông thì Pha B nhận một đường dẫn không tồn tại ở chặng motion.
         if recorded.get("status") == "done" and dest.is_file():
-            log(f"    {run.id}/tryon: bỏ qua (đã xong local, {dest.name})")
+            log(f"    {run.id}/{stage_name}: bỏ qua (đã xong local, {dest.name})")
             return False, None
         started = time.time()
 
@@ -484,7 +489,7 @@ def run_local_phase(*, settings: Settings, manifest: Manifest, out_root: Path, b
             # "error" với lý do rỗng còn khó đọc hơn không ghi gì.
             loi = str(exc) or repr(exc)
             with lock:
-                entry["stages"]["tryon"] = {"status": "error",
+                entry["stages"][stage_name] = {"status": "error",
                                             "elapsed_sec": int(time.time() - started),
                                             "params_manifest": dict(params)}
                 # Mức run, không chỉ mức chặng — đúng giao ước của run_batch. Để nguyên
@@ -496,8 +501,8 @@ def run_local_phase(*, settings: Settings, manifest: Manifest, out_root: Path, b
                 save_state(state_file, state)
             # Journal VÀ run.log (spec §4), giống hệt run_one: stdout là thứ mất khi đóng
             # terminal, mà đây là dòng cần nhất của một lô chạy không người trông.
-            _log_line(log_file, f"✗ tryon (local): {loi}")
-            log(f"    ✗ {run.id}/tryon (local): {loi}")
+            _log_line(log_file, f"✗ {stage_name} (local): {loi}")
+            log(f"    ✗ {run.id}/{stage_name} (local): {loi}")
             return False, loi
 
         try:
@@ -516,11 +521,11 @@ def run_local_phase(*, settings: Settings, manifest: Manifest, out_root: Path, b
         # không đi qua API nào cả — nó gọi thẳng Gemini với đúng param của manifest, nên
         # "xin gì" và "được gì" thật sự là một.
         with lock:
-            entry["stages"]["tryon"] = {
+            entry["stages"][stage_name] = {
                 "status": "done", "elapsed_sec": elapsed, "file": str(dest), "bytes": size,
                 "params_sent": dict(params), "params_manifest": dict(params)}
             save_state(state_file, state)
-        xong = f"tryon (local): xong {elapsed}s · {size // 1024} KB → {dest.name}"
+        xong = f"{stage_name} (local): xong {elapsed}s · {size // 1024} KB → {dest.name}"
         # Cả hai kết cục vào run.log, không chỉ lỗi — run_one cũng ghi cả hai, và "chặng
         # này đã chạy ở Pha A lúc mấy giờ" là nửa còn lại của câu chuyện khi đọc lại sau.
         _log_line(log_file, xong)
@@ -537,8 +542,8 @@ def run_local_phase(*, settings: Settings, manifest: Manifest, out_root: Path, b
 
         def _submit_next() -> None:
             if pending and not aborted:
-                run, params = pending.pop(0)
-                futures[pool.submit(_one, run, params)] = run.id
+                run, stage_name, params = pending.pop(0)
+                futures[pool.submit(_one, run, stage_name, params)] = run.id
 
         for _ in range(min(pool_size, len(pending))):
             _submit_next()

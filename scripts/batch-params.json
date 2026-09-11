@@ -94,9 +94,6 @@
       "cameraGuideFrame": {
         "why": "camera-aware try-on accepts only the representative middle frame policy"
       },
-      "cameraAware": {
-        "why": "camera-aware try-on selects strict guide extraction and three-reference composition"
-      },
       "driverStartSec": {
         "why": "camera guide extraction uses the same selected driver segment as camera-motion"
       },

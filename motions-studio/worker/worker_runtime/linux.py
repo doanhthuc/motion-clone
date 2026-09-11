@@ -4220,7 +4220,7 @@ def _qwen_image_url():
     return (f"https://{QWEN_IMAGE_WORKSPACE}.{QWEN_IMAGE_REGION}.maas.aliyuncs.com"
             "/api/v1/services/aigc/multimodal-generation/generation")
 
-def _qwen_max_edit(images, prompt, key, out_path, negative_prompt=None, model=None):
+def _qwen_max_edit(images, prompt, key, out_path, negative_prompt=None, model=None, size=None):
     """Qwen-Image edit (DashScope Model Studio) — provider='qwen-max' hoặc fallback của Gemini. images=[(bytes,mime),…]
     (cap QWEN_EDIT_MAX_REFS, docs Alibaba giới hạn 1-3 ảnh/lần) + prompt → ghi ảnh ra out_path. Call ĐỒNG BỘ
     (không async submit+poll như _dashscope_i2v/_dashscope_animate — multimodal-generation trả ảnh ngay, ảnh
@@ -4233,6 +4233,8 @@ def _qwen_max_edit(images, prompt, key, out_path, negative_prompt=None, model=No
             "parameters": {"watermark": False}}
     if negative_prompt:
         body["parameters"]["negative_prompt"] = negative_prompt
+    if size:
+        body["parameters"]["size"] = size
     r = requests.post(_qwen_image_url(), headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
                       json=body, timeout=180)
     if r.status_code != 200:
@@ -4243,7 +4245,7 @@ def _qwen_max_edit(images, prompt, key, out_path, negative_prompt=None, model=No
         raise RuntimeError(f"Qwen-Max không trả ảnh: {json.dumps(r.json())[:300]}")
     return _hf_fetch(img_url, out_path)
 
-def _tryon_gemini_or_fallback(job_id, params, images, gem_prompt, gem_key, out_path, aspect_ratio, qwen_prompt, qwen_negative=None):
+def _tryon_gemini_or_fallback(job_id, params, images, gem_prompt, gem_key, out_path, aspect_ratio, qwen_prompt, qwen_negative=None, qwen_size=None):
     """Gọi Gemini image-edit; lỗi (quota/500/network…) + TRYON_GEMINI_FALLBACK bật + có key Qwen-Max/DashScope
     → tự rớt sang Qwen-Max thay vì fail job. Mặc định TẮT (raise thẳng lỗi Gemini, giữ hành vi cũ)."""
     try:
@@ -4256,7 +4258,8 @@ def _tryon_gemini_or_fallback(job_id, params, images, gem_prompt, gem_key, out_p
             api_log(job_id, f"Gemini lỗi ({e}) — TRYON_GEMINI_FALLBACK bật nhưng thiếu key Qwen-Max/DashScope, giữ nguyên lỗi Gemini", "warn")
             raise
         api_log(job_id, f"Gemini lỗi ({e}) — fallback sang Qwen-Max ({QWEN_IMAGE_MODEL})", "warn")
-        return _qwen_max_edit(images, qwen_prompt, qwen_key, out_path, negative_prompt=qwen_negative)
+        return _qwen_max_edit(images, qwen_prompt, qwen_key, out_path, negative_prompt=qwen_negative,
+                              **({"size": qwen_size} if qwen_size else {}))
 
 CREATE_IMAGE_CFG = float(os.environ.get("CREATE_IMAGE_CFG", "2.5"))  # ALD 11/06/2026 - 3.2→2.5: CFG cao đốt màu, da bóng kiểu render; 2.5 = mặc định template Qwen-Image(-Edit) của ComfyUI
 # ALD 13/06/2026 - steps render chính. 25→30 (mặc định): thêm bước giúp chi tiết tay/mặt/vải ổn hơn (đổi lại ~+20% thời gian).
@@ -5520,6 +5523,65 @@ def _tryon_compose_background(job_id, person_path, bg_path, prefix):
     return outp
 # #endregion
 
+def _tryon_camera_postprocess(out, guide_dims, params, job_id):
+    if not out or not _img_size(out):
+        raise RuntimeError("camera composition: provider returned an undecodable image")
+    w, h = guide_dims
+    framed = os.path.splitext(out)[0] + ".camera.png"
+    try:
+        subprocess.run(["ffmpeg", "-nostdin", "-y", "-v", "error", "-i", out,
+                        "-vf", f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1",
+                        "-frames:v", "1", framed], check=True, capture_output=True, timeout=60)
+    except Exception as exc:
+        raise RuntimeError("camera composition: framing failed") from exc
+    if _img_size(framed) != guide_dims:
+        raise RuntimeError("camera composition: invalid prepared image")
+    prepared = _tryon_postprocess(framed, params, job_id)
+    if not _img_size(prepared):
+        raise RuntimeError("camera composition: postprocess returned an undecodable image")
+    return prepared
+
+
+def _tryon_compose_camera(job_id, provider, person_path, background_path, guide_path, prefix, params):
+    if (QWEN_EDIT_MAX_REFS < 3 and (provider not in ("gemini", "huggingface")
+                                  or (provider == "gemini" and TRYON_GEMINI_FALLBACK))):
+        raise RuntimeError("camera composition requires QWEN_EDIT_MAX_REFS >= 3")
+    dims = _img_size(guide_path)
+    if not dims or min(dims) <= 0:
+        raise RuntimeError("camera guide: invalid image dimensions")
+    positive, negative = _load_camera_compose_prompt()
+    refs = (person_path, background_path, guide_path)
+    out = os.path.join(os.path.dirname(person_path), prefix + "-camera-compose.png")
+    if provider in ("gemini", "qwen-max"):
+        qwen_size = "*".join(map(str, _fit_aligned(*dims, mp=1.0, align=16)))
+        parts = []
+        for path in refs:
+            with open(path, "rb") as handle:
+                parts.append((handle.read(), _mime(path)))
+        if provider == "gemini":
+            _tryon_gemini_or_fallback(job_id, params, parts, positive, _gemini_key(params), out,
+                                      _gemini_aspect(dims), positive, qwen_negative=negative, qwen_size=qwen_size)
+        else:
+            _qwen_max_edit(parts, positive, _qwen_key(params), out, negative_prompt=negative, size=qwen_size)
+    elif provider == "huggingface":
+        _, fal_id, queue = _hf_resolve(params.get("hfModel"), "image-to-image")
+        uris = [_hf_data_uri(path) for path in refs]
+        payload = {"prompt": positive, "negative_prompt": negative,
+                   "image_url": uris[0], "image_urls": uris, "image_size": _hf_image_size(dims)}
+        result = _hf_call(fal_id, payload, _hf_key(params), queue, job_id, 600, 0.82, 0.93,
+                          "camera composition")
+        _hf_fetch(_hf_first_image(result), out)
+    else:
+        w, h = _fit_aligned(*dims, mp=TRYON_MP, align=64)
+        pid = comfy_submit(build_qwen_create_workflow(
+            [comfy_upload(path) for path in refs], positive, prefix + "-camera",
+            width=w, height=h, force_size=True, realism=False,
+            negative_prompt=negative, target_mp=TRYON_MP))
+        out = comfy_fetch_output(comfy_poll(pid, job_id, deadline_sec=600,
+                                 prog_lo=0.82, prog_hi=0.93, prog_step="camera composition"), exts=IMG_EXTS)
+    return _tryon_camera_postprocess(out, dims, params, job_id)
+
+
 def run_tryon(job):
     job_id = job["id"]; inputs = job.get("inputs", {}); params = job.get("params", {})
     model_key = inputs.get("model") or inputs.get("ref") or inputs.get("image")
@@ -5528,6 +5590,9 @@ def run_tryon(job):
     # "Chỉ làm sạch ảnh" VÀ template Singer đa-outfit dựng node tryon cleanOnly làm bước làm sạch trước Motion —
     # các flow đó chết với "tryon cần inputs.product". cleanOnly chỉ cần ảnh model, không cần sản phẩm.
     clean_only = str(params.get("cleanOnly") or params.get("clean_only") or "").lower().strip() in ("1", "true", "yes", "on")
+    camera_aware = str(params.get("cameraAware") or "").lower().strip() in ("1", "true", "yes", "on")
+    if camera_aware and (not inputs.get("background") or not inputs.get("cameraGuide")):
+        raise RuntimeError("camera-aware try-on requires background and cameraGuide")
     if not model_key or (not product_key and not clean_only):
         raise RuntimeError("tryon cần inputs.model (người) + inputs.product (trang phục)")
     # ALD 16/08/2026 - KHÔI PHỤC đa-góc sản phẩm (theo yêu cầu user, đảo quyết định "tối giản" 20/07): FE vẫn có
@@ -5535,6 +5600,11 @@ def run_tryon(job):
     product2_key = inputs.get("product2") or inputs.get("garment2")
     product_keys = [k for k in (product_key, product2_key) if k]
     tmp = tempfile.mkdtemp(prefix=f"tryon-{job_id[:8]}-")
+    if camera_aware:
+        video = api_download(inputs["cameraGuide"], os.path.join(tmp, "camera-guide-video" +
+                             (os.path.splitext(inputs["cameraGuide"])[1] or ".mp4")))
+        guide_local = os.path.join(tmp, "camera-guide.png")
+        _extract_camera_guide_frame(job_id, video, guide_local, params)
     api_progress(job_id, 0.05, "tải input")
     m_local = api_download(model_key, os.path.join(tmp, "model" + os.path.splitext(model_key)[1]))
     p_locals = [api_download(k, os.path.join(tmp, f"product{i}" + os.path.splitext(k)[1]))
@@ -5561,6 +5631,12 @@ def run_tryon(job):
     # ALD 11/06/2026 - đọc provider SỚM: gemini/huggingface là API call thuần — KHÔNG upload ComfyUI (box GPU
     # bận/chết vẫn chạy được; trước đây gemini vẫn upload phí và phụ thuộc ComfyUI vô cớ).
     provider = str(params.get("provider") or "qwen").lower().strip()
+    def camera_finish(person_path, compose_provider=provider):
+        prepared = _tryon_compose_camera(job_id, compose_provider, person_path, bg_local,
+                                         guide_local, f"tryon-{job_id[:8]}", params)
+        api_progress(job_id, 0.95, "upload output")
+        api_upload_output(job_id, prepared, content_type="image/png")
+        return prepared
     m_name = p_name = None; p_names = []
     if provider not in ("gemini", "huggingface", "qwen-max"):
         api_progress(job_id, 0.15, "upload vào ComfyUI")
@@ -5583,6 +5659,8 @@ def run_tryon(job):
         out = comfy_fetch_output(comfy_poll(pid, job_id, deadline_sec=600), exts=IMG_EXTS)
         if not out:
             raise RuntimeError("ComfyUI không trả ảnh clean")
+        if camera_aware:
+            return camera_finish(out, "qwen")
         if bg_local:
             api_progress(job_id, 0.82, "ghép nền (Qwen pass 2)")
             out = _tryon_compose_background(job_id, out, bg_local, f"tryon-{job_id[:8]}")
@@ -5634,6 +5712,8 @@ def run_tryon(job):
                       "the second product image is NOT an additional garment to add.")
         _tryon_gemini_or_fallback(job_id, params, parts, prompt_g, gem_key, out,
                                   _gemini_aspect(_img_size(m_local)), pos_q, qwen_negative=neg_q)
+        if camera_aware:
+            return camera_finish(out)
         # ALD 16/08/2026 - Ghép nền pass 2 (Gemini): ảnh 1 = kết quả thay đồ, ảnh 2 = bối cảnh. Tách pass riêng
         # (không nhét nền vào pass thay đồ) để mỗi lệnh 1 việc — cùng triết lý pass 2 của nhánh Qwen.
         if bg_local:
@@ -5668,6 +5748,8 @@ def run_tryon(job):
                       "front and the back. Use both views only to render that ONE product accurately; "
                       "the second product image is NOT an additional garment to add.")
         _qwen_max_edit(parts, pos_q, qwen_key, out, negative_prompt=neg_q)
+        if camera_aware:
+            return camera_finish(out)
         if bg_local:
             api_progress(job_id, 0.8, "ghép nền (Qwen-Max pass 2)")
             with open(out, "rb") as f: ob = f.read()
@@ -5702,6 +5784,8 @@ def run_tryon(job):
         res = _hf_call(fal_id, payload, hf_key, q, job_id, 600, 0.3, 0.9, "HF tryon")
         out = os.path.join(tmp, "hf_tryon.png")
         _hf_fetch(_hf_first_image(res), out)
+        if camera_aware:
+            return camera_finish(out)
         # ALD 16/08/2026 - Ghép nền pass 2 qua fal-ai (cùng họ Qwen-Edit nên dùng chung prompt _TRYON_BG_*).
         if bg_local:
             api_progress(job_id, 0.82, "ghép nền (HF pass 2)")
@@ -5721,10 +5805,13 @@ def run_tryon(job):
     api_progress(job_id, 0.3, "Qwen-Image-Edit (tryon)")
     # Giày/dép: bàn chân quá nhỏ trong full-body → FEET-DETAILER (crop chân → thay giày res cao → ghép lại).
     if garment in GARMENT_SHOES and TRYON_FEET_DETAILER:
+        comp = None
         try:
             comp = _run_shoes_detailer(job_id, m_local, p_name, garment, f"tryon-{job_id[:8]}", tmp,
                                        frac=params.get("feetCrop") or params.get("feet_crop"))
             if comp:
+                if camera_aware:
+                    return camera_finish(comp)
                 if bg_local:
                     comp = _tryon_compose_background(job_id, comp, bg_local, f"tryon-{job_id[:8]}")
                 comp = _tryon_postprocess(comp, params, job_id)
@@ -5733,6 +5820,8 @@ def run_tryon(job):
                 return comp
             api_log(job_id, "feet-detailer trống → tryon toàn ảnh", "warn")
         except Exception as e:
+            if camera_aware and comp:
+                raise
             api_log(job_id, f"feet-detailer lỗi → tryon toàn ảnh: {e}", "warn")
     # Kích thước latent /64-aligned theo ảnh model → fix band đáy; giày dùng mp cao hơn (rõ bàn chân).
     mp = _tryon_mp(garment); twh = None
@@ -5745,6 +5834,8 @@ def run_tryon(job):
     api_progress(job_id, 0.9, "tải kết quả")
     out = comfy_fetch_output(outputs, exts=IMG_EXTS)
     if not out: raise RuntimeError("ComfyUI không trả ảnh tryon")
+    if camera_aware:
+        return camera_finish(out)
     if bg_local:
         api_progress(job_id, 0.82, "ghép nền (Qwen pass 2)")
         out = _tryon_compose_background(job_id, out, bg_local, f"tryon-{job_id[:8]}")

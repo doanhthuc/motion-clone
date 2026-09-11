@@ -71,11 +71,12 @@ class TestValidate(unittest.TestCase):
             validate_params("enhance", {"targetRes": "1080p", "fpsInterp": "60"},
                             ast_params=self.ast, curated=self.curated), [])
 
-    def test_camera_helper_parameters_are_declared_as_extra(self):
-        expected_tryon = {"cameraGuideFrame", "cameraAware", "driverStartSec", "driverDurSec"}
-        self.assertTrue(expected_tryon <= set(self.curated["tryon"]["extra"]))
-        self.assertIn("cameraAwareMotion", self.curated["motion"]["extra"])
-        self.assertEqual(self.curated["tryon"]["allowed"]["cameraGuideFrame"], ["middle"])
+    def test_camera_parameters_are_valid_from_ast_and_helper_declarations(self):
+        self.assertEqual(validate_params("tryon", {
+            "cameraGuideFrame": "middle", "cameraAware": True, "driverStartSec": 1, "driverDurSec": 2,
+        }, ast_params=self.ast, curated=self.curated), [])
+        self.assertEqual(validate_params("motion", {"cameraAwareMotion": True},
+                                         ast_params=self.ast, curated=self.curated), [])
 
     def test_key_la_bi_chan_kem_goi_y(self):
         errs = validate_params("enhance", {"targetres": "1080p"},
