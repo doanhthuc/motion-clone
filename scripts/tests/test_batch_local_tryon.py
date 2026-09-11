@@ -443,6 +443,66 @@ class TestPostprocess(unittest.TestCase):
             self.assertEqual(out, p)
 
 
+class TestCameraAwareGuide(unittest.TestCase):
+    def test_camera_prompt_is_loaded_from_the_worker_asset(self):
+        positive, negative = lt.load_camera_compose_prompt()
+        self.assertIn("Image 1", positive)
+        self.assertIn("Image 2", positive)
+        self.assertIn("Image 3", positive)
+        self.assertIn("do not copy", positive.lower())
+        self.assertIn("different location", negative.lower())
+
+    def test_midpoint_respects_selected_segment(self):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[0] == "ffprobe" and "format=duration" in cmd:
+                return mock.Mock(returncode=0, stdout="40.0\n", stderr="")
+            if cmd[0] == "ffprobe":
+                return mock.Mock(returncode=0, stdout="720x1280\n", stderr="")
+            Path(cmd[-1]).write_bytes(b"png")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(lt.subprocess, "run", fake_run):
+            dims = lt.extract_camera_guide_frame(
+                Path("driver.mp4"), Path(d) / "guide.png",
+                {"driverStartSec": 10, "driverDurSec": 12},
+            )
+        ffmpeg = next(cmd for cmd in calls if cmd[0] == "ffmpeg")
+        self.assertEqual(ffmpeg[ffmpeg.index("-ss") + 1], "16.000000")
+        self.assertEqual(dims, (720, 1280))
+
+    def test_empty_or_zero_duration_guide_is_strictly_rejected(self):
+        with mock.patch.object(
+            lt.subprocess, "run", return_value=mock.Mock(returncode=0, stdout="0\n", stderr="")
+        ):
+            with self.assertRaises(JobError) as cm:
+                lt.extract_camera_guide_frame(Path("driver.mp4"), Path("guide.png"), {})
+        self.assertIn("camera guide", str(cm.exception))
+
+    def test_camera_guide_frame_other_than_middle_is_rejected(self):
+        with self.assertRaises(JobError) as cm:
+            lt.extract_camera_guide_frame(
+                Path("driver.mp4"), Path("guide.png"), {"cameraGuideFrame": "start"}
+            )
+        self.assertIn("camera guide", str(cm.exception))
+
+    def test_non_finite_segment_start_is_rejected(self):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return mock.Mock(returncode=0, stdout="40\n", stderr="")
+
+        with mock.patch.object(lt.subprocess, "run", fake_run):
+            with self.assertRaises(JobError):
+                lt.extract_camera_guide_frame(
+                    Path("driver.mp4"), Path("guide.png"), {"driverStartSec": float("nan")}
+                )
+        self.assertFalse(any(cmd[0] == "ffmpeg" for cmd in calls))
+
+
 def _run_gemini(tmp: Path, background: bool = False) -> Run:
     (tmp / "char.jpg").write_bytes(b"char-bytes")
     (tmp / "outfit.jpg").write_bytes(b"outfit-bytes")

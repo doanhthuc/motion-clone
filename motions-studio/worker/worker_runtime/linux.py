@@ -11,6 +11,7 @@ ComfyUI ở ngoài (COMFY_URL) — model files do container comfyui tự tải (
 """
 import os, sys, time, json, tempfile, traceback, subprocess, shutil, base64, threading, random, re, math
 from datetime import datetime, timezone
+from pathlib import Path
 # ALD 22/06/2026 - HF_HOME → cache GHI ĐƯỢC. faster_whisper (subtitle ASR) + mọi tải HF mặc định ghi vào
 # ~/.cache/huggingface/hub (root-owned → "[Errno 13] Permission denied"). Worker thiếu HF_HOME nên dính lỗi.
 # Trỏ sang ~/.cache/hf (ubuntu-owned, ghi được; dir đã có sẵn). ĐẶT TRƯỚC mọi import HF (faster_whisper/
@@ -3740,6 +3741,62 @@ def _img_size(path):
         return int(w), int(h)
     except Exception:
         return None
+
+
+def _load_camera_compose_prompt():
+    asset = Path(__file__).resolve().parents[1] / "assets/camera-aware-tryon.json"
+    try:
+        prompt = json.loads(asset.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"camera guide prompt asset {asset}: unreadable") from exc
+    if prompt.get("version") != 1 or not all(
+        isinstance(prompt.get(key), str) and prompt[key].strip() for key in ("positive", "negative")
+    ):
+        raise RuntimeError(f"camera guide prompt asset {asset}: invalid")
+    return prompt["positive"], prompt["negative"]
+
+
+def _extract_camera_guide_frame(job_id, video_path, out_path, params):
+    if params.get("cameraGuideFrame", "middle") != "middle":
+        raise RuntimeError(f"camera guide {video_path}: cameraGuideFrame must be middle")
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
+            capture_output=True, text=True, timeout=30,
+        )
+        source_duration = float((probe.stdout or "").strip())
+        requested_start = float(params.get("driverStartSec") or 0)
+        if not math.isfinite(requested_start):
+            raise ValueError("non-finite start")
+        start = max(0.0, requested_start)
+        available = source_duration - start
+        requested_duration = float(params.get("driverDurSec") or available)
+        if not math.isfinite(requested_duration):
+            raise ValueError("non-finite duration")
+        duration = requested_duration
+        effective_duration = min(duration, available)
+        midpoint = start + effective_duration / 2.0
+        if (probe.returncode != 0 or not all(math.isfinite(value) for value in (
+                source_duration, start, available, duration, effective_duration, midpoint))
+                or source_duration <= 0 or start >= source_duration or effective_duration <= 0):
+            raise ValueError("invalid duration")
+        subprocess.run(
+            ["ffmpeg", "-nostdin", "-y", "-v", "error", "-ss", f"{midpoint:.6f}",
+             "-i", str(video_path), "-frames:v", "1", str(out_path)],
+            check=True, capture_output=True, text=True, timeout=60,
+        )
+        if not os.path.isfile(out_path) or os.path.getsize(out_path) <= 0:
+            raise ValueError("empty extracted frame")
+        dims = _img_size(out_path)
+        if not dims or dims[0] <= 0 or dims[1] <= 0:
+            raise ValueError("undecodable extracted frame")
+        api_log(job_id, f"camera guide midpoint {midpoint:.6f}s resolved to {dims[0]}x{dims[1]}", "info")
+        return dims
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"camera guide {video_path}: {exc}") from exc
 
 def _fit_aligned(w, h, mp=1.0, align=64):
     """Scale (w,h) về ~mp megapixel, GIỮ tỉ lệ, làm tròn BỘI SỐ `align` (≥align). Latent /64 tránh

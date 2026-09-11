@@ -18,6 +18,7 @@ hay chạy trên pod — rõ nhất với ảnh outfit mà món đồ nhỏ so v
 """
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 LOCAL_PROVIDERS = {"gemini", "qwen-max"}
@@ -64,6 +65,61 @@ def img_size(path: Path) -> tuple[int, int] | None:
         return int(w), int(h)
     except Exception:
         return None
+
+
+def load_camera_compose_prompt() -> tuple[str, str]:
+    asset = Path(__file__).resolve().parents[2] / "motions-studio/worker/assets/camera-aware-tryon.json"
+    try:
+        prompt = json.loads(asset.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise JobError(f"camera guide prompt asset {asset}: unreadable") from exc
+    if prompt.get("version") != 1 or not all(
+        isinstance(prompt.get(key), str) and prompt[key].strip() for key in ("positive", "negative")
+    ):
+        raise JobError(f"camera guide prompt asset {asset}: invalid")
+    return prompt["positive"], prompt["negative"]
+
+
+def extract_camera_guide_frame(video_path: Path, out_path: Path, params: dict) -> tuple[int, int]:
+    if params.get("cameraGuideFrame", "middle") != "middle":
+        raise JobError(f"camera guide {video_path}: cameraGuideFrame must be middle")
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
+            capture_output=True, text=True, timeout=30,
+        )
+        source_duration = float((probe.stdout or "").strip())
+        requested_start = float(params.get("driverStartSec") or 0)
+        if not math.isfinite(requested_start):
+            raise ValueError("non-finite start")
+        start = max(0.0, requested_start)
+        available = source_duration - start
+        requested_duration = float(params.get("driverDurSec") or available)
+        if not math.isfinite(requested_duration):
+            raise ValueError("non-finite duration")
+        duration = requested_duration
+        effective_duration = min(duration, available)
+        midpoint = start + effective_duration / 2.0
+        if (probe.returncode != 0 or not all(math.isfinite(value) for value in (
+                source_duration, start, available, duration, effective_duration, midpoint))
+                or source_duration <= 0 or start >= source_duration or effective_duration <= 0):
+            raise ValueError("invalid duration")
+        subprocess.run(
+            ["ffmpeg", "-nostdin", "-y", "-v", "error", "-ss", f"{midpoint:.6f}",
+             "-i", str(video_path), "-frames:v", "1", str(out_path)],
+            check=True, capture_output=True, text=True, timeout=60,
+        )
+        if not out_path.is_file() or out_path.stat().st_size <= 0:
+            raise ValueError("empty extracted frame")
+        dims = img_size(out_path)
+        if not dims or dims[0] <= 0 or dims[1] <= 0:
+            raise ValueError("undecodable extracted frame")
+        return dims
+    except JobError:
+        raise
+    except Exception as exc:
+        raise JobError(f"camera guide {video_path}: {exc}") from exc
 
 
 GARMENT_LABEL = {
