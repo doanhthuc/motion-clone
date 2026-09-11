@@ -6,8 +6,12 @@ import { normalizeMotionDriverSegment as normalizeWorkflowMotion } from "./wf-wo
 
 assert.equal(isCameraAwareMotion({ cameraAwareMotion: true }), true)
 assert.equal(isCameraAwareMotion({ cameraAwareMotion: "true" }), true)
+assert.equal(isCameraAwareMotion({ cameraAwareMotion: "1" }), true)
 assert.equal(isCameraAwareMotion({ camera_aware_motion: "yes" }), true)
+assert.equal(isCameraAwareMotion({ camera_aware_motion: "on" }), true)
 assert.equal(isCameraAwareMotion({ cameraAwareMotion: "0" }), false)
+assert.equal(isCameraAwareMotion({ cameraAwareMotion: 1 }), false)
+assert.equal(isCameraAwareMotion({ cameraAwareMotion: ["true"] }), false)
 assert.equal(isCameraAwareMotion({}), false)
 
 for (const unsupported of [null, undefined, 0, "motion", true]) {

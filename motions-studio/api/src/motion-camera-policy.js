@@ -1,7 +1,8 @@
 export function isCameraAwareMotion(params) {
-  return ["1", "true", "yes", "on"].includes(
-    String(params?.cameraAwareMotion ?? params?.camera_aware_motion ?? "").trim().toLowerCase(),
-  )
+  const value = params?.cameraAwareMotion ?? params?.camera_aware_motion
+  return value === true || (typeof value === "string" && ["1", "true", "yes", "on"].includes(
+    value.trim().toLowerCase(),
+  ))
 }
 
 export function enforceMotionFitPolicy(params) {
