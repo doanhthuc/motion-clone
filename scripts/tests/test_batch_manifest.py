@@ -30,6 +30,19 @@ runs:
     enhance: { fpsInterp: "48" }
 """
 
+CAMERA = """
+runs:
+  - id: cameraA
+    pipeline: tryon-camera-motion-enhance
+    inputs:
+      character: char.jpg
+      outfit: vay.jpg
+      background: bg.jpg
+      driver: drv.mp4
+    camera-tryon: { provider: gemini, driverStartSec: 5 }
+    camera-motion: { preset: drv-15s, quality: 720p }
+"""
+
 
 def _fixture(tmp: Path, text: str = GOOD) -> Path:
     for name in ("char.jpg", "vay.jpg", "bg.jpg", "drv.mp4"):
@@ -40,6 +53,24 @@ def _fixture(tmp: Path, text: str = GOOD) -> Path:
 
 
 class TestLoad(unittest.TestCase):
+    def test_camera_segment_is_shared_and_duration_derives_from_driver_preset(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = load_manifest(_fixture(Path(d), CAMERA)).runs[0]
+            self.assertEqual(run.stage_params["camera-tryon"]["driverStartSec"], 5)
+            self.assertEqual(run.stage_params["camera-motion"]["driverStartSec"], 5)
+            self.assertEqual(run.stage_params["camera-tryon"]["driverDurSec"], 15)
+            self.assertEqual(run.stage_params["camera-motion"]["driverDurSec"], 15)
+
+    def test_conflicting_camera_segments_are_rejected_before_gpu(self):
+        text = CAMERA.replace("preset: drv-15s, quality: 720p",
+                              "preset: drv-15s, quality: 720p, driverStartSec: 6")
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(ManifestError) as cm:
+                load_manifest(_fixture(Path(d), text))
+            self.assertIn("driverStartSec", str(cm.exception))
+            self.assertIn("camera-tryon", str(cm.exception))
+            self.assertIn("camera-motion", str(cm.exception))
+
     def test_doc_duoc_run_va_giai_duong_dan_tuong_doi(self):
         with tempfile.TemporaryDirectory() as d:
             m = load_manifest(_fixture(Path(d)))
@@ -142,6 +173,26 @@ class TestLoad(unittest.TestCase):
 
 
 class TestValidate(unittest.TestCase):
+    def test_camera_pipeline_requires_background_and_driver(self):
+        text = CAMERA.replace("      background: bg.jpg\n", "")
+        with tempfile.TemporaryDirectory() as d:
+            errs = validate_manifest(load_manifest(_fixture(Path(d), text)),
+                                     ast_params=AST, curated=CURATED)
+            self.assertTrue(any("background" in error for error in errs))
+
+    def test_camera_alias_blocks_are_valid(self):
+        with tempfile.TemporaryDirectory() as d:
+            manifest = load_manifest(_fixture(Path(d), CAMERA))
+            self.assertEqual(validate_manifest(manifest, ast_params=AST, curated=CURATED), [])
+
+    def test_camera_guide_frame_rejects_non_middle_value(self):
+        text = CAMERA.replace("provider: gemini, driverStartSec: 5",
+                              "provider: gemini, cameraGuideFrame: first, driverStartSec: 5")
+        with tempfile.TemporaryDirectory() as d:
+            errs = validate_manifest(load_manifest(_fixture(Path(d), text)),
+                                     ast_params=AST, curated=CURATED)
+            self.assertTrue(any("cameraGuideFrame" in error for error in errs))
+
     def test_manifest_tot_thi_khong_loi(self):
         with tempfile.TemporaryDirectory() as d:
             m = load_manifest(_fixture(Path(d)))

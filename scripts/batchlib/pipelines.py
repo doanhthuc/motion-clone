@@ -16,7 +16,7 @@ phát hiện SAU khi job đã được nhận, đã vào hàng đợi, đã đá
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 class PipelineError(Exception):
@@ -31,6 +31,9 @@ class Stage:
     output_ext: str
     min_bytes: int           # sàn kích thước tải về; dưới ngưỡng = MinIO trả về rỗng
     timeout_min: int
+    param_type: str = ""
+    defaults: dict[str, object] = field(default_factory=dict)
+    locked_params: dict[str, object] = field(default_factory=dict)
 
 
 # min_bytes lấy đúng hai ngưỡng pod-smoke.sh đã dùng và đã chứng minh:
@@ -41,25 +44,43 @@ STAGES: dict[str, Stage] = {
         inputs={"model": "material:character",
                 "product": "material:outfit",
                 "background": "material:background?"},
-        output_ext=".png", min_bytes=5_000, timeout_min=20,
+        output_ext=".png", min_bytes=5_000, timeout_min=20, param_type="tryon",
     ),
     "motion": Stage(
         name="motion", job_type="motion",
         inputs={"ref": "prev|material:character",
                 "motion": "material:driver"},
-        output_ext=".mp4", min_bytes=100_000, timeout_min=60,
+        output_ext=".mp4", min_bytes=100_000, timeout_min=60, param_type="motion",
     ),
     "character-swap": Stage(
         name="character-swap", job_type="character-swap",
         inputs={"ref": "prev|material:character",
                 "video": "material:driver"},
-        output_ext=".mp4", min_bytes=100_000, timeout_min=60,
+        output_ext=".mp4", min_bytes=100_000, timeout_min=60, param_type="character-swap",
     ),
     # enhance 1080p60 nội suy RIFE ×4 rồi encode lại — luôn lâu hơn motion sinh ra nó.
     "enhance": Stage(
         name="enhance", job_type="enhance",
         inputs={"input": "prev"},
-        output_ext=".mp4", min_bytes=100_000, timeout_min=90,
+        output_ext=".mp4", min_bytes=100_000, timeout_min=90, param_type="enhance",
+    ),
+    "camera-tryon": Stage(
+        name="camera-tryon", job_type="tryon", param_type="tryon",
+        inputs={"model": "material:character",
+                "product": "material:outfit",
+                "background": "material:background",
+                "cameraGuide": "material:driver"},
+        output_ext=".png", min_bytes=5_000, timeout_min=20,
+        defaults={"cameraGuideFrame": "middle"},
+        locked_params={"cameraAware": True},
+    ),
+    "camera-motion": Stage(
+        name="camera-motion", job_type="motion", param_type="motion",
+        inputs={"ref": "prev", "motion": "material:driver"},
+        output_ext=".mp4", min_bytes=100_000, timeout_min=60,
+        defaults={"bodyProportionLock": False, "poseStrength": 0.9,
+                  "clipStrength": 1.2},
+        locked_params={"cameraAwareMotion": True, "fitDriver": True},
     ),
 }
 
@@ -72,7 +93,22 @@ PIPELINES: dict[str, list[str]] = {
     "tryon-motion-enhance": ["tryon", "motion", "enhance"],
     "character-swap-enhance": ["character-swap", "enhance"],
     "tryon-character-swap-enhance": ["tryon", "character-swap", "enhance"],
+    "tryon-camera-motion-enhance": ["camera-tryon", "camera-motion", "enhance"],
 }
+
+
+def effective_stage_params(stage_name: str, manifest_params: dict | None = None) -> dict:
+    stage = STAGES[stage_name]
+    return {**stage.defaults, **dict(manifest_params or {}), **stage.locked_params}
+
+
+def locked_stage_param_errors(stage_name: str, manifest_params: dict | None = None) -> list[str]:
+    supplied = dict(manifest_params or {})
+    return [
+        f"{stage_name}.{key} is locked to {expected!r}"
+        for key, expected in STAGES[stage_name].locked_params.items()
+        if key in supplied and supplied[key] != expected
+    ]
 
 
 def _stages(pipeline: str) -> list[Stage]:

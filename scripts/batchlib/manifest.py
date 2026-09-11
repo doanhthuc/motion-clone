@@ -8,14 +8,17 @@ dùng cho batch_scan.py — lúc đó file còn chưa tồn tại nên chưa có
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
 
 from .params import validate_params
-from .pipelines import PIPELINES, optional_roles, required_roles
+from .pipelines import (PIPELINES, STAGES, effective_stage_params,
+                        locked_stage_param_errors, optional_roles, required_roles)
 
 STAGE_KEYS = set()
 for _stages in PIPELINES.values():
@@ -24,6 +27,68 @@ for _stages in PIPELINES.values():
 
 class ManifestError(Exception):
     """Manifest không đọc được. Khác với 'đọc được nhưng sai' — cái đó là validate."""
+
+
+_CAMERA_PIPELINE = "tryon-camera-motion-enhance"
+_CAMERA_STAGES = ("camera-tryon", "camera-motion")
+_DRV_PRESET = re.compile(r"^drv-(5|10|15|20|30)s$")
+
+
+def synchronize_camera_stage_segments(
+    pipeline: str,
+    stage_params: dict[str, dict],
+    *,
+    where: str = "",
+) -> dict[str, dict]:
+    """Share a selected driver segment between the two camera-stage aliases."""
+    copied = {stage: dict(params) for stage, params in stage_params.items()}
+    if pipeline != _CAMERA_PIPELINE:
+        return copied
+
+    prefix = f"{where}: " if where else ""
+
+    def resolve(field: str, snake_field: str, *, positive: bool = False) -> float | None:
+        supplied: list[tuple[str, float]] = []
+        for stage_name in _CAMERA_STAGES:
+            params = copied.get(stage_name, {})
+            for key in (field, snake_field):
+                if key not in params:
+                    continue
+                try:
+                    value = float(params[key])
+                except (TypeError, ValueError) as exc:
+                    raise ManifestError(
+                        f"{prefix}{stage_name}.{key} must be a finite number"
+                    ) from exc
+                if not math.isfinite(value):
+                    raise ManifestError(f"{prefix}{stage_name}.{key} must be a finite number")
+                if (positive and value <= 0) or (not positive and value < 0):
+                    relation = "positive" if positive else "non-negative"
+                    raise ManifestError(f"{prefix}{stage_name}.{key} must be {relation}")
+                supplied.append((f"{stage_name}.{key}", value))
+        if supplied and any(value != supplied[0][1] for _, value in supplied[1:]):
+            names = ", ".join(name for name, _ in supplied)
+            raise ManifestError(f"{prefix}{field} conflicts between {names}")
+        return supplied[0][1] if supplied else None
+
+    start = resolve("driverStartSec", "driver_start_sec")
+    duration = resolve("driverDurSec", "driver_dur_sec", positive=True)
+    if duration is None:
+        preset = copied.get("camera-motion", {}).get("preset")
+        if isinstance(preset, str):
+            match = _DRV_PRESET.fullmatch(preset)
+            if match:
+                duration = float(match.group(1))
+
+    for stage_name in _CAMERA_STAGES:
+        params = copied.setdefault(stage_name, {})
+        params.pop("driver_start_sec", None)
+        params.pop("driver_dur_sec", None)
+        if start is not None:
+            params["driverStartSec"] = start
+        if duration is not None:
+            params["driverDurSec"] = duration
+    return copied
 
 
 def _require_mapping(value: object, *, path: Path, where: str, key: str, hint: str) -> dict:
@@ -149,6 +214,9 @@ def load_manifest(path: Path) -> Manifest:
             if merged:
                 stage_params[stage] = merged
 
+        stage_params = synchronize_camera_stage_segments(
+            pipeline, stage_params, where=f"run {run_id!r}"
+        )
         runs.append(Run(id=run_id, pipeline=pipeline,
                         inputs=inputs, stage_params=stage_params))
     return Manifest(path=path, runs=runs)
@@ -181,7 +249,14 @@ def validate_manifest(m: Manifest, *, ast_params: dict, curated: dict) -> list[s
         for stage in PIPELINES[run.pipeline]:
             errors.extend(
                 f"{where}: {msg}"
-                for msg in validate_params(stage, run.stage_params.get(stage, {}),
+                for msg in locked_stage_param_errors(stage, run.stage_params.get(stage))
+            )
+            declared = STAGES[stage]
+            errors.extend(
+                f"{where}: {msg}"
+                for msg in validate_params(
+                    declared.param_type,
+                    effective_stage_params(stage, run.stage_params.get(stage)),
                                            ast_params=ast_params, curated=curated)
             )
         for stage in sorted(set(run.stage_params) - set(PIPELINES[run.pipeline])):
