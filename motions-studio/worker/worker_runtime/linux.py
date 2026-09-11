@@ -5593,7 +5593,7 @@ def run_tryon(job):
     camera_aware = str(params.get("cameraAware") or "").lower().strip() in ("1", "true", "yes", "on")
     if camera_aware and (not inputs.get("background") or not inputs.get("cameraGuide")):
         raise RuntimeError("camera-aware try-on requires background and cameraGuide")
-    if not model_key or (not product_key and not clean_only):
+    if not model_key or (not product_key and (camera_aware or not clean_only)):
         raise RuntimeError("tryon cần inputs.model (người) + inputs.product (trang phục)")
     # ALD 16/08/2026 - KHÔI PHỤC đa-góc sản phẩm (theo yêu cầu user, đảo quyết định "tối giản" 20/07): FE vẫn có
     # UI "2 ảnh (đa góc)" + cổng Ảnh SP 2 → inputs.product2 = CÙNG sản phẩm chụp mặt sau/bên hông → Qwen image3.

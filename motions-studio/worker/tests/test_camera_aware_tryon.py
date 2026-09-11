@@ -27,6 +27,40 @@ from worker_runtime import linux  # noqa: E402
 
 
 class CameraCompositionTests(unittest.TestCase):
+    def _assert_camera_clean_requires_product(self, clean_flag):
+        job = {"id": "missing-product", "inputs": {
+            "model": "model.png", "background": "background.png", "cameraGuide": "driver.mp4",
+        }, "params": {"cameraAware": True, clean_flag: True}}
+        with mock.patch.object(linux, "api_download", side_effect=lambda *args: self.fail(
+            "camera-aware job without product reached input download")):
+            with self.assertRaises(RuntimeError):
+                linux.run_tryon(job)
+
+    def test_camera_clean_only_requires_product(self):
+        self._assert_camera_clean_requires_product("cleanOnly")
+
+    def test_camera_clean_only_snake_requires_product(self):
+        self._assert_camera_clean_requires_product("clean_only")
+
+    def test_ordinary_clean_only_still_accepts_model_without_product(self):
+        for clean_flag in ("cleanOnly", "clean_only"):
+            with self.subTest(clean_flag=clean_flag), tempfile.TemporaryDirectory() as d, ExitStack() as stack:
+                person = self.fixtures(Path(d))[0]
+                uploads = []
+                for name, replacement in {
+                    "api_download": lambda key, dest: shutil.copyfile(key, dest),
+                    "api_progress": lambda *args, **kwargs: None,
+                    "api_upload_output": lambda job, out, **kwargs: uploads.append(out),
+                    "comfy_upload": str, "comfy_submit": lambda graph: "pid",
+                    "comfy_poll": lambda *args, **kwargs: {},
+                    "comfy_fetch_output": lambda *args, **kwargs: str(person),
+                }.items():
+                    stack.enter_context(mock.patch.object(linux, name, replacement))
+                output = linux.run_tryon({"id": "ordinary-clean", "inputs": {"model": str(person)},
+                                         "params": {clean_flag: True}})
+                self.assertEqual(output, str(person))
+                self.assertEqual(uploads, [str(person)])
+
     def test_qwen_reference_cap_cannot_silently_drop_camera_guide(self):
         for provider in ("qwen", "qwen-max", "gemini"):
             with self.subTest(provider=provider), tempfile.TemporaryDirectory() as d, ExitStack() as stack:
