@@ -27,6 +27,27 @@ from worker_runtime import linux  # noqa: E402
 
 
 class CameraCompositionTests(unittest.TestCase):
+    def test_motion_normalization_preserves_driver_fitting_only_for_camera_aware_motion(self):
+        camera = linux._normalize_motion_params({
+            "preset": "drv-15s", "cameraAwareMotion": True,
+            "bodyProportionLock": False, "poseStrength": 0.9,
+            "clipStrength": 1.2, "fitDriver": True,
+        })
+        self.assertTrue(camera["fitDriver"])
+        self.assertTrue(camera["fit_driver"])
+        self.assertFalse(camera["bodyProportionLock"])
+        self.assertEqual(camera["poseStrength"], 0.9)
+        self.assertEqual(camera["clipStrength"], 1.2)
+
+        ordinary = linux._normalize_motion_params({"preset": "drv-15s", "fitDriver": True})
+        self.assertFalse(ordinary["fitDriver"])
+        self.assertFalse(ordinary["fit_driver"])
+
+        character_swap = linux._normalize_motion_params({
+            "preset": "drv-15s", "fitDriver": True, "_swapEngine": "wananimate",
+        })
+        self.assertTrue(character_swap["fitDriver"])
+
     def _assert_camera_clean_requires_product(self, clean_flag):
         job = {"id": "missing-product", "inputs": {
             "model": "model.png", "background": "background.png", "cameraGuide": "driver.mp4",

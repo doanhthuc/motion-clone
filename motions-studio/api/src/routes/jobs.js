@@ -5,6 +5,7 @@ import { query } from "../db.js"
 import { putObject, getObjectStream, getObjectRange, presignGet, browserUrl, verifyMediaSig, pipeObjectStream } from "../storage.js"
 import { clientAuth, workerAuth } from "../auth.js"
 import { enforceMotionResolution } from "../motion-resolution.js"
+import { enforceMotionFitPolicy } from "../motion-camera-policy.js"
 import { enforceTaskCloudEnhancePolicy } from "../task-cloud/enhance-policy.js"
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200 * 1024 * 1024, files: 20 } })
@@ -12,13 +13,11 @@ const router = Router()
 
 const extOf = (n, fb) => { const i = (n || "").lastIndexOf("."); return i >= 0 ? n.slice(i + 1).toLowerCase() : fb }
 
-function normalizeMotionDriverSegment(type, params) {
+export function normalizeMotionDriverSegment(type, params) {
   if (type !== "motion" || !params || typeof params !== "object") return params
-  const out = { ...params }
+  let out = enforceMotionFitPolicy(params)
   out.deliveryPreset = "source"
   out.delivery_preset = "source"
-  out.fitDriver = false
-  out.fit_driver = false
   delete out.bgAnchor
   delete out.bg_anchor
   delete out.bgAnchorMaskExpand

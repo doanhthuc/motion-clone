@@ -2650,7 +2650,11 @@ def _normalize_motion_params(p):
         # background + camera của video nguồn, ép về 9:16 mặc định là kéo dãn chính cái video phải giữ.
         # Đo thật trên pod 22/08: driver 3:4 (576×768) ra 544×960, mặt hẹp và dài ra. Ai vẫn muốn ép
         # khung thì truyền fitDriver=0 — nhánh này không đụng vào giá trị người dùng gửi.
-        if not p.get("_swapEngine"):
+        _camera_aware_motion = _motion_bool(p, "cameraAwareMotion", "camera_aware_motion", default=False)
+        if not p.get("_swapEngine") and _camera_aware_motion:
+            p["fitDriver"] = True
+            p["fit_driver"] = True
+        elif not p.get("_swapEngine"):
             p["fitDriver"] = False
             p["fit_driver"] = False
         p["quality"] = "720p" if str(p.get("quality") or "").strip().lower() == "720p" else "540p"

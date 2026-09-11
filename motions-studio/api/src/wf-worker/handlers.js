@@ -7,6 +7,7 @@ import { putObject, browserUrl, getObjectStream } from "../storage.js"
 import path from "node:path"
 import { scheduleSocialPosts } from "./social-scheduler.js"
 import { enforceMotionResolution } from "../motion-resolution.js"
+import { enforceMotionFitPolicy } from "../motion-camera-policy.js"
 import { detectGpuVramGb, WAN_DANCER_MIN_VRAM_GB } from "../gpu-vram.js"
 import { enforceTaskCloudEnhancePolicy } from "../task-cloud/enhance-policy.js"
 
@@ -145,13 +146,11 @@ function mediaJobTimeoutSec(type, params) {
   return 30 * 60
 }
 
-function normalizeMotionDriverSegment(type, params) {
+export function normalizeMotionDriverSegment(type, params) {
   if (type !== "motion" || !params || typeof params !== "object") return params
-  const out = { ...params }
+  let out = enforceMotionFitPolicy(params)
   out.deliveryPreset = "source"
   out.delivery_preset = "source"
-  out.fitDriver = false
-  out.fit_driver = false
   delete out.bgAnchor
   delete out.bg_anchor
   delete out.bgAnchorMaskExpand
