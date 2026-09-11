@@ -33,12 +33,15 @@ def _driver_stage(pipeline: str) -> str | None:
     consumes that role for a given pipeline IS derivable, and deriving it
     avoids hardcoding "motion" when a pipeline instead runs character-swap.
     """
-    for stage_name in PIPELINES.get(pipeline, []):
-        stage = STAGES[stage_name]
-        for source in stage.inputs.values():
-            if "material:driver" in source.split("|"):
-                return stage_name
-    return None
+    driver_consumers = [
+        stage_name for stage_name in PIPELINES.get(pipeline, [])
+        if any("material:driver" in source.split("|")
+               for source in STAGES[stage_name].inputs.values())
+    ]
+    for stage_name in driver_consumers:
+        if STAGES[stage_name].job_type in {"motion", "character-swap"}:
+            return stage_name
+    return driver_consumers[0] if driver_consumers else None
 
 
 def slot_for(probe: Probe, job: Job) -> str | None:
