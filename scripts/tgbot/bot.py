@@ -770,11 +770,14 @@ def _ask_about(tg: Tg, chat_id: int, p: Probe, pipeline: str,
     rows = [labels[i:i + 2] for i in range(0, len(labels), 2)]
     question = f"{describe(p)}\nWhich slot is this?"
     if filled & set(roles):
-        # The ✅ on a role's button says it's filled, but not what tapping it
-        # does — a user wanting to swap that file out has no other button to
-        # reach for, so the answer has to live right next to the question
-        # (2026-09-02, reported as "didn't tell me how to change outfit").
-        question += f"\n({ICON_OK} = already set — tap it again to replace)"
+        # The animated checkmark on a role's button says it's filled, but not
+        # what tapping it does — a user wanting to swap that file out has no
+        # other button to reach for, so the answer has to live right next to
+        # the question (2026-09-02, reported as "didn't tell me how to change
+        # outfit"). ICON_OK_CE here, not a plain "✅", so it reads as the same
+        # checkmark the button itself carries via icon_custom_emoji_id
+        # (2026-09-12, reported live: the two didn't match).
+        question += f"\n({ICON_OK_CE} = already set — tap it again to replace)"
 
     # With the picture, when there is one (2026-09-01). This question used to
     # be asked about an image the user could not see — the File rule that keeps
@@ -785,13 +788,14 @@ def _ask_about(tg: Tg, chat_id: int, p: Probe, pipeline: str,
             if path else None)
     if shot is not None:
         try:
-            tg.send_photo(chat_id, shot, caption=question, buttons=rows)
+            tg.send_photo(chat_id, shot, caption=question, buttons=rows,
+                          parse_mode=PARSE_HTML)
             return
         except TgError as exc:
             # Fall through to text. A preview is a courtesy and must never be
             # able to swallow the question itself.
             log(f"preview upload failed, asking without it: {exc}")
-    tg.send_message(chat_id, question, buttons=rows)
+    tg.send_message(chat_id, question, buttons=rows, parse_mode=PARSE_HTML)
 
 
 def _fill_slot(tg: Tg, chat_id: int, job: Job, role: str, path: Path,
@@ -1706,11 +1710,6 @@ def _row_mark(index: int) -> str:
     return ROW_MARK[index % len(ROW_MARK)]
 
 
-# ICON_OK has the same button/text split as ROLE_ICON — it is used both in
-# _ask_about's button label and in the unformatted `question` text (neither
-# gets parse_mode=HTML) — so it stays plain, and ICON_OK_CE is the animated
-# version _role_line uses instead.
-ICON_OK = "✅"
 ICON_OK_CE = _ce("5980930633298350051", "✅")
 ICON_WARN = _ce("5420323339723881652", "⚠️")
 ICON_EMPTY = _ce("5884089033558070257", "⬜️")
@@ -1746,6 +1745,9 @@ ICON_GPU_CE = _ce("5269375507220165755", "👊")
 # NewsEmoji (the same pack most of the icons above already came from).
 ICON_RUN_CE = _ce("5422837510499739688", "▶️")
 ICON_ADD_CE = _ce("5397916757333654639", "➕")
+# Button-only, same as Run/Add above — picked from the Interface_Icons pack
+# (2026-09-12), the two-arrow loop glyph closest to the plain "🔄" it replaces.
+ICON_REFRESH_CE = _ce("5465680951738637726", "🔄")
 
 PARSE_HTML = "HTML"
 
@@ -3103,7 +3105,7 @@ def _report_gpu_stock(tg: Tg, chat_id: int, *, message_id: int | None = None,
         stock = stock_at(wanted) if force else stock_at_cached(wanted)
     except RuntimeError as exc:
         _edit_or_send(tg, chat_id, message_id, f"couldn't reach runpodctl: {exc}",
-                     [[("🔄 Refresh", _CB_GPU_REFRESH)]])
+                     [[("Refresh", _CB_GPU_REFRESH, _ce_id(ICON_REFRESH_CE))]])
         return
 
     lines = ["📦 <b>GPU stock</b>"]
@@ -3150,7 +3152,7 @@ def _report_gpu_stock(tg: Tg, chat_id: int, *, message_id: int | None = None,
         lines.extend(other_lines)
 
     _edit_or_send(tg, chat_id, message_id, "\n".join(lines),
-                 [[("🔄 Refresh", _CB_GPU_REFRESH)]], parse_mode=PARSE_HTML)
+                 [[("Refresh", _CB_GPU_REFRESH, _ce_id(ICON_REFRESH_CE))]], parse_mode=PARSE_HTML)
 
 
 # One-shot GPU-stock watches: (gpu_id, datacenter_id) pairs a chat asked to
@@ -3688,7 +3690,7 @@ def _offer_run_confirm(tg: Tg, chat_id: int, *, message_id: int | None = None,
             tg, chat_id, message_id,
             f"This rents a GPU pod at ${price:.2f}/hour and starts the job.\n"
             "Confirm?",
-            [[("🔄 Refresh", _CB_RUN_REFRESH + "m")],
+            [[("Refresh", _CB_RUN_REFRESH + "m", _ce_id(ICON_REFRESH_CE))],
              [(f"Yes, spend ${price:.2f}/h", _CB_RUN_GO + _run_token(chat_id),
                _ce_id(ICON_ROCKET_CE)),
               ("Cancel", _CB_RUN_NO)]])
@@ -3739,10 +3741,10 @@ def _offer_run_confirm(tg: Tg, chat_id: int, *, message_id: int | None = None,
     # per row, so nothing there is packed tight enough to truncate.
     buttons = []
     if switch_buttons:
-        buttons.append([("🖥 Switch GPU type ▸", _CB_RUN_SWITCH_MENU)])
+        buttons.append([("Switch GPU type ▸", _CB_RUN_SWITCH_MENU, _ce_id(ICON_NVIDIA_CE))])
     if migrate_buttons:
         buttons.append([("Other regions ▸", _CB_RUN_MIGRATE_MENU, _ce_id(ICON_DEPART_CE))])
-    buttons.append([("🔄 Refresh", _CB_RUN_REFRESH + "m")])
+    buttons.append([("Refresh", _CB_RUN_REFRESH + "m", _ce_id(ICON_REFRESH_CE))])
     # No spend button at all when sold out (2026-09-12) — a "Yes, spend" that
     # can only fail is worse than no button, and Refresh (just above) is the
     # honest next action instead.
@@ -3785,7 +3787,7 @@ def _offer_run_switch_menu(tg: Tg, chat_id: int, *, message_id: int | None = Non
                       [[("◀ Back", _CB_RUN_BACK)]])
         return
     rows = [[b] for b in buttons]
-    rows.append([("🔄 Refresh", _CB_RUN_REFRESH + "s")])
+    rows.append([("Refresh", _CB_RUN_REFRESH + "s", _ce_id(ICON_REFRESH_CE))])
     rows.append([("◀ Back", _CB_RUN_BACK)])
     _edit_or_send(tg, chat_id, message_id,
                  f"Switch to a different GPU, still at {_esc(home_dc)}:",
@@ -3815,7 +3817,7 @@ def _offer_run_migrate_menu(tg: Tg, chat_id: int, *, message_id: int | None = No
                       [[("◀ Back", _CB_RUN_BACK)]])
         return
     rows = [[b] for b in buttons]
-    rows.append([("🔄 Refresh", _CB_RUN_REFRESH + "g")])
+    rows.append([("Refresh", _CB_RUN_REFRESH + "g", _ce_id(ICON_REFRESH_CE))])
     rows.append([("◀ Back", _CB_RUN_BACK)])
     _edit_or_send(tg, chat_id, message_id,
                  "Migrate the volume to rent elsewhere "

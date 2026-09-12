@@ -108,6 +108,11 @@ _ICON_EYES_CE = '<tg-emoji emoji-id="5210956306952758910">👀</tg-emoji>'
 # message again, which is exactly why it is decoration only now — see
 # `_elapsed()` below for what actually proves the process is still alive.
 _ICON_LOADING_CE = '<tg-emoji emoji-id="5328089410963513796">💠</tg-emoji>'
+# Same id as bot.py's ICON_EMPTY — an unstarted stage here is the same "not
+# filled in yet" state as an empty slot on the confirmation panel, and the two
+# messages sit next to each other in the chat, so they should read the same
+# (2026-09-12, reported live: the plain "⬜" here didn't match the panel).
+_ICON_EMPTY_CE = '<tg-emoji emoji-id="5884089033558070257">⬜️</tg-emoji>'
 
 
 def _elapsed(lease) -> str:
@@ -194,7 +199,7 @@ def progress_text(manifest_path: Path, *, lease,
             stage = seen.get(stage_name) or {}
             status = stage.get("status")
             icon = {"done": "✅", "running": _ICON_LOADING_CE,
-                    "error": "❌"}.get(status, "⬜")
+                    "error": "❌"}.get(status, _ICON_EMPTY_CE)
             sec = stage.get("sec")
             suffix = f" · {sec}s" if sec is not None else ""
             lines.append(f"{icon} {html.escape(stage_name, quote=False)}{suffix}")

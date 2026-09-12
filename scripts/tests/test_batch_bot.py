@@ -2187,6 +2187,14 @@ class TestFlow(unittest.TestCase):
         self.assertFalse(any(d.startswith(bot._CB_RUN_GO) for d in flat_data))
         self.assertIn(bot._CB_RUN_NO, flat_data)
         self.assertIn(bot._CB_RUN_REFRESH + "m", flat_data)
+        # Same class of bug as the settings gear/Run/Add: a literal "🔄"
+        # baked into the label alongside icon_custom_emoji_id doubled it on
+        # screen (2026-09-12).
+        refresh = next(entry for row in last_buttons(self.tg) for entry in row
+                       if entry[1] == bot._CB_RUN_REFRESH + "m")
+        label, _data, *icon = refresh
+        self.assertNotIn("🔄", label)
+        self.assertEqual(icon, [bot._ce_id(bot.ICON_REFRESH_CE)])
 
     def test_refresh_bypasses_the_cache_with_an_interim_message(self):
         with mock.patch("tgbot.bot.drain_running", return_value=False), \
