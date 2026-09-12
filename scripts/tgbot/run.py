@@ -25,7 +25,7 @@ from pathlib import Path
 # Relies on the caller having put scripts/ on sys.path (bot.py does this at
 # import time; tests do it directly) — same convention as tgbot/job.py,
 # which imports batchlib the same way without inserting its own path.
-from batchlib.manifest import load_state, state_path_for
+from batchlib.manifest import ManifestError, load_manifest, load_state, state_path_for
 from batchlib.pipelines import PIPELINES, STAGES
 from batchlib_ext.lease import read_lease
 
@@ -151,10 +151,16 @@ def progress_text(manifest_path: Path, *, lease,
     It is also the source of `_elapsed()`, the one number in this message
     that has to be real (see its own docstring for why).
 
-    `stages` is the pipeline's full stage list, captured when the drain starts.
-    Without it there is no denominator: the journal records only stages that
-    have already begun, so a bar computed from it alone would read 1/1 at the
-    first stage and never move.
+    `stages` is a fallback denominator only, used when a run's own pipeline
+    can't be recovered from the manifest (deleted mid-render, or corrupt).
+    Per run, the real stage list comes from the manifest's own
+    `Run.pipeline` via `PIPELINES` — a batch mixing e.g. character-swap-enhance
+    with tryon-camera-motion-enhance must not show one job's checklist padded
+    with the other's stages (2026-09-12: reported live, a character-swap-enhance
+    run was rendered with camera-tryon/camera-motion boxes it would never run).
+    Without any fallback there is no denominator at all: the journal records
+    only stages that have already begun, so a bar computed from it alone would
+    read 1/1 at the first stage and never move.
 
     HTML (2026-08-31) because this is re-rendered into the same message every
     poll — the caller must send it with parse_mode="HTML", and every
@@ -162,6 +168,10 @@ def progress_text(manifest_path: Path, *, lease,
     """
     state = load_state(state_path_for(manifest_path))
     batch = state.get("batch") or "(not started yet)"
+    try:
+        pipeline_by_run = {r.id: r.pipeline for r in load_manifest(manifest_path).runs}
+    except (ManifestError, OSError):
+        pipeline_by_run = {}
     # ⚙️, not the 🎬 the control panel opens with (2026-09-01). The two used to
     # be indistinguishable at a glance, which matters most in the one place
     # they sit next to each other: the frozen panel and the progress message
@@ -184,9 +194,15 @@ def progress_text(manifest_path: Path, *, lease,
         seen = run.get("stages") or {}
         # The bar needs a DENOMINATOR the journal cannot give: it only records
         # stages already started, so done/seen would read 1/1 at the first
-        # stage and never move. `stages` is captured from the pipeline when the
-        # drain starts (bot._start_progress) precisely so this can say 1/3.
-        planned = list(stages or seen.keys())
+        # stage and never move. Each run's OWN pipeline (from the manifest)
+        # gives the right denominator and checklist for THAT run; `stages`
+        # (captured batch-wide when the drain starts, bot._start_progress)
+        # is only a fallback for when the manifest can't be read.
+        run_pipeline = pipeline_by_run.get(run_id)
+        if run_pipeline in PIPELINES:
+            planned = list(PIPELINES[run_pipeline])
+        else:
+            planned = list(stages or seen.keys())
         done = sum(1 for st in seen.values() if st.get("status") == "done")
         current = next((n for n in planned
                         if (seen.get(n) or {}).get("status") == "running"), None)
