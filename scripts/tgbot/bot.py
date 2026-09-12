@@ -1132,6 +1132,23 @@ _CB_RUN_ASK = "run:ask"
 _CB_RUN_GO = "run:go:"      # + the manifest's mtime_ns, see _run_token
 _CB_RUN_NO = "run:no"
 _CB_RUN_SWITCH = "run:sw:"  # + a key from _GPU_SHORT
+# Open the switch-type / migrate submenus off the Choose GPU screen
+# (2026-09-12). Exact-match, no trailing colon — same shape as _CB_RUN_ASK —
+# and deliberately NOT "run:sw" + suffix: _CB_PIPE_ASK's own comment below
+# is the standing lesson that a shorter key must never be a prefix of a
+# longer one when dispatch matches by startswith.
+_CB_RUN_SWITCH_MENU = "run:swmenu"
+_CB_RUN_MIGRATE_MENU = "run:mgmenu"
+# ◀ Back, distinct from _CB_RUN_ASK even though both re-render the main
+# Choose GPU screen: _CB_RUN_ASK also lives on the job panel (a DIFFERENT
+# message), and only Back should ever pass its own message_id in to be
+# edited — passing the panel's id there would overwrite the manifest.
+_CB_RUN_BACK = "run:back"
+# + "m"/"s"/"g" — which screen to redraw (main / switch menu / migrate menu).
+_CB_RUN_REFRESH = "run:refresh:"
+# The /gpu report's own Refresh button — separate from _CB_RUN_REFRESH
+# because /gpu has no submenus to disambiguate between.
+_CB_GPU_REFRESH = "gpu:refresh"
 _CB_REDO = "redo:"
 _CB_CLEAR_ASK = "clr:ask"
 _CB_CLEAR_GO = "clr:go"
@@ -1253,9 +1270,51 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
                                          "version of the bot; tap Run again")
             else:
                 env_set(ROOT / ".env", "GPU", gpu_id)
-                tg.send_message(chat_id, f"switched — GPU is now {_esc(gpu_id)}",
-                                parse_mode=PARSE_HTML)
-                _offer_run_confirm(tg, chat_id)
+                # Edits the submenu message straight into the refreshed main
+                # screen (2026-09-12) — its own "Current:" line already says
+                # what changed, so a separate "switched — GPU is now X" text
+                # message would just be one more message saying the same thing.
+                msg_id = (query.get("message") or {}).get("message_id")
+                _offer_run_confirm(tg, chat_id, message_id=msg_id)
+
+        elif data == _CB_RUN_SWITCH_MENU:
+            msg_id = (query.get("message") or {}).get("message_id")
+            _offer_run_switch_menu(tg, chat_id, message_id=msg_id)
+
+        elif data == _CB_RUN_MIGRATE_MENU:
+            msg_id = (query.get("message") or {}).get("message_id")
+            _offer_run_migrate_menu(tg, chat_id, message_id=msg_id)
+
+        elif data == _CB_RUN_BACK:
+            msg_id = (query.get("message") or {}).get("message_id")
+            job = _STATE.get(chat_id)
+            if job is None or missing_slots(job):
+                tg.send_message(chat_id, "no complete job yet — send the "
+                                         "required files first")
+            else:
+                _offer_run_confirm(tg, chat_id, message_id=msg_id)
+
+        elif data.startswith(_CB_RUN_REFRESH):
+            view = data[len(_CB_RUN_REFRESH):]
+            msg_id = (query.get("message") or {}).get("message_id")
+            # A brief interstitial (2026-09-12): the real recheck below skips
+            # stock_at_cached's TTL and hits runpodctl live, which can take a
+            # couple of seconds — an unchanged screen for that long reads as a
+            # dead button, not a working one.
+            if msg_id is not None:
+                tg.edit_message(chat_id, msg_id, "🔄 Refreshing stock…")
+            if view == "s":
+                _offer_run_switch_menu(tg, chat_id, message_id=msg_id, force=True)
+            elif view == "g":
+                _offer_run_migrate_menu(tg, chat_id, message_id=msg_id, force=True)
+            else:
+                _offer_run_confirm(tg, chat_id, message_id=msg_id, force=True)
+
+        elif data == _CB_GPU_REFRESH:
+            msg_id = (query.get("message") or {}).get("message_id")
+            if msg_id is not None:
+                tg.edit_message(chat_id, msg_id, "🔄 Refreshing stock…")
+            _report_gpu_stock(tg, chat_id, message_id=msg_id, force=True)
 
         elif data.startswith(_CB_RUN_GO):
             if data[len(_CB_RUN_GO):] != _run_token(chat_id):
@@ -2726,7 +2785,8 @@ def _stock_icon(status: str) -> str:
     return f"{ICON_CRITICAL_CE} {dot}" if status == "none" else dot
 
 
-def _report_gpu_stock(tg: Tg, chat_id: int) -> None:
+def _report_gpu_stock(tg: Tg, chat_id: int, *, message_id: int | None = None,
+                      force: bool = False) -> None:
     """Live RunPod stock for the 5090 and its fallbacks, at every datacenter
     that carries them — free, no pod rented.
 
@@ -2738,14 +2798,20 @@ def _report_gpu_stock(tg: Tg, chat_id: int) -> None:
     ~33GB of models until the volume is synced or migrated to it — so
     "other regions" is worded as a fallback with a cost, not a same-speed
     alternative.
+
+    `message_id` edits that message in place instead of sending a new one
+    (see _edit_or_send) — set when the 🔄 Refresh button below re-renders
+    this same report. `force` bypasses stock_at_cached's 60s TTL for a real
+    live recheck, used only by that button.
     """
     volume_id = env_get(ROOT / ".env", "POD_VOLUME_ID")
     home_dc = volume_datacenter(volume_id)
     wanted = [_PRIMARY_GPU_ID, *_FALLBACK_GPU_IDS]
     try:
-        stock = stock_at_cached(wanted)
+        stock = stock_at(wanted) if force else stock_at_cached(wanted)
     except RuntimeError as exc:
-        tg.send_message(chat_id, f"couldn't reach runpodctl: {exc}")
+        _edit_or_send(tg, chat_id, message_id, f"couldn't reach runpodctl: {exc}",
+                     [[("🔄 Refresh", _CB_GPU_REFRESH)]])
         return
 
     lines = ["📦 <b>GPU stock</b>"]
@@ -2791,7 +2857,8 @@ def _report_gpu_stock(tg: Tg, chat_id: int) -> None:
                      f"first, {MIGRATE_DURATION_SHORT} — not an instant switch):")
         lines.extend(other_lines)
 
-    tg.send_message(chat_id, "\n".join(lines), parse_mode=PARSE_HTML)
+    _edit_or_send(tg, chat_id, message_id, "\n".join(lines),
+                 [[("🔄 Refresh", _CB_GPU_REFRESH)]], parse_mode=PARSE_HTML)
 
 
 def _gpu_price(gpu_id: str, stock: dict) -> float:
@@ -2953,7 +3020,100 @@ def migration_running() -> bool:
     return _migration_launching()
 
 
-def _offer_run_confirm(tg: Tg, chat_id: int) -> None:
+def _switch_type_options(configured: str, home_dc: str | None, stock: dict,
+                         wanted: list) -> tuple[list, list]:
+    """Same-datacenter alternatives to the currently configured GPU.
+
+    Returns (text_lines, buttons): text_lines is the "Switch to:" summary
+    printed on the main Choose GPU screen, buttons is the same alternatives
+    paired with the _CB_RUN_SWITCH button that flips .env's GPU= to them.
+    Shared between _offer_run_confirm (to decide whether the ▸ Switch GPU
+    type button even has anything behind it) and _offer_run_switch_menu (the
+    submenu that button opens) so neither can drift from the other's idea of
+    what's offered.
+    """
+    lines: list[str] = []
+    buttons: list[tuple[str, str]] = []
+    for gpu_id in wanted:
+        if gpu_id == configured:
+            continue
+        entries = stock.get(gpu_id) or []
+        home = next((e for e in entries if e.datacenter_id == home_dc), None)
+        if home is None:
+            lines.append(f"  {_esc(gpu_id)}: not offered at {_esc(home_dc)}")
+            continue
+        icon = _stock_icon(home.stock_status.lower())
+        lines.append(f"  {icon} <b>{_esc(home.display_name)}</b> — "
+                     f"{_esc(home.stock_status)} · {ICON_MONEY_CE} ${home.price_per_hr:.2f}/h")
+        short = _GPU_SHORT.get(gpu_id)
+        if short:
+            buttons.append((f"🖥 {home.display_name} — {home.stock_status} · "
+                            f"${home.price_per_hr:.2f}/h",
+                            _CB_RUN_SWITCH + short))
+    return lines, buttons
+
+
+def _migrate_options(stock: dict, wanted: list, home_dc: str | None) -> tuple[list, list]:
+    """Every OTHER datacenter each GPU is stocked at, not just the home one
+    (2026-09-02) — "5090 is out, why not check other regions" was a fair
+    question. Renting there means migrating the Network Volume first
+    (~15-25 min, docs/gpu-pod.md), which is why each entry gets its own
+    MIGRATE button rather than switching anything directly — a destructive
+    operation, so the button only opens _ask_migrate's confirm screen, never
+    starts anything itself.
+
+    Returns (text_lines, buttons), same split as _switch_type_options and for
+    the same reason: shared by the main screen's summary and
+    _offer_run_migrate_menu.
+    """
+    lines: list[str] = []
+    buttons: list[tuple[str, str]] = []
+    # Checked once, not per candidate — a second migration racing the first
+    # would fight it for the same temp pods, and this can't change mid-loop.
+    can_migrate = not migration_running()
+    for gpu_id in wanted:
+        entries = stock.get(gpu_id) or []
+        home = next((e for e in entries if e.datacenter_id == home_dc), None)
+        elsewhere = sorted(
+            (e for e in entries if e is not home and e.stock_status.lower() != "none"),
+            key=lambda e: _STOCK_RANK.get(e.stock_status.lower(), 9))
+        for e in elsewhere[:2]:
+            icon = _stock_icon(e.stock_status.lower())
+            price = f"{ICON_MONEY_CE} ${e.price_per_hr:.2f}/h" if e.price_per_hr else "?"
+            lines.append(f"  {icon} {_esc(e.display_name)} — "
+                         f"{_esc(e.datacenter_id)}: {_esc(e.stock_status)} · {price}")
+            # NOT gated on _GPU_SHORT any more. The payload only needs the
+            # DATACENTER — a migration moves the volume and says nothing about
+            # which GPU is rented afterwards — and requiring a short code to
+            # build a prefix nobody read meant a GPU absent from that table
+            # silently offered no migrate button at all.
+            if can_migrate:
+                buttons.append((f"🛫 {e.display_name} — {e.datacenter_id} "
+                                f"(${e.price_per_hr:.2f}/h)",
+                                _CB_MIGRATE_ASK + e.datacenter_id))
+    return lines, buttons
+
+
+def _edit_or_send(tg: Tg, chat_id: int, message_id: int | None, text: str,
+                  buttons: list, *, parse_mode: str | None = None) -> None:
+    """Redraw one screen of the Choose GPU flow in place when possible
+    (2026-09-12) — switching type, opening/leaving a submenu and refreshing
+    stock used to each send a brand new message, so a few taps left a wall
+    of near-duplicate screens behind. Mirrors the edit-first, send-as-
+    fallback shape _show_panel already uses for the same reason.
+
+    Falls back to a fresh send whenever there is nothing to edit yet (the
+    very first [Run] tap lives on the job panel, a DIFFERENT message) or the
+    edit target is gone (deleted by the user, or too old to edit).
+    """
+    if message_id is not None and tg.edit_message(
+            chat_id, message_id, text, buttons=buttons, parse_mode=parse_mode):
+        return
+    tg.send_message(chat_id, text, buttons=buttons, parse_mode=parse_mode)
+
+
+def _offer_run_confirm(tg: Tg, chat_id: int, *, message_id: int | None = None,
+                       force: bool = False) -> None:
     """The step between [Run] and spending money: always lists every known
     GPU's live stock/price at the home datacenter and lets [Confirm] switch
     to any of them before renting (2026-09-02, widened from "only offer a
@@ -2976,24 +3136,31 @@ def _offer_run_confirm(tg: Tg, chat_id: int) -> None:
     never be the reason [Run] itself stops working, and a picker with no
     datacenter to compare against would be showing numbers that do not
     mean what they claim to.
+
+    `message_id` edits that message in place instead of sending a new one
+    (see _edit_or_send) — set by every caller except the very first [Run]
+    tap on the job panel. `force` bypasses stock_at_cached's 60s TTL for a
+    real live recheck, used only by the 🔄 Refresh button.
     """
     configured = env_get(ROOT / ".env", "GPU") or _PRIMARY_GPU_ID
     volume_id = env_get(ROOT / ".env", "POD_VOLUME_ID")
     home_dc = volume_datacenter(volume_id)
     wanted = [_PRIMARY_GPU_ID, *_FALLBACK_GPU_IDS]
     try:
-        stock = stock_at_cached(wanted) if home_dc else {}
+        stock = ((stock_at(wanted) if force else stock_at_cached(wanted))
+                 if home_dc else {})
     except RuntimeError:
         stock = {}
 
     price = _gpu_price(configured, stock)
     if not stock or not home_dc:
-        tg.send_message(
-            chat_id,
+        _edit_or_send(
+            tg, chat_id, message_id,
             f"This rents a GPU pod at ${price:.2f}/hour and starts the job.\n"
             "Confirm?",
-            buttons=[[(f"🚀 Yes, spend ${price:.2f}/h", _CB_RUN_GO + _run_token(chat_id)),
-                      ("Cancel", _CB_RUN_NO)]])
+            [[("🔄 Refresh", _CB_RUN_REFRESH + "m")],
+             [(f"🚀 Yes, spend ${price:.2f}/h", _CB_RUN_GO + _run_token(chat_id)),
+              ("Cancel", _CB_RUN_NO)]])
         return
 
     # "Current" gets its own paragraph rather than an inline "(current)" tag
@@ -3003,6 +3170,12 @@ def _offer_run_confirm(tg: Tg, chat_id: int) -> None:
     lines = [f"{ICON_NVIDIA_CE} <b>Choose GPU</b> — renting at {_esc(home_dc)}", ""]
     configured_home = next((e for e in (stock.get(configured) or [])
                             if e.datacenter_id == home_dc), None)
+    # Sold out at home covers both shapes runpodctl can report: an entry that
+    # explicitly reads "none", or no entry there at all. Either way, [Run]
+    # spending money on THIS card right now would just fail — so the button
+    # that promises it is dropped rather than left enabled on a false promise
+    # (2026-09-12, reported live: "5090 đã hết mà nút spend vẫn enable").
+    sold_out = configured_home is None or configured_home.stock_status.lower() == "none"
     if configured_home is not None:
         icon = _stock_icon(configured_home.stock_status.lower())
         lines.append(f"Current: {icon} <b>{_esc(configured_home.display_name)}</b> — "
@@ -3012,69 +3185,110 @@ def _offer_run_confirm(tg: Tg, chat_id: int) -> None:
         lines.append(f"Current: <b>{_esc(configured)}</b> — "
                      f"not offered at {_esc(home_dc)}")
 
-    alt_lines: list[str] = []
-    switch_row: list[tuple[str, str]] = []
-    # Every OTHER datacenter each GPU is stocked at, not just the home one
-    # (2026-09-02) — "5090 is out, why not check other regions" was a fair
-    # question: the GPU-TYPE switch buttons only ever move within the pinned
-    # home datacenter, but that is not a reason to hide where else the 5090
-    # itself is doing fine. Renting there means migrating the Network Volume
-    # first, which is why each row also gets a MIGRATE button (Task 8) — a
-    # destructive operation, so the button only opens the confirm screen,
-    # never starts anything.
-    other_lines: list[str] = []
-    for gpu_id in wanted:
-        entries = stock.get(gpu_id) or []
-        home = next((e for e in entries if e.datacenter_id == home_dc), None)
-        if gpu_id != configured:
-            if home is None:
-                alt_lines.append(f"  {_esc(gpu_id)}: not offered at {_esc(home_dc)}")
-            else:
-                icon = _stock_icon(home.stock_status.lower())
-                alt_lines.append(f"  {icon} <b>{_esc(home.display_name)}</b> — "
-                                 f"{_esc(home.stock_status)} · {ICON_MONEY_CE} ${home.price_per_hr:.2f}/h")
-                short = _GPU_SHORT.get(gpu_id)
-                if short:
-                    switch_row.append((f"🖥 Switch to {home.display_name} "
-                                      f"(${home.price_per_hr:.2f}/h)",
-                                      _CB_RUN_SWITCH + short))
-        elsewhere = sorted(
-            (e for e in entries if e is not home and e.stock_status.lower() != "none"),
-            key=lambda e: _STOCK_RANK.get(e.stock_status.lower(), 9))
-        for e in elsewhere[:2]:
-            icon = _stock_icon(e.stock_status.lower())
-            other_lines.append(f"  {icon} {_esc(e.display_name)} — "
-                               f"{_esc(e.datacenter_id)}: {_esc(e.stock_status)}")
-            # Only offered when nothing is already mid-copy (2026-09-02) — a
-            # second migration racing the first would fight it for the same
-            # temp pods; migration_running() is the same guard _ask_migrate
-            # and _start_migration re-check themselves, so a stale button
-            # tapped after a migration already started still fails safely.
-            #
-            # NOT gated on _GPU_SHORT any more. The payload only needs the
-            # DATACENTER — a migration moves the volume and says nothing about
-            # which GPU is rented afterwards — and requiring a short code to
-            # build a prefix nobody read meant a GPU absent from that table
-            # silently offered no migrate button at all.
-            if not migration_running():
-                switch_row.append((f"🛫 Switch to {e.display_name} ({e.datacenter_id})",
-                                  _CB_MIGRATE_ASK + e.datacenter_id))
+    alt_lines, switch_buttons = _switch_type_options(configured, home_dc, stock, wanted)
+    other_lines, migrate_buttons = _migrate_options(stock, wanted, home_dc)
     if alt_lines:
         lines += ["", "Switch to:", *alt_lines]
     if other_lines:
         lines += ["", "Other regions (needs the volume migrated there first, "
                       f"{MIGRATE_DURATION_SHORT} — not an instant switch):",
                   *other_lines]
-    elif not switch_row:
+    elif not switch_buttons and not migrate_buttons:
         # Nothing else at this datacenter, and no other region has it
         # either — the manual EU-CZ-1 runbook is the only remaining option.
         lines += ["", "No other GPU or region has better stock right now. "
                       "See docs/gpu-pod.md for the manual EU-CZ-1 runbook."]
 
-    buttons = [switch_row[i:i + 2] for i in range(0, len(switch_row), 2)]
-    buttons.append([(f"🚀 Yes, spend ${price:.2f}/h", _CB_RUN_GO + _run_token(chat_id)),
-                    ("Cancel", _CB_RUN_NO)])
-    tg.send_message(chat_id, "\n".join(lines), parse_mode=PARSE_HTML, buttons=buttons)
+    # One button per CATEGORY here, not one per GPU (2026-09-12) — the flat
+    # list used to pack up to ~10 switch/migrate buttons two-per-row, and
+    # long names like "RTX PRO 4500" or "EU-CZ-1" got clipped on a phone
+    # before a reader could tell which one they were about to tap. Each
+    # category button opens a submenu (_offer_run_switch_menu /
+    # _offer_run_migrate_menu) with the same options one full-width button
+    # per row, so nothing there is packed tight enough to truncate.
+    buttons = []
+    if switch_buttons:
+        buttons.append([("🖥 Switch GPU type ▸", _CB_RUN_SWITCH_MENU)])
+    if migrate_buttons:
+        buttons.append([("🛫 Other regions ▸", _CB_RUN_MIGRATE_MENU)])
+    buttons.append([("🔄 Refresh", _CB_RUN_REFRESH + "m")])
+    # No spend button at all when sold out (2026-09-12) — a "Yes, spend" that
+    # can only fail is worse than no button, and Refresh (just above) is the
+    # honest next action instead.
+    if sold_out:
+        buttons.append([("Cancel", _CB_RUN_NO)])
+    else:
+        buttons.append([(f"🚀 Yes, spend ${price:.2f}/h", _CB_RUN_GO + _run_token(chat_id)),
+                        ("Cancel", _CB_RUN_NO)])
+    _edit_or_send(tg, chat_id, message_id, "\n".join(lines), buttons,
+                 parse_mode=PARSE_HTML)
+
+
+def _offer_run_switch_menu(tg: Tg, chat_id: int, *, message_id: int | None = None,
+                           force: bool = False) -> None:
+    """The submenu behind the Choose GPU screen's ▸ Switch GPU type button —
+    same-datacenter alternatives, one full-width button per row.
+
+    Recomputes stock from scratch rather than reusing anything from the
+    screen that opened it: nothing is threaded through callback_data (it
+    stays a short, fixed string — Bot API caps it at 64 bytes), and
+    stock_at_cached's own 60s TTL makes a second call here effectively free.
+    A stale button tapped after the config changed just shows whatever is
+    true now, same fail-open posture as _offer_run_confirm itself. `force`
+    bypasses that TTL, for the 🔄 Refresh button.
+    """
+    configured = env_get(ROOT / ".env", "GPU") or _PRIMARY_GPU_ID
+    volume_id = env_get(ROOT / ".env", "POD_VOLUME_ID")
+    home_dc = volume_datacenter(volume_id)
+    wanted = [_PRIMARY_GPU_ID, *_FALLBACK_GPU_IDS]
+    try:
+        stock = ((stock_at(wanted) if force else stock_at_cached(wanted))
+                 if home_dc else {})
+    except RuntimeError:
+        stock = {}
+    _lines, buttons = _switch_type_options(configured, home_dc, stock, wanted)
+    if not buttons:
+        _edit_or_send(tg, chat_id, message_id,
+                      "nothing else to switch to right now.",
+                      [[("◀ Back", _CB_RUN_BACK)]])
+        return
+    rows = [[b] for b in buttons]
+    rows.append([("🔄 Refresh", _CB_RUN_REFRESH + "s")])
+    rows.append([("◀ Back", _CB_RUN_BACK)])
+    _edit_or_send(tg, chat_id, message_id,
+                 f"Switch to a different GPU, still at {_esc(home_dc)}:",
+                 rows, parse_mode=PARSE_HTML)
+
+
+def _offer_run_migrate_menu(tg: Tg, chat_id: int, *, message_id: int | None = None,
+                            force: bool = False) -> None:
+    """The submenu behind the Choose GPU screen's ▸ Other regions button —
+    mirrors _offer_run_switch_menu but for cross-datacenter migrate
+    candidates. Tapping one of these still only opens _ask_migrate's
+    destructive confirm screen; nothing here starts a migration itself.
+    `force` bypasses stock_at_cached's TTL, for the 🔄 Refresh button.
+    """
+    volume_id = env_get(ROOT / ".env", "POD_VOLUME_ID")
+    home_dc = volume_datacenter(volume_id)
+    wanted = [_PRIMARY_GPU_ID, *_FALLBACK_GPU_IDS]
+    try:
+        stock = ((stock_at(wanted) if force else stock_at_cached(wanted))
+                 if home_dc else {})
+    except RuntimeError:
+        stock = {}
+    _lines, buttons = _migrate_options(stock, wanted, home_dc)
+    if not buttons:
+        _edit_or_send(tg, chat_id, message_id,
+                      "no other region has better stock right now.",
+                      [[("◀ Back", _CB_RUN_BACK)]])
+        return
+    rows = [[b] for b in buttons]
+    rows.append([("🔄 Refresh", _CB_RUN_REFRESH + "g")])
+    rows.append([("◀ Back", _CB_RUN_BACK)])
+    _edit_or_send(tg, chat_id, message_id,
+                 "Migrate the volume to rent elsewhere "
+                 f"({MIGRATE_DURATION_SHORT} — not an instant switch):",
+                 rows)
 
 
 def _ask_kill(tg: Tg, chat_id: int) -> None:

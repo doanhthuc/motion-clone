@@ -119,6 +119,16 @@ def panel_text(tg):
     return panels[-1]
 
 
+def last_buttons(tg):
+    """The buttons on whatever the bot most recently rendered — sent OR
+    edited. The Choose GPU flow edits in place (2026-09-12), so `tg.buttons`
+    alone stops seeing it past the first render, the same reason `screen`
+    exists alongside `messages`/`edits`.
+    """
+    assert tg.screen_buttons, "the bot never rendered anything with buttons"
+    return tg.screen_buttons[-1]
+
+
 def reset_bot_state():
     """Clear every per-chat dict in bot.py between tests.
 
@@ -180,6 +190,11 @@ class FakeTg:
         # assertion against `messages` silently stops seeing the panel from the
         # second update onwards — which is most of a job.
         self.screen: list[str] = []
+        # Buttons, parallel to `screen` — the Choose GPU flow (2026-09-12)
+        # edits in place as often as it sends, so a test asserting "the
+        # buttons offered just now" needs one ordered list spanning both,
+        # the same reason `screen` exists alongside `messages`/`edits`.
+        self.screen_buttons: list[list[list[tuple[str, str]]] | None] = []
         self.deleted: list[int] = []
         # Message ids increment, as they do in a real chat: _show_panel's drift
         # check is arithmetic on ids, so a fake that returns a constant would
@@ -216,6 +231,7 @@ class FakeTg:
         self._check_markup(text, parse_mode)
         self.messages.append(text)
         self.screen.append(text)
+        self.screen_buttons.append(buttons)
         self.buttons.append(buttons)
         self.reply_keyboards.append(reply_keyboard)
         # Recorded so a test can assert that HTML-formatted bodies actually
@@ -235,6 +251,7 @@ class FakeTg:
         self._check_markup(text, parse_mode)
         self.edits.append((message_id, text))
         self.screen.append(text)
+        self.screen_buttons.append(buttons)
         self.edit_buttons.append(buttons)
         return self.edit_ok
 
@@ -1554,16 +1571,23 @@ class TestFlow(unittest.TestCase):
                        return_value=self._stock_5090_low_4090_ok()):
             self._fill_required_slots()
             bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
-        text = self.tg.messages[-1]
-        self.assertIn("Low", text)
-        self.assertIn("EU-RO-1", text)
-        offered = self.tg.buttons[-1]
+            text = self.tg.messages[-1]
+            self.assertIn("Low", text)
+            self.assertIn("EU-RO-1", text)
+            main_data = [data for row in self.tg.buttons[-1] for _, data in row]
+            # The picker's main screen now offers a category button, not one
+            # per GPU — the per-GPU buttons live in the submenu it opens
+            # (2026-09-12, see _offer_run_switch_menu).
+            self.assertIn(bot._CB_RUN_SWITCH_MENU, main_data)
+            self.assertTrue(any(d.startswith(bot._CB_RUN_GO) for d in main_data))
+            self.assertIn(bot._CB_RUN_NO, main_data)
+
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_SWITCH_MENU), allowed_user_id=ME)
+        offered = last_buttons(self.tg)   # the submenu edited the same message
         flat_data = [data for row in offered for _, data in row]
         self.assertIn(bot._CB_RUN_SWITCH + "4090", flat_data)
         # PRO 4500 is ALSO Low at home — still offered, just labelled as Low.
         self.assertIn(bot._CB_RUN_SWITCH + "pro4500", flat_data)
-        self.assertTrue(any(d.startswith(bot._CB_RUN_GO) for d in flat_data))
-        self.assertIn(bot._CB_RUN_NO, flat_data)
 
     def test_the_5090_being_out_at_home_still_surfaces_other_regions(self):
         # "nếu 5090 hết thì sao không tìm các region khác nữa" (2026-09-02):
@@ -1591,17 +1615,69 @@ class TestFlow(unittest.TestCase):
              mock.patch("tgbot.bot.stock_at_cached", return_value=stock):
             self._fill_required_slots()
             bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
-        text = self.tg.messages[-1]
-        self.assertIn("Other regions", text)
-        self.assertIn("EU-CZ-1", text)
-        # ONE duration everywhere (2026-09-02): this screen, the destructive
-        # confirm and docs/gpu-pod.md used to disagree with each other.
-        self.assertIn(bot.MIGRATE_DURATION_SHORT, text)
-        self.assertIn("15-25", text)
-        # Still a same-datacenter switch to 4090/PRO 4500 too — the other-
-        # region note is additive, not a replacement for the local options.
-        flat_data = [data for row in self.tg.buttons[-1] for _, data in row]
+            text = self.tg.messages[-1]
+            self.assertIn("Other regions", text)
+            self.assertIn("EU-CZ-1", text)
+            # ONE duration everywhere (2026-09-02): this screen, the destructive
+            # confirm and docs/gpu-pod.md used to disagree with each other.
+            self.assertIn(bot.MIGRATE_DURATION_SHORT, text)
+            self.assertIn("15-25", text)
+            # Still a same-datacenter switch to 4090/PRO 4500 too — the other-
+            # region note is additive, not a replacement for the local options,
+            # and its own submenu still has it (2026-09-12).
+            main_data = [data for row in self.tg.buttons[-1] for _, data in row]
+            self.assertIn(bot._CB_RUN_SWITCH_MENU, main_data)
+
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_SWITCH_MENU), allowed_user_id=ME)
+        flat_data = [data for row in last_buttons(self.tg) for _, data in row]
         self.assertIn(bot._CB_RUN_SWITCH + "4090", flat_data)
+
+    def test_other_regions_shows_a_price_not_just_stock_status(self):
+        # "Other regions" used to print stock status alone (Low/none) with
+        # no $/h, unlike /gpu's own "GPU stock" report — a reader had no way
+        # to tell a promising alternative from an expensive one (2026-09-12).
+        stock = {
+            "NVIDIA GeForce RTX 5090": [
+                Stock(gpu_id="NVIDIA GeForce RTX 5090", display_name="RTX 5090",
+                     price_per_hr=0.99, datacenter_id="EU-RO-1", stock_status="none"),
+                Stock(gpu_id="NVIDIA GeForce RTX 5090", display_name="RTX 5090",
+                     price_per_hr=2.09, datacenter_id="EU-CZ-1", stock_status="High"),
+            ],
+            "NVIDIA GeForce RTX 4090": [
+                Stock(gpu_id="NVIDIA GeForce RTX 4090", display_name="RTX 4090",
+                     price_per_hr=0.74, datacenter_id="EU-RO-1", stock_status="Medium"),
+            ],
+            "NVIDIA RTX PRO 4500 Blackwell": [],
+        }
+        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=stock):
+            self._fill_required_slots()
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
+        text = self.tg.messages[-1]
+        self.assertIn("EU-CZ-1", text)
+        self.assertIn("$2.09/h", text)
+
+    def test_the_switch_menu_lists_one_button_per_row_with_a_back_button(self):
+        # The truncation bug this replaces: buttons used to be packed two per
+        # row, so a long label like "Switch to RTX PRO 4500 ($0.72/h)" got
+        # clipped on a phone before a reader could tell which GPU/price they
+        # were about to tap (2026-09-12).
+        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached",
+                       return_value=self._stock_5090_low_4090_ok()):
+            self._fill_required_slots()
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_SWITCH_MENU), allowed_user_id=ME)
+        rows = last_buttons(self.tg)   # the submenu edited the same message
+        # Every row holding a GPU switch button has exactly one button in it.
+        gpu_rows = [row for row in rows
+                   if any(d.startswith(bot._CB_RUN_SWITCH) for _, d in row)]
+        self.assertTrue(gpu_rows)
+        self.assertTrue(all(len(row) == 1 for row in gpu_rows))
+        flat_data = [data for row in rows for _, data in row]
+        self.assertIn(bot._CB_RUN_BACK, flat_data)   # ◀ Back re-opens the main screen
 
     def test_other_regions_offer_a_migrate_button(self):
         stock = {
@@ -1626,7 +1702,11 @@ class TestFlow(unittest.TestCase):
              mock.patch("tgbot.bot.migration_running", return_value=False):
             self._fill_required_slots()
             bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
-        flat_data = [data for row in self.tg.buttons[-1] for _, data in row]
+            main_data = [data for row in self.tg.buttons[-1] for _, data in row]
+            self.assertIn(bot._CB_RUN_MIGRATE_MENU, main_data)
+
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_MIGRATE_MENU), allowed_user_id=ME)
+        flat_data = [data for row in last_buttons(self.tg) for _, data in row]
         self.assertIn(bot._CB_MIGRATE_ASK + "EU-CZ-1", flat_data)
 
     def test_a_gpu_missing_from_gpu_short_still_gets_a_migrate_button(self):
@@ -1656,8 +1736,9 @@ class TestFlow(unittest.TestCase):
              mock.patch("tgbot.bot.migration_running", return_value=False):
             self._fill_required_slots()
             bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
-        self.assertNotIn(unknown, bot._GPU_SHORT)
-        flat_data = [data for row in self.tg.buttons[-1] for _, data in row]
+            self.assertNotIn(unknown, bot._GPU_SHORT)
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_MIGRATE_MENU), allowed_user_id=ME)
+        flat_data = [data for row in last_buttons(self.tg) for _, data in row]
         self.assertIn(bot._CB_MIGRATE_ASK + "EU-CZ-1", flat_data)
 
     def test_tapping_migrate_ask_shows_the_destructive_confirm(self):
@@ -1874,16 +1955,82 @@ class TestFlow(unittest.TestCase):
                        return_value=self._stock_5090_low_4090_ok()):
             self._fill_required_slots()
             bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
+            baseline = len(self.tg.messages)
             bot.handle(self.tg, cb_from(ME, bot._CB_RUN_SWITCH + "4090"),
                       allowed_user_id=ME)
         self.assertEqual(env_get(self.root / ".env", "GPU"),
                          "NVIDIA GeForce RTX 4090")
-        # The re-offer is still the full picker — 4090 now the one labelled
-        # "Current:", and its price is what the Yes button quotes.
-        self.assertIn("Current:", self.tg.messages[-1])
-        self.assertIn("RTX 4090", self.tg.messages[-1].split("Current:")[1].splitlines()[0])
+        # The re-offer edits the same message in place (2026-09-12) — still
+        # the full picker, 4090 now the one labelled "Current:", and its
+        # price is what the Yes button quotes.
+        text = self.tg.screen[-1]
+        self.assertIn("Current:", text)
+        self.assertIn("RTX 4090", text.split("Current:")[1].splitlines()[0])
         self.assertIn("🚀 Yes, spend $0.74/h",
-                      [label for row in self.tg.buttons[-1] for label, _ in row])
+                      [label for row in last_buttons(self.tg) for label, _ in row])
+        # No separate "switched — GPU is now X" message any more — the edited
+        # screen's own "Current:" line already says it (2026-09-12).
+        self.assertEqual(len(self.tg.messages), baseline)
+
+    def test_sold_out_at_home_drops_run_and_offers_refresh_instead(self):
+        # "5090 đã hết mà nút spend vẫn enable là sai" (reported live,
+        # 2026-09-12): a GO button that can only fail is worse than none.
+        stock = {
+            "NVIDIA GeForce RTX 5090": [
+                Stock(gpu_id="NVIDIA GeForce RTX 5090", display_name="RTX 5090",
+                     price_per_hr=0.99, datacenter_id="EU-RO-1", stock_status="none"),
+            ],
+            "NVIDIA GeForce RTX 4090": [],
+            "NVIDIA RTX PRO 4500 Blackwell": [],
+        }
+        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=stock):
+            self._fill_required_slots()
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
+        flat_data = [data for row in last_buttons(self.tg) for _, data in row]
+        self.assertFalse(any(d.startswith(bot._CB_RUN_GO) for d in flat_data))
+        self.assertIn(bot._CB_RUN_NO, flat_data)
+        self.assertIn(bot._CB_RUN_REFRESH + "m", flat_data)
+
+    def test_refresh_bypasses_the_cache_with_an_interim_message(self):
+        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached",
+                       return_value=self._stock_5090_low_4090_ok()) as cached, \
+             mock.patch("tgbot.bot.stock_at",
+                       return_value=self._stock_5090_low_4090_ok()) as live:
+            self._fill_required_slots()
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
+            # _fill_required_slots's own panel redraws already call
+            # stock_at_cached (for the panel's cost line) — snapshot the
+            # count here rather than assert_called_once() on the whole test.
+            before = cached.call_count
+            live.assert_not_called()
+
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_REFRESH + "m"),
+                      allowed_user_id=ME)
+            live.assert_called_once()
+            self.assertEqual(cached.call_count, before)   # refresh skips the cache
+        self.assertIn("Refreshing", self.tg.edits[-2][1])
+        self.assertIn("Current:", self.tg.edits[-1][1])
+
+    def test_back_returns_to_the_main_screen_in_place(self):
+        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached",
+                       return_value=self._stock_5090_low_4090_ok()):
+            self._fill_required_slots()
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
+            baseline = len(self.tg.messages)
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_SWITCH_MENU), allowed_user_id=ME)
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_BACK), allowed_user_id=ME)
+        self.assertIn("Choose GPU", self.tg.screen[-1])
+        flat_data = [data for row in last_buttons(self.tg) for _, data in row]
+        self.assertIn(bot._CB_RUN_SWITCH_MENU, flat_data)
+        # Both taps after the Choose GPU screen first opened were edits of
+        # the SAME message — no new message sent for either.
+        self.assertEqual(len(self.tg.messages), baseline)
 
     def test_rent_anyway_still_starts_the_drain_at_the_original_price(self):
         with mock.patch("tgbot.bot.start_drain") as start_drain, \
@@ -3957,6 +4104,40 @@ class TestGpuStockCommand(unittest.TestCase):
              mock.patch("tgbot.bot.stock_at_cached", return_value={}):
             bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
         self.assertIn("sold out everywhere", self.tg.messages[-1])
+
+    def test_the_report_offers_a_refresh_button(self):
+        self._write_env()
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
+            bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
+        flat_data = [data for row in self.tg.buttons[-1] for _, data in row]
+        self.assertEqual(flat_data, [bot._CB_GPU_REFRESH])
+
+    def test_refresh_bypasses_the_cache_with_an_interim_message(self):
+        self._write_env()
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached",
+                       return_value=self._stock()) as cached, \
+             mock.patch("tgbot.bot.stock_at", return_value=self._stock()) as live:
+            bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
+            cached.assert_called_once()
+            live.assert_not_called()
+
+            bot.handle(self.tg, cb_from(ME, bot._CB_GPU_REFRESH), allowed_user_id=ME)
+            live.assert_called_once()
+            cached.assert_called_once()   # unchanged — refresh skips the cache
+        self.assertEqual(len(self.tg.messages), 1)   # the refresh edited in place
+        self.assertIn("Refreshing", self.tg.edits[-2][1])
+        self.assertIn("📦", self.tg.edits[-1][1])
+
+    def test_a_refresh_failure_still_offers_the_button_again(self):
+        with mock.patch("tgbot.bot.volume_datacenter", return_value=None), \
+             mock.patch("tgbot.bot.stock_at", side_effect=RuntimeError("boom")):
+            bot.handle(self.tg, cb_from(ME, bot._CB_GPU_REFRESH), allowed_user_id=ME)
+        text = self.tg.screen[-1]
+        self.assertIn("couldn't reach runpodctl", text)
+        flat_data = [data for row in last_buttons(self.tg) for _, data in row]
+        self.assertEqual(flat_data, [bot._CB_GPU_REFRESH])
 
 
 class TestKillCommand(unittest.TestCase):
