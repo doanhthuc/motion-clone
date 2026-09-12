@@ -3,8 +3,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tgbot.ingest import Probe
-from tgbot.job import (_driver_stage, run_id_for, Job, missing_slots,
-                       render_manifest, slot_for)
+from tgbot.job import (DEFAULT_PROVIDER, _driver_stage, _tryon_stage,
+                       run_id_for, Job, missing_slots, render_manifest, slot_for)
 
 VIDEO = Probe(kind="video", width=1080, height=1920, duration_s=14.8,
               bitrate_kbps=12400, size_bytes=22_000_000)
@@ -81,6 +81,65 @@ class TestRenderManifest(unittest.TestCase):
         self.assertEqual(_driver_stage("tryon-motion-enhance"), "motion")
         self.assertEqual(_driver_stage("tryon-character-swap-enhance"),
                          "character-swap")
+
+    def test_default_provider_is_never_written(self):
+        # linux.py:5653 already defaults an absent `provider` to "qwen" (the
+        # self-host GPU path) — writing it out on every run would be noise,
+        # and would make batchlib/runner.py's needs_pod() harder to eyeball
+        # from the manifest text alone.
+        job = Job(slots={"character": Path("/c.png"), "outfit": Path("/o.png")},
+                  probes={}, pipeline="tryon-motion-enhance",
+                  provider=DEFAULT_PROVIDER)
+        text = render_manifest([job], now="2026-09-12 09:00:00")
+        self.assertNotIn("provider", text)
+
+    def test_a_non_default_provider_lands_on_the_tryon_stage(self):
+        # This is the line batchlib/runner.py's _local_tryon_stage() reads back
+        # to decide a run is local-eligible (Phase A, no pod) — see
+        # docs/batch-runner.md section 2.9 and runner.py:382-391.
+        job = Job(slots={"character": Path("/c.png"), "outfit": Path("/o.png")},
+                  probes={}, pipeline="tryon-motion-enhance", provider="gemini")
+        text = render_manifest([job], now="2026-09-12 09:00:00")
+        self.assertIn("tryon: { provider: gemini }", text)
+
+    def test_qwen_max_provider_lands_on_the_tryon_stage_too(self):
+        # "Qwen Image 3.0 Pro" in the user's own words — the DashScope
+        # Qwen-Image API, provider string "qwen-max" in
+        # batchlib/local_tryon.py and scripts/batch-params.json.
+        job = Job(slots={"character": Path("/c.png"), "outfit": Path("/o.png")},
+                  probes={}, pipeline="tryon-motion-enhance", provider="qwen-max")
+        text = render_manifest([job], now="2026-09-12 09:00:00")
+        self.assertIn("tryon: { provider: qwen-max }", text)
+
+    def test_provider_and_driver_preset_land_on_different_stages(self):
+        # tryon-motion-enhance's try-on stage and driver-preset stage are two
+        # different stages ("tryon" vs "motion") — this pins that the two
+        # overrides do not clobber each other in stage_params.
+        job = Job(slots={"character": Path("/c.png"), "outfit": Path("/o.png"),
+                         "driver": Path("/d.mp4")},
+                  probes={"driver": VIDEO}, pipeline="tryon-motion-enhance",
+                  provider="gemini")
+        text = render_manifest([job], now="2026-09-12 09:00:00")
+        self.assertIn("tryon: { provider: gemini }", text)
+        self.assertIn("motion: { preset: drv-15s }", text)
+
+    def test_camera_pipeline_routes_provider_to_camera_tryon(self):
+        # camera-tryon (job_type "tryon") and camera-motion (job_type "motion",
+        # the driver-preset stage) are distinct stages in this pipeline — the
+        # provider override must not land on camera-motion by accident.
+        self.assertEqual(_tryon_stage("tryon-camera-motion-enhance"),
+                         "camera-tryon")
+        job = Job(slots={"character": Path("/c.png"), "outfit": Path("/o.png"),
+                         "background": Path("/b.png"), "driver": Path("/d.mp4")},
+                  probes={"driver": VIDEO},
+                  pipeline="tryon-camera-motion-enhance", provider="gemini")
+        text = render_manifest([job], now="2026-09-12 09:00:00")
+        self.assertIn("camera-tryon: { provider: gemini }", text)
+        self.assertIn("camera-motion: { preset: drv-15s }", text)
+
+    def test_pipeline_with_no_tryon_stage_has_none(self):
+        self.assertIsNone(_tryon_stage("motion-enhance"))
+        self.assertIsNone(_tryon_stage("character-swap-enhance"))
 
 
 class TestMultiRunManifest(unittest.TestCase):

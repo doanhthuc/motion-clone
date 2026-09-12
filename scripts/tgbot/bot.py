@@ -26,8 +26,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batchlib.config import env_get, env_set
-from batchlib.manifest import load_manifest, load_state, state_path_for
-from batchlib.pipelines import PIPELINES, optional_roles, required_roles
+from batchlib.local_tryon import is_local_provider
+from batchlib.manifest import ManifestError, load_manifest, load_state, state_path_for
+from batchlib.pipelines import (PIPELINES, effective_stage_params,
+                               optional_roles, required_roles)
 # Not `from batchlib_ext...` or `scripts/batchlib/...` — drain.py itself lives
 # at scripts/drain.py, a plain top-level module, same as batch_run.py. scripts/
 # is already on sys.path (the insert above), so this is the plan's own "import
@@ -43,8 +45,8 @@ from tgbot import tiktok
 from tgbot.ingest import (Probe, describe, probe, quality_warning,
                          quality_warning_html,
                          to_png_if_heic)
-from tgbot.job import (Job, missing_slots, run_id_for, slot_for,
-                       write_manifest)
+from tgbot.job import (DEFAULT_PROVIDER, Job, _tryon_stage, missing_slots,
+                       run_id_for, slot_for, write_manifest)
 from tgbot.preview import sheet, slot_preview
 from tgbot.run import (LEASE_PATH, _RUNNING, drain_running, estimate_minutes,
                        final_files, lease_for, progress_text, start_drain,
@@ -91,6 +93,48 @@ JOB_PIPELINE = "tryon-motion-enhance"
 # back to a value the user set is predictable, falling back to a hard-coded
 # one silently switches pipelines under them).
 _DEFAULT_PIPELINE = JOB_PIPELINE
+
+# Try-on providers offered from the bot. gemini/qwen-max run directly from
+# THIS process (batchlib/runner.py's run_local_phase, invoked by drain.py's
+# Phase A) before a pod is ever rented — the self-host default still needs the
+# pod, same as every pipeline's motion/character-swap/enhance stage always has.
+#
+# "qwen-max" here is what the user calls "Qwen Image 3.0 Pro" — the DashScope
+# Qwen-Image API (batchlib/local_tryon.py:394-398). Needs DASHSCOPE_API_KEY
+# AND QWEN_IMAGE_WORKSPACE (or QWEN_IMAGE_BASE) in the VPS's .env; missing
+# either raises a ConfigError from run_local_phase, same as a missing
+# GEMINI_API_KEY does for gemini. The model actually called is
+# QWEN_IMAGE_MODEL (defaults to "qwen-image-edit-plus", GA) — "qwen-image-3.0-
+# pro" specifically was limited preview at local_tryon.py:395-397 and only
+# runs once that env var is set to it; the button does not promise 3.0 by name.
+PROVIDER_LABELS = {"qwen": "🖥 Self-host (qwen) — needs the GPU pod",
+                  "gemini": "☁️ Gemini API — runs here, no pod wait; "
+                            "may crop product photos less precisely than "
+                            "the pod path",
+                  "qwen-max": "☁️ Qwen-Image API (DashScope) — runs here, "
+                              "no pod wait; same crop caveat as Gemini"}
+
+# The value a NEW job starts on — same role for provider as JOB_PIPELINE/
+# _DEFAULT_PIPELINE above has for pipeline, including the TG_PROVIDER env
+# override in main() and /provider overriding it per chat thereafter.
+#
+# Changed from "qwen" to "gemini" 2026-09-12 on the user's own request: the
+# whole point of Phase A (drain.py, batchlib/runner.py's run_local_phase) is
+# to run try-on on the VPS and catch errors before a pod is ever rented, and
+# that only happens when a job's provider is gemini/qwen-max — "qwen" (the
+# self-host default) always needs the pod, same as every pipeline's own
+# motion/character-swap/enhance stage. Leaving new jobs on "qwen" made the
+# whole feature opt-in per job, which is the same "everything works except
+# the thing you actually wanted" gap _DEFAULT_PIPELINE was created to close.
+#
+# NOT job.py's DEFAULT_PROVIDER ("qwen"), which means something different and
+# must never change: that constant is the value linux.py:5653 itself falls
+# back to when a manifest carries no `provider:` line at all, so
+# render_manifest() (job.py) and _fix_buttons/_provider_tag (below) compare
+# against it specifically to decide whether "qwen" needs an explicit ☁️/🖥
+# marker — not "whichever provider a brand-new job happens to start on".
+JOB_PROVIDER = "gemini"
+_DEFAULT_PROVIDER = JOB_PROVIDER
 
 # Per-chat state — Plan 2A is one job at a time per chat.
 #
@@ -587,7 +631,8 @@ def _job_for(chat_id: int) -> Job:
     how they drift apart.
     """
     return _STATE.setdefault(
-        chat_id, Job(slots={}, probes={}, pipeline=_DEFAULT_PIPELINE))
+        chat_id, Job(slots={}, probes={}, pipeline=_DEFAULT_PIPELINE,
+                    provider=_DEFAULT_PROVIDER))
 
 
 def _switch_pipeline(chat_id: int, name: str) -> tuple[Job, list[str]]:
@@ -612,6 +657,21 @@ def _switch_pipeline(chat_id: int, name: str) -> tuple[Job, list[str]]:
     _LAST_VALIDATE.pop(chat_id, None)
     _CONFIRM_WARNED.discard(chat_id)
     return job, dropped
+
+
+def _switch_provider(chat_id: int, provider: str) -> Job:
+    """Point the chat's job at `provider` for whichever stage runs try-on.
+
+    No slots to drop here — provider is a param on an existing stage, not a
+    change to which materials the pipeline consumes. Same cache-invalidation
+    as _switch_pipeline, for the same reason: the cached verdict is about the
+    manifest as it stood before this call.
+    """
+    job = _job_for(chat_id)
+    job.provider = provider
+    _LAST_VALIDATE.pop(chat_id, None)
+    _CONFIRM_WARNED.discard(chat_id)
+    return job
 
 
 def _job_manifest_path(chat_id: int) -> Path:
@@ -894,6 +954,12 @@ def _save_draft(chat_id: int) -> None:
         return
     payload = {
         "pipeline": job.pipeline if job else _DEFAULT_PIPELINE,
+        # _DEFAULT_PROVIDER (bot.py's "what a new job starts on"), not job.py's
+        # DEFAULT_PROVIDER — same "pipeline" if job else _DEFAULT_PIPELINE
+        # reasoning two lines up: there is no job yet, so this placeholder
+        # should read as what /provider would show for one, not "qwen" (which
+        # would just be job.py's unrelated worker-fallback fact leaking in).
+        "provider": job.provider if job else _DEFAULT_PROVIDER,
         "slots": {r: str(p) for r, p in (job.slots if job else {}).items()},
         "probes": {r: asdict(pr) for r, pr in (job.probes if job else {}).items()},
         "pending": [[str(p), asdict(pr)] for p, pr in pending],
@@ -948,7 +1014,16 @@ def _load_draft(chat_id: int) -> str | None:
         path.replace(bad)
         log(f"draft for chat {chat_id} is unreadable, moved to {bad.name}: {exc!r}")
         return bad.name
-    _STATE[chat_id] = Job(slots=slots, probes=probes, pipeline=pipeline)
+    # .get, not payload["provider"]: same "missing cosmetic field must not
+    # condemn an otherwise good draft" reasoning as "panel" below — a draft
+    # written before /provider existed simply has none. job.py's
+    # DEFAULT_PROVIDER ("qwen"), not bot.py's _DEFAULT_PROVIDER: a draft this
+    # old was assembled back when self-host was the only behaviour that
+    # existed, and this fallback should say what it actually was, not
+    # retroactively become whatever a brand-new job defaults to today.
+    provider = payload.get("provider", DEFAULT_PROVIDER)
+    _STATE[chat_id] = Job(slots=slots, probes=probes, pipeline=pipeline,
+                          provider=provider)
     if pending:
         _PENDING[chat_id] = pending
     # Read with .get, unlike the fields above: a draft written by the previous
@@ -1193,6 +1268,9 @@ _CB_JOB_HERE = "bj:here" # drop the job currently on screen
 # its first run — a prefix scheme needs the shorter key to not be a prefix of
 # the longer one, which is easy to lose sight of when adding a key months later.
 _CB_PIPE_ASK = "pipe-ask"
+# Same shape, same "-ask" not ":ask" reasoning as _CB_PIPE_ASK above.
+_CB_PROVIDER = "prov:"
+_CB_PROVIDER_ASK = "prov-ask"
 
 
 def _run_token(chat_id: int) -> str:
@@ -1251,6 +1329,11 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
         elif data.startswith(_CB_PIPE):
             msg_id = (query.get("message") or {}).get("message_id")
             _switch_pipeline_and_report(tg, chat_id, data[len(_CB_PIPE):],
+                                        chooser_message_id=msg_id)
+
+        elif data.startswith(_CB_PROVIDER):
+            msg_id = (query.get("message") or {}).get("message_id")
+            _switch_provider_and_report(tg, chat_id, data[len(_CB_PROVIDER):],
                                         chooser_message_id=msg_id)
 
         elif data == _CB_RUN_ASK:
@@ -1339,6 +1422,9 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
 
         elif data == _CB_PIPE_ASK:
             _offer_pipelines(tg, chat_id)
+
+        elif data == _CB_PROVIDER_ASK:
+            _offer_providers(tg, chat_id)
 
         elif data == _CB_JOB_OPEN:
             tg.answer_callback_query(query.get("id") or "",
@@ -1458,6 +1544,54 @@ def _switch_pipeline_and_report(tg: Tg, chat_id: int, name: str, *,
             chat_id, chooser_message_id,
             f"{ICON_EDIT_CE} <b>Flow switched</b>\n"
             f"now: {_flow(job.pipeline)}  <i>({_esc(job.pipeline)})</i>",
+            parse_mode=PARSE_HTML)
+
+
+def _offer_providers(tg: Tg, chat_id: int) -> None:
+    """Pick who runs try-on for the job on screen — same shape as _offer_pipelines.
+
+    Only reachable from a pipeline that actually has a try-on stage
+    (_fix_buttons hides the button otherwise); /provider itself still reports
+    plainly rather than showing an empty chooser, since it can be typed
+    regardless of what pipeline happens to be open.
+    """
+    job = _job_for(chat_id)
+    if _tryon_stage(job.pipeline) is None:
+        tg.send_message(chat_id, f"{_esc(job.pipeline)} has no try-on stage — "
+                                 "nothing here for a provider to run.")
+        return
+    tg.send_message(
+        chat_id,
+        f"{ICON_ASK_CE} <b>Try-on provider</b>\n"
+        f"now: {_esc(PROVIDER_LABELS.get(job.provider, job.provider))}",
+        buttons=[[(label, _CB_PROVIDER + key)]
+                 for key, label in PROVIDER_LABELS.items() if key != job.provider],
+        parse_mode=PARSE_HTML)
+
+
+def _switch_provider_and_report(tg: Tg, chat_id: int, provider: str, *,
+                                chooser_message_id: int | None = None) -> None:
+    """The /provider body, shared by the typed command and the buttons."""
+    job = _job_for(chat_id)
+    if provider not in PROVIDER_LABELS:
+        tg.send_message(chat_id, "no provider called that. send /provider to "
+                                 "list them.")
+        return
+    if _tryon_stage(job.pipeline) is None:
+        tg.send_message(chat_id, f"{_esc(job.pipeline)} has no try-on stage — "
+                                 "nothing here for a provider to run.")
+        return
+    if provider == job.provider:
+        tg.send_message(chat_id, f"already on {provider}")
+        return
+    job = _switch_provider(chat_id, provider)
+    _PANEL_NOTE[chat_id] = f"try-on provider switched to {provider}"
+    _maybe_show_manifest(tg, chat_id, job, bump=True)
+    if chooser_message_id is not None:
+        tg.edit_message(
+            chat_id, chooser_message_id,
+            f"{ICON_EDIT_CE} <b>Provider switched</b>\n"
+            f"now: {_esc(PROVIDER_LABELS[job.provider])}",
             parse_mode=PARSE_HTML)
 
 
@@ -1672,6 +1806,12 @@ def _fix_buttons(job: Job) -> list[list[tuple[str, str]]]:
     beside each role name a few lines above, so the mapping is on screen.
     """
     labels = [("⚙️", _CB_PIPE_ASK)]
+    # Only offered when the open pipeline actually runs a try-on stage —
+    # motion-enhance/character-swap(-enhance) have nothing for a provider to
+    # change, and a button that opens an empty chooser is worse than no button.
+    if _tryon_stage(job.pipeline) is not None:
+        labels.append(("☁️" if job.provider != DEFAULT_PROVIDER else "🖥",
+                       _CB_PROVIDER_ASK))
     labels += [(f"🔁{ROLE_ICON.get(role, '')}", _CB_REDO + role)
                for role in sorted(job.slots)]
     return [labels]
@@ -1745,6 +1885,15 @@ def _flow(pipeline: str) -> str:
     return _esc(" → ".join(PIPELINES[pipeline]))
 
 
+def _provider_tag(job: Job) -> str:
+    """" · ☁️ gemini" when the try-on stage is running off the default —
+    empty for the common case, so a panel with nothing switched stays exactly
+    as it read before /provider existed."""
+    if job.provider == DEFAULT_PROVIDER or _tryon_stage(job.pipeline) is None:
+        return ""
+    return f" · ☁️ {_esc(job.provider)}"
+
+
 def _panel_text(chat_id: int, job: Job, *, with_pictures: bool = True) -> str:
     """The panel body. Same vocabulary as the old review screen, one message."""
     basket = _BASKET.get(chat_id) or []
@@ -1763,7 +1912,7 @@ def _panel_text(chat_id: int, job: Job, *, with_pictures: bool = True) -> str:
         # picture to identify anything by.
         lines.append(f"🎬 <b>{len(queued)} job(s)</b> · one pod")
         for index, other in enumerate(basket):
-            line = f"{_row_mark(index)} {_flow(other.pipeline)}"
+            line = f"{_row_mark(index)} {_flow(other.pipeline)}{_provider_tag(other)}"
             if not with_pictures:
                 line += "  <i>" + _esc(", ".join(Path(other.slots[role]).stem
                                                  for role in sorted(other.slots))) + "</i>"
@@ -1773,10 +1922,10 @@ def _panel_text(chat_id: int, job: Job, *, with_pictures: bool = True) -> str:
             # the next square. Without this the picture has one more coloured
             # bar than the list has squares and the mapping silently breaks.
             lines.append(f"▸{_row_mark(len(basket))} {_flow(job.pipeline)}"
-                         "  <i>← open</i>")
+                         f"{_provider_tag(job)}  <i>← open</i>")
         lines.append("")
     else:
-        lines += [f"🎬 <b>{_esc(job.pipeline)}</b>", ""]
+        lines += [f"🎬 <b>{_esc(job.pipeline)}</b>{_provider_tag(job)}", ""]
 
     for role in sorted(required_roles(job.pipeline) | optional_roles(job.pipeline)):
         lines.append(_role_line(role, job))
@@ -1899,12 +2048,20 @@ def _copy_job(job: Job) -> Job:
     it would silently rewrite an entry the user already committed to the batch.
     """
     return Job(pipeline=job.pipeline, slots=dict(job.slots),
-               probes=dict(job.probes))
+               probes=dict(job.probes), provider=job.provider)
 
 
 def _signature(job: Job) -> tuple:
-    """What makes two runs the same run — pipeline plus material."""
-    return (job.pipeline, tuple(sorted((r, str(p)) for r, p in job.slots.items())))
+    """What makes two runs the same run — pipeline, material, and provider.
+
+    Provider is part of the identity, not just a cosmetic setting: same
+    material through gemini vs qwen is two different runs (different API,
+    different cost, possibly different output) — collapsing them into "the
+    same job" would make _job_digest collide and an edit/drop tap on one
+    basket row silently act on the other.
+    """
+    return (job.pipeline, job.provider,
+            tuple(sorted((r, str(p)) for r, p in job.slots.items())))
 
 
 def _job_digest(job: Job) -> str:
@@ -2335,7 +2492,68 @@ def _start_progress(tg: Tg, chat_id: int, manifest_path: Path,
     message_id = tg.send_message(chat_id, text, parse_mode=PARSE_HTML)
     _progress_path(chat_id).write_text(json.dumps({
         "manifest": str(manifest_path), "message_id": message_id,
-        "stages": stages}, indent=2), encoding="utf-8")
+        "stages": stages, "sent_tryon": []}, indent=2), encoding="utf-8")
+
+
+def _deliver_tryon_previews(tg: Tg, chat_id: int, manifest_path: Path,
+                            payload: dict) -> None:
+    """Send a run's try-on/camera-tryon image the moment it finishes — only
+    for gemini/qwen-max, on the user's own request (2026-09-12).
+
+    Only those two providers finish this early: batchlib/runner.py's
+    run_local_phase runs them from THIS process, before drain.py rents a pod
+    at all, so there is a real wait (Phase A's API call, then provision +
+    bootstrap) between "try-on is done" and "the rest of the pipeline even
+    started" worth showing something for. Self-host (qwen) runs the same
+    stage moments before motion, already on the pod paid for — no comparable
+    gap to fill, and the final video follows soon after anyway.
+
+    Sent at most once per run: `payload["sent_tryon"]` lives in the same
+    on-disk progress file tick_progress already rewrites every tick, so this
+    survives both a poll finding nothing new and a bot restart mid-render —
+    same reasoning as _progress_path's own docstring.
+    """
+    try:
+        manifest = load_manifest(manifest_path)
+    except ManifestError:
+        return
+    state = load_state(state_path_for(manifest_path))
+    runs = state.get("runs") or {}
+    sent = set(payload.get("sent_tryon") or [])
+    changed = False
+    for run in manifest.runs:
+        if run.id in sent:
+            continue
+        stage_name = _tryon_stage(run.pipeline)
+        if stage_name is None:
+            continue
+        params = effective_stage_params(stage_name, run.stage_params.get(stage_name))
+        provider = str(params.get("provider") or "").strip()
+        if not is_local_provider(provider):
+            continue
+        stage = ((runs.get(run.id) or {}).get("stages") or {}).get(stage_name) or {}
+        if stage.get("status") != "done":
+            continue
+        image = Path(stage.get("file") or "")
+        # is_file(), not just "was it recorded done": _local_tryon_stage's own
+        # `dest.is_file()` check (runner.py) is the same defence against a
+        # journal that says done while batch-clean (or anything else) removed
+        # the file it points to.
+        if not image.is_file():
+            continue
+        tg.send_chat_action(chat_id, "upload_document")
+        # caption is plain text — send_document has no parse_mode (unlike
+        # send_message/edit_message), so no HTML here.
+        tg.send_document(
+            chat_id, image,
+            caption=f"🖼 try-on ({provider}) · {run.id} — "
+                    "pipeline continues on the pod")
+        sent.add(run.id)
+        changed = True
+    if changed:
+        payload["sent_tryon"] = sorted(sent)
+        _progress_path(chat_id).write_text(json.dumps(payload, indent=2),
+                                           encoding="utf-8")
 
 
 def tick_progress(tg: Tg, chat_id: int) -> None:
@@ -2365,6 +2583,12 @@ def tick_progress(tg: Tg, chat_id: int) -> None:
         log(f"progress file for chat {chat_id} is unreadable, dropping it: {exc!r}")
         path.unlink(missing_ok=True)
         return
+
+    # Every tick, regardless of whether the drain is still running or about
+    # to be reported finished below — Phase A can complete while the pod is
+    # still being provisioned, minutes before anything else in this function
+    # would otherwise say a word about it.
+    _deliver_tryon_previews(tg, chat_id, manifest_path, payload)
 
     hpath = handoff_path(_job_manifest_path(chat_id))
     handoff = read_handoff(hpath)
@@ -2512,6 +2736,7 @@ _LAST_SUFFIX = ".last.json"
 
 def _dump_jobs(jobs: list[Job]) -> list[dict]:
     return [{"pipeline": j.pipeline,
+             "provider": j.provider,
              "slots": {r: str(v) for r, v in j.slots.items()},
              "probes": {r: asdict(pr) for r, pr in j.probes.items()}}
             for j in jobs]
@@ -2519,6 +2744,11 @@ def _dump_jobs(jobs: list[Job]) -> list[dict]:
 
 def _load_jobs(payload: list) -> list[Job]:
     return [Job(pipeline=entry["pipeline"],
+                # .get, not entry["provider"]: a basket dumped by a previous
+                # version of this bot has no such key, and refusing to load an
+                # otherwise good job over a missing cosmetic field is exactly
+                # the failure _load_draft's own docstring warns against.
+                provider=entry.get("provider", DEFAULT_PROVIDER),
                 slots={r: Path(v) for r, v in entry["slots"].items()},
                 probes={r: Probe(**d) for r, d in entry["probes"].items()})
             for entry in payload]
@@ -4014,6 +4244,14 @@ def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
         _switch_pipeline_and_report(tg, chat_id, parts[1].strip())
         return
 
+    if text.startswith("/provider"):
+        parts = text.split(maxsplit=1)
+        if len(parts) != 2:
+            _offer_providers(tg, chat_id)
+            return
+        _switch_provider_and_report(tg, chat_id, parts[1].strip())
+        return
+
     if text.startswith("/start"):
         tg.send_message(
             chat_id,
@@ -4050,6 +4288,7 @@ BOT_COMMANDS = [
     ("start", "what this bot does and the commands"),
     ("job", "what is assembled so far, and what is missing"),
     ("pipeline", "show or switch the pipeline"),
+    ("provider", "show or switch who runs try-on (self-host GPU vs API)"),
     ("again", "reuse the last job's files, e.g. with another pipeline"),
     ("clear", "throw away the job being assembled"),
     ("status", "progress of this chat's job"),
@@ -4077,7 +4316,7 @@ def main() -> int:
     # Validated here, loudly, rather than at first use: an unknown pipeline
     # name in .env would otherwise surface as a confusing manifest-validation
     # failure on the phone, hours later, after material was already uploaded.
-    global _DEFAULT_PIPELINE
+    global _DEFAULT_PIPELINE, _DEFAULT_PROVIDER
     configured = env_get(ROOT / ".env", "TG_PIPELINE")
     if configured:
         if configured not in PIPELINES:
@@ -4085,6 +4324,15 @@ def main() -> int:
                   f"Known: {', '.join(sorted(PIPELINES))}", file=sys.stderr)
             return 2
         _DEFAULT_PIPELINE = configured
+
+    configured_provider = env_get(ROOT / ".env", "TG_PROVIDER")
+    if configured_provider:
+        if configured_provider not in PROVIDER_LABELS:
+            print(f"TG_PROVIDER={configured_provider!r} is not a known "
+                  f"provider. Known: {', '.join(sorted(PROVIDER_LABELS))}",
+                  file=sys.stderr)
+            return 2
+        _DEFAULT_PROVIDER = configured_provider
 
     tg = _track_sends(Tg(token=token, base_url=base))
     allowed_user_id = int(raw_id)

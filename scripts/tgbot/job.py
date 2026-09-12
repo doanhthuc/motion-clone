@@ -17,11 +17,15 @@ from batchlib.pipelines import PIPELINES, STAGES, required_roles
 from .ingest import Probe, describe, suggest_preset
 
 
+DEFAULT_PROVIDER = "qwen"
+
+
 @dataclass
 class Job:
     slots: dict[str, Path]
     probes: dict[str, Probe]
     pipeline: str
+    provider: str = DEFAULT_PROVIDER
 
 
 def _driver_stage(pipeline: str) -> str | None:
@@ -42,6 +46,19 @@ def _driver_stage(pipeline: str) -> str | None:
         if STAGES[stage_name].job_type in {"motion", "character-swap"}:
             return stage_name
     return driver_consumers[0] if driver_consumers else None
+
+
+def _tryon_stage(pipeline: str) -> str | None:
+    """Which stage of `pipeline` runs try-on ("tryon" or "camera-tryon").
+
+    Where `job.provider` lands in the manifest when it differs from
+    DEFAULT_PROVIDER — see batchlib/runner.py's `_local_tryon_stage`, which
+    reads it back the same way (first stage whose job_type is "tryon").
+    """
+    for stage_name in PIPELINES.get(pipeline, []):
+        if STAGES[stage_name].job_type == "tryon":
+            return stage_name
+    return None
 
 
 def slot_for(probe: Probe, job: Job) -> str | None:
@@ -150,11 +167,27 @@ def render_manifest(jobs: list[Job], *, now) -> str:
         lines.append("    inputs:")
         for slot in sorted(job.slots):
             lines.append(f"      {slot}: {job.slots[slot]}")
+
+        # One line per stage that has an override, not one line per known kind
+        # of override — driver preset and try-on provider land on two
+        # different stages today (camera-tryon vs camera-motion), but would
+        # land on the SAME stage if a pipeline ever merged them, and this dict
+        # merges correctly either way.
+        stage_params: dict[str, dict[str, object]] = {}
         driver_stage = _driver_stage(job.pipeline)
         driver_probe = job.probes.get("driver")
         if driver_stage and driver_probe is not None:
-            preset = suggest_preset(driver_probe.duration_s)
-            lines.append(f"    {driver_stage}: {{ preset: {preset} }}")
+            stage_params.setdefault(driver_stage, {})["preset"] = \
+                suggest_preset(driver_probe.duration_s)
+        tryon_stage = _tryon_stage(job.pipeline)
+        # DEFAULT_PROVIDER is the self-host GPU path already in effect when the
+        # manifest carries no `provider:` at all (linux.py:5653's own fallback)
+        # — writing it out unconditionally would just be noise on every run.
+        if tryon_stage and job.provider != DEFAULT_PROVIDER:
+            stage_params.setdefault(tryon_stage, {})["provider"] = job.provider
+        for stage_name, params in stage_params.items():
+            kv = ", ".join(f"{k}: {v}" for k, v in params.items())
+            lines.append(f"    {stage_name}: {{ {kv} }}")
         lines.append("")
 
     return "\n".join(lines)
