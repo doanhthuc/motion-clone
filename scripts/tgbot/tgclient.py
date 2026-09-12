@@ -85,23 +85,34 @@ class Tg:
         return body.get("result")
 
     @staticmethod
-    def keyboard(rows: list[list[tuple[str, str]]]) -> dict:
-        """An inline keyboard from [[(label, callback_data), ...], ...].
+    def keyboard(rows: list[list[tuple[str, str] | tuple[str, str, str]]]) -> dict:
+        """An inline keyboard from [[(label, callback_data[, icon_custom_emoji_id]), ...], ...].
 
         callback_data is capped at 64 BYTES by the Bot API, and a button that
         exceeds it makes the whole sendMessage fail — so the caller's data
         scheme has to stay short. Asserted here rather than trusted: the
         failure is a rejected message, i.e. the user sees nothing at all.
+
+        A 3rd tuple element is the id of a custom emoji (Bot API 9.4's
+        `icon_custom_emoji_id`), shown before `text` — the same eligibility
+        this bot already relies on for message-text tg-emoji (owner's
+        Telegram Premium, see bot.py's `_ce()`). Optional per button so every
+        existing 2-tuple call site keeps working unchanged.
         """
         for row in rows:
-            for label, data in row:
+            for label, data, *_ in row:
                 encoded = data.encode()
                 if len(encoded) > 64:
                     raise ValueError(
                         f"callback_data for {label!r} is {len(encoded)} bytes, "
                         "max 64")
-        return {"inline_keyboard": [[{"text": label, "callback_data": data}
-                                     for label, data in row] for row in rows]}
+        def _button(entry):
+            label, data, *icon = entry
+            button = {"text": label, "callback_data": data}
+            if icon:
+                button["icon_custom_emoji_id"] = icon[0]
+            return button
+        return {"inline_keyboard": [[_button(entry) for entry in row] for row in rows]}
 
     @staticmethod
     def reply_keyboard(rows: list[list[str]]) -> dict:

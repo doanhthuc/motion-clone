@@ -307,7 +307,7 @@ class FakeTg:
         if not buttons:
             return
         for row in buttons:
-            for label, _ in row:
+            for label, *_ in row:
                 assert "<" not in label and ">" not in label, (
                     f"button label contains raw markup, Telegram renders "
                     f"button text literally: {label[:160]!r}")
@@ -324,7 +324,7 @@ class FakeTg:
         offered on any job the user did not build in a single update.
         """
         return [d for rows in self.buttons + self.edit_buttons if rows
-                for row in rows for _, d in row]
+                for row in rows for _, d, *_ in row]
 
     def send_document(self, chat_id, path, caption=""):
         self.documents.append((path, caption))
@@ -1394,7 +1394,7 @@ class TestFlow(unittest.TestCase):
         job = bot._job_for(ME)
         job.slots.update({"character": Path("c.png"), "outfit": Path("o.png"),
                           "driver": Path("d.mp4")})
-        flat = lambda rows: [d for row in rows for _, d in row]
+        flat = lambda rows: [d for row in rows for _, d, *_ in row]
         bot._LAST_VALIDATE.pop(ME, None)
         self.assertNotIn(bot._CB_RUN_ASK, flat(bot._panel_buttons(ME, job)))
         bot._LAST_VALIDATE[ME] = False
@@ -1497,9 +1497,9 @@ class TestFlow(unittest.TestCase):
             bot.handle(self.tg, cmd_from(ME, "character"), allowed_user_id=ME)
             bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME)
         rows = [b for b in self.tg.buttons if b
-                and any(d.startswith(bot._CB_SLOT) for row in b for _, d in row)][-1]
+                and any(d.startswith(bot._CB_SLOT) for row in b for _, d, *_ in row)][-1]
         self.assertTrue(all(len(row) <= 2 for row in rows), rows)
-        labels = {d: label for row in rows for label, d in row}
+        labels = {d: label for row in rows for label, d, *_ in row}
         self.assertIn(bot.ICON_OK, labels[bot._CB_SLOT + "character"])
         self.assertNotIn(bot.ICON_OK, labels[bot._CB_SLOT + "outfit"])
 
@@ -1705,7 +1705,7 @@ class TestFlow(unittest.TestCase):
             text = self.tg.messages[-1]
             self.assertIn("Low", text)
             self.assertIn("EU-RO-1", text)
-            main_data = [data for row in self.tg.buttons[-1] for _, data in row]
+            main_data = [data for row in self.tg.buttons[-1] for _, data, *_ in row]
             # The picker's main screen now offers a category button, not one
             # per GPU — the per-GPU buttons live in the submenu it opens
             # (2026-09-12, see _offer_run_switch_menu).
@@ -1715,7 +1715,7 @@ class TestFlow(unittest.TestCase):
 
             bot.handle(self.tg, cb_from(ME, bot._CB_RUN_SWITCH_MENU), allowed_user_id=ME)
         offered = last_buttons(self.tg)   # the submenu edited the same message
-        flat_data = [data for row in offered for _, data in row]
+        flat_data = [data for row in offered for _, data, *_ in row]
         self.assertIn(bot._CB_RUN_SWITCH + "4090", flat_data)
         # PRO 4500 is ALSO Low at home — still offered, just labelled as Low.
         self.assertIn(bot._CB_RUN_SWITCH + "pro4500", flat_data)
@@ -1756,11 +1756,11 @@ class TestFlow(unittest.TestCase):
             # Still a same-datacenter switch to 4090/PRO 4500 too — the other-
             # region note is additive, not a replacement for the local options,
             # and its own submenu still has it (2026-09-12).
-            main_data = [data for row in self.tg.buttons[-1] for _, data in row]
+            main_data = [data for row in self.tg.buttons[-1] for _, data, *_ in row]
             self.assertIn(bot._CB_RUN_SWITCH_MENU, main_data)
 
             bot.handle(self.tg, cb_from(ME, bot._CB_RUN_SWITCH_MENU), allowed_user_id=ME)
-        flat_data = [data for row in last_buttons(self.tg) for _, data in row]
+        flat_data = [data for row in last_buttons(self.tg) for _, data, *_ in row]
         self.assertIn(bot._CB_RUN_SWITCH + "4090", flat_data)
 
     def test_other_regions_shows_a_price_not_just_stock_status(self):
@@ -1804,10 +1804,10 @@ class TestFlow(unittest.TestCase):
         rows = last_buttons(self.tg)   # the submenu edited the same message
         # Every row holding a GPU switch button has exactly one button in it.
         gpu_rows = [row for row in rows
-                   if any(d.startswith(bot._CB_RUN_SWITCH) for _, d in row)]
+                   if any(d.startswith(bot._CB_RUN_SWITCH) for _, d, *_ in row)]
         self.assertTrue(gpu_rows)
         self.assertTrue(all(len(row) == 1 for row in gpu_rows))
-        flat_data = [data for row in rows for _, data in row]
+        flat_data = [data for row in rows for _, data, *_ in row]
         self.assertIn(bot._CB_RUN_BACK, flat_data)   # ◀ Back re-opens the main screen
 
     def test_other_regions_offer_a_migrate_button(self):
@@ -1833,11 +1833,11 @@ class TestFlow(unittest.TestCase):
              mock.patch("tgbot.bot.migration_running", return_value=False):
             self._fill_required_slots()
             bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
-            main_data = [data for row in self.tg.buttons[-1] for _, data in row]
+            main_data = [data for row in self.tg.buttons[-1] for _, data, *_ in row]
             self.assertIn(bot._CB_RUN_MIGRATE_MENU, main_data)
 
             bot.handle(self.tg, cb_from(ME, bot._CB_RUN_MIGRATE_MENU), allowed_user_id=ME)
-        flat_data = [data for row in last_buttons(self.tg) for _, data in row]
+        flat_data = [data for row in last_buttons(self.tg) for _, data, *_ in row]
         self.assertIn(bot._CB_MIGRATE_ASK + "EU-CZ-1", flat_data)
 
     def test_a_gpu_missing_from_gpu_short_still_gets_a_migrate_button(self):
@@ -1869,7 +1869,7 @@ class TestFlow(unittest.TestCase):
             bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
             self.assertNotIn(unknown, bot._GPU_SHORT)
             bot.handle(self.tg, cb_from(ME, bot._CB_RUN_MIGRATE_MENU), allowed_user_id=ME)
-        flat_data = [data for row in last_buttons(self.tg) for _, data in row]
+        flat_data = [data for row in last_buttons(self.tg) for _, data, *_ in row]
         self.assertIn(bot._CB_MIGRATE_ASK + "EU-CZ-1", flat_data)
 
     def test_tapping_migrate_ask_shows_the_destructive_confirm(self):
@@ -1881,7 +1881,7 @@ class TestFlow(unittest.TestCase):
         self.assertIn("cannot be undone", text.lower())
         self.assertIn("EU-CZ-1", text)
         self.assertIn("15-25", text)
-        flat_data = [data for row in self.tg.buttons[-1] for _, data in row]
+        flat_data = [data for row in self.tg.buttons[-1] for _, data, *_ in row]
         self.assertIn(bot._CB_MIGRATE_GO + "EU-CZ-1", flat_data)
         self.assertIn(bot._CB_MIGRATE_NO, flat_data)
 
@@ -2098,7 +2098,7 @@ class TestFlow(unittest.TestCase):
         self.assertIn("Current:", text)
         self.assertIn("RTX 4090", text.split("Current:")[1].splitlines()[0])
         self.assertIn("🚀 Yes, spend $0.74/h",
-                      [label for row in last_buttons(self.tg) for label, _ in row])
+                      [label for row in last_buttons(self.tg) for label, *_ in row])
         # No separate "switched — GPU is now X" message any more — the edited
         # screen's own "Current:" line already says it (2026-09-12).
         self.assertEqual(len(self.tg.messages), baseline)
@@ -2119,7 +2119,7 @@ class TestFlow(unittest.TestCase):
              mock.patch("tgbot.bot.stock_at_cached", return_value=stock):
             self._fill_required_slots()
             bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
-        flat_data = [data for row in last_buttons(self.tg) for _, data in row]
+        flat_data = [data for row in last_buttons(self.tg) for _, data, *_ in row]
         self.assertFalse(any(d.startswith(bot._CB_RUN_GO) for d in flat_data))
         self.assertIn(bot._CB_RUN_NO, flat_data)
         self.assertIn(bot._CB_RUN_REFRESH + "m", flat_data)
@@ -2157,7 +2157,7 @@ class TestFlow(unittest.TestCase):
             bot.handle(self.tg, cb_from(ME, bot._CB_RUN_SWITCH_MENU), allowed_user_id=ME)
             bot.handle(self.tg, cb_from(ME, bot._CB_RUN_BACK), allowed_user_id=ME)
         self.assertIn("Choose GPU", self.tg.screen[-1])
-        flat_data = [data for row in last_buttons(self.tg) for _, data in row]
+        flat_data = [data for row in last_buttons(self.tg) for _, data, *_ in row]
         self.assertIn(bot._CB_RUN_SWITCH_MENU, flat_data)
         # Both taps after the Choose GPU screen first opened were edits of
         # the SAME message — no new message sent for either.
@@ -2197,7 +2197,7 @@ class TestFlow(unittest.TestCase):
         self.assertIn("EU-CZ-1", text)
         self.assertIn(bot.MIGRATE_DURATION_SHORT, text)
         self.assertIn("not offered at EU-RO-1", text)
-        flat_data = [data for row in self.tg.buttons[-1] for _, data in row]
+        flat_data = [data for row in self.tg.buttons[-1] for _, data, *_ in row]
         self.assertFalse(any(d.startswith(bot._CB_RUN_SWITCH) for d in flat_data))
 
     def test_a_stock_check_failure_fails_open_to_the_plain_confirm(self):
@@ -2605,10 +2605,26 @@ class TestFlow(unittest.TestCase):
         # the second button — see test_the_provider_button_only_shows_for_a_
         # tryon_pipeline for the case where it is absent instead.
         self.assertEqual(rows[0][1][1], bot._CB_PROVIDER_ASK)
-        for label, data in rows[0][2:]:
+        for label, data, *_ in rows[0][2:]:
             self.assertTrue(data.startswith(bot._CB_REDO))
             self.assertNotIn(data[len(bot._CB_REDO):], label,
                              "the role name is still spelled out")
+
+    def test_the_driver_redo_button_carries_its_animated_icon(self):
+        """driver is the one role whose CE differs from its plain glyph
+        (bot.py's ROLE_ICON_CE comment: a TikTok logo, not a generic clapper)
+        — Bot API 9.4's icon_custom_emoji_id is how a BUTTON can show that,
+        same eligibility already used for message text (owner's Premium).
+        The other three roles have no CE id, so their redo buttons are
+        unchanged plain glyphs."""
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+        rows = bot._fix_buttons(bot._STATE[ME])
+        driver_button = next(entry for entry in rows[0]
+                             if entry[1] == bot._CB_REDO + "driver")
+        label, data, *icon = driver_button
+        self.assertEqual(icon, [bot._ce_id(bot.ROLE_ICON_CE["driver"])])
+        self.assertEqual(label, "🔁")
 
     def test_the_provider_button_only_shows_for_a_tryon_pipeline(self):
         with mock.patch("tgbot.bot.drain_running", return_value=False):
@@ -2616,7 +2632,7 @@ class TestFlow(unittest.TestCase):
         bot._STATE[ME].pipeline = "motion-enhance"
         bot._STATE[ME].slots.pop("outfit", None)
         rows = bot._fix_buttons(bot._STATE[ME])
-        self.assertNotIn(bot._CB_PROVIDER_ASK, [data for _, data in rows[0]])
+        self.assertNotIn(bot._CB_PROVIDER_ASK, [data for _, data, *_ in rows[0]])
 
     def test_the_pipeline_can_be_picked_per_job_from_the_panel(self):
         """Each run carries its own pipeline in the manifest, so a batch can mix
@@ -4410,7 +4426,7 @@ class TestGpuStockCommand(unittest.TestCase):
         with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
              mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
             bot.handle(self.tg, cmd_from(ME, "/gpu"), allowed_user_id=ME)
-        flat_data = [data for row in self.tg.buttons[-1] for _, data in row]
+        flat_data = [data for row in self.tg.buttons[-1] for _, data, *_ in row]
         self.assertEqual(flat_data, [bot._CB_GPU_REFRESH])
 
     def test_refresh_bypasses_the_cache_with_an_interim_message(self):
@@ -4436,7 +4452,7 @@ class TestGpuStockCommand(unittest.TestCase):
             bot.handle(self.tg, cb_from(ME, bot._CB_GPU_REFRESH), allowed_user_id=ME)
         text = self.tg.screen[-1]
         self.assertIn("couldn't reach runpodctl", text)
-        flat_data = [data for row in last_buttons(self.tg) for _, data in row]
+        flat_data = [data for row in last_buttons(self.tg) for _, data, *_ in row]
         self.assertEqual(flat_data, [bot._CB_GPU_REFRESH])
 
 
@@ -4471,7 +4487,7 @@ class TestGpuSubscribe(unittest.TestCase):
 
     def test_subscribe_offers_the_five_catalog_gpus(self):
         bot.handle(self.tg, cmd_from(ME, "/subscribe"), allowed_user_id=ME)
-        flat = [data for row in last_buttons(self.tg) for _, data in row]
+        flat = [data for row in last_buttons(self.tg) for _, data, *_ in row]
         self.assertEqual(len(flat), 5)
         self.assertTrue(all(d.startswith(bot._CB_GPUSUB_PICK) for d in flat))
         self.assertIn(bot._CB_GPUSUB_PICK + "5090", flat)
@@ -4482,7 +4498,7 @@ class TestGpuSubscribe(unittest.TestCase):
                       allowed_user_id=ME)
         text = self.tg.screen[-1]
         self.assertIn("RTX 5090", text)
-        flat = [data for row in last_buttons(self.tg) for _, data in row]
+        flat = [data for row in last_buttons(self.tg) for _, data, *_ in row]
         self.assertEqual(set(flat),
                          {bot._CB_GPUSUB_DC + "5090:EU-RO-1",
                           bot._CB_GPUSUB_DC + "5090:EU-CZ-1"})
@@ -4498,10 +4514,25 @@ class TestGpuSubscribe(unittest.TestCase):
                       allowed_user_id=ME)
         text = self.tg.screen[-1]
         self.assertIn(bot.MIGRATE_DURATION_SHORT, text)
-        labels = [label for row in last_buttons(self.tg) for label, _ in row]
+        labels = [label for row in last_buttons(self.tg) for label, *_ in row]
         self.assertTrue(any("📍" in label and "EU-RO-1" in label for label in labels))
         self.assertTrue(all("📍" not in label for label in labels
                            if "EU-CZ-1" in label))
+
+    def test_the_none_status_button_carries_its_animated_icon(self):
+        """Regression follow-up (2026-09-12, 652ea4f): that fix made the
+        "none" button safe by dropping the icon entirely. Bot API 9.4's
+        icon_custom_emoji_id is the field that actually lets a button show
+        it, so the siren can come back without leaking a raw tag."""
+        with mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
+            bot.handle(self.tg, cb_from(ME, bot._CB_GPUSUB_PICK + "5090"),
+                      allowed_user_id=ME)
+        rows = last_buttons(self.tg)
+        none_row = next(row for row in rows
+                        if any("EU-RO-1" in label for label, *_ in row))
+        label, data, *icon = none_row[0]
+        self.assertEqual(icon, [bot._ce_id(bot.ICON_CRITICAL_CE)])
+        self.assertEqual(label, "🔴 EU-RO-1")
 
     def test_subscribing_to_a_non_home_datacenter_warns_it_needs_a_migration(self):
         with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"):
@@ -4548,7 +4579,7 @@ class TestGpuSubscribe(unittest.TestCase):
                       allowed_user_id=ME)
         text = self.tg.screen[-1]
         self.assertIn("which datacenter", text)
-        flat = [data for row in last_buttons(self.tg) for _, data in row]
+        flat = [data for row in last_buttons(self.tg) for _, data, *_ in row]
         self.assertEqual(set(flat),
                          {bot._CB_GPUSUB_DC + "5090:EU-RO-1",
                           bot._CB_GPUSUB_DC + "5090:EU-CZ-1"})
@@ -4589,7 +4620,7 @@ class TestGpuSubscribe(unittest.TestCase):
         bot.handle(self.tg, cmd_from(ME, "/unsubscribe"), allowed_user_id=ME)
         text = self.tg.messages[-1]
         self.assertIn("EU-RO-1", text)
-        flat = [data for row in last_buttons(self.tg) for _, data in row]
+        flat = [data for row in last_buttons(self.tg) for _, data, *_ in row]
         self.assertEqual(set(flat),
                          {bot._CB_GPUSUB_RM + "5090:EU-RO-1",
                           bot._CB_GPUSUB_RM + "4090:EU-RO-1"})
@@ -4680,7 +4711,7 @@ class TestKillCommand(unittest.TestCase):
         text = self.tg.messages[-1]
         self.assertIn("destroys the pod right now", text)
         self.assertIn("10 min", text)
-        offered = [data for row in self.tg.buttons[-1] for _, data in row]
+        offered = [data for row in self.tg.buttons[-1] for _, data, *_ in row]
         self.assertEqual(offered, [bot._CB_KILL_GO, bot._CB_KILL_NO])
 
     def test_confirming_terminates_a_tracked_popen_then_destroys_the_pod(self):
