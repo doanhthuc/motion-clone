@@ -1669,6 +1669,18 @@ class TestFlow(unittest.TestCase):
             start_drain.assert_called_once()
             self.assertIs(start_drain.call_args.kwargs["dry_run"], False)
 
+    def test_the_run_confirm_button_carries_the_animated_rocket(self):
+        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value=None), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value={}):
+            self._fill_required_slots()
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
+        go = next(entry for row in last_buttons(self.tg) for entry in row
+                 if entry[1].startswith(bot._CB_RUN_GO))
+        label, data, *icon = go
+        self.assertEqual(icon, [bot._ce_id(bot.ICON_ROCKET_CE)])
+        self.assertEqual(label, "Yes, spend $0.99/h")
+
     # ---- [Run]'s GPU-stock check (added 2026-09-02) -----------------------
 
     def _stock_5090_low_4090_ok(self):
@@ -1840,6 +1852,27 @@ class TestFlow(unittest.TestCase):
         flat_data = [data for row in last_buttons(self.tg) for _, data, *_ in row]
         self.assertIn(bot._CB_MIGRATE_ASK + "EU-CZ-1", flat_data)
 
+    def test_the_other_regions_button_carries_the_animated_departure_icon(self):
+        stock = {
+            "NVIDIA GeForce RTX 5090": [
+                Stock(gpu_id="NVIDIA GeForce RTX 5090", display_name="RTX 5090",
+                     price_per_hr=0.99, datacenter_id="EU-RO-1", stock_status="none"),
+                Stock(gpu_id="NVIDIA GeForce RTX 5090", display_name="RTX 5090",
+                     price_per_hr=0.99, datacenter_id="EU-CZ-1", stock_status="High"),
+            ],
+        }
+        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=stock), \
+             mock.patch("tgbot.bot.migration_running", return_value=False):
+            self._fill_required_slots()
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
+        other = next(entry for row in self.tg.buttons[-1] for entry in row
+                    if entry[1] == bot._CB_RUN_MIGRATE_MENU)
+        label, data, *icon = other
+        self.assertEqual(icon, [bot._ce_id(bot.ICON_DEPART_CE)])
+        self.assertEqual(label, "Other regions ▸")
+
     def test_a_gpu_missing_from_gpu_short_still_gets_a_migrate_button(self):
         # The migrate button used to be minted only when _GPU_SHORT had an
         # entry for the GPU, because the callback payload carried a short
@@ -1884,6 +1917,17 @@ class TestFlow(unittest.TestCase):
         flat_data = [data for row in self.tg.buttons[-1] for _, data, *_ in row]
         self.assertIn(bot._CB_MIGRATE_GO + "EU-CZ-1", flat_data)
         self.assertIn(bot._CB_MIGRATE_NO, flat_data)
+
+    def test_the_migrate_confirm_button_carries_the_animated_departure_icon(self):
+        with mock.patch("tgbot.bot.migration_running", return_value=False):
+            bot.handle(self.tg,
+                      cb_from(ME, bot._CB_MIGRATE_ASK + "EU-CZ-1"),
+                      allowed_user_id=ME)
+        go = next(entry for row in self.tg.buttons[-1] for entry in row
+                 if entry[1] == bot._CB_MIGRATE_GO + "EU-CZ-1")
+        label, data, *icon = go
+        self.assertEqual(icon, [bot._ce_id(bot.ICON_DEPART_CE)])
+        self.assertEqual(label, "Yes, migrate")
 
     def test_migrate_go_launches_the_script_exactly_once(self):
         with mock.patch("tgbot.bot.subprocess.Popen") as mock_popen, \
@@ -2097,7 +2141,7 @@ class TestFlow(unittest.TestCase):
         text = self.tg.screen[-1]
         self.assertIn("Current:", text)
         self.assertIn("RTX 4090", text.split("Current:")[1].splitlines()[0])
-        self.assertIn("🚀 Yes, spend $0.74/h",
+        self.assertIn("Yes, spend $0.74/h",
                       [label for row in last_buttons(self.tg) for label, *_ in row])
         # No separate "switched — GPU is now X" message any more — the edited
         # screen's own "Current:" line already says it (2026-09-12).
@@ -2336,6 +2380,16 @@ class TestFlow(unittest.TestCase):
         self.assertIn(ME, bot._STATE)                   # nothing gone yet
         self.assertTrue(self.staged("driver.mp4").exists())
 
+    def test_the_clear_confirm_button_carries_the_animated_checkmark(self):
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+        bot.handle(self.tg, cmd_from(ME, "/clear"), allowed_user_id=ME)
+        go = next(entry for row in last_buttons(self.tg) for entry in row
+                 if entry[1] == bot._CB_CLEAR_GO)
+        label, data, *icon = go
+        self.assertEqual(icon, [bot._ce_id(bot.ICON_OK_CE)])
+        self.assertEqual(label, "Yes, start over")
+
     def test_confirming_clear_deletes_the_staged_files_and_the_draft(self):
         with mock.patch("tgbot.bot.drain_running", return_value=False):
             self._fill_required_slots()
@@ -2371,6 +2425,14 @@ class TestFlow(unittest.TestCase):
         bot.handle(self.tg, cmd_from(ME, "/wipe"), allowed_user_id=ME)
         self.assertIn("Delete all", self.tg.messages[-1])
         self.assertIn(bot._CB_WIPE_GO, self.tg.callback_data())
+
+    def test_the_wipe_confirm_button_carries_the_animated_checkmark(self):
+        bot.handle(self.tg, cmd_from(ME, "/wipe"), allowed_user_id=ME)
+        go = next(entry for row in last_buttons(self.tg) for entry in row
+                 if entry[1] == bot._CB_WIPE_GO)
+        label, data, *icon = go
+        self.assertEqual(icon, [bot._ce_id(bot.ICON_OK_CE)])
+        self.assertEqual(label, "Yes, wipe it")
 
     def test_confirming_wipe_deletes_every_tracked_message_and_the_job(self):
         # _track_sends is what main() applies once in production; applied
@@ -2998,6 +3060,18 @@ class TestFlow(unittest.TestCase):
         # rather than left out, or the squares and the bars would not match.
         self.assertIn(bot._CB_JOB_OPEN, offered)
         self.assertIn(bot._CB_JOB_HERE, offered)
+
+    def test_the_panel_trash_buttons_carry_the_animated_trash_can(self):
+        self._add_second_job()
+        rows = last_buttons(self.tg)
+        here = next(entry for row in rows for entry in row
+                   if entry[1] == bot._CB_JOB_HERE)
+        all_ = next(entry for row in rows for entry in row
+                   if entry[1] == bot._CB_CLEAR_ASK)
+        for label, data, *icon in (here, all_):
+            self.assertEqual(icon, [bot._ce_id(bot.ICON_TRASH_CE)])
+        self.assertEqual(here[0], "this job")
+        self.assertEqual(all_[0], "all")
 
     def test_removing_the_open_job_opens_the_next_one(self):
         """Something has to stay on screen, or the panel shows an empty job
@@ -4624,6 +4698,15 @@ class TestGpuSubscribe(unittest.TestCase):
         self.assertEqual(set(flat),
                          {bot._CB_GPUSUB_RM + "5090:EU-RO-1",
                           bot._CB_GPUSUB_RM + "4090:EU-RO-1"})
+
+    def test_the_unsubscribe_remove_button_carries_the_animated_trash_can(self):
+        bot.handle(self.tg, cb_from(ME, bot._CB_GPUSUB_DC + "5090:EU-RO-1"),
+                  allowed_user_id=ME)
+        bot.handle(self.tg, cmd_from(ME, "/unsubscribe"), allowed_user_id=ME)
+        rows = last_buttons(self.tg)
+        label, data, *icon = rows[0][0]
+        self.assertEqual(icon, [bot._ce_id(bot.ICON_TRASH_CE)])
+        self.assertNotIn("🗑", label)
 
     def test_tapping_remove_drops_only_that_one(self):
         bot.handle(self.tg, cb_from(ME, bot._CB_GPUSUB_DC + "5090:EU-RO-1"),

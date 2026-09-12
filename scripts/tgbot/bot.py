@@ -2045,11 +2045,12 @@ def _panel_buttons(chat_id: int, job: Job) -> list[list[tuple[str, str]]]:
 
     rows += _fix_buttons(job)
 
-    trash: list[tuple[str, str]] = []
+    trash_icon = _ce_id(ICON_TRASH_CE)
+    trash: list[tuple[str, str, str]] = []
     if len(queued) > 1:
-        trash.append(("🗑 this job", _CB_JOB_HERE))
+        trash.append(("this job", _CB_JOB_HERE, trash_icon))
     if job.slots or basket:
-        trash.append(("🗑 all", _CB_CLEAR_ASK))
+        trash.append(("all", _CB_CLEAR_ASK, trash_icon))
     if trash:
         rows.append(trash)
     return rows
@@ -2890,7 +2891,8 @@ def _ask_to_clear(tg: Tg, chat_id: int) -> None:
         chat_id,
         f"Delete this job and its {n} staged file(s)? The originals in "
         "Telegram are untouched — only the copies here go.",
-        buttons=[[("✅ Yes, start over", _CB_CLEAR_GO), ("↩️ Keep it", _CB_CLEAR_NO)]])
+        buttons=[[("Yes, start over", _CB_CLEAR_GO, _ce_id(ICON_OK_CE)),
+                  ("↩️ Keep it", _CB_CLEAR_NO)]])
 
 
 def _clear_job(tg: Tg, chat_id: int) -> None:
@@ -2956,7 +2958,8 @@ def _ask_to_wipe(tg: Tg, chat_id: int) -> None:
         f"Delete all {n} message(s) in this chat — yours and mine — and "
         "clear the job being assembled?\nTelegram will not let anything "
         "older than 48h be removed; those are reported, not silently left.",
-        buttons=[[("✅ Yes, wipe it", _CB_WIPE_GO), ("↩️ Keep it", _CB_WIPE_NO)]])
+        buttons=[[("Yes, wipe it", _CB_WIPE_GO, _ce_id(ICON_OK_CE)),
+                  ("↩️ Keep it", _CB_WIPE_NO)]])
 
 
 def _wipe_chat(tg: Tg, chat_id: int) -> None:
@@ -3308,8 +3311,9 @@ def _gpu_subs_lines_and_buttons(chat_id: int) -> tuple[str, list]:
         short = _GPU_DISPLAY_SHORT.get(s["gpu_id"], s["gpu_id"])
         dc = s["datacenter_id"]
         lines.append(f"  {_esc(short)} @ {_esc(dc)}")
-        buttons.append([(f"🗑 {short} @ {dc}",
-                        f"{_CB_GPUSUB_RM}{_GPU_SHORT.get(s['gpu_id'], '')}:{dc}")])
+        buttons.append([(f"{short} @ {dc}",
+                        f"{_CB_GPUSUB_RM}{_GPU_SHORT.get(s['gpu_id'], '')}:{dc}",
+                        _ce_id(ICON_TRASH_CE))])
     return "\n".join(lines), buttons
 
 
@@ -3673,7 +3677,8 @@ def _offer_run_confirm(tg: Tg, chat_id: int, *, message_id: int | None = None,
             f"This rents a GPU pod at ${price:.2f}/hour and starts the job.\n"
             "Confirm?",
             [[("🔄 Refresh", _CB_RUN_REFRESH + "m")],
-             [(f"🚀 Yes, spend ${price:.2f}/h", _CB_RUN_GO + _run_token(chat_id)),
+             [(f"Yes, spend ${price:.2f}/h", _CB_RUN_GO + _run_token(chat_id),
+               _ce_id(ICON_ROCKET_CE)),
               ("Cancel", _CB_RUN_NO)]])
         return
 
@@ -3724,7 +3729,7 @@ def _offer_run_confirm(tg: Tg, chat_id: int, *, message_id: int | None = None,
     if switch_buttons:
         buttons.append([("🖥 Switch GPU type ▸", _CB_RUN_SWITCH_MENU)])
     if migrate_buttons:
-        buttons.append([("🛫 Other regions ▸", _CB_RUN_MIGRATE_MENU)])
+        buttons.append([("Other regions ▸", _CB_RUN_MIGRATE_MENU, _ce_id(ICON_DEPART_CE))])
     buttons.append([("🔄 Refresh", _CB_RUN_REFRESH + "m")])
     # No spend button at all when sold out (2026-09-12) — a "Yes, spend" that
     # can only fail is worse than no button, and Refresh (just above) is the
@@ -3732,7 +3737,8 @@ def _offer_run_confirm(tg: Tg, chat_id: int, *, message_id: int | None = None,
     if sold_out:
         buttons.append([("Cancel", _CB_RUN_NO)])
     else:
-        buttons.append([(f"🚀 Yes, spend ${price:.2f}/h", _CB_RUN_GO + _run_token(chat_id)),
+        buttons.append([(f"Yes, spend ${price:.2f}/h", _CB_RUN_GO + _run_token(chat_id),
+                        _ce_id(ICON_ROCKET_CE)),
                         ("Cancel", _CB_RUN_NO)])
     _edit_or_send(tg, chat_id, message_id, "\n".join(lines), buttons,
                  parse_mode=PARSE_HTML)
@@ -3907,7 +3913,7 @@ def _ask_migrate(tg: Tg, chat_id: int, to_dc: str) -> None:
         f"verified byte-for-byte. {MIGRATE_DURATION_TEXT}. "
         f"<b>Cannot be undone</b> once the old volume is deleted.",
         parse_mode=PARSE_HTML,
-        buttons=[[("🛫 Yes, migrate", _CB_MIGRATE_GO + to_dc),
+        buttons=[[("Yes, migrate", _CB_MIGRATE_GO + to_dc, _ce_id(ICON_DEPART_CE)),
                   ("Cancel", _CB_MIGRATE_NO)]])
 
 
