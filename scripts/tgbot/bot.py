@@ -3245,8 +3245,8 @@ def _add_gpu_sub(tg: Tg, chat_id: int, message_id: int, short: str, dc: str) -> 
     subs.append({"gpu_id": gpu_id, "datacenter_id": dc})
     _save_gpu_subs(chat_id)
     home_dc = _home_datacenter()
-    caveat = ("\n⚠️ not your volume's home datacenter — renting here needs "
-             f"it synced there first ({MIGRATE_DURATION_SHORT})."
+    caveat = (f"\n{ICON_WARN} not your volume's home datacenter — renting here "
+             f"needs it synced there first ({MIGRATE_DURATION_SHORT})."
              if home_dc and dc != home_dc else "")
     tg.edit_message(
         chat_id, message_id,
