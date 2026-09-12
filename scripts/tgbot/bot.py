@@ -1846,7 +1846,10 @@ def _fix_buttons(job: Job) -> list[list[tuple[str, str]]]:
     two of the four rows available. The icons are the ones already printed
     beside each role name a few lines above, so the mapping is on screen.
     """
-    labels = [("⚙️", _CB_PIPE_ASK, _ce_id(ICON_ASK_CE))]
+    # Text can't be empty (Bot API rejects it), and icon_custom_emoji_id is a
+    # PREFIX to text, not a replacement — a literal "⚙️" here duplicated the
+    # gear (⚙️⚙️ on screen) once the icon field was wired in (2026-09-12).
+    labels = [(" ", _CB_PIPE_ASK, _ce_id(ICON_ASK_CE))]
     # Only offered when the open pipeline actually runs a try-on stage —
     # motion-enhance/character-swap(-enhance) have nothing for a provider to
     # change, and a button that opens an empty chooser is worse than no button.
@@ -2025,12 +2028,15 @@ def _panel_buttons(chat_id: int, job: Job) -> list[list[tuple[str, str]]]:
     basket = _BASKET.get(chat_id) or []
     if queued and not (_PENDING.get(chat_id) or []) and _LAST_VALIDATE.get(chat_id) is True:
         price = _panel_price()
-        run = [(f"▶️ Run {len(queued)} · ${price:.2f}/h" if len(queued) > 1
-                else f"▶️ Run · ${price:.2f}/h", _CB_RUN_ASK, _ce_id(ICON_RUN_CE))]
+        # No leading ▶️/➕ in the text: icon_custom_emoji_id already prefixes
+        # the same glyph, and keeping both duplicated it on screen (▶️▶️ Run,
+        # ➕➕ Add) — same bug as the settings gear above (2026-09-12).
+        run = [(f"Run {len(queued)} · ${price:.2f}/h" if len(queued) > 1
+                else f"Run · ${price:.2f}/h", _CB_RUN_ASK, _ce_id(ICON_RUN_CE))]
         # Offered beside Run, not instead of it: one pod runs everything in the
         # manifest, so adding another job costs nothing but the render itself.
         if not missing_slots(job):
-            run.append(("➕ Add", _CB_ADD, _ce_id(ICON_ADD_CE)))
+            run.append(("Add", _CB_ADD, _ce_id(ICON_ADD_CE)))
         rows.append(run)
 
     # ONE row of coloured squares, whatever the batch size. The first version

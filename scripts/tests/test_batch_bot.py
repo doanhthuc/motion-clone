@@ -1402,6 +1402,22 @@ class TestFlow(unittest.TestCase):
         bot._LAST_VALIDATE[ME] = True
         self.assertIn(bot._CB_RUN_ASK, flat(bot._panel_buttons(ME, job)))
 
+    def test_run_and_add_labels_do_not_duplicate_their_animated_icon(self):
+        """Same bug as the settings gear: icon_custom_emoji_id prefixes text,
+        it doesn't replace it, so a leading "▶️"/"➕" baked into the label
+        alongside the icon showed doubled (▶️▶️ Run, ➕➕ Add) (2026-09-12)."""
+        job = bot._job_for(ME)
+        job.slots.update({"character": Path("c.png"), "outfit": Path("o.png"),
+                          "driver": Path("d.mp4")})
+        bot._LAST_VALIDATE[ME] = True
+        entries = [entry for row in bot._panel_buttons(ME, job) for entry in row
+                   if entry[1] in (bot._CB_RUN_ASK, bot._CB_ADD)]
+        self.assertTrue(entries)
+        for label, data, *icon in entries:
+            self.assertTrue(icon, f"{data} lost its icon_custom_emoji_id")
+            self.assertNotIn("▶️", label)
+            self.assertNotIn("➕", label)
+
     def test_confirm_freezes_the_panel_with_the_inputs_and_no_buttons(self):
         """The transcript invariant, under the new shape.
 
@@ -2667,6 +2683,12 @@ class TestFlow(unittest.TestCase):
         rows = bot._fix_buttons(bot._STATE[ME])
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0][0][1], bot._CB_PIPE_ASK)
+        # icon_custom_emoji_id is a PREFIX to text, not a replacement for it —
+        # a literal "⚙️" in the label alongside the gear's CE id duplicated the
+        # gear on screen (⚙️⚙️) once the icon field was wired in (2026-09-12).
+        gear_label, _gear_data, *gear_icon = rows[0][0]
+        self.assertEqual(gear_icon, [bot._ce_id(bot.ICON_ASK_CE)])
+        self.assertNotIn("⚙️", gear_label)
         # tryon-motion-enhance has a try-on stage, so the provider chooser is
         # the second button — see test_the_provider_button_only_shows_for_a_
         # tryon_pipeline for the case where it is absent instead.
