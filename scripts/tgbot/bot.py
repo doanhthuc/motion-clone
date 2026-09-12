@@ -4204,12 +4204,22 @@ def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
         return
 
     if text.startswith("/job"):
-        if _STATE.get(chat_id) is None:
+        job = _STATE.get(chat_id)
+        if job is None:
             tg.send_message(chat_id, NOTHING_ASSEMBLED, parse_mode=PARSE_HTML)
         else:
+            # _maybe_show_manifest, not _show_panel directly: `_LAST_VALIDATE`
+            # is deliberately memory-only (see `_save_draft`'s docstring) and
+            # every deploy restarts motion-bot, so a chat reopened after a
+            # restart has slots/basket restored from disk but no verdict —
+            # `_sheet_for` then refuses to draw the material preview at all.
+            # Every OTHER panel redraw already re-validates first (or just
+            # invalidated the job itself); /job going straight to `_show_panel`
+            # was the one path that skipped it, so a restart silently dropped
+            # previews for jobs the user had already finished assembling.
             # bump: /job is an explicit "show me now", and a silent edit to a
             # message somewhere above would look like the command did nothing.
-            _show_panel(tg, chat_id, bump=True)
+            _maybe_show_manifest(tg, chat_id, job, bump=True)
         return
 
     if text.startswith("/clear"):
