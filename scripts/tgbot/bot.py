@@ -1224,6 +1224,13 @@ _CB_RUN_REFRESH = "run:refresh:"
 # The /gpu report's own Refresh button — separate from _CB_RUN_REFRESH
 # because /gpu has no submenus to disambiguate between.
 _CB_GPU_REFRESH = "gpu:refresh"
+# /subscribe's two-step chooser (pick a GPU, then pick a datacenter for it)
+# and /unsubscribe's per-row remove button. Short "gs:" (GPU Subscribe) so
+# none of the three is a prefix of another — same constraint _CB_PIPE_ASK's
+# comment names for this whole scheme.
+_CB_GPUSUB_PICK = "gs:pick:"  # + a key from _GPU_SHORT
+_CB_GPUSUB_DC = "gs:dc:"      # + "<gpu short>:<datacenter_id>"
+_CB_GPUSUB_RM = "gs:rm:"      # + "<gpu short>:<datacenter_id>"
 _CB_REDO = "redo:"
 _CB_CLEAR_ASK = "clr:ask"
 _CB_CLEAR_GO = "clr:go"
@@ -1398,6 +1405,24 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
             if msg_id is not None:
                 tg.edit_message(chat_id, msg_id, "🔄 Refreshing stock…")
             _report_gpu_stock(tg, chat_id, message_id=msg_id, force=True)
+
+        elif data.startswith(_CB_GPUSUB_PICK):
+            msg_id = (query.get("message") or {}).get("message_id")
+            if msg_id is not None:
+                _offer_gpu_sub_datacenters(tg, chat_id, msg_id,
+                                           data[len(_CB_GPUSUB_PICK):])
+
+        elif data.startswith(_CB_GPUSUB_DC):
+            msg_id = (query.get("message") or {}).get("message_id")
+            short, _, dc = data[len(_CB_GPUSUB_DC):].partition(":")
+            if msg_id is not None and dc:
+                _add_gpu_sub(tg, chat_id, msg_id, short, dc)
+
+        elif data.startswith(_CB_GPUSUB_RM):
+            msg_id = (query.get("message") or {}).get("message_id")
+            short, _, dc = data[len(_CB_GPUSUB_RM):].partition(":")
+            if msg_id is not None and dc:
+                _remove_gpu_sub(tg, chat_id, msg_id, short, dc)
 
         elif data.startswith(_CB_RUN_GO):
             if data[len(_CB_RUN_GO):] != _run_token(chat_id):
@@ -2977,6 +3002,10 @@ _PRIMARY_GPU_ID = "NVIDIA GeForce RTX 5090"
 _FALLBACK_GPU_IDS = ("NVIDIA GeForce RTX 4090", "NVIDIA RTX PRO 4500 Blackwell",
                      "NVIDIA L40S", "NVIDIA RTX PRO 6000 Blackwell Server Edition")
 
+# Every GPU /gpu (and /subscribe, below) knows how to check — the primary
+# plus its fallbacks, in the same order /gpu reports them.
+_GPU_CATALOG = (_PRIMARY_GPU_ID, *_FALLBACK_GPU_IDS)
+
 # callback_data stays short (Bot API caps it at 64 bytes) — a switch button
 # carries one of these keys, never the full gpuId string.
 _GPU_SHORT = {_PRIMARY_GPU_ID: "5090", "NVIDIA GeForce RTX 4090": "4090",
@@ -3089,6 +3118,186 @@ def _report_gpu_stock(tg: Tg, chat_id: int, *, message_id: int | None = None,
 
     _edit_or_send(tg, chat_id, message_id, "\n".join(lines),
                  [[("🔄 Refresh", _CB_GPU_REFRESH)]], parse_mode=PARSE_HTML)
+
+
+# One-shot GPU-stock watches: (gpu_id, datacenter_id) pairs a chat asked to
+# hear about the moment they stop being sold out. Own file per chat, not
+# folded into the draft — same reasoning as _LEDGER's (2026-09-02): a
+# subscription has nothing to do with whatever job is or isn't being
+# assembled, and _save_draft deletes the draft the instant a job clears.
+_GPU_SUBS: dict[int, list[dict]] = {}
+_GPU_SUBS_LOADED: set[int] = set()
+
+
+def _gpu_subs_path(chat_id: int) -> Path:
+    return ROOT / "batch" / f"tg-{chat_id}.gpusubs.json"
+
+
+def _gpu_subs_for(chat_id: int) -> list[dict]:
+    """Every (gpu_id, datacenter_id) this chat is watching. Loaded once per
+    process per chat, same as `_ledger_for`."""
+    if chat_id not in _GPU_SUBS_LOADED:
+        _GPU_SUBS_LOADED.add(chat_id)
+        path = _gpu_subs_path(chat_id)
+        try:
+            _GPU_SUBS[chat_id] = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            pass
+        except (ValueError, TypeError) as exc:
+            log(f"gpu subs for chat {chat_id} unreadable, starting over: {exc!r}")
+    return _GPU_SUBS.setdefault(chat_id, [])
+
+
+def _save_gpu_subs(chat_id: int) -> None:
+    path = _gpu_subs_path(chat_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(_GPU_SUBS.get(chat_id) or []), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _offer_gpu_sub_targets(tg: Tg, chat_id: int) -> None:
+    """/subscribe's first step — which of the five GPUs /gpu already tracks."""
+    tg.send_message(
+        chat_id,
+        f"{ICON_ASK_CE} <b>Subscribe to GPU stock</b>\nWhich GPU?",
+        buttons=[[(_GPU_DISPLAY_SHORT[gpu_id], _CB_GPUSUB_PICK + _GPU_SHORT[gpu_id])]
+                 for gpu_id in _GPU_CATALOG],
+        parse_mode=PARSE_HTML)
+
+
+def _offer_gpu_sub_datacenters(tg: Tg, chat_id: int, message_id: int, short: str) -> None:
+    """/subscribe's second step — every datacenter runpodctl lists for that
+    GPU right now, dot included, so subscribing to one already in stock is a
+    visible (if harmless) choice rather than a silent one."""
+    gpu_id = _GPU_BY_SHORT.get(short)
+    if gpu_id is None:
+        tg.edit_message(chat_id, message_id,
+                        "that button is from an older version of the bot; "
+                        "send /subscribe again")
+        return
+    try:
+        stock = stock_at_cached(list(_GPU_CATALOG))
+    except RuntimeError as exc:
+        tg.edit_message(chat_id, message_id, f"couldn't reach runpodctl: {exc}")
+        return
+    entries = stock.get(gpu_id) or []
+    if not entries:
+        tg.edit_message(chat_id, message_id,
+                        f"no datacenter data for {_esc(_GPU_DISPLAY_SHORT[gpu_id])} "
+                        "right now — try /subscribe again later.",
+                        parse_mode=PARSE_HTML)
+        return
+    tg.edit_message(
+        chat_id, message_id,
+        f"{ICON_ASK_CE} <b>{_esc(_GPU_DISPLAY_SHORT[gpu_id])}</b> — which datacenter?",
+        buttons=[[(f"{_stock_icon(e.stock_status.lower())} {e.datacenter_id}",
+                  f"{_CB_GPUSUB_DC}{short}:{e.datacenter_id}")]
+                 for e in entries],
+        parse_mode=PARSE_HTML)
+
+
+def _add_gpu_sub(tg: Tg, chat_id: int, message_id: int, short: str, dc: str) -> None:
+    """/subscribe's last step — record the pair and confirm in place."""
+    gpu_id = _GPU_BY_SHORT.get(short)
+    if gpu_id is None:
+        tg.edit_message(chat_id, message_id,
+                        "that button is from an older version of the bot; "
+                        "send /subscribe again")
+        return
+    subs = _gpu_subs_for(chat_id)
+    if any(s["gpu_id"] == gpu_id and s["datacenter_id"] == dc for s in subs):
+        tg.edit_message(chat_id, message_id,
+                        f"already subscribed to {_esc(_GPU_DISPLAY_SHORT[gpu_id])} "
+                        f"@ {_esc(dc)} — see /unsubscribe to remove it.")
+        return
+    subs.append({"gpu_id": gpu_id, "datacenter_id": dc})
+    _save_gpu_subs(chat_id)
+    tg.edit_message(
+        chat_id, message_id,
+        f"🔔 <b>Subscribed</b>: {_esc(_GPU_DISPLAY_SHORT[gpu_id])} @ {_esc(dc)}\n"
+        "You'll get a message here the moment it has stock — checked "
+        "automatically, no need to /gpu. Clears itself once it fires.",
+        parse_mode=PARSE_HTML)
+
+
+def _gpu_subs_lines_and_buttons(chat_id: int) -> tuple[str, list]:
+    """The /unsubscribe body — shared by the command and the remove callback,
+    which redraws the same list rather than resending it."""
+    subs = _gpu_subs_for(chat_id)
+    if not subs:
+        return "no active GPU subscriptions.", []
+    lines = ["🔔 <b>Active GPU subscriptions</b>"]
+    buttons = []
+    for s in subs:
+        short = _GPU_DISPLAY_SHORT.get(s["gpu_id"], s["gpu_id"])
+        dc = s["datacenter_id"]
+        lines.append(f"  {_esc(short)} @ {_esc(dc)}")
+        buttons.append([(f"🗑 {short} @ {dc}",
+                        f"{_CB_GPUSUB_RM}{_GPU_SHORT.get(s['gpu_id'], '')}:{dc}")])
+    return "\n".join(lines), buttons
+
+
+def _list_gpu_subs(tg: Tg, chat_id: int) -> None:
+    text, buttons = _gpu_subs_lines_and_buttons(chat_id)
+    tg.send_message(chat_id, text, buttons=buttons or None, parse_mode=PARSE_HTML)
+
+
+def _remove_gpu_sub(tg: Tg, chat_id: int, message_id: int, short: str, dc: str) -> None:
+    gpu_id = _GPU_BY_SHORT.get(short)
+    subs = _gpu_subs_for(chat_id)
+    remaining = [s for s in subs
+                if not (s["gpu_id"] == gpu_id and s["datacenter_id"] == dc)]
+    if len(remaining) != len(subs):
+        _GPU_SUBS[chat_id] = remaining
+        _save_gpu_subs(chat_id)
+    text, buttons = _gpu_subs_lines_and_buttons(chat_id)
+    tg.edit_message(chat_id, message_id, text, buttons=buttons or None,
+                    parse_mode=PARSE_HTML)
+
+
+def _tick_gpu_subs(tg: Tg, chat_id: int) -> None:
+    """Fire any subscription whose (gpu, datacenter) is no longer sold out.
+
+    Reuses `stock_at_cached` — the same 60s-TTL cache /gpu itself reads from
+    — so a chat with active subscriptions costs no extra `runpodctl` calls
+    beyond what the poll loop's own cadence already pays for. One-shot: a
+    fired subscription is removed immediately, same tick, on the user's own
+    request (2026-09-12) — "báo 1 lần rồi gỡ, giống đặt báo thức 1 lần".
+    """
+    subs = _gpu_subs_for(chat_id)
+    if not subs:
+        return
+    try:
+        stock = stock_at_cached(list(_GPU_CATALOG))
+    except RuntimeError as exc:
+        log(f"gpu-sub check skipped, will retry next tick: {exc}")
+        return
+    remaining: list[dict] = []
+    fired: list[tuple[dict, object]] = []
+    for sub in subs:
+        entries = stock.get(sub["gpu_id"]) or []
+        hit = next((e for e in entries
+                   if e.datacenter_id == sub["datacenter_id"]
+                   and e.stock_status.lower() != "none"), None)
+        if hit is None:
+            remaining.append(sub)
+        else:
+            fired.append((sub, hit))
+    if fired:
+        _GPU_SUBS[chat_id] = remaining
+        _save_gpu_subs(chat_id)
+    for sub, hit in fired:
+        short = _GPU_DISPLAY_SHORT.get(sub["gpu_id"], sub["gpu_id"])
+        price = f"${hit.price_per_hr:.2f}/h" if hit.price_per_hr else "?"
+        tg.send_message(
+            chat_id,
+            f"🔔 <b>{_esc(short)}</b> is now available at "
+            f"<b>{_esc(sub['datacenter_id'])}</b>: "
+            f"{_stock_icon(hit.stock_status.lower())} {_esc(hit.stock_status)} · "
+            f"{ICON_MONEY_CE} {price}\n"
+            "This subscription cleared itself — /subscribe again to re-arm.",
+            parse_mode=PARSE_HTML)
 
 
 def _gpu_price(gpu_id: str, stock: dict) -> float:
@@ -4237,6 +4446,14 @@ def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
         _report_gpu_stock(tg, chat_id)
         return
 
+    if text.startswith("/subscribe"):
+        _offer_gpu_sub_targets(tg, chat_id)
+        return
+
+    if text.startswith("/unsubscribe"):
+        _list_gpu_subs(tg, chat_id)
+        return
+
     if text.startswith("/kill"):
         _ask_kill(tg, chat_id)
         return
@@ -4307,6 +4524,8 @@ BOT_COMMANDS = [
     ("tryon", "just the try-on image, when the result looks wrong"),
     ("wipe", "delete every message in this chat, yours and mine"),
     ("gpu", "check RunPod 5090 stock before you rent — free"),
+    ("subscribe", "get a message the moment a GPU has stock in a region"),
+    ("unsubscribe", "stop watching a GPU/region — list and remove"),
     ("kill", "EMERGENCY STOP - destroys the pod right now, abandons the run"),
 ]
 
@@ -4377,6 +4596,7 @@ def main() -> int:
             # One chat, because the allowlist is one user (spec section 2).
             tick_progress(tg, allowed_user_id)
             tick_migration_progress(tg, allowed_user_id)
+            _tick_gpu_subs(tg, allowed_user_id)
             _tick_staging_prune()
         except TgError as exc:
             log(f"poll failed, continuing: {exc}")
