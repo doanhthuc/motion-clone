@@ -3752,6 +3752,28 @@ class TestPreviews(unittest.TestCase):
         self.assertIn(bot._CB_RUN_ASK, self.tg.callback_data())
         self.assertIn(ME, bot._PANEL_IS_PHOTO)
 
+    def test_job_restores_the_picture_after_a_restart_wiped_LAST_VALIDATE(self):
+        """Regression: a deploy always ends with `systemctl restart motion-bot`
+        (scripts/vps/deploy-bot.sh), and `_LAST_VALIDATE` is deliberately
+        memory-only (see `_save_draft`'s docstring) — slots/basket come back
+        from the on-disk draft, but the validate verdict does not.
+
+        Before the fix, `/job` called `_show_panel` directly, which
+        `_sheet_for` refuses to draw a picture for unless `_LAST_VALIDATE` is
+        True — so a chat reopened right after a deploy got a text-only panel
+        for a job that had a picture before the restart, with no way back to
+        it short of editing a slot. `/job` must re-validate for free (like
+        every other panel redraw already does) and restore the picture.
+        """
+        job = self._ready_job()
+        bot._LAST_VALIDATE.pop(ME, None)     # what a restart actually leaves
+        passed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with mock.patch("tgbot.bot.sheet", return_value=self.shot), \
+             mock.patch("tgbot.bot.subprocess.run", return_value=passed):
+            bot.handle(self.tg, cmd_from(ME, "/job"), allowed_user_id=ME)
+        self.assertEqual(len(self.tg.photos), 1)
+        self.assertTrue(bot._LAST_VALIDATE.get(ME))
+
     def test_a_redraw_edits_the_caption_rather_than_resending_the_picture(self):
         job = self._ready_job()
         with mock.patch("tgbot.bot.sheet", return_value=self.shot):
