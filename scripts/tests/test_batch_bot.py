@@ -4467,6 +4467,36 @@ class TestGpuSubscribe(unittest.TestCase):
                          {bot._CB_GPUSUB_DC + "5090:EU-RO-1",
                           bot._CB_GPUSUB_DC + "5090:EU-CZ-1"})
 
+    def test_home_datacenter_is_marked_and_others_carry_the_migration_caveat(self):
+        """Regression (2026-09-12): the un-annotated list read as "5090 has
+        stock in 5 datacenters", when only the volume's own datacenter is
+        actually rentable without a ~15-25 min migration first — the same
+        caveat /gpu's own "Other regions" section already states."""
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
+            bot.handle(self.tg, cb_from(ME, bot._CB_GPUSUB_PICK + "5090"),
+                      allowed_user_id=ME)
+        text = self.tg.screen[-1]
+        self.assertIn(bot.MIGRATE_DURATION_SHORT, text)
+        labels = [label for row in last_buttons(self.tg) for label, _ in row]
+        self.assertTrue(any("📍" in label and "EU-RO-1" in label for label in labels))
+        self.assertTrue(all("📍" not in label for label in labels
+                           if "EU-CZ-1" in label))
+
+    def test_subscribing_to_a_non_home_datacenter_warns_it_needs_a_migration(self):
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"):
+            bot.handle(self.tg, cb_from(ME, bot._CB_GPUSUB_DC + "5090:EU-CZ-1"),
+                      allowed_user_id=ME)
+        text = self.tg.screen[-1]
+        self.assertIn("not your volume's home datacenter", text)
+        self.assertIn(bot.MIGRATE_DURATION_SHORT, text)
+
+    def test_subscribing_to_the_home_datacenter_has_no_caveat(self):
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"):
+            bot.handle(self.tg, cb_from(ME, bot._CB_GPUSUB_DC + "5090:EU-RO-1"),
+                      allowed_user_id=ME)
+        self.assertNotIn("home datacenter", self.tg.screen[-1])
+
     def test_a_stale_pick_button_is_refused(self):
         bot.handle(self.tg, cb_from(ME, bot._CB_GPUSUB_PICK + "not-a-real-gpu"),
                   allowed_user_id=ME)
