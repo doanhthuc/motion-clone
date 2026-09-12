@@ -143,7 +143,8 @@ def reset_bot_state():
                  "_CONFIRM_WARNED", "_PANEL", "_PANEL_NOTE", "_LAST_SEEN",
                  "_ANIM_PAUSE", "_ALBUM_KEY", "_FIDELITY",
                  "_PANEL_IS_PHOTO", "_STRIP", "_BASKET",
-                 "_LEDGER", "_LEDGER_LOADED", "_MIGRATE_PROC"):
+                 "_LEDGER", "_LEDGER_LOADED", "_MIGRATE_PROC",
+                 "_GPU_SUBS", "_GPU_SUBS_LOADED"):
         # getattr, not bot._STATE etc: a name that disappears from bot.py
         # should fail here loudly rather than be silently skipped.
         getattr(bot, name).clear()
@@ -4417,6 +4418,149 @@ class TestGpuStockCommand(unittest.TestCase):
         self.assertIn("couldn't reach runpodctl", text)
         flat_data = [data for row in last_buttons(self.tg) for _, data in row]
         self.assertEqual(flat_data, [bot._CB_GPU_REFRESH])
+
+
+class TestGpuSubscribe(unittest.TestCase):
+    """/subscribe + /unsubscribe — a one-shot watch on a (GPU, datacenter)
+    pair, added 2026-09-12 on the user's own request: "subscribe loại gpu
+    available trong region một region nào đó nếu có thì gửi tin nhắn thông
+    báo và cũng cho unsubscribe nữa"."""
+
+    def setUp(self):
+        self._orig_root = bot.ROOT
+        self.root = Path(tempfile.mkdtemp())
+        bot.ROOT = self.root
+        reset_bot_state()
+        self.tg = FakeTg()
+
+    def tearDown(self):
+        bot.ROOT = self._orig_root
+        reset_bot_state()
+
+    def _stock(self, status_5090_ro="none", status_5090_cz="High"):
+        return {
+            "NVIDIA GeForce RTX 5090": [
+                Stock(gpu_id="NVIDIA GeForce RTX 5090", display_name="RTX 5090",
+                     price_per_hr=0.99, datacenter_id="EU-RO-1",
+                     stock_status=status_5090_ro),
+                Stock(gpu_id="NVIDIA GeForce RTX 5090", display_name="RTX 5090",
+                     price_per_hr=0.99, datacenter_id="EU-CZ-1",
+                     stock_status=status_5090_cz),
+            ],
+        }
+
+    def test_subscribe_offers_the_five_catalog_gpus(self):
+        bot.handle(self.tg, cmd_from(ME, "/subscribe"), allowed_user_id=ME)
+        flat = [data for row in last_buttons(self.tg) for _, data in row]
+        self.assertEqual(len(flat), 5)
+        self.assertTrue(all(d.startswith(bot._CB_GPUSUB_PICK) for d in flat))
+        self.assertIn(bot._CB_GPUSUB_PICK + "5090", flat)
+
+    def test_picking_a_gpu_offers_its_current_datacenters(self):
+        with mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
+            bot.handle(self.tg, cb_from(ME, bot._CB_GPUSUB_PICK + "5090"),
+                      allowed_user_id=ME)
+        text = self.tg.screen[-1]
+        self.assertIn("RTX 5090", text)
+        flat = [data for row in last_buttons(self.tg) for _, data in row]
+        self.assertEqual(set(flat),
+                         {bot._CB_GPUSUB_DC + "5090:EU-RO-1",
+                          bot._CB_GPUSUB_DC + "5090:EU-CZ-1"})
+
+    def test_a_stale_pick_button_is_refused(self):
+        bot.handle(self.tg, cb_from(ME, bot._CB_GPUSUB_PICK + "not-a-real-gpu"),
+                  allowed_user_id=ME)
+        self.assertIn("older version of the bot", self.tg.screen[-1])
+
+    def test_choosing_a_datacenter_subscribes_and_confirms(self):
+        bot.handle(self.tg, cb_from(ME, bot._CB_GPUSUB_DC + "5090:EU-RO-1"),
+                  allowed_user_id=ME)
+        text = self.tg.screen[-1]
+        self.assertIn("Subscribed", text)
+        self.assertIn("RTX 5090", text)
+        self.assertIn("EU-RO-1", text)
+        subs = bot._gpu_subs_for(ME)
+        self.assertEqual(subs, [{"gpu_id": "NVIDIA GeForce RTX 5090",
+                                 "datacenter_id": "EU-RO-1"}])
+
+    def test_subscribing_to_the_same_pair_twice_is_refused(self):
+        bot.handle(self.tg, cb_from(ME, bot._CB_GPUSUB_DC + "5090:EU-RO-1"),
+                  allowed_user_id=ME)
+        bot.handle(self.tg, cb_from(ME, bot._CB_GPUSUB_DC + "5090:EU-RO-1"),
+                  allowed_user_id=ME)
+        self.assertIn("already subscribed", self.tg.screen[-1])
+        self.assertEqual(len(bot._gpu_subs_for(ME)), 1)
+
+    def test_unsubscribe_with_none_active_says_so(self):
+        bot.handle(self.tg, cmd_from(ME, "/unsubscribe"), allowed_user_id=ME)
+        self.assertEqual(self.tg.messages[-1], "no active GPU subscriptions.")
+
+    def test_unsubscribe_lists_every_active_subscription_with_a_remove_button(self):
+        bot.handle(self.tg, cb_from(ME, bot._CB_GPUSUB_DC + "5090:EU-RO-1"),
+                  allowed_user_id=ME)
+        bot.handle(self.tg, cb_from(ME, bot._CB_GPUSUB_DC + "4090:EU-RO-1"),
+                  allowed_user_id=ME)
+        bot.handle(self.tg, cmd_from(ME, "/unsubscribe"), allowed_user_id=ME)
+        text = self.tg.messages[-1]
+        self.assertIn("EU-RO-1", text)
+        flat = [data for row in last_buttons(self.tg) for _, data in row]
+        self.assertEqual(set(flat),
+                         {bot._CB_GPUSUB_RM + "5090:EU-RO-1",
+                          bot._CB_GPUSUB_RM + "4090:EU-RO-1"})
+
+    def test_tapping_remove_drops_only_that_one(self):
+        bot.handle(self.tg, cb_from(ME, bot._CB_GPUSUB_DC + "5090:EU-RO-1"),
+                  allowed_user_id=ME)
+        bot.handle(self.tg, cb_from(ME, bot._CB_GPUSUB_DC + "4090:EU-RO-1"),
+                  allowed_user_id=ME)
+        bot.handle(self.tg, cb_from(ME, bot._CB_GPUSUB_RM + "5090:EU-RO-1"),
+                  allowed_user_id=ME)
+        subs = bot._gpu_subs_for(ME)
+        self.assertEqual(subs, [{"gpu_id": "NVIDIA GeForce RTX 4090",
+                                 "datacenter_id": "EU-RO-1"}])
+        # The redrawn list reflects the removal in place, not a fresh send.
+        self.assertNotIn("RTX 5090", self.tg.edits[-1][1])
+        self.assertIn("RTX 4090", self.tg.edits[-1][1])
+
+    def test_tick_fires_and_clears_when_stock_appears(self):
+        bot._gpu_subs_for(ME).append({"gpu_id": "NVIDIA GeForce RTX 5090",
+                                      "datacenter_id": "EU-RO-1"})
+        bot._save_gpu_subs(ME)
+        with mock.patch("tgbot.bot.stock_at_cached",
+                       return_value=self._stock(status_5090_ro="High")):
+            bot._tick_gpu_subs(self.tg, ME)
+        text = self.tg.messages[-1]
+        self.assertIn("RTX 5090", text)
+        self.assertIn("EU-RO-1", text)
+        self.assertIn("now available", text)
+        self.assertEqual(bot._gpu_subs_for(ME), [])
+
+    def test_tick_does_nothing_while_still_sold_out(self):
+        bot._gpu_subs_for(ME).append({"gpu_id": "NVIDIA GeForce RTX 5090",
+                                      "datacenter_id": "EU-RO-1"})
+        bot._save_gpu_subs(ME)
+        with mock.patch("tgbot.bot.stock_at_cached",
+                       return_value=self._stock(status_5090_ro="none")):
+            bot._tick_gpu_subs(self.tg, ME)
+        self.assertEqual(self.tg.messages, [])
+        self.assertEqual(len(bot._gpu_subs_for(ME)), 1)
+
+    def test_tick_is_a_free_noop_with_nothing_subscribed(self):
+        with mock.patch("tgbot.bot.stock_at_cached") as cached:
+            bot._tick_gpu_subs(self.tg, ME)
+        cached.assert_not_called()
+
+    def test_subscriptions_survive_a_restart(self):
+        """Same guarantee as the ledger's own docstring: a subscription has
+        nothing to do with the draft/basket, so it must not depend on
+        `_STATE` surviving — only the file on disk does."""
+        bot.handle(self.tg, cb_from(ME, bot._CB_GPUSUB_DC + "5090:EU-RO-1"),
+                  allowed_user_id=ME)
+        bot._GPU_SUBS.clear()
+        bot._GPU_SUBS_LOADED.clear()   # what a fresh process actually starts with
+        self.assertEqual(bot._gpu_subs_for(ME),
+                        [{"gpu_id": "NVIDIA GeForce RTX 5090",
+                          "datacenter_id": "EU-RO-1"}])
 
 
 class TestKillCommand(unittest.TestCase):
