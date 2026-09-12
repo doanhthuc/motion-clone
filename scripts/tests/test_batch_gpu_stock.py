@@ -120,6 +120,25 @@ class TestStockAt(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             stock_at(["NVIDIA GeForce RTX 5090"])
 
+    @patch("subprocess.run")
+    def test_include_unavailable_appends_the_cli_flag(self, mock_run):
+        """A GPU with zero stock at every datacenter is dropped from
+        runpodctl's default `gpu list` output entirely (verified live
+        2026-09-12) — /subscribe needs exactly those rows, since that is
+        the moment subscribing is the point."""
+        mock_run.return_value = MagicMock(returncode=0, stdout=_GPU_LIST_JSON, stderr="")
+        stock_at(["NVIDIA GeForce RTX 5090"], include_unavailable=True)
+        self.assertEqual(mock_run.call_args[0][0],
+                         ["runpodctl", "gpu", "list", "-o", "json",
+                          "--include-unavailable"])
+
+    @patch("subprocess.run")
+    def test_the_flag_is_omitted_by_default(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout=_GPU_LIST_JSON, stderr="")
+        stock_at(["NVIDIA GeForce RTX 5090"])
+        self.assertEqual(mock_run.call_args[0][0],
+                         ["runpodctl", "gpu", "list", "-o", "json"])
+
 
 class TestStockAtCached(unittest.TestCase):
     def setUp(self):
@@ -160,6 +179,16 @@ class TestStockAtCached(unittest.TestCase):
         mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="down")
         stale = stock_at_cached(["NVIDIA GeForce RTX 5090"], ttl=0.0)
         self.assertEqual(warm, stale)
+
+    @patch("subprocess.run")
+    def test_include_unavailable_is_its_own_cache_key(self, mock_run):
+        """The plain and include_unavailable calls hit different runpodctl
+        invocations, so one must not shadow or be served by the other."""
+        mock_run.return_value = MagicMock(returncode=0, stdout=_GPU_LIST_JSON, stderr="")
+        stock_at_cached(["NVIDIA GeForce RTX 5090"])
+        stock_at_cached(["NVIDIA GeForce RTX 5090"], include_unavailable=True)
+        self.assertEqual(mock_run.call_count, 2)
+        self.assertIn("--include-unavailable", mock_run.call_args[0][0])
 
 
 if __name__ == "__main__":

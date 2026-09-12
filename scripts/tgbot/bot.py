@@ -3186,6 +3186,15 @@ def _offer_gpu_sub_datacenters(tg: Tg, chat_id: int, message_id: int, short: str
     is marked and every other one carries that same caveat /gpu already
     states — a user report (2026-09-12) found the un-annotated list
     surprising: "5090 hình như chỉ có trên 2 datacenter thôi mà".
+
+    Asks for `include_unavailable` (2026-09-12, same user's next report): a
+    GPU with zero stock at EVERY datacenter is dropped from runpodctl's
+    default output entirely, so the plain `stock_at_cached` this bot's other
+    call sites use would show nothing to subscribe to at exactly the moment
+    subscribing is the point — the user was mid-sentence about it: "5090
+    đang hết ở các datacenter nên tôi mới làm tính năng subscribe này".
+    /gpu itself does not ask for this — it already has its own "sold out
+    everywhere" line for the absent case.
     """
     gpu_id = _GPU_BY_SHORT.get(short)
     if gpu_id is None:
@@ -3194,15 +3203,16 @@ def _offer_gpu_sub_datacenters(tg: Tg, chat_id: int, message_id: int, short: str
                         "send /subscribe again")
         return
     try:
-        stock = stock_at_cached(list(_GPU_CATALOG))
+        stock = stock_at_cached(list(_GPU_CATALOG), include_unavailable=True)
     except RuntimeError as exc:
         tg.edit_message(chat_id, message_id, f"couldn't reach runpodctl: {exc}")
         return
     entries = stock.get(gpu_id) or []
     if not entries:
         tg.edit_message(chat_id, message_id,
-                        f"no datacenter data for {_esc(_GPU_DISPLAY_SHORT[gpu_id])} "
-                        "right now — try /subscribe again later.",
+                        f"runpodctl doesn't list any datacenter at all for "
+                        f"{_esc(_GPU_DISPLAY_SHORT[gpu_id])} right now — try "
+                        "/subscribe again later.",
                         parse_mode=PARSE_HTML)
         return
     home_dc = _home_datacenter()
