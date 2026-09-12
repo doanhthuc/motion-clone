@@ -1499,9 +1499,13 @@ class TestFlow(unittest.TestCase):
         rows = [b for b in self.tg.buttons if b
                 and any(d.startswith(bot._CB_SLOT) for row in b for _, d, *_ in row)][-1]
         self.assertTrue(all(len(row) <= 2 for row in rows), rows)
-        labels = {d: label for row in rows for label, d, *_ in row}
-        self.assertIn(bot.ICON_OK, labels[bot._CB_SLOT + "character"])
-        self.assertNotIn(bot.ICON_OK, labels[bot._CB_SLOT + "outfit"])
+        # The checkmark is now an animated icon_custom_emoji_id, not text
+        # (2026-09-12) — same button/text split _fix_buttons' driver redo
+        # button already uses, so the label itself carries only the role.
+        icons = {d: (icon[0] if icon else None)
+                 for row in rows for _, d, *icon in row}
+        self.assertEqual(bot._ce_id(bot.ICON_OK_CE), icons[bot._CB_SLOT + "character"])
+        self.assertIsNone(icons[bot._CB_SLOT + "outfit"])
 
     def test_the_slot_question_hints_that_a_checked_role_can_be_replaced(self):
         # A checkmark alone doesn't say what tapping it does — the fix for
