@@ -170,6 +170,17 @@ class TestKeyboard(unittest.TestCase):
             [{"text": "Run", "callback_data": "run:ask"},
              {"text": "Cancel", "callback_data": "run:no"}]]})
 
+    def test_a_button_can_carry_an_icon_custom_emoji_id(self):
+        # Bot API 9.4 added icon_custom_emoji_id as a field alongside `text`,
+        # not inside it — the same eligibility this bot already has for
+        # message-text tg-emoji (owner's Telegram Premium, see bot.py's
+        # `_ce()`). A 3-tuple opts a button into the icon; 2-tuples (every
+        # existing call site) must keep working unchanged.
+        markup = Tg.keyboard([[("Run", "run:ask", "5395695537687123235")]])
+        self.assertEqual(markup, {"inline_keyboard": [
+            [{"text": "Run", "callback_data": "run:ask",
+              "icon_custom_emoji_id": "5395695537687123235"}]]})
+
     def test_callback_data_over_64_bytes_is_refused_loudly(self):
         # The Bot API caps callback_data at 64 bytes and rejects the whole
         # sendMessage when a button exceeds it — so the user would see NO

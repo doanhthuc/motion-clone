@@ -1673,6 +1673,16 @@ def _ce(emoji_id: str, glyph: str) -> str:
     return f'<tg-emoji emoji-id="{emoji_id}">{glyph}</tg-emoji>'
 
 
+# Buttons can't carry the `_ce()` HTML tag (Telegram renders button text
+# literally, no parsing) but Bot API 9.4 added a field just for this,
+# icon_custom_emoji_id, that Tg.keyboard() accepts as an optional 3rd tuple
+# element — same eligibility as `_ce()` (owner's Telegram Premium). This pulls
+# the id back out of an already-built `_ce()` string instead of hardcoding it
+# a second time at the button call site, so the two never drift apart.
+def _ce_id(ce: str) -> str:
+    return re.search(r'emoji-id="(\d+)"', ce).group(1)
+
+
 # Role icons are shown in two kinds of place: button labels (_ask_about's
 # rows, the redo button) and HTML message text (_role_line, _sheet_caption).
 # Buttons cannot carry entities — Telegram renders their text literally, no
@@ -1837,8 +1847,16 @@ def _fix_buttons(job: Job) -> list[list[tuple[str, str]]]:
     if _tryon_stage(job.pipeline) is not None:
         labels.append(("☁️" if job.provider != DEFAULT_PROVIDER else "🖥",
                        _CB_PROVIDER_ASK))
-    labels += [(f"🔁{ROLE_ICON.get(role, '')}", _CB_REDO + role)
-               for role in sorted(job.slots)]
+    for role in sorted(job.slots):
+        # driver is the one role whose CE differs from its plain glyph (a
+        # TikTok logo, not a generic clapper — see ROLE_ICON_CE above), so
+        # its redo button gets that icon via icon_custom_emoji_id instead of
+        # spelling both glyphs out in plain text. The others have no CE id,
+        # so their buttons are unchanged.
+        if role == "driver":
+            labels.append(("🔁", _CB_REDO + role, _ce_id(ROLE_ICON_CE["driver"])))
+        else:
+            labels.append((f"🔁{ROLE_ICON.get(role, '')}", _CB_REDO + role))
     return [labels]
 
 
@@ -3218,17 +3236,21 @@ def _offer_gpu_sub_datacenters(tg: Tg, chat_id: int, message_id: int, short: str
     home_dc = _home_datacenter()
     buttons = []
     for e in entries:
-        # _STOCK_ICON's plain dot, NOT _stock_icon() — that wrapper adds
-        # ICON_CRITICAL_CE (an animated <tg-emoji> tag) for "none", and a
-        # button label is plain text Telegram never parses (same reason
-        # ROLE_ICON stays plain for buttons while ROLE_ICON_CE is text-only)
-        # — sent through here, the tag showed up as literal angle-bracket
-        # text on every "none" button (reported 2026-09-12).
+        # _STOCK_ICON's plain dot, NOT _stock_icon() — that wrapper's siren
+        # is an HTML <tg-emoji> tag meant for message text, and a button's
+        # `text` is plain, unparsed Telegram-side (reported 2026-09-12: it
+        # showed up as literal angle-bracket text on every "none" button).
+        # icon_custom_emoji_id (Bot API 9.4) is the field that actually lets
+        # a BUTTON carry it, added below instead.
         dot = _STOCK_ICON.get(e.stock_status.lower(), "⬜")
         label = f"{dot} {e.datacenter_id}"
         if e.datacenter_id == home_dc:
             label = f"📍 {label}"
-        buttons.append([(label, f"{_CB_GPUSUB_DC}{short}:{e.datacenter_id}")])
+        data = f"{_CB_GPUSUB_DC}{short}:{e.datacenter_id}"
+        if e.stock_status.lower() == "none":
+            buttons.append([(label, data, _ce_id(ICON_CRITICAL_CE))])
+        else:
+            buttons.append([(label, data)])
     if home_dc is None:
         note = "\n(volume datacenter unknown — showing every region)"
     elif any(e.datacenter_id != home_dc for e in entries):
