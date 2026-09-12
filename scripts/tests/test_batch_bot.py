@@ -230,6 +230,7 @@ class FakeTg:
     def send_message(self, chat_id, text, *, buttons=None, reply_keyboard=None,
                      parse_mode=None):
         self._check_markup(text, parse_mode)
+        self._check_buttons(buttons)
         self.messages.append(text)
         self.screen.append(text)
         self.screen_buttons.append(buttons)
@@ -250,6 +251,7 @@ class FakeTg:
         if self.edit_raises is not None:
             raise self.edit_raises
         self._check_markup(text, parse_mode)
+        self._check_buttons(buttons)
         self.edits.append((message_id, text))
         self.screen.append(text)
         self.screen_buttons.append(buttons)
@@ -294,6 +296,22 @@ class FakeTg:
                 f"unescaped {ch!r} in an HTML message — Telegram would reject "
                 f"the whole thing: {text[:160]!r}")
 
+    def _check_buttons(self, buttons):
+        """Button labels are plain text Telegram never parses — no parse_mode
+        field exists for them at all (2026-09-12 bug: a stock-icon helper
+        meant for HTML message text leaked into a button label, and its
+        <tg-emoji> tag showed up as literal angle-bracket text on screen
+        instead of being stripped or rendered). Any tag-shaped content here
+        is that same class of bug, not a false positive — real button text
+        never legitimately contains "<"."""
+        if not buttons:
+            return
+        for row in buttons:
+            for label, _ in row:
+                assert "<" not in label and ">" not in label, (
+                    f"button label contains raw markup, Telegram renders "
+                    f"button text literally: {label[:160]!r}")
+
     def answer_callback_query(self, callback_id, text=""):
         self.answered.append(callback_id)
 
@@ -317,6 +335,7 @@ class FakeTg:
         if self.photo_raises is not None:
             raise self.photo_raises
         self._check_markup(caption, parse_mode)
+        self._check_buttons(buttons)
         self.photos.append((path, caption))
         self.screen.append(caption)
         self.buttons.append(buttons)
@@ -328,6 +347,7 @@ class FakeTg:
     def edit_message_caption(self, chat_id, message_id, caption, *, buttons=None,
                              parse_mode=None):
         self._check_markup(caption, parse_mode)
+        self._check_buttons(buttons)
         self.caption_edits.append((message_id, caption))
         self.screen.append(caption)
         self.edit_buttons.append(buttons)
