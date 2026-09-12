@@ -52,7 +52,8 @@ def volume_datacenter(volume_id: str) -> str | None:
     return data.get("dataCenterId") or data.get("datacenterId") or None
 
 
-def stock_at(gpu_ids: list[str]) -> dict[str, list[Stock]]:
+def stock_at(gpu_ids: list[str], *, include_unavailable: bool = False
+            ) -> dict[str, list[Stock]]:
     """Every datacenter each requested gpu_id is listed at, stock included.
 
     One entry per (gpu, datacenter) pair rather than a single collapsed
@@ -60,11 +61,23 @@ def stock_at(gpu_ids: list[str]) -> dict[str, list[Stock]]:
     option here (docs/gpu-pod.md's EU-CZ-1 failover), so the caller needs
     to see every candidate, not just the one that matters most, and decide
     how to rank/highlight them. A gpu_id runpodctl does not currently list
-    at all is simply absent from the result.
+    at all is simply absent from the result — UNLESS `include_unavailable`,
+    which is the one case that gap matters: a GPU with zero stock at every
+    datacenter is dropped from runpodctl's default output entirely (verified
+    live 2026-09-12 — a sold-out 5090 vanishes from the plain `gpu list` and
+    only reappears with `--include-unavailable`, every datacenter reporting
+    "none"), and /subscribe needs exactly those "none" rows to offer a
+    datacenter to watch. /gpu itself does NOT set this — it already renders
+    "sold out everywhere" for an absent gpu_id, and turning that branch into
+    a full per-datacenter "none" listing is a cosmetic change nobody asked
+    for, so this stays opt-in per call rather than the new default.
     """
+    cmd = ["runpodctl", "gpu", "list", "-o", "json"]
+    if include_unavailable:
+        cmd.append("--include-unavailable")
     try:
-        out = subprocess.run(["runpodctl", "gpu", "list", "-o", "json"],
-                             capture_output=True, text=True, timeout=_TIMEOUT_SEC)
+        out = subprocess.run(cmd, capture_output=True, text=True,
+                             timeout=_TIMEOUT_SEC)
     except (OSError, subprocess.SubprocessError) as exc:
         # Same OSError-vs-SubprocessError split as volume_datacenter above,
         # but this function DOES raise on failure (its callers decide how
@@ -97,16 +110,21 @@ def stock_at(gpu_ids: list[str]) -> dict[str, list[Stock]]:
 
 
 _CACHE_TTL_SEC = 60.0
-# keyed on the exact gpu_ids tuple asked for, so bot.py's three call sites
+# Keyed on (gpu_ids tuple, include_unavailable), so bot.py's plain call sites
 # (the panel, /confirm, /gpu) share one warm entry as long as they all ask
-# for the same list — which they do, [_PRIMARY_GPU_ID, *_FALLBACK_GPU_IDS].
-_cache: dict[tuple[str, ...], tuple[float, dict[str, list[Stock]]]] = {}
+# for the same list — which they do, [_PRIMARY_GPU_ID, *_FALLBACK_GPU_IDS] —
+# and /subscribe's include_unavailable=True call gets its own entry rather
+# than either colliding with or being shadowed by the plain one, since the
+# two are genuinely different runpodctl invocations.
+_cache: dict[tuple[tuple[str, ...], bool], tuple[float, dict[str, list[Stock]]]] = {}
 
 
-def stock_at_cached(gpu_ids: list[str], *, ttl: float = _CACHE_TTL_SEC
+def stock_at_cached(gpu_ids: list[str], *, ttl: float = _CACHE_TTL_SEC,
+                    include_unavailable: bool = False
                     ) -> dict[str, list[Stock]]:
-    """stock_at, but skips the runpodctl round trip if the same gpu_ids were
-    asked for within the last `ttl` seconds.
+    """stock_at, but skips the runpodctl round trip if the same gpu_ids
+    (and the same include_unavailable) were asked for within the last `ttl`
+    seconds.
 
     Exists because the Telegram bot's panel redraws on nearly every action
     while a batch is assembled — a file upload, a slot answer, a pipeline
@@ -124,13 +142,13 @@ def stock_at_cached(gpu_ids: list[str], *, ttl: float = _CACHE_TTL_SEC
     call currently fails, on the theory that a slightly stale number beats
     turning a working panel into a broken one because RunPod hiccuped.
     """
-    key = tuple(gpu_ids)
+    key = (tuple(gpu_ids), include_unavailable)
     now = time.monotonic()
     cached = _cache.get(key)
     if cached is not None and now - cached[0] < ttl:
         return cached[1]
     try:
-        result = stock_at(gpu_ids)
+        result = stock_at(gpu_ids, include_unavailable=include_unavailable)
     except RuntimeError:
         if cached is not None:
             return cached[1]

@@ -4497,6 +4497,42 @@ class TestGpuSubscribe(unittest.TestCase):
                       allowed_user_id=ME)
         self.assertNotIn("home datacenter", self.tg.screen[-1])
 
+    def test_the_datacenter_picker_asks_for_sold_out_gpus_too(self):
+        """Regression (2026-09-12): runpodctl's default `gpu list` drops a
+        GPU with zero stock at every datacenter entirely — the moment
+        subscribing is the point ("5090 đang hết ở các datacenter nên tôi
+        mới làm tính năng subscribe này"). The picker must ask
+        stock_at_cached for include_unavailable=True, not the plain call
+        every other caller uses."""
+        with mock.patch("tgbot.bot.stock_at_cached",
+                       return_value=self._stock()) as cached:
+            bot.handle(self.tg, cb_from(ME, bot._CB_GPUSUB_PICK + "5090"),
+                      allowed_user_id=ME)
+        cached.assert_called_once_with(list(bot._GPU_CATALOG),
+                                       include_unavailable=True)
+
+    def test_a_gpu_sold_out_everywhere_can_still_be_subscribed_to(self):
+        sold_out_everywhere = {
+            "NVIDIA GeForce RTX 5090": [
+                Stock(gpu_id="NVIDIA GeForce RTX 5090", display_name="RTX 5090",
+                     price_per_hr=0.99, datacenter_id="EU-RO-1",
+                     stock_status="none"),
+                Stock(gpu_id="NVIDIA GeForce RTX 5090", display_name="RTX 5090",
+                     price_per_hr=0.99, datacenter_id="EU-CZ-1",
+                     stock_status="none"),
+            ],
+        }
+        with mock.patch("tgbot.bot.stock_at_cached",
+                       return_value=sold_out_everywhere):
+            bot.handle(self.tg, cb_from(ME, bot._CB_GPUSUB_PICK + "5090"),
+                      allowed_user_id=ME)
+        text = self.tg.screen[-1]
+        self.assertIn("which datacenter", text)
+        flat = [data for row in last_buttons(self.tg) for _, data in row]
+        self.assertEqual(set(flat),
+                         {bot._CB_GPUSUB_DC + "5090:EU-RO-1",
+                          bot._CB_GPUSUB_DC + "5090:EU-CZ-1"})
+
     def test_a_stale_pick_button_is_refused(self):
         bot.handle(self.tg, cb_from(ME, bot._CB_GPUSUB_PICK + "not-a-real-gpu"),
                   allowed_user_id=ME)
