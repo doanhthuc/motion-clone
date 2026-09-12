@@ -244,6 +244,59 @@ class TestProgressBar(unittest.TestCase):
         # cannot see what is still to come.
         self.assertIn("enhance", text)
 
+    def test_each_run_shows_only_its_own_pipelines_stages(self):
+        """Regression: a batch mixing pipelines rendered EVERY job with the
+        union of all jobs' stages (2026-09-12, reported live) — a
+        character-swap-enhance run showed unchecked camera-tryon/camera-motion
+        boxes it would never run, and a tryon-camera-motion-enhance run showed
+        an unchecked character-swap box it would never run. The per-run
+        checklist must come from that run's OWN pipeline in the manifest, not
+        the flat `stages` list (which stays only a fallback denominator)."""
+        self.manifest.write_text(
+            "runs:\n"
+            "  - id: job-swap\n"
+            "    pipeline: character-swap-enhance\n"
+            "    inputs: { character: c.jpg, driver: d.mp4 }\n"
+            "  - id: job-camera\n"
+            "    pipeline: tryon-camera-motion-enhance\n"
+            "    inputs: { character: c.jpg, outfit: o.jpg, background: b.jpg, driver: d.mp4 }\n"
+            "    camera-motion: { preset: drv-5s }\n",
+            encoding="utf-8")
+        self._state({"batch": "b", "runs": {
+            "job-swap": {"status": "running", "stages": {
+                "character-swap": {"status": "done"},
+                "enhance": {"status": "running"}}},
+            "job-camera": {"status": "running", "stages": {
+                "camera-tryon": {"status": "done"},
+                "camera-motion": {"status": "running"}}},
+        }})
+        text = progress_text(self.manifest, lease=None,
+                             stages=["character-swap", "enhance",
+                                     "camera-tryon", "camera-motion"])
+        # Each run's bar must read against ITS OWN pipeline length (2 and 3
+        # stages respectively), not the 4-stage batch-wide union both would
+        # have shown as "1/4" under the bug.
+        self.assertIn("1/2", text)
+        self.assertIn("1/3", text)
+        self.assertNotIn("1/4", text)
+        # Split the message into its two per-run blocks at each bar line
+        # ("▰..." / "N/M") — runs are rendered sorted by id, so job-camera's
+        # block ("c" < "s") comes first.
+        lines = text.splitlines()
+        bar_idxs = [i for i, l in enumerate(lines) if l.startswith("▰")]
+        self.assertEqual(len(bar_idxs), 2, "expected one bar per run")
+        camera_block = "\n".join(lines[bar_idxs[0]:bar_idxs[1]])
+        swap_block = "\n".join(lines[bar_idxs[1]:])
+        # job-camera's checklist must not list the other job's character-swap.
+        self.assertIn("camera-tryon", camera_block)
+        self.assertIn("camera-motion", camera_block)
+        self.assertNotIn("character-swap", camera_block)
+        # job-swap's checklist must not list the other job's camera stages.
+        self.assertIn("character-swap", swap_block)
+        self.assertIn("enhance", swap_block)
+        self.assertNotIn("camera-tryon", swap_block)
+        self.assertNotIn("camera-motion", swap_block)
+
     def test_elapsed_is_the_only_thing_that_changes_between_two_real_ticks(self):
         """The line between animation and lying, redrawn 2026-09-04.
 
