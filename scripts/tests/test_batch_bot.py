@@ -4,7 +4,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batchlib.config import env_get
-from batchlib.manifest import state_path_for
+from batchlib.manifest import load_manifest, state_path_for
 from batchlib_ext.gpu_stock import Stock
 from batchlib_ext.handoff import Handoff, handoff_path, mailbox_path, write_handoff
 from batchlib_ext.migrate_lease import MigrateLease, write_migrate_lease
@@ -841,6 +841,116 @@ class TestPipelineCommand(unittest.TestCase):
         bot.handle(tg, cmd_from(ME, "/pipeline tryon-motion-enhance"),
                    allowed_user_id=ME)
         self.assertIn("already on", tg.messages[0])
+
+
+class TestProviderCommand(unittest.TestCase):
+    """/provider picks who runs try-on: an API provider (gemini or qwen-max —
+    "Qwen Image 3.0 Pro" in the user's own words — both run from this process
+    via drain.py's Phase A / batchlib/runner.py's run_local_phase, before any
+    pod is rented) or self-host (qwen, needs the pod).
+
+    gemini is the default a NEW job starts on (changed 2026-09-12, on the
+    user's own request) — see bot.py's JOB_PROVIDER/_DEFAULT_PROVIDER
+    docstring for why: the whole point of Phase A only fires for
+    gemini/qwen-max, so defaulting to qwen made the feature opt-in per job.
+    """
+
+    def setUp(self):
+        reset_bot_state()
+        bot._LAST_VALIDATE.clear()
+        bot._CONFIRM_WARNED.clear()
+        self._orig_default = bot._DEFAULT_PIPELINE
+        bot._DEFAULT_PIPELINE = "tryon-motion-enhance"
+        self._orig_default_provider = bot._DEFAULT_PROVIDER
+        bot._DEFAULT_PROVIDER = "gemini"
+        self._orig_root = bot.ROOT
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "batch").mkdir()
+        bot.ROOT = self.root
+
+    def tearDown(self):
+        bot._DEFAULT_PIPELINE = self._orig_default
+        bot._DEFAULT_PROVIDER = self._orig_default_provider
+        bot.ROOT = self._orig_root
+
+    def test_a_new_job_starts_on_gemini(self):
+        self.assertEqual(bot._job_for(ME).provider, "gemini")
+
+    def test_bare_provider_offers_the_other_ones(self):
+        tg = FakeTg()
+        bot.handle(tg, cmd_from(ME, "/provider"), allowed_user_id=ME)
+        offered = {d[len(bot._CB_PROVIDER):] for d in tg.callback_data()
+                   if d.startswith(bot._CB_PROVIDER)}
+        self.assertEqual(offered, set(bot.PROVIDER_LABELS) - {"gemini"})
+        # Pinned by name, not just internal consistency with PROVIDER_LABELS:
+        # qwen-max is another API provider, qwen is the self-host fallback.
+        self.assertEqual(offered, {"qwen", "qwen-max"})
+
+    def test_pipeline_with_no_tryon_stage_has_nothing_to_offer(self):
+        with mock.patch.object(bot, "_maybe_show_manifest"):
+            bot.handle(FakeTg(), cmd_from(ME, "/pipeline motion-enhance"),
+                       allowed_user_id=ME)
+        tg = FakeTg()
+        bot.handle(tg, cmd_from(ME, "/provider"), allowed_user_id=ME)
+        self.assertIn("no try-on stage", tg.messages[0])
+        self.assertEqual(tg.callback_data(), [])
+
+    def test_an_unknown_provider_is_refused_and_changes_nothing(self):
+        tg = FakeTg()
+        bot.handle(tg, cmd_from(ME, "/provider dashscope"), allowed_user_id=ME)
+        self.assertIn("no provider called that", tg.messages[0])
+        self.assertEqual(bot._job_for(ME).provider, "gemini")
+
+    def test_switching_to_self_host_is_remembered(self):
+        # The explicit opt-OUT of the API-provider default, back to the
+        # self-host GPU path.
+        with mock.patch.object(bot, "_maybe_show_manifest"):
+            tg = FakeTg()
+            bot.handle(tg, cmd_from(ME, "/provider qwen"), allowed_user_id=ME)
+        self.assertEqual(bot._job_for(ME).provider, "qwen")
+
+    def test_switching_to_qwen_max_is_remembered(self):
+        # "Qwen Image 3.0 Pro" in the user's own words — provider string
+        # "qwen-max" in batchlib/local_tryon.py and scripts/batch-params.json's
+        # curated allowed list for tryon.provider.
+        with mock.patch.object(bot, "_maybe_show_manifest"):
+            tg = FakeTg()
+            bot.handle(tg, cmd_from(ME, "/provider qwen-max"), allowed_user_id=ME)
+        self.assertEqual(bot._job_for(ME).provider, "qwen-max")
+
+    def test_switching_to_the_current_provider_is_a_no_op(self):
+        tg = FakeTg()
+        bot.handle(tg, cmd_from(ME, "/provider gemini"), allowed_user_id=ME)
+        self.assertIn("already on", tg.messages[0])
+
+    def test_switching_invalidates_the_cached_validation(self):
+        bot._LAST_VALIDATE[ME] = True
+        with mock.patch.object(bot, "_maybe_show_manifest"):
+            bot.handle(FakeTg(), cmd_from(ME, "/provider qwen"),
+                       allowed_user_id=ME)
+        self.assertNotIn(ME, bot._LAST_VALIDATE)
+
+    def test_tapping_a_provider_button_switches_like_the_command_does(self):
+        with mock.patch.object(bot, "_maybe_show_manifest"):
+            tg = FakeTg()
+            bot.handle(tg, cb_from(ME, bot._CB_PROVIDER + "qwen"),
+                       allowed_user_id=ME)
+        self.assertEqual(bot._job_for(ME).provider, "qwen")
+        self.assertEqual(tg.answered, ["cb1"])
+
+    def test_switching_pipeline_does_not_reset_provider(self):
+        # provider is a param on the try-on stage, not something a pipeline
+        # switch should touch — tryon-motion-enhance and
+        # tryon-character-swap-enhance both run try-on. Set explicitly to
+        # something OTHER than the default, so this cannot pass by accident
+        # of what a fresh job already starts on.
+        job = bot._job_for(ME)
+        job.provider = "qwen"
+        with mock.patch.object(bot, "_maybe_show_manifest"):
+            bot.handle(FakeTg(),
+                       cmd_from(ME, "/pipeline tryon-character-swap-enhance"),
+                       allowed_user_id=ME)
+        self.assertEqual(bot._job_for(ME).provider, "qwen")
 
 
 class TestDraftPersistence(unittest.TestCase):
@@ -2470,10 +2580,22 @@ class TestFlow(unittest.TestCase):
         rows = bot._fix_buttons(bot._STATE[ME])
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0][0][1], bot._CB_PIPE_ASK)
-        for label, data in rows[0][1:]:
+        # tryon-motion-enhance has a try-on stage, so the provider chooser is
+        # the second button — see test_the_provider_button_only_shows_for_a_
+        # tryon_pipeline for the case where it is absent instead.
+        self.assertEqual(rows[0][1][1], bot._CB_PROVIDER_ASK)
+        for label, data in rows[0][2:]:
             self.assertTrue(data.startswith(bot._CB_REDO))
             self.assertNotIn(data[len(bot._CB_REDO):], label,
                              "the role name is still spelled out")
+
+    def test_the_provider_button_only_shows_for_a_tryon_pipeline(self):
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+        bot._STATE[ME].pipeline = "motion-enhance"
+        bot._STATE[ME].slots.pop("outfit", None)
+        rows = bot._fix_buttons(bot._STATE[ME])
+        self.assertNotIn(bot._CB_PROVIDER_ASK, [data for _, data in rows[0]])
 
     def test_the_pipeline_can_be_picked_per_job_from_the_panel(self):
         """Each run carries its own pipeline in the manifest, so a batch can mix
@@ -3359,6 +3481,141 @@ class TestFlow(unittest.TestCase):
             bot.handle(self.tg, doc_from(ME, "driver-id"), allowed_user_id=ME)
         self.assertIn("Input/output error", self.tg.messages[-1])
         self.assertNotIn(ME, bot._STATE)
+
+    def test_tryon_result_is_sent_while_the_pipeline_keeps_running(self):
+        # Provider defaults to gemini (bot._DEFAULT_PROVIDER) — Phase A
+        # (batchlib/runner.py's run_local_phase, invoked by drain.py before
+        # any pod exists) is what finishes this stage this early.
+        self._confirm_and_start()
+        manifest = load_manifest(bot._job_manifest_path(ME))
+        run_id = manifest.runs[0].id
+        image = self.root / "01-tryon.png"
+        image.write_bytes(b"fake-png")
+        state_path_for(bot._job_manifest_path(ME)).write_text(json.dumps(
+            {"batch": "2026-09-12-1000",
+             "runs": {run_id: {"status": "running",
+                              "stages": {"tryon": {"status": "done",
+                                                   "file": str(image)}}}}}),
+            encoding="utf-8")
+        with mock.patch("tgbot.bot.drain_running", return_value=True):
+            bot.tick_progress(self.tg, ME)
+        self.assertEqual(len(self.tg.documents), 1)
+        sent_path, caption = self.tg.documents[0]
+        self.assertEqual(Path(sent_path), image)
+        self.assertIn("gemini", caption)
+        self.assertIn(run_id, caption)
+        self.assertIn("upload_document", self.tg.actions)
+
+    def test_tryon_result_is_never_sent_twice(self):
+        self._confirm_and_start()
+        manifest = load_manifest(bot._job_manifest_path(ME))
+        run_id = manifest.runs[0].id
+        image = self.root / "01-tryon.png"
+        image.write_bytes(b"fake-png")
+        state_path_for(bot._job_manifest_path(ME)).write_text(json.dumps(
+            {"batch": "2026-09-12-1000",
+             "runs": {run_id: {"status": "running",
+                              "stages": {"tryon": {"status": "done",
+                                                   "file": str(image)}}}}}),
+            encoding="utf-8")
+        with mock.patch("tgbot.bot.drain_running", return_value=True):
+            bot.tick_progress(self.tg, ME)
+            bot.tick_progress(self.tg, ME)
+        self.assertEqual(len(self.tg.documents), 1)
+        payload = json.loads(bot._progress_path(ME).read_text())
+        self.assertEqual(payload["sent_tryon"], [run_id])
+
+    def test_self_host_tryon_is_not_previewed(self):
+        # qwen (self-host) runs the same stage moments before motion, already
+        # on the pod paid for — no comparable wait to fill, so nothing is sent.
+        job = bot._job_for(ME)
+        job.provider = "qwen"
+        self._confirm_and_start()
+        manifest = load_manifest(bot._job_manifest_path(ME))
+        run_id = manifest.runs[0].id
+        image = self.root / "01-tryon.png"
+        image.write_bytes(b"fake-png")
+        state_path_for(bot._job_manifest_path(ME)).write_text(json.dumps(
+            {"batch": "2026-09-12-1000",
+             "runs": {run_id: {"status": "running",
+                              "stages": {"tryon": {"status": "done",
+                                                   "file": str(image)}}}}}),
+            encoding="utf-8")
+        with mock.patch("tgbot.bot.drain_running", return_value=True):
+            bot.tick_progress(self.tg, ME)
+        self.assertEqual(self.tg.documents, [])
+
+    def test_a_recorded_file_missing_from_disk_is_not_sent(self):
+        # The journal can say "done" for a file that was later cleaned up
+        # (make batch-clean) or never actually finished writing — same
+        # defence as batchlib/runner.py's own dest.is_file() check.
+        self._confirm_and_start()
+        state_path_for(bot._job_manifest_path(ME)).write_text(json.dumps(
+            {"batch": "2026-09-12-1000",
+             "runs": {load_manifest(bot._job_manifest_path(ME)).runs[0].id: {
+                 "status": "running",
+                 "stages": {"tryon": {"status": "done",
+                                      "file": str(self.root / "gone.png")}}}}}),
+            encoding="utf-8")
+        with mock.patch("tgbot.bot.drain_running", return_value=True):
+            bot.tick_progress(self.tg, ME)
+        self.assertEqual(self.tg.documents, [])
+
+    def test_a_stage_still_running_is_not_sent_early(self):
+        self._confirm_and_start()
+        run_id = load_manifest(bot._job_manifest_path(ME)).runs[0].id
+        state_path_for(bot._job_manifest_path(ME)).write_text(json.dumps(
+            {"batch": "2026-09-12-1000",
+             "runs": {run_id: {"status": "running",
+                              "stages": {"tryon": {"status": "running"}}}}}),
+            encoding="utf-8")
+        with mock.patch("tgbot.bot.drain_running", return_value=True):
+            bot.tick_progress(self.tg, ME)
+        self.assertEqual(self.tg.documents, [])
+
+
+class TestTryonPreviewStageGeneric(unittest.TestCase):
+    """_deliver_tryon_previews works off _tryon_stage(), not a hardcoded
+    "tryon" — camera-tryon (tryon-camera-motion-enhance) must be found too.
+    Exercised directly against a hand-built manifest, since assembling a
+    camera-aware job through the full chat flow would also need a background
+    slot with nothing to do with what is being tested here.
+    """
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "batch").mkdir()
+        self.manifest_path = self.root / "batch" / "camera.yaml"
+        self.manifest_path.write_text(
+            "runs:\n"
+            "  - id: camrun\n"
+            "    pipeline: tryon-camera-motion-enhance\n"
+            "    inputs:\n"
+            "      character: character.png\n"
+            "      outfit: outfit.png\n"
+            "      background: background.png\n"
+            "      driver: driver.mp4\n"
+            "    camera-tryon: { provider: qwen-max }\n"
+            "    camera-motion: { preset: drv-5s }\n",
+            encoding="utf-8")
+        self.image = self.root / "01-camera-tryon.png"
+        self.image.write_bytes(b"fake-png")
+        state_path_for(self.manifest_path).write_text(json.dumps(
+            {"batch": "2026-09-12-1000",
+             "runs": {"camrun": {"status": "running",
+                                "stages": {"camera-tryon": {
+                                    "status": "done", "file": str(self.image)}}}}}),
+            encoding="utf-8")
+        self.tg = FakeTg()
+
+    def test_camera_tryon_is_found_and_sent(self):
+        payload = {"sent_tryon": []}
+        bot._deliver_tryon_previews(self.tg, ME, self.manifest_path, payload)
+        self.assertEqual(len(self.tg.documents), 1)
+        _sent_path, caption = self.tg.documents[0]
+        self.assertIn("qwen-max", caption)
+        self.assertIn("camrun", caption)
+        self.assertEqual(payload["sent_tryon"], ["camrun"])
 
 
 class TestSafeNameFoldsDiacritics(unittest.TestCase):

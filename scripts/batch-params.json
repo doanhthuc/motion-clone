@@ -108,7 +108,8 @@
       ],
       "provider": [
         "qwen",
-        "gemini"
+        "gemini",
+        "qwen-max"
       ]
     }
   },
