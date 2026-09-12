@@ -3267,10 +3267,10 @@ def _add_gpu_sub(tg: Tg, chat_id: int, message_id: int, short: str, dc: str) -> 
              if home_dc and dc != home_dc else "")
     tg.edit_message(
         chat_id, message_id,
-        f"🔔 <b>Subscribed</b>: {_esc(_GPU_DISPLAY_SHORT[gpu_id])} @ {_esc(dc)}"
+        f"🔔 <b>Subscribed.</b> {_esc(_GPU_DISPLAY_SHORT[gpu_id])} @ {_esc(dc)}"
         f"{caveat}\n"
-        "You'll get a message here the moment it has stock — checked "
-        "automatically, no need to /gpu. Clears itself once it fires.",
+        "You'll get a message here the moment it has stock, checked "
+        "automatically — no need to /gpu. Clears itself once it fires.",
         parse_mode=PARSE_HTML)
 
 
