@@ -3166,10 +3166,27 @@ def _offer_gpu_sub_targets(tg: Tg, chat_id: int) -> None:
         parse_mode=PARSE_HTML)
 
 
+def _home_datacenter() -> str | None:
+    """Where the Network Volume lives — the only datacenter a pod can
+    actually rent in without migrating first. Same lookup `_report_gpu_stock`
+    does, reused here so /subscribe can flag the same caveat."""
+    return volume_datacenter(env_get(ROOT / ".env", "POD_VOLUME_ID"))
+
+
 def _offer_gpu_sub_datacenters(tg: Tg, chat_id: int, message_id: int, short: str) -> None:
     """/subscribe's second step — every datacenter runpodctl lists for that
     GPU right now, dot included, so subscribing to one already in stock is a
-    visible (if harmless) choice rather than a silent one."""
+    visible (if harmless) choice rather than a silent one.
+
+    Every entry runpodctl reports is offered, not just the home datacenter —
+    a GPU that is out of stock at home but in stock elsewhere is exactly the
+    case /gpu's own "Other regions" section exists for. But renting anywhere
+    other than home needs the volume migrated there first
+    (docs/gpu-pod.md's EU-CZ-1 failover, ~15-25 min), so the home datacenter
+    is marked and every other one carries that same caveat /gpu already
+    states — a user report (2026-09-12) found the un-annotated list
+    surprising: "5090 hình như chỉ có trên 2 datacenter thôi mà".
+    """
     gpu_id = _GPU_BY_SHORT.get(short)
     if gpu_id is None:
         tg.edit_message(chat_id, message_id,
@@ -3188,12 +3205,26 @@ def _offer_gpu_sub_datacenters(tg: Tg, chat_id: int, message_id: int, short: str
                         "right now — try /subscribe again later.",
                         parse_mode=PARSE_HTML)
         return
+    home_dc = _home_datacenter()
+    buttons = []
+    for e in entries:
+        label = f"{_stock_icon(e.stock_status.lower())} {e.datacenter_id}"
+        if e.datacenter_id == home_dc:
+            label = f"📍 {label}"
+        buttons.append([(label, f"{_CB_GPUSUB_DC}{short}:{e.datacenter_id}")])
+    if home_dc is None:
+        note = "\n(volume datacenter unknown — showing every region)"
+    elif any(e.datacenter_id != home_dc for e in entries):
+        note = (f"\n📍 = your volume's home datacenter, rentable now. Any "
+                f"other region needs the volume synced there first "
+                f"({MIGRATE_DURATION_SHORT}) — not an instant switch.")
+    else:
+        note = ""
     tg.edit_message(
         chat_id, message_id,
-        f"{ICON_ASK_CE} <b>{_esc(_GPU_DISPLAY_SHORT[gpu_id])}</b> — which datacenter?",
-        buttons=[[(f"{_stock_icon(e.stock_status.lower())} {e.datacenter_id}",
-                  f"{_CB_GPUSUB_DC}{short}:{e.datacenter_id}")]
-                 for e in entries],
+        f"{ICON_ASK_CE} <b>{_esc(_GPU_DISPLAY_SHORT[gpu_id])}</b> — "
+        f"which datacenter?{note}",
+        buttons=buttons,
         parse_mode=PARSE_HTML)
 
 
@@ -3213,9 +3244,14 @@ def _add_gpu_sub(tg: Tg, chat_id: int, message_id: int, short: str, dc: str) -> 
         return
     subs.append({"gpu_id": gpu_id, "datacenter_id": dc})
     _save_gpu_subs(chat_id)
+    home_dc = _home_datacenter()
+    caveat = ("\n⚠️ not your volume's home datacenter — renting here needs "
+             f"it synced there first ({MIGRATE_DURATION_SHORT})."
+             if home_dc and dc != home_dc else "")
     tg.edit_message(
         chat_id, message_id,
-        f"🔔 <b>Subscribed</b>: {_esc(_GPU_DISPLAY_SHORT[gpu_id])} @ {_esc(dc)}\n"
+        f"🔔 <b>Subscribed</b>: {_esc(_GPU_DISPLAY_SHORT[gpu_id])} @ {_esc(dc)}"
+        f"{caveat}\n"
         "You'll get a message here the moment it has stock — checked "
         "automatically, no need to /gpu. Clears itself once it fires.",
         parse_mode=PARSE_HTML)
