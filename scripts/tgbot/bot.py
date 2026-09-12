@@ -764,8 +764,9 @@ def _ask_about(tg: Tg, chat_id: int, p: Probe, pipeline: str,
     # three or four buttons on one row have their labels truncated on a phone,
     # and an unmarked role gives no warning that tapping it overwrites a file
     # already placed — _fill_slot names the replacement, but only afterwards.
-    labels = [(f"{ROLE_ICON.get(r, '')} {r}" + (f" {ICON_OK}" if r in filled else ""),
-               _CB_SLOT + r) for r in roles]
+    labels = [(f"{ROLE_ICON.get(r, '')} {r}", _CB_SLOT + r, _ce_id(ICON_OK_CE))
+              if r in filled else (f"{ROLE_ICON.get(r, '')} {r}", _CB_SLOT + r)
+              for r in roles]
     rows = [labels[i:i + 2] for i in range(0, len(labels), 2)]
     question = f"{describe(p)}\nWhich slot is this?"
     if filled & set(roles):
@@ -1740,6 +1741,11 @@ ICON_NVIDIA_CE = _ce("4994617077676376661", "💻")
 # logo above — not wired to any message yet; kept alongside ICON_NVIDIA_CE
 # since both came out of the same round of icon picks (2026-09-04).
 ICON_GPU_CE = _ce("5269375507220165755", "👊")
+# Button-only icons (no HTML text use, unlike the ones above) — user picked
+# the pack for each by hand (2026-09-12): Run from cwdinfo_aemoji, Add from
+# NewsEmoji (the same pack most of the icons above already came from).
+ICON_RUN_CE = _ce("5422837510499739688", "▶️")
+ICON_ADD_CE = _ce("5397916757333654639", "➕")
 
 PARSE_HTML = "HTML"
 
@@ -1840,7 +1846,7 @@ def _fix_buttons(job: Job) -> list[list[tuple[str, str]]]:
     two of the four rows available. The icons are the ones already printed
     beside each role name a few lines above, so the mapping is on screen.
     """
-    labels = [("⚙️", _CB_PIPE_ASK)]
+    labels = [("⚙️", _CB_PIPE_ASK, _ce_id(ICON_ASK_CE))]
     # Only offered when the open pipeline actually runs a try-on stage —
     # motion-enhance/character-swap(-enhance) have nothing for a provider to
     # change, and a button that opens an empty chooser is worse than no button.
@@ -2020,11 +2026,11 @@ def _panel_buttons(chat_id: int, job: Job) -> list[list[tuple[str, str]]]:
     if queued and not (_PENDING.get(chat_id) or []) and _LAST_VALIDATE.get(chat_id) is True:
         price = _panel_price()
         run = [(f"▶️ Run {len(queued)} · ${price:.2f}/h" if len(queued) > 1
-                else f"▶️ Run · ${price:.2f}/h", _CB_RUN_ASK)]
+                else f"▶️ Run · ${price:.2f}/h", _CB_RUN_ASK, _ce_id(ICON_RUN_CE))]
         # Offered beside Run, not instead of it: one pod runs everything in the
         # manifest, so adding another job costs nothing but the render itself.
         if not missing_slots(job):
-            run.append(("➕ Add", _CB_ADD))
+            run.append(("➕ Add", _CB_ADD, _ce_id(ICON_ADD_CE)))
         rows.append(run)
 
     # ONE row of coloured squares, whatever the batch size. The first version
