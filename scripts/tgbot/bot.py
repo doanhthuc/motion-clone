@@ -3218,7 +3218,14 @@ def _offer_gpu_sub_datacenters(tg: Tg, chat_id: int, message_id: int, short: str
     home_dc = _home_datacenter()
     buttons = []
     for e in entries:
-        label = f"{_stock_icon(e.stock_status.lower())} {e.datacenter_id}"
+        # _STOCK_ICON's plain dot, NOT _stock_icon() — that wrapper adds
+        # ICON_CRITICAL_CE (an animated <tg-emoji> tag) for "none", and a
+        # button label is plain text Telegram never parses (same reason
+        # ROLE_ICON stays plain for buttons while ROLE_ICON_CE is text-only)
+        # — sent through here, the tag showed up as literal angle-bracket
+        # text on every "none" button (reported 2026-09-12).
+        dot = _STOCK_ICON.get(e.stock_status.lower(), "⬜")
+        label = f"{dot} {e.datacenter_id}"
         if e.datacenter_id == home_dc:
             label = f"📍 {label}"
         buttons.append([(label, f"{_CB_GPUSUB_DC}{short}:{e.datacenter_id}")])
