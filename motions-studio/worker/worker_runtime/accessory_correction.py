@@ -29,7 +29,14 @@ def visible_intervals(visible):
 
 def prepare_reference(source: Path, destination: Path, box=None):
     with Image.open(source) as image:
+        if box is not None:
+            if (not isinstance(box, (tuple, list)) or len(box) != 4
+                    or any(type(v) is not int for v in box)
+                    or not (0 <= box[0] < box[2] <= image.width and 0 <= box[1] < box[3] <= image.height)):
+                raise ValueError('referenceBox must be integer pixel coordinates inside the source image')
         crop = image.convert('RGB').crop(box) if box else image.convert('RGB')
+        if min(crop.size) < 64:
+            raise ValueError('reference quality: crop needs at least 64 native pixels on each edge')
         gray = crop.convert('L')
         blurred = gray.filter(ImageFilter.GaussianBlur(2))
         sharpness = ImageStat.Stat(gray).var[0] - ImageStat.Stat(blurred).var[0]
