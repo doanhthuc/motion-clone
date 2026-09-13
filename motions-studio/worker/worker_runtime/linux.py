@@ -10821,7 +10821,14 @@ def run_wan_dancer(job):
 # #endregion
 
 
+def run_accessory_correction(job):
+    """Experimental mask-guided correction runs on the GPU worker."""
+    from worker_runtime.accessory_job import run
+    return run(job, sys.modules[__name__])
+
+
 PIPELINES = {
+    "accessory-correction": run_accessory_correction,
     "motion": run_motion,
     "bds": run_bds,       # time-lapse xây nhà từ 1 ảnh (ESRGAN + Qwen reverse-stage + Wan 2.1 FLF + flycam + concat dọc 60fps)
     "tryon": run_tryon,

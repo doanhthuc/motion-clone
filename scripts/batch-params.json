@@ -1,5 +1,15 @@
 {
   "_note": "Khai TAY năm thứ AST của linux.py không thấy. 'extra' = param worker đọc ĐỘNG (không phải params.get('ten')) — nếu AST đã thấy thì cổng báo thừa. 'api' = param TẦNG API: worker không bao giờ đọc, api/src/routes/jobs.js tiêu thụ hoặc dịch nó trước khi ghi DB — cổng KHÔNG đòi các key này xuất hiện trong AST. 'allowed' = giá trị hợp lệ. 'requires' = param CHỈ có tác dụng khi một param khác mang giá trị nhất định (không thì API bỏ qua âm thầm). 'overridden' = param API ép giá trị VÔ ĐIỀU KIỆN, gửi gì cũng mất — validate phải nói ra thay vì để nó validate xong rồi biến mất. Key của cả bốn khối phải nằm trong AST ∪ extra ∪ api.",
+  "accessory-correction": {
+    "extra": {
+      "accessoryPrompt": {"why": "accessory_job.correction_options: one target, default wristwatch"},
+      "referenceBox": {"why": "accessory_job: optional native pixel crop [left, top, right, bottom]"},
+      "accessoryMaskGrow": {"why": "accessory_job: mask dilation pixels, 0 to 24, default 6"},
+      "accessoryChunkFrames": {"why": "accessory_job: 4k+1 frames, 17 to 81, default 49"},
+      "accessoryChunkOverlap": {"why": "accessory_job: 1 to 24 frames, less than half a chunk, default 8"},
+      "seed": {"why": "accessory_job: fixed sampling seed, default 42"}
+    }
+  },
   "motion": {
     "extra": {
       "cameraAwareMotion": {

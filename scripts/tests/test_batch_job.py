@@ -36,6 +36,12 @@ class TestMissingSlots(unittest.TestCase):
 
 
 class TestRenderManifest(unittest.TestCase):
+    def test_correction_does_not_receive_a_driver_generation_preset(self):
+        job = Job(slots={"driver": Path("/d.mp4"), "accessoryReference": Path("/r.png")},
+                  probes={"driver": VIDEO}, pipeline="accessory-fix-enhance")
+        text = render_manifest([job], now="2026-09-13")
+        self.assertNotIn("accessory-correction: { preset:", text)
+
     def test_carries_the_measured_numbers_as_comments(self):
         job = Job(slots={"character": Path("/c.png"), "driver": Path("/d.mp4")},
                   probes={"driver": VIDEO}, pipeline="motion-enhance")

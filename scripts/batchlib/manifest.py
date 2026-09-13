@@ -43,7 +43,7 @@ def synchronize_camera_stage_segments(
 ) -> dict[str, dict]:
     """Share a selected driver segment between the two camera-stage aliases."""
     copied = {stage: dict(params) for stage, params in stage_params.items()}
-    if pipeline != _CAMERA_PIPELINE:
+    if not all(stage in PIPELINES.get(pipeline, []) for stage in _CAMERA_STAGES):
         return copied
 
     prefix = f"{where}: " if where else ""

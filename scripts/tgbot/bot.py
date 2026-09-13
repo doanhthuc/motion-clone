@@ -14,6 +14,7 @@ import contextlib
 import hashlib
 import html
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -1533,7 +1534,7 @@ def _offer_pipelines(tg: Tg, chat_id: int) -> None:
         f"{ICON_ASK_CE} <b>Flow for{where}</b>\n"
         f"now: {_flow(job.pipeline)}  <i>({_esc(job.pipeline)})</i>",
         buttons=[[("🎬 " + " → ".join(PIPELINES[name]), _CB_PIPE + name)]
-                 for name in sorted(PIPELINES) if name != job.pipeline],
+                 for name in sorted(PIPELINES) if name != job.pipeline and _pipeline_available(name)],
         parse_mode=PARSE_HTML)
 
 
@@ -1541,7 +1542,7 @@ def _switch_pipeline_and_report(tg: Tg, chat_id: int, name: str, *,
                                 chooser_message_id: int | None = None) -> None:
     """The /pipeline body, shared by the typed command and the buttons."""
     job = _job_for(chat_id)
-    if name not in PIPELINES:
+    if name not in PIPELINES or not _pipeline_available(name):
         tg.send_message(chat_id, "no pipeline called that. send /pipeline to "
                                  "list them.")
         return
@@ -1695,7 +1696,13 @@ def _ce_id(ce: str) -> str:
 # only) carries the animated version. Only "driver" differs from its plain
 # counterpart: the driver slot is always a TikTok download now (tgbot/tiktok.py),
 # so its message icon is that app's real logo, not a generic clapper.
-ROLE_ICON = {"character": "👤", "outfit": "👗", "driver": "🎬", "background": "🖼"}
+ROLE_ICON = {"character": "👤", "outfit": "👗", "driver": "🎬", "background": "🖼", "accessoryReference": "⌚"}
+ACCESSORY_PIPELINES_ENABLED = os.environ.get("ENABLE_ACCESSORY_CORRECTION", "0").lower() in {"1", "true", "yes"}
+
+
+def _pipeline_available(name: str) -> bool:
+    """Keep the experimental correction flow out of Telegram until GPU A/B sign-off."""
+    return ACCESSORY_PIPELINES_ENABLED or "accessory" not in name
 ROLE_ICON_CE = {**ROLE_ICON, "driver": _ce("5327982530702359565", "📱")}
 
 # One square per job, in the same order as preview.ROW_ACCENTS and the same

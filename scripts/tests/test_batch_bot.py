@@ -719,7 +719,8 @@ class TestPipelineCommand(unittest.TestCase):
         offered = {d[len(bot._CB_PIPE):] for d in tg.callback_data()
                    if d.startswith(bot._CB_PIPE)}
         current = bot._STATE[ME].pipeline if ME in bot._STATE else bot._DEFAULT_PIPELINE
-        self.assertEqual(offered, set(bot.PIPELINES) - {current})
+        self.assertEqual(offered, {name for name in bot.PIPELINES
+                                   if bot._pipeline_available(name)} - {current})
         # And the one in force is named, so /pipeline <name> stays usable.
         self.assertIn(current, tg.messages[0])
         self.assertNotIn("swap-character-enhance", tg.messages[0])
@@ -729,6 +730,14 @@ class TestPipelineCommand(unittest.TestCase):
         bot.handle(tg, cmd_from(ME, "/pipeline swap-character-enhance"),
                    allowed_user_id=ME)
         self.assertIn("no pipeline called that", tg.messages[0])
+        self.assertEqual(bot._job_for(ME).pipeline, "tryon-motion-enhance")
+
+    def test_unvalidated_accessory_flow_is_not_offered_or_selectable(self):
+        tg = FakeTg()
+        bot.handle(tg, cmd_from(ME, "/pipeline"), allowed_user_id=ME)
+        self.assertFalse(any("accessory-fix" in value for value in tg.callback_data()))
+        bot.handle(tg, cmd_from(ME, "/pipeline tryon-camera-motion-accessory-fix-enhance"),
+                   allowed_user_id=ME)
         self.assertEqual(bot._job_for(ME).pipeline, "tryon-motion-enhance")
 
     def test_switching_keeps_slots_the_new_pipeline_still_uses(self):

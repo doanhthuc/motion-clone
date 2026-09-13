@@ -99,7 +99,7 @@ def run_id_for(job: Job) -> str:
     Order is character, outfit, background, driver: what varies most often
     comes first, so the ids of a batch differ early rather than in their tails.
     """
-    order = ("character", "outfit", "background", "driver")
+    order = ("character", "outfit", "background", "driver", "accessoryReference")
     parts = []
     for role in order:
         if role not in job.slots:
@@ -176,7 +176,8 @@ def render_manifest(jobs: list[Job], *, now) -> str:
         stage_params: dict[str, dict[str, object]] = {}
         driver_stage = _driver_stage(job.pipeline)
         driver_probe = job.probes.get("driver")
-        if driver_stage and driver_probe is not None:
+        if (driver_stage and driver_probe is not None
+                and STAGES[driver_stage].job_type in {"motion", "character-swap"}):
             stage_params.setdefault(driver_stage, {})["preset"] = \
                 suggest_preset(driver_probe.duration_s)
         tryon_stage = _tryon_stage(job.pipeline)

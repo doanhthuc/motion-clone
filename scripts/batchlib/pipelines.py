@@ -84,6 +84,14 @@ STAGES: dict[str, Stage] = {
     ),
 }
 
+STAGES["accessory-correction"] = Stage(
+    name="accessory-correction", job_type="accessory-correction",
+    inputs={"video": "prev|material:driver", "reference": "material:accessoryReference"},
+    output_ext=".mp4", min_bytes=100_000, timeout_min=90,
+    param_type="accessory-correction",
+)
+
+
 PIPELINES: dict[str, list[str]] = {
     # ALD 23/08/2026 - swap TRẦN, không enhance: dùng cho A/B màu. Đo trên 4 cặp 23/08 thì enhance
     # (Lanczos lẫn FlashVSR) lệch màu ≤2/255 so với đầu vào, nên với A/B về MÀU nó chỉ tốn GPU chứ
@@ -94,6 +102,11 @@ PIPELINES: dict[str, list[str]] = {
     "character-swap-enhance": ["character-swap", "enhance"],
     "tryon-character-swap-enhance": ["tryon", "character-swap", "enhance"],
     "tryon-camera-motion-enhance": ["camera-tryon", "camera-motion", "enhance"],
+    "accessory-fix-enhance": ["accessory-correction", "enhance"],
+    "tryon-camera-motion-accessory-fix-enhance": [
+        "camera-tryon", "camera-motion", "accessory-correction", "enhance"],
+    "tryon-motion-accessory-fix-enhance": ["tryon", "motion", "accessory-correction", "enhance"],
+    "character-swap-accessory-fix-enhance": ["character-swap", "accessory-correction", "enhance"],
 }
 
 
