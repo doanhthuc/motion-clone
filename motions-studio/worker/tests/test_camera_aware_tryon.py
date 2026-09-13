@@ -27,6 +27,12 @@ from worker_runtime import linux  # noqa: E402
 
 
 class CameraCompositionTests(unittest.TestCase):
+    def test_camera_tryon_prompt_forces_clean_wrists_and_natural_nails(self):
+        positive, negative = linux._load_camera_compose_prompt()
+        self.assertIn("bare natural fingernails", positive)
+        self.assertIn("watch or bracelet", positive)
+        self.assertIn("nail polish", negative)
+        self.assertIn("wristwatch", negative)
     def test_motion_normalization_uses_the_api_camera_flag_contract(self):
         for key in ("cameraAwareMotion", "camera_aware_motion"):
             for value in (True, "1", "true", "yes", "on"):
@@ -86,7 +92,7 @@ class CameraCompositionTests(unittest.TestCase):
 
 
 class CameraMotionWorkflowBoundaryTests(unittest.TestCase):
-    def _submit_motion(self, driver_dims, *, camera_aware):
+    def _submit_motion(self, driver_dims, *, camera_aware, appearance=None):
         with tempfile.TemporaryDirectory() as d, ExitStack() as stack:
             tmp = Path(d)
             ref = tmp / "ref.png"
@@ -131,10 +137,22 @@ class CameraMotionWorkflowBoundaryTests(unittest.TestCase):
                     "preset": "drv-15s", "quality": "720p", "width": 720, "height": 1280,
                     "maxRenderEdge": 1280, "driverDurSec": 15,
                     **({"cameraAwareMotion": True} if camera_aware else {}),
+                    **(appearance or {}),
                 },
             })
             self.assertEqual(len(submitted), 1)
             return submitted[0]
+
+    def test_camera_motion_forces_bare_unpainted_nails_and_no_wrist_accessories(self):
+        workflow = self._submit_motion((900, 1200), camera_aware=True,
+                                      appearance={"naturalNails": True, "removeWristAccessories": True})
+        positive = workflow["60"]["inputs"]["positive_prompt"]
+        negative = workflow["60"]["inputs"]["negative_prompt"]
+        self.assertIn("bare natural fingernails", positive)
+        self.assertIn("unpainted nails", positive)
+        self.assertIn("watch", negative)
+        self.assertIn("bracelet", negative)
+        self.assertIn("nail polish", negative)
 
     def test_camera_motion_bypasses_api_injected_dimensions_at_workflow_boundary(self):
         for driver_dims, expected in (((1920, 1080), (1280, 720)), ((900, 1200), (720, 960))):

@@ -1517,6 +1517,12 @@ def build_wan_workflow(ref_name, motion_name, p, prefix="motion-out"):
         _clip_strength = max(_clip_strength, 1.35)
     _positive_prompt = str(p.get("positive_prompt") or MOTION_BASE_POSITIVE).strip()
     _negative_prompt = str(p.get("negative_prompt") or "色调艳丽，过曝，皮肤油光，高光反射，手臂反光，静态，细节模糊不清，最差质量，低质量，畸形，多余的手指, shiny oily skin, glossy plastic skin, specular highlights on skin, blown-out highlights, overexposed arms, flash glare").strip()
+    if _is_camera_aware_motion(p) and _motion_bool(p, "natural_nails", "naturalNails", default=False):
+        _positive_prompt += ", bare natural fingernails, unpainted nails, natural nail color"
+        _negative_prompt += ", painted nails, nail polish, colored nails, manicure, artificial nails"
+    if _is_camera_aware_motion(p) and _motion_bool(p, "remove_wrist_accessories", "removeWristAccessories", default=False):
+        _positive_prompt += ", bare wrists with no watch or bracelet"
+        _negative_prompt += ", watch, wristwatch, bracelet, wrist jewelry"
     if _body_lock:
         _positive_prompt = f"{_positive_prompt}, {MOTION_BODY_PROPORTION_POSITIVE}"
         _negative_prompt = f"{_negative_prompt}, {MOTION_BODY_PROPORTION_NEGATIVE}"

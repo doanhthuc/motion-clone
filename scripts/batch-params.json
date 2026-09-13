@@ -16,7 +16,9 @@
       },
       "driverStartSec": {
         "why": "Motion driver segment helper reads the synchronized camera segment outside run_motion"
-      }
+      },
+      "naturalNails": {"why": "Camera motion prompt requires natural unpainted fingernails"},
+      "removeWristAccessories": {"why": "Camera motion prompt excludes watches and bracelets"}
     },
     "api": {
       "quality": {

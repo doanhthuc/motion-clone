@@ -79,7 +79,8 @@ STAGES: dict[str, Stage] = {
         inputs={"ref": "prev", "motion": "material:driver"},
         output_ext=".mp4", min_bytes=100_000, timeout_min=60,
         defaults={"bodyProportionLock": False, "poseStrength": 0.9,
-                  "clipStrength": 1.2},
+                  "clipStrength": 1.2, "naturalNails": True,
+                  "removeWristAccessories": True},
         locked_params={"cameraAwareMotion": True, "fitDriver": True},
     ),
 }
