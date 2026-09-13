@@ -29,9 +29,12 @@ from worker_runtime import linux  # noqa: E402
 class CameraCompositionTests(unittest.TestCase):
     def test_camera_tryon_prompt_forces_clean_wrists_and_natural_nails(self):
         positive, negative = linux._load_camera_compose_prompt()
-        self.assertIn("bare natural fingernails", positive)
+        self.assertIn("short, neatly trimmed, rounded natural fingernails", positive)
         self.assertIn("watch or bracelet", positive)
         self.assertIn("nail polish", negative)
+        self.assertIn("long nails", negative)
+        self.assertIn("stiletto nails", negative)
+        self.assertIn("white nail tips", negative)
         self.assertIn("wristwatch", negative)
     def test_motion_normalization_uses_the_api_camera_flag_contract(self):
         for key in ("cameraAwareMotion", "camera_aware_motion"):
@@ -148,11 +151,14 @@ class CameraMotionWorkflowBoundaryTests(unittest.TestCase):
                                       appearance={"naturalNails": True, "removeWristAccessories": True})
         positive = workflow["60"]["inputs"]["positive_prompt"]
         negative = workflow["60"]["inputs"]["negative_prompt"]
-        self.assertIn("bare natural fingernails", positive)
+        self.assertIn("short, neatly trimmed, rounded natural fingernails", positive)
         self.assertIn("unpainted nails", positive)
         self.assertIn("watch", negative)
         self.assertIn("bracelet", negative)
         self.assertIn("nail polish", negative)
+        self.assertIn("long nails", negative)
+        self.assertIn("stiletto nails", negative)
+        self.assertIn("white nail tips", negative)
 
     def test_camera_motion_bypasses_api_injected_dimensions_at_workflow_boundary(self):
         for driver_dims, expected in (((1920, 1080), (1280, 720)), ((900, 1200), (720, 960))):
