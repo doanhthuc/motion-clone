@@ -2554,6 +2554,23 @@ class TestFlow(unittest.TestCase):
         # would both be wrong.
         self.assertEqual(bot._STATE[ME].probes["driver"], self.driver_probe)
 
+    def test_again_puts_its_note_on_the_panel_with_run_and_pipeline_buttons(self):
+        # Regression: /again used to send a bare, button-less text message
+        # ("... /pipeline to change the flow, then Run.") and only then draw
+        # the panel as a second message — so the one thing the user actually
+        # read had nothing to tap. Fixed to fold the note into the panel
+        # itself, the same merge every other flow in this file already uses.
+        with mock.patch("tgbot.bot.start_drain"), \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+            bot.handle(self.tg, cmd_from(ME, "/again"), allowed_user_id=ME)
+        text = panel_text(self.tg)
+        self.assertIn("reusing the last batch", text)
+        self.assertIn("1 job(s)", text)
+        self.assertIn(bot._CB_RUN_ASK, self.tg.callback_data())
+        self.assertIn(bot._CB_PIPE_ASK, self.tg.callback_data())
+
     def test_again_refuses_to_overwrite_a_job_in_progress(self):
         with mock.patch("tgbot.bot.start_drain"), \
              mock.patch("tgbot.bot.drain_running", return_value=False):

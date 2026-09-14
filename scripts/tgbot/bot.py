@@ -988,7 +988,7 @@ def _render_and_validate(tg: Tg, chat_id: int) -> bool:
 
 
 def _maybe_show_manifest(tg: Tg, chat_id: int, job: Job, *,
-                         bump: bool = False) -> None:
+                         bump: bool = False, note: str = "") -> None:
     """Redraw the panel, validating for free first if the job is complete.
 
     This is the plan's "[Run]" step (docs/superpowers/plans/2026-08-31-…
@@ -1009,7 +1009,7 @@ def _maybe_show_manifest(tg: Tg, chat_id: int, job: Job, *,
     """
     if _jobs_for(chat_id):
         _render_and_validate(tg, chat_id)
-    _show_panel(tg, chat_id, bump=bump)
+    _show_panel(tg, chat_id, bump=bump, note=note)
 
 
 _DRAFT_SUFFIX = ".draft.json"
@@ -4193,9 +4193,13 @@ def _again(tg: Tg, chat_id: int) -> None:
     *earlier, current = jobs
     _BASKET[chat_id] = earlier
     _STATE[chat_id] = current
-    tg.send_message(chat_id, f"reusing the last batch — {len(jobs)} job(s). "
-                             "/pipeline to change the flow, then Run.")
-    _maybe_show_manifest(tg, chat_id, current)
+    # Used to be its own button-less tg.send_message telling the user to type
+    # /pipeline — the panel below already carries Run and the ⚙️ pipeline
+    # switch as buttons, so folding this into its note (the same merge every
+    # other flow uses, e.g. _add_to_batch, _drop_current) puts the buttons on
+    # the message the user actually reads instead of a second one below it.
+    _maybe_show_manifest(tg, chat_id, current,
+                         note=f"reusing the last batch — {len(jobs)} job(s)")
 
 
 def _do_resume(tg: Tg, chat_id: int, manifest_path: Path, *, dry_run: bool) -> None:
