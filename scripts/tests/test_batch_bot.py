@@ -4456,6 +4456,27 @@ class TestProvisionFailureRecovery(unittest.TestCase):
         # PRO 4500 is sold out everywhere in this fixture — no switch button.
         self.assertFalse(any("pro4500" in d for d in flat))
 
+    def test_switch_and_subscribe_buttons_carry_the_same_animated_icons_as_elsewhere(self):
+        # Switch resumes a paid rental immediately (same action "Yes, spend
+        # $/h" performs) so it gets ICON_ROCKET_CE, matching that button
+        # exactly. Subscribe is always offered for a "none"-stock (gpu, dc)
+        # pair here, so it gets ICON_CRITICAL_CE, matching
+        # _offer_gpu_sub_datacenters' own "none" branch.
+        self._write_failure(stock_out=True)
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
+            bot.deliver_result(self.tg, ME, self.manifest)
+        rows = self.tg.buttons[-1]
+        switch_row = next(r for r in rows
+                          if r[0][1].startswith(bot._CB_RECOVER_SWITCH))
+        sub_row = next(r for r in rows if r[0][1].startswith(bot._CB_GPUSUB_DC))
+        self.assertEqual(switch_row[0][2], bot._ce_id(bot.ICON_ROCKET_CE))
+        self.assertEqual(sub_row[0][2], bot._ce_id(bot.ICON_CRITICAL_CE))
+        # Đợi mirrors every other Cancel-style button in this file: bare,
+        # no icon.
+        wait_row = next(r for r in rows if r[0][1] == bot._CB_RECOVER_WAIT)
+        self.assertEqual(len(wait_row[0]), 2)
+
     def test_non_stock_out_falls_back_to_a_plain_message_with_no_recovery_buttons(self):
         self._write_failure(stock_out=False, detail="runpodctl: connection refused")
         bot.deliver_result(self.tg, ME, self.manifest)

@@ -603,9 +603,14 @@ def _deliver_provision_failure(tg: Tg, chat_id: int, manifest_path: Path,
                      if e.datacenter_id == home_dc), None)
         if entry is None or entry.stock_status.lower() == "none":
             continue
-        buttons.append([(f"Đổi sang {entry.display_name} — {entry.stock_status} · "
+        # ICON_ROCKET_CE, not plain — unlike _switch_type_options' own
+        # switch buttons (which only update the picker before a later,
+        # separate spend confirmation), this one resumes the rental the
+        # instant it's tapped, the same action "Yes, spend $/h" performs.
+        buttons.append([(f"🖥 Đổi sang {entry.display_name} — {entry.stock_status} · "
                         f"${entry.price_per_hr:.2f}/h",
-                        f"{_CB_RECOVER_SWITCH}{short}:{stem}")])
+                        f"{_CB_RECOVER_SWITCH}{short}:{stem}",
+                        _ce_id(ICON_ROCKET_CE))])
 
     # Other datacenters the SAME failed GPU is stocked at — a migration,
     # never a same-datacenter switch (see _migrate_options for why the two
@@ -619,8 +624,12 @@ def _deliver_provision_failure(tg: Tg, chat_id: int, manifest_path: Path,
 
     short = _GPU_SHORT.get(failure.gpu)
     if short is not None:
+        # ICON_CRITICAL_CE, same as _offer_gpu_sub_datacenters' own "none"
+        # branch — this datacenter is always "none" for the failed GPU here,
+        # by construction (that IS the failure being reported).
         buttons.append([(f"🔔 Subscribe {_GPU_DISPLAY_SHORT.get(failure.gpu, failure.gpu)} "
-                        f"@ {dc}", f"{_CB_GPUSUB_DC}{short}:{dc}")])
+                        f"@ {dc}", f"{_CB_GPUSUB_DC}{short}:{dc}",
+                        _ce_id(ICON_CRITICAL_CE))])
 
     tg.send_message(chat_id, "\n".join(lines), parse_mode=PARSE_HTML, buttons=buttons)
 
