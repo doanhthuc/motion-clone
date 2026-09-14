@@ -707,7 +707,7 @@ def deliver_result(tg: Tg, chat_id: int, manifest_path: Path) -> None:
             # and bury the actual reason under noise.
             _deliver_provision_failure(tg, chat_id, manifest_path, failure)
             return
-        tg.send_message(chat_id, f"⚠️ <b>Nothing to send</b> for "
+        tg.send_message(chat_id, f"{ICON_WARN} <b>Nothing to send</b> for "
                                  f"{_esc(batch_id)} — no output files and no "
                                  "run marked failed. Check the drain log on "
                                  "the box.", parse_mode=PARSE_HTML)
@@ -1287,7 +1287,7 @@ def handle(tg: Tg, update: dict, *, allowed_user_id: int,
             # log line on a box they are not looking at.
             tg.send_message(
                 chat_id,
-                "⚠️ <b>The job I was holding could not be read.</b>\n"
+                f"{ICON_WARN} <b>The job I was holding could not be read.</b>\n"
                 f"Saved as <code>{_esc(salvaged)}</code> and set aside; the "
                 "staged files are still on disk. Send the files again, or "
                 "forward them from earlier in this chat.",
@@ -1862,6 +1862,10 @@ ICON_EDIT_CE = _ce("5395444784611480792", "✏️")
 ICON_ROCKET_CE = _ce("5188481279963715781", "🚀")
 ICON_DEPART_CE = _ce("5201691993775818138", "🛫")
 ICON_MONEY_CE = _ce("5201873447554145566", "💵")
+# FinanceEmoji#57 (money bag) — distinct from ICON_MONEY_CE above so the
+# "you're about to spend" warning in /start doesn't reuse the same glyph as
+# the per-hour price display it sits near (2026-09-15).
+ICON_SPEND_CE = _ce("5287231198098117669", "💰")
 ICON_ANNOUNCE_CE = _ce("5424818078833715060", "📣")
 ICON_ALERT_CE = _ce("5440660757194744323", "‼️")
 ICON_FLAG_CE = _ce("5460755126761312667", "🚩")
@@ -2819,13 +2823,13 @@ def tick_progress(tg: Tg, chat_id: int) -> None:
                     if stage not in next_stages:
                         next_stages.append(stage)
             tg.send_message(chat_id,
-                            "✅ Finished — automatically continuing with your "
+                            f"{ICON_OK_CE} Finished — automatically continuing with your "
                             "queued job on the same pod, no extra rental.",
                             parse_mode=PARSE_HTML)
             _start_progress(tg, chat_id, picked_up, next_stages)
         else:
             tg.send_message(chat_id,
-                            f"⚠️ Finished, but the job you queued next could not "
+                            f"{ICON_WARN} Finished, but the job you queued next could not "
                             f"start on the reused pod ({_esc(handoff.reason or 'unknown error')})"
                             f" — the pod was destroyed as usual, nothing extra "
                             f"was billed. Nothing is lost: send /again to reload "
@@ -2906,12 +2910,12 @@ def tick_migration_progress(tg: Tg, chat_id: int, *, dry_run: bool = False) -> N
         return
 
     text = {
-        "create": "🔄 <b>Migrating volume</b> — creating the destination volume…",
-        "sync": "🔄 <b>Migrating volume</b> — copying data between temp pods…",
-        "verify": "🔄 <b>Migrating volume</b> — verifying checksums…",
-        "done": "✅ Migration done.",
-        "failed": f"⚠️ Migration failed: {_esc(payload.get('reason', 'unknown error'))}",
-    }.get(phase, f"🔄 <b>Migrating volume</b> — {_esc(phase)}")
+        "create": f"{ICON_REFRESH_CE} <b>Migrating volume</b> — creating the destination volume…",
+        "sync": f"{ICON_REFRESH_CE} <b>Migrating volume</b> — copying data between temp pods…",
+        "verify": f"{ICON_REFRESH_CE} <b>Migrating volume</b> — verifying checksums…",
+        "done": f"{ICON_OK_CE} Migration done.",
+        "failed": f"{ICON_WARN} Migration failed: {_esc(payload.get('reason', 'unknown error'))}",
+    }.get(phase, f"{ICON_REFRESH_CE} <b>Migrating volume</b> — {_esc(phase)}")
     if phase == "done" and payload.get("warning"):
         text += f"\n{_esc(payload['warning'])}"
 
@@ -4014,7 +4018,7 @@ def _ask_kill(tg: Tg, chat_id: int) -> None:
         spent = f" — already {mins} min (${mins / 60 * 0.99:.2f}) on the pod"
     tg.send_message(
         chat_id,
-        f"⚠️ This destroys the pod right now{spent}. Whatever is mid-render "
+        f"{ICON_WARN} This destroys the pod right now{spent}. Whatever is mid-render "
         "is lost — no output, no resume. Are you sure?",
         buttons=[[("🛑 Yes, kill it", _CB_KILL_GO), ("↩️ Leave it running", _CB_KILL_NO)]])
 
@@ -4074,7 +4078,7 @@ def _do_kill(tg: Tg, chat_id: int) -> None:
         tg.send_message(chat_id, "🛑 Killed. Pod destroyed and verified gone.")
     else:
         tg.send_message(chat_id,
-                        f"⚠️ <b>gpu-destroy may not have worked</b> — check "
+                        f"{ICON_WARN} <b>gpu-destroy may not have worked</b> — check "
                         f"manually, it may still be billing.{detail}",
                         parse_mode=PARSE_HTML)
 
@@ -4514,7 +4518,7 @@ def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
         if recompressed:
             cost = _RECOMPRESSION_COST.get(recompressed)
             tg.send_message(chat_id,
-                            f"⚠️ that arrived as a {recompressed}, not a File — "
+                            f"{ICON_WARN} that arrived as a {recompressed}, not a File — "
                             f"measured 2026-08-31, {cost}. Accepted anyway; "
                             "send it again as a File if this run doesn't come "
                             "out right.")
@@ -4807,8 +4811,8 @@ def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
             f"{ICON_SPEAK_CE} <b>Here's how this works:</b>\n\n"
             f"{ICON_CLIP_CE} <b>File, not Photo</b> — picker → \"...\" → Send as File\n"
             "🎬 Videos are the driver. For images, I'll ask — just tap.\n\n"
-            "✅ Full job shown before anything runs.\n"
-            "💸 <b>Nothing spends money until you tap Run and confirm.</b>\n\n"
+            f"{ICON_OK_CE} Full job shown before anything runs.\n"
+            f"{ICON_SPEND_CE} <b>Nothing spends money until you tap Run and confirm.</b>\n\n"
             "Buttons below, or type the commands.",
             parse_mode=PARSE_HTML,
             reply_keyboard=START_KEYBOARD)

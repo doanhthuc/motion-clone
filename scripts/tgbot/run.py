@@ -113,6 +113,13 @@ _ICON_LOADING_CE = '<tg-emoji emoji-id="5328089410963513796">💠</tg-emoji>'
 # messages sit next to each other in the chat, so they should read the same
 # (2026-09-12, reported live: the plain "⬜" here didn't match the panel).
 _ICON_EMPTY_CE = '<tg-emoji emoji-id="5884089033558070257">⬜️</tg-emoji>'
+# Same ids as bot.py's ICON_OK_CE / ICON_ERROR_CE — a finished/failed stage
+# here is the same state as a filled/warning slot on the confirmation panel,
+# so it should animate the same way instead of falling back to a flat glyph
+# (2026-09-15, reported live: done/error rows here were the only ones left
+# static while running/empty already animated).
+_ICON_OK_CE = '<tg-emoji emoji-id="5980930633298350051">✅</tg-emoji>'
+_ICON_ERROR_CE = '<tg-emoji emoji-id="5210952531676504517">❌</tg-emoji>'
 
 
 def _elapsed(lease) -> str:
@@ -214,13 +221,13 @@ def progress_text(manifest_path: Path, *, lease,
         for stage_name in planned:
             stage = seen.get(stage_name) or {}
             status = stage.get("status")
-            icon = {"done": "✅", "running": _ICON_LOADING_CE,
-                    "error": "❌"}.get(status, _ICON_EMPTY_CE)
+            icon = {"done": _ICON_OK_CE, "running": _ICON_LOADING_CE,
+                    "error": _ICON_ERROR_CE}.get(status, _ICON_EMPTY_CE)
             sec = stage.get("sec")
             suffix = f" · {sec}s" if sec is not None else ""
             lines.append(f"{icon} {html.escape(stage_name, quote=False)}{suffix}")
         if run.get("status") == "error":
-            lines.append("❌ <b>this run failed</b>")
+            lines.append(f"{_ICON_ERROR_CE} <b>this run failed</b>")
 
     if lease is not None:
         mins = (time.time() - lease.provisioned_at) / 60
