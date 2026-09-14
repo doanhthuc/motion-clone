@@ -134,8 +134,9 @@ Runs many jobs from a YAML manifest. Hard boundary: **`batch/<name>.yaml` is you
 the machine's** — the runner journals to `batch/<name>.state.json` (never rewrites the YAML, because
 `safe_dump` would strip your comments). `RESUME=1` first re-attaches to the *existing* `job_id` before
 resubmitting, so a batch interrupted at minute 39 of a 40-minute job doesn't restart it. Try-on with
-`provider: gemini` runs locally (no pod) and is the only stage allowed to run concurrently — the pod
-has one GPU and `run_enhance` calls `comfy_recycle`, which assumes exclusive use.
+`provider: gemini` or `provider: qwen-max` runs locally (no pod) — both are pure hosted-API calls
+(`scripts/batchlib/local_tryon.py`'s `LOCAL_PROVIDERS`) — and is the only stage allowed to run
+concurrently — the pod has one GPU and `run_enhance` calls `comfy_recycle`, which assumes exclusive use.
 
 An MCP server (`.mcp.json` → `scripts/batch_mcp.py`) exposes `batch_validate` / `batch_run` /
 `batch_status` / `batch_rerun`. **Editing `batchlib/mcp_tools.py` requires restarting Claude Code** —
