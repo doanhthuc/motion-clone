@@ -8,6 +8,9 @@ from batchlib.manifest import load_manifest, state_path_for
 from batchlib_ext.gpu_stock import Stock
 from batchlib_ext.handoff import Handoff, handoff_path, mailbox_path, write_handoff
 from batchlib_ext.migrate_lease import MigrateLease, write_migrate_lease
+from batchlib_ext.provision_failure import (ProvisionFailure,
+                                            provision_failure_path,
+                                            write_provision_failure)
 import tgbot.bot as bot
 from tgbot.bot import allowed
 from tgbot.ingest import Probe
@@ -4373,6 +4376,233 @@ class TestDeliverResult(unittest.TestCase):
 
     def test_an_unreadable_log_reports_itself_rather_than_raising(self):
         self.assertIn("could not read", bot._tail(self.root / "missing.log"))
+
+
+class TestProvisionFailureRecovery(unittest.TestCase):
+    """The recovery message + buttons deliver_result shows when pod-
+    provision.sh itself never got a pod for an already-confirmed batch
+    (2026-09-14) — replacing the generic "nothing to send, check the log"
+    reply for exactly this case. See drain.py's provision() for the writer.
+    """
+
+    def setUp(self):
+        self._orig_root = bot.ROOT
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "batch").mkdir()
+        (self.root / "out").mkdir()
+        bot.ROOT = self.root
+        (self.root / ".env").write_text(
+            "GPU=NVIDIA GeForce RTX 5090\nPOD_VOLUME_ID=vol-1\n", encoding="utf-8")
+        self.manifest = self.root / "batch" / "tg-1.yaml"
+        self.manifest.write_text("runs: []\n", encoding="utf-8")
+        state_path_for(self.manifest).write_text(
+            json.dumps({"batch": "2026-09-14-1421", "runs": {}}), encoding="utf-8")
+        (self.root / "out" / "2026-09-14-1421").mkdir()
+        self.tg = FakeTg()
+
+    def tearDown(self):
+        bot.ROOT = self._orig_root
+
+    def _stock(self):
+        # RTX 5090 sold out at home (EU-RO-1), some stock at EUR-NO-1 — the
+        # exact live shape this feature was built for. RTX 4090 has stock at
+        # home (a switch candidate); PRO 4500 is sold out everywhere (no
+        # switch button should be offered for it).
+        return {
+            "NVIDIA GeForce RTX 5090": [
+                Stock(gpu_id="NVIDIA GeForce RTX 5090", display_name="RTX 5090",
+                     price_per_hr=0.99, datacenter_id="EU-RO-1", stock_status="none"),
+                Stock(gpu_id="NVIDIA GeForce RTX 5090", display_name="RTX 5090",
+                     price_per_hr=0.69, datacenter_id="EUR-NO-1", stock_status="Low"),
+            ],
+            "NVIDIA GeForce RTX 4090": [
+                Stock(gpu_id="NVIDIA GeForce RTX 4090", display_name="RTX 4090",
+                     price_per_hr=0.74, datacenter_id="EU-RO-1", stock_status="Low"),
+            ],
+            "NVIDIA RTX PRO 4500 Blackwell": [
+                Stock(gpu_id="NVIDIA RTX PRO 4500 Blackwell",
+                     display_name="RTX PRO 4500", price_per_hr=0.72,
+                     datacenter_id="EU-RO-1", stock_status="none"),
+            ],
+        }
+
+    def _write_failure(self, *, stock_out: bool, detail: str = "hết máy ...") -> None:
+        write_provision_failure(provision_failure_path(self.manifest), ProvisionFailure(
+            gpu="NVIDIA GeForce RTX 5090", datacenter="EU-RO-1",
+            stock_out=stock_out, detail=detail))
+
+    def test_stock_out_shows_the_real_reason_not_a_json_dump_or_the_old_generic_message(self):
+        self._write_failure(stock_out=True)
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
+            bot.deliver_result(self.tg, ME, self.manifest)
+        joined = "\n".join(self.tg.messages)
+        self.assertIn("RTX 5090", joined)
+        self.assertIn("EU-RO-1", joined)
+        self.assertNotIn("{", joined)              # no JSON, as explicitly asked
+        self.assertNotIn("Nothing to send", joined)
+        self.assertNotIn("no _index.tsv", joined)   # no noisy fallback summary either
+
+    def test_stock_out_offers_wait_switch_migrate_and_subscribe_buttons(self):
+        self._write_failure(stock_out=True)
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
+            bot.deliver_result(self.tg, ME, self.manifest)
+        flat = [data for row in self.tg.buttons[-1] for _, data, *_ in row]
+        self.assertIn(bot._CB_RECOVER_WAIT, flat)
+        self.assertIn(f"{bot._CB_RECOVER_SWITCH}4090:tg-1", flat)
+        self.assertIn(f"{bot._CB_RECOVER_MIGRATE}EUR-NO-1:tg-1", flat)
+        self.assertTrue(any(d.startswith(bot._CB_GPUSUB_DC) for d in flat))
+        # PRO 4500 is sold out everywhere in this fixture — no switch button.
+        self.assertFalse(any("pro4500" in d for d in flat))
+
+    def test_non_stock_out_falls_back_to_a_plain_message_with_no_recovery_buttons(self):
+        self._write_failure(stock_out=False, detail="runpodctl: connection refused")
+        bot.deliver_result(self.tg, ME, self.manifest)
+        self.assertIn("connection refused", self.tg.messages[-1])
+        self.assertIsNone(self.tg.buttons[-1])
+
+    def test_no_sentinel_falls_back_to_the_unchanged_nothing_to_send_message(self):
+        bot.deliver_result(self.tg, ME, self.manifest)
+        self.assertIn("Nothing to send", "\n".join(self.tg.messages))
+
+
+class TestProvisionFailureRecoveryButtons(unittest.TestCase):
+    """Tapping the buttons _deliver_provision_failure offers."""
+
+    def setUp(self):
+        self._orig_root = bot.ROOT
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "batch").mkdir()
+        (self.root / "out").mkdir()
+        bot.ROOT = self.root
+        (self.root / ".env").write_text(
+            "GPU=NVIDIA GeForce RTX 5090\nPOD_VOLUME_ID=vol-1\n", encoding="utf-8")
+        self.manifest = self.root / "batch" / "tg-1.yaml"
+        self.manifest.write_text(
+            "runs:\n  - id: a\n    pipeline: motion-enhance\n"
+            "    inputs: {character: /tmp/c.png, driver: /tmp/d.mp4}\n",
+            encoding="utf-8")
+        state_path_for(self.manifest).write_text(
+            json.dumps({"batch": "2026-09-14-1421", "runs": {}}), encoding="utf-8")
+        write_provision_failure(provision_failure_path(self.manifest), ProvisionFailure(
+            gpu="NVIDIA GeForce RTX 5090", datacenter="EU-RO-1",
+            stock_out=True, detail="hết máy ..."))
+        self.tg = FakeTg()
+
+    def tearDown(self):
+        bot.ROOT = self._orig_root
+
+    def test_wait_dismisses_without_starting_anything(self):
+        with mock.patch("tgbot.bot.start_drain") as start_drain:
+            bot.handle(self.tg, cb_from(ME, bot._CB_RECOVER_WAIT), allowed_user_id=ME)
+        start_drain.assert_not_called()
+        self.assertTrue(provision_failure_path(self.manifest).exists())
+
+    def test_switch_rewrites_env_clears_the_sentinel_and_resumes(self):
+        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.migration_running", return_value=False), \
+             mock.patch("tgbot.bot.start_drain") as start_drain:
+            bot.handle(self.tg, cb_from(ME, f"{bot._CB_RECOVER_SWITCH}4090:tg-1"),
+                      allowed_user_id=ME)
+        self.assertEqual(env_get(self.root / ".env", "GPU"),
+                         "NVIDIA GeForce RTX 4090")
+        start_drain.assert_called_once_with(self.manifest, dry_run=False, resume=True)
+        self.assertFalse(provision_failure_path(self.manifest).exists())
+
+    def test_switch_refuses_a_stale_button_from_an_older_bot_version(self):
+        with mock.patch("tgbot.bot.start_drain") as start_drain:
+            bot.handle(self.tg, cb_from(ME, f"{bot._CB_RECOVER_SWITCH}unknown:tg-1"),
+                      allowed_user_id=ME)
+        start_drain.assert_not_called()
+        self.assertEqual(env_get(self.root / ".env", "GPU"),
+                         "NVIDIA GeForce RTX 5090")   # unchanged
+
+    def test_switch_does_nothing_if_already_running(self):
+        with mock.patch("tgbot.bot.drain_running", return_value=True), \
+             mock.patch("tgbot.bot.migration_running", return_value=False), \
+             mock.patch("tgbot.bot.start_drain") as start_drain:
+            bot.handle(self.tg, cb_from(ME, f"{bot._CB_RECOVER_SWITCH}4090:tg-1"),
+                      allowed_user_id=ME)
+        start_drain.assert_not_called()
+        self.assertIn("already running", self.tg.messages[-1])
+
+    def test_migrate_writes_a_resume_marker_and_opens_the_destructive_confirm(self):
+        with mock.patch("tgbot.bot.migration_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, f"{bot._CB_RECOVER_MIGRATE}EUR-NO-1:tg-1"),
+                      allowed_user_id=ME)
+        self.assertEqual(
+            json.loads(bot._migrate_resume_marker().read_text())["stem"], "tg-1")
+        # _ask_migrate's own destructive-confirm screen, unchanged.
+        self.assertIn("Cannot be undone", self.tg.messages[-1])
+        flat = [data for row in self.tg.buttons[-1] for _, data, *_ in row]
+        self.assertIn(f"{bot._CB_MIGRATE_GO}EUR-NO-1", flat)
+
+    def test_cancelling_the_migrate_confirm_drops_the_resume_marker(self):
+        with mock.patch("tgbot.bot.migration_running", return_value=False):
+            bot.handle(self.tg, cb_from(ME, f"{bot._CB_RECOVER_MIGRATE}EUR-NO-1:tg-1"),
+                      allowed_user_id=ME)
+        self.assertTrue(bot._migrate_resume_marker().exists())
+        bot.handle(self.tg, cb_from(ME, bot._CB_MIGRATE_NO), allowed_user_id=ME)
+        self.assertFalse(bot._migrate_resume_marker().exists())
+
+
+class TestMigrationResumesRecoveredManifest(unittest.TestCase):
+    """tick_migration_progress auto-resuming whatever _CB_RECOVER_MIGRATE
+    left in _migrate_resume_marker() once the migration it started reaches
+    "done" — the other half of the recovery Migrate button, see
+    TestProvisionFailureRecoveryButtons for the button tap itself.
+    """
+
+    def setUp(self):
+        self._orig_root = bot.ROOT
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "batch").mkdir()
+        bot.ROOT = self.root
+        self.manifest = self.root / "batch" / "tg-1.yaml"
+        self.manifest.write_text(
+            "runs:\n  - id: a\n    pipeline: motion-enhance\n"
+            "    inputs: {character: /tmp/c.png, driver: /tmp/d.mp4}\n",
+            encoding="utf-8")
+        state_path_for(self.manifest).write_text(
+            json.dumps({"batch": "2026-09-14-1421", "runs": {}}), encoding="utf-8")
+        self.tg = FakeTg()
+
+    def tearDown(self):
+        bot.ROOT = self._orig_root
+
+    def _write_progress(self, phase: str) -> None:
+        prog_path = bot._migrate_progress_path()
+        prog_path.parent.mkdir(parents=True, exist_ok=True)
+        prog_path.write_text(json.dumps({"phase": phase, "at": 0.0}), encoding="utf-8")
+
+    def test_a_done_migration_resumes_the_marked_manifest(self):
+        bot._migrate_resume_marker().write_text(json.dumps({"stem": "tg-1"}),
+                                                 encoding="utf-8")
+        self._write_progress("done")
+        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.migration_running", return_value=False), \
+             mock.patch("tgbot.bot.start_drain") as start_drain:
+            bot.tick_migration_progress(self.tg, ME)
+        start_drain.assert_called_once_with(self.manifest, dry_run=False, resume=True)
+        self.assertFalse(bot._migrate_resume_marker().exists())
+
+    def test_a_failed_migration_does_not_resume_anything(self):
+        # The pinned datacenter never got the volume — retrying there would
+        # just fail the same way the original provision attempt did.
+        bot._migrate_resume_marker().write_text(json.dumps({"stem": "tg-1"}),
+                                                 encoding="utf-8")
+        self._write_progress("failed")
+        with mock.patch("tgbot.bot.start_drain") as start_drain:
+            bot.tick_migration_progress(self.tg, ME)
+        start_drain.assert_not_called()
+        self.assertFalse(bot._migrate_resume_marker().exists())
+
+    def test_no_marker_means_a_done_migration_does_nothing_extra(self):
+        self._write_progress("done")
+        with mock.patch("tgbot.bot.start_drain") as start_drain:
+            bot.tick_migration_progress(self.tg, ME)
+        start_drain.assert_not_called()
 
 
 class TestGpuStockCommand(unittest.TestCase):

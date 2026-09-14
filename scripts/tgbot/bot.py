@@ -55,6 +55,9 @@ from batchlib_ext.gpu_stock import stock_at, stock_at_cached, volume_datacenter
 from batchlib_ext.handoff import handoff_path, mailbox_path, read_handoff
 from batchlib_ext.lease import clear_lease
 from batchlib_ext.migrate_lease import read_migrate_lease
+from batchlib_ext.provision_failure import (clear_provision_failure,
+                                            provision_failure_path,
+                                            read_provision_failure)
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -547,6 +550,81 @@ def _tail(path: Path, limit: int = TAIL_CHARS) -> str:
     return text[-limit:]
 
 
+def _deliver_provision_failure(tg: Tg, chat_id: int, manifest_path: Path,
+                               failure: "ProvisionFailure") -> None:
+    """Report why pod-provision.sh itself never got a pod, in place of the
+    generic "nothing to send, check the log" message deliver_result used to
+    leave behind for this exact case (a batch whose local phase finished but
+    whose GPU rental never started).
+
+    Only a stock-out (pod-provision.sh's own "no instances available"
+    classification, drain.py's _STOCK_OUT_MARKER) gets recovery buttons: any
+    other reason (bad config, a RunPod API error, ...) is not decidable from
+    a fixed menu, so it gets the plain reason plus today's "check the log"
+    pointer instead.
+    """
+    stem = manifest_path.stem
+    if not failure.stock_out:
+        tg.send_message(
+            chat_id,
+            f"{ICON_ERROR_CE} <b>Could not rent a pod</b> for {_esc(stem)}.\n"
+            f"<blockquote expandable>{_esc(failure.detail[-500:])}</blockquote>\n"
+            "Check the drain log on the box for the full error.",
+            parse_mode=PARSE_HTML)
+        return
+
+    dc = failure.datacenter or "?"
+    lines = [f"{ICON_ERROR_CE} <b>Could not rent a pod</b> for {_esc(stem)}", "",
+            f"No stock for <b>{_esc(failure.gpu)}</b> at {_esc(dc)} — the only "
+            "datacenter your Network Volume can mount in.", "",
+            "Your batch is safe — nothing already finished was lost, it's "
+            "just stuck waiting for a pod."]
+
+    volume_id = env_get(ROOT / ".env", "POD_VOLUME_ID")
+    home_dc = volume_datacenter(volume_id)
+    wanted = [_PRIMARY_GPU_ID, *_FALLBACK_GPU_IDS]
+    try:
+        stock = stock_at_cached(wanted) if home_dc else {}
+    except RuntimeError:
+        stock = {}
+
+    buttons = [[("Đợi", _CB_RECOVER_WAIT)]]
+
+    # Same-datacenter alternatives — tapping one resumes immediately, unlike
+    # _CB_RUN_SWITCH's pre-spend picker, because this batch was already
+    # confirmed once; switching GPU here is not a new spend decision.
+    for gpu_id in wanted:
+        if gpu_id == failure.gpu:
+            continue
+        short = _GPU_SHORT.get(gpu_id)
+        if short is None:
+            continue
+        entry = next((e for e in (stock.get(gpu_id) or [])
+                     if e.datacenter_id == home_dc), None)
+        if entry is None or entry.stock_status.lower() == "none":
+            continue
+        buttons.append([(f"Đổi sang {entry.display_name} — {entry.stock_status} · "
+                        f"${entry.price_per_hr:.2f}/h",
+                        f"{_CB_RECOVER_SWITCH}{short}:{stem}")])
+
+    # Other datacenters the SAME failed GPU is stocked at — a migration,
+    # never a same-datacenter switch (see _migrate_options for why the two
+    # are always offered separately).
+    for e in stock.get(failure.gpu) or []:
+        if e.datacenter_id == home_dc or e.stock_status.lower() == "none":
+            continue
+        buttons.append([(f"🛫 Migrate → {e.datacenter_id} — {e.stock_status} · "
+                        f"${e.price_per_hr:.2f}/h",
+                        f"{_CB_RECOVER_MIGRATE}{e.datacenter_id}:{stem}")])
+
+    short = _GPU_SHORT.get(failure.gpu)
+    if short is not None:
+        buttons.append([(f"🔔 Subscribe {_GPU_DISPLAY_SHORT.get(failure.gpu, failure.gpu)} "
+                        f"@ {dc}", f"{_CB_GPUSUB_DC}{short}:{dc}")])
+
+    tg.send_message(chat_id, "\n".join(lines), parse_mode=PARSE_HTML, buttons=buttons)
+
+
 def deliver_result(tg: Tg, chat_id: int, manifest_path: Path) -> None:
     """Send the finished video(s) back, or the failure diagnostics already on disk.
 
@@ -612,6 +690,14 @@ def deliver_result(tg: Tg, chat_id: int, manifest_path: Path) -> None:
             tg.send_document(chat_id, log_path, caption=f"{run_id}/{name}")
 
     if not outputs and not failures:
+        failure = read_provision_failure(provision_failure_path(manifest_path))
+        if failure is not None:
+            # This IS the whole report for this case — no trailing
+            # summary_text blockquote below, which would only say
+            # "no _index.tsv yet" (Phase A ran, the pod stage never got to)
+            # and bury the actual reason under noise.
+            _deliver_provision_failure(tg, chat_id, manifest_path, failure)
+            return
         tg.send_message(chat_id, f"⚠️ <b>Nothing to send</b> for "
                                  f"{_esc(batch_id)} — no output files and no "
                                  "run marked failed. Check the drain log on "
@@ -1255,6 +1341,17 @@ _CB_MIGRATE_ASK = "mig:ask:"    # + "<to_dc>"
 _CB_MIGRATE_GO = "mig:go:"      # + "<to_dc>"
 _CB_MIGRATE_NO = "mig:no"
 
+# The recovery buttons _deliver_provision_failure offers when pod-
+# provision.sh itself failed with "no instances available" for an already-
+# confirmed batch (drain.py wrote a ProvisionFailure next to its manifest).
+# Distinct from _CB_RUN_SWITCH/_CB_MIGRATE_ASK: those act on the job still
+# being drafted in _STATE, these act on a manifest that already ran its
+# local phase — see _do_resume. Subscribing reuses _CB_GPUSUB_DC as-is,
+# no new constant needed for that one.
+_CB_RECOVER_WAIT = "rec:wait"
+_CB_RECOVER_SWITCH = "rec:sw:"     # + "<gpu short>:<manifest stem>"
+_CB_RECOVER_MIGRATE = "rec:mig:"   # + "<to_dc>:<manifest stem>"
+
 # ONE number, everywhere a migration's duration is quoted: the /gpu listing,
 # the [Run] picker's "Other regions" note, the destructive confirm, and the
 # "started" reply. They said "~25-30 min" in two of those places and "15-25
@@ -1502,6 +1599,37 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
 
         elif data == _CB_MIGRATE_NO:
             tg.send_message(chat_id, "kept — nothing migrated")
+            # Drops a resume request minted by the recovery Migrate button
+            # (see _CB_RECOVER_MIGRATE below) — cancelling here means there is
+            # nothing left to resume when some LATER, unrelated migration
+            # finishes.
+            _migrate_resume_marker().unlink(missing_ok=True)
+
+        elif data == _CB_RECOVER_WAIT:
+            tg.send_message(chat_id, "OK — dismissed, nothing changed. Use the "
+                                     "other buttons above, or /confirm again "
+                                     "later, when you want to retry.")
+
+        elif data.startswith(_CB_RECOVER_SWITCH):
+            short, _, stem = data[len(_CB_RECOVER_SWITCH):].partition(":")
+            gpu_id = _GPU_BY_SHORT.get(short)
+            if gpu_id is None or not stem:
+                tg.send_message(chat_id, "that button is from an older "
+                                         "version of the bot; check /status")
+            else:
+                env_set(ROOT / ".env", "GPU", gpu_id)
+                _do_resume(tg, chat_id, ROOT / "batch" / f"{stem}.yaml",
+                          dry_run=dry_run)
+
+        elif data.startswith(_CB_RECOVER_MIGRATE):
+            to_dc, _, stem = data[len(_CB_RECOVER_MIGRATE):].partition(":")
+            if not to_dc or not stem:
+                tg.send_message(chat_id, "that button is from an older "
+                                         "version of the bot; check /status")
+            else:
+                _migrate_resume_marker().write_text(
+                    json.dumps({"stem": stem}), encoding="utf-8")
+                _ask_migrate(tg, chat_id, to_dc)
 
         else:
             tg.send_message(chat_id, "that button is from an older version of "
@@ -2737,7 +2865,7 @@ def tick_progress(tg: Tg, chat_id: int) -> None:
     deliver_result(tg, chat_id, manifest_path)
 
 
-def tick_migration_progress(tg: Tg, chat_id: int) -> None:
+def tick_migration_progress(tg: Tg, chat_id: int, *, dry_run: bool = False) -> None:
     """Re-render the migration progress message, same shape as tick_progress
     for a drain — one message, edited in place throughout, including its
     final done/failed state ("one last edit so the message ends on the
@@ -2746,6 +2874,14 @@ def tick_migration_progress(tg: Tg, chat_id: int) -> None:
     output files, so nothing should be sent as a substitute for editing the
     progress text itself). Called every poll tick alongside tick_progress;
     harmless no-op when no migration is running.
+
+    On a successful "done", also resumes whatever manifest the recovery
+    Migrate button (_CB_RECOVER_MIGRATE) left in _migrate_resume_marker() —
+    that button is the only writer of that file, and migration_running()'s
+    one-at-a-time guard means there is never more than one manifest waiting
+    on it. A "failed" migration does NOT resume anything: the pinned
+    datacenter never got the volume, so a retry there would just fail again
+    the same way the original provision attempt did.
     """
     progress_path = _migrate_progress_path()
     if not progress_path.exists():
@@ -2787,6 +2923,20 @@ def tick_migration_progress(tg: Tg, chat_id: int) -> None:
         # one for the rest of its staleness window.
         _migrate_launch_marker().unlink(missing_ok=True)
         _MIGRATE_PROC.pop(_MIGRATE_PROC_KEY, None)
+
+        resume_marker = _migrate_resume_marker()
+        if phase == "done" and resume_marker.exists():
+            try:
+                stem = json.loads(resume_marker.read_text(encoding="utf-8"))["stem"]
+            except (ValueError, KeyError, TypeError) as exc:
+                log(f"migrate-resume marker unreadable, dropping it: {exc!r}")
+                stem = None
+            resume_marker.unlink(missing_ok=True)
+            if stem:
+                _do_resume(tg, chat_id, ROOT / "batch" / f"{stem}.yaml",
+                          dry_run=dry_run)
+        else:
+            resume_marker.unlink(missing_ok=True)
 
 
 _LAST_SUFFIX = ".last.json"
@@ -3490,6 +3640,19 @@ def _migrate_log_path() -> Path:
     return ROOT / "batch" / "volume-migrate.log"
 
 
+def _migrate_resume_marker() -> Path:
+    """Which stalled manifest to resume once the CURRENT migration reaches
+    "done" — written only by the recovery Migrate button (_CB_RECOVER_MIGRATE
+    in _handle_callback), never by the plain /gpu "Other regions" flow, which
+    has nothing to resume. Safe against migration_running()'s own one-at-a-
+    time guard: only one migration can ever be in flight, so this never has
+    to disambiguate which migration a marker belongs to — there is at most
+    one. Cleared here, by tick_migration_progress on done/failed, and by the
+    _CB_MIGRATE_NO cancel — any of the three is the end of what it was for.
+    """
+    return ROOT / "batch" / "migrate-resume.json"
+
+
 # Popen handle for a migration THIS process started, so a finished one stops
 # blocking the next. Same shape and same limits as tgbot/run.py's _RUNNING:
 # process memory, empty again after a bot restart — which is exactly why the
@@ -4026,8 +4189,59 @@ def _again(tg: Tg, chat_id: int) -> None:
     _maybe_show_manifest(tg, chat_id, current)
 
 
+def _do_resume(tg: Tg, chat_id: int, manifest_path: Path, *, dry_run: bool) -> None:
+    """Continue a batch whose pod rental already failed once — reached only
+    from the recovery buttons _deliver_provision_failure offers, after the
+    user picked a different GPU (_CB_RECOVER_SWITCH) or a migration finished
+    (tick_migration_progress's own resume-on-done).
+
+    Deliberately NOT routed through _do_confirm: that function's checks
+    (a drafted job in _STATE, the unanswered-file queue, cached validation)
+    are about a job still being assembled in chat, and there is none of that
+    for a manifest that was already confirmed and ran its local phase —
+    money was already committed to THIS exact manifest the first time
+    /confirm ran. _do_resume is the second, and only other, function in this
+    file allowed to call start_drain: unlike _do_confirm it can only ever be
+    reached for a manifest that already has a recorded batch id (proof it
+    already passed the money gate once), so it is not a second way to spend
+    money the user has not already agreed to.
+    """
+    if migration_running():
+        tg.send_message(chat_id, "a volume migration is in progress for this "
+                                 "pod's datacenter — wait for it to finish "
+                                 "before retrying")
+        return
+    if drain_running(manifest_path):
+        tg.send_message(chat_id, "already running — nothing to resume")
+        return
+    state = load_state(state_path_for(manifest_path))
+    if not state.get("batch"):
+        tg.send_message(chat_id, f"nothing to resume for {_esc(manifest_path.stem)} "
+                                 "— that batch never started")
+        return
+    try:
+        manifest = load_manifest(manifest_path)
+    except ManifestError as exc:
+        tg.send_message(chat_id, f"could not resume — {_esc(str(exc))}")
+        return
+    clear_provision_failure(provision_failure_path(manifest_path))
+    stages: list[str] = []
+    for run in manifest.runs:
+        for stage in PIPELINES[run.pipeline]:
+            if stage not in stages:
+                stages.append(stage)
+    tg.send_message(chat_id, f"{ICON_ROCKET_CE} <b>Retrying</b> — renting a pod "
+                             f"again for {_esc(manifest_path.stem)}.",
+                    parse_mode=PARSE_HTML)
+    start_drain(manifest_path, dry_run=dry_run, resume=True)
+    _start_progress(tg, chat_id, manifest_path, stages)
+
+
 def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
-    """THE money gate. The ONLY function that may call start_drain.
+    """THE money gate for a FRESH spend decision. The only OTHER function
+    that may call start_drain is _do_resume, which continues a manifest
+    already confirmed here once — see its own docstring for why that is not
+    a second way to spend money the user has not agreed to.
 
     Extracted from the /confirm branch on 2026-08-31 when the Run button
     arrived. Two entry points must not mean two gates: every check below —
@@ -4036,8 +4250,8 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
     /confirm or tapped a button, and the way to guarantee that is one body
     with two callers rather than two bodies that agree today.
 
-    `grep -rn "start_drain" scripts/tgbot/bot.py` must show exactly one
-    call site, and it must be in here.
+    `grep -rn "start_drain" scripts/tgbot/bot.py` must show exactly two call
+    sites: this one, and _do_resume's.
     """
     # Checked before anything else, including completeness — a migration mid-
     # copy is moving the Network Volume this pod would mount, so renting must
@@ -4690,7 +4904,7 @@ def main() -> int:
             # After the updates, not instead of them.
             # One chat, because the allowlist is one user (spec section 2).
             tick_progress(tg, allowed_user_id)
-            tick_migration_progress(tg, allowed_user_id)
+            tick_migration_progress(tg, allowed_user_id, dry_run=args.dry_run)
             _tick_gpu_subs(tg, allowed_user_id)
             _tick_staging_prune()
         except TgError as exc:

@@ -20,8 +20,13 @@ from batch_run import EXIT_NEEDS_POD
 from batchlib.config import env_get, load_settings
 from batchlib.manifest import Manifest, load_manifest, load_state, state_path_for
 from batchlib.pipelines import PIPELINES, STAGES
+from batchlib_ext.gpu_stock import volume_datacenter
 from batchlib_ext.handoff import Handoff, claim_mailbox, handoff_path, write_handoff
 from batchlib_ext.lease import Lease, clear_lease, read_lease, write_lease
+from batchlib_ext.provision_failure import (ProvisionFailure,
+                                            clear_provision_failure,
+                                            provision_failure_path,
+                                            write_provision_failure)
 
 ROOT = Path(__file__).resolve().parents[1]
 LEASE_PATH = ROOT / "batch" / "pod-lease.json"
@@ -74,7 +79,16 @@ def pod_max_hours(ceiling_min: int, configured: str) -> str:
     return str(max(1, min(-(-ceiling_min // 60), int(value))))   # ceil, capped
 
 
-def provision(*, ceiling_min: int) -> str:
+# The exact phrase pod-provision.sh's own die() prints ONLY on its "no
+# instances available" branch — never on its other die() calls (bad config,
+# a different runpodctl error). Matching this one string, rather than
+# re-implementing pod-provision.sh's own stock-out regex here, keeps the
+# classification in one place: whatever that script decides is a stock-out
+# is what drain.py reports as one.
+_STOCK_OUT_MARKER = "không tự xoay sang card khác"
+
+
+def provision(*, ceiling_min: int, manifest_path: Path) -> str:
     """Rent a pod and return its instance id. Does NOT wait or bootstrap.
 
     Split from the wait so main() can write the lease in between. The pod is
@@ -86,10 +100,31 @@ def provision(*, ceiling_min: int) -> str:
 
     POD_MAX_HOURS is tightened per-drain — see pod_max_hours(). pod-provision.sh
     already reads it from the environment.
+
+    On failure, writes a batchlib_ext.provision_failure.ProvisionFailure next
+    to manifest_path before re-raising — the bot's deliver_result reads it to
+    show the real reason (and, for a stock-out, switch/migrate/subscribe
+    buttons) instead of the generic "check the log" message this used to
+    leave behind. stderr is captured for that classification but still
+    written through to this process's own stderr so it keeps landing in the
+    drain log exactly as before.
     """
     hours = pod_max_hours(ceiling_min, env_get(ROOT / ".env", "POD_MAX_HOURS"))
-    subprocess.run(f"POD_MAX_HOURS={hours} CONFIRM=yes bash scripts/pod-provision.sh",
-                   shell=True, check=True, cwd=ROOT)
+    result = subprocess.run(
+        f"POD_MAX_HOURS={hours} CONFIRM=yes bash scripts/pod-provision.sh",
+        shell=True, cwd=ROOT, stderr=subprocess.PIPE, text=True)
+    if result.stderr:
+        sys.stderr.write(result.stderr)
+    failure_path = provision_failure_path(manifest_path)
+    if result.returncode != 0:
+        write_provision_failure(failure_path, ProvisionFailure(
+            gpu=env_get(ROOT / ".env", "GPU"),
+            datacenter=volume_datacenter(env_get(ROOT / ".env", "POD_VOLUME_ID")),
+            stock_out=_STOCK_OUT_MARKER in result.stderr,
+            detail=result.stderr.strip()))
+        raise subprocess.CalledProcessError(result.returncode, result.args,
+                                            stderr=result.stderr)
+    clear_provision_failure(failure_path)
     pod_id = env_get(ROOT / ".env", "GPU_INSTANCE_ID")
     if not pod_id:
         # env_get returns "" for every failure mode, including .env being
@@ -297,7 +332,7 @@ def main() -> int:
         print(f"local phase failed (exit {rc}) — NOT renting a pod", file=sys.stderr)
         return rc
 
-    pod_id = provision(ceiling_min=ceiling)
+    pod_id = provision(ceiling_min=ceiling, manifest_path=manifest_path)
     # The lease is written HERE, between provisioning and waiting — not after
     # bootstrap. The pod bills from the line above, and tier 3's grace window is
     # 10 minutes while bootstrap is 284s prebuilt (docs/gpu-pod.md:81) and ~30 min

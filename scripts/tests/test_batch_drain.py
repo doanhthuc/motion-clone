@@ -6,6 +6,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batchlib.manifest import load_manifest, state_path_for
 from batchlib_ext.handoff import Handoff, handoff_path, mailbox_path
 from batchlib_ext.lease import Lease
+from batchlib_ext.provision_failure import (provision_failure_path,
+                                            read_provision_failure,
+                                            write_provision_failure,
+                                            ProvisionFailure)
 import drain
 from drain import (abs_max_min, chain_or_teardown, collect_diagnostics,
                    failed_job_ids, pod_max_hours, teardown)
@@ -66,6 +70,9 @@ class TestPodMaxHours(unittest.TestCase):
 
 
 class TestProvision(unittest.TestCase):
+    def _manifest_path(self) -> Path:
+        return Path(tempfile.mkdtemp()) / "tg-1.yaml"
+
     def test_empty_pod_id_raises_instead_of_writing_a_useless_lease(self):
         # env_get returns "" on ANY failure to read .env (config.py:62-66). A
         # lease with an empty pod_id makes every later kill `runpodctl pod delete
@@ -73,19 +80,74 @@ class TestProvision(unittest.TestCase):
         # was just rented.
         with mock.patch.object(drain.subprocess, "run") as mock_run, \
              mock.patch.object(drain, "env_get", return_value=""):
-            mock_run.return_value = mock.Mock(returncode=0)
+            mock_run.return_value = mock.Mock(returncode=0, stderr="")
             with self.assertRaises(RuntimeError) as cm:
-                drain.provision(ceiling_min=120)
+                drain.provision(ceiling_min=120, manifest_path=self._manifest_path())
         self.assertIn("GPU_INSTANCE_ID is empty", str(cm.exception))
 
     def test_returns_the_pod_id_provisioning_wrote_to_env(self):
         with mock.patch.object(drain.subprocess, "run") as mock_run, \
              mock.patch.object(drain, "env_get", side_effect=["8", "pod-xyz"]):
-            mock_run.return_value = mock.Mock(returncode=0)
-            self.assertEqual(drain.provision(ceiling_min=120), "pod-xyz")
+            mock_run.return_value = mock.Mock(returncode=0, stderr="")
+            pod_id = drain.provision(ceiling_min=120, manifest_path=self._manifest_path())
+            self.assertEqual(pod_id, "pod-xyz")
         # provision() must NOT wait or bootstrap: main() writes the lease between
         # the two, because the pod bills from the moment provisioning returns.
         self.assertEqual(mock_run.call_count, 1)
+
+    def test_success_clears_a_stale_provision_failure(self):
+        # A previous drain's stock-out sentinel must not survive a rental
+        # that then succeeds — the bot would otherwise keep offering
+        # recovery buttons for a problem that is already resolved.
+        manifest_path = self._manifest_path()
+        failure_path = provision_failure_path(manifest_path)
+        write_provision_failure(failure_path, ProvisionFailure(
+            gpu="x", datacenter=None, stock_out=True, detail="stale"))
+        with mock.patch.object(drain.subprocess, "run") as mock_run, \
+             mock.patch.object(drain, "env_get", side_effect=["8", "pod-xyz"]):
+            mock_run.return_value = mock.Mock(returncode=0, stderr="")
+            drain.provision(ceiling_min=120, manifest_path=manifest_path)
+        self.assertFalse(failure_path.exists())
+
+    def test_stock_out_failure_writes_a_classified_provision_failure(self):
+        # The exact stderr text pod-provision.sh's own die() prints on a
+        # "no instances available" runpodctl create — see scripts/pod-
+        # provision.sh's stock-out branch.
+        stderr = ("\033[31m ✗ \033[0mhết máy 'NVIDIA GeForce RTX 5090' "
+                  "tại datacenter của volume — không tự xoay "
+                  "sang card khác.\n")
+        manifest_path = self._manifest_path()
+        with mock.patch.object(drain.subprocess, "run") as mock_run, \
+             mock.patch.object(drain, "env_get",
+                               side_effect=lambda path, key: {
+                                   "POD_MAX_HOURS": "8", "GPU": "NVIDIA GeForce RTX 5090",
+                                   "POD_VOLUME_ID": "u469c9efga"}[key]), \
+             mock.patch.object(drain, "volume_datacenter", return_value="EU-RO-1"):
+            mock_run.return_value = mock.Mock(returncode=1, stderr=stderr)
+            with self.assertRaises(drain.subprocess.CalledProcessError):
+                drain.provision(ceiling_min=120, manifest_path=manifest_path)
+        failure = read_provision_failure(provision_failure_path(manifest_path))
+        self.assertIsNotNone(failure)
+        self.assertTrue(failure.stock_out)
+        self.assertEqual(failure.gpu, "NVIDIA GeForce RTX 5090")
+        self.assertEqual(failure.datacenter, "EU-RO-1")
+
+    def test_other_failure_writes_a_non_stock_out_provision_failure(self):
+        stderr = "✗ runpodctl pod create failed ('NVIDIA GeForce RTX 5090'):\nsome API error\n"
+        manifest_path = self._manifest_path()
+        with mock.patch.object(drain.subprocess, "run") as mock_run, \
+             mock.patch.object(drain, "env_get",
+                               side_effect=lambda path, key: {
+                                   "POD_MAX_HOURS": "8", "GPU": "NVIDIA GeForce RTX 5090",
+                                   "POD_VOLUME_ID": "u469c9efga"}[key]), \
+             mock.patch.object(drain, "volume_datacenter", return_value="EU-RO-1"):
+            mock_run.return_value = mock.Mock(returncode=1, stderr=stderr)
+            with self.assertRaises(drain.subprocess.CalledProcessError):
+                drain.provision(ceiling_min=120, manifest_path=manifest_path)
+        failure = read_provision_failure(provision_failure_path(manifest_path))
+        self.assertIsNotNone(failure)
+        self.assertFalse(failure.stock_out)
+        self.assertIn("some API error", failure.detail)
 
 
 class TestFailedJobIds(unittest.TestCase):

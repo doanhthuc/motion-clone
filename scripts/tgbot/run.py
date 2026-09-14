@@ -231,7 +231,8 @@ def progress_text(manifest_path: Path, *, lease,
     return "\n".join(lines)
 
 
-def start_drain(manifest_path: Path, *, dry_run: bool) -> subprocess.Popen:
+def start_drain(manifest_path: Path, *, dry_run: bool,
+                resume: bool = False) -> subprocess.Popen:
     """Launch `make drain FILE=...`, appending CONFIRM=yes only when dry_run is False.
 
     This is the ONLY line in this module (in this repo) that may write the
@@ -240,8 +241,15 @@ def start_drain(manifest_path: Path, *, dry_run: bool) -> subprocess.Popen:
     file beside the manifest rather than a pipe: a drain can run for the
     lifetime of a rented pod (hours), and a Popen pipe that nobody reads
     fills its OS buffer and deadlocks the child.
+
+    `resume` forwards RESUME=1 to `make drain` (drain.py's own --resume,
+    Makefile:84) — used by bot.py's _do_resume to continue a manifest whose
+    local try-on phase already ran and was journalled, so batch_run.py skips
+    it instead of re-running (and re-billing Gemini for) it.
     """
     argv = ["make", "drain", f"FILE={manifest_path}"]
+    if resume:
+        argv.append("RESUME=1")
     if not dry_run:
         argv.append("CONFIRM=yes")
 
