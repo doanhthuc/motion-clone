@@ -6,8 +6,8 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from batchlib.client import (JobError, JobFailed, JobGone, download_output, encode_multipart,
-                            health_ok, poll_job, submit_job)
+from batchlib.client import (DOWNLOAD_MAX_RETRIES, JobError, JobFailed, JobGone, download_output,
+                            encode_multipart, health_ok, poll_job, submit_job)
 from batchlib.config import Settings
 
 STATE = {"poll_calls": 0, "statuses": [], "last_post": None, "output": b"", "health": 200,
@@ -367,6 +367,54 @@ class TestDownload(ServerCase):
             self.assertIn("404", msg)
             self.assertIn("Chua co output cho job nay", msg)
             self.assertFalse(dest.exists())
+
+
+class TestDownloadRetry(unittest.TestCase):
+    """download_output: connection nhỏ giọt (JobError từ _download_once) phải được
+    bỏ và mở lại bằng connection MỚI — không đợi thêm, không im lặng trả về rỗng.
+
+    Bug thật đo 15/09/2026: `timeout=` per-recv reset mỗi khi có thêm dù chỉ 1 byte,
+    nên một connection tụt còn ~5.6 KB/s không bao giờ tự timeout. Patch thẳng
+    _download_once (không phải _request) vì cơ chế retry sống ở download_output,
+    còn chi tiết mạng của một lượt gọi sống ở _download_once — xem test_batch_client.
+    """
+
+    settings = Settings(domain="x.test", api_key="mk_test", instance_id="i-1")
+
+    @staticmethod
+    def _scripted(items):
+        calls = []
+
+        def fake(_s, _job_id):
+            item = items[min(len(calls), len(items) - 1)]
+            calls.append(item)
+            if isinstance(item, Exception):
+                raise item
+            return item
+        return fake, calls
+
+    def test_treo_vai_lan_roi_thanh_cong_voi_connection_moi(self):
+        fake, calls = self._scripted([
+            JobError("chậm hơn sàn"),
+            (200, b"v" * 200_000),
+        ])
+        with tempfile.TemporaryDirectory() as d:
+            dest = Path(d) / "out.mp4"
+            with mock.patch("batchlib.client._download_once", fake):
+                size = download_output(self.settings, "job-1", dest, 100_000)
+        self.assertEqual(size, 200_000)
+        self.assertEqual(len(calls), 2)   # lần 1 treo, lần 2 (connection mới) mới ăn
+
+    def test_treo_lien_tuc_thi_bo_cuoc_sau_tran_thu_lai(self):
+        fake, calls = self._scripted([JobError("chậm hơn sàn")])
+        with tempfile.TemporaryDirectory() as d:
+            dest = Path(d) / "out.mp4"
+            with mock.patch("batchlib.client._download_once", fake):
+                with self.assertRaises(JobError) as cm:
+                    download_output(self.settings, "job-1", dest, 100_000)
+        self.assertIn("RESUME=1", str(cm.exception))
+        self.assertEqual(len(calls), DOWNLOAD_MAX_RETRIES)   # trần, không phải vô hạn
+        self.assertFalse(dest.exists())
 
 
 if __name__ == "__main__":
