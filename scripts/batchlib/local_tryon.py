@@ -385,19 +385,14 @@ def _post_json(url: str, query: dict, payload: dict, timeout: int) -> dict:
 
 def gemini_edit(images: list[tuple[bytes, str]], prompt: str, key: str, out_path: Path,
                 aspect_ratio: str | None = None, model: str | None = None,
-                base_url: str = GEMINI_API_BASE, seed: int | None = None) -> Path:
-    """Cổng urllib của linux.py:_gemini_edit (3455-3478, bản gốc dùng requests.post).
-    seed: đo 15/09/2026 — API nhận field này (không lỗi) nhưng KHÔNG deterministic thật (2 lệnh
-    cùng seed vẫn ra ảnh khác nhau, verify bằng call thật). Chỉ dùng để đa dạng hoá nhẹ giữa các
-    lần thử của _camera_compose_local, không dựa vào nó để tái lập kết quả."""
+                base_url: str = GEMINI_API_BASE) -> Path:
+    """Cổng urllib của linux.py:_gemini_edit (3455-3478, bản gốc dùng requests.post)."""
     parts = [{"text": prompt}]
     for data, mime in images:
         parts.append({"inlineData": {"mimeType": mime, "data": base64.b64encode(data).decode()}})
     gcfg = {"responseModalities": ["IMAGE"]}
     if aspect_ratio:
         gcfg["imageConfig"] = {"aspectRatio": aspect_ratio}
-    if seed is not None:
-        gcfg["seed"] = seed
     url = f"{base_url}/v1beta/models/{model or GEMINI_IMAGE_MODEL}:generateContent"
     data = _post_json(url, {"key": key},
                       {"contents": [{"parts": parts}], "generationConfig": gcfg}, 300)
@@ -547,12 +542,12 @@ def postprocess(out_path: Path, params: dict) -> Path:
 
 
 def _gemini_or_qwen_max(gem_key, qwen_key, images, gem_prompt, qwen_prompt, out_path,
-                        aspect_ratio, qwen_negative=None, qwen_size=None, seed=None):
+                        aspect_ratio, qwen_negative=None, qwen_size=None):
     """Cổng linux.py:_tryon_gemini_or_fallback. Gọi Gemini; lỗi + TRYON_GEMINI_FALLBACK bật + có key
     Qwen-Max → tự rớt sang Qwen-Max thay vì fail run. Mặc định TẮT (raise thẳng lỗi Gemini)."""
     try:
         return gemini_edit(images, gem_prompt, gem_key, out_path,
-                           aspect_ratio=aspect_ratio, base_url=GEMINI_API_BASE, seed=seed)
+                           aspect_ratio=aspect_ratio, base_url=GEMINI_API_BASE)
     except Exception:
         if not TRYON_GEMINI_FALLBACK or not qwen_key:
             raise
@@ -566,57 +561,7 @@ def _gemini_or_qwen_max(gem_key, qwen_key, images, gem_prompt, qwen_prompt, out_
 #   bước A - ghép nền (2 ảnh: người, nền) — dùng lại NGUYÊN VĂN TRYON_BG_POS/NEG đã có sẵn (không
 #            viết prompt mới cho phần này, giảm rủi ro).
 #   bước B - xoay góc máy (2 ảnh: kết quả bước A, camera-guide) — prompt MỚI, chỉ còn MỘT việc:
-#            giữ y hệt người+nền của ảnh 1, đổi góc máy theo ảnh 2. Chạy CAMERA_COMPOSE_ATTEMPTS
-#            lần (mặc định 2, seed khác nhau) rồi dùng Gemini làm giám khảo chọn ảnh giữ đúng
-#            người/nền hơn — tốn thêm đúng 1 lệnh Gemini (giám khảo), không tính N lần sinh ảnh.
-CAMERA_COMPOSE_ATTEMPTS = max(1, int(os.environ.get("CAMERA_COMPOSE_ATTEMPTS", "2")))
-
-_CAMERA_JUDGE_PROMPT = (
-    "You are comparing candidate edited photos against a REFERENCE photo. The reference shows the "
-    "correct person already placed in the correct location. Each candidate is supposed to reproject "
-    "that SAME person and SAME location from a new camera angle, without changing who the person is "
-    "or inventing new background content.\n"
-    "Judge ONLY on: (1) does the candidate show the EXACT SAME person as the reference — same face, "
-    "hairstyle, hair color, skin tone, body proportions; (2) does the candidate keep the SAME "
-    "location/background as the reference, without inventing new objects, doors, walls or "
-    "architecture not visible in the reference.\n"
-    "Reply with EXACTLY one character: the letter of the best candidate (A, B, C, ...). If several "
-    "are equally good, reply the first letter among them. Output nothing else."
-)
-
-
-def _pick_better_camera_candidate(key: str, reference: Path, candidates: list[Path],
-                                  base_url: str = GEMINI_API_BASE) -> Path:
-    """Giám khảo Gemini (text model, rẻ hơn model ảnh) chọn candidate bám sát reference nhất.
-    FAIL-SAFE tuyệt đối: bất kỳ lỗi nào (mạng, parse, quota) đều rơi về candidates[0] — một lệnh
-    giám khảo hỏng không được phép làm hỏng cả run, đúng triết lý translate_vn_to_en ở trên."""
-    if len(candidates) <= 1:
-        return candidates[0]
-    if not key:
-        return candidates[0]
-    parts = [{"text": _CAMERA_JUDGE_PROMPT}, {"text": "REFERENCE:"},
-             {"inlineData": {"mimeType": mime_of(reference), "data": base64.b64encode(reference.read_bytes()).decode()}}]
-    labels = []
-    for i, cand in enumerate(candidates):
-        label = chr(ord("A") + i)
-        labels.append(label)
-        parts.append({"text": f"CANDIDATE {label}:"})
-        parts.append({"inlineData": {"mimeType": mime_of(cand),
-                                     "data": base64.b64encode(cand.read_bytes()).decode()}})
-    try:
-        url = f"{base_url}/v1beta/models/{GEMINI_TEXT_MODEL}:generateContent"
-        data = _post_json(url, {"key": key}, {
-            "contents": [{"parts": parts}],
-            "generationConfig": {"temperature": 0},
-        }, 60)
-        text = ""
-        for cand in (data.get("candidates") or []):
-            for part in ((cand.get("content") or {}).get("parts") or []):
-                text += (part.get("text") or "")
-        choice = next((ch for ch in text.strip().upper() if ch in labels), labels[0])
-        return candidates[labels.index(choice)]
-    except Exception:
-        return candidates[0]
+#            giữ y hệt người+nền của ảnh 1, đổi góc máy theo ảnh 2.
 
 
 def _camera_compose_local(provider, edited, background, guide, prompt, keys, out_path) -> Path:
@@ -633,7 +578,7 @@ def _camera_compose_local(provider, edited, background, guide, prompt, keys, out
     if not composed or not img_size(composed):
         raise JobError("camera composition: background swap returned an undecodable image")
 
-    # Bước B - xoay góc máy (2 ảnh: bước A, camera-guide) — CAMERA_COMPOSE_ATTEMPTS lần, giám khảo chọn.
+    # Bước B - xoay góc máy (2 ảnh: bước A, camera-guide) — MỘT lệnh.
     dims = img_size(guide)
     if not dims or min(dims) <= 0:
         raise JobError("camera guide: invalid image dimensions")
@@ -641,23 +586,15 @@ def _camera_compose_local(provider, edited, background, guide, prompt, keys, out
     scale = math.sqrt(1_000_000 / (dims[0] * dims[1]))
     qwen_size = "*".join(str(max(16, round(value * scale / 16) * 16)) for value in dims)
     reframe_images = [(composed.read_bytes(), mime_of(composed)), (guide.read_bytes(), mime_of(guide))]
-    candidates = []
-    for i in range(CAMERA_COMPOSE_ATTEMPTS):
-        cand_path = out_path.with_suffix(f".cand{i}.png")
-        if provider == "qwen-max":
-            cand = qwen_max_edit(reframe_images, positive, qwen_key, cand_path, negative_prompt=negative, size=qwen_size)
-        else:
-            cand = _gemini_or_qwen_max(gem_key, qwen_key, reframe_images, positive, positive, cand_path,
-                                       gemini_aspect(dims), qwen_negative=negative, qwen_size=qwen_size,
-                                       seed=1000 + i)
-        if cand and img_size(cand):
-            candidates.append(cand)
-    if not candidates:
+    if provider == "qwen-max":
+        prepared = qwen_max_edit(reframe_images, positive, qwen_key, out_path.with_suffix(".cand.png"),
+                                 negative_prompt=negative, size=qwen_size)
+    else:
+        prepared = _gemini_or_qwen_max(gem_key, qwen_key, reframe_images, positive, positive,
+                                       out_path.with_suffix(".cand.png"), gemini_aspect(dims),
+                                       qwen_negative=negative, qwen_size=qwen_size)
+    if not prepared or not img_size(prepared):
         raise JobError("camera composition: provider returned an undecodable image")
-    # base_url TRUYỀN TƯỜNG MINH (không dựa default param) — cùng lý do run_local_tryon đã ghi ở
-    # trên: default param chốt cứng GEMINI_API_BASE lúc định nghĩa hàm, patch module-level sau đó
-    # (test dùng server giả) sẽ không có tác dụng nếu không đọc lại biến global mỗi lần gọi.
-    prepared = _pick_better_camera_candidate(gem_key, composed, candidates, base_url=GEMINI_API_BASE)
 
     framed = out_path.with_suffix(".framed.png")
     w, h = dims

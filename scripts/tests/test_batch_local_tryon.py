@@ -568,7 +568,6 @@ class TestCameraComposition(GeminiServerCase):
         # 15/09/2026 - camera compose tách làm 2 lệnh riêng (root cause #2, batch 2026-09-15-0030):
         # bước A ghép nền (2 ảnh: pass1 result + background, dùng lại TRYON_BG_POS) rồi bước B
         # xoay góc máy (2 ảnh: kết quả bước A + camera guide, dùng camera-aware-tryon.json).
-        # CAMERA_COMPOSE_ATTEMPTS ép về 1 để test xác định — multi-attempt+giám khảo có test riêng.
         from PIL import Image, ImageDraw
         for provider in ("gemini", "qwen-max"):
             with self.subTest(provider=provider), tempfile.TemporaryDirectory() as d:
@@ -589,8 +588,7 @@ class TestCameraComposition(GeminiServerCase):
                 out = tmp / "out.png"
                 settings = Settings(domain="x", api_key="x", instance_id="x",
                                     gemini_api_key="AIza" + "x" * 35, dashscope_api_key="fake")
-                with mock.patch.object(lt, "gemini_edit", edit), mock.patch.object(lt, "qwen_max_edit", edit), \
-                     mock.patch.object(lt, "CAMERA_COMPOSE_ATTEMPTS", 1):
+                with mock.patch.object(lt, "gemini_edit", edit), mock.patch.object(lt, "qwen_max_edit", edit):
                     lt.run_local_tryon(run, {"provider": provider, "cameraAware": True}, settings, out)
                 # calls[0] = pass 1 thay đồ (2 ảnh: model + outfit)
                 self.assertEqual(len(calls[0][0]), 2)
@@ -613,66 +611,6 @@ class TestCameraComposition(GeminiServerCase):
                 self.assertEqual(lt.img_size(out), (90, 160))
                 with Image.open(out) as picture:
                     self.assertEqual(picture.getbbox(), (35, 70, 55, 90))
-
-    def test_camera_compose_runs_n_attempts_and_judge_picks_the_winner(self):
-        # Verify đúng yêu cầu "chạy 2 lần khác seed rồi chọn ảnh tốt hơn": 2 candidate camera-reframe
-        # khác nhau (đánh dấu bằng màu khác nhau) + 1 lệnh giám khảo (server giả trả text "B") →
-        # output cuối phải là candidate B, không phải candidate A (mặc định nếu không có giám khảo).
-        from PIL import Image
-        with tempfile.TemporaryDirectory() as d:
-            tmp = Path(d)
-            run = _run_gemini(tmp, background=True)
-            driver = tmp / "driver.mp4"
-            lt.subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
-                               "color=c=blue:s=32x32:d=1", str(driver)], check=True)
-            run.inputs["driver"] = driver
-            reframe_colors = iter(["red", "blue"])
-            reframe_calls = []
-            def edit(images, prompt, key, out_path, **kwargs):
-                if prompt == lt.load_camera_compose_prompt()[0]:
-                    reframe_calls.append(kwargs.get("seed"))
-                    Image.new("RGB", (32, 32), next(reframe_colors)).save(out_path)
-                else:
-                    Image.new("RGB", (32, 32), "black").save(out_path)
-                return out_path
-            out = tmp / "out.png"
-            settings = Settings(domain="x", api_key="x", instance_id="x",
-                                gemini_api_key="AIza" + "x" * 35)
-            with mock.patch.object(lt, "gemini_edit", edit), \
-                 mock.patch.object(lt, "GEMINI_API_BASE", self.base_url):
-                GEMINI_STATE["mode"] = "text"
-                GEMINI_STATE["text_reply"] = "B"
-                lt.run_local_tryon(run, {"provider": "gemini", "cameraAware": True}, settings, out)
-            # 2 lần sinh ảnh (mặc định CAMERA_COMPOSE_ATTEMPTS=2), seed khác nhau mỗi lần.
-            self.assertEqual(len(reframe_calls), 2)
-            self.assertEqual(len(set(reframe_calls)), 2)
-            # Giám khảo trả "B" → output phải là màu xanh (candidate B), không phải đỏ (candidate A).
-            with Image.open(out) as picture:
-                self.assertEqual(picture.getpixel((16, 16)), (0, 0, 255))
-
-    def test_camera_compose_judge_failure_falls_back_to_first_candidate(self):
-        # FAIL-SAFE: giám khảo lỗi mạng (không mock server) → không được phép làm hỏng run, phải
-        # rơi về candidate đầu tiên thay vì raise.
-        from PIL import Image
-        with tempfile.TemporaryDirectory() as d:
-            tmp = Path(d)
-            run = _run_gemini(tmp, background=True)
-            driver = tmp / "driver.mp4"
-            lt.subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
-                               "color=c=blue:s=32x32:d=1", str(driver)], check=True)
-            run.inputs["driver"] = driver
-            def edit(images, prompt, key, out_path, **kwargs):
-                Image.new("RGB", (32, 32), "red").save(out_path)
-                return out_path
-            out = tmp / "out.png"
-            settings = Settings(domain="x", api_key="x", instance_id="x",
-                                gemini_api_key="AIza" + "x" * 35)
-            # KHÔNG mock GEMINI_API_BASE → lệnh giám khảo (_post_json) gọi ra domain thật với key giả,
-            # phải fail nhanh (DNS/HTTP) và được nuốt bởi except Exception trong hàm giám khảo.
-            with mock.patch.object(lt, "gemini_edit", edit), \
-                 mock.patch.object(lt, "GEMINI_API_BASE", "http://127.0.0.1:1"):
-                lt.run_local_tryon(run, {"provider": "gemini", "cameraAware": True}, settings, out)
-            self.assertTrue(out.is_file())
 
     def test_invalid_guide_prevents_garment_call(self):
         with tempfile.TemporaryDirectory() as d:
@@ -715,8 +653,7 @@ class TestCameraComposition(GeminiServerCase):
                     else:
                         Image.new("RGB", (160, 160), "red").save(out_path)
                     return out_path
-                with mock.patch.object(lt, "gemini_edit", edit), \
-                     mock.patch.object(lt, "CAMERA_COMPOSE_ATTEMPTS", 1):
+                with mock.patch.object(lt, "gemini_edit", edit):
                     with self.assertRaises(JobError):
                         lt.run_local_tryon(run, {"provider": "gemini", "cameraAware": True},
                                           Settings(domain="x", api_key="x", instance_id="x",
