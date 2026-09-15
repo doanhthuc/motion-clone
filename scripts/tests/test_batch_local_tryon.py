@@ -1,5 +1,6 @@
 import base64
 import json
+import math
 import sys
 import tempfile
 import threading
@@ -608,9 +609,17 @@ class TestCameraComposition(GeminiServerCase):
                     self.assertEqual(calls[2][2]["aspect_ratio"], "9:16")
                 else:
                     self.assertEqual(calls[2][2].get("size"), "752*1328")
-                self.assertEqual(lt.img_size(out), (90, 160))
-                with Image.open(out) as picture:
-                    self.assertEqual(picture.getbbox(), (35, 70, 55, 90))
+                # 15/09/2026 (batch 2026-09-15-1120, mặt mờ trên driver nét thấp) - framed KHÔNG còn
+                # bị ép về đúng pixel của guide/driver (90x160): candidate sinh ra 160x160 (25600px)
+                # lớn hơn guide (14400px) nên diện tích giữ nguyên mức candidate, chỉ tỉ lệ khung đổi
+                # theo guide — Wan Animate tự resize ref về render W×H của nó (linux.py:_fit_driver_wh
+                # + ImageResizeKJv2), không cần ref khớp pixel driver.
+                out_w, out_h = lt.img_size(out)
+                self.assertGreaterEqual(out_w * out_h, 160 * 160)
+                expected_area = max(90 * 160, 160 * 160)
+                expected_w = max(16, round(math.sqrt(expected_area * (90 / 160)) / 16) * 16)
+                expected_h = max(16, round(math.sqrt(expected_area / (90 / 160)) / 16) * 16)
+                self.assertEqual((out_w, out_h), (expected_w, expected_h))
 
     def test_invalid_guide_prevents_garment_call(self):
         with tempfile.TemporaryDirectory() as d:

@@ -596,8 +596,19 @@ def _camera_compose_local(provider, edited, background, guide, prompt, keys, out
     if not prepared or not img_size(prepared):
         raise JobError("camera composition: provider returned an undecodable image")
 
+    # Đo 15/09/2026 (batch 2026-09-15-1120, run IMG67103-IMG69971-IMG68942-tiktok178947 — mặt mờ):
+    # ép framed về ĐÚNG pixel của `guide` (= driver gốc, có thể chỉ 576x1024 với TikTok nén) vứt bỏ
+    # chi tiết ảnh candidate vừa sinh (~1MP, xem qwen_size ở trên) một cách vô ích. Wan Animate không
+    # cần ref khớp pixel driver: linux.py:_fit_driver_wh tính render W×H từ TỈ LỆ khung driver + preset
+    # chất lượng, rồi ComfyUI (node ImageResizeKJv2 sau LoadImage) tự resize ref về đúng kích thước đó
+    # bất kể ref gốc to hay nhỏ hơn. Giữ đúng TỈ LỆ của guide nhưng không hạ diện tích xuống dưới
+    # candidate đã sinh — chỉ dùng guide để sửa lệch tỉ lệ khung, không dùng để giới hạn độ nét.
+    cand_dims = img_size(prepared)
+    ratio = dims[0] / dims[1]
+    area = max(dims[0] * dims[1], cand_dims[0] * cand_dims[1] if cand_dims else 0)
+    w = max(16, round(math.sqrt(area * ratio) / 16) * 16)
+    h = max(16, round(math.sqrt(area / ratio) / 16) * 16)
     framed = out_path.with_suffix(".framed.png")
-    w, h = dims
     try:
         subprocess.run(["ffmpeg", "-nostdin", "-y", "-v", "error", "-i", str(prepared),
                         "-vf", f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1",
@@ -605,7 +616,7 @@ def _camera_compose_local(provider, edited, background, guide, prompt, keys, out
                        check=True, capture_output=True, timeout=60)
     except Exception as exc:
         raise JobError("camera composition: framing failed") from exc
-    if img_size(framed) != dims:
+    if img_size(framed) != (w, h):
         raise JobError("camera composition: invalid prepared image")
     return framed
 
