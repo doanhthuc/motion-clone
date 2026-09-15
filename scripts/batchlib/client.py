@@ -31,6 +31,17 @@ POLL_SECONDS = 10
 # tha được — job trên pod không chết vì Wi-Fi của máy local.
 MAX_POLL_MISSES = 30
 
+# Sàn tốc độ tải: dưới mức này coi như connection hỏng, bỏ và mở lại — không đợi
+# thêm. `timeout=` của urllib/http.client là timeout PER-RECV, tự reset mỗi khi có
+# dù chỉ một byte mới, nên một connection nhỏ giọt không bao giờ tự kích hoạt nó.
+# Đo thật 15/09/2026 trên một batch qua RunPod Cloudflare Tunnel: một connection
+# tải output 35.7MB bị kẹt ở ~5.6 KB/s (rcv_ooopack:8665 — gói đến sai thứ tự nặng)
+# suốt 40+ phút mà không hề timeout, trong khi một connection MỚI tới đúng URL đó,
+# đúng lúc đó, xong trong 2.9s (~12 MB/s). Sàn 200 KB/s chừa biên 60× cho tốc độ đo
+# được, vẫn đủ thấp để không bao giờ false-positive trên một pod đang bận GPU.
+MIN_DOWNLOAD_BPS = 200_000
+DOWNLOAD_MAX_RETRIES = 3
+
 # BẮT BUỘC đặt User-Agent. Không đặt thì urllib gửi "Python-urllib/3.x" và Cloudflare
 # CHẶN nó: pod nằm sau Cloudflare Tunnel (cả kiến trúc của repo, docs/gpu-pod.md), và
 # Cloudflare trả 403 kèm "error code: 1010" — chặn theo signature client.
@@ -201,8 +212,50 @@ def poll_job(s: Settings, job_id: str, timeout_min: int,
     )
 
 
+def _download_once(s: Settings, job_id: str) -> tuple[int, bytes]:
+    """Một lượt GET /jobs/<id>/download, tự bỏ giữa chừng nếu tốc độ tụt dưới
+    MIN_DOWNLOAD_BPS thay vì tin vào timeout per-recv (xem MIN_DOWNLOAD_BPS)."""
+    req = urllib.request.Request(f"{s.base_url}/jobs/{job_id}/download")
+    req.add_header("x-api-key", s.api_key)
+    req.add_header("user-agent", USER_AGENT)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            content_length = int(resp.headers.get("content-length") or 0)
+            deadline = time.time() + max(30.0, content_length / MIN_DOWNLOAD_BPS)
+            chunks: list[bytes] = []
+            while True:
+                if time.time() > deadline:
+                    got = sum(len(c) for c in chunks)
+                    raise JobError(
+                        f"tải output job {job_id} chậm hơn {MIN_DOWNLOAD_BPS} B/s "
+                        f"(mới nhận {got}/{content_length or '?'} byte) — bỏ connection này, thử lại"
+                    )
+                chunk = resp.read(1 << 18)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            return resp.status, b"".join(chunks)
+    except urllib.error.HTTPError as exc:
+        with exc:
+            return exc.code, exc.read()
+
+
 def download_output(s: Settings, job_id: str, dest: Path, min_bytes: int) -> int:
-    code, raw = _request(s, f"/jobs/{job_id}/download", timeout=600)
+    last_exc: Exception | None = None
+    code = raw = None
+    for _attempt in range(DOWNLOAD_MAX_RETRIES):
+        try:
+            code, raw = _download_once(s, job_id)
+            break
+        except (JobError, urllib.error.URLError, OSError) as exc:
+            last_exc = exc
+            code = raw = None
+    if code is None:
+        raise JobError(
+            f"tải output job {job_id} treo/rớt {DOWNLOAD_MAX_RETRIES} lần liên tiếp "
+            f"(lần cuối: {last_exc}) — job đã done trên pod, chỉ đường mạng có vấn đề; "
+            f"chạy lại với RESUME=1 để thử tải lại"
+        )
     if code != 200:
         raise JobError(
             f"tải output job {job_id} → {code}: {raw[:300].decode('utf-8', 'replace')} — "
