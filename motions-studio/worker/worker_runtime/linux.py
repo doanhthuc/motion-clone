@@ -3766,6 +3766,10 @@ def _img_size(path):
 
 
 def _load_camera_compose_prompt():
+    # 15/09/2026 - asset này giờ CHỈ dùng ở pod (3 ảnh: người, nền, camera-guide trong một lệnh).
+    # scripts/batchlib/local_tryon.py (batch runner) đã tách bước này làm 2 lệnh riêng và dùng asset
+    # KHÁC (camera-reframe-only.json, chỉ 2 vai) — không sửa file này để "fix" bug ở đường local nữa,
+    # 2 asset không còn đồng bộ nội dung một cách cố ý.
     asset = Path(__file__).resolve().parents[1] / "assets/camera-aware-tryon.json"
     try:
         prompt = json.loads(asset.read_text(encoding="utf-8"))
@@ -3948,7 +3952,8 @@ def _qwen_tryon_prompts(gt, extra=None):
     # ALD 06/07/2026 - FIX "ĐỔI MÀU TÓC + sản phẩm KHÔNG GIỐNG" khi ảnh SP là người mặc: negative nguồn-sản-phẩm
     # (khối POS "PRODUCT-SOURCE" cũ đã gộp vào _COMPACT_LOCK).
     _SRC_NEG = ("hair from product image, hair color from image 2, wearer's hairstyle, product model's hair, "
-                "face from image 2, wearer's face, skin tone from image 2, different floral pattern, invented pattern")
+                "face from image 2, wearer's face, skin tone from image 2, different floral pattern, invented pattern, "
+                "background from image 2, room from product image, setting from product image, location from image 2")
     # #region ALD 16/08/2026 - FIX "toàn không thay đồ được" (user báo, tái hiện được bằng ảnh thật + seed 42):
     # 4 khối CRITICAL LOCK dồn TRƯỚC lệnh thay đồ đẩy tổng prompt lên ~2.400 ký tự toàn mệnh lệnh "giữ nguyên
     # hệt ảnh 1" — lệnh thay đồ bị dí xuống cuối nên Qwen tái tạo lại gần nguyên ảnh 1 (đồ gốc giữ nguyên).
@@ -3957,11 +3962,17 @@ def _qwen_tryon_prompts(gt, extra=None):
     # 06/07) chữa identity bằng cách dồn lock lên đầu nhưng chính điều đó giết lệnh chính. Kiến trúc mới:
     # (1) LỆNH THAY ĐỒ theo loại đồ đứng ĐẦU, (2) ghi chú user ngay sau, (3) MỘT khối lock GỌN (mặt/tóc/tỉ lệ/
     # bỏ-người-mặc-trong-ảnh-SP) đứng CUỐI. Negative giữ NGUYÊN toàn bộ (vẫn mã hoá mọi failure mode cũ).
-    _COMPACT_LOCK = ("CRITICAL: the output must show the SAME person as image 1 — identical face (rendered sharp "
-                     "and in focus), identical hairstyle, hair length and hair color, identical body proportions, "
-                     "height and scale within the frame, same skin tone, same pose and expression. "
-                     "If a person, model or mannequin is wearing the product in image 2, ignore that wearer "
-                     "entirely and take ONLY the garments — never copy their hair, face, body, pose or framing.")
+    # ALD 15/09/2026 - FIX "đổi hoàn toàn thành người khác + đổi cả nền": _COMPACT_LOCK cũ chỉ cấm chép
+    # hair/face/body/pose/framing từ ảnh 2, không cấm chép NỀN/PHÒNG của người mặc trong ảnh sản phẩm —
+    # batch 2026-09-15-0030 (đường local_tryon.py, không autocrop) ra cả mặt lẫn phòng của người mẫu trong
+    # ảnh outfit thay vì giữ ảnh 1/ảnh nền thật. Thêm rõ "room/background/setting" vào câu cấm.
+    _COMPACT_LOCK = ("CRITICAL: the output must show the SAME person as image 1, in the SAME background/setting as "
+                     "image 1 — identical face (rendered sharp and in focus), identical hairstyle, hair length and "
+                     "hair color, identical body proportions, height and scale within the frame, same skin tone, "
+                     "same pose and expression. "
+                     "If a person, model or mannequin is wearing the product in image 2, ignore that wearer and "
+                     "their surroundings entirely and take ONLY the garments — never copy their hair, face, body, "
+                     "pose, framing, or the room/background/setting visible in image 2.")
     pos = pos + " " + _tryon_extra_clause(extra) + _COMPACT_LOCK
     # #endregion
     neg = neg + ", " + _FACE_NEG + ", " + _HAIR_NEG + ", " + _PROP_NEG + ", " + _SRC_NEG
@@ -4174,9 +4185,19 @@ def _vixtts_tts(script, out_mp3, ref=None, language="vi", temperature=None):
 def _gemini_tryon_prompt(gt, extra=None):
     # ALD 01/07/2026 - chèn "Ghi chú thêm" của user (ưu tiên cao) trước câu chốt. Gemini hiểu tốt nên đặt cuối vẫn ăn.
     # ALD 04/07/2026 - KHÓA MẶT đặt đầu prompt (đồng bộ fix "tryon đổi mặt" bên _qwen_tryon_prompts).
-    return ("CRITICAL: the person's face and facial identity must remain EXACTLY identical to image 1 — same facial "
-            "structure, eyes, nose, lips, jawline, skin tone, makeup and expression; never beautify, reshape, swap "
-            "or regenerate the face. ") + _gemini_tryon_prompt_base(gt) + _tryon_extra_clause(extra)
+    # 15/09/2026 - FIX "đổi hoàn toàn thành người khác": khi ảnh product/outfit tự nó là ảnh một người khác
+    # mặc món đồ (phổ biến với outfit lấy từ TikTok/shop), prompt Gemini này chưa từng có câu cấm chép người
+    # mặc trong ảnh 2 (khác _qwen_tryon_prompts._COMPACT_LOCK bên dưới, có từ 06/07/2026). scripts/batchlib/
+    # local_tryon.py (đường chạy KHÔNG qua pod cho provider gemini/qwen-max) đã tự vá câu tương tự từ
+    # 28/08/2026 nhưng bản đó cũng thiếu "background" — batch 2026-09-15-0030 vẫn ra cả mặt lẫn phòng của
+    # người mẫu trong ảnh outfit. Port bản ĐÃ TĂNG CƯỜNG (kèm "background") sang đây, đồng bộ cả 2 file.
+    return (("CRITICAL: the person's face and facial identity must remain EXACTLY identical to image 1 — same facial "
+             "structure, eyes, nose, lips, jawline, skin tone, makeup and expression; never beautify, reshape, swap "
+             "or regenerate the face. ") + _gemini_tryon_prompt_base(gt) +
+            " If a person, model or mannequin is wearing the product in image 2, ignore that wearer and their "
+            "surroundings entirely and take ONLY the garment(s) shown — never copy their hair, face, body, pose, "
+            "framing, or the room/background/setting visible in image 2." +
+            _tryon_extra_clause(extra))
 
 def _gemini_tryon_prompt_base(gt):
     label = GARMENT_LABEL.get(gt, "garment")

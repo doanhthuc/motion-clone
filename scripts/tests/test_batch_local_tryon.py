@@ -402,9 +402,12 @@ class TestGeminiTryonPrompt(unittest.TestCase):
     def test_bo_qua_nguoi_mau_trong_anh_san_pham(self):
         # Đo 28/08/2026 (c1-o8-m2-b3): outfit photo là ảnh người mẫu, không phải flat-lay —
         # thiếu câu này thì Gemini có thể chép tóc/mặt người mẫu trong ảnh outfit qua kết quả.
+        # Đo 15/09/2026 (batch 2026-09-15-0030): câu cũ không cấm chép NỀN của người mẫu đó —
+        # tăng cường thêm "room/background/setting visible in image 2".
         for gt in ("auto", "shoes", "upper", "set"):
             p = lt.gemini_tryon_prompt(gt)
-            self.assertIn("ignore that wearer entirely", p)
+            self.assertIn("ignore that wearer and their surroundings entirely", p)
+            self.assertIn("room/background/setting visible in image 2", p)
 
 
 from unittest import mock
@@ -445,10 +448,13 @@ class TestPostprocess(unittest.TestCase):
 
 class TestCameraAwareGuide(unittest.TestCase):
     def test_camera_prompt_is_loaded_from_the_worker_asset(self):
+        # 15/09/2026 - camera compose tách làm 2 lệnh (bg swap 2 ảnh + camera reframe 2 ảnh):
+        # asset này giờ chỉ còn 2 vai (Image 1 = người đã đúng nền, Image 2 = camera guide),
+        # không còn Image 3.
         positive, negative = lt.load_camera_compose_prompt()
         self.assertIn("Image 1", positive)
         self.assertIn("Image 2", positive)
-        self.assertIn("Image 3", positive)
+        self.assertNotIn("Image 3", positive)
         self.assertIn("do not copy", positive.lower())
         self.assertIn("different location", negative.lower())
 
@@ -514,7 +520,7 @@ def _run_gemini(tmp: Path, background: bool = False) -> Run:
               stage_params={"tryon": {"provider": "gemini"}})
 
 
-class TestCameraComposition(unittest.TestCase):
+class TestCameraComposition(GeminiServerCase):
     def test_ordinary_path_ignores_driver_and_preserves_legacy_aspect(self):
         from PIL import Image
         for provider in ("gemini", "qwen-max"):
@@ -558,7 +564,11 @@ class TestCameraComposition(unittest.TestCase):
         self.assertEqual(bodies[0]["parameters"]["size"], "752*1328")
         self.assertEqual(bodies[1]["parameters"], {"watermark": False})
 
-    def test_camera_local_three_references_and_guide_aspect(self):
+    def test_camera_local_two_step_compose_and_guide_aspect(self):
+        # 15/09/2026 - camera compose tách làm 2 lệnh riêng (root cause #2, batch 2026-09-15-0030):
+        # bước A ghép nền (2 ảnh: pass1 result + background, dùng lại TRYON_BG_POS) rồi bước B
+        # xoay góc máy (2 ảnh: kết quả bước A + camera guide, dùng camera-aware-tryon.json).
+        # CAMERA_COMPOSE_ATTEMPTS ép về 1 để test xác định — multi-attempt+giám khảo có test riêng.
         from PIL import Image, ImageDraw
         for provider in ("gemini", "qwen-max"):
             with self.subTest(provider=provider), tempfile.TemporaryDirectory() as d:
@@ -579,23 +589,90 @@ class TestCameraComposition(unittest.TestCase):
                 out = tmp / "out.png"
                 settings = Settings(domain="x", api_key="x", instance_id="x",
                                     gemini_api_key="AIza" + "x" * 35, dashscope_api_key="fake")
-                with mock.patch.object(lt, "gemini_edit", edit), mock.patch.object(lt, "qwen_max_edit", edit):
+                with mock.patch.object(lt, "gemini_edit", edit), mock.patch.object(lt, "qwen_max_edit", edit), \
+                     mock.patch.object(lt, "CAMERA_COMPOSE_ATTEMPTS", 1):
                     lt.run_local_tryon(run, {"provider": provider, "cameraAware": True}, settings, out)
+                # calls[0] = pass 1 thay đồ (2 ảnh: model + outfit)
                 self.assertEqual(len(calls[0][0]), 2)
-                self.assertEqual(len(calls[1][0]), 3)
+                # calls[1] = bước A ghép nền (2 ảnh: kết quả pass1 + background), prompt TRYON_BG_POS có sẵn
+                self.assertEqual(len(calls[1][0]), 2)
                 self.assertEqual(calls[1][0][0][0], generated[0])
                 self.assertEqual(calls[1][0][1][0], b"bg-bytes")
+                self.assertEqual(calls[1][1], lt.TRYON_BG_POS)
+                # calls[2] = bước B xoay góc máy (2 ảnh: kết quả bước A + camera guide)
+                self.assertEqual(len(calls[2][0]), 2)
+                self.assertEqual(calls[2][0][0][0], generated[1])
                 import io
-                with Image.open(io.BytesIO(calls[1][0][2][0])) as guide:
+                with Image.open(io.BytesIO(calls[2][0][1][0])) as guide:
                     self.assertEqual(guide.size, (90, 160))
-                self.assertEqual(calls[1][1], lt.load_camera_compose_prompt()[0])
+                self.assertEqual(calls[2][1], lt.load_camera_compose_prompt()[0])
                 if provider == "gemini":
-                    self.assertEqual(calls[1][2]["aspect_ratio"], "9:16")
+                    self.assertEqual(calls[2][2]["aspect_ratio"], "9:16")
                 else:
-                    self.assertEqual(calls[1][2].get("size"), "752*1328")
+                    self.assertEqual(calls[2][2].get("size"), "752*1328")
                 self.assertEqual(lt.img_size(out), (90, 160))
                 with Image.open(out) as picture:
                     self.assertEqual(picture.getbbox(), (35, 70, 55, 90))
+
+    def test_camera_compose_runs_n_attempts_and_judge_picks_the_winner(self):
+        # Verify đúng yêu cầu "chạy 2 lần khác seed rồi chọn ảnh tốt hơn": 2 candidate camera-reframe
+        # khác nhau (đánh dấu bằng màu khác nhau) + 1 lệnh giám khảo (server giả trả text "B") →
+        # output cuối phải là candidate B, không phải candidate A (mặc định nếu không có giám khảo).
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            run = _run_gemini(tmp, background=True)
+            driver = tmp / "driver.mp4"
+            lt.subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+                               "color=c=blue:s=32x32:d=1", str(driver)], check=True)
+            run.inputs["driver"] = driver
+            reframe_colors = iter(["red", "blue"])
+            reframe_calls = []
+            def edit(images, prompt, key, out_path, **kwargs):
+                if prompt == lt.load_camera_compose_prompt()[0]:
+                    reframe_calls.append(kwargs.get("seed"))
+                    Image.new("RGB", (32, 32), next(reframe_colors)).save(out_path)
+                else:
+                    Image.new("RGB", (32, 32), "black").save(out_path)
+                return out_path
+            out = tmp / "out.png"
+            settings = Settings(domain="x", api_key="x", instance_id="x",
+                                gemini_api_key="AIza" + "x" * 35)
+            with mock.patch.object(lt, "gemini_edit", edit), \
+                 mock.patch.object(lt, "GEMINI_API_BASE", self.base_url):
+                GEMINI_STATE["mode"] = "text"
+                GEMINI_STATE["text_reply"] = "B"
+                lt.run_local_tryon(run, {"provider": "gemini", "cameraAware": True}, settings, out)
+            # 2 lần sinh ảnh (mặc định CAMERA_COMPOSE_ATTEMPTS=2), seed khác nhau mỗi lần.
+            self.assertEqual(len(reframe_calls), 2)
+            self.assertEqual(len(set(reframe_calls)), 2)
+            # Giám khảo trả "B" → output phải là màu xanh (candidate B), không phải đỏ (candidate A).
+            with Image.open(out) as picture:
+                self.assertEqual(picture.getpixel((16, 16)), (0, 0, 255))
+
+    def test_camera_compose_judge_failure_falls_back_to_first_candidate(self):
+        # FAIL-SAFE: giám khảo lỗi mạng (không mock server) → không được phép làm hỏng run, phải
+        # rơi về candidate đầu tiên thay vì raise.
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            run = _run_gemini(tmp, background=True)
+            driver = tmp / "driver.mp4"
+            lt.subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+                               "color=c=blue:s=32x32:d=1", str(driver)], check=True)
+            run.inputs["driver"] = driver
+            def edit(images, prompt, key, out_path, **kwargs):
+                Image.new("RGB", (32, 32), "red").save(out_path)
+                return out_path
+            out = tmp / "out.png"
+            settings = Settings(domain="x", api_key="x", instance_id="x",
+                                gemini_api_key="AIza" + "x" * 35)
+            # KHÔNG mock GEMINI_API_BASE → lệnh giám khảo (_post_json) gọi ra domain thật với key giả,
+            # phải fail nhanh (DNS/HTTP) và được nuốt bởi except Exception trong hàm giám khảo.
+            with mock.patch.object(lt, "gemini_edit", edit), \
+                 mock.patch.object(lt, "GEMINI_API_BASE", "http://127.0.0.1:1"):
+                lt.run_local_tryon(run, {"provider": "gemini", "cameraAware": True}, settings, out)
+            self.assertTrue(out.is_file())
 
     def test_invalid_guide_prevents_garment_call(self):
         with tempfile.TemporaryDirectory() as d:
@@ -617,6 +694,9 @@ class TestCameraComposition(unittest.TestCase):
             self.assertFalse((tmp / "out.png").exists())
 
     def test_camera_compose_failure_never_publishes_garment(self):
+        # 15/09/2026 - camera compose giờ là 2 lệnh 2-ảnh (bg swap rồi camera reframe), không còn
+        # lệnh 3-ảnh duy nhất. Nhận diện bước camera-reframe bằng NỘI DUNG ảnh thứ 2 (camera guide
+        # thật, khác b"outfit-bytes" của pass1 và b"bg-bytes" của bước A) thay vì đếm số ảnh.
         from PIL import Image
         for mode in ("error", "decode"):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as d:
@@ -627,14 +707,16 @@ class TestCameraComposition(unittest.TestCase):
                                    "color=c=blue:s=90x160:d=1", str(driver)], check=True)
                 run.inputs["driver"] = driver
                 def edit(images, prompt, key, out_path, **kwargs):
-                    if len(images) == 3:
+                    is_camera_reframe = len(images) == 2 and images[1][0] not in (b"outfit-bytes", b"bg-bytes")
+                    if is_camera_reframe:
                         if mode == "error":
                             raise JobError("compose failed")
                         out_path.write_bytes(b"not an image")
                     else:
                         Image.new("RGB", (160, 160), "red").save(out_path)
                     return out_path
-                with mock.patch.object(lt, "gemini_edit", edit):
+                with mock.patch.object(lt, "gemini_edit", edit), \
+                     mock.patch.object(lt, "CAMERA_COMPOSE_ATTEMPTS", 1):
                     with self.assertRaises(JobError):
                         lt.run_local_tryon(run, {"provider": "gemini", "cameraAware": True},
                                           Settings(domain="x", api_key="x", instance_id="x",
