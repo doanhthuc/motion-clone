@@ -356,6 +356,12 @@ from .client import JobError
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com"
 # linux.py:2598 — cùng default. Đổi qua env nếu cần model rẻ hơn.
 GEMINI_IMAGE_MODEL = os.environ.get("GEMINI_IMAGE_MODEL", "gemini-3-pro-image")
+# Đo 16/09/2026 (run IMG67441-IMG6957-IMG68943-tiktok178952): candidate bước camera-reframe không
+# truyền imageConfig.imageSize nên gemini-3-pro-image tự mặc định "1K" (~768x1376 cho ảnh dọc 9:16),
+# bất kể ảnh nhân vật gốc to bao nhiêu — trần này KHÁC bug crop đã sửa tối 15/09 (4aca8c9). Model hỗ
+# trợ "1K"/"2K"/"4K" (xem gemini_edit). Chỉ áp cho bước camera-reframe (nơi đo được), không áp cho
+# garment-swap/background-swap — xem GEMINI_CAMERA_IMAGE_SIZE ở _camera_compose_local.
+GEMINI_CAMERA_IMAGE_SIZE = os.environ.get("GEMINI_CAMERA_IMAGE_SIZE", "2K")
 # Không có model text-only nào có sẵn trong linux.py (bản gốc dùng Ollama, xem
 # translate_vn_to_en) — chọn một model Gemini text rẻ, ổn định làm mặc định.
 GEMINI_TEXT_MODEL = os.environ.get("GEMINI_TEXT_MODEL", "gemini-2.5-flash")
@@ -385,14 +391,25 @@ def _post_json(url: str, query: dict, payload: dict, timeout: int) -> dict:
 
 def gemini_edit(images: list[tuple[bytes, str]], prompt: str, key: str, out_path: Path,
                 aspect_ratio: str | None = None, model: str | None = None,
-                base_url: str = GEMINI_API_BASE) -> Path:
-    """Cổng urllib của linux.py:_gemini_edit (3455-3478, bản gốc dùng requests.post)."""
+                base_url: str = GEMINI_API_BASE, image_size: str | None = None) -> Path:
+    """Cổng urllib của linux.py:_gemini_edit (3455-3478, bản gốc dùng requests.post).
+
+    image_size: generationConfig.imageConfig.imageSize ("1K"/"2K"/"4K", viết hoa K). Không truyền →
+    gemini-3-pro-image tự mặc định 1K (~1MP) BẤT KỂ ảnh input to đến đâu — đo 16/09/2026 (run
+    IMG67441-IMG6957-IMG68943-tiktok178952): candidate bước camera-reframe ra đúng 768x1376, khớp
+    hệt preset 1K cho ảnh dọc 9:16. Đây không phải residual của bug crop đã sửa tối 15/09 (4aca8c9,
+    ép framed xuống pixel driver) — bug đó đã sửa đúng, chỉ là chưa từng có ai set imageSize.
+    """
     parts = [{"text": prompt}]
     for data, mime in images:
         parts.append({"inlineData": {"mimeType": mime, "data": base64.b64encode(data).decode()}})
     gcfg = {"responseModalities": ["IMAGE"]}
-    if aspect_ratio:
-        gcfg["imageConfig"] = {"aspectRatio": aspect_ratio}
+    if aspect_ratio or image_size:
+        gcfg["imageConfig"] = {}
+        if aspect_ratio:
+            gcfg["imageConfig"]["aspectRatio"] = aspect_ratio
+        if image_size:
+            gcfg["imageConfig"]["imageSize"] = image_size
     url = f"{base_url}/v1beta/models/{model or GEMINI_IMAGE_MODEL}:generateContent"
     data = _post_json(url, {"key": key},
                       {"contents": [{"parts": parts}], "generationConfig": gcfg}, 300)
@@ -542,12 +559,12 @@ def postprocess(out_path: Path, params: dict) -> Path:
 
 
 def _gemini_or_qwen_max(gem_key, qwen_key, images, gem_prompt, qwen_prompt, out_path,
-                        aspect_ratio, qwen_negative=None, qwen_size=None):
+                        aspect_ratio, qwen_negative=None, qwen_size=None, gem_image_size=None):
     """Cổng linux.py:_tryon_gemini_or_fallback. Gọi Gemini; lỗi + TRYON_GEMINI_FALLBACK bật + có key
     Qwen-Max → tự rớt sang Qwen-Max thay vì fail run. Mặc định TẮT (raise thẳng lỗi Gemini)."""
     try:
         return gemini_edit(images, gem_prompt, gem_key, out_path,
-                           aspect_ratio=aspect_ratio, base_url=GEMINI_API_BASE)
+                           aspect_ratio=aspect_ratio, base_url=GEMINI_API_BASE, image_size=gem_image_size)
     except Exception:
         if not TRYON_GEMINI_FALLBACK or not qwen_key:
             raise
@@ -592,7 +609,8 @@ def _camera_compose_local(provider, edited, background, guide, prompt, keys, out
     else:
         prepared = _gemini_or_qwen_max(gem_key, qwen_key, reframe_images, positive, positive,
                                        out_path.with_suffix(".cand.png"), gemini_aspect(dims),
-                                       qwen_negative=negative, qwen_size=qwen_size)
+                                       qwen_negative=negative, qwen_size=qwen_size,
+                                       gem_image_size=GEMINI_CAMERA_IMAGE_SIZE)
     if not prepared or not img_size(prepared):
         raise JobError("camera composition: provider returned an undecodable image")
 

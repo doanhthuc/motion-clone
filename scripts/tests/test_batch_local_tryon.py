@@ -24,7 +24,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
         GEMINI_STATE["calls"] += 1
         call_idx = GEMINI_STATE["calls"] - 1  # 0-based index for this request
         length = int(self.headers["content-length"])
-        self.rfile.read(length)
+        body_bytes = self.rfile.read(length)
+        GEMINI_STATE.setdefault("bodies", []).append(json.loads(body_bytes))
         # Support per-call modes via "modes" dict (key = 0-based call index)
         # for tests that need different response types on different calls
         mode = GEMINI_STATE.get("modes", {}).get(call_idx) or GEMINI_STATE["mode"]
@@ -89,6 +90,7 @@ class GeminiServerCase(unittest.TestCase):
         GEMINI_STATE.pop("modes", None)
         GEMINI_STATE.pop("text_reply", None)
         GEMINI_STATE.pop("hang_sec", None)
+        GEMINI_STATE.pop("bodies", None)
 
 
 class TestGeminiEdit(GeminiServerCase):
@@ -114,6 +116,22 @@ class TestGeminiEdit(GeminiServerCase):
             with self.assertRaises(JobError):
                 lt.gemini_edit([(b"x", "image/png")], "p", "AIzafake", Path(d) / "o.png",
                                base_url=self.base_url)
+
+    def test_image_size_gui_trong_imageconfig(self):
+        # 16/09/2026: không truyền imageSize thì gemini-3-pro-image tự mặc định 1K (~1MP) bất kể
+        # ảnh gốc to đến đâu — đây là field bị thiếu, không phải bug crop đã sửa 4aca8c9.
+        with tempfile.TemporaryDirectory() as d:
+            lt.gemini_edit([(b"x", "image/png")], "p", "AIzafake", Path(d) / "o.png",
+                           aspect_ratio="9:16", image_size="2K", base_url=self.base_url)
+        self.assertEqual(GEMINI_STATE["bodies"][-1]["generationConfig"]["imageConfig"],
+                         {"aspectRatio": "9:16", "imageSize": "2K"})
+
+    def test_image_size_omitted_when_not_passed(self):
+        with tempfile.TemporaryDirectory() as d:
+            lt.gemini_edit([(b"x", "image/png")], "p", "AIzafake", Path(d) / "o.png",
+                           aspect_ratio="9:16", base_url=self.base_url)
+        self.assertEqual(GEMINI_STATE["bodies"][-1]["generationConfig"]["imageConfig"],
+                         {"aspectRatio": "9:16"})
 
 
 class TestPostJsonLoiMang(GeminiServerCase):
@@ -607,6 +625,10 @@ class TestCameraComposition(GeminiServerCase):
                 self.assertEqual(calls[2][1], lt.load_camera_compose_prompt()[0])
                 if provider == "gemini":
                     self.assertEqual(calls[2][2]["aspect_ratio"], "9:16")
+                    # 16/09/2026 (run IMG67441-IMG6957-IMG68943-tiktok178952 — mặt vẫn mờ sau
+                    # 4aca8c9): thiếu imageConfig.imageSize khiến gemini-3-pro-image tự mặc định
+                    # 1K bất kể ảnh gốc to đến đâu. Trần này khác bug crop tối 15/09.
+                    self.assertEqual(calls[2][2]["image_size"], lt.GEMINI_CAMERA_IMAGE_SIZE)
                 else:
                     self.assertEqual(calls[2][2].get("size"), "752*1328")
                 # 15/09/2026 (batch 2026-09-15-1120, mặt mờ trên driver nét thấp) - framed KHÔNG còn
