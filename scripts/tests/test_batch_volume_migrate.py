@@ -332,6 +332,17 @@ class TestSyncAndVerify(unittest.TestCase):
         self.assertIn("-avncR", cmd)
         self.assertIn("/workspace/./.motion-volume", cmd)
 
+    def test_both_real_and_dry_run_omit_dir_times(self):
+        # Root cause of the 2026-09-16 EU-RO-1->EUR-IS-1 verify failures
+        # (28, then 59 "file(s) differ", every one a bare directory line with
+        # a matching total size): NFS-backed Network Volumes don't round-trip
+        # directory mtimes, so a later dry-run always sees the directory
+        # itself as "changed" even when every file inside is byte-identical.
+        for dry_run in (True, False):
+            cmd = volume_migrate._rsync_cmd("/workspace", "pgdata", "host-b",
+                                            1002, dry_run=dry_run)
+            self.assertIn("--omit-dir-times", cmd)
+
     def test_verify_sums_pending_changes_across_every_subdir(self):
         clean = mock.Mock(stdout="sending incremental file list\n\nsent 1 bytes\n")
         dirty = mock.Mock(stdout="sending incremental file list\n"

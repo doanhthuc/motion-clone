@@ -445,8 +445,23 @@ def _rsync_cmd(mount: str, unit: str, dest_host: str, dest_port: int,
     file list" banner and nothing else (no "./" line), which
     count_pending_changes already scores as 0; a dirty one lists full
     relative paths such as "comfy-models/loras/a.safetensors".
+
+    `--omit-dir-times`: confirmed root cause of the 2026-09-16 EU-RO-1→
+    EUR-IS-1 verify failures (28, then 59, "file(s) differ") — every single
+    reported line across BOTH runs was a bare directory path
+    ("comfy-models/", "pgdata/", "minio/", the shared parent of whichever
+    unit was checked), never an actual file, and every unit's reported total
+    size matched the source exactly. The file content was correct both
+    times; only each directory's OWN mtime disagreed. RunPod Network Volumes
+    are NFS-backed, and rsync's own man page names this exact case: "If NFS
+    is sharing the directories on the receiving side, it is a good idea to
+    use this option" — directory mtimes don't round-trip reliably over NFS,
+    so a later dry-run always finds the directory itself "changed" even when
+    every file inside checksums clean. Applied to both the real copy and the
+    verify dry-run, so neither side ever tries to compare a value NFS can't
+    preserve.
     """
-    flags = "-avncR" if dry_run else "-aR"
+    flags = ("-avncR --omit-dir-times" if dry_run else "-aR --omit-dir-times")
     return (f"rsync {flags} -e 'ssh -i ~/.ssh_migrate/id_migrate "
             f"-o StrictHostKeyChecking=accept-new -p {dest_port}' "
             f"{mount}/./{unit} root@{dest_host}:{mount}/")
