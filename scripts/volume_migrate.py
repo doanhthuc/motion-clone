@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -71,6 +72,14 @@ COMFY_MODELS_DIR = "comfy-models"
 # 16 concurrent got some connections MaxStartups-rejected — measured
 # 2026-08-29, docs/gpu-pod.md#volume-migrate.
 MAX_RSYNC_THREADS = 8
+
+# How often the background byte-count poller SSHes into pod B while sync()
+# runs. A single `du -sb /workspace` over a many-GB tree costs real seconds on
+# its own, so this is a compromise between "the Telegram message visibly
+# moves" and "the poller itself doesn't become the SSH load sync() is trying
+# to stay under MaxStartups for" — not independently measured, tune if a real
+# run shows it too chatty or too slow to notice movement.
+PROGRESS_POLL_SEC = 30
 
 # The temp CPU pods never hold volume data on their container disk — the
 # Network Volume is mounted separately at /workspace (_cpu_pod_body's
@@ -363,6 +372,16 @@ def list_top_level(host: str, port: int, mount: str = "/workspace") -> list[str]
                   if name)
 
 
+def _total_bytes(host: str, port: int, mount: str = "/workspace") -> int:
+    """Apparent byte size of everything under `mount` (`du -sb`, not `-sh`) —
+    the raw number the sync-progress percentage divides by/into. Apparent
+    size, not disk usage, so a partially-written file on pod B counts exactly
+    the bytes rsync has flushed for it so far, matching how the same command
+    against pod A counts the finished original."""
+    out = _ssh_out(host, port, f"du -sb {mount} | tail -1")
+    return int(out.split()[0])
+
+
 def existing_subdirs(host: str, port: int, mount: str = "/workspace") -> list[str]:
     """The volume's real contents, split into one rsync unit per entry.
 
@@ -434,28 +453,70 @@ def _rsync_cmd(mount: str, unit: str, dest_host: str, dest_port: int,
 
 
 def sync(host_a: str, port_a: int, host_b: str, port_b: int, units: list[str],
-         mount: str = "/workspace") -> None:
+         mount: str = "/workspace", *, pod_a: str | None = None,
+         pod_b: str | None = None) -> None:
     """rsync -aR, one process per sync unit, run FROM pod A (using the temp
     key placed there by place_key_on) straight to pod B — never routed
     through this machine. Capped at MAX_RSYNC_THREADS concurrent.
+
+    Reports progress two ways at once, same "two independent signals" spirit
+    as verify()'s checksum-plus-listing pair: the batch loop below records
+    which units are in flight (free, no extra SSH — it already knows), while
+    a background thread SSHes into pod B every PROGRESS_POLL_SEC for a real
+    byte count, because "batch 3 of 9" says nothing about whether that batch
+    is a 500MB unit or a 20GB one. Both land in the same write_progress("sync",
+    ...) call so tick_migration_progress only has one payload shape to render.
+    The poller's own SSH failures are swallowed — a missed tick must not aim
+    an exception at a multi-hour copy over one transient hiccup.
     """
-    for start in range(0, len(units), MAX_RSYNC_THREADS):
-        batch = units[start:start + MAX_RSYNC_THREADS]
-        procs = [
-            subprocess.Popen(
-                ["ssh", "-o", "StrictHostKeyChecking=accept-new", "-p", str(port_a),
-                 f"root@{host_a}", _rsync_cmd(mount, d, host_b, port_b, dry_run=False)])
-            for d in batch
-        ]
-        # Wait on EVERY process already launched in this batch before
-        # raising anything. A previous version returned/raised on the FIRST
-        # non-zero .wait(), leaving any OTHER Popen in the same batch
-        # running untracked in the background — flagged in the Task 6
-        # review and deferred to here, the task that first wires sync()
-        # into main()'s real flow.
-        bad_rcs = [rc for rc in (p.wait() for p in procs) if rc != 0]
-        if bad_rcs:
-            raise RuntimeError(f"rsync leg exited {bad_rcs[0]} — see pod A's own stderr above")
+    total_bytes = _total_bytes(host_a, port_a, mount)
+    batch_total = (len(units) + MAX_RSYNC_THREADS - 1) // MAX_RSYNC_THREADS
+    started_at = time.time()
+    state_lock = threading.Lock()
+    state = {"batch_index": 0, "batch_total": batch_total, "units": []}
+    stop_event = threading.Event()
+
+    def _poll() -> None:
+        while not stop_event.wait(PROGRESS_POLL_SEC):
+            try:
+                bytes_copied = _total_bytes(host_b, port_b, mount)
+            except (subprocess.CalledProcessError, ValueError):
+                continue
+            with state_lock:
+                snapshot = dict(state)
+            write_progress("sync", pod_a=pod_a, pod_b=pod_b, started_at=started_at,
+                           total_bytes=total_bytes, bytes_copied=bytes_copied,
+                           **snapshot)
+
+    watcher = threading.Thread(target=_poll, daemon=True)
+    watcher.start()
+    try:
+        for start in range(0, len(units), MAX_RSYNC_THREADS):
+            batch = units[start:start + MAX_RSYNC_THREADS]
+            with state_lock:
+                state["batch_index"] = start // MAX_RSYNC_THREADS + 1
+                state["units"] = batch
+            procs = [
+                subprocess.Popen(
+                    ["ssh", "-o", "StrictHostKeyChecking=accept-new", "-p", str(port_a),
+                     f"root@{host_a}", _rsync_cmd(mount, d, host_b, port_b, dry_run=False)])
+                for d in batch
+            ]
+            # Wait on EVERY process already launched in this batch before
+            # raising anything. A previous version returned/raised on the FIRST
+            # non-zero .wait(), leaving any OTHER Popen in the same batch
+            # running untracked in the background — flagged in the Task 6
+            # review and deferred to here, the task that first wires sync()
+            # into main()'s real flow.
+            bad_rcs = [rc for rc in (p.wait() for p in procs) if rc != 0]
+            if bad_rcs:
+                raise RuntimeError(
+                    f"rsync leg exited {bad_rcs[0]} — see pod A's own stderr above")
+    finally:
+        # Joined before returning either way, so main()'s next write_progress
+        # ("verify", ...) call can never race this thread's own write.
+        stop_event.set()
+        watcher.join()
 
 
 #  real GNU rsync 3.2.7 (verified locally via `docker run debian:12-slim`,
@@ -676,7 +737,7 @@ def main(argv: list[str]) -> int:
                     f"pod A ({pod_a}) lists no entries at all under /workspace — "
                     f"refusing to 'migrate' an empty listing. The Network Volume "
                     f"is probably not mounted there; {old_volume_id} is untouched.")
-            sync(host_a, port_a, host_b, port_b, units)
+            sync(host_a, port_a, host_b, port_b, units, pod_a=pod_a, pod_b=pod_b)
 
             write_progress("verify", pod_a=pod_a, pod_b=pod_b)
             result = verify(host_a, port_a, host_b, port_b, units)

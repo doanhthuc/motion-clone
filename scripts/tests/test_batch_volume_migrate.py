@@ -268,7 +268,8 @@ class TestSyncAndVerify(unittest.TestCase):
     def test_sync_runs_one_ssh_per_subdir_from_pod_a(self):
         fake_proc = mock.Mock()
         fake_proc.wait.return_value = 0
-        with mock.patch("subprocess.Popen", return_value=fake_proc) as mock_popen:
+        with mock.patch.object(volume_migrate, "_total_bytes", return_value=1000), \
+             mock.patch("subprocess.Popen", return_value=fake_proc) as mock_popen:
             volume_migrate.sync("host-a", 1001, "host-b", 1002, ["loras", "checkpoints"])
         self.assertEqual(mock_popen.call_count, 2)
         first_call_argv = mock_popen.call_args_list[0].args[0]
@@ -277,7 +278,8 @@ class TestSyncAndVerify(unittest.TestCase):
     def test_sync_raises_if_any_leg_exits_non_zero(self):
         fake_proc = mock.Mock()
         fake_proc.wait.return_value = 1
-        with mock.patch("subprocess.Popen", return_value=fake_proc):
+        with mock.patch.object(volume_migrate, "_total_bytes", return_value=1000), \
+             mock.patch("subprocess.Popen", return_value=fake_proc):
             with self.assertRaises(RuntimeError):
                 volume_migrate.sync("host-a", 1001, "host-b", 1002, ["loras"])
 
@@ -291,12 +293,22 @@ class TestSyncAndVerify(unittest.TestCase):
         proc_fail.wait.return_value = 1
         proc_ok = mock.Mock()
         proc_ok.wait.return_value = 0
-        with mock.patch("subprocess.Popen", side_effect=[proc_fail, proc_ok]):
+        with mock.patch.object(volume_migrate, "_total_bytes", return_value=1000), \
+             mock.patch("subprocess.Popen", side_effect=[proc_fail, proc_ok]):
             with self.assertRaises(RuntimeError):
                 volume_migrate.sync("host-a", 1001, "host-b", 1002,
                                     ["loras", "checkpoints"])
         proc_fail.wait.assert_called_once()
         proc_ok.wait.assert_called_once()
+
+    def test_sync_reports_pod_a_s_total_bytes_before_the_first_batch(self):
+        fake_proc = mock.Mock()
+        fake_proc.wait.return_value = 0
+        with mock.patch.object(volume_migrate, "_total_bytes",
+                               return_value=12345) as mock_total, \
+             mock.patch("subprocess.Popen", return_value=fake_proc):
+            volume_migrate.sync("host-a", 1001, "host-b", 1002, ["loras"])
+        mock_total.assert_called_once_with("host-a", 1001, "/workspace")
 
     def test_a_nested_unit_keeps_its_full_relative_path_on_both_sides(self):
         # Sync units are now relative paths from the mount, and comfy-models'
@@ -454,6 +466,20 @@ REAL_COMFY_CHILDREN = ("diffusion_models\ntext_encoders\nloras\ncheckpoints\n"
 def _listings(*stdouts: str):
     """subprocess.run side_effect for a sequence of `ls -A` calls."""
     return [mock.Mock(stdout=s, returncode=0) for s in stdouts]
+
+
+class TestTotalBytes(unittest.TestCase):
+    def test_parses_the_last_line_of_du_sb(self):
+        with mock.patch("subprocess.run",
+                        return_value=mock.Mock(stdout="70999999999\t/workspace\n")):
+            self.assertEqual(volume_migrate._total_bytes("host-a", 1001), 70999999999)
+
+    def test_a_trailing_blank_line_does_not_break_parsing(self):
+        # `| tail -1` on the remote side should already prevent this, but a
+        # local mock is cheaper proof than trusting the remote shell pipeline.
+        with mock.patch("subprocess.run",
+                        return_value=mock.Mock(stdout="123\t/workspace\n\n")):
+            self.assertEqual(volume_migrate._total_bytes("host-a", 1001), 123)
 
 
 class TestExistingSubdirs(unittest.TestCase):

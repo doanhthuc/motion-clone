@@ -1243,6 +1243,43 @@ class TestResultAndTryonPathSafety(unittest.TestCase):
         self.assertNotIn("passwd", tg.messages[0])
 
 
+class TestMigrateSyncDetail(unittest.TestCase):
+    def test_fmt_gb_rounds_to_one_decimal(self):
+        self.assertEqual(bot._fmt_gb(15_000_000_000), "15.0GB")
+
+    def test_fmt_elapsed_under_an_hour_is_mm_ss(self):
+        self.assertEqual(bot._fmt_elapsed(754), "12m34s")
+
+    def test_fmt_elapsed_past_an_hour_switches_format(self):
+        self.assertEqual(bot._fmt_elapsed(3725), "1h02m")
+
+    def test_no_batch_or_byte_fields_yet_renders_nothing(self):
+        # sync() hasn't reached its first PROGRESS_POLL_SEC tick — the plain
+        # "copying data between temp pods…" phase text already covers this.
+        self.assertEqual(bot._migrate_sync_detail({"phase": "sync", "at": 0.0}), "")
+
+    def test_all_three_fields_join_with_a_middle_dot(self):
+        with mock.patch.object(bot.time, "time", return_value=754.0):
+            detail = bot._migrate_sync_detail({
+                "batch_index": 2, "batch_total": 5,
+                "units": ["checkpoints", "clip_vision"],
+                "total_bytes": 71_000_000_000, "bytes_copied": 15_000_000_000,
+                "started_at": 0.0,
+            })
+        self.assertEqual(
+            detail,
+            "batch 2/5: checkpoints, clip_vision · 15.0GB/71.0GB (21%) · running 12m34s")
+
+    def test_a_percentage_never_exceeds_100(self):
+        # bytes_copied can transiently read higher than total_bytes — du's
+        # apparent-size count on pod B racing a still-growing file against a
+        # total_bytes snapshot taken once, at the very start, on pod A.
+        detail = bot._migrate_sync_detail({
+            "total_bytes": 100, "bytes_copied": 150,
+        })
+        self.assertIn("(100%)", detail)
+
+
 class TestFlow(unittest.TestCase):
     """The state machine Task 7 adds: files in, an ambiguous image asked
     about (never guessed), the manifest shown once every required slot is
@@ -2106,6 +2143,21 @@ class TestFlow(unittest.TestCase):
         second_message_id = json.loads(
             bot._migrate_progress_message_path(ME).read_text())["message_id"]
         self.assertEqual(first_message_id, second_message_id)   # edited, not re-sent
+
+    def test_tick_migration_progress_renders_batch_and_byte_progress(self):
+        prog_path = bot._migrate_progress_path()
+        prog_path.parent.mkdir(parents=True, exist_ok=True)
+        prog_path.write_text(json.dumps({
+            "phase": "sync", "at": 100.0, "started_at": 0.0,
+            "batch_index": 2, "batch_total": 5, "units": ["checkpoints", "clip_vision"],
+            "total_bytes": 71_000_000_000, "bytes_copied": 15_000_000_000,
+        }), encoding="utf-8")
+        with mock.patch.object(bot.time, "time", return_value=754.0):
+            bot.tick_migration_progress(self.tg, ME)
+        text = self.tg.messages[-1]
+        self.assertIn("batch 2/5: checkpoints, clip_vision", text)
+        self.assertIn("15.0GB/71.0GB (21%)", text)
+        self.assertIn("running 12m34s", text)
 
     def test_tick_migration_progress_delivers_a_final_message_on_done(self):
         prog_path = bot._migrate_progress_path()

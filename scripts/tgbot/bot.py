@@ -2878,6 +2878,45 @@ def tick_progress(tg: Tg, chat_id: int) -> None:
     deliver_result(tg, chat_id, manifest_path)
 
 
+def _fmt_gb(num_bytes) -> str:
+    return f"{num_bytes / 1e9:.1f}GB"
+
+
+def _fmt_elapsed(seconds: float) -> str:
+    """mm:ss, or h:mm past the first hour — same reasoning as run.py's own
+    _elapsed: a ticking number, not a spinner, is what proves a multi-minute
+    sync is still alive rather than stuck."""
+    seconds = max(0, int(seconds))
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours}h{minutes:02d}m" if hours else f"{minutes}m{secs:02d}s"
+
+
+def _migrate_sync_detail(payload: dict) -> str:
+    """The extra line under "copying data between temp pods…": which batch
+    of units is in flight and a real byte count, not just that string sitting
+    unchanged for 30+ minutes (2026-09-16: a run to EUR-IS-1 ran long enough
+    that "is this stuck?" came up with nothing in the message to answer it).
+    Returns "" until volume_migrate.py's sync() has written its first
+    background poll tick (see PROGRESS_POLL_SEC there) — the plain phase text
+    above already covers that gap.
+    """
+    parts = []
+    batch_index, batch_total = payload.get("batch_index"), payload.get("batch_total")
+    units = payload.get("units") or []
+    if batch_index and batch_total:
+        names = ", ".join(_esc(str(u)) for u in units) if units else "…"
+        parts.append(f"batch {batch_index}/{batch_total}: {names}")
+    total_bytes, bytes_copied = payload.get("total_bytes"), payload.get("bytes_copied")
+    if isinstance(total_bytes, (int, float)) and total_bytes and isinstance(bytes_copied, (int, float)):
+        pct = min(100, round(bytes_copied / total_bytes * 100))
+        parts.append(f"{_fmt_gb(bytes_copied)}/{_fmt_gb(total_bytes)} ({pct}%)")
+    started_at = payload.get("started_at")
+    if isinstance(started_at, (int, float)):
+        parts.append(f"running {_fmt_elapsed(time.time() - started_at)}")
+    return " · ".join(parts)
+
+
 def tick_migration_progress(tg: Tg, chat_id: int, *, dry_run: bool = False) -> None:
     """Re-render the migration progress message, same shape as tick_progress
     for a drain — one message, edited in place throughout, including its
@@ -2918,6 +2957,10 @@ def tick_migration_progress(tg: Tg, chat_id: int, *, dry_run: bool = False) -> N
     }.get(phase, f"{ICON_REFRESH_CE} <b>Migrating volume</b> — {_esc(phase)}")
     if phase == "done" and payload.get("warning"):
         text += f"\n{_esc(payload['warning'])}"
+    if phase == "sync":
+        detail = _migrate_sync_detail(payload)
+        if detail:
+            text += f"\n{detail}"
 
     msg_path = _migrate_progress_message_path(chat_id)
     if msg_path.exists():
