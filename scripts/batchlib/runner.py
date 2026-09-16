@@ -169,7 +169,8 @@ def run_one(*, settings: Settings, run: Run, out_dir: Path, state: dict,
         # (run_batch/prepare_batch), nên "done" ở đây chỉ có thể đến từ Pha A
         # (run_local_phase) đã ghi trong CHÍNH lần gọi `make batch` này — bỏ qua đúng
         # là hành vi cần, không phải một lỗ hổng bỏ sót --resume.
-        if recorded.get("status") == "done" and dest.is_file():
+        if (recorded.get("status") == "done" and dest.is_file()
+                and not _local_provenance_stale(run, stage_name, recorded)):
             log(f"    {stage_name}: bỏ qua (đã xong, {dest.name})")
             prev_output = dest
             continue
@@ -420,6 +421,59 @@ def local_tryon_reusable(run: Run, stage_name: str, recorded: dict, dest: Path) 
         stage_name, run.stage_params.get(stage_name))
 
 
+def _local_provenance_stale(run: Run, stage_name: str, recorded: dict) -> bool:
+    """True when a journal entry Phase A wrote can no longer stand in for this run.
+
+    Narrow on purpose — this is NOT a params check, and §5 of the spec records
+    why: comparing a journalled params_manifest against effective_stage_params
+    recomputed at resume time means any change to params.py's defaults silently
+    invalidates every stage marked done, and at Phase B that re-submits a
+    40-minute enhance to a GPU billing $0.99/h.
+
+    What it does catch is the one hole reachable from the bot: /provider moves
+    a stage off the local providers, so _local_tryon_stage stops naming it, and
+    the image Gemini made must not be passed off as the pod's output.
+
+    A missing "phase" key means the entry predates the stamp. Unknown
+    provenance gets today's behaviour (reuse), so a batch in flight across the
+    upgrade is unaffected rather than silently re-run.
+    """
+    if recorded.get("phase") != "local":
+        return False
+    return _local_tryon_stage(run) != stage_name
+
+
+def preserved_local_tryon(manifest: Manifest, state: dict, out_root: Path) -> tuple[int, int]:
+    """(reusable, total) — how many of this manifest's local try-ons a resume would skip.
+
+    Lives here rather than in the bot because the answer has to come from the
+    same two predicates run_local_phase skips with: _local_tryon_stage for
+    "is this stage local at all", local_tryon_reusable for "may we reuse what
+    it produced". A bot-side reimplementation is the second opinion
+    _local_tryon_eligible's docstring warns about, and here it would show up as
+    a stock-out card promising "4/4 preserved" for a batch whose provider
+    changed and which is therefore about to re-run all four.
+
+    Reads no journal of its own: the caller passes the state it already loaded,
+    so the count and whatever else the caller does with that state cannot
+    disagree about which file they read.
+    """
+    batch_id = str(state.get("batch") or "")
+    runs = state.get("runs") or {}
+    total = reusable = 0
+    for run in manifest.runs:
+        stage_name = _local_tryon_stage(run)
+        if stage_name is None:
+            continue
+        total += 1
+        recorded = ((runs.get(run.id) or {}).get("stages") or {}).get(stage_name) or {}
+        run_dir = out_root / batch_id / "runs" / run.id
+        if local_tryon_reusable(run, stage_name, recorded,
+                                stage_dest(run, run_dir, stage_name)):
+            reusable += 1
+    return reusable, total
+
+
 def needs_pod(manifest: Manifest) -> bool:
     """True nếu còn ít nhất một chặng KHÔNG THỂ chạy local trong toàn bộ manifest.
 
@@ -559,7 +613,14 @@ def run_local_phase(*, settings: Settings, manifest: Manifest, out_root: Path, b
         with lock:
             entry["stages"][stage_name] = {
                 "status": "done", "elapsed_sec": elapsed, "file": str(dest), "bytes": size,
-                "params_sent": dict(params), "params_manifest": dict(params)}
+                "params_sent": dict(params), "params_manifest": dict(params),
+                # Provenance, so run_one can tell a pod stage's output from a
+                # local one. Without it a /provider switch away from a local
+                # provider leaves run_one skipping a stage that now belongs to
+                # the pod, on the strength of an image a different provider
+                # made. Entries predating the stamp have no key and keep
+                # today's behaviour — see _local_provenance_stale.
+                "phase": "local"}
             save_state(state_file, state)
         xong = f"{stage_name} (local): xong {elapsed}s · {size // 1024} KB → {dest.name}"
         # Cả hai kết cục vào run.log, không chỉ lỗi — run_one cũng ghi cả hai, và "chặng
