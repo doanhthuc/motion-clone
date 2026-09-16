@@ -1530,6 +1530,14 @@ không có API đổi datacenter. Muốn nhỏ hơn hoặc ở DC khác thì ph�
 | Khác DC | 4 | `dd\|ssh cat` | **~184MB/s (3.2×)** | gấp ~2× rsync cùng số luồng |
 | Khác DC | 8 | `dd\|ssh cat` | **~427MB/s (7.5×)** | **~3 phút** |
 | Khác DC | 16 | `dd\|ssh cat` | ~447MB/s, nhưng **3/16 kết nối lỗi** | không nên dùng |
+| Khác DC (EU-RO-1→EUR-IS-1, lần đầu đo `volume_migrate.py` thật, 16/09/2026) | 1-2 | `rsync` (script, `MAX_RSYNC_THREADS=8`) | **~32MB/s**, không tăng khi 2 luồng cùng chạy | 71GB ước ~35-40 phút |
+
+**EU-RO-1→EUR-IS-1 chậm hơn hẳn EU-RO-1→EU-CZ-1 (32MB/s so với 57-94MB/s) dù cùng là "khác DC".**
+Đo trên pod tạm 4 vCPU, `load average` 0.26 lúc đang chạy — không nghẽn CPU như lần đo 29/08 (pod tạm
+đó chỉ 2 vCPU). Thêm luồng thứ 2 không tăng tổng thông lượng, nên trần nằm ở bản thân đường truyền
+RO↔Iceland (quãng xa hơn RO↔Czech), không phải ở script hay CPU — nhưng chưa đo latency trực tiếp để
+xác nhận, đây là suy luận từ việc thêm luồng không giúp gì. Nếu di chuyển tới EUR-IS-1 lần nữa mà vẫn
+~32MB/s thì coi đó là trần thật của tuyến này, đừng kỳ vọng ~94MB/s như tuyến EU-CZ-1.
 
 Nén trước khi sync (`rsync -z`/tar+gzip) **không đáng thử**: phần lớn dữ liệu là tensor
 `.safetensors`/`.gguf`/`.ckpt` (fp16/fp8) — entropy cao, nén được dưới 5%, trong khi pod CPU tạm
