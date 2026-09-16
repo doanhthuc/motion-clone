@@ -5708,5 +5708,65 @@ class TestPhaseABlocksManifestMutation(unittest.TestCase):
                          "_wipe_chat swept the chat despite refusing")
 
 
+class TestRunConfirmPanelIsParameterised(unittest.TestCase):
+    """Task 9 renders this same panel a second time, after Phase A, with a
+    different spend destination. Pinning the parameterisation here keeps the
+    refactor honest: the default must still be _CB_RUN_GO, or every existing
+    Run button in the chat changes meaning.
+    """
+
+    def setUp(self):
+        self._orig_root = bot.ROOT
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "batch").mkdir()
+        bot.ROOT = self.root
+        (self.root / ".env").write_text(
+            "GPU=NVIDIA GeForce RTX 5090\nPOD_VOLUME_ID=vol-1\n", encoding="utf-8")
+        reset_bot_state()
+        self.manifest = self.root / "batch" / "tg-1.yaml"
+        self.manifest.write_text("runs: []\n", encoding="utf-8")
+        self.tg = FakeTg()
+
+    def tearDown(self):
+        bot.ROOT = self._orig_root
+
+    def _stock(self):
+        return {"NVIDIA GeForce RTX 5090": [
+            Stock(gpu_id="NVIDIA GeForce RTX 5090", display_name="RTX 5090",
+                  datacenter_id="EU-RO-1", stock_status="available", price_per_hr=0.99)]}
+
+    def test_default_spend_callback_is_unchanged(self):
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
+            bot._offer_run_confirm(self.tg, ME)
+        flat = [data for row in self.tg.buttons[-1] for _, data, *_ in row]
+        self.assertTrue(any(d.startswith(bot._CB_RUN_GO) for d in flat))
+
+    def test_a_caller_supplied_spend_callback_replaces_it(self):
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
+            bot._offer_run_confirm(self.tg, ME, spend_cb="rec:retry:tg-1")
+        flat = [data for row in self.tg.buttons[-1] for _, data, *_ in row]
+        self.assertIn("rec:retry:tg-1", flat)
+        self.assertFalse(any(d.startswith(bot._CB_RUN_GO) for d in flat))
+
+    def test_the_no_stock_data_branch_honours_it_too(self):
+        # The fail-open branch mints its own spend button. Missing it would
+        # leave a panel that renders with one destination and spends with
+        # another, only when the stock check fails — i.e. only in production.
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", side_effect=RuntimeError("runpodctl down")):
+            bot._offer_run_confirm(self.tg, ME, spend_cb="rec:retry:tg-1")
+        flat = [data for row in self.tg.buttons[-1] for _, data, *_ in row]
+        self.assertIn("rec:retry:tg-1", flat)
+
+    def test_a_heading_replaces_the_choose_gpu_line(self):
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
+            bot._offer_run_confirm(self.tg, ME, heading="Try-on done — now rent?")
+        self.assertIn("Try-on done — now rent?", self.tg.screen[-1])
+        self.assertNotIn("Choose GPU", self.tg.screen[-1])
+
+
 if __name__ == "__main__":
     unittest.main()

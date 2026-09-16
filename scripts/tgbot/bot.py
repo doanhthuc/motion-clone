@@ -3949,7 +3949,8 @@ def _edit_or_send(tg: Tg, chat_id: int, message_id: int | None, text: str,
 
 
 def _offer_run_confirm(tg: Tg, chat_id: int, *, message_id: int | None = None,
-                       force: bool = False) -> None:
+                       force: bool = False, spend_cb: str | None = None,
+                       heading: str | None = None) -> None:
     """The step between [Run] and spending money: always lists every known
     GPU's live stock/price at the home datacenter and lets [Confirm] switch
     to any of them before renting (2026-09-02, widened from "only offer a
@@ -3973,6 +3974,14 @@ def _offer_run_confirm(tg: Tg, chat_id: int, *, message_id: int | None = None,
     datacenter to compare against would be showing numbers that do not
     mean what they claim to.
 
+    `spend_cb` and `heading` exist because this panel is rendered twice with
+    different meanings (2026-09-16): once before anything has run, where
+    [Yes, spend] starts Phase A, and once after Phase A has finished, where it
+    rents the pod for a batch whose try-on is already on disk. The stock
+    rendering is identical in both — that is the reason to parameterise rather
+    than duplicate — and the second one is the whole point of the change, since
+    it measures stock at the moment of the decision instead of minutes before.
+
     `message_id` edits that message in place instead of sending a new one
     (see _edit_or_send) — set by every caller except the very first [Run]
     tap on the job panel. `force` bypasses stock_at_cached's 60s TTL for a
@@ -3981,6 +3990,12 @@ def _offer_run_confirm(tg: Tg, chat_id: int, *, message_id: int | None = None,
     configured = env_get(ROOT / ".env", "GPU") or _PRIMARY_GPU_ID
     volume_id = env_get(ROOT / ".env", "POD_VOLUME_ID")
     home_dc = volume_datacenter(volume_id)
+    # Defaults resolved here rather than at each of the two mint sites below:
+    # the fail-open branch (no stock data) and the normal one each build a
+    # spend button, and two call sites defaulting independently is how a panel
+    # ends up rendering one destination and spending with another — only when
+    # the stock check fails, i.e. only in production.
+    spend_cb = spend_cb or (_CB_RUN_GO + _run_token(chat_id))
     wanted = [_PRIMARY_GPU_ID, *_FALLBACK_GPU_IDS]
     try:
         stock = ((stock_at(wanted) if force else stock_at_cached(wanted))
@@ -3995,7 +4010,7 @@ def _offer_run_confirm(tg: Tg, chat_id: int, *, message_id: int | None = None,
             f"This rents a GPU pod at ${price:.2f}/hour and starts the job.\n"
             "Confirm?",
             [[("Refresh", _CB_RUN_REFRESH + "m", _ce_id(ICON_REFRESH_CE))],
-             [(f"Yes, spend ${price:.2f}/h", _CB_RUN_GO + _run_token(chat_id),
+             [(f"Yes, spend ${price:.2f}/h", spend_cb,
                _ce_id(ICON_ROCKET_CE)),
               ("Cancel", _CB_RUN_NO)]])
         return
@@ -4004,7 +4019,8 @@ def _offer_run_confirm(tg: Tg, chat_id: int, *, message_id: int | None = None,
     # (2026-09-02) — on a phone, three bold lines that only differ by six
     # small letters at the end read as one undifferentiated list; a reader
     # reported not being able to tell which was already selected.
-    lines = [f"{ICON_NVIDIA_CE} <b>Choose GPU</b> — renting at {_esc(home_dc)}", ""]
+    lines = [heading or (f"{ICON_NVIDIA_CE} <b>Choose GPU</b> — renting at "
+                         f"{_esc(home_dc)}"), ""]
     configured_home = next((e for e in (stock.get(configured) or [])
                             if e.datacenter_id == home_dc), None)
     # Sold out at home covers both shapes runpodctl can report: an entry that
@@ -4055,7 +4071,7 @@ def _offer_run_confirm(tg: Tg, chat_id: int, *, message_id: int | None = None,
     if sold_out:
         buttons.append([("Cancel", _CB_RUN_NO)])
     else:
-        buttons.append([(f"Yes, spend ${price:.2f}/h", _CB_RUN_GO + _run_token(chat_id),
+        buttons.append([(f"Yes, spend ${price:.2f}/h", spend_cb,
                         _ce_id(ICON_ROCKET_CE)),
                         ("Cancel", _CB_RUN_NO)])
     _edit_or_send(tg, chat_id, message_id, "\n".join(lines), buttons,
