@@ -439,5 +439,69 @@ class TestPhaseAForwardsForceLocal(unittest.TestCase):
         self.assertNotIn("--force-local", seen[0])
 
 
+class TestPhaseAOnly(unittest.TestCase):
+    """--phase-a-only runs the local try-on and stops. It may never reach
+    provision(), whatever Phase A returns.
+
+    Also independent of --yes, and that ordering is the trap: main()'s
+    existing `if not args.yes` gate prints DRY RUN and returns 0 without
+    running anything. Phase A is not a dry run — it spends Gemini quota and
+    writes the journal — so a --phase-a-only invocation placed after that
+    gate would be a money-adjacent flag that silently does nothing.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.manifest = self.tmp / "tg-1.yaml"
+        self.manifest.write_text(
+            "runs:\n  - id: a\n    pipeline: tryon-motion-enhance\n"
+            "    inputs: {character: /tmp/c.png, outfit: /tmp/o.png, driver: /tmp/d.mp4}\n"
+            "    tryon: { provider: gemini }\n", encoding="utf-8")
+
+    def _main(self, *extra: str):
+        with mock.patch.object(sys, "argv",
+                               ["drain.py", "--file", str(self.manifest), *extra]):
+            return drain.main()
+
+    def test_never_provisions_when_phase_a_says_a_pod_is_needed(self):
+        with mock.patch.object(drain, "batch_run", return_value=drain.EXIT_NEEDS_POD), \
+             mock.patch.object(drain, "provision",
+                               side_effect=AssertionError("rented a pod")) as prov:
+            rc = self._main("--phase-a-only", "--yes")
+        self.assertEqual(rc, drain.EXIT_NEEDS_POD)
+        prov.assert_not_called()
+
+    def test_runs_without_yes_rather_than_printing_dry_run(self):
+        calls: list[tuple] = []
+        with mock.patch.object(drain, "batch_run",
+                               side_effect=lambda *a: calls.append(a) or 0):
+            rc = self._main("--phase-a-only")
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("--no-start", calls[0])
+
+    def test_propagates_a_phase_a_failure_code(self):
+        with mock.patch.object(drain, "batch_run", return_value=1), \
+             mock.patch.object(drain, "provision",
+                               side_effect=AssertionError("rented a pod")):
+            self.assertEqual(self._main("--phase-a-only"), 1)
+
+    def test_forwards_resume_and_force_local(self):
+        calls: list[tuple] = []
+        with mock.patch.object(drain, "batch_run",
+                               side_effect=lambda *a: calls.append(a) or 0):
+            self._main("--phase-a-only", "--resume", "--force-local")
+        self.assertIn("--resume", calls[0])
+        self.assertIn("--force-local", calls[0])
+
+    def test_no_yes_and_no_phase_a_is_still_a_dry_run(self):
+        # The existing gate must survive unchanged for the renting path.
+        with mock.patch.object(drain, "batch_run",
+                               side_effect=AssertionError("ran a batch")) as br:
+            rc = self._main()
+        self.assertEqual(rc, 0)
+        br.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
