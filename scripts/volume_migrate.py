@@ -201,7 +201,15 @@ def provision_temp_pod(name: str, volume_id: str, dc: str, disk_gb: int) -> str:
     request = urllib.request.Request(
         RUNPOD_PODS_URL, data=json.dumps(body).encode("utf-8"),
         headers={"Authorization": f"Bearer {api_key}",
-                 "Content-Type": "application/json"},
+                 "Content-Type": "application/json",
+                 # rest.runpod.io sits behind Cloudflare, which returns a 403
+                 # "error code: 1010" HTML page (not JSON) for urllib's default
+                 # `Python-urllib/3.x` User-Agent — confirmed 2026-09-16 with a
+                 # free GET /v1/pods: blocked with no UA override, HTTP 200
+                 # once UA is set to a curl-like string. pod-provision.sh's
+                 # curl-based call to the same endpoint never hit this because
+                 # curl's own UA isn't flagged.
+                 "User-Agent": "curl/8.7.1"},
         method="POST")
     try:
         with urllib.request.urlopen(request, timeout=120) as response:
