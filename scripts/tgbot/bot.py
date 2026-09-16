@@ -559,10 +559,18 @@ def _preserved_tryon(manifest_path: Path) -> tuple[int, int]:
     guarantee that is one implementation. A manifest that will not load is
     (0, 0) — the card falls back to its generic "your batch is safe" line
     rather than claiming a number it could not check.
+
+    The except below mirrors what load_manifest can actually raise: ManifestError
+    for YAML and structural problems, OSError for an unreadable file, and
+    UnicodeDecodeError from the read_text that sits inside its own try. It is
+    that set and no wider — if load_manifest grows a new raise, this tuple is
+    the thing to revisit, because an escape here reaches the poll loop after
+    `offset` was already bumped and silently drops the rest of that batch of
+    updates along with the card itself.
     """
     try:
         manifest = load_manifest(manifest_path)
-    except (ManifestError, OSError):
+    except (ManifestError, OSError, UnicodeDecodeError):
         return 0, 0
     state = load_state(state_path_for(manifest_path))
     if not state.get("batch"):
@@ -1388,10 +1396,11 @@ _CB_MIGRATE_NO = "mig:no"
 _CB_RECOVER_WAIT = "rec:wait"
 _CB_RECOVER_SWITCH = "rec:sw:"     # + "<gpu short>:<manifest stem>"
 _CB_RECOVER_MIGRATE = "rec:mig:"   # + "<to_dc>:<manifest stem>"
-# Same-GPU retry. The other three recovery buttons all change something —
-# GPU type, datacenter, or nothing at all (Đợi) — and before this existed a
-# user whose card had scrolled away had no way to resume without /confirm,
-# which minted a new batch id and re-ran every try-on.
+# Same-GPU retry. Before this existed the card's four other buttons each did
+# something else — switch GPU type, migrate datacenter, subscribe to a stock
+# alert, or dismiss (Đợi) — and none of them resumed on the GPU the batch had
+# just failed on. A user whose card had scrolled away had no way to resume
+# without /confirm, which minted a new batch id and re-ran every try-on.
 _CB_RECOVER_RETRY = "rec:retry:"   # + "<manifest stem>"
 
 # ONE number, everywhere a migration's duration is quoted: the /gpu listing,
@@ -1648,9 +1657,14 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
             _migrate_resume_marker().unlink(missing_ok=True)
 
         elif data == _CB_RECOVER_WAIT:
-            tg.send_message(chat_id, "OK — parked. The try-on images are kept, "
-                                     "nothing is lost. Tap <b>Thử lại</b> above "
-                                     "when you want to rent again.",
+            # Count-agnostic on purpose: this handler gets a bare rec:wait with
+            # no manifest stem, so it cannot know whether the card above it just
+            # claimed "0/2 preserved", or whether the batch had any try-on
+            # images at all. It matches the card's generic fallback line, which
+            # is why it stays true in all three states.
+            tg.send_message(chat_id, "OK — parked. Nothing already finished is "
+                                     "lost. Tap <b>Thử lại</b> above when you "
+                                     "want to rent again.",
                             parse_mode=PARSE_HTML)
 
         elif data.startswith(_CB_RECOVER_RETRY):
@@ -4296,7 +4310,8 @@ def _again(tg: Tg, chat_id: int) -> None:
 def _do_resume(tg: Tg, chat_id: int, manifest_path: Path, *, dry_run: bool) -> None:
     """Continue a batch whose pod rental already failed once — reached only
     from the recovery buttons _deliver_provision_failure offers, after the
-    user picked a different GPU (_CB_RECOVER_SWITCH) or a migration finished
+    user picked a different GPU (_CB_RECOVER_SWITCH) or asked to retry the
+    same one (_CB_RECOVER_RETRY), or after a migration finished
     (tick_migration_progress's own resume-on-done).
 
     Deliberately NOT routed through _do_confirm: that function's checks

@@ -4568,6 +4568,19 @@ class TestProvisionFailureRecovery(unittest.TestCase):
                 read_provision_failure(provision_failure_path(self.manifest)))
         self.assertIn("0/2", self.tg.messages[-1])
 
+    def test_a_non_utf8_manifest_counts_as_unknown_rather_than_raising(self):
+        # load_manifest wraps only yaml.YAMLError into ManifestError, and its
+        # read_text(encoding="utf-8") sits inside that same try — so a manifest
+        # saved in some other encoding (cp1258 is what a Vietnamese Windows
+        # editor writes) raises UnicodeDecodeError straight out of it. That
+        # escape is not cosmetic: _preserved_tryon runs before any send_message
+        # in the stock-out branch, so the card is never delivered, and handle()
+        # re-raises into the poll loop after `offset` was already bumped — the
+        # rest of that fetched batch of updates is dropped and every tick in
+        # that pass is skipped. The user sees nothing at all.
+        self.manifest.write_bytes("runs: []\n# ghi chú\n".encode("cp1258"))
+        self.assertEqual(bot._preserved_tryon(self.manifest), (0, 0))
+
     def test_stock_out_shows_the_real_reason_not_a_json_dump_or_the_old_generic_message(self):
         self._write_failure(stock_out=True)
         with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
@@ -4669,6 +4682,9 @@ class TestProvisionFailureRecoveryButtons(unittest.TestCase):
         with mock.patch("tgbot.bot.start_drain"):
             bot.handle(self.tg, cb_from(ME, bot._CB_RECOVER_WAIT), allowed_user_id=ME)
         self.assertNotIn("/confirm again", self.tg.messages[-1])
+        # ...and it must actually name the button it points at, or an empty
+        # reply would satisfy the assertion above.
+        self.assertIn("Thử lại", self.tg.messages[-1])
 
     def test_retry_resumes_without_touching_the_gpu_setting(self):
         with mock.patch("tgbot.bot.drain_running", return_value=False), \
