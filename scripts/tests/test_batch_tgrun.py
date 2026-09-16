@@ -170,6 +170,41 @@ class TestStartDrain(unittest.TestCase):
         self.assertIsNot(popen.call_args.kwargs["stdout"], subprocess.PIPE)
 
 
+class TestStartDrainArgv(unittest.TestCase):
+    """start_drain's argv is the money gate's only output. These assert on the
+    list it would run, never on a real `make`."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.manifest = self.tmp / "tg-1.yaml"
+        self.manifest.write_text("runs: []\n", encoding="utf-8")
+        self._orig_running = dict(run_mod._RUNNING)
+
+    def tearDown(self):
+        run_mod._RUNNING.clear()
+        run_mod._RUNNING.update(self._orig_running)
+
+    def _argv(self, **kwargs) -> list[str]:
+        with mock.patch.object(run_mod.subprocess, "Popen") as popen:
+            popen.return_value = _FakeProc(poll_return=None)
+            run_mod.start_drain(self.manifest, **kwargs)
+        return popen.call_args.args[0]
+
+    def test_force_local_becomes_the_make_variable(self):
+        self.assertIn("FORCE_LOCAL=1",
+                      self._argv(dry_run=False, resume=True, force_local=True))
+
+    def test_omitted_force_local_adds_nothing(self):
+        self.assertNotIn("FORCE_LOCAL=1", self._argv(dry_run=False))
+
+    def test_force_local_does_not_imply_confirm(self):
+        # A dry run stays a dry run no matter what else is set: CONFIRM=yes is
+        # gated on dry_run alone, and that gate is the whole money invariant.
+        argv = self._argv(dry_run=True, force_local=True)
+        self.assertIn("FORCE_LOCAL=1", argv)
+        self.assertNotIn("CONFIRM=yes", argv)
+
+
 class TestEstimateMinutes(unittest.TestCase):
     def test_sums_the_measured_medians_for_the_pipeline(self):
         # docs/batch-runner.md section 7, batch 2026-08-18-2105: tryon 351s,

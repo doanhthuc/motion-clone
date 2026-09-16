@@ -449,7 +449,7 @@ class LocalPhaseResult:
 
 def run_local_phase(*, settings: Settings, manifest: Manifest, out_root: Path, batch_id: str,
                     resume: bool, fail_fast: bool = False, log: Callable[[str], None] = print,
-                    pool_size: int = 4) -> LocalPhaseResult:
+                    pool_size: int = 4, force: bool = False) -> LocalPhaseResult:
     """Pha A: try-on qua API (provider local-eligible) chạy TRƯỚC khi đụng pod, qua một
     pool đồng thời có giới hạn — không tốn GPU nên chạy song song không có cái giá
     "hai job chồng nhau trên một GPU" mà run_one/run_batch phải tránh (xem docstring
@@ -458,6 +458,13 @@ def run_local_phase(*, settings: Settings, manifest: Manifest, out_root: Path, b
 
     Giới hạn pool là thật chứ không phải trang trí: mỗi job là một request ảnh tới
     Gemini, và bơm cả 12 run của một lô cùng lúc là cách chắc chắn nhất ăn 429.
+
+    `force` bypasses the reuse check for EVERY run in the batch, not only the
+    ones whose params changed. Per-run forcing would need a notion of "which
+    run did the user actually edit" and guessing wrong there silently reuses
+    the bad image the user was trying to get away from — worse than one extra
+    Gemini call. It never touches the batch id or any other stage's journal
+    entry: force re-runs try-on, it does not start a new batch.
     """
     # CÙNG một hàm với needs_pod — xem docstring của _local_tryon_eligible: hai chỗ này
     # trả lời khác nhau là lô hoặc gọi Gemini sai run, hoặc đứng chờ pod vô cớ.
@@ -508,7 +515,7 @@ def run_local_phase(*, settings: Settings, manifest: Manifest, out_root: Path, b
         dest = stage_dest(run, run_dir, stage_name)
         # Hai vế, giống hệt run_one: journal nói "done" VÀ file còn trên đĩa. Tin journal
         # suông thì Pha B nhận một đường dẫn không tồn tại ở chặng motion.
-        if local_tryon_reusable(run, stage_name, recorded, dest):
+        if not force and local_tryon_reusable(run, stage_name, recorded, dest):
             log(f"    {run.id}/{stage_name}: bỏ qua (đã xong local, {dest.name})")
             return False, None
         started = time.time()

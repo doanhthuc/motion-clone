@@ -594,6 +594,40 @@ class TestMainPhaA(unittest.TestCase):
             self.assertEqual(code, 0)
             m_run_batch.assert_called_once()
 
+    def test_force_local_reaches_run_local_phase(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = _manifest_tryon_gemini(Path(d))
+
+            def fake_run_local_tryon(run, params, settings_, out_path):
+                out_path.write_bytes(b"fake")
+                return 2, out_path.stat().st_size
+
+            with mock.patch("batch_run.load_settings",
+                            return_value=Settings(domain="pod.test", api_key="mk_test",
+                                                  instance_id="", gemini_api_key="AIza" + "x" * 35)), \
+                 mock.patch("batch_run.health_ok", return_value=False), \
+                 mock.patch("batchlib.runner.run_local_tryon", fake_run_local_tryon), \
+                 mock.patch("batch_run.run_local_phase", wraps=None) as m_phase, \
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                m_phase.return_value = LocalPhaseResult(ran=False)
+                batch_run.main(["--file", str(p), "--force-local"])
+            self.assertIs(m_phase.call_args.kwargs["force"], True)
+
+    def test_no_force_local_flag_means_force_false(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = _manifest_tryon_gemini(Path(d))
+            with mock.patch("batch_run.load_settings",
+                            return_value=Settings(domain="pod.test", api_key="mk_test",
+                                                  instance_id="", gemini_api_key="AIza" + "x" * 35)), \
+                 mock.patch("batch_run.health_ok", return_value=False), \
+                 mock.patch("batch_run.run_local_phase") as m_phase, \
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                m_phase.return_value = LocalPhaseResult(ran=False)
+                batch_run.main(["--file", str(p)])
+            self.assertIs(m_phase.call_args.kwargs["force"], False)
+
 
 class TestLocalTryonWorkers(unittest.TestCase):
     """LOCAL_TRYON_WORKERS (spec §4): số job Gemini bay cùng lúc, chỉnh từ env."""

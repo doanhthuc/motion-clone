@@ -1288,6 +1288,19 @@ class TestLocalTryonReuseIsParamsAware(unittest.TestCase):
             self.assertEqual([c.get("provider") for c in calls], ["qwen-max"])
             self.assertEqual(result.done, ["runA"])
 
+    def test_force_reruns_a_tryon_the_journal_says_is_done(self):
+        # The user's other intent at the chooser: "that image came out wrong,
+        # roll it again." Force must bypass the skip WITHOUT minting a new
+        # batch id — a fresh id would orphan any pod stage already done,
+        # which is the bug resolve_batch_id exists to prevent.
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            self._first_pass(tmp)
+            calls, result = self._second_pass(tmp, MANIFEST_TRYON_GEMINI, force=True)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(result.done, ["runA"])
+            self.assertEqual(result.state["batch"], self.BATCH)
+
     def test_helper_is_false_when_the_file_has_been_cleaned_away(self):
         # `make batch-clean` deletes runs/ and keeps _final/, so "journal says
         # done" outliving the file is a normal state, not a corrupt one.

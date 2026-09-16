@@ -298,6 +298,8 @@ def main() -> int:
     ap.add_argument("--file", required=True)
     ap.add_argument("--resume", action="store_true",
                     help="continue a deferred drain instead of starting a new batch")
+    ap.add_argument("--force-local", action="store_true",
+                    help="re-run local try-on even when the journal says it is done")
     ap.add_argument("--yes", action="store_true",
                     help="required to actually rent — without it, dry run")
     args = ap.parse_args()
@@ -324,6 +326,11 @@ def main() -> int:
     phase_a = ["--file", str(manifest_path), "--no-start"]
     if args.resume:
         phase_a.append("--resume")
+    # Phase A is the only invocation that calls Gemini, so --force-local
+    # forwarded only to the post-provisioning run would leave the rejected
+    # image in place while the pod re-runs motion/enhance on top of it.
+    if args.force_local:
+        phase_a.append("--force-local")
     rc = batch_run(*phase_a)
     if rc == 0:
         print("finished without needing a pod")

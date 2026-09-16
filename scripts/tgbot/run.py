@@ -239,7 +239,7 @@ def progress_text(manifest_path: Path, *, lease,
 
 
 def start_drain(manifest_path: Path, *, dry_run: bool,
-                resume: bool = False) -> subprocess.Popen:
+                resume: bool = False, force_local: bool = False) -> subprocess.Popen:
     """Launch `make drain FILE=...`, appending CONFIRM=yes only when dry_run is False.
 
     This is the ONLY line in this module (in this repo) that may write the
@@ -253,10 +253,19 @@ def start_drain(manifest_path: Path, *, dry_run: bool,
     Makefile:84) — used by bot.py's _do_resume to continue a manifest whose
     local try-on phase already ran and was journalled, so batch_run.py skips
     it instead of re-running (and re-billing Gemini for) it.
+
+    `force_local` forwards FORCE_LOCAL=1 (drain.py's --force-local) for the
+    other half of the bot's reuse-or-rerun chooser: the user looked at a
+    finished try-on and asked for a different one. It is placed before the
+    dry_run gate deliberately — the gate must stay the last thing appended so
+    that "CONFIRM=yes appears iff dry_run is False" remains readable as a
+    single trailing condition.
     """
     argv = ["make", "drain", f"FILE={manifest_path}"]
     if resume:
         argv.append("RESUME=1")
+    if force_local:
+        argv.append("FORCE_LOCAL=1")
     if not dry_run:
         argv.append("CONFIRM=yes")
 

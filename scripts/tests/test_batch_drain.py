@@ -402,5 +402,42 @@ class TestChainOrTeardown(unittest.TestCase):
         mock_teardown.assert_called_once_with(link2)
 
 
+class TestPhaseAForwardsForceLocal(unittest.TestCase):
+    """--force-local must reach batch_run.py in the Phase A invocation, not
+    only in the post-provisioning one — Phase A is where the try-on actually
+    runs, so a flag that arrives late does nothing."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.manifest = self.tmp / "tg-1.yaml"
+        self.manifest.write_text(
+            "runs:\n  - id: a\n    pipeline: tryon-motion-enhance\n"
+            "    inputs: {character: /tmp/c.png, outfit: /tmp/o.png, driver: /tmp/d.mp4}\n"
+            "    tryon: { provider: gemini }\n", encoding="utf-8")
+
+    def test_force_local_is_forwarded_to_phase_a(self):
+        seen: list[tuple] = []
+        with mock.patch.object(drain, "batch_run",
+                               side_effect=lambda *a: seen.append(a) or drain.EXIT_NEEDS_POD), \
+             mock.patch.object(drain, "provision", side_effect=AssertionError("must not rent")):
+            with mock.patch.object(sys, "argv",
+                                   ["drain.py", "--file", str(self.manifest),
+                                    "--yes", "--force-local"]):
+                with self.assertRaises(AssertionError):
+                    drain.main()
+        self.assertIn("--force-local", seen[0])
+
+    def test_absent_flag_does_not_add_it(self):
+        seen: list[tuple] = []
+        with mock.patch.object(drain, "batch_run",
+                               side_effect=lambda *a: seen.append(a) or drain.EXIT_NEEDS_POD), \
+             mock.patch.object(drain, "provision", side_effect=AssertionError("must not rent")):
+            with mock.patch.object(sys, "argv",
+                                   ["drain.py", "--file", str(self.manifest), "--yes"]):
+                with self.assertRaises(AssertionError):
+                    drain.main()
+        self.assertNotIn("--force-local", seen[0])
+
+
 if __name__ == "__main__":
     unittest.main()
