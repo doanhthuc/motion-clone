@@ -30,6 +30,7 @@ from batchlib.local_tryon import is_local_provider
 from batchlib.manifest import ManifestError, load_manifest, load_state, state_path_for
 from batchlib.pipelines import (PIPELINES, effective_stage_params,
                                optional_roles, required_roles)
+from batchlib.runner import preserved_local_tryon
 # Not `from batchlib_ext...` or `scripts/batchlib/...` — drain.py itself lives
 # at scripts/drain.py, a plain top-level module, same as batch_run.py. scripts/
 # is already on sys.path (the insert above), so this is the plan's own "import
@@ -550,6 +551,25 @@ def _tail(path: Path, limit: int = TAIL_CHARS) -> str:
     return text[-limit:]
 
 
+def _preserved_tryon(manifest_path: Path) -> tuple[int, int]:
+    """(reusable, total) local try-ons for this manifest, or (0, 0) if unknown.
+
+    Delegates to runner.preserved_local_tryon rather than counting here: the
+    card and the runner must give the same answer, and the only way to
+    guarantee that is one implementation. A manifest that will not load is
+    (0, 0) — the card falls back to its generic "your batch is safe" line
+    rather than claiming a number it could not check.
+    """
+    try:
+        manifest = load_manifest(manifest_path)
+    except (ManifestError, OSError):
+        return 0, 0
+    state = load_state(state_path_for(manifest_path))
+    if not state.get("batch"):
+        return 0, 0
+    return preserved_local_tryon(manifest, state, ROOT / "out")
+
+
 def _deliver_provision_failure(tg: Tg, chat_id: int, manifest_path: Path,
                                failure: "ProvisionFailure") -> None:
     """Report why pod-provision.sh itself never got a pod, in place of the
@@ -574,11 +594,17 @@ def _deliver_provision_failure(tg: Tg, chat_id: int, manifest_path: Path,
         return
 
     dc = failure.datacenter or "?"
+    reusable, total = _preserved_tryon(manifest_path)
     lines = [f"{ICON_ERROR_CE} <b>Could not rent a pod</b> for {_esc(stem)}", "",
-            f"No stock for <b>{_esc(failure.gpu)}</b> at {_esc(dc)} — the only "
-            "datacenter your Network Volume can mount in.", "",
-            "Your batch is safe — nothing already finished was lost, it's "
-            "just stuck waiting for a pod."]
+             f"No stock for <b>{_esc(failure.gpu)}</b> at {_esc(dc)} — the only "
+             "datacenter your Network Volume can mount in.", ""]
+    if total:
+        lines.append(f"{ICON_OK_CE} <b>Try-on {reusable}/{total} finished and is "
+                     "preserved.</b> Retrying will not call Gemini again for those.")
+    else:
+        lines.append("Your batch is safe — nothing already finished was lost, it's "
+                     "just stuck waiting for a pod.")
+    lines.append("")
 
     volume_id = env_get(ROOT / ".env", "POD_VOLUME_ID")
     home_dc = volume_datacenter(volume_id)
@@ -588,7 +614,9 @@ def _deliver_provision_failure(tg: Tg, chat_id: int, manifest_path: Path,
     except RuntimeError:
         stock = {}
 
-    buttons = [[("Đợi", _CB_RECOVER_WAIT)]]
+    buttons = [[(f"Thử lại — giữ try-on đã chạy", f"{_CB_RECOVER_RETRY}{stem}",
+                 _ce_id(ICON_ROCKET_CE))],
+               [("Đợi", _CB_RECOVER_WAIT)]]
 
     # Same-datacenter alternatives — tapping one resumes immediately, unlike
     # _CB_RUN_SWITCH's pre-spend picker, because this batch was already
@@ -1360,6 +1388,11 @@ _CB_MIGRATE_NO = "mig:no"
 _CB_RECOVER_WAIT = "rec:wait"
 _CB_RECOVER_SWITCH = "rec:sw:"     # + "<gpu short>:<manifest stem>"
 _CB_RECOVER_MIGRATE = "rec:mig:"   # + "<to_dc>:<manifest stem>"
+# Same-GPU retry. The other three recovery buttons all change something —
+# GPU type, datacenter, or nothing at all (Đợi) — and before this existed a
+# user whose card had scrolled away had no way to resume without /confirm,
+# which minted a new batch id and re-ran every try-on.
+_CB_RECOVER_RETRY = "rec:retry:"   # + "<manifest stem>"
 
 # ONE number, everywhere a migration's duration is quoted: the /gpu listing,
 # the [Run] picker's "Other regions" note, the destructive confirm, and the
@@ -1615,9 +1648,19 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
             _migrate_resume_marker().unlink(missing_ok=True)
 
         elif data == _CB_RECOVER_WAIT:
-            tg.send_message(chat_id, "OK — dismissed, nothing changed. Use the "
-                                     "other buttons above, or /confirm again "
-                                     "later, when you want to retry.")
+            tg.send_message(chat_id, "OK — parked. The try-on images are kept, "
+                                     "nothing is lost. Tap <b>Thử lại</b> above "
+                                     "when you want to rent again.",
+                            parse_mode=PARSE_HTML)
+
+        elif data.startswith(_CB_RECOVER_RETRY):
+            stem = data[len(_CB_RECOVER_RETRY):]
+            if not stem:
+                tg.send_message(chat_id, "that button is from an older "
+                                         "version of the bot; check /status")
+            else:
+                _do_resume(tg, chat_id, ROOT / "batch" / f"{stem}.yaml",
+                           dry_run=dry_run)
 
         elif data.startswith(_CB_RECOVER_SWITCH):
             short, _, stem = data[len(_CB_RECOVER_SWITCH):].partition(":")

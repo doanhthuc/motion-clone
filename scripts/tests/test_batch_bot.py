@@ -5,11 +5,13 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batchlib.config import env_get
 from batchlib.manifest import load_manifest, state_path_for
+from batchlib.pipelines import effective_stage_params
 from batchlib_ext.gpu_stock import Stock
 from batchlib_ext.handoff import Handoff, handoff_path, mailbox_path, write_handoff
 from batchlib_ext.migrate_lease import MigrateLease, write_migrate_lease
 from batchlib_ext.provision_failure import (ProvisionFailure,
                                             provision_failure_path,
+                                            read_provision_failure,
                                             write_provision_failure)
 import tgbot.bot as bot
 from tgbot.bot import allowed
@@ -4500,6 +4502,72 @@ class TestProvisionFailureRecovery(unittest.TestCase):
             gpu="NVIDIA GeForce RTX 5090", datacenter="EU-RO-1",
             stock_out=stock_out, detail=detail))
 
+    def _write_tryon_journal(self, *, reusable: int) -> None:
+        """A manifest with two gemini try-ons and a journal saying `reusable`
+        of them are done with matching params.
+
+        params_manifest is computed with effective_stage_params, NOT written as
+        a literal {"provider": "gemini"}: local_tryon_reusable compares against
+        that function's output, which merges the stage's own defaults in, so a
+        hand-written subset would never match and the count would read 0/2 for a
+        batch that really is fully reusable.
+        """
+        self.manifest.write_text(
+            "runs:\n"
+            "  - id: runA\n    pipeline: tryon-motion-enhance\n"
+            "    inputs: {character: /tmp/c.png, outfit: /tmp/o.png, driver: /tmp/d.mp4}\n"
+            "    tryon: { provider: gemini }\n"
+            "  - id: runB\n    pipeline: tryon-motion-enhance\n"
+            "    inputs: {character: /tmp/c.png, outfit: /tmp/o.png, driver: /tmp/d.mp4}\n"
+            "    tryon: { provider: gemini }\n", encoding="utf-8")
+        params = effective_stage_params("tryon", {"provider": "gemini"})
+        batch_dir = bot.ROOT / "out" / "2026-09-16-0900"
+        runs = {}
+        for i, run_id in enumerate(("runA", "runB")):
+            run_dir = batch_dir / "runs" / run_id
+            run_dir.mkdir(parents=True, exist_ok=True)
+            dest = run_dir / "01-tryon.png"
+            if i < reusable:
+                dest.write_bytes(b"png")
+                stage = {"status": "done", "phase": "local", "file": str(dest),
+                         "params_manifest": params}
+            else:
+                stage = {"status": "error", "phase": "local"}
+            # Nested under "stages", exactly as run_local_phase._one writes it
+            # and as preserved_local_tryon reads it: a stage dict sitting at the
+            # run level reads as an empty journal, and would also make the
+            # provider-change test below pass for the wrong reason.
+            runs[run_id] = {"status": "pending", "stages": {"tryon": stage}}
+        state_path_for(self.manifest).write_text(json.dumps(
+            {"batch": "2026-09-16-0900", "runs": runs}), encoding="utf-8")
+
+    def test_stock_out_card_names_how_many_tryons_survive(self):
+        self._write_tryon_journal(reusable=2)
+        self._write_failure(stock_out=True)
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
+            bot._deliver_provision_failure(
+                self.tg, ME, self.manifest,
+                read_provision_failure(provision_failure_path(self.manifest)))
+        self.assertIn("2/2", self.tg.messages[-1])
+
+    def test_a_provider_change_is_not_reported_as_preserved(self):
+        # The card must count with the runner's own predicate. Saying "2/2
+        # preserved" for a batch about to re-run both is the lie Task 3's
+        # preserved_local_tryon exists to prevent.
+        self._write_tryon_journal(reusable=2)
+        self.manifest.write_text(
+            self.manifest.read_text(encoding="utf-8").replace("provider: gemini",
+                                                              "provider: qwen-max"),
+            encoding="utf-8")
+        self._write_failure(stock_out=True)
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
+            bot._deliver_provision_failure(
+                self.tg, ME, self.manifest,
+                read_provision_failure(provision_failure_path(self.manifest)))
+        self.assertIn("0/2", self.tg.messages[-1])
+
     def test_stock_out_shows_the_real_reason_not_a_json_dump_or_the_old_generic_message(self):
         self._write_failure(stock_out=True)
         with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
@@ -4519,6 +4587,7 @@ class TestProvisionFailureRecovery(unittest.TestCase):
             bot.deliver_result(self.tg, ME, self.manifest)
         flat = [data for row in self.tg.buttons[-1] for _, data, *_ in row]
         self.assertIn(bot._CB_RECOVER_WAIT, flat)
+        self.assertIn(f"{bot._CB_RECOVER_RETRY}tg-1", flat)
         self.assertIn(f"{bot._CB_RECOVER_SWITCH}4090:tg-1", flat)
         self.assertIn(f"{bot._CB_RECOVER_MIGRATE}EUR-NO-1:tg-1", flat)
         self.assertTrue(any(d.startswith(bot._CB_GPUSUB_DC) for d in flat))
@@ -4541,6 +4610,10 @@ class TestProvisionFailureRecovery(unittest.TestCase):
         sub_row = next(r for r in rows if r[0][1].startswith(bot._CB_GPUSUB_DC))
         self.assertEqual(switch_row[0][2], bot._ce_id(bot.ICON_ROCKET_CE))
         self.assertEqual(sub_row[0][2], bot._ce_id(bot.ICON_CRITICAL_CE))
+        # Retry resumes a paid rental immediately, same as the switch button,
+        # so it carries the same rocket.
+        retry_row = next(r for r in rows if r[0][1].startswith(bot._CB_RECOVER_RETRY))
+        self.assertEqual(retry_row[0][2], bot._ce_id(bot.ICON_ROCKET_CE))
         # Đợi mirrors every other Cancel-style button in this file: bare,
         # no icon.
         wait_row = next(r for r in rows if r[0][1] == bot._CB_RECOVER_WAIT)
@@ -4588,6 +4661,41 @@ class TestProvisionFailureRecoveryButtons(unittest.TestCase):
             bot.handle(self.tg, cb_from(ME, bot._CB_RECOVER_WAIT), allowed_user_id=ME)
         start_drain.assert_not_called()
         self.assertTrue(provision_failure_path(self.manifest).exists())
+
+    def test_wait_copy_no_longer_points_at_the_path_that_loses_the_tryon(self):
+        # "/confirm again later" reaches _do_confirm, which did not resume:
+        # new batch id, empty journal, every try-on re-run and Gemini billed
+        # twice. The button may dismiss, it may not advise that.
+        with mock.patch("tgbot.bot.start_drain"):
+            bot.handle(self.tg, cb_from(ME, bot._CB_RECOVER_WAIT), allowed_user_id=ME)
+        self.assertNotIn("/confirm again", self.tg.messages[-1])
+
+    def test_retry_resumes_without_touching_the_gpu_setting(self):
+        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.migration_running", return_value=False), \
+             mock.patch("tgbot.bot.start_drain") as start_drain:
+            bot.handle(self.tg, cb_from(ME, f"{bot._CB_RECOVER_RETRY}tg-1"),
+                       allowed_user_id=ME)
+        start_drain.assert_called_once_with(self.manifest, dry_run=False, resume=True)
+        # Retry keeps the GPU the batch already failed on — switching is the
+        # other button's job, and silently rewriting .env's GPU= would change
+        # what every LATER batch rents too.
+        self.assertEqual(env_get(self.root / ".env", "GPU"),
+                         "NVIDIA GeForce RTX 5090")
+        self.assertFalse(provision_failure_path(self.manifest).exists())
+
+    def test_retry_refuses_a_stale_stem(self):
+        with mock.patch("tgbot.bot.start_drain") as start_drain:
+            bot.handle(self.tg, cb_from(ME, f"{bot._CB_RECOVER_RETRY}"),
+                       allowed_user_id=ME)
+        start_drain.assert_not_called()
+
+    def test_stock_out_card_offers_retry(self):
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value={}):
+            bot.deliver_result(self.tg, ME, self.manifest)
+        flat = [data for row in self.tg.buttons[-1] for _, data, *_ in row]
+        self.assertIn(f"{bot._CB_RECOVER_RETRY}tg-1", flat)
 
     def test_switch_rewrites_env_clears_the_sentinel_and_resumes(self):
         with mock.patch("tgbot.bot.drain_running", return_value=False), \
