@@ -404,8 +404,15 @@ class TestChainOrTeardown(unittest.TestCase):
 
 class TestPhaseAForwardsForceLocal(unittest.TestCase):
     """--force-local must reach batch_run.py in the Phase A invocation, not
-    only in the post-provisioning one — Phase A is where the try-on actually
-    runs, so a flag that arrives late does nothing."""
+    only in the post-provisioning one.
+
+    A flag that arrives only in the second invocation is not a no-op — that
+    invocation is a full batch_run.main, which calls run_local_phase before
+    run_batch, so the try-on would still be regenerated ahead of motion and
+    enhance. It is worse than a no-op: it regenerates after provision() and
+    wait_and_bootstrap(), so the GPU bills while the process waits on a hosted
+    Gemini call.
+    """
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -466,10 +473,13 @@ class TestPhaseAOnly(unittest.TestCase):
     def test_never_provisions_when_phase_a_says_a_pod_is_needed(self):
         with mock.patch.object(drain, "batch_run", return_value=drain.EXIT_NEEDS_POD), \
              mock.patch.object(drain, "provision",
-                               side_effect=AssertionError("rented a pod")) as prov:
+                               side_effect=AssertionError("rented a pod")) as prov, \
+             mock.patch.object(drain, "chain_or_teardown",
+                               side_effect=AssertionError("tore down")) as co:
             rc = self._main("--phase-a-only", "--yes")
         self.assertEqual(rc, drain.EXIT_NEEDS_POD)
         prov.assert_not_called()
+        co.assert_not_called()
 
     def test_runs_without_yes_rather_than_printing_dry_run(self):
         calls: list[tuple] = []

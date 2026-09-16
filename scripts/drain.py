@@ -327,6 +327,10 @@ def main() -> int:
     phase_a = ["--file", str(manifest_path), "--no-start"]
     if args.resume:
         phase_a.append("--resume")
+    # Phase A runs before provision(), so a --force-local forwarded only to the
+    # post-provisioning batch_run would still regenerate the try-on before
+    # motion/enhance — but on the pod's clock, billing GPU minutes while the
+    # process waits on a hosted Gemini call.
     if args.force_local:
         phase_a.append("--force-local")
 
