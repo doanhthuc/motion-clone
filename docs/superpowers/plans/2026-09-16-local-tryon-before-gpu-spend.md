@@ -2745,7 +2745,7 @@ At ~line 4973, next to the existing ticks:
 
 `tick_phase_a` goes **before** `tick_migration_progress` and after `tick_progress`: it is the faster-moving of the two batch ticks (2s cadence while Phase A runs) and shares `_progress_path` with `tick_progress`, so ordering them keeps one owner of that file per tick.
 
-Also extend the poll-cadence condition that drops from 50s to 2s while a drain runs, so Phase A animates too. Find the line that tests `drain_running(...)` for the cadence and make it `busy(...)`.
+The poll cadence needs **no change**, and an earlier draft of this step said otherwise. It is driven by `animating = _progress_path(allowed_user_id).exists()` (`bot.py:5179`), not by `drain_running` — so because `_start_progress` writes that same file for Phase A, the 2s cadence already applies. Do not go looking for a `drain_running` test in the cadence logic; there is not one. Verify by reading `:5179` rather than trusting this note.
 
 - [ ] **Step 9: Run the tests**
 
