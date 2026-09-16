@@ -6,9 +6,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batchlib.client import JobError, JobFailed, JobGone
 from batchlib.config import ConfigError, Settings
 from batchlib.manifest import load_manifest, load_state, save_state, state_path_for
-from batchlib.pipelines import PIPELINES
-from batchlib.runner import (LocalPhaseResult, batch_id_now, needs_pod, prepare_batch, run_batch,
-                              run_local_phase, run_one, stage_dest, write_index)
+from batchlib.pipelines import PIPELINES, effective_stage_params
+from batchlib.runner import (LocalPhaseResult, batch_id_now, local_tryon_reusable, needs_pod,
+                              prepare_batch, run_batch, run_local_phase, run_one, stage_dest,
+                              write_index)
 
 SETTINGS = Settings(domain="x.test", api_key="mk_test", instance_id="i-1")
 
@@ -1026,9 +1027,18 @@ class TestRunLocalPhase(unittest.TestCase):
             run_dir.mkdir(parents=True)
             dest = run_dir / "01-tryon.png"
             dest.write_bytes(b"da-xong-tu-truoc")
+            # `params_manifest` is what run_local_phase._one writes on success
+            # (runner.py:553-555), so it belongs in any journal claiming to be the
+            # leftover of a real earlier Phase A. Derived from the manifest rather
+            # than spelled out, so a change to params.py defaults cannot turn this
+            # test into a params-mismatch failure about something else.
+            done_params = effective_stage_params(
+                "tryon", manifest.runs[0].stage_params.get("tryon"))
             save_state(state_file, {"version": 1, "batch": "2026-08-21-0900", "runs": {
                 "runA": {"status": "pending", "stages": {
-                    "tryon": {"status": "done", "file": str(dest), "bytes": dest.stat().st_size}}}}})
+                    "tryon": {"status": "done", "file": str(dest),
+                              "bytes": dest.stat().st_size,
+                              "params_manifest": done_params}}}}})
 
             with mock.patch("batchlib.runner.run_local_tryon") as m_local:
                 result = run_local_phase(settings=GEMINI_SETTINGS, manifest=manifest,
@@ -1046,9 +1056,15 @@ class TestRunLocalPhase(unittest.TestCase):
             manifest = load_manifest(_fixture_tryon(tmp, MANIFEST_TRYON_GEMINI))
             state_file = state_path_for(manifest.path)
             dest = tmp / "out" / "2026-08-21-0900" / "runs" / "runA" / "01-tryon.png"
+            # Params MATCH on purpose: this test is about the missing-file clause. A
+            # journal without params_manifest would re-run for the params reason too,
+            # so the test would still pass after `dest.is_file()` was dropped from the
+            # helper — green while no longer proving what it claims.
             save_state(state_file, {"version": 1, "batch": "2026-08-21-0900", "runs": {
-                "runA": {"status": "pending",
-                         "stages": {"tryon": {"status": "done", "file": str(dest)}}}}})
+                "runA": {"status": "pending", "stages": {"tryon": {
+                    "status": "done", "file": str(dest),
+                    "params_manifest": effective_stage_params(
+                        "tryon", manifest.runs[0].stage_params.get("tryon"))}}}}})
 
             def fake_run_local_tryon(run, params, settings_, out_path):
                 out_path.write_bytes(b"chay-lai")
@@ -1210,6 +1226,84 @@ class TestRunLocalPhase(unittest.TestCase):
                                 out_root=tmp / "out", batch_id="2026-08-21-0900",
                                 resume=False, log=lambda _m: None)
             self.assertEqual(thay, ["2026-08-21-0900"])
+
+
+class TestLocalTryonReuseIsParamsAware(unittest.TestCase):
+    """A journalled try-on may stand in for a request ONLY at the same params.
+
+    run_id_for (tgbot/job.py:90) hashes material file stems and nothing else,
+    so gemini and qwen-max over the same four files produce the SAME run id.
+    A journal-only check therefore hands the gemini image to a qwen-max
+    request: manifest valid, nothing raised, only the output wrong.
+    """
+
+    BATCH = "2026-09-16-0900"
+
+    def _first_pass(self, tmp: Path) -> None:
+        manifest = load_manifest(_fixture_tryon(tmp, MANIFEST_TRYON_GEMINI))
+
+        def fake(run, params, settings_, out_path):
+            out_path.write_bytes(b"png")
+            return 1, 3
+
+        with mock.patch("batchlib.runner.run_local_tryon", fake):
+            run_local_phase(settings=GEMINI_SETTINGS, manifest=manifest,
+                            out_root=tmp / "out", batch_id=self.BATCH,
+                            resume=False, log=lambda _m: None)
+
+    def _second_pass(self, tmp: Path, text: str, **kwargs):
+        manifest = load_manifest(_fixture_tryon(tmp, text))
+        calls: list[dict] = []
+
+        def fake(run, params, settings_, out_path):
+            calls.append(dict(params))
+            out_path.write_bytes(b"png2")
+            return 1, 4
+
+        with mock.patch("batchlib.runner.run_local_tryon", fake):
+            result = run_local_phase(settings=GEMINI_SETTINGS, manifest=manifest,
+                                     out_root=tmp / "out", batch_id=self.BATCH,
+                                     resume=True, log=lambda _m: None, **kwargs)
+        return calls, result
+
+    def test_same_params_second_pass_calls_gemini_zero_times(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            self._first_pass(tmp)
+            calls, result = self._second_pass(tmp, MANIFEST_TRYON_GEMINI)
+            self.assertEqual(calls, [])
+            # `done` is what THIS invocation actually did — a reused stage is
+            # not new work and must not be reported as such (run_local_phase's
+            # own docstring makes that distinction).
+            self.assertEqual(result.done, [])
+            self.assertEqual(result.failed, {})
+
+    def test_different_provider_reruns_instead_of_reusing_the_image(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            self._first_pass(tmp)
+            calls, result = self._second_pass(
+                tmp, MANIFEST_TRYON_GEMINI.replace("provider: gemini",
+                                                   "provider: qwen-max"))
+            self.assertEqual([c.get("provider") for c in calls], ["qwen-max"])
+            self.assertEqual(result.done, ["runA"])
+
+    def test_helper_is_false_when_the_file_has_been_cleaned_away(self):
+        # `make batch-clean` deletes runs/ and keeps _final/, so "journal says
+        # done" outliving the file is a normal state, not a corrupt one.
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            self._first_pass(tmp)
+            manifest = load_manifest(_fixture_tryon(tmp, MANIFEST_TRYON_GEMINI))
+            run = manifest.runs[0]
+            run_dir = tmp / "out" / self.BATCH / "runs" / run.id
+            dest = stage_dest(run, run_dir, "tryon")
+            recorded = {"status": "done",
+                        "params_manifest": effective_stage_params(
+                            "tryon", run.stage_params.get("tryon"))}
+            self.assertTrue(local_tryon_reusable(run, "tryon", recorded, dest))
+            dest.unlink()
+            self.assertFalse(local_tryon_reusable(run, "tryon", recorded, dest))
 
 
 if __name__ == "__main__":

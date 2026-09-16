@@ -391,6 +391,35 @@ def _local_tryon_stage(run: Run) -> str | None:
     return None
 
 
+def local_tryon_reusable(run: Run, stage_name: str, recorded: dict, dest: Path) -> bool:
+    """True when a try-on already on disk may stand in for THIS run's request.
+
+    Params are part of the question, not just "done + file exists" (2026-09-16):
+    run_id_for (tgbot/job.py:90) hashes material file stems and nothing else,
+    so gemini and qwen-max over the same four files produce the SAME run id.
+    A journal-only verdict hands the gemini image to a qwen-max request — the
+    manifest is valid, nothing raises, only the output is wrong. That is the
+    failure shape _local_tryon_eligible's own docstring describes for cleanOnly.
+
+    Compared against effective_stage_params so both sides of the == come from
+    one derivation. No normalisation layer and no coercion that could drift
+    from what Phase A actually sent.
+
+    A false negative costs one Gemini call — cents. That is why this check is
+    affordable here and NOT in run_one; see the spec's §5 for what the same
+    check would cost on a paid stage.
+
+    Three callers on purpose: run_local_phase's skip, preserved_local_tryon
+    below, and through it the bot's reuse-or-rerun chooser and the stock-out
+    card's "N/M preserved" count. A card counting with a looser rule than the
+    runner skips with would promise preservation the runner declines to honour.
+    """
+    if recorded.get("status") != "done" or not dest.is_file():
+        return False
+    return recorded.get("params_manifest") == effective_stage_params(
+        stage_name, run.stage_params.get(stage_name))
+
+
 def needs_pod(manifest: Manifest) -> bool:
     """True nếu còn ít nhất một chặng KHÔNG THỂ chạy local trong toàn bộ manifest.
 
@@ -479,7 +508,7 @@ def run_local_phase(*, settings: Settings, manifest: Manifest, out_root: Path, b
         dest = stage_dest(run, run_dir, stage_name)
         # Hai vế, giống hệt run_one: journal nói "done" VÀ file còn trên đĩa. Tin journal
         # suông thì Pha B nhận một đường dẫn không tồn tại ở chặng motion.
-        if recorded.get("status") == "done" and dest.is_file():
+        if local_tryon_reusable(run, stage_name, recorded, dest):
             log(f"    {run.id}/{stage_name}: bỏ qua (đã xong local, {dest.name})")
             return False, None
         started = time.time()
