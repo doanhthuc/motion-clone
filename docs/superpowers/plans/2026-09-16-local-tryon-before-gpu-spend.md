@@ -378,8 +378,10 @@ In `scripts/batch_run.py`, add next to the existing `--no-start` argument:
 
 ```python
     ap.add_argument("--force-local", action="store_true",
-                    help="chạy lại try-on local kể cả khi journal nói đã xong")
+                    help="re-run local try-on even when the journal says it is done")
 ```
+
+The help string is English even though every other string in this file's argparse surface is Vietnamese. Deliberate, and it is the only such exception in this plan: QWEN.md's "do not translate it in passing" forbids rewriting *existing* Vietnamese, it does not license writing *new* Vietnamese, and the identical flag is documented in English one layer down in `drain.py`. Two languages describing one switch across two layers is the worse inconsistency. This brief originally mandated the Vietnamese string; the Task 2 review caught it and the controller ruled against its own plan.
 
 and pass it through at the `run_local_phase` call (~line 158):
 
@@ -399,8 +401,15 @@ Add to `scripts/tests/test_batch_drain.py`:
 ```python
 class TestPhaseAForwardsForceLocal(unittest.TestCase):
     """--force-local must reach batch_run.py in the Phase A invocation, not
-    only in the post-provisioning one — Phase A is where the try-on actually
-    runs, so a flag that arrives late does nothing."""
+    only in the post-provisioning one.
+
+    A flag that arrives only in the second invocation is not a no-op — that
+    invocation is a full batch_run.main, which calls run_local_phase before
+    run_batch, so the try-on would still be regenerated ahead of motion and
+    enhance. It is worse than a no-op: it regenerates after provision() and
+    wait_and_bootstrap(), so the GPU bills while the process waits on a hosted
+    Gemini call.
+    """
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
