@@ -1418,10 +1418,19 @@ _CB_PHASE_A_RERUN = "pa:rerun:"   # + _run_token
 # to _CB_RUN_GO would answer "no complete job yet" for a batch whose try-on
 # images are sitting on disk. _do_resume needs no _STATE — it loads the
 # manifest and requires only that the journal has a batch id, which Phase A
-# writes before its first Gemini call. Carries the manifest stem, not
-# _run_token: the manifest is not rewritten between the panel and the tap,
-# and the stem is what _do_resume needs anyway.
-_CB_PHASE_A_SPEND = "pa:spend:"   # + "<manifest stem>"
+# writes before its first Gemini call.
+#
+# Carries _run_token, like _CB_PHASE_A_REUSE and _CB_PHASE_A_RERUN. The
+# manifest stem looks sufficient — "the manifest is not rewritten between the
+# panel and the tap" — but that is not an invariant: _job_manifest_path(chat_id)
+# IS the file the stem names, the same file _run_token stamps with mtime_ns and
+# _maybe_show_manifest rewrites, and once Phase A has exited busy() is False so
+# nothing blocks that rewrite while the panel sits unanswered. A stem-carrying
+# button cannot detect it and would then rent $0.99/hour against inputs the user
+# never reviewed, the exact harm _run_token's own docstring names. The handler
+# derives the path from chat_id, so the token is only ever proof of which
+# manifest was seen, never a path.
+_CB_PHASE_A_SPEND = "pa:spend:"   # + _run_token
 
 # ONE number, everywhere a migration's duration is quoted: the /gpu listing,
 # the [Run] picker's "Other regions" note, the destructive confirm, and the
@@ -1619,14 +1628,17 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
                             phase_a_choice="reuse" if reuse else "rerun")
 
         elif data.startswith(_CB_PHASE_A_SPEND):
-            stem = data[len(_CB_PHASE_A_SPEND):]
-            if not stem:
-                tg.send_message(chat_id, "that button is from an older "
-                                         "version of the bot; check /status")
+            if data[len(_CB_PHASE_A_SPEND):] != _run_token(chat_id):
+                tg.send_message(chat_id,
+                                "the job changed since that button was sent, so "
+                                "nothing ran. Check the manifest above and "
+                                "confirm again.")
             else:
                 # _do_resume, not _do_confirm — see _CB_PHASE_A_SPEND's own
-                # comment for why _STATE cannot be relied on here.
-                _do_resume(tg, chat_id, ROOT / "batch" / f"{stem}.yaml",
+                # comment for why _STATE cannot be relied on here. The path
+                # comes from chat_id, the way _CB_RUN_GO's branch reaches
+                # _do_confirm; the token proved which manifest was reviewed.
+                _do_resume(tg, chat_id, _job_manifest_path(chat_id),
                            dry_run=dry_run)
 
         elif data == _CB_RUN_NO:
@@ -3002,8 +3014,16 @@ def tick_phase_a(tg: Tg, chat_id: int, *, dry_run: bool = False) -> None:
     The latch is `offered` in the progress file, not a module dict: a Phase A
     can outlive a bot restart (systemd Restart=always plus a 12-run batch of
     Gemini calls), and phase_a_exit deliberately keeps answering after the
-    handle is reaped. Without a durable latch the 2s poll would re-send the
-    panel for as long as the chat lives.
+    handle is reaped. What normally stops the panel being re-sent is the unlink
+    every terminal branch below does — the poll loop's cadence keys on this
+    file's existence, so a file left behind also leaves that loop spinning at 2s
+    forever. The latch covers the one window the unlink cannot: a crash between
+    writing it and rendering the panel, which may straddle that same restart.
+
+    `dry_run` is taken because main()'s poll loop passes it to every tick
+    (tick_migration_progress takes it too) and is unused because this tick
+    launches nothing: the spend decision it renders is carried out later by
+    _do_resume, which gets dry_run from _handle_callback's own plumbing.
 
     Ownership is the `phase` key in that same file, checked both ways: this
     function returns unless the message is marked "local", and tick_progress
@@ -3030,6 +3050,16 @@ def tick_phase_a(tg: Tg, chat_id: int, *, dry_run: bool = False) -> None:
         return          # a drain owns this message — tick_progress handles it
 
     if phase_a_running(manifest_path):
+        if not payload.get("seen_running"):
+            # Durable, and latched by the first tick that can prove the child
+            # existed. "phase == local, not running, phase_a_exit is None" is
+            # ALSO true in the window between _start_progress(..., phase="local")
+            # and start_phase_a(...), so recovering on that bare triple would
+            # unlink the progress file of a Phase A that is about to start.
+            # This flag is what separates a restart orphan from a not-yet-
+            # started one; see the rc-is-None branch below.
+            payload["seen_running"] = True
+            path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         # Try-on previews are worth sending during Phase A too: they are the
         # one piece of visible progress in a phase that records nothing else
         # until a whole stage finishes.
@@ -3046,13 +3076,49 @@ def tick_phase_a(tg: Tg, chat_id: int, *, dry_run: bool = False) -> None:
 
     rc = phase_a_exit(manifest_path)
     if rc is None:
-        return          # not ours — a drain, or nothing at all
+        if not payload.get("seen_running"):
+            return      # not started yet, or not ours — see the flag above
+        # A restart orphan. _PHASE_A and _PHASE_A_RC are in-memory, so this
+        # process can never learn how that child ended, and no other path
+        # clears the file: tick_progress returns at its ownership guard, and
+        # /kill cannot reach it because _ask_kill gates on drain_running, which
+        # Phase A never sets. Unlink and say so. Deliberately NOT handing
+        # ownership back to tick_progress by dropping the `phase` key — that
+        # makes its very next tick take the "Finished" branch and deliver_result
+        # a half-finished batch, the exact bug the ownership marker exists to
+        # prevent. The wording claims only what is known: the BOT restarted,
+        # which is certain, not that the child died, which is not — a hand-run
+        # bot's Phase A may still be alive, and only the systemd case
+        # (Restart=always with the default KillMode=control-group) reliably
+        # takes it down with the process.
+        path.unlink(missing_ok=True)
+        _ANIM_PAUSE.pop(chat_id, None)
+        reusable, total = _preserved_tryon(manifest_path)
+        kept = (f"{ICON_OK_CE} <b>Try-on {reusable}/{total} finished and is "
+                "preserved.</b> Run will skip those instead of calling Gemini "
+                "again." if total else
+                "Nothing already finished was lost.")
+        tg.send_message(
+            chat_id,
+            f"{ICON_WARN} <b>The bot restarted during the try-on phase</b> and "
+            "can no longer see it — the try-on itself may still be running.\n"
+            "Nothing was rented and no GPU time was spent.\n"
+            f"{kept}",
+            parse_mode=PARSE_HTML)
+        log(f"chat {chat_id}: cleared a Phase A progress message this process "
+            f"holds no handle for ({manifest_path.name})")
+        return
     if payload.get("offered"):
         return          # already handed the decision to the user
 
     payload["offered"] = True
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     _ANIM_PAUSE.pop(chat_id, None)
+    # The same call the running branch makes, and the last chance to make it:
+    # every branch below is terminal, and a try-on recorded done inside THIS
+    # tick would otherwise never be previewed at all, because deliver_result
+    # sends _final/*.mp4 only.
+    _deliver_tryon_previews(tg, chat_id, manifest_path, payload)
     text = progress_text(manifest_path, lease=None, stages=stages, phase="local")
     tg.edit_message(chat_id, message_id, text, parse_mode=PARSE_HTML)
 
@@ -3064,8 +3130,12 @@ def tick_phase_a(tg: Tg, chat_id: int, *, dry_run: bool = False) -> None:
         # (2026-09-12, reported live: "5090 đã hết mà nút spend vẫn enable").
         _offer_run_confirm(
             tg, chat_id,
-            spend_cb=f"{_CB_PHASE_A_SPEND}{manifest_path.stem}",
+            spend_cb=f"{_CB_PHASE_A_SPEND}{_run_token(chat_id)}",
             heading=f"{ICON_NVIDIA_CE} <b>Try-on finished</b> — now rent a GPU?")
+        # Last, like the other two branches: this file's existence is what holds
+        # the poll loop at its 2s cadence, and from here the panel is the only
+        # thing the user needs to act on.
+        path.unlink(missing_ok=True)
     elif rc == 0:
         path.unlink(missing_ok=True)
         deliver_result(tg, chat_id, manifest_path)
@@ -4110,8 +4180,9 @@ def _offer_run_confirm(tg: Tg, chat_id: int, *, message_id: int | None = None,
     it measures stock at the moment of the decision instead of minutes before.
 
     `message_id` edits that message in place instead of sending a new one
-    (see _edit_or_send) — set by every caller except the very first [Run]
-    tap on the job panel. `force` bypasses stock_at_cached's 60s TTL for a
+    (see _edit_or_send) — set by every caller except the two that send a fresh
+    message: the very first [Run] tap on the job panel, and tick_phase_a's
+    post-Phase-A panel. `force` bypasses stock_at_cached's 60s TTL for a
     real live recheck, used only by the 🔄 Refresh button.
     """
     configured = env_get(ROOT / ".env", "GPU") or _PRIMARY_GPU_ID
@@ -4482,8 +4553,10 @@ def _do_resume(tg: Tg, chat_id: int, manifest_path: Path, *, dry_run: bool) -> N
     """Continue a batch whose pod rental already failed once — reached only
     from the recovery buttons _deliver_provision_failure offers, after the
     user picked a different GPU (_CB_RECOVER_SWITCH) or asked to retry the
-    same one (_CB_RECOVER_RETRY), or after a migration finished
-    (tick_migration_progress's own resume-on-done).
+    same one (_CB_RECOVER_RETRY), after a migration finished
+    (tick_migration_progress's own resume-on-done), or from the post-Phase-A
+    rent panel (_CB_PHASE_A_SPEND), where the batch's try-on is already on
+    disk and the pod is the only thing still missing.
 
     Deliberately NOT routed through _do_confirm: that function's checks
     (a drafted job in _STATE, the unanswered-file queue, cached validation)
@@ -4501,7 +4574,16 @@ def _do_resume(tg: Tg, chat_id: int, manifest_path: Path, *, dry_run: bool) -> N
                                  "pod's datacenter — wait for it to finish "
                                  "before retrying")
         return
-    if drain_running(manifest_path):
+    # busy(), not drain_running(): this is about to hand the manifest to
+    # drain.py, which READS it — the predicate run.busy's own docstring names
+    # for exactly that. A live Phase A holds no lease and registers no _RUNNING
+    # entry, so drain_running() answers False for it and the resume would start
+    # underneath a child still writing the same batch/<name>.state.json; two
+    # writers on one journal is the corruption those guards exist to prevent.
+    # The reply needs no rewording for that case: "already running" is true of
+    # a Phase A too, and unlike /clear's and /wipe's strings it never claimed
+    # the thing running was a drain.
+    if busy(manifest_path):
         tg.send_message(chat_id, "already running — nothing to resume")
         return
     state = load_state(state_path_for(manifest_path))
@@ -5113,16 +5195,25 @@ def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
         # The same renderer the auto-updating message uses, so /status can
         # never disagree with what is already on screen.
         stages = None
+        phase = None
         prog = _progress_path(chat_id)
         if prog.exists():
             try:
-                stages = json.loads(prog.read_text(encoding="utf-8")).get("stages")
+                payload = json.loads(prog.read_text(encoding="utf-8"))
+                stages = payload.get("stages")
+                # Without this, a Phase A renders "waiting for the pod —
+                # nothing recorded yet": no lease plus an empty journal is the
+                # combination that used to mean exactly one thing, and Phase A
+                # broke it. The message on screen says the try-on is running,
+                # so /status saying the pod is coming is the disagreement the
+                # comment above promises cannot happen.
+                phase = payload.get("phase")
             except ValueError:
                 stages = None
         tg.send_message(chat_id,
                         progress_text(manifest_path,
                                       lease=lease_for(manifest_path),
-                                      stages=stages),
+                                      stages=stages, phase=phase),
                         parse_mode=PARSE_HTML)
         return
 
@@ -5312,9 +5403,10 @@ def main() -> int:
                        dry_run=args.dry_run)
             # After the updates, not instead of them.
             # One chat, because the allowlist is one user (spec section 2).
-            # tick_phase_a sits between the two: it shares _progress_path with
-            # tick_progress, so keeping them adjacent leaves exactly one owner
-            # of that file per tick.
+            # tick_phase_a sits next to tick_progress for readability — the two
+            # read the same _progress_path. Order is not what makes that safe:
+            # the `phase` guard in each tick is, and they would be correct in
+            # either order.
             tick_progress(tg, allowed_user_id)
             tick_phase_a(tg, allowed_user_id, dry_run=args.dry_run)
             tick_migration_progress(tg, allowed_user_id, dry_run=args.dry_run)

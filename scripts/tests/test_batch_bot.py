@@ -4747,8 +4747,15 @@ class TestProvisionFailureRecoveryButtons(unittest.TestCase):
                          "NVIDIA GeForce RTX 5090")   # unchanged
 
     def test_switch_does_nothing_if_already_running(self):
-        with mock.patch("tgbot.bot.drain_running", return_value=True), \
-             mock.patch("tgbot.bot.migration_running", return_value=False), \
+        # Through the REAL predicate, not a patched one: _do_resume gates on
+        # busy(), and busy() calls run.drain_running from run's own namespace —
+        # so the `mock.patch("tgbot.bot.drain_running")` this test used no
+        # longer reached the guard and it passed by accident. A live handle in
+        # run._RUNNING is the case the guard exists for (a pod already billed).
+        key = self.manifest.resolve()
+        run_mod._RUNNING[key] = _AliveProc()
+        self.addCleanup(run_mod._RUNNING.pop, key, None)
+        with mock.patch("tgbot.bot.migration_running", return_value=False), \
              mock.patch("tgbot.bot.start_drain") as start_drain:
             bot.handle(self.tg, cb_from(ME, f"{bot._CB_RECOVER_SWITCH}4090:tg-1"),
                       allowed_user_id=ME)
@@ -5863,7 +5870,19 @@ class TestTickPhaseA(unittest.TestCase):
         (self.root / "out").mkdir()
         bot.ROOT = self.root
         reset_bot_state()
-        self.manifest = self.root / "batch" / "tg-1.yaml"
+        # _PHASE_A/_PHASE_A_RC live in tgbot.run, so reset_bot_state() — which
+        # clears bot's own per-chat dicts — does not reach them. A handle
+        # leaked by an earlier test would make busy() answer True here, and
+        # busy() is what _do_resume now gates on.
+        run_mod._PHASE_A.clear()
+        run_mod._PHASE_A_RC.clear()
+        # The per-chat path, not an arbitrary name: the spend button carries
+        # _run_token(ME), which IS this file's mtime_ns, and its handler
+        # resumes _job_manifest_path(ME). A manifest under any other name makes
+        # the token "0" (stat fails) and the resume path a file that does not
+        # exist, so the end-to-end test below would fail for a reason that has
+        # nothing to do with what it is testing.
+        self.manifest = bot._job_manifest_path(ME)
         self.manifest.write_text(
             "runs:\n  - id: runA\n    pipeline: tryon-motion-enhance\n"
             "    inputs: {character: /tmp/c.png, outfit: /tmp/o.png, driver: /tmp/d.mp4}\n"
@@ -5889,12 +5908,121 @@ class TestTickPhaseA(unittest.TestCase):
     def tearDown(self):
         bot.ROOT = self._orig_root
 
+    def _payload(self) -> dict:
+        return json.loads(bot._progress_path(ME).read_text(encoding="utf-8"))
+
+    def _mark_seen_running(self) -> None:
+        """Put the progress file in the state a bot restart orphans it in.
+
+        Rewrites the payload setUp already produced rather than building one by
+        hand: message_id, manifest and stages have to stay the ones the tick
+        reads, and the only difference from a live Phase A is that this
+        process's _PHASE_A is empty (setUp clears it).
+        """
+        payload = self._payload()
+        payload["seen_running"] = True
+        bot._progress_path(ME).write_text(json.dumps(payload, indent=2),
+                                          encoding="utf-8")
+
     def test_still_running_only_redraws(self):
         with mock.patch("tgbot.bot.phase_a_running", return_value=True), \
              mock.patch("tgbot.bot.phase_a_exit", return_value=None):
             bot.tick_phase_a(self.tg, ME)
-        flat = [data for row in (self.tg.buttons[-1] or []) for _, data, *_ in row]
-        self.assertFalse(any(d.startswith(bot._CB_PHASE_A_SPEND) for d in flat))
+        # `edits`, not `buttons[-1]`: _start_progress sends with no keyboard,
+        # so tg.buttons[-1] is None and an assertion flattened from it is False
+        # whatever the tick did — this test could not fail while it read that.
+        # The redraw is the half its name claims, so assert it happened;
+        # callback_data() spans sends AND edits (see its docstring), which is
+        # what makes the "no spend button" half mean something.
+        self.assertEqual(len(self.tg.edits), 1)
+        self.assertIn("running the try-on over the API", self.tg.edits[-1][1])
+        self.assertFalse(any(d.startswith(bot._CB_PHASE_A_SPEND)
+                             for d in self.tg.callback_data()))
+
+    def test_the_first_tick_that_sees_the_child_alive_latches_it(self):
+        # `seen_running` is what separates a restart orphan from a Phase A that
+        # has not been started yet — both look identical to the tick. It has to
+        # be durable (the restart is the case) and set on the first tick that
+        # can prove the child existed.
+        with mock.patch("tgbot.bot.phase_a_running", return_value=True), \
+             mock.patch("tgbot.bot.phase_a_exit", return_value=None):
+            bot.tick_phase_a(self.tg, ME)
+        payload = self._payload()
+        self.assertIs(payload["seen_running"], True)
+        self.assertEqual(payload["phase"], "local")   # ownership untouched
+
+    def test_a_restart_orphan_is_cleared_and_reported_not_delivered(self):
+        # A restart empties _PHASE_A and _PHASE_A_RC, so phase_a_exit answers
+        # None forever: tick_phase_a returns at its rc-is-None guard,
+        # tick_progress returns at the ownership guard, and /kill cannot reach
+        # it either (_ask_kill gates on drain_running, which Phase A never
+        # sets). Nothing would ever clear the file — a message frozen at
+        # "running the try-on" and a poll loop stuck at its 2s cadence for the
+        # life of the chat.
+        self._mark_seen_running()
+        with mock.patch("tgbot.bot._preserved_tryon", return_value=(2, 3)), \
+             mock.patch("tgbot.bot.deliver_result") as deliver:
+            bot.tick_phase_a(self.tg, ME)
+        self.assertFalse(bot._progress_path(ME).exists())
+        # The whole reason recovery unlinks instead of dropping the `phase`
+        # key: handing the message back to tick_progress makes its next tick
+        # take the "Finished" branch and deliver a half-done batch.
+        deliver.assert_not_called()
+        text = self.tg.messages[-1].lower()
+        # Must not claim the child died — a hand-run bot's Phase A may still be
+        # alive; only systemd (Restart=always, KillMode=control-group) reliably
+        # takes it down with the process.
+        for claim in ("died", "crashed", "killed", "failed", "stopped",
+                      "timed out"):
+            self.assertNotIn(claim, text)
+        self.assertIn("restarted", text)
+        self.assertIn("nothing was rented", text)
+        # How many try-ons survived, and that Run will not pay for them twice.
+        self.assertIn("2/3", self.tg.messages[-1])
+        self.assertIn("skip", text)
+
+    def test_the_orphan_report_falls_back_when_the_count_is_unknown(self):
+        # _preserved_tryon returns (0, 0) for a manifest it cannot read — the
+        # card at _deliver_provision_failure falls back to generic wording for
+        # the same reason: a number it could not check is worse than none.
+        self._mark_seen_running()
+        with mock.patch("tgbot.bot._preserved_tryon", return_value=(0, 0)):
+            bot.tick_phase_a(self.tg, ME)
+        self.assertFalse(bot._progress_path(ME).exists())
+        text = self.tg.messages[-1].lower()
+        self.assertNotIn("0/0", text)
+        self.assertIn("nothing already finished was lost", text)
+
+    def test_a_phase_a_that_has_not_started_yet_is_not_an_orphan(self):
+        # The detection race, and the reason `seen_running` exists: "phase ==
+        # local, not running, exit is None" is ALSO true in the window between
+        # Task 10's _start_progress(..., phase="local") and its
+        # start_phase_a(...). Recovering on that bare triple would unlink the
+        # progress file of a Phase A that is about to start. setUp leaves the
+        # file in exactly that window — this must pass before AND after the
+        # recovery lands, which is what proves the flag is doing the work.
+        before = list(self.tg.messages)
+        with mock.patch("tgbot.bot.deliver_result") as deliver:
+            bot.tick_phase_a(self.tg, ME)
+        self.assertTrue(bot._progress_path(ME).exists())
+        self.assertEqual(self.tg.messages, before)   # and said nothing
+        deliver.assert_not_called()
+
+    def test_a_resume_is_refused_while_a_phase_a_child_is_still_alive(self):
+        # busy(), not drain_running(): a live Phase A writes no lease and
+        # registers no _RUNNING entry, so drain_running answers False for it —
+        # and _do_resume is about to hand the same manifest to drain.py, which
+        # reads it while the child is still writing the journal. Two writers on
+        # batch/<name>.state.json is the corruption run.busy's own docstring
+        # names it as the predicate for. Asserted through the REAL busy (only
+        # the handle is faked), not by patching it.
+        run_mod._PHASE_A[self.manifest.resolve()] = _AliveProc()
+        self.addCleanup(run_mod._PHASE_A.pop, self.manifest.resolve(), None)
+        with mock.patch("tgbot.bot.migration_running", return_value=False), \
+             mock.patch("tgbot.bot.start_drain") as start_drain:
+            bot._do_resume(self.tg, ME, self.manifest, dry_run=False)
+        start_drain.assert_not_called()
+        self.assertIn("already running", self.tg.messages[-1])
 
     def test_exit_three_offers_the_rent_decision_with_fresh_stock(self):
         with mock.patch("tgbot.bot.phase_a_running", return_value=False), \
@@ -5907,7 +6035,43 @@ class TestTickPhaseA(unittest.TestCase):
         # The whole point: the panel is rendered AFTER Phase A, so the stock it
         # shows was measured now, and its spend button must not route back
         # through _do_confirm (whose _STATE this chat no longer has).
-        self.assertTrue(offer.call_args.kwargs["spend_cb"].startswith(bot._CB_PHASE_A_SPEND))
+        # The token, not the stem: _job_manifest_path(ME) IS the file the stem
+        # names, and once Phase A has exited busy() is False, so nothing stops
+        # _maybe_show_manifest rewriting it while the panel sits unanswered.
+        self.assertEqual(offer.call_args.kwargs["spend_cb"],
+                         bot._CB_PHASE_A_SPEND + bot._run_token(ME))
+
+    def test_exit_three_clears_the_progress_file_so_the_poll_can_idle(self):
+        # The plan's headline path, and the one branch that used not to unlink.
+        # Left behind, the file keeps `animating = _progress_path(...).exists()`
+        # True forever, so the poll loop never returns to its 50s idle cadence
+        # and spins at 2s — roughly 30 Telegram calls a minute instead of ~1.2 —
+        # under a progress message frozen at "running the try-on" with nothing
+        # running. No other path clears it: _CB_RUN_NO only replies, _do_kill's
+        # unlink is unreachable because _ask_kill gates on drain_running, and
+        # _clear_job never touches _progress_path.
+        with mock.patch("tgbot.bot.phase_a_running", return_value=False), \
+             mock.patch("tgbot.bot.phase_a_exit", return_value=3), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value={}), \
+             mock.patch("tgbot.bot._offer_run_confirm") as offer:
+            bot.tick_phase_a(self.tg, ME)
+        offer.assert_called_once()
+        self.assertFalse(bot._progress_path(ME).exists())
+
+    def test_the_exit_three_path_previews_a_tryon_that_finished_in_its_last_tick(self):
+        # deliver_result sends _final/*.mp4 only, so a try-on image recorded
+        # done inside the final tick is never shown unless this branch previews
+        # it — and it is never shown later either, because the exit-3 path
+        # unlinks the progress file that _deliver_tryon_previews dedupes with.
+        with mock.patch("tgbot.bot.phase_a_running", return_value=False), \
+             mock.patch("tgbot.bot.phase_a_exit", return_value=3), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value={}), \
+             mock.patch("tgbot.bot._offer_run_confirm"), \
+             mock.patch("tgbot.bot._deliver_tryon_previews") as previews:
+            bot.tick_phase_a(self.tg, ME)
+        previews.assert_called_once()
 
     def test_the_panel_it_offers_reaches_start_drain_with_state_cleared(self):
         # The §6.3 condition that rules _do_confirm out, end to end: by the
@@ -5920,17 +6084,43 @@ class TestTickPhaseA(unittest.TestCase):
              mock.patch("tgbot.bot.phase_a_exit", return_value=3), \
              mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
              mock.patch("tgbot.bot.stock_at_cached", return_value={}), \
-             mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.busy", return_value=False), \
              mock.patch("tgbot.bot.migration_running", return_value=False), \
              mock.patch("tgbot.bot._start_progress"), \
              mock.patch("tgbot.bot.start_drain") as start_drain:
             bot.tick_phase_a(self.tg, ME)
-            flat = [data for row in self.tg.buttons[-1] for _, data, *_ in row]
-            spend = next(d for d in flat if d.startswith(bot._CB_PHASE_A_SPEND))
+            spend = next(d for d in self.tg.callback_data()
+                         if d.startswith(bot._CB_PHASE_A_SPEND))
             bot.handle(self.tg, cb_from(ME, spend), allowed_user_id=ME)
         start_drain.assert_called_once()
         self.assertIs(start_drain.call_args.kwargs["resume"], True)
+        # The path comes from chat_id, the way _CB_RUN_GO reaches _do_confirm:
+        # the token proves WHICH manifest was reviewed, it is not itself a path.
         self.assertEqual(start_drain.call_args.args[0], self.manifest)
+
+    def test_a_spend_button_whose_manifest_was_rewritten_is_refused(self):
+        # The harm _run_token exists to prevent, on the button that spends the
+        # money: rent $0.99/hour against inputs the user never reviewed. The
+        # panel sits unanswered while nothing holds the manifest — Phase A has
+        # exited, so busy() is False and _maybe_show_manifest is free to write.
+        with mock.patch("tgbot.bot.phase_a_running", return_value=False), \
+             mock.patch("tgbot.bot.phase_a_exit", return_value=3), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value={}), \
+             mock.patch("tgbot.bot.start_drain") as start_drain:
+            bot.tick_phase_a(self.tg, ME)
+            spend = next(d for d in self.tg.callback_data()
+                         if d.startswith(bot._CB_PHASE_A_SPEND))
+            import os
+            # utime, not a rewrite: the same effect on mtime_ns without
+            # depending on the filesystem giving two writes inside one test
+            # distinguishable timestamps.
+            os.utime(self.manifest, ns=(1_000_000_000, 1_000_000_000))
+            self.assertNotEqual(spend[len(bot._CB_PHASE_A_SPEND):],
+                                bot._run_token(ME))   # stale, as intended
+            bot.handle(self.tg, cb_from(ME, spend), allowed_user_id=ME)
+        start_drain.assert_not_called()
+        self.assertIn("the job changed", self.tg.messages[-1])
 
     def test_exit_zero_delivers_results_and_offers_nothing_to_rent(self):
         with mock.patch("tgbot.bot.phase_a_running", return_value=False), \
@@ -5962,8 +6152,11 @@ class TestTickPhaseA(unittest.TestCase):
 
     def test_the_panel_is_offered_once_not_every_tick(self):
         # phase_a_exit keeps answering 3 after the process is reaped, by design.
-        # Without a latch the poll loop would re-send the panel every 2s for
-        # as long as the chat lives.
+        # Two things stop the 2s poll re-sending the panel: every terminal
+        # branch unlinks the progress file, and the durable `offered` latch
+        # covers the window between writing it and rendering — a crash there
+        # leaves the file on disk with the latch set, and a restart cannot
+        # re-send either.
         with mock.patch("tgbot.bot.phase_a_running", return_value=False), \
              mock.patch("tgbot.bot.phase_a_exit", return_value=3), \
              mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
@@ -5972,6 +6165,17 @@ class TestTickPhaseA(unittest.TestCase):
             bot.tick_phase_a(self.tg, ME)
             bot.tick_phase_a(self.tg, ME)
         offer.assert_called_once()
+
+    def test_status_during_phase_a_does_not_say_it_is_waiting_for_a_pod(self):
+        # /status renders through the same progress_text the on-screen message
+        # uses, and its own comment promises the two "can never disagree with
+        # what is already on screen". Without the phase they did: no lease plus
+        # an empty journal is exactly the combination that renders "waiting for
+        # the pod — nothing recorded yet", the inference spec §6.5 exists to
+        # remove, about a phase that deliberately runs before any pod exists.
+        bot.handle(self.tg, cmd_from(ME, "/status"), allowed_user_id=ME)
+        self.assertNotIn("waiting for the pod", self.tg.messages[-1])
+        self.assertIn("running the try-on over the API", self.tg.messages[-1])
 
 
 if __name__ == "__main__":
