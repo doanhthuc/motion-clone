@@ -164,11 +164,23 @@ def run_one(*, settings: Settings, run: Run, out_dir: Path, state: dict,
         recorded = entry["stages"].get(stage_name) or {}
         params = effective_stage_params(stage_name, run.stage_params.get(stage_name))
 
-        # Chặng đã "done" VÀ còn file trên đĩa thì bỏ qua — KHÔNG gate theo `resume`.
-        # Một lô THẬT SỰ mới (resume=False) luôn khởi tạo state["runs"] rỗng
-        # (run_batch/prepare_batch), nên "done" ở đây chỉ có thể đến từ Pha A
-        # (run_local_phase) đã ghi trong CHÍNH lần gọi `make batch` này — bỏ qua đúng
-        # là hành vi cần, không phải một lỗ hổng bỏ sót --resume.
+        # A stage that is "done" AND still on disk is skipped — deliberately NOT
+        # gated on `resume`. A genuinely new batch (resume=False) always starts
+        # from an empty state["runs"] (prepare_batch), so within one invocation a
+        # "done" entry can only have come from Phase A (run_local_phase) writing
+        # it during this same `make batch` call. Skipping there is the intended
+        # behaviour, not a hole left by a missing --resume.
+        #
+        # The third clause is the exception, and it can only bite on a RESUME=1
+        # whose manifest has since moved this stage off the local providers.
+        # Within one invocation it is provably a no-op: Phase A only ever creates
+        # a job where _local_tryon_stage(run) == stage_name, so the provenance
+        # check has nothing to disagree with. Trusting the journal alone across a
+        # resume would hand Phase B an image a different provider made.
+        #
+        # This skip is NOT params-aware and must not become so — see
+        # local_tryon_reusable's docstring for what that comparison would cost on
+        # a stage billed at $0.99/h.
         if (recorded.get("status") == "done" and dest.is_file()
                 and not _local_provenance_stale(run, stage_name, recorded)):
             log(f"    {stage_name}: bỏ qua (đã xong, {dest.name})")
@@ -567,8 +579,21 @@ def run_local_phase(*, settings: Settings, manifest: Manifest, out_root: Path, b
         run_dir.mkdir(parents=True, exist_ok=True)
         log_file = run_dir / "run.log"
         dest = stage_dest(run, run_dir, stage_name)
-        # Hai vế, giống hệt run_one: journal nói "done" VÀ file còn trên đĩa. Tin journal
-        # suông thì Pha B nhận một đường dẫn không tồn tại ở chặng motion.
+        # NOT the same condition as run_one's, and the difference is the point.
+        # Phase A also compares params (local_tryon_reusable) because redoing a
+        # wrong image here costs one Gemini call; run_one deliberately does not,
+        # because the same comparison on a pod stage would re-submit a 40-minute
+        # enhance at $0.99/h whenever params.py's defaults move.
+        #
+        # Phase A needs no provenance clause either, and must not gain one: _one
+        # only runs for a (run, stage_name) pair where _local_tryon_stage(run) ==
+        # stage_name by construction, so _local_provenance_stale could only ever
+        # return False here. Adding it would be dead code behind a comment
+        # claiming a guard that cannot fire.
+        #
+        # Both halves of the reuse check are required, not just the journal's
+        # "done": trusting the journal alone hands Phase B a path that does not
+        # exist at the motion stage.
         if not force and local_tryon_reusable(run, stage_name, recorded, dest):
             log(f"    {run.id}/{stage_name}: bỏ qua (đã xong local, {dest.name})")
             return False, None
