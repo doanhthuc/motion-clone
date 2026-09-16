@@ -231,8 +231,10 @@ Making `run_one`'s skip check (`runner.py:172`) compare params looks symmetric w
 
 The journal stores `params_manifest` as computed at submit time; the check would compare it against
 `effective_stage_params` recomputed at resume time. Those two agree only as long as the *code* that
-derives defaults does not change. Update `params.py`'s defaults, or pull a repo change that adds a
-key, and every stage recorded "done" stops matching — on a resume that was supposed to skip them.
+derives defaults does not change. Edit a `STAGES[...]` entry's `defaults` or `locked_params` in
+`pipelines.py` — which is what `effective_stage_params` merges, not `params.py`, whose job is
+validating param *names* against `linux.py` and `batch-params.json` — and every stage recorded "done"
+stops matching, on a resume that was supposed to skip them.
 At Phase A that costs a Gemini call. At Phase B it re-submits a 40-minute `enhance` to a GPU billing
 $0.99/h, on a batch the user resumed precisely to avoid paying twice.
 

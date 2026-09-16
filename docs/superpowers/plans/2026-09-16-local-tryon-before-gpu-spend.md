@@ -792,9 +792,9 @@ def _local_provenance_stale(run: Run, stage_name: str, recorded: dict) -> bool:
 
     Narrow on purpose — this is NOT a params check, and §5 of the spec records
     why: comparing a journalled params_manifest against effective_stage_params
-    recomputed at resume time means any change to params.py's defaults silently
-    invalidates every stage marked done, and at Phase B that re-submits a
-    40-minute enhance to a GPU billing $0.99/h.
+    recomputed at resume time means any change to the stage defaults in
+    pipelines.py silently invalidates every stage marked done, and at Phase B
+    that re-submits a 40-minute enhance to a GPU billing $0.99/h.
 
     What it does catch is the one hole reachable from the bot: /provider moves
     a stage off the local providers, so _local_tryon_stage stops naming it, and
@@ -3299,6 +3299,13 @@ EOF
 ---
 
 ## After both commits
+
+- [ ] **Erratum — correct the `params.py` misattribution in three code comments.** Spec §5 originally said a change to "`params.py`'s defaults" would silently invalidate journalled `params_manifest` values, and that wording propagated into code before the Task 3 re-review caught it. **`params.py` is the wrong module**: `effective_stage_params` merges `STAGES[stage_name].defaults` and `.locked_params` from `pipelines.py:103`, declared at `:35-36` and populated at `:74-84`; `params.py` validates param *names* against `linux.py`'s AST and `batch-params.json`, and `runner.py` does not import it at all. The reasoning is unaffected — a change to the defaults really would invalidate every journalled value — only the module name is wrong, and it sends a reader somewhere that cannot move the number. Fix all three, in one commit:
+  - `scripts/batchlib/runner.py:441` — `_local_provenance_stale`'s docstring
+  - `scripts/batchlib/runner.py:586` — the Phase A skip comment rewritten in Task 3's fix round
+  - `scripts/tests/test_batch_runner.py:1033` — a test comment from Task 1
+
+  The spec is corrected; this plan is not, because the two remaining instances (Task 1's and Task 3's commit-message blocks) are verbatim records of what `c5c480b` and `1e363f6` actually say. History is not being rewritten for a comment-level attribution error, so the plan keeps matching it. Do **not** "fix" `runner.py:390` — its `params.py` reference is correct, it says that module records both spellings as valid params, which is exactly its job.
 
 - [ ] **Update the operator docs.** `docs/batch-runner.md` §2.9 describes the try-on-survives-a-pod-stop behaviour; it needs the params-aware caveat (a provider change invalidates reuse) and `--force-local`. `QWEN.md`'s "Known traps" gains one line: a stock-out retry through `/confirm` used to re-bill Gemini, and the chooser is why it no longer does silently. `docs/gpu-pod.md`'s runbook is unaffected — no pod lifecycle step changed.
 
