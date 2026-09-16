@@ -5527,6 +5527,85 @@ class TestConfirmAsksBeforeReusingTryon(TestFlow):
         flat = [data for row in (self.tg.buttons[-1] or []) for _, data, *_ in row]
         self.assertFalse(any(d.startswith(bot._CB_PHASE_A_REUSE) for d in flat))
         start_drain.assert_not_called()
+        # And the mailbox really was written: "queued" on this branch means a
+        # file on disk that chain_or_teardown can claim, and the two race tests
+        # below depend on the SECOND entry deliberately not writing one. Without
+        # this line the test would also pass if the first entry skipped the
+        # write, which is the bug the write gate's comment describes.
+        self.assertTrue(mailbox_path(bot._job_manifest_path(ME)).exists())
+
+    def _tap_after_a_drain_started(self, prefix: str) -> tuple[mock.MagicMock, str]:
+        """/confirm, then a drain appears on the live manifest while the chooser
+        is still unanswered, then the tap. Returns the start_drain mock and the
+        last message the bot sent.
+
+        The two conditions co-occur by construction rather than by luck: the
+        stock-out card that offers Retry / Switch-GPU exists exactly when Phase A
+        finished and the journal holds a preserved try-on, which is exactly when
+        _preserved_tryon reports reusable > 0 and the chooser appears. Both of
+        those buttons call _do_resume on this same file, and so does
+        tick_migration_progress's resume-on-done — which needs no tap at all.
+
+        `drain_running` is a mutable cell, not a side_effect list: a list raises
+        StopIteration the moment the function is called more often than this
+        helper predicted, which would surface as a fixture error instead of the
+        behaviour under test.
+        """
+        self._journal_for_draft()
+        running = [False]
+        with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot.drain_running",
+                        side_effect=lambda *_: running[0]), \
+             mock.patch("tgbot.bot._start_progress"):
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+            token = self._chooser_token()
+            running[0] = True
+            bot.handle(self.tg, cb_from(ME, prefix + token), allowed_user_id=ME)
+            return start_drain, self.tg.messages[-1]
+
+    def test_a_drain_that_started_during_the_chooser_reports_the_reuse_not_a_queue(self):
+        # On the second entry `running` is True, so manifest_path is the mailbox
+        # and start_drain is never reached. Nothing was written to the mailbox
+        # either — the write is skipped on the second entry, and writing it
+        # would be the expensive mistake: claim_mailbox renames it to a new
+        # stem, chain_or_teardown runs that stem with no --resume and no
+        # --force-local, so a fresh journal and a fresh batch id follow. That is
+        # a second full GPU run of the same video AND a second Gemini try-on
+        # payment, whichever button was tapped.
+        #
+        # The job is not lost, though: a drain is running on this very manifest,
+        # started by _do_resume with resume=True, so the try-on IS reused and the
+        # video does get made. What has to change is the message — "Queued."
+        # describes a mailbox file that does not exist.
+        start_drain, msg = self._tap_after_a_drain_started(bot._CB_PHASE_A_REUSE)
+        start_drain.assert_not_called()
+        self.assertFalse(mailbox_path(bot._job_manifest_path(ME)).exists())
+        self.assertNotIn("Queued", msg)
+        self.assertIn("reused", msg)
+        # Reuse is the outcome the user asked for, so there is nothing to
+        # recover and no recovery path to name — pointing at /again here would
+        # invite a second paid run for no reason.
+        self.assertNotIn("/again", msg)
+        # The draft must be gone: leaving it in _STATE would let a later
+        # /confirm submit the same job a second time.
+        self.assertIsNone(bot._STATE.get(ME))
+
+    def test_a_drain_that_started_during_the_chooser_says_the_rerun_could_not_be_applied(self):
+        # Same race, opposite choice, and the difference matters: FORCE_LOCAL
+        # has no route into a drain that is already on a pod, so a "Re-run
+        # try-on" tap is silently converted into a reuse unless the message says
+        # so. That silence is the exact failure this whole feature exists to
+        # remove — the user gets back the image they were trying to get away
+        # from and no hint that their choice did not take.
+        start_drain, msg = self._tap_after_a_drain_started(bot._CB_PHASE_A_RERUN)
+        start_drain.assert_not_called()
+        self.assertFalse(mailbox_path(bot._job_manifest_path(ME)).exists())
+        self.assertNotIn("Queued", msg)
+        self.assertIn("reused", msg)
+        # Names the recovery that actually works, rather than leaving the
+        # dropped choice unmentioned.
+        self.assertIn("/again", msg)
+        self.assertIsNone(bot._STATE.get(ME))
 
 
 if __name__ == "__main__":

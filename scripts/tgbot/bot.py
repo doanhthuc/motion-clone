@@ -4486,6 +4486,12 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool,
     # path to the mailbox, and the mailbox would otherwise sit empty — queued
     # in every OTHER sense but never actually written to disk. write_manifest
     # is a plain YAML dump, no subprocess, so redoing it here costs nothing.
+    #
+    # That empty-mailbox protection is FIRST-entry-only, on purpose: the second
+    # entry skips the write below even when a drain has since appeared, and the
+    # tail's `elif running:` branch reports that race honestly instead. Read
+    # that branch before "restoring" the write here — writing the mailbox would
+    # not make its "Queued." message true, it would buy a duplicate paid run.
     if phase_a_choice is None:
         # Skipped on the second entry, and not as an optimisation: _run_token
         # IS this file's mtime_ns, so rewriting it would invalidate the
@@ -4534,10 +4540,23 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool,
         #
         # resume is True only when the chooser ran: phase_a_choice is set
         # exactly when a journal with reusable try-on exists, and resume is
-        # what makes that try-on skipped rather than paid for twice. A
-        # stale button answering after the journal vanished lands in
-        # resolve_batch_id's own "RESUME=1 but nothing to continue" branch,
-        # which reports it and runs as a new batch — safe, not silent.
+        # what makes that try-on skipped rather than paid for twice.
+        #
+        # A stale button answering after the journal vanished lands in
+        # resolve_batch_id's own "RESUME=1 but nothing to continue" branch
+        # (batch_run.py:73) and runs as a new batch. That branch DOES report
+        # itself — but `decision.note` is printed to the drain's stdout
+        # (batch_run.py:148), which is the drain log on the pod, not this chat.
+        # The user reads "🚀 Started." below and pays for a try-on they asked to
+        # reuse. So it is reported, not silent, and still not visible to the
+        # only person who could act on it.
+        #
+        # Left that way on purpose, not overlooked: the window needs the journal
+        # deleted between the two entries, and closing it means re-reading
+        # _preserved_tryon here — a second journal read on the money path, the
+        # same duplication already flagged at _preserved_tryon — plus a new
+        # user-visible message that would need its own test. Revisit together
+        # with that finding, not separately.
         start_drain(manifest_path, dry_run=dry_run,
                     resume=phase_a_choice is not None,
                     force_local=phase_a_choice == "rerun")
@@ -4563,7 +4582,7 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool,
     _STRIP.pop(chat_id, None)
     if dropped:
         tg.send_message(chat_id, f"running without {dropped} unassigned file(s)")
-    if running:
+    if running and phase_a_choice is None:
         tg.send_message(chat_id,
                         f"📥 <b>Queued.</b> {submitted_count} job(s) will start "
                         "automatically on the same pod the moment the current "
@@ -4572,6 +4591,54 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool,
         # No progress message yet — tick_progress starts one itself once
         # drain.py's handoff file says this was actually picked up. Sending
         # one now would claim progress on a job that has not started.
+    elif running:
+        # The race: a drain appeared on this manifest while the chooser sat
+        # unanswered. Reachable three ways, and the three co-occur by
+        # construction — the stock-out card that offers Retry / Switch-GPU
+        # exists exactly when Phase A finished and the journal holds a
+        # preserved try-on, which is exactly when the chooser appears:
+        # _CB_RECOVER_RETRY and _CB_RECOVER_SWITCH both _do_resume THIS file
+        # (its stem is _job_manifest_path's), and so does
+        # tick_migration_progress's resume-on-done, which needs no tap at all.
+        # _run_token does not catch it: it is the LIVE path's mtime_ns, and
+        # nothing in drain.py or the runner rewrites the manifest — they write
+        # the .state.json journal.
+        #
+        # "Queued." above would be a lie here, because it describes the mailbox
+        # file this branch deliberately did NOT write. Making it true is the
+        # expensive mistake rather than the fix: claim_mailbox renames the
+        # mailbox to a fresh stem (handoff.py:78) and chain_or_teardown runs
+        # that stem with neither --resume nor --force-local (drain.py:236), so
+        # state_path_for yields a fresh journal and resolve_batch_id mints a
+        # fresh batch id — a second full GPU run of the same video AND a second
+        # Gemini try-on payment, whichever button was tapped, then announced as
+        # a feature. The mailbox cannot carry force_local at all.
+        #
+        # Nothing was lost, though: the running drain was started with
+        # resume=True on this very manifest, so the try-on IS being reused and
+        # the video does get made. What differs by choice is whether that is
+        # what the user asked for, so the two get different text. The
+        # _freeze_panel and the _STATE clear above both stay correct on this
+        # branch — the job genuinely is running, and a draft left in _STATE
+        # would let a later /confirm submit it a second time.
+        if phase_a_choice == "rerun":
+            tg.send_message(
+                chat_id,
+                f"{ICON_WARN} <b>Already running.</b> A drain picked this batch "
+                "up while you were deciding, so it is running now with the "
+                "try-on <b>reused</b>. Your re-run could not be applied — a "
+                "batch already on a pod cannot be told to redo its try-on.\n"
+                "When it finishes: /again, then Run, and choose <b>Re-run "
+                "try-on</b> there.",
+                parse_mode=PARSE_HTML)
+        else:
+            tg.send_message(
+                chat_id,
+                f"{ICON_WARN} <b>Already running.</b> A drain picked this batch "
+                "up while you were deciding, so it is running now with the "
+                "try-on <b>reused</b> — which is the choice you made. No second "
+                "rental, and no second Gemini call.",
+                parse_mode=PARSE_HTML)
     else:
         tg.send_message(chat_id,
                         f"{ICON_ROCKET_CE} <b>Started.</b> {submitted_count} job(s) on one pod at "
