@@ -2049,8 +2049,10 @@ EOF
 A pure refactor. No behaviour change, every existing test stays green.
 
 **Files:**
-- Modify: `scripts/tgbot/bot.py` (`_offer_run_confirm` ~line 3866; its callers ~lines 3990, 4030 in the `_CB_RUN_REFRESH` / `_CB_RUN_BACK` branches)
+- Modify: `scripts/tgbot/bot.py` (`_offer_run_confirm` only, ~line 3866)
 - Test: `scripts/tests/test_batch_bot.py`
+
+Its four call sites (`bot.py:1465`, `:1479`, `:1496`, `:1512`) are **not** touched here — both new parameters default to today's behaviour, which is what makes this a refactor. Task 10 rewires them.
 
 **Interfaces:**
 - Produces: `_offer_run_confirm(tg, chat_id, *, message_id=None, force=False, spend_cb=None, heading=None)`. Task 9 passes both new arguments.
