@@ -1539,6 +1539,18 @@ RO↔Iceland (quãng xa hơn RO↔Czech), không phải ở script hay CPU — n
 xác nhận, đây là suy luận từ việc thêm luồng không giúp gì. Nếu di chuyển tới EUR-IS-1 lần nữa mà vẫn
 ~32MB/s thì coi đó là trần thật của tuyến này, đừng kỳ vọng ~94MB/s như tuyến EU-CZ-1.
 
+**Bẫy: `verify()` báo file "khác" dù copy đúng 100% — do NFS, không phải mất dữ liệu (16/09/2026).**
+Lần chạy thật đầu tiên của `volume_migrate.py` tới EUR-IS-1 fail 2 lần liền ở bước verify (28 rồi 59
+file "still differ"), nhưng log chi tiết (thêm ở cùng ngày) cho thấy **mọi** dòng khác biệt chỉ là
+tên một thư mục trần (`comfy-models/`, `pgdata/`, `minio/`…) — không có file nào bên trong bị liệt
+kê, và `total size` luôn khớp chính xác với dữ liệu thật. Network Volume của RunPod chạy trên NFS,
+và mtime của thư mục không round-trip đúng qua NFS — man page của `rsync` nêu thẳng case này, khuyên
+dùng `--omit-dir-times`. Đã thêm flag đó vào cả sync thật lẫn verify dry-run
+(`scripts/volume_migrate.py`'s `_rsync_cmd`). Rút kinh nghiệm: khi verify fail, đừng vội nghi ngờ dữ
+liệu — coi log chi tiết trước (bây giờ `verify()` in cả rsync `-v` output ra
+`batch/volume-migrate.log` khi có pending change), vì phần lớn khả năng là nhiễu mtime thư mục qua
+NFS, không phải nội dung file sai.
+
 Nén trước khi sync (`rsync -z`/tar+gzip) **không đáng thử**: phần lớn dữ liệu là tensor
 `.safetensors`/`.gguf`/`.ckpt` (fp16/fp8) — entropy cao, nén được dưới 5%, trong khi pod CPU tạm
 (2 vCPU) yếu, nén tốn CPU nhiều khả năng lỗ hơn lãi.
