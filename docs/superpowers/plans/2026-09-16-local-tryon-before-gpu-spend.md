@@ -1207,26 +1207,35 @@ class TestConfirmAsksBeforeReusingTryon(TestFlow):
     than one extra Gemini call.
     """
 
-    def _journal_for_draft(self) -> Path:
-        """Fill the draft, point it at a LOCAL provider, write the real manifest,
-        then fake a journal saying its try-on is already done.
+    def _journal_for_draft(self, *, provider: str = "gemini") -> Path:
+        """Fill the draft, write the real manifest, then fake a journal saying
+        its try-on is already done.
 
         Three things here are load-bearing and each one is a way this fixture
         could silently test nothing:
 
-        - provider must be set explicitly. DEFAULT_PROVIDER is "qwen", the
-          self-host GPU path, which render_manifest omits from the YAML and
-          _local_tryon_stage therefore rejects — with the default there is no
-          Phase A at all and the chooser never appears, so every test below
-          would pass against a code path that never ran.
+        - the provider is set explicitly even though it already defaults to
+          "gemini", because `bot.JOB_PROVIDER` (`bot.py:140`) is a hardcoded
+          module constant and a test that depends on it silently changes meaning
+          if that constant is ever retuned. Do NOT confuse it with `job.py`'s
+          `DEFAULT_PROVIDER` ("qwen"), which is a different thing entirely: that
+          one is the value `linux.py:5653` falls back to when a manifest carries
+          no `provider:` line, and `render_manifest` compares against it to
+          decide whether to emit an explicit marker. Passing `provider="qwen"`
+          here is what makes a run NOT local-eligible.
         - the stage name is looked up, not written as "tryon". The default
           pipeline may call it camera-tryon.
         - params_manifest comes from effective_stage_params, not a literal
           {"provider": "gemini"}: local_tryon_reusable compares against that
           function's output, which merges the stage defaults in.
+        - the journal is nested as runs[id]["stages"][stage], because that is
+          what preserved_local_tryon reads (runner.py:481) and what
+          run_local_phase._one writes. A flat shape makes reusable always 0 and
+          every count test pass for the wrong reason — this exact defect shipped
+          in Task 4's brief and was caught by its implementer.
         """
         self._fill_required_slots()
-        bot._job_for(ME).provider = "gemini"
+        bot._job_for(ME).provider = provider
         bot._LAST_VALIDATE[ME] = True
         manifest = bot._job_manifest_path(ME)
         write_manifest(bot._jobs_for(ME), manifest, now="2026-09-16 09:00:00")
@@ -1333,19 +1342,28 @@ class TestConfirmAsksBeforeReusingTryon(TestFlow):
         self.assertIs(start_drain.call_args.kwargs.get("resume"), False)
         self.assertIs(start_drain.call_args.kwargs.get("force_local"), False)
 
-    def test_a_default_provider_draft_has_no_phase_a_and_gets_no_chooser(self):
-        # The mirror of _journal_for_draft's first load-bearing detail: "qwen"
-        # is the self-host path, so there is nothing to reuse and no choice to
-        # offer. If this ever starts showing a chooser, _local_tryon_stage grew
-        # an opinion of its own.
-        self._fill_required_slots()
-        bot._LAST_VALIDATE[ME] = True
+    def test_a_self_host_provider_gets_no_chooser_even_with_a_reusable_journal(self):
+        # The real control group, and the reason it needs a journal: this test
+        # was originally written as "a default-provider draft gets no chooser",
+        # which was vacuous twice over — bot.JOB_PROVIDER is "gemini"
+        # (bot.py:140) so a default draft IS local-eligible, and the test wrote
+        # no journal, so it passed on the absence of a journal rather than on
+        # anything about locality.
+        #
+        # Setting provider="qwen" makes render_manifest emit no provider: line,
+        # _local_tryon_stage returns None, and preserved_local_tryon's total
+        # falls to 0 — so the chooser is suppressed by LOCALITY, with a journal
+        # sitting right there whose entry would otherwise be reusable. If this
+        # ever starts showing a chooser, _local_tryon_stage grew an opinion of
+        # its own.
+        self._journal_for_draft(provider="qwen")
         with mock.patch("tgbot.bot.start_drain") as start_drain, \
              mock.patch("tgbot.bot.drain_running", return_value=False):
             bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
         flat = [data for row in (self.tg.buttons[-1] or []) for _, data, *_ in row]
         self.assertFalse(any(d.startswith(bot._CB_PHASE_A_REUSE) for d in flat))
         start_drain.assert_called_once()
+        self.assertIs(start_drain.call_args.kwargs.get("resume"), False)
 
     def test_a_job_queued_behind_a_live_drain_gets_no_chooser(self):
         # The mailbox branch never reaches the money gate, so it must not reach
@@ -1364,7 +1382,7 @@ class TestConfirmAsksBeforeReusingTryon(TestFlow):
 - [ ] **Step 2: Run them, verify they fail**
 
 Run: `python3 -m unittest scripts.tests.test_batch_bot.TestConfirmAsksBeforeReusingTryon -v`
-Expected: FAIL — `AttributeError: module 'tgbot.bot' has no attribute '_CB_PHASE_A_REUSE'`. Two tests should already PASS: `test_no_journal_means_no_chooser_and_one_tap_still_starts` and `test_a_default_provider_draft_has_no_phase_a_and_gets_no_chooser`. If either of those fails, the fixture is wrong, not the implementation — debug it before writing any production code, because both are the control group that proves the chooser is conditional rather than unconditional.
+Expected: FAIL — `AttributeError: module 'tgbot.bot' has no attribute '_CB_PHASE_A_REUSE'`. Two tests should already PASS: `test_no_journal_means_no_chooser_and_one_tap_still_starts` and `test_a_self_host_provider_gets_no_chooser_even_with_a_reusable_journal`. If either of those fails, the fixture is wrong, not the implementation — debug it before writing any production code, because both are the control group that proves the chooser is conditional rather than unconditional. The second one is the sharper of the two: it has a reusable journal present and still expects no chooser, so it can only pass if locality gates before params.
 
 - [ ] **Step 3: Add the constants**
 
