@@ -612,7 +612,20 @@ def verify(host_a: str, port_a: int, host_b: str, port_b: int, units: list[str],
             ["ssh", "-o", "StrictHostKeyChecking=accept-new", "-p", str(port_a),
              f"root@{host_a}", _rsync_cmd(mount, unit, host_b, port_b, dry_run=True)],
             capture_output=True, text=True, check=True)
-        total += count_pending_changes(result.stdout)
+        pending = count_pending_changes(result.stdout)
+        total += pending
+        if pending:
+            # The 2026-09-16 EU-RO-1→EUR-IS-1 run failed here with only "28
+            # file(s) still differ" to go on — count_pending_changes summed a
+            # number and threw away the rsync -v listing it summed FROM, so
+            # there was no way to tell which unit, let alone which files. This
+            # print is the fix: it goes to stderr, which _start_migration
+            # redirects to batch/volume-migrate.log (never to Telegram, so no
+            # REASON_MAX_CHARS/secret-scrub concerns — this file has no
+            # secrets, rsync paths only).
+            print(f"--- {pending} pending change(s) in unit {unit!r} ---",
+                 file=sys.stderr)
+            print(result.stdout, file=sys.stderr)
 
     on_a = set(list_top_level(host_a, port_a, mount))
     on_b = set(list_top_level(host_b, port_b, mount))

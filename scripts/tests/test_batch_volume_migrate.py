@@ -344,6 +344,29 @@ class TestSyncAndVerify(unittest.TestCase):
         self.assertEqual(result.pending_changes, 1)
         self.assertFalse(result.ok)
 
+    def test_a_dirty_unit_logs_its_own_name_and_diff_to_stderr(self):
+        clean = mock.Mock(stdout="sending incremental file list\n\nsent 1 bytes\n")
+        dirty = mock.Mock(stdout="sending incremental file list\n"
+                                 "comfy-models/loras/file.gguf\n\nsent 1 bytes\n")
+        same_listing = mock.Mock(stdout="comfy-models\nminio\n")
+        buf = io.StringIO()
+        with mock.patch("subprocess.run",
+                        side_effect=[clean, dirty, same_listing, same_listing]), \
+             contextlib.redirect_stderr(buf):
+            volume_migrate.verify("host-a", 1001, "host-b", 1002,
+                                  ["comfy-models/loras", "minio"])
+        self.assertIn("comfy-models/loras", buf.getvalue())
+        self.assertIn("file.gguf", buf.getvalue())
+
+    def test_a_clean_unit_logs_nothing(self):
+        clean = mock.Mock(stdout="sending incremental file list\n\nsent 1 bytes\n")
+        same_listing = mock.Mock(stdout="minio\n")
+        buf = io.StringIO()
+        with mock.patch("subprocess.run", side_effect=[clean, same_listing, same_listing]), \
+             contextlib.redirect_stderr(buf):
+            volume_migrate.verify("host-a", 1001, "host-b", 1002, ["minio"])
+        self.assertEqual(buf.getvalue(), "")
+
 
 class TestVerifyCoverage(unittest.TestCase):
     """Critical 2: per-unit checksums say nothing about units nobody enumerated.
