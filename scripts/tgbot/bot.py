@@ -4063,7 +4063,8 @@ def _ask_kill(tg: Tg, chat_id: int) -> None:
         chat_id,
         f"{ICON_WARN} This destroys the pod right now{spent}. Whatever is mid-render "
         "is lost — no output, no resume. Are you sure?",
-        buttons=[[("🛑 Yes, kill it", _CB_KILL_GO), ("↩️ Leave it running", _CB_KILL_NO)]])
+        buttons=[[("🛑 Yes, kill it", _CB_KILL_GO), ("↩️ Leave it running", _CB_KILL_NO)]],
+        parse_mode=PARSE_HTML)
 
 
 def _do_kill(tg: Tg, chat_id: int) -> None:
@@ -4560,11 +4561,17 @@ def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
 
         if recompressed:
             cost = _RECOMPRESSION_COST.get(recompressed)
+            # _esc on a module constant looks redundant until you read the
+            # video measurement: it quotes "13,196 -> 6,603 kbps", and a bare
+            # ">" in a parse_mode=HTML body makes Telegram reject the WHOLE
+            # message — the user would get no warning at all, which is worse
+            # than the literal <tg-emoji> tag this parse_mode was added to fix.
             tg.send_message(chat_id,
                             f"{ICON_WARN} that arrived as a {recompressed}, not a File — "
-                            f"measured 2026-08-31, {cost}. Accepted anyway; "
+                            f"measured 2026-08-31, {_esc(cost)}. Accepted anyway; "
                             "send it again as a File if this run doesn't come "
-                            "out right.")
+                            "out right.",
+                            parse_mode=PARSE_HTML)
 
         _CONFIRM_WARNED.discard(chat_id)
 
