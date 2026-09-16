@@ -62,6 +62,19 @@ MEASURED_STAGE_SEC = {
 # a bot restart (a restarted bot has no drain of its own running yet).
 _RUNNING: dict[Path, subprocess.Popen] = {}
 
+# Popen handles for Phase A runs (local try-on, no pod). Kept SEPARATE from
+# _RUNNING: drain_running() being True makes bot._do_confirm route the job
+# into the mailbox so chain_or_teardown picks it up on a pod already paid for,
+# and Phase A has no pod — sharing the dict would queue a job into its own
+# mailbox. busy() is the union, for the guards that exist because drain.py
+# READS the manifest file rather than because a pod is billed.
+_PHASE_A: dict[Path, subprocess.Popen] = {}
+# Exit codes collected from finished Phase A processes, keyed the same way.
+# Kept after the handle is reaped so the tick that acts on the code cannot
+# race itself between two polls, and so a code is never lost by being read
+# twice.
+_PHASE_A_RC: dict[Path, int] = {}
+
 
 def estimate_minutes(job: Job) -> int:
     """A minutes estimate to show BEFORE [Confirm], never presented as a promise.
@@ -280,6 +293,39 @@ def start_drain(manifest_path: Path, *, dry_run: bool,
     return proc
 
 
+def start_phase_a(manifest_path: Path, *, resume: bool = False,
+                  force_local: bool = False) -> subprocess.Popen:
+    """Launch the local try-on phase only. NEVER appends CONFIRM=yes.
+
+    That is the whole point of this function existing beside start_drain
+    rather than inside it: `grep -rn CONFIRM scripts/tgbot/` must keep showing
+    exactly one executable hit, in start_drain's dry_run gate, and this is a
+    second subprocess launcher that must not become a second one. Phase A
+    spends Gemini quota and writes the journal; it cannot rent anything,
+    because drain.py's --phase-a-only returns before provision() — and before
+    the --yes gate, which is why no --yes belongs in this argv either
+    (drain.py:313-343).
+
+    Same log-file-not-a-pipe shape as start_drain, for the same reason: a
+    Popen pipe nobody reads fills its OS buffer and deadlocks the child.
+    Phase A is minutes rather than hours, but a 12-run batch of Gemini calls
+    is enough output to matter.
+    """
+    argv = ["make", "drain", f"FILE={manifest_path}", "PHASE_A=1"]
+    if resume:
+        argv.append("RESUME=1")
+    if force_local:
+        argv.append("FORCE_LOCAL=1")
+
+    log_path = manifest_path.with_suffix(".phase-a.log")
+    with open(log_path, "ab") as log_file:
+        proc = subprocess.Popen(argv, cwd=ROOT, stdout=log_file, stderr=subprocess.STDOUT)
+    key = manifest_path.resolve()
+    _PHASE_A[key] = proc
+    _PHASE_A_RC.pop(key, None)   # a fresh run invalidates the last one's code
+    return proc
+
+
 def lease_for(manifest_path: Path):
     """The on-disk lease if it names THIS manifest, else None.
 
@@ -326,6 +372,50 @@ def drain_running(manifest_path: Path) -> bool:
         return True
 
     return lease_for(manifest_path) is not None
+
+
+def phase_a_running(manifest_path: Path) -> bool:
+    """True while THIS process has a Phase A child alive.
+
+    Popen-only, no lease fallback the way drain_running has: a lease is
+    written at provision time and Phase A never provisions, so there is
+    nothing on disk to recover from. The consequence is deliberate and
+    acceptable — a restarted bot loses track of an in-flight Phase A. It
+    rents nothing, so the worst case is that the user taps Run again, and
+    with resume=True the finished try-ons are skipped rather than re-billed.
+    """
+    proc = _PHASE_A.get(manifest_path.resolve())
+    return proc is not None and proc.poll() is None
+
+
+def phase_a_exit(manifest_path: Path) -> int | None:
+    """The finished Phase A's exit code, or None if it is still running.
+
+    Recorded once and kept, so the tick that acts on it is idempotent: a
+    second poll after the handle is reaped still answers, and answering None
+    there would strand the chat with a progress message and no panel.
+    """
+    key = manifest_path.resolve()
+    proc = _PHASE_A.get(key)
+    if proc is None:
+        return _PHASE_A_RC.get(key)
+    rc = proc.poll()
+    if rc is None:
+        return None
+    _PHASE_A_RC[key] = rc
+    return rc
+
+
+def busy(manifest_path: Path) -> bool:
+    """Anything holding this manifest — a billed drain OR an unpaid Phase A.
+
+    Use this for the guards that exist because drain.py READS the manifest
+    file (/clear, /wipe, _render_and_validate's write guard): overwriting a
+    file a running child is about to re-read corrupts its input. Keep using
+    drain_running() for the guards that exist because a POD IS BILLED —
+    conflating them would let an unpaid try-on phase block a kill.
+    """
+    return drain_running(manifest_path) or phase_a_running(manifest_path)
 
 
 def final_files(batch_dir: Path) -> list[Path]:

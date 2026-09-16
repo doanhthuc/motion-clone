@@ -1,4 +1,5 @@
 # scripts/tests/test_batch_tgrun.py
+import ast
 import json
 import subprocess
 import sys
@@ -203,6 +204,126 @@ class TestStartDrainArgv(unittest.TestCase):
         argv = self._argv(dry_run=True, force_local=True)
         self.assertIn("FORCE_LOCAL=1", argv)
         self.assertNotIn("CONFIRM=yes", argv)
+
+
+class TestStartPhaseA(unittest.TestCase):
+    """Phase A is a second subprocess launcher sitting next to the one that
+    holds the money gate, so its argv is asserted with the same care.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.manifest = self.tmp / "tg-1.yaml"
+        self.manifest.write_text("runs: []\n", encoding="utf-8")
+        self._orig_running = dict(run_mod._RUNNING)
+        self._orig_phase_a = dict(run_mod._PHASE_A)
+        self._orig_phase_a_rc = dict(run_mod._PHASE_A_RC)
+        self._orig_lease_path = run_mod.LEASE_PATH
+        run_mod._RUNNING.clear()
+        run_mod._PHASE_A.clear()
+        run_mod.LEASE_PATH = Path(tempfile.mkdtemp()) / "no-lease.json"
+
+    def tearDown(self):
+        run_mod._RUNNING.clear()
+        run_mod._RUNNING.update(self._orig_running)
+        run_mod._PHASE_A.clear()
+        run_mod._PHASE_A.update(self._orig_phase_a)
+        # _PHASE_A_RC is cleared here as well as saved: phase_a_exit() writes
+        # into it by design (that is what makes the tick idempotent), so two of
+        # these tests mutate it and an unrestored dict would carry an exit code
+        # into whatever runs next.
+        run_mod._PHASE_A_RC.clear()
+        run_mod._PHASE_A_RC.update(self._orig_phase_a_rc)
+        run_mod.LEASE_PATH = self._orig_lease_path
+
+    def _argv(self, **kwargs) -> list[str]:
+        with mock.patch.object(run_mod.subprocess, "Popen") as popen:
+            popen.return_value = _FakeProc(poll_return=None)
+            run_mod.start_phase_a(self.manifest, **kwargs)
+        return popen.call_args.args[0]
+
+    def test_never_appends_confirm_yes(self):
+        # THE invariant. grep -rn CONFIRM scripts/tgbot/ must still show one
+        # executable hit, inside start_drain's dry_run gate, and this function
+        # must not be a second one.
+        for kwargs in ({}, {"resume": True}, {"force_local": True},
+                       {"resume": True, "force_local": True}):
+            self.assertNotIn("CONFIRM=yes", self._argv(**kwargs))
+
+    def test_confirm_yes_still_appears_in_exactly_one_executable_line(self):
+        # The argv assertion above only covers start_phase_a's own call. This
+        # is the repo-wide grep run.py:259 has always asked a human to do, made
+        # a test: a third launcher added later that appends CONFIRM=yes
+        # somewhere else fails here instead of silently becoming a second way
+        # to rent a pod.
+        #
+        # AST, not text search. Measured 2026-09-17: `grep -n CONFIRM=yes
+        # run.py` returns NINE lines, of which exactly one (run.py:283) is
+        # executable. The other eight sit in FOUR docstring bodies — the AST
+        # nodes at lines 1, 256, 298 and 349 — and two of them defeat the
+        # obvious shortcuts directly: line 274 wraps the string in literal
+        # double quotes, so searching for the quoted form finds prose, and
+        # line 365 wraps it in backticks, so it is not even greppable as
+        # `"CONFIRM=yes"`. Neither "skip lines starting with a comment or a
+        # triple quote" nor "search for the quoted form" gives one hit.
+        # Walking the tree and excluding docstring nodes does, and comments
+        # are not nodes at all.
+        root = Path(run_mod.__file__).resolve().parent
+        hits = []
+        for path in sorted(root.rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            docstrings = set()
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef,
+                                     ast.AsyncFunctionDef)) \
+                        and node.body and isinstance(node.body[0], ast.Expr) \
+                        and isinstance(node.body[0].value, ast.Constant) \
+                        and isinstance(node.body[0].value.value, str):
+                    docstrings.add(id(node.body[0].value))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Constant) and isinstance(node.value, str) \
+                        and "CONFIRM=yes" in node.value and id(node) not in docstrings:
+                    hits.append(f"{path.name}:{node.lineno}: {node.value!r}")
+        self.assertEqual(
+            len(hits), 1,
+            "CONFIRM=yes must appear in exactly one executable string literal "
+            f"in scripts/tgbot/ — start_drain's dry_run gate. Found: {hits}")
+        self.assertIn("run.py", hits[0])
+
+    def test_sets_the_phase_a_variable(self):
+        self.assertIn("PHASE_A=1", self._argv())
+
+    def test_forwards_resume_and_force_local(self):
+        argv = self._argv(resume=True, force_local=True)
+        self.assertIn("RESUME=1", argv)
+        self.assertIn("FORCE_LOCAL=1", argv)
+
+    def test_a_live_phase_a_does_not_make_drain_running_true(self):
+        # drain_running True routes a job into the mailbox so chain_or_teardown
+        # picks it up on a pod already paid for. Phase A has no pod, so
+        # reusing _RUNNING would queue a job into its own mailbox.
+        run_mod._PHASE_A[self.manifest.resolve()] = _FakeProc(poll_return=None)
+        self.assertFalse(run_mod.drain_running(self.manifest))
+        self.assertTrue(run_mod.phase_a_running(self.manifest))
+        self.assertTrue(run_mod.busy(self.manifest))
+
+    def test_busy_is_true_for_a_drain_too(self):
+        run_mod._RUNNING[self.manifest.resolve()] = _FakeProc(poll_return=None)
+        self.assertTrue(run_mod.busy(self.manifest))
+        self.assertFalse(run_mod.phase_a_running(self.manifest))
+
+    def test_exit_code_is_none_while_running_and_read_once_finished(self):
+        self.assertIsNone(run_mod.phase_a_exit(self.manifest))
+        run_mod._PHASE_A[self.manifest.resolve()] = _FakeProc(poll_return=3)
+        self.assertEqual(run_mod.phase_a_exit(self.manifest), 3)
+
+    def test_a_finished_phase_a_is_no_longer_busy(self):
+        run_mod._PHASE_A[self.manifest.resolve()] = _FakeProc(poll_return=0)
+        self.assertFalse(run_mod.phase_a_running(self.manifest))
+        self.assertFalse(run_mod.busy(self.manifest))
+        # The exit code survives the process being reaped, so the tick that
+        # collects it cannot race itself between two polls.
+        self.assertEqual(run_mod.phase_a_exit(self.manifest), 0)
 
 
 class TestEstimateMinutes(unittest.TestCase):

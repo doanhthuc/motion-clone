@@ -49,9 +49,9 @@ from tgbot.ingest import (Probe, describe, probe, quality_warning,
 from tgbot.job import (DEFAULT_PROVIDER, Job, _tryon_stage, missing_slots,
                        run_id_for, slot_for, write_manifest)
 from tgbot.preview import sheet, slot_preview
-from tgbot.run import (LEASE_PATH, _RUNNING, drain_running, estimate_minutes,
-                       final_files, lease_for, progress_text, start_drain,
-                       summary_text)
+from tgbot.run import (LEASE_PATH, _RUNNING, busy, drain_running,
+                       estimate_minutes, final_files, lease_for,
+                       progress_text, start_drain, summary_text)
 from batchlib_ext.gpu_stock import stock_at, stock_at_cached, volume_datacenter
 from batchlib_ext.handoff import handoff_path, mailbox_path, read_handoff
 from batchlib_ext.lease import clear_lease
@@ -3193,10 +3193,16 @@ def _ask_to_clear(tg: Tg, chat_id: int) -> None:
 
 def _clear_job(tg: Tg, chat_id: int) -> None:
     """Throw away the draft, the queue and the staged files for this chat."""
-    if drain_running(_job_manifest_path(chat_id)):
+    if busy(_job_manifest_path(chat_id)):
         # The staged files ARE the running job's inputs — the manifest points
         # straight at them — so deleting them mid-drain breaks a run that is
         # already being paid for.
+        #
+        # busy(), not drain_running(): an unpaid Phase A reads this same
+        # manifest, so it corrupts the same way. The distinction is the point
+        # of the two predicates — this guard exists because a child READS the
+        # file, not because a pod is billed, and /kill stays on drain_running
+        # so a try-on phase can never block one.
         tg.send_message(chat_id, "a drain is running for this job — clearing "
                                  "now would delete the files it is reading. "
                                  "Wait for it, then /clear.")
@@ -3262,12 +3268,15 @@ def _wipe_chat(tg: Tg, chat_id: int) -> None:
     """Delete every tracked message in this chat and the job being
     assembled, in one action (2026-09-02) — a chat clean enough to restart in.
 
-    Shares /clear's drain guard rather than repeating it: the staged files
+    Shares /clear's manifest guard rather than repeating it: the staged files
     ARE a running job's inputs, and its progress message is the one thing
     telling the user it is still going, so a live drain refuses the whole
     thing, not only the file half.
     """
-    if drain_running(_job_manifest_path(chat_id)):
+    if busy(_job_manifest_path(chat_id)):
+        # busy() for the reason _clear_job's guard gives: this is the
+        # manifest-is-being-read guard, not the pod-is-billed one, so an
+        # unpaid Phase A has to refuse it too.
         tg.send_message(chat_id, f"{ICON_ALERT_CE} a drain is running for this chat's job — "
                                  "wiping now would delete the files it is "
                                  "reading, and the message that tells you "

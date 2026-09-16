@@ -15,6 +15,7 @@ from batchlib_ext.provision_failure import (ProvisionFailure,
                                             read_provision_failure,
                                             write_provision_failure)
 import tgbot.bot as bot
+import tgbot.run as run_mod
 from tgbot.bot import allowed
 from tgbot.ingest import Probe
 from tgbot.job import missing_slots, write_manifest
@@ -2497,7 +2498,12 @@ class TestFlow(unittest.TestCase):
         """
         with mock.patch("tgbot.bot.drain_running", return_value=False):
             self._fill_required_slots()
-        with mock.patch("tgbot.bot.drain_running", return_value=True):
+        # `busy`, not `drain_running`: the guard has called busy() since Phase
+        # A arrived, and busy() resolves drain_running inside tgbot.run's own
+        # namespace — so patching tgbot.bot.drain_running no longer reaches it.
+        # The slot-filling patch above stays on drain_running because
+        # _render_and_validate is a different guard and still calls that.
+        with mock.patch("tgbot.bot.busy", return_value=True):
             bot.handle(self.tg, cb_from(ME, bot._CB_CLEAR_GO), allowed_user_id=ME)
         self.assertIn("a drain is running", self.tg.messages[-1])
         self.assertTrue(self.staged("driver.mp4").exists())
@@ -2556,7 +2562,7 @@ class TestFlow(unittest.TestCase):
         self.tg = bot._track_sends(self.tg)
         with mock.patch("tgbot.bot.drain_running", return_value=False):
             self._fill_required_slots()
-        with mock.patch("tgbot.bot.drain_running", return_value=True):
+        with mock.patch("tgbot.bot.busy", return_value=True):   # see /clear's
             bot.handle(self.tg, cb_from(ME, bot._CB_WIPE_GO), allowed_user_id=ME)
         self.assertIn("a drain is running", self.tg.messages[-1])
         self.assertTrue(self.staged("driver.mp4").exists())
@@ -5606,6 +5612,73 @@ class TestConfirmAsksBeforeReusingTryon(TestFlow):
         # dropped choice unmentioned.
         self.assertIn("/again", msg)
         self.assertIsNone(bot._STATE.get(ME))
+
+
+class _AliveProc:
+    """Stands in for a Popen handle whose child has not exited: only .poll()
+    is ever read by run.drain_running / run.phase_a_running."""
+
+    def poll(self):
+        return None
+
+
+class TestPhaseABlocksManifestMutation(unittest.TestCase):
+    """A live Phase A reads the same manifest file a drain does, so the guards
+    that exist because drain.py reads that file have to cover it too.
+
+    Both guards are reached through their confirm BUTTON, not through the
+    `/clear` and `/wipe` commands: those only call `_ask_to_clear` /
+    `_ask_to_wipe`, which ask the question and return. The refusal lives in
+    `_clear_job` and `_wipe_chat`, one step later.
+    """
+
+    def setUp(self):
+        self._orig_root = bot.ROOT
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "batch").mkdir()
+        bot.ROOT = self.root
+        reset_bot_state()
+        # The per-chat path, not an arbitrary name: it is the exact argument
+        # both guards pass to busy(), so a fixture that spelled it differently
+        # would describe a file nothing reads.
+        self.manifest = bot._job_manifest_path(ME)
+        self.manifest.write_text("runs: []\n", encoding="utf-8")
+        self.tg = FakeTg()
+
+    def tearDown(self):
+        bot.ROOT = self._orig_root
+
+    def test_clear_is_refused_while_phase_a_runs(self):
+        with mock.patch("tgbot.bot.busy", return_value=True):
+            bot.handle(self.tg, cb_from(ME, bot._CB_CLEAR_GO), allowed_user_id=ME)
+        self.assertIn("drain is running", self.tg.messages[-1])
+
+    def test_wipe_is_refused_while_phase_a_runs(self):
+        # /wipe shares /clear's guard and adds its own, for the progress
+        # message that is the only thing telling the user a phase is still
+        # going — so a live Phase A has to stop the whole thing, not only the
+        # file half.
+        with mock.patch("tgbot.bot.busy", return_value=True):
+            bot.handle(self.tg, cb_from(ME, bot._CB_WIPE_GO), allowed_user_id=ME)
+        self.assertIn("drain is running", self.tg.messages[-1])
+
+    def test_a_still_billed_pod_also_refuses_clear(self):
+        # The two tests above patch `busy`, which proves the guard CALLS it
+        # but not that it still answers True for the case it replaced. That
+        # case is the money one — a pod at $0.99/hour whose inputs are about
+        # to be deleted — so here it is asserted through the real predicate:
+        # a not-yet-exited handle in run._RUNNING and nothing patching busy
+        # or drain_running.
+        key = bot._job_manifest_path(ME).resolve()
+        orig_lease_path = run_mod.LEASE_PATH
+        run_mod.LEASE_PATH = Path(tempfile.mkdtemp()) / "no-lease.json"
+        run_mod._RUNNING[key] = _AliveProc()
+        try:
+            bot.handle(self.tg, cb_from(ME, bot._CB_CLEAR_GO), allowed_user_id=ME)
+        finally:
+            run_mod._RUNNING.pop(key, None)
+            run_mod.LEASE_PATH = orig_lease_path
+        self.assertIn("drain is running", self.tg.messages[-1])
 
 
 if __name__ == "__main__":
