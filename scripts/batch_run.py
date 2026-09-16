@@ -105,7 +105,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--fail-fast", action="store_true")
     ap.add_argument("--no-start", action="store_true", help="không tự make gpu-up")
     ap.add_argument("--force-local", action="store_true",
-                    help="chạy lại try-on local kể cả khi journal nói đã xong")
+                    help="re-run local try-on even when the journal says it is done")
     args = ap.parse_args(argv)
 
     try:
