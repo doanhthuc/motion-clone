@@ -2808,12 +2808,12 @@ EOF
 
 **Files:**
 - Modify: `scripts/batchlib/runner.py` (new `has_local_tryon`, next to `preserved_local_tryon`)
-- Modify: `scripts/tgbot/bot.py` (imports; new `_manifest_write_ok` / `_offer_run_for_chat` / `_job_has_local_tryon` / `_do_phase_a` / `_start_phase_a_and_report`; the `_CB_RUN_GO` branch ~line 1538; the four `_offer_run_confirm` call sites at ~1465/1479/1496/1512; `_render_and_validate`'s write guard ~line 944; `BOT_COMMANDS` ~line 4898; `/start`'s money line ~line 4865; the poll-cadence condition)
+- Modify: `scripts/tgbot/bot.py` (imports; new `_manifest_write_ok` / `_offer_run_for_chat` / `_job_has_local_tryon` / `_do_phase_a` / `_start_phase_a_and_report`; the `_CB_RUN_GO` branch at `:1587`; the four `_offer_run_confirm` call sites at `:1514`, `:1528`, `:1545`, `:1561`; `_render_and_validate`'s write guard at `:980`; `BOT_COMMANDS`' confirm entry at `:5113`; `/start`'s money line at `:5080`; the poll-cadence `animating` condition feeding `:5181`; the `/clear` and `/wipe` refusal strings at `:3206` and `:3280`; and a Phase A brake using `run.stop_phase_a`)
 - Test: `scripts/tests/test_batch_runner.py`, `scripts/tests/test_batch_bot.py`
 
 **Interfaces:**
-- Consumes: `start_phase_a`, `busy` (Task 7); `has_local_tryon` (added to `runner.py` in this task); `_offer_run_confirm(phase_a=)` (Task 8); `_start_progress`, `_jobs_for`, `_job_manifest_path`, `render_manifest`, `write_manifest` (all existing)
-- Produces: `_offer_run_for_chat`, `_job_has_local_tryon`, `_do_phase_a`, `_start_phase_a_and_report`, `_manifest_write_ok` in `bot.py`; `has_local_tryon(manifest: Manifest) -> bool` in `runner.py`. Nothing after this task depends on them — it is the wiring task.
+- Consumes: `start_phase_a`, `busy`, `phase_a_running`, `stop_phase_a` (Task 7); `_offer_run_confirm(spend_cb=, heading=)` (Task 8 — note `phase_a=` is added by **this** task's Step 4, not by Task 8); `_start_progress(..., phase=)` and `tick_phase_a` (Task 9); `_start_progress`, `_jobs_for`, `_job_manifest_path`, `render_manifest`, `write_manifest` (all existing)
+- Produces: `_offer_run_for_chat`, `_job_has_local_tryon`, `_do_phase_a`, `_start_phase_a_and_report`, `_manifest_write_ok` in `bot.py`; `has_local_tryon(manifest: Manifest) -> bool` in `runner.py`; and `_offer_run_confirm(..., phase_a: bool = False)`. Nothing after this task depends on them — it is the wiring task.
 
 - [ ] **Step 1: Write the failing tests**
 
