@@ -2498,12 +2498,14 @@ class TestFlow(unittest.TestCase):
         """
         with mock.patch("tgbot.bot.drain_running", return_value=False):
             self._fill_required_slots()
-        # `busy`, not `drain_running`: the guard has called busy() since Phase
-        # A arrived, and busy() resolves drain_running inside tgbot.run's own
-        # namespace — so patching tgbot.bot.drain_running no longer reaches it.
-        # The slot-filling patch above stays on drain_running because
-        # _render_and_validate is a different guard and still calls that.
-        with mock.patch("tgbot.bot.busy", return_value=True):
+        # Patched in tgbot.run, not tgbot.bot: the guard calls busy(), which
+        # resolves drain_running through its OWN module's globals, so a patch
+        # on tgbot.bot's name cannot reach it. Patching `busy` instead would
+        # reach the guard but restate its own condition — this test is named
+        # for a DRAIN, so make the real busy() see one. The slot-filling patch
+        # above stays on tgbot.bot.drain_running because _render_and_validate
+        # is a different guard and calls that name directly.
+        with mock.patch("tgbot.run.drain_running", return_value=True):
             bot.handle(self.tg, cb_from(ME, bot._CB_CLEAR_GO), allowed_user_id=ME)
         self.assertIn("a drain is running", self.tg.messages[-1])
         self.assertTrue(self.staged("driver.mp4").exists())
@@ -2562,7 +2564,8 @@ class TestFlow(unittest.TestCase):
         self.tg = bot._track_sends(self.tg)
         with mock.patch("tgbot.bot.drain_running", return_value=False):
             self._fill_required_slots()
-        with mock.patch("tgbot.bot.busy", return_value=True):   # see /clear's
+        # tgbot.run, for the namespace reason /clear's refusal test gives.
+        with mock.patch("tgbot.run.drain_running", return_value=True):
             bot.handle(self.tg, cb_from(ME, bot._CB_WIPE_GO), allowed_user_id=ME)
         self.assertIn("a drain is running", self.tg.messages[-1])
         self.assertTrue(self.staged("driver.mp4").exists())
@@ -5679,6 +5682,30 @@ class TestPhaseABlocksManifestMutation(unittest.TestCase):
             run_mod._RUNNING.pop(key, None)
             run_mod.LEASE_PATH = orig_lease_path
         self.assertIn("drain is running", self.tg.messages[-1])
+
+    def test_a_still_billed_pod_also_refuses_wipe(self):
+        # /wipe is the more destructive of the two guards — it takes the job's
+        # staged inputs AND the messages that tell the user a run is still
+        # going — so it is the one that more needs an unmocked proof. Same
+        # shape as /clear's above: a live handle in run._RUNNING, a lease path
+        # pointing nowhere, and nothing patched anywhere in the path.
+        key = bot._job_manifest_path(ME).resolve()
+        orig_lease_path = run_mod.LEASE_PATH
+        run_mod.LEASE_PATH = Path(tempfile.mkdtemp()) / "no-lease.json"
+        run_mod._RUNNING[key] = _AliveProc()
+        try:
+            bot.handle(self.tg, cb_from(ME, bot._CB_WIPE_GO), allowed_user_id=ME)
+        finally:
+            run_mod._RUNNING.pop(key, None)
+            run_mod.LEASE_PATH = orig_lease_path
+        self.assertIn("drain is running", self.tg.messages[-1])
+        # The refusal has to be the last word: were the guard to send it and
+        # then fall through, _wipe_chat would go on to sweep the ledger and
+        # report "Wiped." — the destructive half this test exists to prove did
+        # not happen. Asserted on its own rather than inferred from message
+        # order, since that order is the thing a future edit would change.
+        self.assertFalse(any("Wiped" in t for t in self.tg.screen),
+                         "_wipe_chat swept the chat despite refusing")
 
 
 if __name__ == "__main__":

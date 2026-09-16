@@ -326,6 +326,43 @@ def start_phase_a(manifest_path: Path, *, resume: bool = False,
     return proc
 
 
+def stop_phase_a(manifest_path: Path) -> bool:
+    """Terminate a live Phase A child. True if one was running and got stopped.
+
+    Exists because moving Phase A out of the drain's Popen removed the only brake
+    on it. Before that change /kill reached Phase A through _RUNNING — _do_kill
+    terminates that handle (bot.py:4169-4176) — and after it, nothing does:
+    _ask_kill gates on drain_running, which is False during Phase A, so the bot
+    answers "there is no pod to kill" while a 12-run batch of hosted try-on calls
+    keeps spending. /kill is about forfeiting a PAID pod and Phase A has no pod,
+    so the answer is not to widen /kill's meaning but to give Phase A its own
+    stop path.
+
+    SIGTERM then SIGKILL after a short wait, matching _do_kill's shape. Unlike a
+    drain there is no teardown afterwards: Phase A rents nothing, so there is no
+    pod to destroy and no lease to clear.
+
+    The handle is deliberately LEFT in _PHASE_A rather than popped, so
+    phase_a_exit still answers with the negative signal code and the tick that
+    reports it stays idempotent. Task 9's failure branch is what the user sees.
+    """
+    key = manifest_path.resolve()
+    proc = _PHASE_A.get(key)
+    # An already-exited child is not a stop, and saying so is the whole
+    # contract: the return value is how Task 10's caller picks its message, so
+    # answering True for a child that finished by itself would tell the user
+    # they halted a run that had already completed — including one that
+    # succeeded, which is the version of this lie that costs trust.
+    if proc is None or proc.poll() is not None:
+        return False
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    return True
+
+
 def lease_for(manifest_path: Path):
     """The on-disk lease if it names THIS manifest, else None.
 
@@ -383,6 +420,17 @@ def phase_a_running(manifest_path: Path) -> bool:
     acceptable — a restarted bot loses track of an in-flight Phase A. It
     rents nothing, so the worst case is that the user taps Run again, and
     with resume=True the finished try-ons are skipped rather than re-billed.
+
+    "Worst case" there is money, and it understates the real one: losing the
+    handle also makes busy() False, and busy() is what _clear_job and
+    _wipe_chat gate on — so a bot restarted with a Phase A still in flight
+    lets /clear reach its shutil.rmtree(batch/tg-staging/<chat>/) and delete
+    the files the orphaned child is reading. That is precisely the harm those
+    two guards exist to prevent. It stays acceptable because nothing is
+    billed, the window is one restart inside a minutes-long phase, and the
+    child's resulting failure is recoverable with resume=True — not a licence
+    to widen the window (a longer phase, or another guard moved off busy)
+    without closing the blindness at the same time.
     """
     proc = _PHASE_A.get(manifest_path.resolve())
     return proc is not None and proc.poll() is None
@@ -410,8 +458,9 @@ def busy(manifest_path: Path) -> bool:
     """Anything holding this manifest — a billed drain OR an unpaid Phase A.
 
     Use this for the guards that exist because drain.py READS the manifest
-    file (/clear, /wipe, _render_and_validate's write guard): overwriting a
-    file a running child is about to re-read corrupts its input. Keep using
+    file (/clear, /wipe; _render_and_validate's write guard moves here in
+    Task 10 — it still reads drain_running until then): overwriting a file a
+    running child is about to re-read corrupts its input. Keep using
     drain_running() for the guards that exist because a POD IS BILLED —
     conflating them would let an unpaid try-on phase block a kill.
     """
