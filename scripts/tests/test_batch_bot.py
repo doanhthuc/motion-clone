@@ -6059,6 +6059,31 @@ class TestTickPhaseA(unittest.TestCase):
         offer.assert_called_once()
         self.assertFalse(bot._progress_path(ME).exists())
 
+    def test_the_file_is_cleared_even_when_rendering_the_panel_raises(self):
+        # The unlink has to precede the render, not follow it. _offer_run_confirm
+        # sends a Telegram message and so can raise TgError — flood limits and
+        # network failures are routine, which is why tick_progress wraps its own
+        # edit in try/except TgError. An unlink written behind a raise never
+        # runs, and the state that leaves behind is the one the test above
+        # exists to prevent: the file survives, `animating =
+        # _progress_path(...).exists()` pins the poll loop at 2s forever, and
+        # the message stays frozen on "running the try-on" with nothing running
+        # and no path left to clear it. Losing the panel is the cheaper failure
+        # — /status still reports the batch and /again still reloads it.
+        # assertRaises rather than a tolerant catch: it is what proves the mock
+        # really fired, so this test cannot pass vacuously once the unlink moves.
+        from tgbot.tgclient import TgError
+        with mock.patch("tgbot.bot.phase_a_running", return_value=False), \
+             mock.patch("tgbot.bot.phase_a_exit", return_value=3), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value={}), \
+             mock.patch("tgbot.bot._offer_run_confirm",
+                        side_effect=TgError("Too Many Requests",
+                                            retry_after=42.0)):
+            with self.assertRaises(TgError):
+                bot.tick_phase_a(self.tg, ME)
+        self.assertFalse(bot._progress_path(ME).exists())
+
     def test_the_exit_three_path_previews_a_tryon_that_finished_in_its_last_tick(self):
         # deliver_result sends _final/*.mp4 only, so a try-on image recorded
         # done inside the final tick is never shown unless this branch previews

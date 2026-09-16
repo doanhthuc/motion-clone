@@ -3128,14 +3128,26 @@ def tick_phase_a(tg: Tg, chat_id: int, *, dry_run: bool = False) -> None:
         # second panel: its sold-out branch already drops the spend button
         # instead of leaving it enabled on a promise that can only fail
         # (2026-09-12, reported live: "5090 đã hết mà nút spend vẫn enable").
+        #
+        # Unlinked BEFORE the render, not after — the natural reading order is
+        # the other way, so this is worth spelling out. _offer_run_confirm sends
+        # a message and can raise TgError (flood limit, network), and an unlink
+        # that sits behind a raise never runs. The stranded file would pin the
+        # poll loop at 2s forever via `animating = _progress_path(...).exists()`
+        # and freeze the message on "running the try-on" with nothing running —
+        # the exact state this branch's unlink exists to prevent, and one no
+        # other code path clears. Losing the panel to a TgError is the cheaper
+        # failure: /status still reports the batch and /again still reloads it,
+        # and the poll loop returns to its 50s idle cadence.
+        # Not hoisted above _deliver_tryon_previews either, which looks like the
+        # tidier version of the same idea: that call rewrites this very file
+        # whenever it sends a preview, so an earlier unlink would be undone and
+        # leave the file stranded with `offered` already set.
+        path.unlink(missing_ok=True)
         _offer_run_confirm(
             tg, chat_id,
             spend_cb=f"{_CB_PHASE_A_SPEND}{_run_token(chat_id)}",
             heading=f"{ICON_NVIDIA_CE} <b>Try-on finished</b> — now rent a GPU?")
-        # Last, like the other two branches: this file's existence is what holds
-        # the poll loop at its 2s cadence, and from here the panel is the only
-        # thing the user needs to act on.
-        path.unlink(missing_ok=True)
     elif rc == 0:
         path.unlink(missing_ok=True)
         deliver_result(tg, chat_id, manifest_path)
