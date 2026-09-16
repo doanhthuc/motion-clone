@@ -72,6 +72,18 @@ COMFY_MODELS_DIR = "comfy-models"
 # 2026-08-29, docs/gpu-pod.md#volume-migrate.
 MAX_RSYNC_THREADS = 8
 
+# The temp CPU pods never hold volume data on their container disk — the
+# Network Volume is mounted separately at /workspace (_cpu_pod_body's
+# networkVolumeId), and sync() rsyncs straight from pod A to pod B over ssh,
+# never through this machine or onto either pod's container disk. So the
+# container disk only needs room for the base image (runpod/base:0.6.2-cpu)
+# plus a temp SSH key. A fixed size, not one that grows with the volume, is
+# both correct and required: cpu5c×4vCPU has its own containerDiskInGb cap of
+# 60 (confirmed 2026-09-16 — `size_gb + 20` on a 100GB volume asked for 120
+# and RunPod rejected the pod create with "Container Disk must be less than
+# or equal to 60").
+TEMP_POD_DISK_GB = 20
+
 # An exception message on its way into the progress file — and from there,
 # verbatim, into a Telegram message (tgbot.bot.tick_migration_progress). Long
 # enough to name the failure, short enough that a phone still shows the rest
@@ -639,8 +651,10 @@ def main(argv: list[str]) -> int:
         pod_b: str | None = None
         priv: Path | None = None
         try:
-            pod_a = provision_temp_pod("migrate-tmp-a", old_volume_id, source_dc, size_gb + 20)
-            pod_b = provision_temp_pod("migrate-tmp-b", new_volume_id, args.to_dc, size_gb + 20)
+            pod_a = provision_temp_pod("migrate-tmp-a", old_volume_id, source_dc,
+                                       TEMP_POD_DISK_GB)
+            pod_b = provision_temp_pod("migrate-tmp-b", new_volume_id, args.to_dc,
+                                       TEMP_POD_DISK_GB)
             write_migrate_lease(LEASE_PATH, MigrateLease(
                 pod_a_id=pod_a, pod_b_id=pod_b, started_at=time.time(), to_dc=args.to_dc))
 

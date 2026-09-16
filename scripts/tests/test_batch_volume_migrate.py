@@ -707,6 +707,23 @@ class TestMainEndToEnd(unittest.TestCase):
             volume_migrate.teardown_temp_pods.assert_called_once_with("pod-a", "pod-b")
         self.assertIn("no entries", str(cm.exception))
 
+    def test_temp_pod_disk_does_not_scale_with_volume_size(self):
+        # Regression: `size_gb + 20` used to size the temp pods' container
+        # disk off the Network Volume's size, but that disk never holds
+        # volume data (sync() rsyncs pod A -> pod B directly, over the
+        # mounted volume). On a 100GB volume that asked for 120GB and RunPod
+        # rejected the create — cpu5c x4vCPU caps containerDiskInGb at 60.
+        tmpdir = Path(tempfile.mkdtemp())
+        with self._wired(tmpdir) as stack:
+            stack.enter_context(mock.patch.object(
+                volume_migrate, "create_volume",
+                return_value=("vol-new", 100, "EU-RO-1")))
+            volume_migrate.main(["--to-dc", "EU-CZ-1", "--yes"])
+            for call in volume_migrate.provision_temp_pod.call_args_list:
+                disk_gb = call.args[3]
+                self.assertEqual(disk_gb, volume_migrate.TEMP_POD_DISK_GB)
+                self.assertLessEqual(disk_gb, 60)
+
     def test_a_provisioning_failure_still_tears_down_whatever_was_created(self):
         tmpdir = Path(tempfile.mkdtemp())
         with self._wired(tmpdir, provision=("pod-a", RuntimeError("no capacity"))):
