@@ -37,6 +37,7 @@ from batchlib.runner import preserved_local_tryon
 # it, do not reimplement" for failed_job_ids rather than re-deriving "did this
 # run fail" from state.json by hand a second time.
 from drain import failed_job_ids
+from batch_run import EXIT_NEEDS_POD
 # Absolute, NOT `from .tgclient import ...`. This file runs as
 # `python3 scripts/tgbot/bot.py`, i.e. as __main__, where a relative import
 # raises ImportError regardless of sys.path. The insert above puts scripts/ on
@@ -51,6 +52,7 @@ from tgbot.job import (DEFAULT_PROVIDER, Job, _tryon_stage, missing_slots,
 from tgbot.preview import sheet, slot_preview
 from tgbot.run import (LEASE_PATH, _RUNNING, busy, drain_running,
                        estimate_minutes, final_files, lease_for,
+                       phase_a_exit, phase_a_running,
                        progress_text, start_drain, summary_text)
 from batchlib_ext.gpu_stock import stock_at, stock_at_cached, volume_datacenter
 from batchlib_ext.handoff import handoff_path, mailbox_path, read_handoff
@@ -1410,6 +1412,17 @@ _CB_RECOVER_RETRY = "rec:retry:"   # + "<manifest stem>"
 _CB_PHASE_A_REUSE = "pa:reuse:"   # + _run_token
 _CB_PHASE_A_RERUN = "pa:rerun:"   # + _run_token
 
+# The post-Phase-A spend button. Routes to _do_resume, never _do_confirm:
+# _do_confirm starts from _STATE and clears it before returning, so by the
+# time Phase A finishes minutes later the draft job is gone and a panel wired
+# to _CB_RUN_GO would answer "no complete job yet" for a batch whose try-on
+# images are sitting on disk. _do_resume needs no _STATE — it loads the
+# manifest and requires only that the journal has a batch id, which Phase A
+# writes before its first Gemini call. Carries the manifest stem, not
+# _run_token: the manifest is not rewritten between the panel and the tap,
+# and the stem is what _do_resume needs anyway.
+_CB_PHASE_A_SPEND = "pa:spend:"   # + "<manifest stem>"
+
 # ONE number, everywhere a migration's duration is quoted: the /gpu listing,
 # the [Run] picker's "Other regions" note, the destructive confirm, and the
 # "started" reply. They said "~25-30 min" in two of those places and "15-25
@@ -1604,6 +1617,17 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
             else:
                 _do_confirm(tg, chat_id, dry_run=dry_run,
                             phase_a_choice="reuse" if reuse else "rerun")
+
+        elif data.startswith(_CB_PHASE_A_SPEND):
+            stem = data[len(_CB_PHASE_A_SPEND):]
+            if not stem:
+                tg.send_message(chat_id, "that button is from an older "
+                                         "version of the bot; check /status")
+            else:
+                # _do_resume, not _do_confirm — see _CB_PHASE_A_SPEND's own
+                # comment for why _STATE cannot be relied on here.
+                _do_resume(tg, chat_id, ROOT / "batch" / f"{stem}.yaml",
+                           dry_run=dry_run)
 
         elif data == _CB_RUN_NO:
             tg.send_message(chat_id, "cancelled — nothing was spent")
@@ -2760,14 +2784,24 @@ def _progress_path(chat_id: int) -> Path:
 
 
 def _start_progress(tg: Tg, chat_id: int, manifest_path: Path,
-                    stages: list[str]) -> None:
-    """Send the first progress message and record it for later edits."""
+                    stages: list[str], *, phase: str | None = None) -> None:
+    """Send the first progress message and record it for later edits.
+
+    `phase` names which tick owns the resulting message: "local" while Phase A
+    runs, absent otherwise. Both ticks read this same file and tick_progress
+    runs first in the poll loop, so without an owner the tick after Phase A
+    exits would find drain_running() False (Phase A writes no lease and
+    registers no _RUNNING entry), take tick_progress's "Finished" branch,
+    unlink the file and deliver_result — reporting a half-finished batch as
+    done and never showing the rent panel.
+    """
     text = progress_text(manifest_path, lease=lease_for(manifest_path),
-                         stages=stages)
+                         stages=stages, phase=phase)
     message_id = tg.send_message(chat_id, text, parse_mode=PARSE_HTML)
     _progress_path(chat_id).write_text(json.dumps({
         "manifest": str(manifest_path), "message_id": message_id,
-        "stages": stages, "sent_tryon": []}, indent=2), encoding="utf-8")
+        "stages": stages, "sent_tryon": [],
+        **({"phase": phase} if phase else {})}, indent=2), encoding="utf-8")
 
 
 def _deliver_tryon_previews(tg: Tg, chat_id: int, manifest_path: Path,
@@ -2858,6 +2892,9 @@ def tick_progress(tg: Tg, chat_id: int) -> None:
         log(f"progress file for chat {chat_id} is unreadable, dropping it: {exc!r}")
         path.unlink(missing_ok=True)
         return
+
+    if payload.get("phase") == "local":
+        return      # tick_phase_a owns this message — see _start_progress
 
     # Every tick, regardless of whether the drain is still running or about
     # to be reported finished below — Phase A can complete while the pod is
@@ -2952,6 +2989,96 @@ def tick_progress(tg: Tg, chat_id: int) -> None:
     _ANIM_PAUSE.pop(chat_id, None)
     tg.edit_message(chat_id, message_id, text, parse_mode=PARSE_HTML)
     deliver_result(tg, chat_id, manifest_path)
+
+
+def tick_phase_a(tg: Tg, chat_id: int, *, dry_run: bool = False) -> None:
+    """Turn a finished Phase A into the next thing the user sees.
+
+    Separate from tick_progress rather than folded into it: that function's
+    completion branch calls deliver_result, which is right when a drain ends
+    and wrong when Phase A ends — Phase A ending with exit 3 means the batch
+    is HALF done and the next step is a human decision about renting.
+
+    The latch is `offered` in the progress file, not a module dict: a Phase A
+    can outlive a bot restart (systemd Restart=always plus a 12-run batch of
+    Gemini calls), and phase_a_exit deliberately keeps answering after the
+    handle is reaped. Without a durable latch the 2s poll would re-send the
+    panel for as long as the chat lives.
+
+    Ownership is the `phase` key in that same file, checked both ways: this
+    function returns unless the message is marked "local", and tick_progress
+    returns if it is. See _start_progress for what goes wrong otherwise. The
+    check matters most on the handoff back — after the user taps spend,
+    _do_resume rewrites the file with no phase, and phase_a_exit still
+    remembers 3, so without this guard the next tick would re-send the rent
+    panel over the top of a drain that is already running.
+    """
+    path = _progress_path(chat_id)
+    if not path.exists():
+        return
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        manifest_path = Path(payload["manifest"])
+        message_id = int(payload["message_id"])
+        stages = list(payload.get("stages") or [])
+    except (ValueError, KeyError, TypeError) as exc:
+        log(f"progress file for chat {chat_id} is unreadable, dropping it: {exc!r}")
+        path.unlink(missing_ok=True)
+        return
+
+    if payload.get("phase") != "local":
+        return          # a drain owns this message — tick_progress handles it
+
+    if phase_a_running(manifest_path):
+        # Try-on previews are worth sending during Phase A too: they are the
+        # one piece of visible progress in a phase that records nothing else
+        # until a whole stage finishes.
+        _deliver_tryon_previews(tg, chat_id, manifest_path, payload)
+        text = progress_text(manifest_path, lease=None, stages=stages, phase="local")
+        if time.time() >= _ANIM_PAUSE.get(chat_id, 0.0):
+            try:
+                tg.edit_message(chat_id, message_id, text, parse_mode=PARSE_HTML)
+            except TgError as exc:
+                wait = exc.retry_after or 60.0
+                _ANIM_PAUSE[chat_id] = time.time() + wait
+                log(f"phase-A progress edit throttled, pausing {wait:.0f}s: {exc}")
+        return
+
+    rc = phase_a_exit(manifest_path)
+    if rc is None:
+        return          # not ours — a drain, or nothing at all
+    if payload.get("offered"):
+        return          # already handed the decision to the user
+
+    payload["offered"] = True
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    _ANIM_PAUSE.pop(chat_id, None)
+    text = progress_text(manifest_path, lease=None, stages=stages, phase="local")
+    tg.edit_message(chat_id, message_id, text, parse_mode=PARSE_HTML)
+
+    if rc == EXIT_NEEDS_POD:
+        # Stock is measured HERE, not when [Run] was tapped — that gap is the
+        # whole reason Phase A moved. Reusing _offer_run_confirm rather than a
+        # second panel: its sold-out branch already drops the spend button
+        # instead of leaving it enabled on a promise that can only fail
+        # (2026-09-12, reported live: "5090 đã hết mà nút spend vẫn enable").
+        _offer_run_confirm(
+            tg, chat_id,
+            spend_cb=f"{_CB_PHASE_A_SPEND}{manifest_path.stem}",
+            heading=f"{ICON_NVIDIA_CE} <b>Try-on finished</b> — now rent a GPU?")
+    elif rc == 0:
+        path.unlink(missing_ok=True)
+        deliver_result(tg, chat_id, manifest_path)
+    else:
+        path.unlink(missing_ok=True)
+        tg.send_message(
+            chat_id,
+            f"{ICON_ERROR_CE} <b>The try-on phase failed</b> (exit {rc}) — "
+            "nothing was rented and no GPU time was spent.\n"
+            f"<code>{_esc(manifest_path.stem)}.phase-a.log</code> on the box has "
+            "the detail. Fix it and tap Run again; the try-ons that did finish "
+            "are kept.",
+            parse_mode=PARSE_HTML)
 
 
 def _fmt_gb(num_bytes) -> str:
@@ -5185,7 +5312,11 @@ def main() -> int:
                        dry_run=args.dry_run)
             # After the updates, not instead of them.
             # One chat, because the allowlist is one user (spec section 2).
+            # tick_phase_a sits between the two: it shares _progress_path with
+            # tick_progress, so keeping them adjacent leaves exactly one owner
+            # of that file per tick.
             tick_progress(tg, allowed_user_id)
+            tick_phase_a(tg, allowed_user_id, dry_run=args.dry_run)
             tick_migration_progress(tg, allowed_user_id, dry_run=args.dry_run)
             _tick_gpu_subs(tg, allowed_user_id)
             _tick_staging_prune()

@@ -28,6 +28,14 @@ class TestProgressText(unittest.TestCase):
         self.manifest.write_text("runs: []", encoding="utf-8")
         import json
         state_path_for(self.manifest).write_text(json.dumps(STATE), encoding="utf-8")
+        # The journal shape Phase A actually produces: a batch id but no run
+        # recorded yet. STATE above has runs recorded, so the "nothing recorded
+        # yet" line never fires for it — asserting on self.manifest would test
+        # a branch that cannot run.
+        self.empty = Path(tempfile.mkdtemp()) / "none.yaml"
+        self.empty.write_text("runs: []", encoding="utf-8")
+        state_path_for(self.empty).write_text(
+            json.dumps({"batch": "2026-09-16-0900", "runs": {}}), encoding="utf-8")
 
     def test_names_every_stage_and_its_status(self):
         text = progress_text(self.manifest, lease=None)
@@ -44,6 +52,27 @@ class TestProgressText(unittest.TestCase):
         empty = Path(tempfile.mkdtemp()) / "none.yaml"
         empty.write_text("runs: []", encoding="utf-8")
         self.assertIsInstance(progress_text(empty, lease=None), str)
+
+    def test_phase_a_does_not_claim_to_be_waiting_for_a_pod(self):
+        # There is no pod to wait for during Phase A — that is the entire
+        # point of running it first. Inferring the phase from the absence of
+        # a lease is what made this line a lie.
+        text = progress_text(self.empty, lease=None, phase="local")
+        self.assertNotIn("waiting for the pod", text)
+        self.assertIn("try-on", text.lower())
+
+    def test_no_phase_keeps_the_pod_wording(self):
+        self.assertIn("waiting for the pod",
+                      progress_text(self.empty, lease=None))
+
+    def test_phase_a_replaces_the_nothing_recorded_line(self):
+        empty = Path(tempfile.mkdtemp()) / "none.yaml"
+        empty.write_text("runs: []", encoding="utf-8")
+        state_path_for(empty).write_text(
+            json.dumps({"batch": "2026-09-16-0900", "runs": {}}), encoding="utf-8")
+        text = progress_text(empty, lease=None, phase="local")
+        self.assertNotIn("waiting for the pod", text)
+        self.assertIn("running the try-on", text.lower())
 
 
 class _FakeProc:

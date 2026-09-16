@@ -5768,5 +5768,211 @@ class TestRunConfirmPanelIsParameterised(unittest.TestCase):
         self.assertNotIn("Choose GPU", self.tg.screen[-1])
 
 
+class TestProgressMessageOwnership(unittest.TestCase):
+    """tick_progress and tick_phase_a read the SAME progress file, and
+    tick_progress runs first in the poll loop.
+
+    Without an explicit owner, the tick after Phase A exits goes: tick_progress
+    reads the file, finds drain_running() False (Phase A writes no lease and
+    registers no _RUNNING entry), takes its "Finished" branch, unlinks the file
+    and calls deliver_result. tick_phase_a then finds no file and returns. The
+    user gets a half-finished batch reported as done and never sees the rent
+    panel. This is the single easiest way to get commit B wrong and have every
+    unit test still pass, because nothing else in the suite runs both ticks.
+    """
+
+    def setUp(self):
+        self._orig_root = bot.ROOT
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "batch").mkdir()
+        (self.root / "out").mkdir()
+        bot.ROOT = self.root
+        reset_bot_state()
+        self.manifest = self.root / "batch" / "tg-1.yaml"
+        self.manifest.write_text("runs: []\n", encoding="utf-8")
+        state_path_for(self.manifest).write_text(json.dumps(
+            {"batch": "2026-09-16-0900", "runs": {}}), encoding="utf-8")
+        self.tg = FakeTg()
+        self._lease = mock.patch("tgbot.bot.lease_for", return_value=None)
+        self._lease.start()
+        self.addCleanup(self._lease.stop)
+
+    def tearDown(self):
+        bot.ROOT = self._orig_root
+
+    def _payload(self) -> dict:
+        return json.loads(bot._progress_path(ME).read_text(encoding="utf-8"))
+
+    def test_start_progress_records_the_phase(self):
+        with mock.patch("tgbot.bot._start_progress", wraps=bot._start_progress):
+            bot._start_progress(self.tg, ME, self.manifest, ["tryon"], phase="local")
+        self.assertEqual(self._payload()["phase"], "local")
+
+    def test_the_default_phase_is_absent_so_drains_keep_working(self):
+        bot._start_progress(self.tg, ME, self.manifest, ["tryon"])
+        self.assertIsNone(self._payload().get("phase"))
+
+    def test_tick_progress_ignores_a_phase_a_message(self):
+        bot._start_progress(self.tg, ME, self.manifest, ["tryon"], phase="local")
+        with mock.patch("tgbot.bot.deliver_result") as deliver, \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.tick_progress(self.tg, ME)
+        deliver.assert_not_called()
+        self.assertTrue(bot._progress_path(ME).exists())   # not unlinked
+
+    def test_tick_phase_a_ignores_a_drain_message(self):
+        bot._start_progress(self.tg, ME, self.manifest, ["tryon"])
+        with mock.patch("tgbot.bot.phase_a_exit", return_value=3), \
+             mock.patch("tgbot.bot._offer_run_confirm") as offer:
+            bot.tick_phase_a(self.tg, ME)
+        offer.assert_not_called()
+
+    def test_the_handoff_to_a_drain_gives_tick_progress_ownership_back(self):
+        # After the user taps spend, _do_resume calls _start_progress with no
+        # phase, rewriting the file. tick_phase_a must stop handling it even
+        # though _PHASE_A_RC still remembers exit 3 — a stale code plus a fresh
+        # file with no "offered" latch would re-send the rent panel over the
+        # top of a running drain.
+        bot._start_progress(self.tg, ME, self.manifest, ["tryon"], phase="local")
+        with mock.patch("tgbot.bot.phase_a_running", return_value=False), \
+             mock.patch("tgbot.bot.phase_a_exit", return_value=3), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value={}), \
+             mock.patch("tgbot.bot._offer_run_confirm") as offer:
+            bot.tick_phase_a(self.tg, ME)
+        offer.assert_called_once()
+        bot._start_progress(self.tg, ME, self.manifest, ["tryon", "motion"])
+        with mock.patch("tgbot.bot.phase_a_exit", return_value=3), \
+             mock.patch("tgbot.bot._offer_run_confirm") as offer2:
+            bot.tick_phase_a(self.tg, ME)
+        offer2.assert_not_called()
+
+
+class TestTickPhaseA(unittest.TestCase):
+    """Phase A finishes while nobody is watching; this tick is what turns its
+    exit code into the next thing the user sees.
+
+    Exit 3 is the interesting one: it means "local work done, a pod is still
+    wanted", and it is where the spend decision now lives.
+    """
+
+    def setUp(self):
+        self._orig_root = bot.ROOT
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "batch").mkdir()
+        (self.root / "out").mkdir()
+        bot.ROOT = self.root
+        reset_bot_state()
+        self.manifest = self.root / "batch" / "tg-1.yaml"
+        self.manifest.write_text(
+            "runs:\n  - id: runA\n    pipeline: tryon-motion-enhance\n"
+            "    inputs: {character: /tmp/c.png, outfit: /tmp/o.png, driver: /tmp/d.mp4}\n"
+            "    tryon: { provider: gemini }\n", encoding="utf-8")
+        state_path_for(self.manifest).write_text(json.dumps(
+            {"batch": "2026-09-16-0900", "runs": {}}), encoding="utf-8")
+        self.tg = FakeTg()
+        # lease_for reads run.LEASE_PATH, which points at the repo's real
+        # batch/pod-lease.json. _start_progress calls it, so without this patch
+        # the test reads whatever lease happens to be on the machine running
+        # the suite — and on a box mid-drain that is a real one naming a real
+        # manifest. Patched rather than redirected: Phase A has no lease by
+        # definition, so None is also the truthful value.
+        self._lease = mock.patch("tgbot.bot.lease_for", return_value=None)
+        self._lease.start()
+        self.addCleanup(self._lease.stop)
+        # phase="local" is what makes tick_phase_a own this message at all —
+        # without it the tick returns at its first guard and every test below
+        # passes while asserting nothing.
+        bot._start_progress(self.tg, ME, self.manifest, ["tryon", "motion", "enhance"],
+                            phase="local")
+
+    def tearDown(self):
+        bot.ROOT = self._orig_root
+
+    def test_still_running_only_redraws(self):
+        with mock.patch("tgbot.bot.phase_a_running", return_value=True), \
+             mock.patch("tgbot.bot.phase_a_exit", return_value=None):
+            bot.tick_phase_a(self.tg, ME)
+        flat = [data for row in (self.tg.buttons[-1] or []) for _, data, *_ in row]
+        self.assertFalse(any(d.startswith(bot._CB_PHASE_A_SPEND) for d in flat))
+
+    def test_exit_three_offers_the_rent_decision_with_fresh_stock(self):
+        with mock.patch("tgbot.bot.phase_a_running", return_value=False), \
+             mock.patch("tgbot.bot.phase_a_exit", return_value=3), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value={}), \
+             mock.patch("tgbot.bot._offer_run_confirm") as offer:
+            bot.tick_phase_a(self.tg, ME)
+        offer.assert_called_once()
+        # The whole point: the panel is rendered AFTER Phase A, so the stock it
+        # shows was measured now, and its spend button must not route back
+        # through _do_confirm (whose _STATE this chat no longer has).
+        self.assertTrue(offer.call_args.kwargs["spend_cb"].startswith(bot._CB_PHASE_A_SPEND))
+
+    def test_the_panel_it_offers_reaches_start_drain_with_state_cleared(self):
+        # The §6.3 condition that rules _do_confirm out, end to end: by the
+        # time Phase A finishes, _do_confirm has already cleared _STATE, so a
+        # panel wired to _CB_RUN_GO would answer "no complete job yet" for a
+        # batch whose try-on images are on disk. _do_resume needs no _STATE.
+        bot._STATE.clear()
+        bot._BASKET.clear()
+        with mock.patch("tgbot.bot.phase_a_running", return_value=False), \
+             mock.patch("tgbot.bot.phase_a_exit", return_value=3), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value={}), \
+             mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.migration_running", return_value=False), \
+             mock.patch("tgbot.bot._start_progress"), \
+             mock.patch("tgbot.bot.start_drain") as start_drain:
+            bot.tick_phase_a(self.tg, ME)
+            flat = [data for row in self.tg.buttons[-1] for _, data, *_ in row]
+            spend = next(d for d in flat if d.startswith(bot._CB_PHASE_A_SPEND))
+            bot.handle(self.tg, cb_from(ME, spend), allowed_user_id=ME)
+        start_drain.assert_called_once()
+        self.assertIs(start_drain.call_args.kwargs["resume"], True)
+        self.assertEqual(start_drain.call_args.args[0], self.manifest)
+
+    def test_exit_zero_delivers_results_and_offers_nothing_to_rent(self):
+        with mock.patch("tgbot.bot.phase_a_running", return_value=False), \
+             mock.patch("tgbot.bot.phase_a_exit", return_value=0), \
+             mock.patch("tgbot.bot.deliver_result") as deliver, \
+             mock.patch("tgbot.bot._offer_run_confirm") as offer:
+            bot.tick_phase_a(self.tg, ME)
+        deliver.assert_called_once()
+        offer.assert_not_called()
+
+    def test_a_failed_phase_a_neither_rents_nor_delivers(self):
+        # drain.py:331 already refuses to rent after a failed local phase. The
+        # bot must not become a second, laxer copy of that rule.
+        with mock.patch("tgbot.bot.phase_a_running", return_value=False), \
+             mock.patch("tgbot.bot.phase_a_exit", return_value=1), \
+             mock.patch("tgbot.bot.deliver_result") as deliver, \
+             mock.patch("tgbot.bot._offer_run_confirm") as offer:
+            bot.tick_phase_a(self.tg, ME)
+        deliver.assert_not_called()
+        offer.assert_not_called()
+        self.assertIn("try-on", self.tg.messages[-1].lower())
+
+    def test_no_progress_file_is_a_silent_no_op(self):
+        bot._progress_path(ME).unlink()
+        with mock.patch("tgbot.bot.phase_a_exit", return_value=3), \
+             mock.patch("tgbot.bot._offer_run_confirm") as offer:
+            bot.tick_phase_a(self.tg, ME)
+        offer.assert_not_called()
+
+    def test_the_panel_is_offered_once_not_every_tick(self):
+        # phase_a_exit keeps answering 3 after the process is reaped, by design.
+        # Without a latch the poll loop would re-send the panel every 2s for
+        # as long as the chat lives.
+        with mock.patch("tgbot.bot.phase_a_running", return_value=False), \
+             mock.patch("tgbot.bot.phase_a_exit", return_value=3), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value={}), \
+             mock.patch("tgbot.bot._offer_run_confirm") as offer:
+            bot.tick_phase_a(self.tg, ME)
+            bot.tick_phase_a(self.tg, ME)
+        offer.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

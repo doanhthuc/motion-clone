@@ -155,7 +155,8 @@ def _elapsed(lease) -> str:
 
 
 def progress_text(manifest_path: Path, *, lease,
-                  stages: list[str] | None = None) -> str:
+                  stages: list[str] | None = None,
+                  phase: str | None = None) -> str:
     """Render one progress message from the journal alone. Returns HTML.
 
     A bar of `done/len(planned)` cells is discrete because the journal is
@@ -182,6 +183,13 @@ def progress_text(manifest_path: Path, *, lease,
     only stages that have already begun, so a bar computed from it alone would
     read 1/1 at the first stage and never move.
 
+    `phase` is "local" while Phase A (the API try-on) is running and None
+    otherwise. It exists because the no-lease case used to mean exactly one
+    thing — "the pod is being provisioned" — and Phase A broke that: there is
+    no pod yet and none is coming until the user says so. Inferring a phase
+    from the absence of a lease is how the message came to say "waiting for
+    the pod" about a step that deliberately runs before any pod exists.
+
     HTML (2026-08-31) because this is re-rendered into the same message every
     poll — the caller must send it with parse_mode="HTML", and every
     interpolated value here is escaped for that reason.
@@ -202,13 +210,17 @@ def progress_text(manifest_path: Path, *, lease,
     elapsed = _elapsed(lease)
     runs = state.get("runs") or {}
     if not runs:
-        # This is the provision + bootstrap window, the longest stretch
-        # (~10 min) in which the journal says nothing whatsoever — the one
-        # phase where the only real question is whether anything is
-        # happening at all, which `elapsed` answers and the journal cannot.
-        tail = f" ({elapsed})" if elapsed else ""
-        lines.append(f"{_ICON_EYES_CE} waiting for the pod — "
-                     f"nothing recorded yet{tail}")
+        if phase == "local":
+            lines.append(f"{_ICON_EYES_CE} running the try-on over the API — "
+                         "no pod rented yet")
+        else:
+            # This is the provision + bootstrap window, the longest stretch
+            # (~10 min) in which the journal says nothing whatsoever — the one
+            # phase where the only real question is whether anything is
+            # happening at all, which `elapsed` answers and the journal cannot.
+            tail = f" ({elapsed})" if elapsed else ""
+            lines.append(f"{_ICON_EYES_CE} waiting for the pod — "
+                         f"nothing recorded yet{tail}")
     for run_id in sorted(runs):
         run = runs[run_id]
         seen = run.get("stages") or {}
