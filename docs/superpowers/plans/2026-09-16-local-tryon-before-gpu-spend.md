@@ -1251,7 +1251,7 @@ class TestConfirmAsksBeforeReusingTryon(TestFlow):
             "runs": {run.id: {"status": "running", "stages": {stage_name: {
                 "status": "done", "phase": "local", "file": str(dest),
                 "params_manifest": effective_stage_params(
-                    stage_name, run.stage_params.get(stage_name))}}}}),
+                    stage_name, run.stage_params.get(stage_name))}}}}}),
             encoding="utf-8")
         return manifest
 
@@ -1461,6 +1461,31 @@ Replace the call at ~line 4420:
 ```
 
 - [ ] **Step 7: Handle the two callbacks**
+
+### The race this step must not open — added after Task 5's review found it
+
+`drain_running(live_path)` can flip True **while the chooser sits unanswered**, and the two conditions co-occur by construction: the stock-out card exists exactly when Phase A finished and the journal holds a preserved try-on, which is exactly when `_preserved_tryon` reports `reusable > 0` and the chooser appears. Three routes reach it, and one needs no tap at all:
+
+- `_CB_RECOVER_RETRY` → `_do_resume` on `ROOT/"batch"/f"{stem}.yaml"`, and `_job_manifest_path(chat_id)` is that same file — so the card's Retry button resumes the very manifest the chooser is asking about.
+- `_CB_RECOVER_SWITCH` → same.
+- `tick_migration_progress`'s resume-on-done → same, with no user action.
+
+The card's button is even labelled `Thử lại — giữ try-on đã chạy` ("keep the try-on that already ran"), which reads as the *same offer* as "Reuse — no Gemini spend", and the chooser keyboard is never stripped, so both are live in one chat.
+
+`_run_token` does **not** catch this: it is the *live* path's `mtime_ns`, and nothing in `drain.py`, `batch_run.py` or the runner rewrites the manifest — they write the `.state.json` journal. So a live drain never bumps the token and the tap passes.
+
+On that second entry, `running` is True, so `manifest_path` becomes the mailbox and `start_drain` is not called. The write-skip must stay — but **do not "fix" this by writing the mailbox** (`if phase_a_choice is None or running:`), which is the obvious patch and is strictly worse. `chain_or_teardown` runs a claimed mailbox as `batch_run("--file", nxt)` with **no `--resume` and no `--force-local`** (`drain.py:236`), and `claim_mailbox` renames the file to `<stem>-<epoch>.yaml` (`handoff.py:78-84`), so `state_path_for` yields a **fresh journal** and `resolve_batch_id(resume=False)` mints a **fresh batch id**. Net: a second full GPU run of the same video *and* a second Gemini try-on payment, whichever button the user tapped — and "Queued." would then be literally true, announcing the duplicate as a feature. The mailbox also cannot carry `force_local` at all.
+
+The correct handling keeps the write-skip and fixes the *message*. Split the tail:
+
+- `if running and phase_a_choice is None:` — today's "Queued." path, unchanged. A first entry with a live drain really does queue.
+- `elif running:` — the race. Tell the truth: a drain picked this manifest up while the user was deciding, so the job is **already running with the try-on reused**, and a "Re-run try-on" choice could not be applied because `FORCE_LOCAL=1` cannot reach an already-launched drain. Point at the real recovery path — `/again` once it finishes, then Run and choose Re-run try-on.
+
+Keep `_freeze_panel` and the `_STATE` clear in the race branch. Both are correct there: the job genuinely is running, and leaving the draft in `_STATE` would let a later `/confirm` submit it a second time.
+
+Pin it with a test: second entry with `drain_running` True must not write the mailbox, must not call `start_drain`, and must send the race message rather than "Queued.".
+
+- [ ] **Step 7b: Handle the two callbacks**
 
 In `_handle_callback`, immediately after the `_CB_RUN_GO` branch (~line 1538), mirroring its token check:
 
