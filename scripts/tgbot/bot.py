@@ -1403,6 +1403,13 @@ _CB_RECOVER_MIGRATE = "rec:mig:"   # + "<to_dc>:<manifest stem>"
 # without /confirm, which minted a new batch id and re-ran every try-on.
 _CB_RECOVER_RETRY = "rec:retry:"   # + "<manifest stem>"
 
+# The reuse-or-rerun chooser _do_confirm sends when the journal already holds
+# a matching try-on. Both carry _run_token for the same reason the spend
+# button does: Telegram keyboards stay tappable forever, and a chooser minted
+# for one manifest must not be answerable after it was rewritten.
+_CB_PHASE_A_REUSE = "pa:reuse:"   # + _run_token
+_CB_PHASE_A_RERUN = "pa:rerun:"   # + _run_token
+
 # ONE number, everywhere a migration's duration is quoted: the /gpu listing,
 # the [Run] picker's "Other regions" note, the destructive confirm, and the
 # "started" reply. They said "~25-30 min" in two of those places and "15-25
@@ -1585,6 +1592,18 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
                                 "confirm again.")
             else:
                 _do_confirm(tg, chat_id, dry_run=dry_run)
+
+        elif data.startswith(_CB_PHASE_A_REUSE) or data.startswith(_CB_PHASE_A_RERUN):
+            reuse = data.startswith(_CB_PHASE_A_REUSE)
+            prefix = _CB_PHASE_A_REUSE if reuse else _CB_PHASE_A_RERUN
+            if data[len(prefix):] != _run_token(chat_id):
+                tg.send_message(chat_id,
+                                "the job changed since that button was sent, so "
+                                "nothing ran. Check the manifest above and "
+                                "confirm again.")
+            else:
+                _do_confirm(tg, chat_id, dry_run=dry_run,
+                            phase_a_choice="reuse" if reuse else "rerun")
 
         elif data == _CB_RUN_NO:
             tg.send_message(chat_id, "cancelled — nothing was spent")
@@ -4356,7 +4375,8 @@ def _do_resume(tg: Tg, chat_id: int, manifest_path: Path, *, dry_run: bool) -> N
     _start_progress(tg, chat_id, manifest_path, stages)
 
 
-def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
+def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool,
+                phase_a_choice: str | None = None) -> None:
     """THE money gate for a FRESH spend decision. The only OTHER function
     that may call start_drain is _do_resume, which continues a manifest
     already confirmed here once — see its own docstring for why that is not
@@ -4368,6 +4388,15 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
     drain_running — has to apply identically whether the user typed
     /confirm or tapped a button, and the way to guarantee that is one body
     with two callers rather than two bodies that agree today.
+
+    `phase_a_choice` makes this one body re-entrant for a SINGLE spend
+    decision: the first entry stops at the chooser below and returns, and the
+    tapped button calls it again with "reuse" or "rerun". The paragraph above
+    is why that second entry re-runs every gate rather than trusting the first
+    — `drain_running` in particular may have flipped in the minutes the
+    chooser sat unanswered. What it does skip is write_manifest, and only on
+    that second entry; see the comment there for why skipping the write is
+    required rather than merely cheaper.
 
     `grep -rn "start_drain" scripts/tgbot/bot.py` must show exactly two call
     sites: this one, and _do_resume's.
@@ -4450,14 +4479,19 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
     live_path = _job_manifest_path(chat_id)
     running = drain_running(live_path)
     manifest_path = mailbox_path(live_path) if running else live_path
-    # Re-written unconditionally, even when `validated` was cached True: the
+    # Re-written on the FIRST entry, even when `validated` was cached True: the
     # cache only remembers that the JOB CONTENT was valid, not which file it
     # was last written to. If a drain started in the seconds between the last
     # validate and this tap, `manifest_path` above just switched from the live
     # path to the mailbox, and the mailbox would otherwise sit empty — queued
     # in every OTHER sense but never actually written to disk. write_manifest
     # is a plain YAML dump, no subprocess, so redoing it here costs nothing.
-    write_manifest(queued, manifest_path, now=time.strftime("%Y-%m-%d %H:%M:%S"))
+    if phase_a_choice is None:
+        # Skipped on the second entry, and not as an optimisation: _run_token
+        # IS this file's mtime_ns, so rewriting it would invalidate the
+        # chooser button the user just tapped. The bytes on disk are already
+        # the ones the chooser was minted from.
+        write_manifest(queued, manifest_path, now=time.strftime("%Y-%m-%d %H:%M:%S"))
     # Every stage any queued job will run, in pipeline order, de-duplicated.
     # The progress bar counts against this: a batch mixing two pipelines has to
     # show the union or the denominator would be wrong for half of it.
@@ -4466,6 +4500,28 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
         for stage in PIPELINES[other.pipeline]:
             if stage not in stages:
                 stages.append(stage)
+    # AFTER the write above, so the token minted here matches the manifest now
+    # on disk; BEFORE _freeze_panel and before the state clear, because both
+    # would claim a submission that has not happened yet. Freezing also strips
+    # the Run keyboard from a job the user is still deciding about, and the
+    # clear would leave the second entry with no job to confirm at all — it
+    # would answer "no complete job yet", which reads as a lost draft.
+    if not running and phase_a_choice is None:
+        reusable, total = _preserved_tryon(manifest_path)
+        if reusable:
+            token = _run_token(chat_id)
+            tg.send_message(
+                chat_id,
+                f"{ICON_ASK_CE} <b>Try-on already ran</b> for these exact inputs "
+                f"({reusable}/{total} run(s)).\n"
+                "Reusing it costs no Gemini quota. Re-running replaces those "
+                "images and pays for them again.",
+                parse_mode=PARSE_HTML,
+                buttons=[[("Reuse — no Gemini spend", _CB_PHASE_A_REUSE + token,
+                           _ce_id(ICON_OK_CE)),
+                          ("Re-run try-on", _CB_PHASE_A_RERUN + token,
+                           _ce_id(ICON_ROCKET_CE))]])
+            return
     # BEFORE start_drain and before the state clear: this is the last instant
     # the submitted job exists in memory, and freezing the panel here is what
     # leaves the exact inputs permanently in the transcript.
@@ -4475,7 +4531,16 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
         # Queuing (the `running` branch below) never reaches this: the
         # mailbox file alone is drain.py's signal, claimed by the process
         # already running, on the pod already paid for.
-        start_drain(manifest_path, dry_run=dry_run)
+        #
+        # resume is True only when the chooser ran: phase_a_choice is set
+        # exactly when a journal with reusable try-on exists, and resume is
+        # what makes that try-on skipped rather than paid for twice. A
+        # stale button answering after the journal vanished lands in
+        # resolve_batch_id's own "RESUME=1 but nothing to continue" branch,
+        # which reports it and runs as a new batch — safe, not silent.
+        start_drain(manifest_path, dry_run=dry_run,
+                    resume=phase_a_choice is not None,
+                    force_local=phase_a_choice == "rerun")
     # Clear in-memory state so the next file starts a fresh job rather
     # than mutating one already handed to a running drain. The manifest
     # itself, and the drain's own journal, stay on disk regardless.

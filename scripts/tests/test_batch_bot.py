@@ -5,7 +5,8 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batchlib.config import env_get
 from batchlib.manifest import load_manifest, state_path_for
-from batchlib.pipelines import effective_stage_params
+from batchlib.pipelines import PIPELINES, STAGES, effective_stage_params
+from batchlib.runner import stage_dest
 from batchlib_ext.gpu_stock import Stock
 from batchlib_ext.handoff import Handoff, handoff_path, mailbox_path, write_handoff
 from batchlib_ext.migrate_lease import MigrateLease, write_migrate_lease
@@ -16,7 +17,7 @@ from batchlib_ext.provision_failure import (ProvisionFailure,
 import tgbot.bot as bot
 from tgbot.bot import allowed
 from tgbot.ingest import Probe
-from tgbot.job import missing_slots
+from tgbot.job import missing_slots, write_manifest
 
 ME = 12345
 
@@ -3363,6 +3364,10 @@ class TestFlow(unittest.TestCase):
         start_drain.assert_called_once()
         _, kwargs = start_drain.call_args
         self.assertEqual(kwargs.get("dry_run"), False)
+        # No journal for this chat, so no chooser and no resume: a fresh
+        # /confirm on a fresh job must still start a fresh batch.
+        self.assertIs(kwargs.get("resume"), False)
+        self.assertIs(kwargs.get("force_local"), False)
 
     def test_two_ambiguous_images_sent_back_to_back_do_not_clobber_each_other(self):
         """Regression (Task 7 fix round 1, Finding 1): Telegram delivers a
@@ -5344,6 +5349,184 @@ class TestKillCommand(unittest.TestCase):
             bot.handle(self.tg, cb_from(ME, bot._CB_KILL_NO), allowed_user_id=ME)
         run.assert_not_called()
         self.assertIn("left running", self.tg.messages[-1])
+
+
+class TestConfirmAsksBeforeReusingTryon(TestFlow):
+    """/confirm must not silently pick between "reuse the try-on" and "roll it
+    again". The two intents are indistinguishable from inside _do_confirm, and
+    guessing wrong in the re-roll direction hands back the exact image the
+    user was trying to get away from — silently, which is what makes it worse
+    than one extra Gemini call.
+    """
+
+    def _journal_for_draft(self, *, provider: str = "gemini") -> Path:
+        """Fill the draft, write the real manifest, then fake a journal saying
+        its try-on is already done.
+
+        Three things here are load-bearing and each one is a way this fixture
+        could silently test nothing:
+
+        - the provider is set explicitly even though it already defaults to
+          "gemini", because `bot.JOB_PROVIDER` (`bot.py:140`) is a hardcoded
+          module constant and a test that depends on it silently changes meaning
+          if that constant is ever retuned. Do NOT confuse it with `job.py`'s
+          `DEFAULT_PROVIDER` ("qwen"), which is a different thing entirely: that
+          one is the value `linux.py:5653` falls back to when a manifest carries
+          no `provider:` line, and `render_manifest` compares against it to
+          decide whether to emit an explicit marker. Passing `provider="qwen"`
+          here is what makes a run NOT local-eligible.
+        - the stage name is looked up, not written as "tryon". The default
+          pipeline may call it camera-tryon.
+        - params_manifest comes from effective_stage_params, not a literal
+          {"provider": "gemini"}: local_tryon_reusable compares against that
+          function's output, which merges the stage defaults in.
+        - the journal is nested as runs[id]["stages"][stage], because that is
+          what preserved_local_tryon reads (runner.py:481) and what
+          run_local_phase._one writes. A flat shape makes reusable always 0 and
+          every count test pass for the wrong reason — this exact defect shipped
+          in Task 4's brief and was caught by its implementer.
+        """
+        self._fill_required_slots()
+        bot._job_for(ME).provider = provider
+        bot._LAST_VALIDATE[ME] = True
+        manifest = bot._job_manifest_path(ME)
+        write_manifest(bot._jobs_for(ME), manifest, now="2026-09-16 09:00:00")
+        run = load_manifest(manifest).runs[0]
+        stage_name = next(s for s in PIPELINES[run.pipeline]
+                          if STAGES[s].job_type == "tryon")
+        run_dir = bot.ROOT / "out" / "2026-09-16-0900" / "runs" / run.id
+        dest = stage_dest(run, run_dir, stage_name)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"png")
+        state_path_for(manifest).write_text(json.dumps({
+            "batch": "2026-09-16-0900",
+            "runs": {run.id: {"status": "running", "stages": {stage_name: {
+                "status": "done", "phase": "local", "file": str(dest),
+                "params_manifest": effective_stage_params(
+                    stage_name, run.stage_params.get(stage_name))}}}}}),
+            encoding="utf-8")
+        return manifest
+
+    def _chooser_token(self) -> str:
+        """The token off the rendered chooser, not _run_token(ME) read earlier.
+
+        Reading it before /confirm is wrong and looks right: the first entry
+        rewrites the manifest, _run_token IS that file's mtime_ns, so a
+        pre-captured token no longer matches and every tap below would be
+        refused as stale. Taking it off the buttons tests the real round trip.
+        """
+        flat = [data for row in self.tg.buttons[-1] for _, data, *_ in row]
+        reuse = next(d for d in flat if d.startswith(bot._CB_PHASE_A_REUSE))
+        return reuse[len(bot._CB_PHASE_A_REUSE):]
+
+    def test_a_reusable_journal_offers_the_choice_and_spends_nothing_yet(self):
+        self._journal_for_draft()
+        with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+        start_drain.assert_not_called()
+        flat = [data for row in self.tg.buttons[-1] for _, data, *_ in row]
+        self.assertTrue(any(d.startswith(bot._CB_PHASE_A_REUSE) for d in flat))
+        self.assertTrue(any(d.startswith(bot._CB_PHASE_A_RERUN) for d in flat))
+        # The job must survive the chooser: _do_confirm clears _STATE on the
+        # way out, and a cleared draft cannot be confirmed a second time.
+        self.assertIsNotNone(bot._STATE.get(ME))
+        # And the panel must not be frozen as "submitted" — nothing was.
+        self.assertNotIn("submitted", panel_text(self.tg))
+
+    def test_reuse_resumes_without_forcing(self):
+        self._journal_for_draft()
+        with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+            token = self._chooser_token()
+            bot.handle(self.tg, cb_from(ME, bot._CB_PHASE_A_REUSE + token),
+                       allowed_user_id=ME)
+        start_drain.assert_called_once()
+        self.assertIs(start_drain.call_args.kwargs["resume"], True)
+        self.assertIs(start_drain.call_args.kwargs["force_local"], False)
+
+    def test_rerun_resumes_and_forces(self):
+        self._journal_for_draft()
+        with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+            token = self._chooser_token()
+            bot.handle(self.tg, cb_from(ME, bot._CB_PHASE_A_RERUN + token),
+                       allowed_user_id=ME)
+        start_drain.assert_called_once()
+        self.assertIs(start_drain.call_args.kwargs["resume"], True)
+        self.assertIs(start_drain.call_args.kwargs["force_local"], True)
+
+    def test_the_choice_does_not_rewrite_the_manifest_and_invalidate_its_own_buttons(self):
+        # _run_token IS the manifest's mtime_ns. A second write_manifest would
+        # bump it, and the button the user just tapped would then fail its own
+        # staleness check — "that button is from an older version of the bot".
+        # Measured AFTER /confirm: the first entry writes legitimately, so a
+        # pre-captured mtime would fail for the wrong reason.
+        manifest = self._journal_for_draft()
+        with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+            token = self._chooser_token()
+            after_first = manifest.stat().st_mtime_ns
+            bot.handle(self.tg, cb_from(ME, bot._CB_PHASE_A_REUSE + token),
+                       allowed_user_id=ME)
+        self.assertEqual(manifest.stat().st_mtime_ns, after_first)
+        self.assertEqual(token, bot._run_token(ME))
+        start_drain.assert_called_once()
+
+    def test_a_stale_choice_button_is_refused(self):
+        self._journal_for_draft()
+        with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+            bot.handle(self.tg, cb_from(ME, bot._CB_PHASE_A_REUSE + "0"),
+                       allowed_user_id=ME)
+        start_drain.assert_not_called()
+
+    def test_no_journal_means_no_chooser_and_one_tap_still_starts(self):
+        with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+        start_drain.assert_called_once()
+        self.assertIs(start_drain.call_args.kwargs.get("resume"), False)
+        self.assertIs(start_drain.call_args.kwargs.get("force_local"), False)
+
+    def test_a_self_host_provider_gets_no_chooser_even_with_a_reusable_journal(self):
+        # The real control group, and the reason it needs a journal: this test
+        # was originally written as "a default-provider draft gets no chooser",
+        # which was vacuous twice over — bot.JOB_PROVIDER is "gemini"
+        # (bot.py:140) so a default draft IS local-eligible, and the test wrote
+        # no journal, so it passed on the absence of a journal rather than on
+        # anything about locality.
+        #
+        # Setting provider="qwen" makes render_manifest emit no provider: line,
+        # _local_tryon_stage returns None, and preserved_local_tryon's total
+        # falls to 0 — so the chooser is suppressed by LOCALITY, with a journal
+        # sitting right there whose entry would otherwise be reusable. If this
+        # ever starts showing a chooser, _local_tryon_stage grew an opinion of
+        # its own.
+        self._journal_for_draft(provider="qwen")
+        with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+        flat = [data for row in (self.tg.buttons[-1] or []) for _, data, *_ in row]
+        self.assertFalse(any(d.startswith(bot._CB_PHASE_A_REUSE) for d in flat))
+        start_drain.assert_called_once()
+        self.assertIs(start_drain.call_args.kwargs.get("resume"), False)
+
+    def test_a_job_queued_behind_a_live_drain_gets_no_chooser(self):
+        # The mailbox branch never reaches the money gate, so it must not reach
+        # the chooser either: that job runs later on a pod already paid for.
+        self._journal_for_draft()
+        with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot.drain_running", return_value=True):
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+        flat = [data for row in (self.tg.buttons[-1] or []) for _, data, *_ in row]
+        self.assertFalse(any(d.startswith(bot._CB_PHASE_A_REUSE) for d in flat))
+        start_drain.assert_not_called()
 
 
 if __name__ == "__main__":
