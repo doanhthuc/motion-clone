@@ -6106,19 +6106,48 @@ class TestRunStartsPhaseAFirst(unittest.TestCase):
             bot._offer_run_confirm(self.tg, ME)
         self.assertIn("rents a GPU pod at $0.99/hour", self.tg.screen[-1])
 
-    def test_a_busy_manifest_refusal_names_confirm_as_the_way_to_queue(self):
+    def _refuse_busy_phase_a(self, *, drain: bool):
+        """Drive _do_phase_a into its _manifest_write_ok refusal.
+
+        `drain` picks which half of busy()'s `or` is true, and it is patched
+        in tgbot.run rather than tgbot.bot because that is where _busy_reason
+        resolves drain_running — through the same module globals busy() uses.
+        A patch on tgbot.bot.drain_running would not reach it, and the test
+        would silently describe the other case.
+        """
+        with mock.patch("tgbot.bot.migration_running", return_value=False), \
+             mock.patch("tgbot.bot._jobs_for", return_value=[mock.Mock()]), \
+             mock.patch("tgbot.bot.busy", return_value=True), \
+             mock.patch("tgbot.run.drain_running", return_value=drain), \
+             mock.patch("tgbot.bot.start_phase_a") as start_phase_a:
+            bot._do_phase_a(self.tg, ME, dry_run=False)
+        start_phase_a.assert_not_called()
+        return self.tg.messages[-1]
+
+    def test_a_busy_manifest_refusal_names_confirm_when_a_drain_can_queue(self):
         # Before [Run] routed try-on jobs here, this tap reached _do_confirm,
         # which queues into the mailbox behind a running drain and replies
         # "Queued". _do_phase_a cannot queue (that is out of its scope, by the
         # plan), so the least it can do is name the command that still can —
         # otherwise the feature looks removed rather than moved.
-        with mock.patch("tgbot.bot.migration_running", return_value=False), \
-             mock.patch("tgbot.bot._jobs_for", return_value=[mock.Mock()]), \
-             mock.patch("tgbot.bot.busy", return_value=True), \
-             mock.patch("tgbot.bot.start_phase_a") as start_phase_a:
-            bot._do_phase_a(self.tg, ME, dry_run=False)
-        start_phase_a.assert_not_called()
-        self.assertIn("/confirm", self.tg.messages[-1])
+        text = self._refuse_busy_phase_a(drain=True)
+        self.assertIn("a drain is running", text)
+        self.assertIn("/confirm still can", text)
+
+    def test_a_busy_manifest_refusal_does_not_send_a_phase_a_to_confirm(self):
+        # The contradiction, asserted as an absence. /confirm CANNOT queue
+        # behind a Phase A — _do_confirm's own guard refuses that exact state
+        # ("the try-on phase is still running … or /kill to stop it") — so
+        # naming it here would be one message in this file sending the user
+        # to another message in this file that turns them away. That is the
+        # `Đợi`-button-advising-/confirm-again bug the plan names, not a money
+        # bug: both refusals are individually right, together they dead-end.
+        text = self._refuse_busy_phase_a(drain=False)
+        self.assertIn("the try-on phase is running", text)
+        self.assertNotIn("/confirm still can", text)
+        # And it has to name a way OUT, not just refuse — the same two the
+        # other refusal for this state offers.
+        self.assertIn("/kill", text)
 
 
 class TestRunConfirmPanelIsParameterised(unittest.TestCase):

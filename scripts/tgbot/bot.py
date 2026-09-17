@@ -4795,6 +4795,15 @@ def _manifest_write_ok(chat_id: int) -> bool:
     return not busy(_job_manifest_path(chat_id))
 
 
+# The two answers _busy_reason can give. Constants, not literals at each site,
+# because _do_phase_a's refusal BRANCHES on which one it got — the drain case
+# can point at /confirm and the Phase A case must not — and comparing against a
+# re-typed sentence would send that branch silently down its else the first
+# time anyone reworded the prose.
+_REASON_DRAIN = "a drain is running"
+_REASON_PHASE_A = "the try-on phase is running"
+
+
 def _busy_reason(chat_id: int) -> str:
     """The leading clause of a refusal from a guard that just failed
     _manifest_write_ok — which half of busy()'s `or` is actually true.
@@ -4813,8 +4822,8 @@ def _busy_reason(chat_id: int) -> str:
     drain. Phase A is the else branch for the same reason — busy() was already
     True, so if it is not a drain there is nothing else it can be.
     """
-    return ("a drain is running" if run_mod.drain_running(_job_manifest_path(chat_id))
-            else "the try-on phase is running")
+    return (_REASON_DRAIN if run_mod.drain_running(_job_manifest_path(chat_id))
+            else _REASON_PHASE_A)
 
 
 def _job_has_local_tryon(chat_id: int) -> bool:
@@ -4911,15 +4920,30 @@ def _do_phase_a(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
                         parse_mode=PARSE_HTML)
         return
     if not _manifest_write_ok(chat_id):
-        # Names /confirm, because [Run] used to reach _do_confirm here and
-        # _do_confirm QUEUES: it writes the mailbox and replies "Queued", so
-        # the job rides the pod already paid for (queue-depth-1, 2026-09-02).
-        # _do_phase_a cannot do that — a Phase A has no pod to chain onto —
-        # and a refusal that mentioned neither would make a working feature
-        # look removed rather than moved to a different command.
-        tg.send_message(chat_id, "a batch is already running for this job — "
-                                 "/status shows it. Run cannot queue behind "
-                                 "it, but /confirm still can.")
+        # Which half of busy() is holding it decides the way OUT, not just the
+        # wording, so this branches rather than naming /confirm unconditionally.
+        #
+        # Behind a DRAIN, /confirm really does still work: it writes the
+        # mailbox and replies "Queued", and the job rides the pod already paid
+        # for (queue-depth-1, 2026-09-02). [Run] used to reach _do_confirm and
+        # get that for free; _do_phase_a cannot queue — a Phase A has no pod to
+        # chain onto — so the least it can do is name the command that still
+        # can, or a working feature looks removed rather than moved.
+        #
+        # Behind a PHASE A it does not, and saying so would dead-end the user:
+        # _do_confirm's own guard turns exactly this state away with "the
+        # try-on phase is still running … or /kill to stop it". Two refusals
+        # pointing at each other is the `Đợi`-button-advising-/confirm-again
+        # bug, so this one offers the same two real exits that one does.
+        reason = _busy_reason(chat_id)
+        if reason == _REASON_DRAIN:
+            tg.send_message(chat_id, f"{reason} for this job — /status shows "
+                                     "it. Run cannot queue behind it, but "
+                                     "/confirm still can.")
+        else:
+            tg.send_message(chat_id, f"{reason} for this job — /status shows "
+                                     "it. Wait for it to finish, or /kill to "
+                                     "stop it, then tap Run again.")
         return
     live_path = _job_manifest_path(chat_id)
     write_manifest(queued, live_path, now=time.strftime("%Y-%m-%d %H:%M:%S"))
