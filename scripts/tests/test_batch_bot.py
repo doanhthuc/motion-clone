@@ -6084,6 +6084,32 @@ class TestTickPhaseA(unittest.TestCase):
                 bot.tick_phase_a(self.tg, ME)
         self.assertFalse(bot._progress_path(ME).exists())
 
+    def test_the_terminal_edit_raising_still_runs_the_exit_zero_dispatch(self):
+        # Same class of bug as the panel above, one step earlier and shared by
+        # ALL THREE terminal branches: the edit_message call that renders the
+        # "offered" progress text runs before the rc dispatch, for every rc.
+        # `offered: True` is already on disk by this point (written just above
+        # in tick_phase_a), so a TgError here that is left to propagate skips
+        # the dispatch entirely — for rc == 0 that means deliver_result is
+        # never called (the user's finished videos never arrive) and the
+        # progress file is stranded, pinning the poll loop's 2s cadence
+        # forever. Unlike the two return-based TgError handlers elsewhere in
+        # this file, this one must NOT return: this is the terminal tick, rc
+        # will not change on a later poll, and the branch below already does
+        # its own unlink — swallowing and falling through is what actually
+        # closes the failure mode. assertRaises rather than a tolerant catch
+        # is what proves the mock really fired.
+        from tgbot.tgclient import TgError
+        with mock.patch("tgbot.bot.phase_a_running", return_value=False), \
+             mock.patch("tgbot.bot.phase_a_exit", return_value=0), \
+             mock.patch.object(self.tg, "edit_message",
+                               side_effect=TgError("Too Many Requests",
+                                                    retry_after=42.0)), \
+             mock.patch("tgbot.bot.deliver_result") as deliver:
+            bot.tick_phase_a(self.tg, ME)
+        deliver.assert_called_once()
+        self.assertFalse(bot._progress_path(ME).exists())
+
     def test_the_exit_three_path_previews_a_tryon_that_finished_in_its_last_tick(self):
         # deliver_result sends _final/*.mp4 only, so a try-on image recorded
         # done inside the final tick is never shown unless this branch previews

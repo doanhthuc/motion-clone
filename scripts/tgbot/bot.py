@@ -3118,9 +3118,30 @@ def tick_phase_a(tg: Tg, chat_id: int, *, dry_run: bool = False) -> None:
     # every branch below is terminal, and a try-on recorded done inside THIS
     # tick would otherwise never be previewed at all, because deliver_result
     # sends _final/*.mp4 only.
-    _deliver_tryon_previews(tg, chat_id, manifest_path, payload)
-    text = progress_text(manifest_path, lease=None, stages=stages, phase="local")
-    tg.edit_message(chat_id, message_id, text, parse_mode=PARSE_HTML)
+    try:
+        _deliver_tryon_previews(tg, chat_id, manifest_path, payload)
+        text = progress_text(manifest_path, lease=None, stages=stages, phase="local")
+        tg.edit_message(chat_id, message_id, text, parse_mode=PARSE_HTML)
+    except TgError as exc:
+        # Deliberately swallow-and-fall-through, NOT the pause-and-return shape
+        # tick_progress's running branch and this function's OWN running branch
+        # (above) use. Those pause because there is a next tick to retry the
+        # edit on. This is the terminal tick: rc is already known and will not
+        # change, `offered` is already written to disk above, and every branch
+        # below does its own path.unlink(...) regardless of whether this edit
+        # or preview landed. Returning here instead would drop the terminal
+        # action — deliver_result on rc == 0, the rent panel on EXIT_NEEDS_POD,
+        # the failure message otherwise — for at least a full poll interval,
+        # and for rc == 0 specifically it would also skip delivering the user's
+        # finished videos, for no benefit: nothing downstream depends on this
+        # particular edit having succeeded (/status recomputes the same text
+        # from the same journal on demand). Letting it propagate instead, as
+        # this block used to, is the bug the re-review caught: the exception
+        # would exit tick_phase_a before the dispatch below ever runs, leaving
+        # the progress file (already `offered: true`) stranded and the poll
+        # loop's `animating = _progress_path(...).exists()` pinned at 2s forever.
+        log(f"phase-A terminal edit/preview failed, continuing to the "
+            f"exit-{rc} branch anyway: {exc}")
 
     if rc == EXIT_NEEDS_POD:
         # Stock is measured HERE, not when [Run] was tapped — that gap is the
