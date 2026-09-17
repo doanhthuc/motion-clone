@@ -980,17 +980,31 @@ def _render_and_validate(tg: Tg, chat_id: int) -> bool:
     sent its own specific message — callers must not add a second, vaguer one
     on top, because burying the real reason is the bug finding B is about.
 
-    One asymmetry is load-bearing: the mailbox-already-occupied branch leaves
-    `_LAST_VALIDATE` UNSET rather than setting it False. Unset means "never
-    attempted", which is what /confirm keys off to retry later; False means
-    "attempted and the manifest is bad", which /confirm must not retry.
+    One asymmetry is load-bearing: the two write-guard branches below (a live
+    Phase A, or a mailbox already occupied) leave `_LAST_VALIDATE` UNSET rather
+    than setting it False. Unset means "never attempted", which is what
+    /confirm keys off to retry later; False means "attempted and the manifest
+    is bad", which /confirm must not retry.
     """
     live_path = _job_manifest_path(chat_id)
-    # _manifest_write_ok, not drain_running: --phase-a-only is drain.py too, so
-    # a live Phase A is also a child reading the file this function is about to
-    # rewrite. The live-vs-mailbox CHOICE below stays on drain_running
-    # (_active_manifest_path) — a mailbox is claimed by a running drain's
-    # chain_or_teardown, which a Phase A does not have.
+    # Two guards, and they are not the same shape. This one is unconditional:
+    # --phase-a-only is drain.py too, so a live Phase A is a child re-reading
+    # the very file below is about to rewrite, and there is nowhere to put the
+    # write instead — a mailbox belongs to a running drain's chain_or_teardown,
+    # which a Phase A does not have. Refuse outright, never queue.
+    #
+    # phase_a_running, not busy(): busy() also catches a drain, and a drain is
+    # the OTHER guard's case — it redirects into the mailbox rather than
+    # blocking. Added 2026-09-17: until then neither guard fired for the common
+    # case (Phase A live, no drain, empty mailbox) and the rewrite went through.
+    if phase_a_running(live_path):
+        tg.send_message(chat_id,
+                        "the try-on phase is running for this job — wait for "
+                        "it to finish, or /kill to stop it, then try again")
+        return False
+    # The drain-specific guard. _manifest_write_ok is only half of it: a live
+    # drain alone is fine (the write is redirected below), what is refused is a
+    # mailbox ALREADY holding a job.
     if not _manifest_write_ok(chat_id) and mailbox_path(live_path).exists():
         # Queue depth is "current plus at most one next" (2026-09-02) — a
         # second job can be assembled and validated live while the first
@@ -4786,11 +4800,14 @@ def _do_resume(tg: Tg, chat_id: int, manifest_path: Path, *, dry_run: bool) -> N
 def _manifest_write_ok(chat_id: int) -> bool:
     """May this chat's manifest file be rewritten right now?
 
-    One predicate for the three guards that exist because a child process
-    READS that file (drain.py, in both its modes): _render_and_validate,
-    /clear and /wipe. busy() rather than drain_running(), since --phase-a-only
-    is drain.py too and a rewrite mid-Phase-A corrupts a running child's
-    input.
+    One predicate for the guards that exist because a child process READS that
+    file (drain.py, in both its modes). /clear and /wipe use it as their whole
+    answer; _render_and_validate uses it only for the narrower
+    mailbox-already-occupied case, because it has its own unconditional Phase A
+    refusal above that and must still let a plain drain through to the mailbox.
+
+    busy() rather than drain_running(), since --phase-a-only is drain.py too
+    and a rewrite mid-Phase-A corrupts a running child's input.
     """
     return not busy(_job_manifest_path(chat_id))
 
@@ -4894,15 +4911,23 @@ def _do_phase_a(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
     does NOT do is freeze the panel or clear _STATE: Phase A is not a
     submission, and the spend decision still has to happen afterwards.
 
-    `dry_run` is accepted and deliberately unused, so do not "fix" it away.
-    start_phase_a never writes the confirm flag — that is its whole reason for
-    existing beside start_drain — so a dry run issues the same command a real
-    one does. That is also exactly what a dry-run start_drain already sent
-    down this path before it existed: drain.py's --yes gate sits AFTER the
-    local phase, so `--dry-run` never meant "no Gemini quota" here. Keeping
-    the parameter lets _CB_RUN_GO thread it to both branches identically
-    instead of remembering which of the two takes it.
+    `dry_run` makes this a total no-op, checked before anything else. It is a
+    BOT-LEVEL testing switch — `make bot-dry` is documented as "One polling
+    round … invoking no jobs" — and Phase A is a job: start_phase_a spawns
+    `make drain … PHASE_A=1`, which calls Gemini and bills quota for real.
+    Do not confuse it with drain.py's own --yes gate (the confirm flag only
+    run.py may write, deliberately unspellable here — see its docstring),
+    which is a REAL user's spend decision on a pod. Phase A runs independent
+    of THAT gate (--phase-a-only returns above it, spec §6.1) — but that says
+    nothing about whether the bot should have launched a child at all, which
+    is the only question --dry-run asks. Keeping the parameter also lets
+    _CB_RUN_GO thread it to both branches identically instead of remembering
+    which of the two takes it.
     """
+    if dry_run:
+        tg.send_message(chat_id, "dry run — Phase A would spend Gemini quota, "
+                                 "so nothing ran")
+        return
     if migration_running():
         tg.send_message(chat_id, "a volume migration is in progress for this pod's "
                                  "datacenter — wait for it to finish before renting")

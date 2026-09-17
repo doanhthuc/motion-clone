@@ -3779,6 +3779,39 @@ class TestFlow(unittest.TestCase):
         # to reassemble the job.
         self.assertIn(ME, bot._STATE)
 
+    def test_the_panel_refuses_to_rewrite_the_manifest_during_a_phase_a(self):
+        """New test (2026-09-17 final wave), not an extension of
+        test_manifest_write_ok_itself_is_busy_aware — that one only ever
+        exercised the HELPER.
+
+        _render_and_validate had two guards and neither stopped this: the
+        mailbox-occupied one needs `mailbox_path(...).exists()`, which is
+        False for a Phase A (a mailbox is a drain's), and the live-vs-mailbox
+        CHOICE keys off drain_running alone. So the common case — a Phase A
+        live, no drain, no mailbox — fell through both and rewrote the very
+        file the try-on child is re-reading. Any upload after tapping [Run]
+        reaches this function.
+        """
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+        live = bot._job_manifest_path(ME)
+        before = live.read_bytes()
+        # Cleared so the assertion below is about THIS call's branch and not
+        # about the verdict _fill_required_slots already cached.
+        bot._LAST_VALIDATE.clear()
+        with mock.patch("tgbot.bot.phase_a_running", return_value=True), \
+             mock.patch("tgbot.bot.write_manifest") as write_manifest:
+            ok = bot._render_and_validate(self.tg, ME)
+        self.assertFalse(ok)
+        write_manifest.assert_not_called()
+        self.assertEqual(live.read_bytes(), before)
+        self.assertIn("try-on phase is running", self.tg.messages[-1])
+        self.assertIn("/kill", self.tg.messages[-1])
+        # Unset, not False: "never attempted" is what /confirm keys off to
+        # retry once the child is gone, the same asymmetry the mailbox branch
+        # relies on.
+        self.assertNotIn(ME, bot._LAST_VALIDATE)
+
     def test_confirm_still_queues_behind_a_real_drain_rather_than_refusing(self):
         # The guard above must not become a busy() guard. Queue-depth-1
         # (2026-09-02) is the whole reason /confirm stays reachable during a
@@ -5574,9 +5607,13 @@ class TestKillCommand(unittest.TestCase):
             bot.handle(self.tg, cb_from(ME, bot._CB_KILL_GO), allowed_user_id=ME)
         self.assertEqual(run.call_args.args[0], ["make", "gpu-destroy"])
         clear_lease.assert_called_once()
-        # Not stopped here, and that is correct: destroying the pod takes the
-        # drain down, and drain.py's own teardown is what the Phase A handle
-        # would have belonged to.
+        # Not stopped here, and the assertion is right even though the obvious
+        # reason is not: Phase A is its own Popen in run._PHASE_A, wholly
+        # separate from the pod and the drain, so destroying the pod does NOT
+        # take it down. What /kill prioritises is the thing actually billing —
+        # the pod — and this branch has no path back to the Phase A handle.
+        # The orphaned local child is a known, accepted limitation of this
+        # rare both-live case, deferred rather than fixed here.
         stop.assert_not_called()
         self.assertIn("Killed. Pod destroyed", self.tg.messages[-1])
 
@@ -6077,9 +6114,10 @@ class TestRunStartsPhaseAFirst(unittest.TestCase):
         # The reason the helper has to answer busy() rather than
         # drain_running() is that --phase-a-only is drain.py too, so a rewrite
         # mid-Phase-A corrupts the input of a running child. Whether every
-        # caller then acts on that answer is a separate question, and
-        # _render_and_validate's own `mailbox_path(...).exists()` conjunct
-        # means it does not yet, by the plan's own Step 6 scoping.
+        # caller then acts on that answer is a separate question:
+        # _render_and_validate only consults this helper for the
+        # mailbox-occupied case, and covers Phase A with a guard of its own —
+        # test_the_panel_refuses_to_rewrite_the_manifest_during_a_phase_a.
         self._write(self.PLAIN)
         with mock.patch("tgbot.bot.busy", return_value=True):
             self.assertFalse(bot._manifest_write_ok(ME))
@@ -6133,6 +6171,25 @@ class TestRunStartsPhaseAFirst(unittest.TestCase):
         text = self._refuse_busy_phase_a(drain=True)
         self.assertIn("a drain is running", text)
         self.assertIn("/confirm still can", text)
+
+    def test_a_dry_run_launches_no_phase_a_at_all(self):
+        # `make bot-dry` documents itself as "invoking no jobs", and Phase A is
+        # a job: start_phase_a spawns `make drain … PHASE_A=1`, which calls
+        # Gemini for real. Before this guard, [Run] under --dry-run billed
+        # quota during what the Makefile promises is a no-op poll round — the
+        # only money a dry run could spend anywhere in this file.
+        with mock.patch("tgbot.bot.migration_running", return_value=False), \
+             mock.patch("tgbot.bot._jobs_for", return_value=[mock.Mock()]), \
+             mock.patch("tgbot.bot.busy", return_value=False), \
+             mock.patch("tgbot.bot.write_manifest") as write_manifest, \
+             mock.patch("tgbot.bot.start_phase_a") as start_phase_a:
+            bot._do_phase_a(self.tg, ME, dry_run=True)
+        start_phase_a.assert_not_called()
+        # The manifest write is part of the same no-op: it is what start_phase_a
+        # would have read, and rewriting it is a side effect a dry run has no
+        # business having either.
+        write_manifest.assert_not_called()
+        self.assertIn("dry run", self.tg.messages[-1])
 
     def test_a_busy_manifest_refusal_does_not_send_a_phase_a_to_confirm(self):
         # The contradiction, asserted as an absence. /confirm CANNOT queue

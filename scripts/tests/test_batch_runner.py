@@ -1069,7 +1069,7 @@ class TestRunLocalPhase(unittest.TestCase):
             # `params_manifest` is what run_local_phase._one writes on success
             # (runner.py:553-555), so it belongs in any journal claiming to be the
             # leftover of a real earlier Phase A. Derived from the manifest rather
-            # than spelled out, so a change to params.py defaults cannot turn this
+            # than spelled out, so a change to pipelines.py defaults cannot turn this
             # test into a params-mismatch failure about something else.
             done_params = effective_stage_params(
                 "tryon", manifest.runs[0].stage_params.get("tryon"))

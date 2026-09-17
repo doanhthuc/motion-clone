@@ -470,11 +470,15 @@ def busy(manifest_path: Path) -> bool:
     """Anything holding this manifest — a billed drain OR an unpaid Phase A.
 
     Use this for the guards that exist because drain.py READS the manifest
-    file (/clear, /wipe; _render_and_validate's write guard moves here in
-    Task 10 — it still reads drain_running until then): overwriting a file a
-    running child is about to re-read corrupts its input. Keep using
-    drain_running() for the guards that exist because a POD IS BILLED —
-    conflating them would let an unpaid try-on phase block a kill.
+    file: overwriting a file a running child is about to re-read corrupts its
+    input. /clear and /wipe are exactly that and use it whole.
+    _render_and_validate only uses it for the mailbox-occupied half — a Phase A
+    there is an unconditional refusal (nothing to queue into) and a drain there
+    is a redirect into the mailbox, so the two halves of the `or` below need
+    different answers and it tests them separately.
+
+    Keep using drain_running() for the guards that exist because a POD IS
+    BILLED — conflating them would let an unpaid try-on phase block a kill.
     """
     return drain_running(manifest_path) or phase_a_running(manifest_path)
 

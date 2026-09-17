@@ -372,11 +372,13 @@ class TestStartPhaseA(unittest.TestCase):
         self.assertEqual(run_mod.phase_a_exit(self.manifest), 3)
 
     def test_a_fresh_start_discards_the_previous_runs_exit_code(self):
-        # start_phase_a's _PHASE_A_RC.pop is the one line whose absence would
-        # silently break Task 9's tick: a code left over from the PREVIOUS run
-        # of the same manifest would still be sitting there, and the tick that
-        # polls right after a re-run would report the old failure as this
-        # run's.
+        # start_phase_a's _PHASE_A_RC.pop keeps that dict from ever holding a
+        # code that predates the current live handle. No tick can observe the
+        # stale code today — after a re-run the live handle is back in
+        # _PHASE_A, so phase_a_exit returns at its "still running" branch
+        # (rc is None) and never consults _PHASE_A_RC at all. The invariant is
+        # for any future DIRECT reader of the dict, which would have no such
+        # protection.
         key = self.manifest.resolve()
         run_mod._PHASE_A_RC[key] = 7
         with mock.patch.object(run_mod.subprocess, "Popen") as popen:

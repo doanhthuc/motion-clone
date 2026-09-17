@@ -438,7 +438,7 @@ def _local_provenance_stale(run: Run, stage_name: str, recorded: dict) -> bool:
 
     Narrow on purpose — this is NOT a params check, and §5 of the spec records
     why: comparing a journalled params_manifest against effective_stage_params
-    recomputed at resume time means any change to params.py's defaults silently
+    recomputed at resume time means any change to pipelines.py's defaults silently
     invalidates every stage marked done, and at Phase B that re-submits a
     40-minute enhance to a GPU billing $0.99/h.
 
@@ -596,7 +596,7 @@ def run_local_phase(*, settings: Settings, manifest: Manifest, out_root: Path, b
         # Phase A also compares params (local_tryon_reusable) because redoing a
         # wrong image here costs one Gemini call; run_one deliberately does not,
         # because the same comparison on a pod stage would re-submit a 40-minute
-        # enhance at $0.99/h whenever params.py's defaults move.
+        # enhance at $0.99/h whenever pipelines.py's defaults move.
         #
         # Phase A needs no provenance clause either, and must not gain one: _one
         # only runs for a (run, stage_name) pair where _local_tryon_stage(run) ==
