@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unicodedata
@@ -30,7 +31,7 @@ from batchlib.local_tryon import is_local_provider
 from batchlib.manifest import ManifestError, load_manifest, load_state, state_path_for
 from batchlib.pipelines import (PIPELINES, effective_stage_params,
                                optional_roles, required_roles)
-from batchlib.runner import preserved_local_tryon
+from batchlib.runner import has_local_tryon, preserved_local_tryon
 # Not `from batchlib_ext...` or `scripts/batchlib/...` — drain.py itself lives
 # at scripts/drain.py, a plain top-level module, same as batch_run.py. scripts/
 # is already on sys.path (the insert above), so this is the plan's own "import
@@ -48,12 +49,18 @@ from tgbot.ingest import (Probe, describe, probe, quality_warning,
                          quality_warning_html,
                          to_png_if_heic)
 from tgbot.job import (DEFAULT_PROVIDER, Job, _tryon_stage, missing_slots,
-                       run_id_for, slot_for, write_manifest)
+                       render_manifest, run_id_for, slot_for, write_manifest)
 from tgbot.preview import sheet, slot_preview
+# `run as run_mod` alongside the from-imports, for exactly one caller:
+# _busy_reason, which has to resolve drain_running through tgbot.run's OWN
+# globals so it cannot disagree with the busy() that just returned True. See
+# that function's docstring.
+from tgbot import run as run_mod
 from tgbot.run import (LEASE_PATH, _RUNNING, busy, drain_running,
                        estimate_minutes, final_files, lease_for,
                        phase_a_exit, phase_a_running,
-                       progress_text, start_drain, summary_text)
+                       progress_text, start_drain, start_phase_a,
+                       stop_phase_a, summary_text)
 from batchlib_ext.gpu_stock import stock_at, stock_at_cached, volume_datacenter
 from batchlib_ext.handoff import handoff_path, mailbox_path, read_handoff
 from batchlib_ext.lease import clear_lease
@@ -979,8 +986,12 @@ def _render_and_validate(tg: Tg, chat_id: int) -> bool:
     "attempted and the manifest is bad", which /confirm must not retry.
     """
     live_path = _job_manifest_path(chat_id)
-    running = drain_running(live_path)
-    if running and mailbox_path(live_path).exists():
+    # _manifest_write_ok, not drain_running: --phase-a-only is drain.py too, so
+    # a live Phase A is also a child reading the file this function is about to
+    # rewrite. The live-vs-mailbox CHOICE below stays on drain_running
+    # (_active_manifest_path) — a mailbox is claimed by a running drain's
+    # chain_or_teardown, which a Phase A does not have.
+    if not _manifest_write_ok(chat_id) and mailbox_path(live_path).exists():
         # Queue depth is "current plus at most one next" (2026-09-02) — a
         # second job can be assembled and validated live while the first
         # drains, but a third has nowhere safe to land until drain.py's own
@@ -1533,7 +1544,7 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
             else:
                 # The second step. Deliberately a separate tap: the first one
                 # is next to the manifest and easy to hit by accident.
-                _offer_run_confirm(tg, chat_id)
+                _offer_run_for_chat(tg, chat_id)
 
         elif data.startswith(_CB_RUN_SWITCH):
             gpu_id = _GPU_BY_SHORT.get(data[len(_CB_RUN_SWITCH):])
@@ -1547,7 +1558,7 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
                 # what changed, so a separate "switched — GPU is now X" text
                 # message would just be one more message saying the same thing.
                 msg_id = (query.get("message") or {}).get("message_id")
-                _offer_run_confirm(tg, chat_id, message_id=msg_id)
+                _offer_run_for_chat(tg, chat_id, message_id=msg_id)
 
         elif data == _CB_RUN_SWITCH_MENU:
             msg_id = (query.get("message") or {}).get("message_id")
@@ -1564,7 +1575,7 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
                 tg.send_message(chat_id, "no complete job yet — send the "
                                          "required files first")
             else:
-                _offer_run_confirm(tg, chat_id, message_id=msg_id)
+                _offer_run_for_chat(tg, chat_id, message_id=msg_id)
 
         elif data.startswith(_CB_RUN_REFRESH):
             view = data[len(_CB_RUN_REFRESH):]
@@ -1580,7 +1591,7 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
             elif view == "g":
                 _offer_run_migrate_menu(tg, chat_id, message_id=msg_id, force=True)
             else:
-                _offer_run_confirm(tg, chat_id, message_id=msg_id, force=True)
+                _offer_run_for_chat(tg, chat_id, message_id=msg_id, force=True)
 
         elif data == _CB_GPU_REFRESH:
             msg_id = (query.get("message") or {}).get("message_id")
@@ -1612,6 +1623,13 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
                                 "the job changed since that button was sent, so "
                                 "nothing ran. Check the manifest above and "
                                 "confirm again.")
+            elif _job_has_local_tryon(chat_id):
+                # Two-step flow: Phase A first, rent afterwards. _do_confirm is
+                # NOT called here — it clears _STATE, and the panel
+                # tick_phase_a renders minutes later needs the manifest on disk
+                # and the journal to have a batch id, both of which Phase A
+                # produces. Nothing has been spent yet at this point.
+                _do_phase_a(tg, chat_id, dry_run=dry_run)
             else:
                 _do_confirm(tg, chat_id, dry_run=dry_run)
 
@@ -3081,8 +3099,9 @@ def tick_phase_a(tg: Tg, chat_id: int, *, dry_run: bool = False) -> None:
         # A restart orphan. _PHASE_A and _PHASE_A_RC are in-memory, so this
         # process can never learn how that child ended, and no other path
         # clears the file: tick_progress returns at its ownership guard, and
-        # /kill cannot reach it because _ask_kill gates on drain_running, which
-        # Phase A never sets. Unlink and say so. Deliberately NOT handing
+        # /kill cannot reach it either — its Phase A branch gates on
+        # phase_a_running, which is False for exactly the same reason this
+        # branch is running (no handle in this process). Unlink and say so. Deliberately NOT handing
         # ownership back to tick_progress by dropping the `phase` key — that
         # makes its very next tick take the "Finished" branch and deliver_result
         # a half-finished batch, the exact bug the ownership marker exists to
@@ -3431,9 +3450,14 @@ def _clear_job(tg: Tg, chat_id: int) -> None:
         # busy(), not drain_running(): an unpaid Phase A reads this same
         # manifest, so it corrupts the same way. The distinction is the point
         # of the two predicates — this guard exists because a child READS the
-        # file, not because a pod is billed, and /kill stays on drain_running
-        # so a try-on phase can never block one.
-        tg.send_message(chat_id, "a drain is running for this job — clearing "
+        # file, not because a pod is billed, and /kill's POD-FORFEIT path
+        # stays on drain_running so a try-on phase can never trigger one.
+        #
+        # WHICH of the two is holding it goes in the message, via _busy_reason:
+        # the guard fires identically either way, but naming a drain during an
+        # unpaid Phase A tells the user a pod is burning $0.99/hour when none
+        # exists.
+        tg.send_message(chat_id, f"{_busy_reason(chat_id)} for this job — clearing "
                                  "now would delete the files it is reading. "
                                  "Wait for it, then /clear.")
         return
@@ -3506,8 +3530,10 @@ def _wipe_chat(tg: Tg, chat_id: int) -> None:
     if busy(_job_manifest_path(chat_id)):
         # busy() for the reason _clear_job's guard gives: this is the
         # manifest-is-being-read guard, not the pod-is-billed one, so an
-        # unpaid Phase A has to refuse it too.
-        tg.send_message(chat_id, f"{ICON_ALERT_CE} a drain is running for this chat's job — "
+        # unpaid Phase A has to refuse it too — and _busy_reason for the
+        # reason given there as well, so the refusal names the right one.
+        tg.send_message(chat_id, f"{ICON_ALERT_CE} {_busy_reason(chat_id)} for this "
+                                 "chat's job — "
                                  "wiping now would delete the files it is "
                                  "reading, and the message that tells you "
                                  "when it's done. Wait for it, then /wipe.",
@@ -4180,7 +4206,7 @@ def _edit_or_send(tg: Tg, chat_id: int, message_id: int | None, text: str,
 
 def _offer_run_confirm(tg: Tg, chat_id: int, *, message_id: int | None = None,
                        force: bool = False, spend_cb: str | None = None,
-                       heading: str | None = None) -> None:
+                       heading: str | None = None, phase_a: bool = False) -> None:
     """The step between [Run] and spending money: always lists every known
     GPU's live stock/price at the home datacenter and lets [Confirm] switch
     to any of them before renting (2026-09-02, widened from "only offer a
@@ -4212,6 +4238,12 @@ def _offer_run_confirm(tg: Tg, chat_id: int, *, message_id: int | None = None,
     than duplicate — and the second one is the whole point of the change, since
     it measures stock at the moment of the decision instead of minutes before.
 
+    `phase_a` relabels the spend button, because with the try-on moved ahead
+    of the rental the first tap no longer rents anything: it spends Gemini
+    quota. Leaving the label at "Yes, spend $0.99/h" would make the button
+    promise a pod it does not start, and the GPU decision now happens on a
+    second panel rendered after the try-on results exist.
+
     `message_id` edits that message in place instead of sending a new one
     (see _edit_or_send) — set by every caller except the two that send a fresh
     message: the very first [Run] tap on the job panel, and tick_phase_a's
@@ -4235,14 +4267,20 @@ def _offer_run_confirm(tg: Tg, chat_id: int, *, message_id: int | None = None,
         stock = {}
 
     price = _gpu_price(configured, stock)
+    # Resolved once, for the same reason spend_cb is above: the fail-open
+    # branch and the normal one each mint a spend button, and two sites
+    # wording it independently is how a panel ends up promising a rental on
+    # one branch and Gemini quota on the other — only when the stock check
+    # fails, i.e. only in production.
+    spend_label = ("Yes — run try-on first (Gemini quota, no GPU yet)" if phase_a
+                   else f"Yes, spend ${price:.2f}/h")
     if not stock or not home_dc:
         _edit_or_send(
             tg, chat_id, message_id,
             f"This rents a GPU pod at ${price:.2f}/hour and starts the job.\n"
             "Confirm?",
             [[("Refresh", _CB_RUN_REFRESH + "m", _ce_id(ICON_REFRESH_CE))],
-             [(f"Yes, spend ${price:.2f}/h", spend_cb,
-               _ce_id(ICON_ROCKET_CE)),
+             [(spend_label, spend_cb, _ce_id(ICON_ROCKET_CE)),
               ("Cancel", _CB_RUN_NO)]])
         return
 
@@ -4302,11 +4340,39 @@ def _offer_run_confirm(tg: Tg, chat_id: int, *, message_id: int | None = None,
     if sold_out:
         buttons.append([("Cancel", _CB_RUN_NO)])
     else:
-        buttons.append([(f"Yes, spend ${price:.2f}/h", spend_cb,
-                        _ce_id(ICON_ROCKET_CE)),
+        buttons.append([(spend_label, spend_cb, _ce_id(ICON_ROCKET_CE)),
                         ("Cancel", _CB_RUN_NO)])
     _edit_or_send(tg, chat_id, message_id, "\n".join(lines), buttons,
                  parse_mode=PARSE_HTML)
+
+
+def _offer_run_for_chat(tg: Tg, chat_id: int, *, message_id: int | None = None,
+                        force: bool = False) -> None:
+    """[Run]'s first screen, choosing between the two flows by manifest content.
+
+    A chat whose draft has local try-on gets the two-step flow (Phase A, then
+    decide about the GPU with the try-on results in hand and stock measured
+    now). One without it keeps the single tap it has always had: there is
+    nothing for Phase A to run, so an extra screen would report nothing and
+    cost a round trip.
+
+    All four PRE-spend call sites route through here rather than calling
+    _offer_run_confirm directly (_CB_RUN_ASK, _CB_RUN_SWITCH, _CB_RUN_BACK and
+    _CB_RUN_REFRESH). They have to, or the panel re-rendered after a GPU switch
+    or a Refresh would drop back to the one-step flow and its button would
+    promise a rental that the first screen said was two steps away.
+
+    tick_phase_a's post-Phase-A panel is the one caller that must NOT come
+    through here, and does not: by then the try-on has already run, so the
+    answer would be a stale True and the button would offer to spend Gemini
+    quota a second time on a batch whose images are already on disk. It passes
+    its own spend_cb and heading and leaves phase_a at its default.
+
+    Asks the DRAFT, not the manifest on disk: at _CB_RUN_ASK time the file may
+    not have been written yet.
+    """
+    _offer_run_confirm(tg, chat_id, message_id=message_id, force=force,
+                       phase_a=_job_has_local_tryon(chat_id))
 
 
 def _offer_run_switch_menu(tg: Tg, chat_id: int, *, message_id: int | None = None,
@@ -4380,8 +4446,26 @@ def _ask_kill(tg: Tg, chat_id: int) -> None:
     """The confirm step for /kill — mirrors [Run]'s Yes/Cancel, for the
     opposite reason: this one forfeits money already spent instead of
     committing new money.
+
+    The Phase A branch below is PARALLEL to the pod one, not a widening of it:
+    /kill's meaning for a billed drain is unchanged. It exists because
+    2026-09-16's [Run] rewiring moved Phase A out of the drain's own Popen and
+    into its own handle (run._PHASE_A), invisible to drain_running — so from
+    that change on, a try-on phase stuck hammering a misconfigured Gemini key
+    would have been answered "there is no pod to kill" while it kept spending
+    quota, with no way at all to stop it short of restarting the bot.
     """
     manifest_path = _job_manifest_path(chat_id)
+    if phase_a_running(manifest_path):
+        tg.send_message(
+            chat_id,
+            f"{ICON_WARN} This stops the try-on phase in progress — no pod is "
+            "rented, so there is nothing to destroy, but Gemini calls already "
+            "made are not refunded. Are you sure?",
+            buttons=[[("🛑 Yes, stop it", _CB_KILL_GO),
+                      ("↩️ Leave it running", _CB_KILL_NO)]],
+            parse_mode=PARSE_HTML)
+        return
     if not drain_running(manifest_path):
         tg.send_message(chat_id, "nothing is running for this chat right now — "
                                  "there is no pod to kill")
@@ -4412,8 +4496,42 @@ def _do_kill(tg: Tg, chat_id: int) -> None:
     `make gpu-destroy` already re-lists and verifies the pod is actually gone
     (Makefile:161-167) rather than trusting its own exit code, so this reuses
     that rather than re-deriving it.
+
+    The Phase A branch returns before any of that, and must: nothing was
+    rented, so `make gpu-destroy` here would tear down whatever unrelated pod
+    .env happens to name, and clear_lease would wipe a lease that belongs to
+    someone else's run. phase_a_running is re-derived here rather than trusted
+    from _ask_kill — the same don't-trust-the-ask idiom _run_token encodes,
+    and it matters more here because the phase can finish in the seconds a
+    confirm button sits unanswered.
     """
     manifest_path = _job_manifest_path(chat_id)
+    if phase_a_running(manifest_path):
+        stopped = stop_phase_a(manifest_path)
+        # The same progress file tick_phase_a owns. Left behind it pins the
+        # poll loop at 2s via `animating = _progress_path(...).exists()`,
+        # under a message frozen on "running the try-on" with nothing running.
+        prog = _progress_path(chat_id)
+        if prog.exists():
+            try:
+                payload = json.loads(prog.read_text(encoding="utf-8"))
+                tg.edit_message(chat_id, int(payload["message_id"]),
+                                "🛑 <b>Killed by request</b> — nothing left running.",
+                                parse_mode=PARSE_HTML)
+            except (ValueError, KeyError, TypeError, TgError):
+                pass
+            prog.unlink(missing_ok=True)
+        _ANIM_PAUSE.pop(chat_id, None)
+        # Conditioned on stop_phase_a's return value, which is its whole
+        # contract: claiming a stop for a phase that had already exited tells
+        # the user they halted a run that may well have succeeded.
+        tg.send_message(
+            chat_id,
+            "🛑 Stopped the try-on phase. Nothing was rented, and Gemini calls "
+            "already made are not refunded." if stopped else
+            "the try-on phase had already finished — nothing to stop.")
+        return
+
     proc = _RUNNING.get(manifest_path.resolve())
     if proc is not None and proc.poll() is None:
         proc.terminate()
@@ -4640,6 +4758,147 @@ def _do_resume(tg: Tg, chat_id: int, manifest_path: Path, *, dry_run: bool) -> N
                     parse_mode=PARSE_HTML)
     start_drain(manifest_path, dry_run=dry_run, resume=True)
     _start_progress(tg, chat_id, manifest_path, stages)
+
+
+def _manifest_write_ok(chat_id: int) -> bool:
+    """May this chat's manifest file be rewritten right now?
+
+    One predicate for the three guards that exist because a child process
+    READS that file (drain.py, in both its modes): _render_and_validate,
+    /clear and /wipe. busy() rather than drain_running(), since --phase-a-only
+    is drain.py too and a rewrite mid-Phase-A corrupts a running child's
+    input.
+    """
+    return not busy(_job_manifest_path(chat_id))
+
+
+def _busy_reason(chat_id: int) -> str:
+    """The leading clause of a refusal from a guard that just failed
+    _manifest_write_ok — which half of busy()'s `or` is actually true.
+
+    busy() is `drain_running() or phase_a_running()`, and saying "a drain is
+    running" for the second half is a lie in the direction that costs the most:
+    it tells the user a pod is burning $0.99/hour when nothing is rented at
+    all, so "wait for it" reads as "hurry", and the honest next action (/kill,
+    which since 2026-09-17 can stop a Phase A) is never suggested.
+
+    drain_running is reached through `run_mod`, not the name imported at the
+    top of this file, so it resolves through the SAME module globals busy()
+    resolves it through. Any other spelling lets the two disagree: a caller
+    that substitutes one and not the other would get busy() True and
+    drain_running False, and this function would name Phase A for a live
+    drain. Phase A is the else branch for the same reason — busy() was already
+    True, so if it is not a drain there is nothing else it can be.
+    """
+    return ("a drain is running" if run_mod.drain_running(_job_manifest_path(chat_id))
+            else "the try-on phase is running")
+
+
+def _job_has_local_tryon(chat_id: int) -> bool:
+    """Would this chat's next batch have a Phase A?
+
+    Reads the drafted jobs, not the manifest on disk: at [Run] time the file
+    may be stale or absent, and the jobs in _STATE/_BASKET are what
+    write_manifest is about to render.
+
+    Renders to a throwaway file and loads it back rather than inspecting the
+    jobs directly, because the alternative is a second opinion —
+    _local_tryon_stage is the only thing allowed to answer this, and it takes a
+    loaded Run. A TemporaryDirectory, not mkdtemp(): this runs on every [Run]
+    tap, and a leaked directory per tap on a long-lived VPS process is how /tmp
+    fills up with something nobody owns.
+
+    Fails towards False, i.e. towards _do_confirm and today's behaviour: a
+    manifest that will not render here will not render in write_manifest
+    either, and _do_confirm reports that properly. Silently doing nothing would
+    be worse than falling through.
+    """
+    queued = _jobs_for(chat_id)
+    if not queued:
+        return False
+    try:
+        text = render_manifest(queued, now=time.strftime("%Y-%m-%d %H:%M:%S"))
+        with tempfile.TemporaryDirectory() as d:
+            probe = Path(d) / "probe.yaml"
+            probe.write_text(text, encoding="utf-8")
+            return has_local_tryon(load_manifest(probe))
+    except (ManifestError, OSError):
+        return False
+
+
+def _start_phase_a_and_report(tg: Tg, chat_id: int, manifest_path: Path,
+                              stages: list[str]) -> None:
+    """Launch Phase A and say what it is about to cost.
+
+    resume=True whenever a journal already exists for this manifest: Phase A
+    writes its batch id before the first Gemini call, so a journal means
+    try-ons may already be paid for, and resume is what makes them skipped
+    rather than billed twice. When there is no journal, resolve_batch_id's own
+    "RESUME=1 but nothing to continue" branch reports it and runs as new.
+    """
+    has_journal = bool(load_state(state_path_for(manifest_path)).get("batch"))
+    start_phase_a(manifest_path, resume=has_journal)
+    tg.send_message(
+        chat_id,
+        f"{ICON_ROCKET_CE} <b>Running the try-on over the API.</b>\n"
+        "This spends Gemini quota, not GPU time — no pod is rented yet. When "
+        "it finishes I will show live GPU stock and ask before spending "
+        "anything.",
+        parse_mode=PARSE_HTML)
+    # phase="local" hands the progress message to tick_phase_a. Omitting it
+    # leaves the message owned by tick_progress, which sees no lease and no
+    # _RUNNING entry, concludes the batch finished, and delivers a
+    # half-finished result instead of the rent panel.
+    _start_progress(tg, chat_id, manifest_path, stages, phase="local")
+
+
+def _do_phase_a(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
+    """The pre-spend half of _do_confirm: same guards, same manifest write,
+    no pod and no confirm flag.
+
+    Shares _do_confirm's guard order deliberately — migration_running first,
+    then completeness, then the unanswered-file queue — so the two entry
+    points cannot drift into accepting a job the other would refuse. What it
+    does NOT do is freeze the panel or clear _STATE: Phase A is not a
+    submission, and the spend decision still has to happen afterwards.
+
+    `dry_run` is accepted and deliberately unused, so do not "fix" it away.
+    start_phase_a never writes the confirm flag — that is its whole reason for
+    existing beside start_drain — so a dry run issues the same command a real
+    one does. That is also exactly what a dry-run start_drain already sent
+    down this path before it existed: drain.py's --yes gate sits AFTER the
+    local phase, so `--dry-run` never meant "no Gemini quota" here. Keeping
+    the parameter lets _CB_RUN_GO thread it to both branches identically
+    instead of remembering which of the two takes it.
+    """
+    if migration_running():
+        tg.send_message(chat_id, "a volume migration is in progress for this pod's "
+                                 "datacenter — wait for it to finish before renting")
+        return
+    queued = _jobs_for(chat_id)
+    if not queued:
+        tg.send_message(chat_id, "no complete job yet — send the required files first")
+        return
+    pending = _PENDING.get(chat_id) or []
+    if pending and chat_id not in _CONFIRM_WARNED:
+        _CONFIRM_WARNED.add(chat_id)
+        tg.send_message(chat_id,
+                        f"{ICON_FLAG_CE} {len(pending)} file(s) still unassigned — answer "
+                        f"them, or send /confirm again to run without them",
+                        parse_mode=PARSE_HTML)
+        return
+    if not _manifest_write_ok(chat_id):
+        tg.send_message(chat_id, "a batch is already running for this job — "
+                                 "/status shows it")
+        return
+    live_path = _job_manifest_path(chat_id)
+    write_manifest(queued, live_path, now=time.strftime("%Y-%m-%d %H:%M:%S"))
+    stages: list[str] = []
+    for other in queued:
+        for stage in PIPELINES[other.pipeline]:
+            if stage not in stages:
+                stages.append(stage)
+    _start_phase_a_and_report(tg, chat_id, live_path, stages)
 
 
 def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool,
@@ -5328,7 +5587,9 @@ def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
             f"{ICON_CLIP_CE} <b>File, not Photo</b> — picker → \"...\" → Send as File\n"
             "🎬 Videos are the driver. For images, I'll ask — just tap.\n\n"
             f"{ICON_OK_CE} Full job shown before anything runs.\n"
-            f"{ICON_SPEND_CE} <b>Nothing spends money until you tap Run and confirm.</b>\n\n"
+            f"{ICON_SPEND_CE} <b>Nothing rents a GPU until you tap Run and confirm.</b>\n"
+            "A batch with API try-on spends Gemini quota first, before any pod "
+            "exists — you get asked about the GPU afterwards, with live stock.\n\n"
             "Buttons below, or type the commands.",
             parse_mode=PARSE_HTML,
             reply_keyboard=START_KEYBOARD)
@@ -5361,7 +5622,7 @@ BOT_COMMANDS = [
     ("again", "reuse the last job's files, e.g. with another pipeline"),
     ("clear", "throw away the job being assembled"),
     ("status", "progress of this chat's job"),
-    ("confirm", "SPENDS MONEY - rents a GPU at $0.99/h and starts"),
+    ("confirm", "SPENDS MONEY - rents a GPU at $0.99/h and starts (Run may ask first)"),
     ("result", "the finished video, or the failure logs"),
     ("tryon", "just the try-on image, when the result looks wrong"),
     ("wipe", "delete every message in this chat, yours and mine"),

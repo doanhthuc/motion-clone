@@ -7,7 +7,8 @@ from batchlib.client import JobError, JobFailed, JobGone
 from batchlib.config import ConfigError, Settings
 from batchlib.manifest import load_manifest, load_state, save_state, state_path_for
 from batchlib.pipelines import PIPELINES, effective_stage_params
-from batchlib.runner import (LocalPhaseResult, batch_id_now, local_tryon_reusable, needs_pod,
+from batchlib.runner import (LocalPhaseResult, batch_id_now, has_local_tryon,
+                              local_tryon_reusable, needs_pod,
                               preserved_local_tryon, prepare_batch, run_batch, run_local_phase,
                               run_one, stage_dest, write_index)
 
@@ -828,6 +829,44 @@ class TestNeedsPod(unittest.TestCase):
             with mock.patch.dict(PIPELINES, {"chi-tryon": ["tryon"]}):
                 manifest = load_manifest(_fixture_tryon(Path(d), text))
                 self.assertFalse(needs_pod(manifest))
+
+
+class TestHasLocalTryon(unittest.TestCase):
+    """The bot's answer to "does [Run] start Phase A, or go straight to the
+    spend panel?". It must be _local_tryon_stage's answer, not a second one.
+    """
+
+    def test_true_for_a_gemini_tryon_manifest(self):
+        with tempfile.TemporaryDirectory() as d:
+            manifest = load_manifest(_fixture_tryon(Path(d), MANIFEST_TRYON_GEMINI))
+            self.assertTrue(has_local_tryon(manifest))
+
+    def test_false_for_a_pure_motion_manifest(self):
+        with tempfile.TemporaryDirectory() as d:
+            manifest = load_manifest(_fixture(Path(d), MANIFEST_MOT_RUN))
+            self.assertFalse(has_local_tryon(manifest))
+
+    def test_false_when_clean_only_puts_the_tryon_back_on_the_pod(self):
+        # _local_tryon_stage checks cleanOnly BEFORE provider, matching the
+        # pod's own order (linux.py:4794). A cleanOnly run is a Gemini call
+        # that would produce the wrong image, so it must not start Phase A.
+        with tempfile.TemporaryDirectory() as d:
+            manifest = load_manifest(
+                _fixture_tryon(Path(d), MANIFEST_TRYON_GEMINI_CLEANONLY))
+            self.assertFalse(has_local_tryon(manifest))
+
+    def test_true_when_any_one_run_of_a_batch_is_local(self):
+        # One pod runs the whole manifest, so a single local try-on anywhere
+        # means Phase A has work to do. The second run's id is renamed: both
+        # module constants call their run "runA", and manifest.py refuses a
+        # manifest with a repeated id — concatenating them raw raises
+        # ManifestError instead of testing anything.
+        with tempfile.TemporaryDirectory() as d:
+            text = MANIFEST_TRYON_GEMINI + MANIFEST_MOT_RUN.split("runs:\n")[1].replace(
+                "- id: runA", "- id: runB")
+            manifest = load_manifest(_fixture_tryon(Path(d), text))
+            self.assertEqual([r.id for r in manifest.runs], ["runA", "runB"])
+            self.assertTrue(has_local_tryon(manifest))
 
 
 class TestRunLocalPhase(unittest.TestCase):

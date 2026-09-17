@@ -486,6 +486,19 @@ def preserved_local_tryon(manifest: Manifest, state: dict, out_root: Path) -> tu
     return reusable, total
 
 
+def has_local_tryon(manifest: Manifest) -> bool:
+    """True if ANY run in this manifest has a try-on Phase A can do locally.
+
+    The bot's answer to "does [Run] start Phase A, or go straight to the spend
+    panel?". A manifest with none keeps today's single-tap flow: adding a step
+    that runs nothing and reports nothing would cost a round trip for no
+    information. Asks _local_tryon_stage rather than re-deriving, per that
+    function's own docstring — this is its fourth caller and must not be a
+    second opinion.
+    """
+    return any(_local_tryon_stage(run) is not None for run in manifest.runs)
+
+
 def needs_pod(manifest: Manifest) -> bool:
     """True nếu còn ít nhất một chặng KHÔNG THỂ chạy local trong toàn bộ manifest.
 
