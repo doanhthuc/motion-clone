@@ -659,6 +659,14 @@ def run_local_phase(*, settings: Settings, manifest: Manifest, out_root: Path, b
                 # made. Entries predating the stamp have no key and keep
                 # today's behaviour — see _local_provenance_stale.
                 "phase": "local"}
+            # A retry that succeeds clears the run-level failure a previous
+            # attempt left behind, the same rule run_one applies (status "done"
+            # and an "error" must not coexist). Without this the journal still
+            # said "error" after the image was made (VPS, 2026-09-18,
+            # batch 2026-09-16-1706).
+            if entry.get("status") == "error":
+                entry["status"] = "pending"
+            entry.pop("error", None)
             save_state(state_file, state)
         xong = f"{stage_name} (local): xong {elapsed}s · {size // 1024} KB → {dest.name}"
         # Cả hai kết cục vào run.log, không chỉ lỗi — run_one cũng ghi cả hai, và "chặng

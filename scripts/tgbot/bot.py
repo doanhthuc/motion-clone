@@ -27,7 +27,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batchlib.config import env_get, env_set
-from batchlib.local_tryon import is_local_provider
+from batchlib.local_tryon import is_local_provider, qwen_max_configured
 from batchlib.manifest import (ManifestError, load_manifest, load_state,
                                save_state, state_path_for)
 from batchlib.pipelines import (PIPELINES, effective_stage_params,
@@ -51,7 +51,7 @@ from tgbot import tiktok
 from tgbot.ingest import (Probe, describe, probe, quality_warning,
                          quality_warning_html,
                          to_png_if_heic)
-from tgbot.job import (DEFAULT_PROVIDER, Job, _tryon_stage, missing_slots,
+from tgbot.job import (DEFAULT_PROVIDER, Job, _tryon_stage, _unique_ids, missing_slots,
                        render_manifest, run_id_for, slot_for, write_manifest)
 from tgbot.preview import sheet, slot_preview
 # `run as run_mod` alongside the from-imports, for exactly one caller:
@@ -1510,6 +1510,10 @@ _CB_PHASE_A_SPEND = "pa:spend:"   # + _run_token
 # makes the index safe — a rewritten manifest invalidates it, the same way it
 # invalidates the spend button.
 _CB_TRYON_REGEN = "rg:"           # + "<run index>:<_run_token>"
+# Retry a FAILED try-on with a chosen provider (2026-09-18). Same index+token
+# shape as _CB_TRYON_REGEN; "qwen-max" is the longest provider, so the worst
+# case is "rt:" + 2 + 9 + 19 digits, well under 64 bytes.
+_CB_TRYON_RETRY = "rt:"           # + "<run index>:<provider>:<_run_token>"
 
 # ONE number, everywhere a migration's duration is quoted: the /gpu listing,
 # the [Run] picker's "Other regions" note, the destructive confirm, and the
@@ -1736,6 +1740,11 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
         elif data.startswith(_CB_TRYON_REGEN):
             index, _, token = data[len(_CB_TRYON_REGEN):].partition(":")
             _regen_tryon(tg, chat_id, index, token, dry_run=dry_run)
+
+        elif data.startswith(_CB_TRYON_RETRY):
+            index, _, rest = data[len(_CB_TRYON_RETRY):].partition(":")
+            provider, _, token = rest.partition(":")
+            _retry_tryon(tg, chat_id, index, provider, token, dry_run=dry_run)
 
         elif data == _CB_RUN_NO:
             tg.send_message(chat_id, "cancelled — nothing was spent")
@@ -3133,6 +3142,125 @@ def _regen_tryon(tg: Tg, chat_id: int, index: str, token: str, *,
                     sent_tryon=seed, regen=regen)
 
 
+_RETRY_PROVIDERS = {"gemini": "Gemini", "qwen-max": "Qwen"}
+_QWEN_MISSING = ("Qwen is not set up on this box: it needs DASHSCOPE_API_KEY "
+                 "and QWEN_IMAGE_WORKSPACE in the VPS's .env.")
+
+
+def _tryon_failure_reason(error: str) -> str:
+    """The journal's error string, as something a person can act on (HTML).
+
+    Only the one case seen in practice gets a translation: Gemini's
+    IMAGE_SAFETY finishReason (2026-09-16, batch 2026-09-16-1706) arrives as
+    300 characters of raw JSON. Everything else is shown as-is: a 429 or a
+    missing key already says what it is. "Can pass on a retry" is measured:
+    the run blocked on 2026-09-16 went through unchanged on 2026-09-18.
+    """
+    if "IMAGE_SAFETY" in error or "PROHIBITED_CONTENT" in error:
+        return ("Gemini's safety filter blocked the generated image. It judges "
+                "each output, so the same inputs can pass on a retry; Qwen uses "
+                "a different filter.")
+    return f"<code>{_esc(error[:300])}</code>"
+
+
+def _report_failed_tryons(tg: Tg, chat_id: int, manifest_path: Path) -> None:
+    """One message per run whose Phase A try-on failed: why, plus retry buttons.
+
+    Until this existed the only sign in the chat was a ❌ on the progress bar,
+    and the reason sat in run.log on the VPS.
+    """
+    manifest = load_manifest(manifest_path)
+    runs = load_state(state_path_for(manifest_path)).get("runs") or {}
+    token = _run_token(chat_id)
+    qwen_ok = qwen_max_configured(ROOT)
+    for index, run in enumerate(manifest.runs):
+        stage_name = _local_tryon_stage(run)
+        if stage_name is None:
+            continue
+        entry = runs.get(run.id) or {}
+        if (((entry.get("stages") or {}).get(stage_name) or {})
+                .get("status") != "error"):
+            continue
+        provider = effective_stage_params(
+            stage_name, run.stage_params.get(stage_name)).get("provider")
+        buttons = [(f"🔄 Retry with {label}",
+                    f"{_CB_TRYON_RETRY}{index}:{key}:{token}")
+                   for key, label in _RETRY_PROVIDERS.items()
+                   if key != "qwen-max" or qwen_ok]
+        hint = "" if qwen_ok else f"\n{_esc(_QWEN_MISSING)}"
+        tg.send_message(
+            chat_id,
+            f"{ICON_ERROR_CE} <b>Try-on failed</b> for <code>{_esc(run.id)}</code> "
+            f"({_esc(str(provider))})\n"
+            f"{_tryon_failure_reason(str(entry.get('error') or 'no reason recorded'))}"
+            f"{hint}\nRetrying costs API quota only; no GPU is rented.",
+            parse_mode=PARSE_HTML, buttons=[buttons])
+
+
+def _retry_tryon(tg: Tg, chat_id: int, index: str, provider: str, token: str,
+                 *, dry_run: bool) -> None:
+    """Retry one failed try-on, switching that run alone to `provider` first.
+
+    The switch goes onto the drafted Job as well as the manifest, because
+    [Run] re-renders the manifest from the jobs: a manifest-only edit would be
+    undone by the next render, and Phase A would call the old provider again.
+    Every other run keeps its params, so local_tryon_reusable still skips
+    their finished images. The rest is _regen_tryon, unchanged.
+    """
+    if provider not in _RETRY_PROVIDERS:
+        tg.send_message(chat_id, "that button is from an older version of the "
+                                 "bot; send /start for the commands")
+        return
+    manifest_path = _job_manifest_path(chat_id)
+    # The guards _regen_tryon applies, repeated here because the provider
+    # switch below rewrites the manifest and must not happen when it refuses.
+    if token != _run_token(chat_id):
+        tg.send_message(chat_id, "the job changed since that message was sent, "
+                                 "so nothing was retried.")
+        return
+    if dry_run:
+        tg.send_message(chat_id, "dry run — retrying would spend API quota, "
+                                 "so nothing ran")
+        return
+    if drain_running(manifest_path):
+        tg.send_message(chat_id, "too late to retry — the GPU run has started. "
+                                 "/status shows it.")
+        return
+    if phase_a_running(manifest_path):
+        tg.send_message(chat_id, "the try-on phase is still running — wait for "
+                                 "it to finish, then tap Retry again.")
+        return
+    if provider == "qwen-max" and not qwen_max_configured(ROOT):
+        tg.send_message(chat_id, f"{_QWEN_MISSING} Nothing was retried.")
+        return
+    try:
+        manifest = load_manifest(manifest_path)
+    except ManifestError as exc:
+        tg.send_message(chat_id, f"could not retry — {exc}")
+        return
+    if not index.isdigit() or int(index) >= len(manifest.runs):
+        tg.send_message(chat_id, "that button is from an older version of the "
+                                 "bot; send /start for the commands")
+        return
+    run = manifest.runs[int(index)]
+    stage_name = _local_tryon_stage(run)
+    current = (effective_stage_params(stage_name, run.stage_params.get(stage_name))
+               .get("provider") if stage_name else None)
+    if provider != current:
+        jobs = _jobs_for(chat_id)
+        if [r.id for r in manifest.runs] != _unique_ids(jobs):
+            tg.send_message(chat_id, "the drafted job no longer matches the batch "
+                                     "on disk, so nothing was retried.")
+            return
+        jobs[int(index)].provider = provider
+        write_manifest(jobs, manifest_path, now=time.strftime("%Y-%m-%d %H:%M:%S"))
+        tg.send_message(chat_id, f"{_esc(run.id)} switched to "
+                                 f"{_RETRY_PROVIDERS[provider]} for this retry; "
+                                 "the other runs keep their provider.")
+        token = _run_token(chat_id)
+    _regen_tryon(tg, chat_id, index, token, dry_run=dry_run)
+
+
 def _settle_regen(tg: Tg, chat_id: int, manifest_path: Path,
                   payload: dict) -> None:
     """After a regeneration's Phase A exits: if the new image did not land,
@@ -3157,6 +3285,11 @@ def _settle_regen(tg: Tg, chat_id: int, manifest_path: Path,
         return          # the new preview already went out
     error = (entry or {}).get("error") or "it did not finish"
     backup = Path(regen["backup"]) if regen.get("backup") else None
+    if backup is None:
+        # Nothing to put back, so the run is simply a failed try-on again, and
+        # _report_failed_tryons (called right after this) says so with the
+        # reason and the retry buttons. A second message here repeated it.
+        return
     if backup is not None and backup.is_file() and entry is not None:
         backup.replace(dest)
         entry.setdefault("stages", {})[regen["stage"]] = regen["entry"]
@@ -3450,6 +3583,14 @@ def tick_phase_a(tg: Tg, chat_id: int, *, dry_run: bool = False) -> None:
         _settle_regen(tg, chat_id, manifest_path, payload)
     except (TgError, OSError) as exc:
         log(f"phase-A regen settle failed, continuing to the exit-{rc} "
+            f"branch anyway: {exc}")
+    # After _settle_regen (a failed regeneration that restored its old image is
+    # not a failure any more) and before the panel, so the user sees what
+    # failed before being asked to rent. Same swallow-and-fall-through.
+    try:
+        _report_failed_tryons(tg, chat_id, manifest_path)
+    except (TgError, OSError, ManifestError) as exc:
+        log(f"phase-A failure notice failed, continuing to the exit-{rc} "
             f"branch anyway: {exc}")
 
     if rc == EXIT_NEEDS_POD:

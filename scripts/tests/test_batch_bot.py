@@ -7035,3 +7035,206 @@ class TestTryonRegen(unittest.TestCase):
         self.assertEqual(self.tg.documents, [])
         # The restored image is reusable, so a spend now skips its try-on.
         self.assertEqual(bot._preserved_tryon(self.manifest), (2, 2))
+
+
+class TestTryonFailureRetry(unittest.TestCase):
+    """A try-on that failed in Phase A is reported with its reason and a
+    retry button per provider, and nothing else in the batch is touched.
+
+    Why this exists: on 2026-09-16 Gemini's IMAGE_SAFETY filter blocked one of
+    two camera try-ons (batch 2026-09-16-1706). The only trace in the chat was
+    a ❌ on the progress bar; the reason sat in run.log on the VPS.
+    """
+
+    def setUp(self):
+        self._orig_root = bot.ROOT
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "batch").mkdir()
+        (self.root / "out").mkdir()
+        bot.ROOT = self.root
+        reset_bot_state()
+        run_mod._PHASE_A.clear()
+        run_mod._PHASE_A_RC.clear()
+        drv = Probe(kind="video", width=1080, height=1920, duration_s=5.0,
+                    bitrate_kbps=1000, size_bytes=1000)
+        img = Probe(kind="image", width=1080, height=1920, duration_s=0.0,
+                    bitrate_kbps=0, size_bytes=1000)
+
+        def job(char):
+            return bot.Job(slots={"character": Path(f"/tmp/{char}.png"),
+                                  "outfit": Path("/tmp/o.png"),
+                                  "background": Path("/tmp/b.png"),
+                                  "driver": Path("/tmp/d.mp4")},
+                           probes={"character": img, "outfit": img,
+                                   "background": img, "driver": drv},
+                           pipeline="tryon-camera-motion-enhance", provider="gemini")
+        bot._BASKET[ME] = [job("charA")]
+        bot._STATE[ME] = job("charB")
+        self.manifest = bot._job_manifest_path(ME)
+        write_manifest(bot._jobs_for(ME), self.manifest, now="t")
+        loaded = load_manifest(self.manifest)
+        self.ids = [run.id for run in loaded.runs]
+        self.state = {"batch": "2026-09-18-1000", "runs": {}}
+        self.dest = {}
+        for run in loaded.runs:
+            dest = stage_dest(run, self.root / "out" / "2026-09-18-1000" / "runs" / run.id,
+                              "camera-tryon")
+            dest.parent.mkdir(parents=True)
+            self.dest[run.id] = dest
+        a, b = self.ids
+        self.state["runs"][a] = {
+            "status": "error",
+            "error": 'Gemini không trả ảnh: {"candidates": [{"content": {}, '
+                     '"finishReason": "IMAGE_SAFETY"}]}',
+            "stages": {"camera-tryon": {"status": "error"}}}
+        self.dest[b].write_bytes(b"image-b")
+        run_b = loaded.runs[1]
+        self.state["runs"][b] = {"status": "pending", "stages": {"camera-tryon": {
+            "status": "done", "file": str(self.dest[b]), "phase": "local",
+            "params_manifest": effective_stage_params(
+                "camera-tryon", run_b.stage_params.get("camera-tryon"))}}}
+        state_path_for(self.manifest).write_text(json.dumps(self.state), encoding="utf-8")
+        self.tg = FakeTg()
+        for patcher in (mock.patch("tgbot.bot.lease_for", return_value=None),
+                        mock.patch("tgbot.bot.qwen_max_configured", return_value=True)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        bot.ROOT = self._orig_root
+
+    def _finish(self, rc=bot.EXIT_NEEDS_POD):
+        bot._start_progress(self.tg, ME, self.manifest,
+                            ["camera-tryon", "camera-motion", "enhance"], phase="local")
+        payload = json.loads(bot._progress_path(ME).read_text(encoding="utf-8"))
+        payload["seen_running"] = True
+        bot._progress_path(ME).write_text(json.dumps(payload), encoding="utf-8")
+        with mock.patch("tgbot.bot.phase_a_running", return_value=False), \
+             mock.patch("tgbot.bot.phase_a_exit", return_value=rc), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=None), \
+             mock.patch("tgbot.bot.stock_at", return_value=None):
+            bot.tick_phase_a(self.tg, ME)
+
+    def _notice(self):
+        found = [(m, b) for m, b in zip(self.tg.messages, self.tg.buttons)
+                 if "Try-on failed" in m]
+        self.assertEqual(len(found), 1, self.tg.messages)
+        return found[0]
+
+    def _tap(self, data):
+        with mock.patch("tgbot.bot.start_phase_a") as start:
+            bot._handle_callback(self.tg, ME, {"id": "cb", "data": data}, dry_run=False)
+        return start
+
+    def _retry_cb(self, provider, index=0):
+        return f"{bot._CB_TRYON_RETRY}{index}:{provider}:{bot._run_token(ME)}"
+
+    def _provider_in_manifest(self, index):
+        run = load_manifest(self.manifest).runs[index]
+        return run.stage_params.get("camera-tryon", {}).get("provider")
+
+    # -- the notice ---------------------------------------------------------
+
+    def test_failed_try_on_is_reported_with_its_reason_and_both_retries(self):
+        self._finish()
+        text, buttons = self._notice()
+        self.assertIn(self.ids[0], text)
+        self.assertNotIn(self.ids[1], text)
+        self.assertIn("safety filter", text)
+        data = [d for row in buttons for _, d, *_ in row]
+        token = bot._run_token(ME)
+        self.assertEqual(data, [f"rt:0:gemini:{token}", f"rt:0:qwen-max:{token}"])
+        for d in data:
+            self.assertLessEqual(len(d.encode()), 64)
+        # The rent panel still follows: the other run is fine, and the
+        # decision to rent anyway stays the user's.
+        self.assertTrue(any(d.startswith(bot._CB_PHASE_A_SPEND)
+                            for d in self.tg.callback_data()))
+
+    def test_without_qwen_configured_only_gemini_is_offered(self):
+        with mock.patch("tgbot.bot.qwen_max_configured", return_value=False):
+            self._finish()
+        text, buttons = self._notice()
+        data = [d for row in buttons for _, d, *_ in row]
+        self.assertEqual(len(data), 1)
+        self.assertIn(":gemini:", data[0])
+        self.assertIn("DASHSCOPE_API_KEY", text)
+
+    def test_an_unrecognised_error_is_shown_as_is(self):
+        self.state["runs"][self.ids[0]]["error"] = "Gemini API 429: <quota>"
+        state_path_for(self.manifest).write_text(json.dumps(self.state), encoding="utf-8")
+        self._finish()
+        text, _ = self._notice()
+        self.assertIn("Gemini API 429: &lt;quota&gt;", text)
+
+    def test_nothing_failed_means_no_notice(self):
+        del self.state["runs"][self.ids[0]]
+        state_path_for(self.manifest).write_text(json.dumps(self.state), encoding="utf-8")
+        self._finish()
+        self.assertFalse(any("Try-on failed" in m for m in self.tg.messages))
+
+    # -- the tap --------------------------------------------------------------
+
+    def test_retry_with_the_same_provider_reruns_only_that_run(self):
+        start = self._tap(self._retry_cb("gemini"))
+        start.assert_called_once_with(self.manifest, resume=True)
+        state = json.loads(state_path_for(self.manifest).read_text(encoding="utf-8"))
+        self.assertNotIn("camera-tryon", state["runs"][self.ids[0]]["stages"])
+        self.assertEqual(state["runs"][self.ids[1]]["stages"]["camera-tryon"]["status"], "done")
+        self.assertEqual(self._provider_in_manifest(0), "gemini")
+
+    def test_retry_with_qwen_switches_that_run_only(self):
+        start = self._tap(self._retry_cb("qwen-max"))
+        start.assert_called_once_with(self.manifest, resume=True)
+        self.assertEqual(self._provider_in_manifest(0), "qwen-max")
+        self.assertEqual(self._provider_in_manifest(1), "gemini")
+        # On the job too, so a later re-render (Run, a restart) keeps it.
+        self.assertEqual([j.provider for j in bot._jobs_for(ME)], ["qwen-max", "gemini"])
+        # The untouched run's image still counts as reusable: its params did
+        # not change, so resume will not pay Gemini for it again.
+        self.assertEqual(bot._preserved_tryon(self.manifest), (1, 2))
+        self.assertTrue(any("switched to Qwen" in m for m in self.tg.messages))
+
+    def test_qwen_retry_is_refused_when_not_configured(self):
+        with mock.patch("tgbot.bot.qwen_max_configured", return_value=False):
+            start = self._tap(self._retry_cb("qwen-max"))
+        start.assert_not_called()
+        self.assertEqual(self._provider_in_manifest(0), "gemini")
+        self.assertIn("DASHSCOPE_API_KEY", self.tg.messages[-1])
+
+    def test_a_stale_button_changes_nothing(self):
+        start = self._tap(f"{bot._CB_TRYON_RETRY}0:qwen-max:1")
+        start.assert_not_called()
+        self.assertEqual(self._provider_in_manifest(0), "gemini")
+        self.assertIn("changed", self.tg.messages[-1])
+
+    def test_an_unknown_provider_changes_nothing(self):
+        start = self._tap(self._retry_cb("qwen"))
+        start.assert_not_called()
+        self.assertEqual(self._provider_in_manifest(0), "gemini")
+
+    def test_refused_while_phase_a_is_still_running(self):
+        with mock.patch("tgbot.bot.phase_a_running", return_value=True):
+            start = self._tap(self._retry_cb("qwen-max"))
+        start.assert_not_called()
+        self.assertEqual(self._provider_in_manifest(0), "gemini")
+
+    def test_a_retry_that_fails_again_is_reported_once_with_buttons(self):
+        # _settle_regen used to send its own "Regenerating … failed" for a run
+        # with no earlier image; with the notice it would say it twice.
+        self._tap(self._retry_cb("gemini"))
+        state = json.loads(state_path_for(self.manifest).read_text(encoding="utf-8"))
+        state["runs"][self.ids[0]]["stages"]["camera-tryon"] = {"status": "error"}
+        state["runs"][self.ids[0]]["error"] = "Gemini không trả ảnh: IMAGE_SAFETY"
+        state_path_for(self.manifest).write_text(json.dumps(state), encoding="utf-8")
+        with mock.patch("tgbot.bot.phase_a_running", return_value=False), \
+             mock.patch("tgbot.bot.phase_a_exit", return_value=bot.EXIT_NEEDS_POD), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=None), \
+             mock.patch("tgbot.bot.stock_at", return_value=None):
+            payload = json.loads(bot._progress_path(ME).read_text(encoding="utf-8"))
+            payload["seen_running"] = True
+            bot._progress_path(ME).write_text(json.dumps(payload), encoding="utf-8")
+            bot.tick_phase_a(self.tg, ME)
+        self._notice()
+        self.assertFalse(any("Regenerating" in m and "failed" in m
+                             for m in self.tg.messages))

@@ -426,15 +426,41 @@ def gemini_edit(images: list[tuple[bytes, str]], prompt: str, key: str, out_path
 # 25/08/2026, ngay sau QWEN_EDIT_MAX_REFS). qwen-image-3.0-pro đang limited preview (Alibaba yêu cầu apply
 # access qua Model Gallery trước khi key gọi được — key user 25/08 CHƯA được duyệt) → mặc định về
 # qwen-image-edit-plus (bản GA). Được duyệt 3.0 → set env QWEN_IMAGE_MODEL=qwen-image-3.0-pro, không cần sửa code.
-QWEN_IMAGE_MODEL = os.environ.get("QWEN_IMAGE_MODEL", "qwen-image-edit-plus")
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def qwen_setting(name: str, root: Path = _REPO_ROOT, default: str = "") -> str:
+    """The process environment first, then root/.env.
+
+    The .env half exists because the VPS bot's systemd unit has no
+    EnvironmentFile, so values the comments below say to "set in .env" never
+    reached os.environ there (found 2026-09-18). DASHSCOPE_API_KEY was
+    already read from .env via config.env_get; these were the only ones not.
+    """
+    from .config import env_get
+    return (os.environ.get(name) or env_get(root / ".env", name) or default).strip()
+
+
+def qwen_max_configured(root: Path = _REPO_ROOT) -> bool:
+    """Would provider qwen-max get past its config checks right now?
+
+    Read live, not from the import-time constants below, so the bot offers
+    the Qwen retry as soon as the key lands in .env, without a restart.
+    """
+    from .config import env_get
+    return bool(env_get(root / ".env", "DASHSCOPE_API_KEY")) and bool(
+        qwen_setting("QWEN_IMAGE_WORKSPACE", root) or qwen_setting("QWEN_IMAGE_BASE", root))
+
+
+QWEN_IMAGE_MODEL = qwen_setting("QWEN_IMAGE_MODEL", default="qwen-image-edit-plus")
 # Endpoint multimodal-generation/generation gắn Workspace ID vào HOST — khác dashscope-intl.aliyuncs.com
 # (dùng cho video-generation ở linux.py:_dashscope_i2v). QWEN_IMAGE_BASE ghi đè toàn bộ URL nếu cần.
-QWEN_IMAGE_WORKSPACE = os.environ.get("QWEN_IMAGE_WORKSPACE", "").strip()
-QWEN_IMAGE_REGION = os.environ.get("QWEN_IMAGE_REGION", "ap-southeast-1").strip()
-QWEN_IMAGE_BASE = os.environ.get("QWEN_IMAGE_BASE", "").strip()
+QWEN_IMAGE_WORKSPACE = qwen_setting("QWEN_IMAGE_WORKSPACE")
+QWEN_IMAGE_REGION = qwen_setting("QWEN_IMAGE_REGION", default="ap-southeast-1")
+QWEN_IMAGE_BASE = qwen_setting("QWEN_IMAGE_BASE")
 # Tự rớt Gemini→Qwen-Max khi Gemini lỗi/hết quota — mặc định TẮT (giữ hành vi cũ). Cùng cờ tên với worker
 # (linux.py TRYON_GEMINI_FALLBACK), set trong .env để bật cho cả pod lẫn batch local.
-TRYON_GEMINI_FALLBACK = str(os.environ.get("TRYON_GEMINI_FALLBACK", "")).strip().lower() in ("1", "true", "yes", "on")
+TRYON_GEMINI_FALLBACK = qwen_setting("TRYON_GEMINI_FALLBACK").lower() in ("1", "true", "yes", "on")
 
 
 def _qwen_image_url() -> str:
