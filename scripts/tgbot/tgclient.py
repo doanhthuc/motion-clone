@@ -358,17 +358,24 @@ class Tg:
         # (2026-09-02) needs every id in the album, not just the first.
         return [int(m["message_id"]) for m in result]
 
-    def send_document(self, chat_id: int, path: Path, caption: str = "") -> int:
+    def send_document(self, chat_id: int, path: Path, caption: str = "", *,
+                      buttons: list[list[tuple[str, str]]] | None = None) -> int:
         """sendDocument, never sendVideo.
 
         sendVideo may let Telegram re-encode for streaming, and the quality work
         in this repo measures background chroma, skin exposure and hair jitter.
         A document still plays when tapped — it just plays the original bytes.
+
+        `buttons` puts an inline keyboard on the document itself — the try-on
+        preview's Regenerate button lives there so it sits under the exact
+        image it acts on, not on a separate message the user has to match up.
         """
         boundary = uuid.uuid4().hex
         fields = {"chat_id": str(chat_id)}
         if caption:
             fields["caption"] = caption
+        if buttons:
+            fields["reply_markup"] = json.dumps(self.keyboard(buttons))
         body = bytearray()
         for key, value in fields.items():
             body += (f"--{boundary}\r\n"

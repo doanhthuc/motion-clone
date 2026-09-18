@@ -165,6 +165,7 @@ class FakeTg:
     def __init__(self):
         self.messages: list[str] = []
         self.documents: list[tuple] = []
+        self.document_buttons: list[list[list[tuple[str, str]]] | None] = []
         # Previews: one image with the slot question, and the album shown once
         # a job is ready to spend on.
         self.photos: list[tuple] = []
@@ -330,11 +331,15 @@ class FakeTg:
         this that read `self.buttons` alone reported that Run had never been
         offered on any job the user did not build in a single update.
         """
-        return [d for rows in self.buttons + self.edit_buttons if rows
-                for row in rows for _, d, *_ in row]
+        return [d for rows in self.buttons + self.edit_buttons + self.document_buttons
+                if rows for row in rows for _, d, *_ in row]
 
-    def send_document(self, chat_id, path, caption=""):
+    def send_document(self, chat_id, path, caption="", *, buttons=None):
+        self._check_buttons(buttons)
         self.documents.append((path, caption))
+        # Separate from `buttons`, which tests index in step with `messages`
+        # (buttons[-1] is "the keyboard on the last text message").
+        self.document_buttons.append(buttons)
         return next_message_id()
 
     def send_photo(self, chat_id, path, *, caption="", buttons=None,
@@ -6723,3 +6728,192 @@ class TestTickPhaseA(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTryonRegen(unittest.TestCase):
+    """🔄 under a Phase A try-on preview regenerates THAT image only.
+
+    Two camera runs so "only" is testable: the untouched run must keep its
+    image, its journal entry and its already-sent preview, or a regeneration
+    would quietly re-bill (and re-send) every image in the batch.
+    """
+
+    def setUp(self):
+        self._orig_root = bot.ROOT
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "batch").mkdir()
+        (self.root / "out").mkdir()
+        bot.ROOT = self.root
+        reset_bot_state()
+        run_mod._PHASE_A.clear()
+        run_mod._PHASE_A_RC.clear()
+        self.manifest = bot._job_manifest_path(ME)
+        run_block = ("  - id: {rid}\n"
+                     "    pipeline: tryon-camera-motion-enhance\n"
+                     "    inputs: {{character: /tmp/c{rid}.png, outfit: /tmp/o.png, "
+                     "background: /tmp/b.png, driver: /tmp/d.mp4}}\n"
+                     "    camera-tryon: {{ provider: gemini }}\n"
+                     "    camera-motion: {{ preset: drv-5s }}\n")
+        self.manifest.write_text("runs:\n" + run_block.format(rid="runA")
+                                 + run_block.format(rid="runB"), encoding="utf-8")
+        loaded = load_manifest(self.manifest)
+        self.state = {"batch": "2026-09-18-1000", "runs": {}}
+        self.dest = {}
+        for run in loaded.runs:
+            dest = stage_dest(run, self.root / "out" / "2026-09-18-1000" / "runs" / run.id,
+                              "camera-tryon")
+            dest.parent.mkdir(parents=True)
+            dest.write_bytes(f"old-{run.id}".encode())
+            self.dest[run.id] = dest
+            self.state["runs"][run.id] = {"status": "pending", "stages": {"camera-tryon": {
+                "status": "done", "file": str(dest), "phase": "local",
+                "params_manifest": effective_stage_params(
+                    "camera-tryon", run.stage_params.get("camera-tryon"))}}}
+        self._write_state()
+        self.tg = FakeTg()
+        self._lease = mock.patch("tgbot.bot.lease_for", return_value=None)
+        self._lease.start()
+        self.addCleanup(self._lease.stop)
+
+    def tearDown(self):
+        bot.ROOT = self._orig_root
+
+    def _write_state(self):
+        state_path_for(self.manifest).write_text(json.dumps(self.state), encoding="utf-8")
+
+    def _read_state(self):
+        return json.loads(state_path_for(self.manifest).read_text(encoding="utf-8"))
+
+    def _regen_cb(self, index=0):
+        return f"{bot._CB_TRYON_REGEN}{index}:{bot._run_token(ME)}"
+
+    def _tap(self, data):
+        with mock.patch("tgbot.bot.start_phase_a") as start:
+            bot._handle_callback(self.tg, ME, {"id": "cb", "data": data}, dry_run=False)
+        return start
+
+    # -- the button -------------------------------------------------------
+
+    def test_phase_a_previews_carry_a_regenerate_button_per_image(self):
+        payload = {"phase": "local", "sent_tryon": []}
+        bot._deliver_tryon_previews(self.tg, ME, self.manifest, payload)
+        self.assertEqual(len(self.tg.documents), 2)
+        data = [rows[0][0][1] for rows in self.tg.document_buttons]
+        token = bot._run_token(ME)
+        self.assertEqual(data, [f"rg:0:{token}", f"rg:1:{token}"])
+        for data_str in data:
+            self.assertLessEqual(len(data_str.encode()), 64)
+
+    def test_a_drain_owned_preview_has_no_button(self):
+        # The pod is about to read the file — a button there could only refuse.
+        bot._deliver_tryon_previews(self.tg, ME, self.manifest, {"sent_tryon": []})
+        self.assertEqual(len(self.tg.documents), 2)
+        self.assertEqual(self.tg.document_buttons, [None, None])
+
+    # -- the tap ----------------------------------------------------------
+
+    def test_regenerate_redoes_only_that_image_and_keeps_the_old_one(self):
+        start = self._tap(self._regen_cb(0))
+        start.assert_called_once_with(self.manifest, resume=True)
+        dest = self.dest["runA"]
+        backup = dest.with_name(f"{dest.stem}.v1{dest.suffix}")
+        self.assertEqual(backup.read_bytes(), b"old-runA")
+        self.assertFalse(self.dest["runA"].exists())
+        state = self._read_state()
+        self.assertNotIn("camera-tryon", state["runs"]["runA"]["stages"])
+        # runB untouched: same file, same journal entry — resume will skip it.
+        self.assertEqual(self.dest["runB"].read_bytes(), b"old-runB")
+        self.assertEqual(state["runs"]["runB"]["stages"]["camera-tryon"]["status"], "done")
+        payload = json.loads(bot._progress_path(ME).read_text(encoding="utf-8"))
+        self.assertEqual(payload["phase"], "local")
+        self.assertEqual(payload["sent_tryon"], ["runB"])
+        self.assertEqual(payload["regen"]["run"], "runA")
+        self.assertIn("runA", self.tg.messages[-2])
+        self.assertIn("no GPU", self.tg.messages[-2])
+
+    def test_a_stale_button_regenerates_nothing(self):
+        stale = f"{bot._CB_TRYON_REGEN}0:1"
+        start = self._tap(stale)
+        start.assert_not_called()
+        self.assertTrue(self.dest["runA"].is_file())
+        self.assertIn("changed", self.tg.messages[-1])
+
+    def test_refused_while_phase_a_is_still_running(self):
+        with mock.patch("tgbot.bot.phase_a_running", return_value=True):
+            start = self._tap(self._regen_cb(0))
+        start.assert_not_called()
+        self.assertTrue(self.dest["runA"].is_file())
+        self.assertIn("still running", self.tg.messages[-1])
+
+    def test_refused_once_the_gpu_run_started(self):
+        with mock.patch("tgbot.bot.drain_running", return_value=True):
+            start = self._tap(self._regen_cb(0))
+        start.assert_not_called()
+        self.assertIn("too late", self.tg.messages[-1])
+
+    def test_refused_once_the_pod_went_past_try_on(self):
+        # The drain finished (no lease any more) but camera-motion is journalled:
+        # a new image would never be read by anything.
+        self.state["runs"]["runA"]["stages"]["camera-motion"] = {"status": "done"}
+        self._write_state()
+        start = self._tap(self._regen_cb(0))
+        start.assert_not_called()
+        self.assertTrue(self.dest["runA"].is_file())
+        self.assertIn("too late", self.tg.messages[-1])
+
+    def test_dry_run_regenerates_nothing(self):
+        with mock.patch("tgbot.bot.start_phase_a") as start:
+            bot._handle_callback(self.tg, ME, {"id": "cb", "data": self._regen_cb(0)},
+                                 dry_run=True)
+        start.assert_not_called()
+        self.assertTrue(self.dest["runA"].is_file())
+
+    # -- after Phase A exits ------------------------------------------------
+
+    def _finish(self, rc=bot.EXIT_NEEDS_POD):
+        with mock.patch("tgbot.bot.phase_a_running", return_value=False), \
+             mock.patch("tgbot.bot.phase_a_exit", return_value=rc), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=None), \
+             mock.patch("tgbot.bot.stock_at", return_value=None):
+            payload = json.loads(bot._progress_path(ME).read_text(encoding="utf-8"))
+            payload["seen_running"] = True
+            bot._progress_path(ME).write_text(json.dumps(payload), encoding="utf-8")
+            bot.tick_phase_a(self.tg, ME)
+
+    def test_success_sends_only_the_new_image_as_v2_then_the_rent_panel(self):
+        self._tap(self._regen_cb(0))
+        # What Phase A would have done for runA.
+        self.dest["runA"].write_bytes(b"new-runA")
+        state = self._read_state()
+        state["runs"]["runA"]["stages"]["camera-tryon"] = {
+            "status": "done", "file": str(self.dest["runA"]), "phase": "local"}
+        state_path_for(self.manifest).write_text(json.dumps(state), encoding="utf-8")
+        self._finish()
+        self.assertEqual(len(self.tg.documents), 1)
+        path, caption = self.tg.documents[0]
+        self.assertEqual(Path(path), self.dest["runA"])
+        self.assertIn("runA · v2", caption)
+        self.assertTrue(self.tg.document_buttons[0])     # can regenerate again
+        self.assertTrue(any(d.startswith(bot._CB_PHASE_A_SPEND)
+                            for d in self.tg.callback_data()))
+        self.assertFalse(any("failed" in m for m in self.tg.messages))
+
+    def test_failure_puts_the_old_image_back_and_says_so(self):
+        self._tap(self._regen_cb(0))
+        state = self._read_state()
+        state["runs"]["runA"]["status"] = "error"
+        state["runs"]["runA"]["error"] = "429 quota exhausted"
+        state["runs"]["runA"]["stages"]["camera-tryon"] = {"status": "error"}
+        state_path_for(self.manifest).write_text(json.dumps(state), encoding="utf-8")
+        self._finish()
+        self.assertEqual(self.dest["runA"].read_bytes(), b"old-runA")
+        restored = self._read_state()["runs"]["runA"]
+        self.assertEqual(restored["stages"]["camera-tryon"]["status"], "done")
+        self.assertEqual(restored["status"], "pending")
+        self.assertNotIn("error", restored)
+        warn = next(m for m in self.tg.messages if "failed" in m)
+        self.assertIn("429 quota exhausted", warn)
+        self.assertIn("back in place", warn)
+        self.assertEqual(self.tg.documents, [])
+        # The restored image is reusable, so a spend now skips its try-on.
+        self.assertEqual(bot._preserved_tryon(self.manifest), (2, 2))

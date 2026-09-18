@@ -28,10 +28,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batchlib.config import env_get, env_set
 from batchlib.local_tryon import is_local_provider
-from batchlib.manifest import ManifestError, load_manifest, load_state, state_path_for
+from batchlib.manifest import (ManifestError, load_manifest, load_state,
+                               save_state, state_path_for)
 from batchlib.pipelines import (PIPELINES, effective_stage_params,
                                optional_roles, required_roles)
-from batchlib.runner import has_local_tryon, preserved_local_tryon
+from batchlib.runner import (_local_tryon_stage, has_local_tryon,
+                             preserved_local_tryon, stage_dest)
 # Not `from batchlib_ext...` or `scripts/batchlib/...` — drain.py itself lives
 # at scripts/drain.py, a plain top-level module, same as batch_run.py. scripts/
 # is already on sys.path (the insert above), so this is the plan's own "import
@@ -1457,6 +1459,14 @@ _CB_PHASE_A_RERUN = "pa:rerun:"   # + _run_token
 # manifest was seen, never a path.
 _CB_PHASE_A_SPEND = "pa:spend:"   # + _run_token
 
+# The Regenerate button under one try-on preview (2026-09-18). Carries the
+# run's INDEX in the manifest, not its id: run ids are up to ~51 characters
+# (four 12-character stems, see job.run_id_for) and the _run_token after them
+# is 19 digits, which together overflow the 64-byte cap. The token is what
+# makes the index safe — a rewritten manifest invalidates it, the same way it
+# invalidates the spend button.
+_CB_TRYON_REGEN = "rg:"           # + "<run index>:<_run_token>"
+
 # ONE number, everywhere a migration's duration is quoted: the /gpu listing,
 # the [Run] picker's "Other regions" note, the destructive confirm, and the
 # "started" reply. They said "~25-30 min" in two of those places and "15-25
@@ -1672,6 +1682,10 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
                 # _do_confirm; the token proved which manifest was reviewed.
                 _do_resume(tg, chat_id, _job_manifest_path(chat_id),
                            dry_run=dry_run)
+
+        elif data.startswith(_CB_TRYON_REGEN):
+            index, _, token = data[len(_CB_TRYON_REGEN):].partition(":")
+            _regen_tryon(tg, chat_id, index, token, dry_run=dry_run)
 
         elif data == _CB_RUN_NO:
             tg.send_message(chat_id, "cancelled — nothing was spent")
@@ -2828,7 +2842,9 @@ def _progress_path(chat_id: int) -> Path:
 
 
 def _start_progress(tg: Tg, chat_id: int, manifest_path: Path,
-                    stages: list[str], *, phase: str | None = None) -> None:
+                    stages: list[str], *, phase: str | None = None,
+                    sent_tryon: list[str] | None = None,
+                    regen: dict | None = None) -> None:
     """Send the first progress message and record it for later edits.
 
     `phase` names which tick owns the resulting message: "local" while Phase A
@@ -2838,14 +2854,20 @@ def _start_progress(tg: Tg, chat_id: int, manifest_path: Path,
     registers no _RUNNING entry), take tick_progress's "Finished" branch,
     unlink the file and deliver_result — reporting a half-finished batch as
     done and never showing the rent panel.
+
+    `sent_tryon` pre-seeds the previews already in the chat, and `regen`
+    records a single-image regeneration — both only from _regen_tryon: a
+    regeneration re-runs Phase A on the same manifest, and without the seed
+    every OTHER image would be sent a second time.
     """
     text = progress_text(manifest_path, lease=lease_for(manifest_path),
                          stages=stages, phase=phase)
     message_id = tg.send_message(chat_id, text, parse_mode=PARSE_HTML)
     _progress_path(chat_id).write_text(json.dumps({
         "manifest": str(manifest_path), "message_id": message_id,
-        "stages": stages, "sent_tryon": [],
-        **({"phase": phase} if phase else {})}, indent=2), encoding="utf-8")
+        "stages": stages, "sent_tryon": sorted(sent_tryon or []),
+        **({"phase": phase} if phase else {}),
+        **({"regen": regen} if regen else {})}, indent=2), encoding="utf-8")
 
 
 def _deliver_tryon_previews(tg: Tg, chat_id: int, manifest_path: Path,
@@ -2874,7 +2896,14 @@ def _deliver_tryon_previews(tg: Tg, chat_id: int, manifest_path: Path,
     runs = state.get("runs") or {}
     sent = set(payload.get("sent_tryon") or [])
     changed = False
-    for run in manifest.runs:
+    # Regenerate is only offered while the image is still a draft: Phase A's
+    # progress message (nothing rented yet) on the chat's own manifest, which
+    # is the only one _regen_tryon acts on. Once a drain owns the message the
+    # pod is about to read this file, and a button there could only refuse.
+    regen_ok = (payload.get("phase") == "local"
+                and manifest_path.resolve() == _job_manifest_path(chat_id).resolve())
+    token = _run_token(chat_id) if regen_ok else ""
+    for index, run in enumerate(manifest.runs):
         if run.id in sent:
             continue
         stage_name = _tryon_stage(run.pipeline)
@@ -2895,18 +2924,207 @@ def _deliver_tryon_previews(tg: Tg, chat_id: int, manifest_path: Path,
         if not image.is_file():
             continue
         tg.send_chat_action(chat_id, "upload_document")
+        version = len(_tryon_versions(image)) + 1
+        label = f"{run.id} · v{version}" if version > 1 else run.id
         # caption is plain text — send_document has no parse_mode (unlike
         # send_message/edit_message), so no HTML here.
-        tg.send_document(
-            chat_id, image,
-            caption=f"🖼 try-on ({provider}) · {run.id} — "
-                    "pipeline continues on the pod")
+        if regen_ok:
+            tg.send_document(
+                chat_id, image,
+                caption=f"🖼 try-on ({provider}) · {label} — not right? "
+                        "Regenerate it before renting the GPU",
+                buttons=[[("🔄 Regenerate this image",
+                           f"{_CB_TRYON_REGEN}{index}:{token}")]])
+        else:
+            tg.send_document(
+                chat_id, image,
+                caption=f"🖼 try-on ({provider}) · {label} — "
+                        "pipeline continues on the pod")
         sent.add(run.id)
         changed = True
     if changed:
         payload["sent_tryon"] = sorted(sent)
         _progress_path(chat_id).write_text(json.dumps(payload, indent=2),
                                            encoding="utf-8")
+
+
+def _tryon_versions(image: Path) -> list[Path]:
+    """Earlier versions of one try-on image, oldest first.
+
+    `<stem>.v<N><ext>` beside the live file, kept by _regen_tryon so that a
+    regeneration never destroys the image it replaces: each one is a paid API
+    call, and the older one is sometimes the better one. The live name is
+    untouched, so stage_dest, the journal and /tryon's `*/01-tryon.png` glob
+    never see these.
+    """
+    found = []
+    for path in image.parent.glob(f"{image.stem}.v*{image.suffix}"):
+        number = path.name[len(image.stem) + 2:len(path.name) - len(image.suffix)]
+        if number.isdigit():
+            found.append((int(number), path))
+    return [path for _, path in sorted(found)]
+
+
+def _regen_tryon(tg: Tg, chat_id: int, index: str, token: str, *,
+                 dry_run: bool) -> None:
+    """Redo ONE run's try-on image, leaving every other run's untouched.
+
+    Reached from the 🔄 button under a Phase A preview. The mechanism is the
+    one Phase A already trusts for "skip what is done": drop this run's stage
+    from the journal and start Phase A again with resume=True, so
+    run_local_phase's own local_tryon_reusable check skips every other image
+    and only this one is sent to the provider. No second code path that calls
+    Gemini, and nothing that could disagree with the runner about which
+    images a later resume will reuse.
+
+    The previous image is renamed to `<stem>.v<N><ext>`, not deleted, and is
+    put back by _settle_regen if the new call fails — a 429 on a regeneration
+    must not leave the batch worse off than before the tap.
+
+    Only before a pod has touched the run. Once a drain is running (or has
+    already recorded a later stage), the pod reads or has read this file, and
+    a new image would silently not be used.
+    """
+    manifest_path = _job_manifest_path(chat_id)
+    if token != _run_token(chat_id):
+        tg.send_message(chat_id, "the job changed since that image was sent, so "
+                                 "nothing was regenerated.")
+        return
+    if dry_run:
+        tg.send_message(chat_id, "dry run — regenerating would spend API quota, "
+                                 "so nothing ran")
+        return
+    if drain_running(manifest_path):
+        tg.send_message(chat_id, "too late to regenerate — the GPU run has "
+                                 "started and uses this image. /status shows it.")
+        return
+    if phase_a_running(manifest_path):
+        tg.send_message(chat_id, "the try-on phase is still running — wait for "
+                                 "the \"rent a GPU?\" panel, then tap Regenerate "
+                                 "again.")
+        return
+    try:
+        manifest = load_manifest(manifest_path)
+    except ManifestError as exc:
+        tg.send_message(chat_id, f"could not regenerate — {exc}")
+        return
+    if not index.isdigit() or int(index) >= len(manifest.runs):
+        tg.send_message(chat_id, "that button is from an older version of the "
+                                 "bot; send /start for the commands")
+        return
+    run = manifest.runs[int(index)]
+    stage_name = _local_tryon_stage(run)
+    if stage_name is None:
+        tg.send_message(chat_id, f"{run.id}'s try-on no longer runs over the API "
+                                 "(its provider changed), so there is nothing to "
+                                 "regenerate here.")
+        return
+
+    state_file = state_path_for(manifest_path)
+    state = load_state(state_file)
+    batch_id = str(state.get("batch") or "")
+    entry = (state.get("runs") or {}).get(run.id) or {}
+    stages = entry.get("stages") or {}
+    recorded = stages.get(stage_name) or {}
+    pipeline = PIPELINES[run.pipeline]
+    if any(stages.get(later) for later in pipeline[pipeline.index(stage_name) + 1:]):
+        tg.send_message(chat_id, f"too late to regenerate — {run.id} has already "
+                                 "gone past try-on on the pod, so a new image "
+                                 "would not be used.")
+        return
+    if not batch_id or recorded.get("status") not in ("done", "error"):
+        tg.send_message(chat_id, f"{run.id}'s try-on has not run yet — nothing "
+                                 "to regenerate.")
+        return
+
+    dest = stage_dest(run, ROOT / "out" / batch_id / "runs" / run.id, stage_name)
+    backup = None
+    if recorded.get("status") == "done" and dest.is_file():
+        backup = dest.with_name(
+            f"{dest.stem}.v{len(_tryon_versions(dest)) + 1}{dest.suffix}")
+        dest.replace(backup)
+    regen = {"run": run.id, "stage": stage_name, "dest": str(dest),
+             "backup": str(backup) if backup else None,
+             "entry": recorded, "run_status": entry.get("status"),
+             "run_error": entry.get("error")}
+    stages.pop(stage_name, None)
+    save_state(state_file, state)
+
+    # Seeded with every OTHER image already previewed, so the re-run sends
+    # only the new one. A run whose try-on failed earlier is left out on
+    # purpose: resume retries it too, and if it succeeds now it deserves its
+    # first preview.
+    runs_state = state.get("runs") or {}
+    seed = []
+    for other in manifest.runs:
+        other_stage = _local_tryon_stage(other)
+        if other.id == run.id or other_stage is None:
+            continue
+        other_rec = ((runs_state.get(other.id) or {}).get("stages") or {}) \
+            .get(other_stage) or {}
+        if other_rec.get("status") == "done":
+            seed.append(other.id)
+
+    start_phase_a(manifest_path, resume=True)
+    kept = (f" The previous version stays on the box as "
+            f"<code>{_esc(backup.name)}</code>." if backup else "")
+    tg.send_message(
+        chat_id,
+        f"🔄 <b>Regenerating the try-on for {_esc(run.id)}</b> — API quota "
+        "only, no GPU is rented. The other images are kept as they are."
+        f"{kept} I will send the new image, then ask about the GPU again.",
+        parse_mode=PARSE_HTML)
+    all_stages: list[str] = []
+    for other in manifest.runs:
+        for stage in PIPELINES[other.pipeline]:
+            if stage not in all_stages:
+                all_stages.append(stage)
+    _start_progress(tg, chat_id, manifest_path, all_stages, phase="local",
+                    sent_tryon=seed, regen=regen)
+
+
+def _settle_regen(tg: Tg, chat_id: int, manifest_path: Path,
+                  payload: dict) -> None:
+    """After a regeneration's Phase A exits: if the new image did not land,
+    put the old one back and say so.
+
+    Phase A exits EXIT_NEEDS_POD even when a run failed (batch_run.py only
+    stops early under --fail-fast), so without this a failed regeneration
+    would be invisible: no new preview, then the ordinary rent panel, and the
+    pod would redo the try-on itself or fail on a missing file. Restoring the
+    journal entry and the file means the batch is exactly as it was before
+    the tap, and the old preview's button still works for another try.
+    """
+    regen = payload.get("regen")
+    if not regen:
+        return
+    state_file = state_path_for(manifest_path)
+    state = load_state(state_file)
+    entry = (state.get("runs") or {}).get(regen["run"])
+    now = ((entry or {}).get("stages") or {}).get(regen["stage"]) or {}
+    dest = Path(regen["dest"])
+    if now.get("status") == "done" and dest.is_file():
+        return          # the new preview already went out
+    error = (entry or {}).get("error") or "it did not finish"
+    backup = Path(regen["backup"]) if regen.get("backup") else None
+    if backup is not None and backup.is_file() and entry is not None:
+        backup.replace(dest)
+        entry.setdefault("stages", {})[regen["stage"]] = regen["entry"]
+        entry["status"] = regen.get("run_status") or entry.get("status")
+        if regen.get("run_error"):
+            entry["error"] = regen["run_error"]
+        else:
+            entry.pop("error", None)
+        save_state(state_file, state)
+        kept = ("The previous image is back in place, and it is what the GPU "
+                "run will use. Tap 🔄 on it to try again.")
+    else:
+        kept = "There was no earlier image to fall back to."
+    tg.send_message(
+        chat_id,
+        f"{ICON_WARN} <b>Regenerating {_esc(regen['run'])} failed</b> — "
+        f"{_esc(str(error))}\n{kept}",
+        parse_mode=PARSE_HTML)
 
 
 def tick_progress(tg: Tg, chat_id: int) -> None:
@@ -3175,6 +3393,14 @@ def tick_phase_a(tg: Tg, chat_id: int, *, dry_run: bool = False) -> None:
         # loop's `animating = _progress_path(...).exists()` pinned at 2s forever.
         log(f"phase-A terminal edit/preview failed, continuing to the "
             f"exit-{rc} branch anyway: {exc}")
+    # After the previews, before the panel: a regeneration that failed must be
+    # rolled back (and said so) before the user is asked to rent against it.
+    # Same swallow-and-fall-through as above, for the same terminal-tick reason.
+    try:
+        _settle_regen(tg, chat_id, manifest_path, payload)
+    except (TgError, OSError) as exc:
+        log(f"phase-A regen settle failed, continuing to the exit-{rc} "
+            f"branch anyway: {exc}")
 
     if rc == EXIT_NEEDS_POD:
         # Stock is measured HERE, not when [Run] was tapped — that gap is the
