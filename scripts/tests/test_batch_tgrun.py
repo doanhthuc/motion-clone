@@ -327,13 +327,30 @@ class TestStartPhaseA(unittest.TestCase):
             f"in scripts/tgbot/ — start_drain's dry_run gate. Found: {hits}")
         self.assertIn("run.py", hits[0])
 
-    def test_sets_the_phase_a_variable(self):
-        self.assertIn("PHASE_A=1", self._argv())
+    def test_runs_drain_phase_a_only(self):
+        argv = self._argv()
+        self.assertTrue(argv[1].endswith("drain.py"), argv)
+        self.assertIn("--phase-a-only", argv)
 
     def test_forwards_resume_and_force_local(self):
         argv = self._argv(resume=True, force_local=True)
-        self.assertIn("RESUME=1", argv)
-        self.assertIn("FORCE_LOCAL=1", argv)
+        self.assertIn("--resume", argv)
+        self.assertIn("--force-local", argv)
+
+    def test_exit_needs_pod_reaches_phase_a_exit_unchanged(self):
+        # A real child, not a mocked Popen — every other test here mocks it,
+        # which is how 2026-09-18 shipped: start_phase_a ran `make drain`, and
+        # GNU make exits 2 for ANY failing recipe, so drain.py's
+        # EXIT_NEEDS_POD (3) arrived as 2 and the bot told the user a try-on
+        # that had finished "failed (exit 2)" instead of offering the pod.
+        fake_root = Path(tempfile.mkdtemp())
+        (fake_root / "scripts").mkdir()
+        (fake_root / "scripts" / "drain.py").write_text(
+            "import sys\nsys.exit(3)\n", encoding="utf-8")
+        with mock.patch.object(run_mod, "ROOT", fake_root):
+            proc = run_mod.start_phase_a(self.manifest)
+        proc.wait(timeout=30)
+        self.assertEqual(run_mod.phase_a_exit(self.manifest), 3)
 
     def test_a_live_phase_a_does_not_make_drain_running_true(self):
         # drain_running True routes a job into the mailbox so chain_or_teardown

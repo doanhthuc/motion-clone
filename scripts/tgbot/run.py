@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import html
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -322,12 +323,19 @@ def start_phase_a(manifest_path: Path, *, resume: bool = False,
     Popen pipe nobody reads fills its OS buffer and deadlocks the child.
     Phase A is minutes rather than hours, but a 12-run batch of Gemini calls
     is enough output to matter.
+
+    drain.py directly, not `make drain PHASE_A=1` like start_drain: the caller
+    dispatches on the exit code, and GNU make exits 2 for ANY failing recipe.
+    Through make, drain.py's EXIT_NEEDS_POD (3) arrived as 2, so every
+    finished try-on was reported as "failed (exit 2)" (2026-09-18, batch
+    2026-09-16-1706) and the rent panel never appeared.
     """
-    argv = ["make", "drain", f"FILE={manifest_path}", "PHASE_A=1"]
+    argv = [sys.executable, str(ROOT / "scripts" / "drain.py"),
+            "--file", str(manifest_path), "--phase-a-only"]
     if resume:
-        argv.append("RESUME=1")
+        argv.append("--resume")
     if force_local:
-        argv.append("FORCE_LOCAL=1")
+        argv.append("--force-local")
 
     log_path = manifest_path.with_suffix(".phase-a.log")
     with open(log_path, "ab") as log_file:
