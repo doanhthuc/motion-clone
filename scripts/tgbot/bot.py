@@ -41,6 +41,7 @@ from batchlib.runner import (_local_tryon_stage, has_local_tryon,
 # run fail" from state.json by hand a second time.
 from drain import failed_job_ids
 from batch_run import EXIT_NEEDS_POD
+import batch_clean
 # Absolute, NOT `from .tgclient import ...`. This file runs as
 # `python3 scripts/tgbot/bot.py`, i.e. as __main__, where a relative import
 # raises ImportError regardless of sys.path. The insert above puts scripts/ on
@@ -514,6 +515,47 @@ def _tick_staging_prune() -> None:
     if removed:
         log(f"pruned {len(removed)} staged file(s) older than "
             f"{STAGING_MAX_AGE_DAYS}d: {', '.join(p.name for p in removed)}")
+
+
+# out/ is the one directory on the VPS that grows without bound (measured
+# 2026-09-18: 457MB across 15 batches in ~6 days, ~75MB/day, on a 24GB disk
+# with 17GB free). runs/ was 55% of it — 65-100MB of intermediates per batch —
+# and only answers "what did try-on produce" for recent batches, so keep the
+# newest OUT_RUNS_KEEP and drop the rest. _final/ is the user's finished work
+# and is never deleted automatically; the low-disk warning below exists so a
+# human decides about it instead.
+OUT_RUNS_KEEP = 5
+LOW_DISK_WARN_BYTES = 3 * 1024 ** 3
+_LAST_OUT_PRUNE = 0.0
+
+
+def _tick_out_prune(tg: Tg, chat_id: int) -> None:
+    """Once a day: prune out/*/runs/ beyond the newest OUT_RUNS_KEEP batches,
+    then warn the user if free disk is still under LOW_DISK_WARN_BYTES.
+
+    Skipped entirely while a drain is running or a lease is on disk: RESUME
+    re-attaches to an EXISTING out/<batch>/ that need not be among the newest,
+    and deleting its runs/ mid-render would lose the stage outputs it resumes
+    from. The next day's tick catches up.
+    """
+    global _LAST_OUT_PRUNE
+    now = time.time()
+    if now - _LAST_OUT_PRUNE < _STAGING_PRUNE_INTERVAL_SEC:
+        return
+    if _RUNNING or LEASE_PATH.exists():
+        return
+    _LAST_OUT_PRUNE = now
+    removed = batch_clean.prune(ROOT / "out", OUT_RUNS_KEEP)
+    if removed:
+        log(f"pruned runs/ of {len(removed)} old batch(es): "
+            f"{', '.join(p.parent.name for p in removed)}")
+    free = shutil.disk_usage(ROOT).free
+    if free < LOW_DISK_WARN_BYTES:
+        tg.send_message(
+            chat_id,
+            f"VPS disk low: {free / 1024 ** 3:.1f} GB free. Intermediates are "
+            f"already pruned; what is left is mostly out/*/_final/ (finished "
+            f"videos), which the bot never deletes on its own.")
 
 
 def _fidelity_line(path: Path) -> str:
@@ -6087,6 +6129,7 @@ def main() -> int:
             tick_migration_progress(tg, allowed_user_id, dry_run=args.dry_run)
             _tick_gpu_subs(tg, allowed_user_id)
             _tick_staging_prune()
+            _tick_out_prune(tg, allowed_user_id)
         except TgError as exc:
             log(f"poll failed, continuing: {exc}")
             time.sleep(5)

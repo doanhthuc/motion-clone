@@ -691,6 +691,64 @@ class TestStagingPrune(unittest.TestCase):
         prune.assert_called_once()
 
 
+class TestOutPrune(unittest.TestCase):
+    """out/*/runs/ is pruned daily beyond OUT_RUNS_KEEP; _final/ never is."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self._orig_root = bot.ROOT
+        bot.ROOT = self.root
+        self.addCleanup(setattr, bot, "ROOT", self._orig_root)
+        lease = mock.patch.object(bot, "LEASE_PATH", self.root / "no-lease.json")
+        lease.start()
+        self.addCleanup(lease.stop)
+        bot._LAST_OUT_PRUNE = 0.0
+        self.addCleanup(setattr, bot, "_LAST_OUT_PRUNE", 0.0)
+        self.batches = []
+        for i in range(bot.OUT_RUNS_KEEP + 2):
+            batch = self.root / "out" / f"2026-09-1{i}-0000"
+            (batch / "runs" / "job").mkdir(parents=True)
+            (batch / "_final").mkdir()
+            (batch / "_final" / "job.mp4").write_bytes(b"x")
+            self.batches.append(batch)
+        self.tg = mock.Mock()
+
+    def test_prunes_old_runs_and_keeps_every_final(self):
+        bot._tick_out_prune(self.tg, ME)
+        old, kept = self.batches[:2], self.batches[2:]
+        for batch in old:
+            self.assertFalse((batch / "runs").exists())
+        for batch in kept:
+            self.assertTrue((batch / "runs").exists())
+        for batch in self.batches:
+            self.assertTrue((batch / "_final" / "job.mp4").exists())
+
+    def test_skipped_while_a_lease_is_on_disk(self):
+        bot.LEASE_PATH.write_text("{}")
+        bot._tick_out_prune(self.tg, ME)
+        self.assertTrue((self.batches[0] / "runs").exists())
+
+    def test_warns_only_when_disk_is_low(self):
+        usage = mock.Mock(free=bot.LOW_DISK_WARN_BYTES - 1)
+        with mock.patch("tgbot.bot.shutil.disk_usage", return_value=usage):
+            bot._tick_out_prune(self.tg, ME)
+        self.tg.send_message.assert_called_once()
+        bot._LAST_OUT_PRUNE = 0.0
+        self.tg.reset_mock()
+        usage.free = bot.LOW_DISK_WARN_BYTES + 1
+        with mock.patch("tgbot.bot.shutil.disk_usage", return_value=usage):
+            bot._tick_out_prune(self.tg, ME)
+        self.tg.send_message.assert_not_called()
+
+    def test_tick_runs_at_most_once_per_interval(self):
+        with mock.patch("tgbot.bot.batch_clean.prune", return_value=[]) as prune:
+            bot._tick_out_prune(self.tg, ME)
+            bot._tick_out_prune(self.tg, ME)
+        prune.assert_called_once()
+
+
 class TestPipelineCommand(unittest.TestCase):
     """Added 2026-08-31 after the first real run from the phone: the user
     assembled a job, read the manifest, and wanted character-swap instead of

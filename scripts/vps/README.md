@@ -9,8 +9,10 @@ Actual box (checked 2026-09-04): DigitalOcean `s-1vcpu-1gb` (`motion-vps`, sgp1)
 25 GB disk. Smaller than the Hetzner CX22 this section used to describe; whichever box you use,
 size for the same shape: cheap, not billed by the hour, no GPU (the pod is the only thing that needs
 one). 25 GB is enough for staged material plus `out/` as long as something ages tg-staging/ out —
-`STAGING_MAX_AGE_DAYS` in `tgbot/bot.py` does that automatically now; `make batch-clean KEEP=3` is the
-separate, manual one for `out/runs/`.
+`STAGING_MAX_AGE_DAYS` in `tgbot/bot.py` does that automatically now. The bot also prunes
+`out/*/runs/` daily beyond the newest `OUT_RUNS_KEEP` batches (`_tick_out_prune`, skipped while a
+lease exists) and messages you when free disk drops under 3 GB. `out/*/_final/` is never deleted
+automatically. Measured 2026-09-18: 6.9 GB used of 24 GB, `out/` growing ~75 MB/day.
 
 **2 GB swapfile, added 2026-09-04.** 1 GB RAM leaves ~525 MB "available" with `telegram-bot-api`,
 `motion-bot` and `pod-watchdog` all resident, and there was no swap at all — any spike (yt-dlp having
