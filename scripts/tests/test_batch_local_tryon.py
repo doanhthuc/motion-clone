@@ -282,6 +282,50 @@ class TestQwenImageUrl(unittest.TestCase):
         self.assertEqual(url, "https://custom.example.com/api/v1/services/aigc/multimodal-generation/generation")
 
 
+class TestQwenMaxConfigured(unittest.TestCase):
+    """Whether a Qwen retry can work at all. The bot offers the button only when
+    this says yes, so it has to read the same places the call itself does.
+
+    The .env fallback is the point: the VPS's motion-bot.service has no
+    EnvironmentFile, so a QWEN_IMAGE_WORKSPACE written to .env (as bot.py's
+    own comment instructs) never reached os.environ, and the Qwen call raised
+    "cần QWEN_IMAGE_WORKSPACE" with the value sitting right there in the file.
+    """
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self._env = mock.patch.dict(lt.os.environ, {}, clear=False)
+        self._env.start()
+        self.addCleanup(self._env.stop)
+        for name in ("DASHSCOPE_API_KEY", "QWEN_IMAGE_WORKSPACE", "QWEN_IMAGE_BASE"):
+            lt.os.environ.pop(name, None)
+
+    def _dotenv(self, text):
+        (self.root / ".env").write_text(text, encoding="utf-8")
+
+    def test_key_and_workspace_in_dotenv_is_configured(self):
+        self._dotenv("DASHSCOPE_API_KEY=sk-x\nQWEN_IMAGE_WORKSPACE=ws-1\n")
+        self.assertTrue(lt.qwen_max_configured(self.root))
+
+    def test_base_instead_of_workspace_is_configured(self):
+        self._dotenv("DASHSCOPE_API_KEY=sk-x\nQWEN_IMAGE_BASE=https://q.example\n")
+        self.assertTrue(lt.qwen_max_configured(self.root))
+
+    def test_missing_key_is_not_configured(self):
+        self._dotenv("QWEN_IMAGE_WORKSPACE=ws-1\n")
+        self.assertFalse(lt.qwen_max_configured(self.root))
+
+    def test_missing_workspace_is_not_configured(self):
+        self._dotenv("DASHSCOPE_API_KEY=sk-x\n")
+        self.assertFalse(lt.qwen_max_configured(self.root))
+
+    def test_process_env_wins_over_dotenv(self):
+        self._dotenv("DASHSCOPE_API_KEY=sk-x\n")
+        lt.os.environ["QWEN_IMAGE_WORKSPACE"] = "ws-env"
+        self.assertEqual(lt.qwen_setting("QWEN_IMAGE_WORKSPACE", self.root), "ws-env")
+        self.assertTrue(lt.qwen_max_configured(self.root))
+
+
 class TestQwenMaxEdit(DashscopeServerCase):
     def test_thanh_cong_ghi_ra_file(self):
         with tempfile.TemporaryDirectory() as d:

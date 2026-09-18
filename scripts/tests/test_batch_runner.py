@@ -1222,6 +1222,37 @@ class TestRunLocalPhase(unittest.TestCase):
             self.assertIn("boom khong phai JobError", tren_dia["runA"]["error"])
             self.assertEqual(tren_dia["runB"]["stages"]["tryon"]["status"], "done")
 
+    def test_a_retry_that_succeeds_clears_the_previous_failure(self):
+        # Seen on the VPS 2026-09-18 (batch 2026-09-16-1706): Gemini's
+        # IMAGE_SAFETY filter blocked a try-on, the resumed Phase A then made
+        # the image, and the journal still said status "error" with the old
+        # reason beside a stage recorded "done". The bot reads that as a
+        # failed run.
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            manifest = load_manifest(_fixture_tryon(tmp, MANIFEST_HAI_RUN_GEMINI))
+            calls = {"n": 0}
+
+            def flaky(run, params, settings_, out_path):
+                if run.id == "runA" and calls["n"] == 0:
+                    calls["n"] += 1
+                    raise JobError("Gemini không trả ảnh: IMAGE_SAFETY")
+                out_path.write_bytes(b"ok")
+                return 3, out_path.stat().st_size
+
+            with mock.patch("batchlib.runner.run_local_tryon", flaky):
+                run_local_phase(settings=GEMINI_SETTINGS, manifest=manifest,
+                                out_root=tmp / "out", batch_id="2026-08-21-0900",
+                                resume=False, log=lambda _m: None)
+                result = run_local_phase(settings=GEMINI_SETTINGS, manifest=manifest,
+                                         out_root=tmp / "out", batch_id="2026-08-21-0900",
+                                         resume=True, log=lambda _m: None)
+
+            run_a = load_state(result.state_file)["runs"]["runA"]
+            self.assertEqual(run_a["stages"]["tryon"]["status"], "done")
+            self.assertEqual(run_a["status"], "pending")
+            self.assertNotIn("error", run_a)
+
     def test_ghi_ca_run_log_khong_chi_journal(self):
         # spec §4: hỏng ở Pha A phải vào journal VÀ run.log. stdout là thứ mất khi đóng
         # terminal — run.log là bản ghi còn lại, giống hệt giao ước của run_one.
