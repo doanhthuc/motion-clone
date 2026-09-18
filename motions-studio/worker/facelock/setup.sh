@@ -8,9 +8,14 @@ mkdir -p "$FACELOCK_DIR/models"
 "$FACELOCK_DIR/venv/bin/pip" install -U pip wheel setuptools
 "$FACELOCK_DIR/venv/bin/pip" install insightface opencv-python-headless numpy tqdm
 # GOTCHA: insightface kéo `onnxruntime` (CPU) vào; để chung với -gpu thì bản CPU đè mất CUDA EP
-# → phải gỡ CẢ HAI rồi cài lại riêng bản gpu. CUDA EP cần thêm wheels nvidia cu12 (cuDNN9/cuBLAS).
+# → phải gỡ CẢ HAI rồi cài lại riêng bản gpu.
+# The CUDA libraries come from onnxruntime-gpu's own [cuda,cudnn] extras, not a hand-written list.
+# The old list pinned the cu12 wheels, but an unpinned `onnxruntime-gpu` resolved to 1.30.0 on
+# 18/09/2026, which is built against CUDA 13 (libcudart.so.13, libcublas.so.13). The session
+# silently fell back to CPU: 452 frames took over 15 minutes instead of 22 seconds on GPU.
+# The extras always ship the libraries that match the onnxruntime build that got installed.
 "$FACELOCK_DIR/venv/bin/pip" uninstall -y onnxruntime onnxruntime-gpu || true
-"$FACELOCK_DIR/venv/bin/pip" install onnxruntime-gpu nvidia-cuda-runtime-cu12 nvidia-cudnn-cu12 nvidia-cublas-cu12 nvidia-cufft-cu12
+"$FACELOCK_DIR/venv/bin/pip" install "onnxruntime-gpu[cuda,cudnn]"
 # inswapper_128 (~530MB). buffalo_l tự tải về $FACELOCK_DIR/models/buffalo_l ở lần chạy đầu.
 [ -f "$FACELOCK_DIR/models/inswapper_128.onnx" ] || curl -L -o "$FACELOCK_DIR/models/inswapper_128.onnx" \
   "https://huggingface.co/ezioruan/inswapper_128.onnx/resolve/main/inswapper_128.onnx"

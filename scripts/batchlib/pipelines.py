@@ -78,9 +78,14 @@ STAGES: dict[str, Stage] = {
         name="camera-motion", job_type="motion", param_type="motion",
         inputs={"ref": "prev", "motion": "material:driver"},
         output_ext=".mp4", min_bytes=100_000, timeout_min=60,
+        # faceLock: this stage follows the driver harder than plain motion (pose 0.9, CLIP 1.2)
+        # and Wan feeds it the driver's face crop every frame, so the face drifts off the
+        # try-on image toward the driver. Re-swapping job 4cf001de's output on 18/09/2026 put
+        # the try-on face back on all 452 frames in 22s of GPU time; judged by eye on video.
+        # A default rather than a lock, so a manifest can still set faceLock: 0 to A/B.
         defaults={"bodyProportionLock": False, "poseStrength": 0.9,
                   "clipStrength": 1.2, "naturalNails": True,
-                  "removeWristAccessories": True},
+                  "removeWristAccessories": True, "faceLock": 1},
         locked_params={"cameraAwareMotion": True, "fitDriver": True},
     ),
 }

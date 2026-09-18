@@ -18,7 +18,16 @@
         "why": "Motion driver segment helper reads the synchronized camera segment outside run_motion"
       },
       "naturalNails": {"why": "Camera motion prompt requires natural unpainted fingernails"},
-      "removeWristAccessories": {"why": "Camera motion prompt excludes watches and bracelets"}
+      "removeWristAccessories": {"why": "Camera motion prompt excludes watches and bracelets"},
+      "faceStrength": {
+        "why": "build_wan_workflow:1641 — WanVideoAnimateEmbeds.face_strength, read through _motion_float(p, \"face_strength\", \"faceStrength\") so the AST scanner of run_motion never sees the name. This is the knob that trades driver-face leakage against mouth stiffness (A/B 21/07/2026: 0.6 = mouth frozen, 1.0 = lip timing follows the driver but driver features show through, 0.7 = shipped compromise)."
+      },
+      "seed": {
+        "why": "build_wan_workflow:1648 — WanVideoSampler.seed, read through _motion_int(p, \"seed\", default=42) so the AST scanner misses it. character-swap already declares it; motion needs it too, because an A/B whose arms all run on seed 42 cannot tell an effect apart from Wan's run-to-run noise."
+      },
+      "faceLock": {
+        "why": "_apply_face_lock:424 — post-render identity swap back to the reference face (insightface/inswapper_128), called by run_motion at linux.py:5288 but defined outside it, so the AST scanner misses it. Needs ~/facelock on the pod (make gpu-facelock); missing install is a warn and the original output is kept."
+      }
     },
     "api": {
       "quality": {

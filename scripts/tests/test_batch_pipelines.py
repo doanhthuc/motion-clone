@@ -35,6 +35,16 @@ class TestKhaiBao(unittest.TestCase):
         self.assertTrue(got["fitDriver"])
         self.assertTrue(got["cameraAwareMotion"])
 
+    def test_camera_motion_face_lock_is_a_default_not_a_lock(self):
+        # Default on: the face drifts toward the driver without it (A/B 18/09/2026).
+        self.assertEqual(effective_stage_params("camera-motion", {})["faceLock"], 1)
+        # Not locked: a manifest can still turn it off, e.g. to A/B against it.
+        self.assertEqual(effective_stage_params("camera-motion", {"faceLock": 0})["faceLock"], 0)
+        self.assertEqual(locked_stage_param_errors("camera-motion", {"faceLock": 0}), [])
+
+    def test_plain_motion_does_not_get_face_lock(self):
+        self.assertNotIn("faceLock", effective_stage_params("motion", {}))
+
     def test_contractual_values_report_an_explicit_conflict(self):
         errors = locked_stage_param_errors("camera-motion", {"fitDriver": False})
         self.assertEqual(len(errors), 1)

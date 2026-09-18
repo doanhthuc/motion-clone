@@ -136,6 +136,27 @@ màu xanh, chạy một job thật.
 | Sửa code FE → đẩy lên pod | `make gpu-fe` (~2 phút) |
 | Sửa code BE → đẩy lên pod | `make gpu-bootstrap` (idempotent, chạy lại an toàn) |
 | Code FE ở máy mình | `make dev` → `localhost:2030` |
+| Re-install `faceLock` by hand | `make gpu-facelock` (`gpu-bootstrap` already runs it — see below) |
+
+<a id="facelock"></a>
+**`make gpu-facelock`** installs `/root/facelock` on the pod (insightface + `inswapper_128`,
+~530MB). `gpu-bootstrap` runs it at the end, because `camera-motion` turns `faceLock` on by
+default; the separate target is for a pod bootstrapped before that, or one where the install
+failed. Without it `faceLock: 1` does not fail — it does nothing: the worker logs one warning and
+returns the un-swapped video ([`linux.py:430`](../motions-studio/worker/worker_runtime/linux.py))
+while the job still burns its full GPU minutes. That is why a failed install prints a warning at
+the end of `gpu-bootstrap` rather than passing silently.
+
+It installs on container disk, not the Network Volume: measured 18/09/2026, pip on the MooseFS
+mount ran over 10 minutes without finishing, while container disk took ~30 seconds (with pip's
+cache already warm — a fresh pod has not been timed). The script fails unless a real ONNX session
+on the model comes up on CUDA; a CPU fallback turned a 22-second swap into more than 15 minutes.
+
+What faceLock does: after Wan renders, it swaps the face of every frame back to the face in the
+reference image, keeping the expression and mouth shape Wan produced. Use it when the face in the
+video drifts off the reference or shows the driver's features. That defect is worst on
+`camera-motion`, which runs `poseStrength=0.9` with `clipStrength=1.2` — it follows the driver
+harder and anchors the reference image more loosely than ordinary Motion.
 
 <a id="destroy-first"></a>
 **Vì sao `gpu-destroy` là mặc định, không phải `gpu-down`.** Ba khoản làm cho việc dựng lại pod

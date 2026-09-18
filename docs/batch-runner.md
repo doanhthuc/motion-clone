@@ -166,6 +166,24 @@ Control; it never falls back silently to ordinary try-on.
 Timeout riêng từng chặng (`batchlib/pipelines.py`): tryon 20 phút · motion 60 · character-swap 60 ·
 enhance 90. enhance 1080p60 nội suy RIFE rồi encode lại nên **luôn lâu hơn** chặng sinh ra nó.
 
+**When the face drifts off the try-on image or shows the driver's features.** `camera-motion`
+anchors the reference image more loosely than ordinary Motion on purpose (`poseStrength=0.9`,
+`clipStrength=1.2`, `bodyProportionLock` off), and Wan Animate feeds it a crop of the *driver's*
+face every frame as its expression source, at `faceStrength=0.7`. Three motion params exist to
+work against that, and all three are accepted on `camera-motion` as well as `motion`:
+
+| Param | What it does | What it costs |
+|---|---|---|
+| `faceLock: 1` | After the render, swaps every frame's face back to the reference face, keeping the expression Wan produced | **On by default for `camera-motion`** (`faceLock: 0` turns it off). Needs the pod install that [`gpu-bootstrap` runs](gpu-pod.md#facelock), or it silently does nothing; `inswapper_128` works at 128px, so a large face can come back softer |
+| `faceStrength: 0.55` | Weakens the driver-face branch | Mouth movement stiffens — A/B 21/07/2026 measured 0.6 as fully frozen |
+| `poseStrength` / `clipStrength` | Back to ordinary Motion's 0.8 / 1.35 | May loosen the driver framing that `camera-motion` exists to match |
+
+`faceLock` was checked on 18/09/2026 by re-swapping one finished Telegram job (`4cf001de`): all 452
+frames got the try-on face back in 22s of GPU time, and the user judged the side-by-side video
+good. That is one clip judged by eye, not a metric. The other two rows are still unmeasured on this
+pipeline. `seed` is also declared for motion now, because Wan differs run to run — a past A/B here
+saw a 5.2-point spread between two identical runs, so an arm that only wins on one seed has not won.
+
 ### 2.3 Tra param — đừng đoán
 
 ```bash
