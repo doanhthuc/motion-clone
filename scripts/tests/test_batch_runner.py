@@ -6,9 +6,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batchlib.client import JobError, JobFailed, JobGone
 from batchlib.config import ConfigError, Settings
 from batchlib.manifest import load_manifest, load_state, save_state, state_path_for
-from batchlib.pipelines import PIPELINES
-from batchlib.runner import (LocalPhaseResult, batch_id_now, needs_pod, prepare_batch, run_batch,
-                              run_local_phase, run_one, stage_dest, write_index)
+from batchlib.pipelines import PIPELINES, effective_stage_params
+from batchlib.runner import (LocalPhaseResult, batch_id_now, has_local_tryon,
+                              local_tryon_reusable, needs_pod,
+                              preserved_local_tryon, prepare_batch, run_batch, run_local_phase,
+                              run_one, stage_dest, write_index)
 
 SETTINGS = Settings(domain="x.test", api_key="mk_test", instance_id="i-1")
 
@@ -829,6 +831,44 @@ class TestNeedsPod(unittest.TestCase):
                 self.assertFalse(needs_pod(manifest))
 
 
+class TestHasLocalTryon(unittest.TestCase):
+    """The bot's answer to "does [Run] start Phase A, or go straight to the
+    spend panel?". It must be _local_tryon_stage's answer, not a second one.
+    """
+
+    def test_true_for_a_gemini_tryon_manifest(self):
+        with tempfile.TemporaryDirectory() as d:
+            manifest = load_manifest(_fixture_tryon(Path(d), MANIFEST_TRYON_GEMINI))
+            self.assertTrue(has_local_tryon(manifest))
+
+    def test_false_for_a_pure_motion_manifest(self):
+        with tempfile.TemporaryDirectory() as d:
+            manifest = load_manifest(_fixture(Path(d), MANIFEST_MOT_RUN))
+            self.assertFalse(has_local_tryon(manifest))
+
+    def test_false_when_clean_only_puts_the_tryon_back_on_the_pod(self):
+        # _local_tryon_stage checks cleanOnly BEFORE provider, matching the
+        # pod's own order (linux.py:4794). A cleanOnly run is a Gemini call
+        # that would produce the wrong image, so it must not start Phase A.
+        with tempfile.TemporaryDirectory() as d:
+            manifest = load_manifest(
+                _fixture_tryon(Path(d), MANIFEST_TRYON_GEMINI_CLEANONLY))
+            self.assertFalse(has_local_tryon(manifest))
+
+    def test_true_when_any_one_run_of_a_batch_is_local(self):
+        # One pod runs the whole manifest, so a single local try-on anywhere
+        # means Phase A has work to do. The second run's id is renamed: both
+        # module constants call their run "runA", and manifest.py refuses a
+        # manifest with a repeated id — concatenating them raw raises
+        # ManifestError instead of testing anything.
+        with tempfile.TemporaryDirectory() as d:
+            text = MANIFEST_TRYON_GEMINI + MANIFEST_MOT_RUN.split("runs:\n")[1].replace(
+                "- id: runA", "- id: runB")
+            manifest = load_manifest(_fixture_tryon(Path(d), text))
+            self.assertEqual([r.id for r in manifest.runs], ["runA", "runB"])
+            self.assertTrue(has_local_tryon(manifest))
+
+
 class TestRunLocalPhase(unittest.TestCase):
     def test_khong_co_run_local_nao_thi_no_op_khong_dung_dia(self):
         with tempfile.TemporaryDirectory() as d:
@@ -1026,9 +1066,18 @@ class TestRunLocalPhase(unittest.TestCase):
             run_dir.mkdir(parents=True)
             dest = run_dir / "01-tryon.png"
             dest.write_bytes(b"da-xong-tu-truoc")
+            # `params_manifest` is what run_local_phase._one writes on success
+            # (runner.py:553-555), so it belongs in any journal claiming to be the
+            # leftover of a real earlier Phase A. Derived from the manifest rather
+            # than spelled out, so a change to pipelines.py defaults cannot turn this
+            # test into a params-mismatch failure about something else.
+            done_params = effective_stage_params(
+                "tryon", manifest.runs[0].stage_params.get("tryon"))
             save_state(state_file, {"version": 1, "batch": "2026-08-21-0900", "runs": {
                 "runA": {"status": "pending", "stages": {
-                    "tryon": {"status": "done", "file": str(dest), "bytes": dest.stat().st_size}}}}})
+                    "tryon": {"status": "done", "file": str(dest),
+                              "bytes": dest.stat().st_size,
+                              "params_manifest": done_params}}}}})
 
             with mock.patch("batchlib.runner.run_local_tryon") as m_local:
                 result = run_local_phase(settings=GEMINI_SETTINGS, manifest=manifest,
@@ -1046,9 +1095,15 @@ class TestRunLocalPhase(unittest.TestCase):
             manifest = load_manifest(_fixture_tryon(tmp, MANIFEST_TRYON_GEMINI))
             state_file = state_path_for(manifest.path)
             dest = tmp / "out" / "2026-08-21-0900" / "runs" / "runA" / "01-tryon.png"
+            # Params MATCH on purpose: this test is about the missing-file clause. A
+            # journal without params_manifest would re-run for the params reason too,
+            # so the test would still pass after `dest.is_file()` was dropped from the
+            # helper — green while no longer proving what it claims.
             save_state(state_file, {"version": 1, "batch": "2026-08-21-0900", "runs": {
-                "runA": {"status": "pending",
-                         "stages": {"tryon": {"status": "done", "file": str(dest)}}}}})
+                "runA": {"status": "pending", "stages": {"tryon": {
+                    "status": "done", "file": str(dest),
+                    "params_manifest": effective_stage_params(
+                        "tryon", manifest.runs[0].stage_params.get("tryon"))}}}}})
 
             def fake_run_local_tryon(run, params, settings_, out_path):
                 out_path.write_bytes(b"chay-lai")
@@ -1210,6 +1265,235 @@ class TestRunLocalPhase(unittest.TestCase):
                                 out_root=tmp / "out", batch_id="2026-08-21-0900",
                                 resume=False, log=lambda _m: None)
             self.assertEqual(thay, ["2026-08-21-0900"])
+
+
+class TestLocalTryonReuseIsParamsAware(unittest.TestCase):
+    """A journalled try-on may stand in for a request ONLY at the same params.
+
+    run_id_for (tgbot/job.py:90) hashes material file stems and nothing else,
+    so gemini and qwen-max over the same four files produce the SAME run id.
+    A journal-only check therefore hands the gemini image to a qwen-max
+    request: manifest valid, nothing raised, only the output wrong.
+    """
+
+    BATCH = "2026-09-16-0900"
+
+    def _first_pass(self, tmp: Path) -> None:
+        manifest = load_manifest(_fixture_tryon(tmp, MANIFEST_TRYON_GEMINI))
+
+        def fake(run, params, settings_, out_path):
+            out_path.write_bytes(b"png")
+            return 1, 3
+
+        with mock.patch("batchlib.runner.run_local_tryon", fake):
+            run_local_phase(settings=GEMINI_SETTINGS, manifest=manifest,
+                            out_root=tmp / "out", batch_id=self.BATCH,
+                            resume=False, log=lambda _m: None)
+
+    def _second_pass(self, tmp: Path, text: str, **kwargs):
+        manifest = load_manifest(_fixture_tryon(tmp, text))
+        calls: list[dict] = []
+
+        def fake(run, params, settings_, out_path):
+            calls.append(dict(params))
+            out_path.write_bytes(b"png2")
+            return 1, 4
+
+        with mock.patch("batchlib.runner.run_local_tryon", fake):
+            result = run_local_phase(settings=GEMINI_SETTINGS, manifest=manifest,
+                                     out_root=tmp / "out", batch_id=self.BATCH,
+                                     resume=True, log=lambda _m: None, **kwargs)
+        return calls, result
+
+    def test_same_params_second_pass_calls_gemini_zero_times(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            self._first_pass(tmp)
+            calls, result = self._second_pass(tmp, MANIFEST_TRYON_GEMINI)
+            self.assertEqual(calls, [])
+            # `done` is what THIS invocation actually did — a reused stage is
+            # not new work and must not be reported as such (run_local_phase's
+            # own docstring makes that distinction).
+            self.assertEqual(result.done, [])
+            self.assertEqual(result.failed, {})
+
+    def test_different_provider_reruns_instead_of_reusing_the_image(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            self._first_pass(tmp)
+            calls, result = self._second_pass(
+                tmp, MANIFEST_TRYON_GEMINI.replace("provider: gemini",
+                                                   "provider: qwen-max"))
+            self.assertEqual([c.get("provider") for c in calls], ["qwen-max"])
+            self.assertEqual(result.done, ["runA"])
+
+    def test_force_reruns_a_tryon_the_journal_says_is_done(self):
+        # The user's other intent at the chooser: "that image came out wrong,
+        # roll it again." Force must bypass the skip WITHOUT minting a new
+        # batch id — a fresh id would orphan any pod stage already done,
+        # which is the bug resolve_batch_id exists to prevent.
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            self._first_pass(tmp)
+            calls, result = self._second_pass(tmp, MANIFEST_TRYON_GEMINI, force=True)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(result.done, ["runA"])
+            self.assertEqual(result.state["batch"], self.BATCH)
+
+    def test_helper_is_false_when_the_file_has_been_cleaned_away(self):
+        # `make batch-clean` deletes runs/ and keeps _final/, so "journal says
+        # done" outliving the file is a normal state, not a corrupt one.
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            self._first_pass(tmp)
+            manifest = load_manifest(_fixture_tryon(tmp, MANIFEST_TRYON_GEMINI))
+            run = manifest.runs[0]
+            run_dir = tmp / "out" / self.BATCH / "runs" / run.id
+            dest = stage_dest(run, run_dir, "tryon")
+            recorded = {"status": "done",
+                        "params_manifest": effective_stage_params(
+                            "tryon", run.stage_params.get("tryon"))}
+            self.assertTrue(local_tryon_reusable(run, "tryon", recorded, dest))
+            dest.unlink()
+            self.assertFalse(local_tryon_reusable(run, "tryon", recorded, dest))
+
+
+class TestLocalProvenance(unittest.TestCase):
+    """Phase A stamps its journal entries so run_one will not pass a local
+    image off as a pod stage's output.
+
+    Reachable from the bot: /provider switches gemini -> qwen, the stage
+    stops being local-eligible, and run_one would otherwise skip it on the
+    strength of an entry Phase A wrote for a different provider.
+    """
+
+    BATCH = "2026-09-16-0900"
+
+    def _phase_a(self, tmp: Path, text: str = MANIFEST_TRYON_GEMINI):
+        manifest = load_manifest(_fixture_tryon(tmp, text))
+
+        def fake(run, params, settings_, out_path):
+            out_path.write_bytes(b"png")
+            return 1, 3
+
+        with mock.patch("batchlib.runner.run_local_tryon", fake):
+            result = run_local_phase(settings=GEMINI_SETTINGS, manifest=manifest,
+                                     out_root=tmp / "out", batch_id=self.BATCH,
+                                     resume=False, log=lambda _m: None)
+        return manifest, result
+
+    def test_phase_a_stamps_its_entries(self):
+        with tempfile.TemporaryDirectory() as d:
+            _manifest, result = self._phase_a(Path(d))
+            stage = result.state["runs"]["runA"]["stages"]["tryon"]
+            self.assertEqual(stage["phase"], "local")
+            # On disk, not just in memory — run_one reads the file.
+            on_disk = load_state(result.state_file)["runs"]["runA"]["stages"]["tryon"]
+            self.assertEqual(on_disk["phase"], "local")
+
+    def test_run_one_refuses_a_local_entry_for_a_stage_that_moved_to_the_pod(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            self._phase_a(tmp)
+            # Same run id (run_id_for hashes file stems only), different
+            # provider: no longer local-eligible, so `tryon` belongs to the pod.
+            pod_manifest = load_manifest(_fixture_tryon(
+                tmp, MANIFEST_TRYON_GEMINI.replace("provider: gemini", "provider: qwen")))
+            out_dir = tmp / "out" / self.BATCH
+            state_file = state_path_for(pod_manifest.path)
+            state = load_state(state_file)
+            submitted = self._run_pod_stages(pod_manifest, out_dir, state, state_file)
+            self.assertIn("tryon", submitted)
+
+    def test_run_one_still_reuses_an_unstamped_entry(self):
+        # A journal written before the stamp exists. Unknown provenance must
+        # keep today's behaviour, or every batch in flight across the upgrade
+        # re-runs its try-on on the pod.
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            self._phase_a(tmp)
+            manifest = load_manifest(_fixture_tryon(tmp, MANIFEST_TRYON_GEMINI))
+            state_file = state_path_for(manifest.path)
+            state = load_state(state_file)
+            del state["runs"]["runA"]["stages"]["tryon"]["phase"]
+            save_state(state_file, state)
+            out_dir = tmp / "out" / self.BATCH
+            submitted = self._run_pod_stages(manifest, out_dir, state, state_file)
+            self.assertNotIn("tryon", submitted)
+
+    def _run_pod_stages(self, manifest, out_dir, state, state_file) -> list[str]:
+        """Run run_one with the whole pod surface faked, return what it submitted.
+
+        download_output must really create the file: run_one promotes the last
+        stage's output into _final/ with hardlink_to and falls back to copy2,
+        and a mock that returns a byte count without writing anything makes
+        both raise FileNotFoundError — an unrelated failure that would hide
+        the assertion this helper exists to make.
+        """
+        submitted: list[str] = []
+
+        def fake_submit(settings_, job_type, params, files):
+            submitted.append(job_type)
+            return f"job-{job_type}"
+
+        def fake_download(settings_, job_id, dest, min_bytes):
+            Path(dest).parent.mkdir(parents=True, exist_ok=True)
+            Path(dest).write_bytes(b"x" * 4096)
+            return 4096
+
+        with mock.patch("batchlib.runner.submit_job", side_effect=fake_submit), \
+             mock.patch("batchlib.runner.poll_job",
+                        return_value={"status": "done", "params": {}}), \
+             mock.patch("batchlib.runner.download_output", side_effect=fake_download):
+            run_one(settings=SETTINGS, run=manifest.runs[0], out_dir=out_dir,
+                    state=state, state_file=state_file,
+                    resume=True, log=lambda _m: None)
+        return submitted
+
+
+class TestPreservedLocalTryon(unittest.TestCase):
+    def test_counts_only_what_a_resume_would_actually_skip(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            manifest = load_manifest(_fixture_tryon(tmp, MANIFEST_HAI_RUN_GEMINI))
+
+            def fake(run, params, settings_, out_path):
+                out_path.write_bytes(b"png")
+                return 1, 3
+
+            with mock.patch("batchlib.runner.run_local_tryon", fake):
+                result = run_local_phase(settings=GEMINI_SETTINGS, manifest=manifest,
+                                         out_root=tmp / "out", batch_id="2026-09-16-0900",
+                                         resume=False, log=lambda _m: None)
+            self.assertEqual(
+                preserved_local_tryon(manifest, result.state, tmp / "out"), (2, 2))
+
+    def test_a_provider_change_drops_the_reusable_count_not_the_total(self):
+        # The exact lie this function exists to prevent: a card reading
+        # "2/2 preserved" for a batch about to re-run both.
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            manifest = load_manifest(_fixture_tryon(tmp, MANIFEST_HAI_RUN_GEMINI))
+
+            def fake(run, params, settings_, out_path):
+                out_path.write_bytes(b"png")
+                return 1, 3
+
+            with mock.patch("batchlib.runner.run_local_tryon", fake):
+                result = run_local_phase(settings=GEMINI_SETTINGS, manifest=manifest,
+                                         out_root=tmp / "out", batch_id="2026-09-16-0900",
+                                         resume=False, log=lambda _m: None)
+            changed = load_manifest(_fixture_tryon(
+                tmp, MANIFEST_HAI_RUN_GEMINI.replace("provider: gemini", "provider: qwen-max")))
+            self.assertEqual(
+                preserved_local_tryon(changed, result.state, tmp / "out"), (0, 2))
+
+    def test_a_manifest_with_no_local_tryon_counts_zero_zero(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            manifest = load_manifest(_fixture(tmp, MANIFEST_MOT_RUN))
+            self.assertEqual(preserved_local_tryon(manifest, {"runs": {}}, tmp / "out"),
+                             (0, 0))
 
 
 if __name__ == "__main__":

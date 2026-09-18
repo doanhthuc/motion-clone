@@ -254,7 +254,7 @@ Manual trigger (skip the wait for a push): `gh workflow run deploy-bot.yml -R do
 | `/result <manifest>.yaml` | the finished video(s), or the failure logs already pulled to disk |
 | `/tryon <batch-id>` | just `01-tryon.png`, when the final video looks wrong |
 | `/again` | rebuild the last submitted job from the same files — change one thing (usually the pipeline) and run it again |
-| `/clear` | drop the job being assembled and delete its staged copies. Always asks first, and refuses while a drain is running |
+| `/clear` | drop the job being assembled and delete its staged copies. Always asks first, and refuses while a drain **or the try-on phase** is running — the refusal names which one, since only the drain costs money |
 
 `/status` with nothing running falls through to `/job` rather than dead-ending on "nothing
 started" — which is true, but useless in the state `/status` is most often asked in.

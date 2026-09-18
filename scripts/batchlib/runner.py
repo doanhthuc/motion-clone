@@ -164,12 +164,25 @@ def run_one(*, settings: Settings, run: Run, out_dir: Path, state: dict,
         recorded = entry["stages"].get(stage_name) or {}
         params = effective_stage_params(stage_name, run.stage_params.get(stage_name))
 
-        # Chặng đã "done" VÀ còn file trên đĩa thì bỏ qua — KHÔNG gate theo `resume`.
-        # Một lô THẬT SỰ mới (resume=False) luôn khởi tạo state["runs"] rỗng
-        # (run_batch/prepare_batch), nên "done" ở đây chỉ có thể đến từ Pha A
-        # (run_local_phase) đã ghi trong CHÍNH lần gọi `make batch` này — bỏ qua đúng
-        # là hành vi cần, không phải một lỗ hổng bỏ sót --resume.
-        if recorded.get("status") == "done" and dest.is_file():
+        # A stage that is "done" AND still on disk is skipped — deliberately NOT
+        # gated on `resume`. A genuinely new batch (resume=False) always starts
+        # from an empty state["runs"] (prepare_batch), so within one invocation a
+        # "done" entry can only have come from Phase A (run_local_phase) writing
+        # it during this same `make batch` call. Skipping there is the intended
+        # behaviour, not a hole left by a missing --resume.
+        #
+        # The third clause is the exception, and it can only bite on a RESUME=1
+        # whose manifest has since moved this stage off the local providers.
+        # Within one invocation it is provably a no-op: Phase A only ever creates
+        # a job where _local_tryon_stage(run) == stage_name, so the provenance
+        # check has nothing to disagree with. Trusting the journal alone across a
+        # resume would hand Phase B an image a different provider made.
+        #
+        # This skip is NOT params-aware and must not become so — see
+        # local_tryon_reusable's docstring for what that comparison would cost on
+        # a stage billed at $0.99/h.
+        if (recorded.get("status") == "done" and dest.is_file()
+                and not _local_provenance_stale(run, stage_name, recorded)):
             log(f"    {stage_name}: bỏ qua (đã xong, {dest.name})")
             prev_output = dest
             continue
@@ -391,6 +404,101 @@ def _local_tryon_stage(run: Run) -> str | None:
     return None
 
 
+def local_tryon_reusable(run: Run, stage_name: str, recorded: dict, dest: Path) -> bool:
+    """True when a try-on already on disk may stand in for THIS run's request.
+
+    Params are part of the question, not just "done + file exists" (2026-09-16):
+    run_id_for (tgbot/job.py:90) hashes material file stems and nothing else,
+    so gemini and qwen-max over the same four files produce the SAME run id.
+    A journal-only verdict hands the gemini image to a qwen-max request — the
+    manifest is valid, nothing raises, only the output is wrong. That is the
+    failure shape _local_tryon_eligible's own docstring describes for cleanOnly.
+
+    Compared against effective_stage_params so both sides of the == come from
+    one derivation. No normalisation layer and no coercion that could drift
+    from what Phase A actually sent.
+
+    A false negative costs one Gemini call — cents. That is why this check is
+    affordable here and NOT in run_one; see the spec's §5 for what the same
+    check would cost on a paid stage.
+
+    Three callers on purpose: run_local_phase's skip, preserved_local_tryon
+    below, and through it the bot's reuse-or-rerun chooser and the stock-out
+    card's "N/M preserved" count. A card counting with a looser rule than the
+    runner skips with would promise preservation the runner declines to honour.
+    """
+    if recorded.get("status") != "done" or not dest.is_file():
+        return False
+    return recorded.get("params_manifest") == effective_stage_params(
+        stage_name, run.stage_params.get(stage_name))
+
+
+def _local_provenance_stale(run: Run, stage_name: str, recorded: dict) -> bool:
+    """True when a journal entry Phase A wrote can no longer stand in for this run.
+
+    Narrow on purpose — this is NOT a params check, and §5 of the spec records
+    why: comparing a journalled params_manifest against effective_stage_params
+    recomputed at resume time means any change to pipelines.py's defaults silently
+    invalidates every stage marked done, and at Phase B that re-submits a
+    40-minute enhance to a GPU billing $0.99/h.
+
+    What it does catch is the one hole reachable from the bot: /provider moves
+    a stage off the local providers, so _local_tryon_stage stops naming it, and
+    the image Gemini made must not be passed off as the pod's output.
+
+    A missing "phase" key means the entry predates the stamp. Unknown
+    provenance gets today's behaviour (reuse), so a batch in flight across the
+    upgrade is unaffected rather than silently re-run.
+    """
+    if recorded.get("phase") != "local":
+        return False
+    return _local_tryon_stage(run) != stage_name
+
+
+def preserved_local_tryon(manifest: Manifest, state: dict, out_root: Path) -> tuple[int, int]:
+    """(reusable, total) — how many of this manifest's local try-ons a resume would skip.
+
+    Lives here rather than in the bot because the answer has to come from the
+    same two predicates run_local_phase skips with: _local_tryon_stage for
+    "is this stage local at all", local_tryon_reusable for "may we reuse what
+    it produced". A bot-side reimplementation is the second opinion
+    _local_tryon_eligible's docstring warns about, and here it would show up as
+    a stock-out card promising "4/4 preserved" for a batch whose provider
+    changed and which is therefore about to re-run all four.
+
+    Reads no journal of its own: the caller passes the state it already loaded,
+    so the count and whatever else the caller does with that state cannot
+    disagree about which file they read.
+    """
+    batch_id = str(state.get("batch") or "")
+    runs = state.get("runs") or {}
+    total = reusable = 0
+    for run in manifest.runs:
+        stage_name = _local_tryon_stage(run)
+        if stage_name is None:
+            continue
+        total += 1
+        recorded = ((runs.get(run.id) or {}).get("stages") or {}).get(stage_name) or {}
+        run_dir = out_root / batch_id / "runs" / run.id
+        if local_tryon_reusable(run, stage_name, recorded,
+                                stage_dest(run, run_dir, stage_name)):
+            reusable += 1
+    return reusable, total
+
+
+def has_local_tryon(manifest: Manifest) -> bool:
+    """True if ANY run in this manifest has a try-on Phase A can do locally.
+
+    The bot's answer to "does [Run] start Phase A, or go straight to the spend
+    panel?". A manifest with none keeps today's single-tap flow: adding a step
+    that runs nothing and reports nothing would cost a round trip for no
+    information. Asks _local_tryon_stage rather than re-deriving, per that
+    function's own docstring — this is its fourth caller and must not be a
+    second opinion.
+    """
+    return any(_local_tryon_stage(run) is not None for run in manifest.runs)
+
+
 def needs_pod(manifest: Manifest) -> bool:
     """True nếu còn ít nhất một chặng KHÔNG THỂ chạy local trong toàn bộ manifest.
 
@@ -420,7 +528,7 @@ class LocalPhaseResult:
 
 def run_local_phase(*, settings: Settings, manifest: Manifest, out_root: Path, batch_id: str,
                     resume: bool, fail_fast: bool = False, log: Callable[[str], None] = print,
-                    pool_size: int = 4) -> LocalPhaseResult:
+                    pool_size: int = 4, force: bool = False) -> LocalPhaseResult:
     """Pha A: try-on qua API (provider local-eligible) chạy TRƯỚC khi đụng pod, qua một
     pool đồng thời có giới hạn — không tốn GPU nên chạy song song không có cái giá
     "hai job chồng nhau trên một GPU" mà run_one/run_batch phải tránh (xem docstring
@@ -429,6 +537,13 @@ def run_local_phase(*, settings: Settings, manifest: Manifest, out_root: Path, b
 
     Giới hạn pool là thật chứ không phải trang trí: mỗi job là một request ảnh tới
     Gemini, và bơm cả 12 run của một lô cùng lúc là cách chắc chắn nhất ăn 429.
+
+    `force` bypasses the reuse check for EVERY run in the batch, not only the
+    ones whose params changed. Per-run forcing would need a notion of "which
+    run did the user actually edit" and guessing wrong there silently reuses
+    the bad image the user was trying to get away from — worse than one extra
+    Gemini call. It never touches the batch id or any other stage's journal
+    entry: force re-runs try-on, it does not start a new batch.
     """
     # CÙNG một hàm với needs_pod — xem docstring của _local_tryon_eligible: hai chỗ này
     # trả lời khác nhau là lô hoặc gọi Gemini sai run, hoặc đứng chờ pod vô cớ.
@@ -477,9 +592,22 @@ def run_local_phase(*, settings: Settings, manifest: Manifest, out_root: Path, b
         run_dir.mkdir(parents=True, exist_ok=True)
         log_file = run_dir / "run.log"
         dest = stage_dest(run, run_dir, stage_name)
-        # Hai vế, giống hệt run_one: journal nói "done" VÀ file còn trên đĩa. Tin journal
-        # suông thì Pha B nhận một đường dẫn không tồn tại ở chặng motion.
-        if recorded.get("status") == "done" and dest.is_file():
+        # NOT the same condition as run_one's, and the difference is the point.
+        # Phase A also compares params (local_tryon_reusable) because redoing a
+        # wrong image here costs one Gemini call; run_one deliberately does not,
+        # because the same comparison on a pod stage would re-submit a 40-minute
+        # enhance at $0.99/h whenever pipelines.py's defaults move.
+        #
+        # Phase A needs no provenance clause either, and must not gain one: _one
+        # only runs for a (run, stage_name) pair where _local_tryon_stage(run) ==
+        # stage_name by construction, so _local_provenance_stale could only ever
+        # return False here. Adding it would be dead code behind a comment
+        # claiming a guard that cannot fire.
+        #
+        # Both halves of the reuse check are required, not just the journal's
+        # "done": trusting the journal alone hands Phase B a path that does not
+        # exist at the motion stage.
+        if not force and local_tryon_reusable(run, stage_name, recorded, dest):
             log(f"    {run.id}/{stage_name}: bỏ qua (đã xong local, {dest.name})")
             return False, None
         started = time.time()
@@ -523,7 +651,14 @@ def run_local_phase(*, settings: Settings, manifest: Manifest, out_root: Path, b
         with lock:
             entry["stages"][stage_name] = {
                 "status": "done", "elapsed_sec": elapsed, "file": str(dest), "bytes": size,
-                "params_sent": dict(params), "params_manifest": dict(params)}
+                "params_sent": dict(params), "params_manifest": dict(params),
+                # Provenance, so run_one can tell a pod stage's output from a
+                # local one. Without it a /provider switch away from a local
+                # provider leaves run_one skipping a stage that now belongs to
+                # the pod, on the strength of an image a different provider
+                # made. Entries predating the stamp have no key and keep
+                # today's behaviour — see _local_provenance_stale.
+                "phase": "local"}
             save_state(state_file, state)
         xong = f"{stage_name} (local): xong {elapsed}s · {size // 1024} KB → {dest.name}"
         # Cả hai kết cục vào run.log, không chỉ lỗi — run_one cũng ghi cả hai, và "chặng

@@ -298,6 +298,10 @@ def main() -> int:
     ap.add_argument("--file", required=True)
     ap.add_argument("--resume", action="store_true",
                     help="continue a deferred drain instead of starting a new batch")
+    ap.add_argument("--force-local", action="store_true",
+                    help="re-run local try-on even when the journal says it is done")
+    ap.add_argument("--phase-a-only", action="store_true",
+                    help="run the local try-on phase and exit; never rent a pod")
     ap.add_argument("--yes", action="store_true",
                     help="required to actually rent — without it, dry run")
     args = ap.parse_args()
@@ -306,24 +310,43 @@ def main() -> int:
     manifest = load_manifest(manifest_path)
     ceiling = abs_max_min(manifest)
 
-    if not args.yes:
-        print(f"DRY RUN. {len(manifest.runs)} runs, tier-2 ceiling {ceiling} min.")
-        print("Re-run with --yes to rent a pod.")
-        return 0
-
-    # Phase A. --no-start so it cannot quietly resume a stopped pod behind our
-    # back: renting is this script's job, and it must be the only one doing it.
+    # Built before the --yes gate because --phase-a-only needs it and is
+    # deliberately NOT gated on --yes: Phase A spends Gemini quota and writes
+    # the journal, so it is not a dry run. Only renting is.
+    #
+    # --no-start so it cannot quietly resume a stopped pod behind our back:
+    # renting is this script's job, and it must be the only one doing it.
     # Local Gemini try-on happens here, before any GPU clock starts, so a 429
     # costs nothing. See docs/batch-runner.md section 2.9.
     #
     # --resume must be forwarded to phase A, not only to the run after
-    # provisioning. Without it, resolve_batch_id (batch_run.py:38) mints a NEW
+    # provisioning. Without it, resolve_batch_id (batch_run.py:44) mints a NEW
     # batch id on a re-drain, so every local try-on runs again and Gemini is
     # billed a second time — silently destroying the "defer preserves the
     # try-on you already paid for" guarantee in the design spec.
     phase_a = ["--file", str(manifest_path), "--no-start"]
     if args.resume:
         phase_a.append("--resume")
+    # Phase A runs before provision(), so a --force-local forwarded only to the
+    # post-provisioning batch_run would still regenerate the try-on before
+    # motion/enhance — but on the pod's clock, billing GPU minutes while the
+    # process waits on a hosted Gemini call.
+    if args.force_local:
+        phase_a.append("--force-local")
+
+    if args.phase_a_only:
+        # The bot's pre-spend step: run the try-on, hand back the exit code,
+        # and let a human decide about the GPU afterwards. Returning
+        # EXIT_NEEDS_POD unchanged is what tells the caller a pod is still
+        # wanted; collapsing it to 0 here would make "done, no pod needed" and
+        # "stopped, needs a pod" indistinguishable.
+        return batch_run(*phase_a)
+
+    if not args.yes:
+        print(f"DRY RUN. {len(manifest.runs)} runs, tier-2 ceiling {ceiling} min.")
+        print("Re-run with --yes to rent a pod.")
+        return 0
+
     rc = batch_run(*phase_a)
     if rc == 0:
         print("finished without needing a pod")

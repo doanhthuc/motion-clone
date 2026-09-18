@@ -104,6 +104,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--fail-fast", action="store_true")
     ap.add_argument("--no-start", action="store_true", help="không tự make gpu-up")
+    ap.add_argument("--force-local", action="store_true",
+                    help="re-run local try-on even when the journal says it is done")
     args = ap.parse_args(argv)
 
     try:
@@ -157,7 +159,8 @@ def main(argv: list[str]) -> int:
     try:
         local_result = run_local_phase(settings=settings, manifest=manifest, out_root=ROOT / "out",
                                        batch_id=decision.batch_id, resume=decision.resumed,
-                                       fail_fast=args.fail_fast, pool_size=pool_size)
+                                       fail_fast=args.fail_fast, pool_size=pool_size,
+                                       force=args.force_local)
     except ConfigError as exc:
         print(f"✗ {exc}", file=sys.stderr)
         return 1

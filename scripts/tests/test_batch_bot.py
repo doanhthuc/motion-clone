@@ -5,16 +5,20 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batchlib.config import env_get
 from batchlib.manifest import load_manifest, state_path_for
+from batchlib.pipelines import PIPELINES, STAGES, effective_stage_params
+from batchlib.runner import stage_dest
 from batchlib_ext.gpu_stock import Stock
 from batchlib_ext.handoff import Handoff, handoff_path, mailbox_path, write_handoff
 from batchlib_ext.migrate_lease import MigrateLease, write_migrate_lease
 from batchlib_ext.provision_failure import (ProvisionFailure,
                                             provision_failure_path,
+                                            read_provision_failure,
                                             write_provision_failure)
 import tgbot.bot as bot
+import tgbot.run as run_mod
 from tgbot.bot import allowed
 from tgbot.ingest import Probe
-from tgbot.job import missing_slots
+from tgbot.job import missing_slots, write_manifest
 
 ME = 12345
 
@@ -1715,19 +1719,52 @@ class TestFlow(unittest.TestCase):
         self.assertEqual(self.tg.answered, ["cb1"])
 
     def test_the_run_button_needs_a_second_tap_before_it_spends(self):
+        # Asserts on start_phase_a, not start_drain, since 2026-09-16: this
+        # fixture's default pipeline IS tryon-motion-enhance with the gemini
+        # provider (bot.JOB_PIPELINE / bot.JOB_PROVIDER), so [Run] takes the
+        # two-step flow and the second tap starts the try-on rather than
+        # renting. The property under test is unchanged — the FIRST tap must
+        # still spend nothing — and start_drain staying uncalled is now part
+        # of it rather than the thing being waited for.
         with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot.start_phase_a") as start_phase_a, \
+             mock.patch("tgbot.bot._start_progress"), \
              mock.patch("tgbot.bot.drain_running", return_value=False), \
              mock.patch("tgbot.bot.volume_datacenter", return_value=None), \
              mock.patch("tgbot.bot.stock_at_cached", return_value={}):
             self._fill_required_slots()
             bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
             start_drain.assert_not_called()     # first tap only asks
-            self.assertIn("$0.99/hour", self.tg.messages[-1])
+            start_phase_a.assert_not_called()
+            # The ask screen's fail-open body (no stock data) now describes
+            # what the next tap actually does for this try-on draft, rather
+            # than quoting an hourly rate it will not charge yet.
+            self.assertIn("no GPU rented yet", self.tg.messages[-1])
             token = bot._run_token(ME)
             bot.handle(self.tg, cb_from(ME, bot._CB_RUN_GO + token),
                        allowed_user_id=ME)
-            start_drain.assert_called_once()
-            self.assertIs(start_drain.call_args.kwargs["dry_run"], False)
+            start_phase_a.assert_called_once()
+            # The whole point of commit B: the second tap on a try-on job
+            # rents nothing. The pod decision is a third tap, on the panel
+            # tick_phase_a renders once the try-on images exist.
+            start_drain.assert_not_called()
+
+    def test_the_drain_second_tap_still_spends_for_a_job_with_no_local_tryon(self):
+        # The other half of the split above, kept as its own test rather than
+        # folded in: a manifest Phase A has nothing to do for must still go
+        # straight from [Yes, spend] to start_drain with dry_run threaded, or
+        # --dry-run would stop being honoured on the button path.
+        with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot._job_has_local_tryon", return_value=False), \
+             mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value=None), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value={}):
+            self._fill_required_slots()
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_ASK), allowed_user_id=ME)
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_GO + bot._run_token(ME)),
+                       allowed_user_id=ME)
+        start_drain.assert_called_once()
+        self.assertIs(start_drain.call_args.kwargs["dry_run"], False)
 
     def test_the_run_confirm_button_carries_the_animated_rocket(self):
         with mock.patch("tgbot.bot.drain_running", return_value=False), \
@@ -1739,7 +1776,12 @@ class TestFlow(unittest.TestCase):
                  if entry[1].startswith(bot._CB_RUN_GO))
         label, data, *icon = go
         self.assertEqual(icon, [bot._ce_id(bot.ICON_ROCKET_CE)])
-        self.assertEqual(label, "Yes, spend $0.99/h")
+        # The default draft is a gemini try-on, so this panel is the two-step
+        # flow's first screen and the button says what it actually spends.
+        # Pinned rather than loosened: a button that tapped straight into a
+        # rental while saying "spend $0.99/h" is the failure the relabel
+        # exists to prevent, and it would still match a substring assertion.
+        self.assertEqual(label, "Yes — run try-on first (Gemini quota, no GPU yet)")
 
     # ---- [Run]'s GPU-stock check (added 2026-09-02) -----------------------
 
@@ -2199,7 +2241,14 @@ class TestFlow(unittest.TestCase):
     def test_tapping_switch_writes_env_and_shows_the_new_price(self):
         (self.root / ".env").write_text(
             "GPU=NVIDIA GeForce RTX 5090\nPOD_VOLUME_ID=vol-1\n", encoding="utf-8")
-        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+        # Pinned to the one-step flow (2026-09-16): this fixture's default
+        # draft is a gemini try-on, whose spend button quotes Gemini quota
+        # instead of a price. This test is about the GPU switch — that .env
+        # was rewritten and the panel now quotes the NEW card's hourly rate —
+        # so it asks for the flow where that rate is on the button. The flow
+        # choice itself is TestRunStartsPhaseAFirst's subject, not this one's.
+        with mock.patch("tgbot.bot._job_has_local_tryon", return_value=False), \
+             mock.patch("tgbot.bot.drain_running", return_value=False), \
              mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
              mock.patch("tgbot.bot.stock_at_cached",
                        return_value=self._stock_5090_low_4090_ok()):
@@ -2291,7 +2340,12 @@ class TestFlow(unittest.TestCase):
         self.assertEqual(len(self.tg.messages), baseline)
 
     def test_rent_anyway_still_starts_the_drain_at_the_original_price(self):
+        # Pinned to the one-step flow for the reason
+        # test_tapping_switch_writes_env_and_shows_the_new_price gives: this
+        # test is about renting on a Low-stock card anyway, and a try-on draft
+        # would start Phase A instead and never reach start_drain at all.
         with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot._job_has_local_tryon", return_value=False), \
              mock.patch("tgbot.bot.drain_running", return_value=False), \
              mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
              mock.patch("tgbot.bot.stock_at_cached",
@@ -2328,7 +2382,12 @@ class TestFlow(unittest.TestCase):
         self.assertFalse(any(d.startswith(bot._CB_RUN_SWITCH) for d in flat_data))
 
     def test_a_stock_check_failure_fails_open_to_the_plain_confirm(self):
-        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+        # Pinned to the one-step flow: this is the "runpodctl is down, still
+        # let the user rent" test, and the rental sentence is the thing being
+        # asserted. The Phase A wording of the same branch is
+        # TestRunStartsPhaseAFirst's subject.
+        with mock.patch("tgbot.bot._job_has_local_tryon", return_value=False), \
+             mock.patch("tgbot.bot.drain_running", return_value=False), \
              mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
              mock.patch("tgbot.bot.stock_at_cached", side_effect=RuntimeError("boom")):
             self._fill_required_slots()
@@ -2494,7 +2553,14 @@ class TestFlow(unittest.TestCase):
         """
         with mock.patch("tgbot.bot.drain_running", return_value=False):
             self._fill_required_slots()
-        with mock.patch("tgbot.bot.drain_running", return_value=True):
+        # Patched in tgbot.run, not tgbot.bot: the guard calls busy(), which
+        # resolves drain_running through its OWN module's globals, so a patch
+        # on tgbot.bot's name cannot reach it. Patching `busy` instead would
+        # reach the guard but restate its own condition — this test is named
+        # for a DRAIN, so make the real busy() see one. The slot-filling patch
+        # above stays on tgbot.bot.drain_running because _render_and_validate
+        # is a different guard and calls that name directly.
+        with mock.patch("tgbot.run.drain_running", return_value=True):
             bot.handle(self.tg, cb_from(ME, bot._CB_CLEAR_GO), allowed_user_id=ME)
         self.assertIn("a drain is running", self.tg.messages[-1])
         self.assertTrue(self.staged("driver.mp4").exists())
@@ -2553,7 +2619,8 @@ class TestFlow(unittest.TestCase):
         self.tg = bot._track_sends(self.tg)
         with mock.patch("tgbot.bot.drain_running", return_value=False):
             self._fill_required_slots()
-        with mock.patch("tgbot.bot.drain_running", return_value=True):
+        # tgbot.run, for the namespace reason /clear's refusal test gives.
+        with mock.patch("tgbot.run.drain_running", return_value=True):
             bot.handle(self.tg, cb_from(ME, bot._CB_WIPE_GO), allowed_user_id=ME)
         self.assertIn("a drain is running", self.tg.messages[-1])
         self.assertTrue(self.staged("driver.mp4").exists())
@@ -3361,6 +3428,10 @@ class TestFlow(unittest.TestCase):
         start_drain.assert_called_once()
         _, kwargs = start_drain.call_args
         self.assertEqual(kwargs.get("dry_run"), False)
+        # No journal for this chat, so no chooser and no resume: a fresh
+        # /confirm on a fresh job must still start a fresh batch.
+        self.assertIs(kwargs.get("resume"), False)
+        self.assertIs(kwargs.get("force_local"), False)
 
     def test_two_ambiguous_images_sent_back_to_back_do_not_clobber_each_other(self):
         """Regression (Task 7 fix round 1, Finding 1): Telegram delivers a
@@ -3646,7 +3717,14 @@ class TestFlow(unittest.TestCase):
         """
         live = bot._job_manifest_path(ME)
         mailbox_path(live).write_text("runs: []\n", encoding="utf-8")
+        # Both namespaces, since 2026-09-16: the write guard moved to
+        # _manifest_write_ok, i.e. busy(), which resolves drain_running
+        # through tgbot.run's OWN globals (the reason /clear's refusal test
+        # patches it there). The tgbot.bot patch is still needed for
+        # _active_manifest_path and _do_confirm, which call the name imported
+        # into this module. One without the other describes half a drain.
         with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.run.drain_running", return_value=True), \
              mock.patch("tgbot.bot.drain_running", return_value=True):
             self._fill_required_slots()
         # Not messages[-1] (2026-09-02): the panel redraw that follows this
@@ -3660,11 +3738,94 @@ class TestFlow(unittest.TestCase):
         # freeing it — while the drain itself may still be running.
         mailbox_path(live).unlink()
         with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.run.drain_running", return_value=True), \
              mock.patch("tgbot.bot.drain_running", return_value=True):
             bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
         start_drain.assert_not_called()   # queued, not rented — a drain is still running
         self.assertIn("Queued", self.tg.messages[-1])
         self.assertTrue(mailbox_path(live).exists())
+
+    def test_confirm_is_refused_while_this_job_s_try_on_phase_is_running(self):
+        """The hole [Run]-starts-Phase-A opened, and the reason _do_confirm
+        needed a guard it never needed before.
+
+        _do_phase_a deliberately does not clear _STATE — Phase A is not a
+        submission — so the draft is still there and /confirm is still
+        reachable while the try-on child runs. _do_confirm's own gate is
+        drain_running, which a Phase A never sets, so before this guard
+        /confirm fell straight through to write_manifest (over the file the
+        child is reading) and then start_drain WITH the confirm flag: a second
+        pod at $0.99/hour, a second writer on one state.json, and Gemini billed
+        again for try-ons already in flight.
+
+        Mirrors _do_resume's busy() guard, which has refused this since it was
+        written. Asserted on all three of the things that must not happen, not
+        just start_drain: a refusal that still wrote the manifest would corrupt
+        the child's input without spending anything, and would pass a
+        start_drain-only test.
+        """
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+        with mock.patch("tgbot.bot.phase_a_running", return_value=True), \
+             mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot.write_manifest") as write_manifest, \
+             mock.patch("tgbot.bot._freeze_panel") as freeze_panel:
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+        start_drain.assert_not_called()
+        write_manifest.assert_not_called()
+        freeze_panel.assert_not_called()
+        self.assertIn("try-on phase is still running", self.tg.messages[-1])
+        # The draft survives the refusal: the user is being asked to wait, not
+        # to reassemble the job.
+        self.assertIn(ME, bot._STATE)
+
+    def test_the_panel_refuses_to_rewrite_the_manifest_during_a_phase_a(self):
+        """New test (2026-09-17 final wave), not an extension of
+        test_manifest_write_ok_itself_is_busy_aware — that one only ever
+        exercised the HELPER.
+
+        _render_and_validate had two guards and neither stopped this: the
+        mailbox-occupied one needs `mailbox_path(...).exists()`, which is
+        False for a Phase A (a mailbox is a drain's), and the live-vs-mailbox
+        CHOICE keys off drain_running alone. So the common case — a Phase A
+        live, no drain, no mailbox — fell through both and rewrote the very
+        file the try-on child is re-reading. Any upload after tapping [Run]
+        reaches this function.
+        """
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+        live = bot._job_manifest_path(ME)
+        before = live.read_bytes()
+        # Cleared so the assertion below is about THIS call's branch and not
+        # about the verdict _fill_required_slots already cached.
+        bot._LAST_VALIDATE.clear()
+        with mock.patch("tgbot.bot.phase_a_running", return_value=True), \
+             mock.patch("tgbot.bot.write_manifest") as write_manifest:
+            ok = bot._render_and_validate(self.tg, ME)
+        self.assertFalse(ok)
+        write_manifest.assert_not_called()
+        self.assertEqual(live.read_bytes(), before)
+        self.assertIn("try-on phase is running", self.tg.messages[-1])
+        self.assertIn("/kill", self.tg.messages[-1])
+        # Unset, not False: "never attempted" is what /confirm keys off to
+        # retry once the child is gone, the same asymmetry the mailbox branch
+        # relies on.
+        self.assertNotIn(ME, bot._LAST_VALIDATE)
+
+    def test_confirm_still_queues_behind_a_real_drain_rather_than_refusing(self):
+        # The guard above must not become a busy() guard. Queue-depth-1
+        # (2026-09-02) is the whole reason /confirm stays reachable during a
+        # DRAIN: the job goes into the mailbox and rides the pod already paid
+        # for. Only an unpaid Phase A, which has no mailbox to queue into, is
+        # a refusal.
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+        with mock.patch("tgbot.run.drain_running", return_value=True), \
+             mock.patch("tgbot.bot.drain_running", return_value=True), \
+             mock.patch("tgbot.bot.start_drain") as start_drain:
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+        start_drain.assert_not_called()          # queued, not rented
+        self.assertIn("Queued", self.tg.messages[-1])
 
     def test_confirm_after_a_real_validation_failure_names_the_real_reason(self):
         """The other half of finding B: recovering from the write guard must
@@ -4500,6 +4661,85 @@ class TestProvisionFailureRecovery(unittest.TestCase):
             gpu="NVIDIA GeForce RTX 5090", datacenter="EU-RO-1",
             stock_out=stock_out, detail=detail))
 
+    def _write_tryon_journal(self, *, reusable: int) -> None:
+        """A manifest with two gemini try-ons and a journal saying `reusable`
+        of them are done with matching params.
+
+        params_manifest is computed with effective_stage_params, NOT written as
+        a literal {"provider": "gemini"}: local_tryon_reusable compares against
+        that function's output, which merges the stage's own defaults in, so a
+        hand-written subset would never match and the count would read 0/2 for a
+        batch that really is fully reusable.
+        """
+        self.manifest.write_text(
+            "runs:\n"
+            "  - id: runA\n    pipeline: tryon-motion-enhance\n"
+            "    inputs: {character: /tmp/c.png, outfit: /tmp/o.png, driver: /tmp/d.mp4}\n"
+            "    tryon: { provider: gemini }\n"
+            "  - id: runB\n    pipeline: tryon-motion-enhance\n"
+            "    inputs: {character: /tmp/c.png, outfit: /tmp/o.png, driver: /tmp/d.mp4}\n"
+            "    tryon: { provider: gemini }\n", encoding="utf-8")
+        params = effective_stage_params("tryon", {"provider": "gemini"})
+        batch_dir = bot.ROOT / "out" / "2026-09-16-0900"
+        runs = {}
+        for i, run_id in enumerate(("runA", "runB")):
+            run_dir = batch_dir / "runs" / run_id
+            run_dir.mkdir(parents=True, exist_ok=True)
+            dest = run_dir / "01-tryon.png"
+            if i < reusable:
+                dest.write_bytes(b"png")
+                stage = {"status": "done", "phase": "local", "file": str(dest),
+                         "params_manifest": params}
+            else:
+                stage = {"status": "error", "phase": "local"}
+            # Nested under "stages", exactly as run_local_phase._one writes it
+            # and as preserved_local_tryon reads it: a stage dict sitting at the
+            # run level reads as an empty journal, and would also make the
+            # provider-change test below pass for the wrong reason.
+            runs[run_id] = {"status": "pending", "stages": {"tryon": stage}}
+        state_path_for(self.manifest).write_text(json.dumps(
+            {"batch": "2026-09-16-0900", "runs": runs}), encoding="utf-8")
+
+    def test_stock_out_card_names_how_many_tryons_survive(self):
+        self._write_tryon_journal(reusable=2)
+        self._write_failure(stock_out=True)
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
+            bot._deliver_provision_failure(
+                self.tg, ME, self.manifest,
+                read_provision_failure(provision_failure_path(self.manifest)))
+        self.assertIn("2/2", self.tg.messages[-1])
+
+    def test_a_provider_change_is_not_reported_as_preserved(self):
+        # The card must count with the runner's own predicate. Saying "2/2
+        # preserved" for a batch about to re-run both is the lie Task 3's
+        # preserved_local_tryon exists to prevent.
+        self._write_tryon_journal(reusable=2)
+        self.manifest.write_text(
+            self.manifest.read_text(encoding="utf-8").replace("provider: gemini",
+                                                              "provider: qwen-max"),
+            encoding="utf-8")
+        self._write_failure(stock_out=True)
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
+            bot._deliver_provision_failure(
+                self.tg, ME, self.manifest,
+                read_provision_failure(provision_failure_path(self.manifest)))
+        self.assertIn("0/2", self.tg.messages[-1])
+
+    def test_a_non_utf8_manifest_counts_as_unknown_rather_than_raising(self):
+        # load_manifest wraps only yaml.YAMLError into ManifestError, and its
+        # read_text(encoding="utf-8") sits inside that same try — so a manifest
+        # saved in some other encoding (cp1258 is what a Vietnamese Windows
+        # editor writes) raises UnicodeDecodeError straight out of it. That
+        # escape is not cosmetic: _preserved_tryon runs before any send_message
+        # in the stock-out branch, so the card is never delivered, and handle()
+        # re-raises into the poll loop after `offset` was already bumped — the
+        # rest of that fetched batch of updates is dropped and every tick in
+        # that pass is skipped. The user sees nothing at all.
+        self.manifest.write_bytes("runs: []\n# ghi chú\n".encode("cp1258"))
+        self.assertEqual(bot._preserved_tryon(self.manifest), (0, 0))
+
     def test_stock_out_shows_the_real_reason_not_a_json_dump_or_the_old_generic_message(self):
         self._write_failure(stock_out=True)
         with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
@@ -4519,6 +4759,7 @@ class TestProvisionFailureRecovery(unittest.TestCase):
             bot.deliver_result(self.tg, ME, self.manifest)
         flat = [data for row in self.tg.buttons[-1] for _, data, *_ in row]
         self.assertIn(bot._CB_RECOVER_WAIT, flat)
+        self.assertIn(f"{bot._CB_RECOVER_RETRY}tg-1", flat)
         self.assertIn(f"{bot._CB_RECOVER_SWITCH}4090:tg-1", flat)
         self.assertIn(f"{bot._CB_RECOVER_MIGRATE}EUR-NO-1:tg-1", flat)
         self.assertTrue(any(d.startswith(bot._CB_GPUSUB_DC) for d in flat))
@@ -4541,6 +4782,10 @@ class TestProvisionFailureRecovery(unittest.TestCase):
         sub_row = next(r for r in rows if r[0][1].startswith(bot._CB_GPUSUB_DC))
         self.assertEqual(switch_row[0][2], bot._ce_id(bot.ICON_ROCKET_CE))
         self.assertEqual(sub_row[0][2], bot._ce_id(bot.ICON_CRITICAL_CE))
+        # Retry resumes a paid rental immediately, same as the switch button,
+        # so it carries the same rocket.
+        retry_row = next(r for r in rows if r[0][1].startswith(bot._CB_RECOVER_RETRY))
+        self.assertEqual(retry_row[0][2], bot._ce_id(bot.ICON_ROCKET_CE))
         # Đợi mirrors every other Cancel-style button in this file: bare,
         # no icon.
         wait_row = next(r for r in rows if r[0][1] == bot._CB_RECOVER_WAIT)
@@ -4589,6 +4834,44 @@ class TestProvisionFailureRecoveryButtons(unittest.TestCase):
         start_drain.assert_not_called()
         self.assertTrue(provision_failure_path(self.manifest).exists())
 
+    def test_wait_copy_no_longer_points_at_the_path_that_loses_the_tryon(self):
+        # "/confirm again later" reaches _do_confirm, which did not resume:
+        # new batch id, empty journal, every try-on re-run and Gemini billed
+        # twice. The button may dismiss, it may not advise that.
+        with mock.patch("tgbot.bot.start_drain"):
+            bot.handle(self.tg, cb_from(ME, bot._CB_RECOVER_WAIT), allowed_user_id=ME)
+        self.assertNotIn("/confirm again", self.tg.messages[-1])
+        # ...and it must actually name the button it points at, or an empty
+        # reply would satisfy the assertion above.
+        self.assertIn("Thử lại", self.tg.messages[-1])
+
+    def test_retry_resumes_without_touching_the_gpu_setting(self):
+        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.migration_running", return_value=False), \
+             mock.patch("tgbot.bot.start_drain") as start_drain:
+            bot.handle(self.tg, cb_from(ME, f"{bot._CB_RECOVER_RETRY}tg-1"),
+                       allowed_user_id=ME)
+        start_drain.assert_called_once_with(self.manifest, dry_run=False, resume=True)
+        # Retry keeps the GPU the batch already failed on — switching is the
+        # other button's job, and silently rewriting .env's GPU= would change
+        # what every LATER batch rents too.
+        self.assertEqual(env_get(self.root / ".env", "GPU"),
+                         "NVIDIA GeForce RTX 5090")
+        self.assertFalse(provision_failure_path(self.manifest).exists())
+
+    def test_retry_refuses_a_stale_stem(self):
+        with mock.patch("tgbot.bot.start_drain") as start_drain:
+            bot.handle(self.tg, cb_from(ME, f"{bot._CB_RECOVER_RETRY}"),
+                       allowed_user_id=ME)
+        start_drain.assert_not_called()
+
+    def test_stock_out_card_offers_retry(self):
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value={}):
+            bot.deliver_result(self.tg, ME, self.manifest)
+        flat = [data for row in self.tg.buttons[-1] for _, data, *_ in row]
+        self.assertIn(f"{bot._CB_RECOVER_RETRY}tg-1", flat)
+
     def test_switch_rewrites_env_clears_the_sentinel_and_resumes(self):
         with mock.patch("tgbot.bot.drain_running", return_value=False), \
              mock.patch("tgbot.bot.migration_running", return_value=False), \
@@ -4609,8 +4892,15 @@ class TestProvisionFailureRecoveryButtons(unittest.TestCase):
                          "NVIDIA GeForce RTX 5090")   # unchanged
 
     def test_switch_does_nothing_if_already_running(self):
-        with mock.patch("tgbot.bot.drain_running", return_value=True), \
-             mock.patch("tgbot.bot.migration_running", return_value=False), \
+        # Through the REAL predicate, not a patched one: _do_resume gates on
+        # busy(), and busy() calls run.drain_running from run's own namespace —
+        # so the `mock.patch("tgbot.bot.drain_running")` this test used no
+        # longer reached the guard and it passed by accident. A live handle in
+        # run._RUNNING is the case the guard exists for (a pod already billed).
+        key = self.manifest.resolve()
+        run_mod._RUNNING[key] = _AliveProc()
+        self.addCleanup(run_mod._RUNNING.pop, key, None)
+        with mock.patch("tgbot.bot.migration_running", return_value=False), \
              mock.patch("tgbot.bot.start_drain") as start_drain:
             bot.handle(self.tg, cb_from(ME, f"{bot._CB_RECOVER_SWITCH}4090:tg-1"),
                       allowed_user_id=ME)
@@ -5220,6 +5510,1215 @@ class TestKillCommand(unittest.TestCase):
             bot.handle(self.tg, cb_from(ME, bot._CB_KILL_NO), allowed_user_id=ME)
         run.assert_not_called()
         self.assertIn("left running", self.tg.messages[-1])
+
+    # ---- the Phase A brake (2026-09-17) ----------------------------------
+    # Moving Phase A out of the drain's own Popen took away the only thing
+    # that could stop it: _ask_kill gates on drain_running, which a Phase A
+    # never sets, so a 12-run batch hammering a misconfigured Gemini key
+    # would have been answered "there is no pod to kill" while it kept
+    # spending quota. These pin the parallel branch, not a widening of what
+    # /kill means for a paid pod.
+
+    def test_ask_offers_to_stop_a_live_phase_a_and_says_no_pod_exists(self):
+        with mock.patch("tgbot.bot.phase_a_running", return_value=True):
+            bot.handle(self.tg, cmd_from(ME, "/kill"), allowed_user_id=ME)
+        text = self.tg.messages[-1]
+        self.assertIn("try-on phase", text)
+        self.assertIn("no pod is rented", text)
+        # Same two buttons as the drain ask: one keyboard shape, so the
+        # confirm callback needs no second variant to route.
+        offered = [data for row in self.tg.buttons[-1] for _, data, *_ in row]
+        self.assertEqual(offered, [bot._CB_KILL_GO, bot._CB_KILL_NO])
+
+    def test_confirming_stops_the_phase_a_and_never_destroys_a_pod(self):
+        # Nothing was rented, so `make gpu-destroy` here would tear down
+        # whatever unrelated pod the .env happens to point at. Asserted
+        # negatively for that reason, the way
+        # test_a_dead_tracked_process_is_left_alone asserts its own negative.
+        with mock.patch("tgbot.bot.phase_a_running", return_value=True), \
+             mock.patch("tgbot.bot.stop_phase_a", return_value=True) as stop, \
+             mock.patch("tgbot.bot.subprocess.run") as run, \
+             mock.patch("tgbot.bot.clear_lease") as clear_lease:
+            bot.handle(self.tg, cb_from(ME, bot._CB_KILL_GO), allowed_user_id=ME)
+        stop.assert_called_once_with(self.manifest)
+        run.assert_not_called()
+        clear_lease.assert_not_called()
+        self.assertIn("Stopped the try-on phase", self.tg.messages[-1])
+
+    def test_confirming_an_already_finished_phase_a_says_so(self):
+        # stop_phase_a's return value is the whole contract: reporting
+        # "stopped" for a phase that had already finished tells the user they
+        # halted a run that may well have succeeded.
+        with mock.patch("tgbot.bot.phase_a_running", return_value=True), \
+             mock.patch("tgbot.bot.stop_phase_a", return_value=False), \
+             mock.patch("tgbot.bot.subprocess.run") as run:
+            bot.handle(self.tg, cb_from(ME, bot._CB_KILL_GO), allowed_user_id=ME)
+        run.assert_not_called()
+        self.assertIn("already finished", self.tg.messages[-1])
+        self.assertNotIn("Stopped the try-on phase", self.tg.messages[-1])
+
+    def test_stopping_a_phase_a_clears_its_progress_message(self):
+        # The same file tick_phase_a owns. Left behind it pins the poll loop
+        # at 2s via `animating = _progress_path(...).exists()`, under a
+        # message frozen on "running the try-on" with nothing running.
+        prog = bot._progress_path(ME)
+        prog.write_text(json.dumps({"manifest": str(self.manifest),
+                                    "message_id": 778, "stages": ["tryon"],
+                                    "phase": "local"}), encoding="utf-8")
+        # subprocess.run and clear_lease are mocked and asserted-not-called
+        # rather than left real: without them, a future edit that moved the
+        # Phase A branch below the drain logic would make this test SHELL OUT
+        # to a real `make gpu-destroy` instead of failing.
+        with mock.patch("tgbot.bot.phase_a_running", return_value=True), \
+             mock.patch("tgbot.bot.stop_phase_a", return_value=True), \
+             mock.patch("tgbot.bot.subprocess.run") as run, \
+             mock.patch("tgbot.bot.clear_lease") as clear_lease:
+            bot.handle(self.tg, cb_from(ME, bot._CB_KILL_GO), allowed_user_id=ME)
+        run.assert_not_called()
+        clear_lease.assert_not_called()
+        self.assertIn(
+            (778, "🛑 <b>Killed by request</b> — nothing left running."),
+            self.tg.edits)
+        self.assertFalse(prog.exists())
+
+    # ---- a billed drain always wins the branch ---------------------------
+    # Defence in depth for the state /confirm-during-Phase-A could reach: if
+    # both predicates are ever true for one manifest, taking the cheap branch
+    # reports "Nothing was rented" and leaves a real pod billing — with no way
+    # back, because the message already told the user /kill handled it.
+
+    def test_ask_names_the_pod_when_a_drain_and_a_phase_a_are_both_live(self):
+        with mock.patch("tgbot.bot.phase_a_running", return_value=True), \
+             mock.patch("tgbot.bot.drain_running", return_value=True), \
+             mock.patch("tgbot.bot.lease_for", return_value=None):
+            bot.handle(self.tg, cmd_from(ME, "/kill"), allowed_user_id=ME)
+        text = self.tg.messages[-1]
+        self.assertIn("destroys the pod right now", text)
+        self.assertNotIn("no pod is rented", text)
+
+    def test_confirming_destroys_the_pod_when_a_drain_and_a_phase_a_are_both_live(self):
+        ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="destroyed",
+                                         stderr="")
+        with mock.patch("tgbot.bot.phase_a_running", return_value=True), \
+             mock.patch("tgbot.bot.drain_running", return_value=True), \
+             mock.patch("tgbot.bot.stop_phase_a") as stop, \
+             mock.patch("tgbot.bot.subprocess.run", return_value=ok) as run, \
+             mock.patch("tgbot.bot.clear_lease") as clear_lease:
+            bot.handle(self.tg, cb_from(ME, bot._CB_KILL_GO), allowed_user_id=ME)
+        self.assertEqual(run.call_args.args[0], ["make", "gpu-destroy"])
+        clear_lease.assert_called_once()
+        # Not stopped here, and the assertion is right even though the obvious
+        # reason is not: Phase A is its own Popen in run._PHASE_A, wholly
+        # separate from the pod and the drain, so destroying the pod does NOT
+        # take it down. What /kill prioritises is the thing actually billing —
+        # the pod — and this branch has no path back to the Phase A handle.
+        # The orphaned local child is a known, accepted limitation of this
+        # rare both-live case, deferred rather than fixed here.
+        stop.assert_not_called()
+        self.assertIn("Killed. Pod destroyed", self.tg.messages[-1])
+
+
+class TestConfirmAsksBeforeReusingTryon(TestFlow):
+    """/confirm must not silently pick between "reuse the try-on" and "roll it
+    again". The two intents are indistinguishable from inside _do_confirm, and
+    guessing wrong in the re-roll direction hands back the exact image the
+    user was trying to get away from — silently, which is what makes it worse
+    than one extra Gemini call.
+    """
+
+    def _journal_for_draft(self, *, provider: str = "gemini") -> Path:
+        """Fill the draft, write the real manifest, then fake a journal saying
+        its try-on is already done.
+
+        Three things here are load-bearing and each one is a way this fixture
+        could silently test nothing:
+
+        - the provider is set explicitly even though it already defaults to
+          "gemini", because `bot.JOB_PROVIDER` (`bot.py:140`) is a hardcoded
+          module constant and a test that depends on it silently changes meaning
+          if that constant is ever retuned. Do NOT confuse it with `job.py`'s
+          `DEFAULT_PROVIDER` ("qwen"), which is a different thing entirely: that
+          one is the value `linux.py:5653` falls back to when a manifest carries
+          no `provider:` line, and `render_manifest` compares against it to
+          decide whether to emit an explicit marker. Passing `provider="qwen"`
+          here is what makes a run NOT local-eligible.
+        - the stage name is looked up, not written as "tryon". The default
+          pipeline may call it camera-tryon.
+        - params_manifest comes from effective_stage_params, not a literal
+          {"provider": "gemini"}: local_tryon_reusable compares against that
+          function's output, which merges the stage defaults in.
+        - the journal is nested as runs[id]["stages"][stage], because that is
+          what preserved_local_tryon reads (runner.py:481) and what
+          run_local_phase._one writes. A flat shape makes reusable always 0 and
+          every count test pass for the wrong reason — this exact defect shipped
+          in Task 4's brief and was caught by its implementer.
+        """
+        self._fill_required_slots()
+        bot._job_for(ME).provider = provider
+        bot._LAST_VALIDATE[ME] = True
+        manifest = bot._job_manifest_path(ME)
+        write_manifest(bot._jobs_for(ME), manifest, now="2026-09-16 09:00:00")
+        run = load_manifest(manifest).runs[0]
+        stage_name = next(s for s in PIPELINES[run.pipeline]
+                          if STAGES[s].job_type == "tryon")
+        run_dir = bot.ROOT / "out" / "2026-09-16-0900" / "runs" / run.id
+        dest = stage_dest(run, run_dir, stage_name)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"png")
+        state_path_for(manifest).write_text(json.dumps({
+            "batch": "2026-09-16-0900",
+            "runs": {run.id: {"status": "running", "stages": {stage_name: {
+                "status": "done", "phase": "local", "file": str(dest),
+                "params_manifest": effective_stage_params(
+                    stage_name, run.stage_params.get(stage_name))}}}}}),
+            encoding="utf-8")
+        return manifest
+
+    def _chooser_token(self) -> str:
+        """The token off the rendered chooser, not _run_token(ME) read earlier.
+
+        Reading it before /confirm is wrong and looks right: the first entry
+        rewrites the manifest, _run_token IS that file's mtime_ns, so a
+        pre-captured token no longer matches and every tap below would be
+        refused as stale. Taking it off the buttons tests the real round trip.
+        """
+        flat = [data for row in self.tg.buttons[-1] for _, data, *_ in row]
+        reuse = next(d for d in flat if d.startswith(bot._CB_PHASE_A_REUSE))
+        return reuse[len(bot._CB_PHASE_A_REUSE):]
+
+    def test_a_reusable_journal_offers_the_choice_and_spends_nothing_yet(self):
+        self._journal_for_draft()
+        with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+        start_drain.assert_not_called()
+        flat = [data for row in self.tg.buttons[-1] for _, data, *_ in row]
+        self.assertTrue(any(d.startswith(bot._CB_PHASE_A_REUSE) for d in flat))
+        self.assertTrue(any(d.startswith(bot._CB_PHASE_A_RERUN) for d in flat))
+        # The job must survive the chooser: _do_confirm clears _STATE on the
+        # way out, and a cleared draft cannot be confirmed a second time.
+        self.assertIsNotNone(bot._STATE.get(ME))
+        # And the panel must not be frozen as "submitted" — nothing was.
+        self.assertNotIn("submitted", panel_text(self.tg))
+
+    def test_reuse_resumes_without_forcing(self):
+        self._journal_for_draft()
+        with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+            token = self._chooser_token()
+            bot.handle(self.tg, cb_from(ME, bot._CB_PHASE_A_REUSE + token),
+                       allowed_user_id=ME)
+        start_drain.assert_called_once()
+        self.assertIs(start_drain.call_args.kwargs["resume"], True)
+        self.assertIs(start_drain.call_args.kwargs["force_local"], False)
+
+    def test_rerun_resumes_and_forces(self):
+        self._journal_for_draft()
+        with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+            token = self._chooser_token()
+            bot.handle(self.tg, cb_from(ME, bot._CB_PHASE_A_RERUN + token),
+                       allowed_user_id=ME)
+        start_drain.assert_called_once()
+        self.assertIs(start_drain.call_args.kwargs["resume"], True)
+        self.assertIs(start_drain.call_args.kwargs["force_local"], True)
+
+    def test_the_choice_does_not_rewrite_the_manifest_and_invalidate_its_own_buttons(self):
+        # _run_token IS the manifest's mtime_ns. A second write_manifest would
+        # bump it, and the button the user just tapped would then fail its own
+        # staleness check — "that button is from an older version of the bot".
+        # Measured AFTER /confirm: the first entry writes legitimately, so a
+        # pre-captured mtime would fail for the wrong reason.
+        manifest = self._journal_for_draft()
+        with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+            token = self._chooser_token()
+            after_first = manifest.stat().st_mtime_ns
+            bot.handle(self.tg, cb_from(ME, bot._CB_PHASE_A_REUSE + token),
+                       allowed_user_id=ME)
+        self.assertEqual(manifest.stat().st_mtime_ns, after_first)
+        self.assertEqual(token, bot._run_token(ME))
+        start_drain.assert_called_once()
+
+    def test_a_stale_choice_button_is_refused(self):
+        self._journal_for_draft()
+        with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+            bot.handle(self.tg, cb_from(ME, bot._CB_PHASE_A_REUSE + "0"),
+                       allowed_user_id=ME)
+        start_drain.assert_not_called()
+
+    def test_no_journal_means_no_chooser_and_one_tap_still_starts(self):
+        with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+        start_drain.assert_called_once()
+        self.assertIs(start_drain.call_args.kwargs.get("resume"), False)
+        self.assertIs(start_drain.call_args.kwargs.get("force_local"), False)
+
+    def test_a_self_host_provider_gets_no_chooser_even_with_a_reusable_journal(self):
+        # The real control group, and the reason it needs a journal: this test
+        # was originally written as "a default-provider draft gets no chooser",
+        # which was vacuous twice over — bot.JOB_PROVIDER is "gemini"
+        # (bot.py:140) so a default draft IS local-eligible, and the test wrote
+        # no journal, so it passed on the absence of a journal rather than on
+        # anything about locality.
+        #
+        # Setting provider="qwen" makes render_manifest emit no provider: line,
+        # _local_tryon_stage returns None, and preserved_local_tryon's total
+        # falls to 0 — so the chooser is suppressed by LOCALITY, with a journal
+        # sitting right there whose entry would otherwise be reusable. If this
+        # ever starts showing a chooser, _local_tryon_stage grew an opinion of
+        # its own.
+        self._journal_for_draft(provider="qwen")
+        with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+        flat = [data for row in (self.tg.buttons[-1] or []) for _, data, *_ in row]
+        self.assertFalse(any(d.startswith(bot._CB_PHASE_A_REUSE) for d in flat))
+        start_drain.assert_called_once()
+        self.assertIs(start_drain.call_args.kwargs.get("resume"), False)
+
+    def test_a_job_queued_behind_a_live_drain_gets_no_chooser(self):
+        # The mailbox branch never reaches the money gate, so it must not reach
+        # the chooser either: that job runs later on a pod already paid for.
+        self._journal_for_draft()
+        with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot.drain_running", return_value=True):
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+        flat = [data for row in (self.tg.buttons[-1] or []) for _, data, *_ in row]
+        self.assertFalse(any(d.startswith(bot._CB_PHASE_A_REUSE) for d in flat))
+        start_drain.assert_not_called()
+        # And the mailbox really was written: "queued" on this branch means a
+        # file on disk that chain_or_teardown can claim, and the two race tests
+        # below depend on the SECOND entry deliberately not writing one. Without
+        # this line the test would also pass if the first entry skipped the
+        # write, which is the bug the write gate's comment describes.
+        self.assertTrue(mailbox_path(bot._job_manifest_path(ME)).exists())
+
+    def _tap_after_a_drain_started(self, prefix: str) -> tuple[mock.MagicMock, str]:
+        """/confirm, then a drain appears on the live manifest while the chooser
+        is still unanswered, then the tap. Returns the start_drain mock and the
+        last message the bot sent.
+
+        The two conditions co-occur by construction rather than by luck: the
+        stock-out card that offers Retry / Switch-GPU exists exactly when Phase A
+        finished and the journal holds a preserved try-on, which is exactly when
+        _preserved_tryon reports reusable > 0 and the chooser appears. Both of
+        those buttons call _do_resume on this same file, and so does
+        tick_migration_progress's resume-on-done — which needs no tap at all.
+
+        `drain_running` is a mutable cell, not a side_effect list: a list raises
+        StopIteration the moment the function is called more often than this
+        helper predicted, which would surface as a fixture error instead of the
+        behaviour under test.
+        """
+        self._journal_for_draft()
+        running = [False]
+        with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot.drain_running",
+                        side_effect=lambda *_: running[0]), \
+             mock.patch("tgbot.bot._start_progress"):
+            bot.handle(self.tg, cmd_from(ME, "/confirm"), allowed_user_id=ME)
+            token = self._chooser_token()
+            running[0] = True
+            bot.handle(self.tg, cb_from(ME, prefix + token), allowed_user_id=ME)
+            return start_drain, self.tg.messages[-1]
+
+    def test_a_drain_that_started_during_the_chooser_reports_the_reuse_not_a_queue(self):
+        # On the second entry `running` is True, so manifest_path is the mailbox
+        # and start_drain is never reached. Nothing was written to the mailbox
+        # either — the write is skipped on the second entry, and writing it
+        # would be the expensive mistake: claim_mailbox renames it to a new
+        # stem, chain_or_teardown runs that stem with no --resume and no
+        # --force-local, so a fresh journal and a fresh batch id follow. That is
+        # a second full GPU run of the same video AND a second Gemini try-on
+        # payment, whichever button was tapped.
+        #
+        # The job is not lost, though: a drain is running on this very manifest,
+        # started by _do_resume with resume=True, so the try-on IS reused and the
+        # video does get made. What has to change is the message — "Queued."
+        # describes a mailbox file that does not exist.
+        start_drain, msg = self._tap_after_a_drain_started(bot._CB_PHASE_A_REUSE)
+        start_drain.assert_not_called()
+        self.assertFalse(mailbox_path(bot._job_manifest_path(ME)).exists())
+        self.assertNotIn("Queued", msg)
+        self.assertIn("reused", msg)
+        # Reuse is the outcome the user asked for, so there is nothing to
+        # recover and no recovery path to name — pointing at /again here would
+        # invite a second paid run for no reason.
+        self.assertNotIn("/again", msg)
+        # The draft must be gone: leaving it in _STATE would let a later
+        # /confirm submit the same job a second time.
+        self.assertIsNone(bot._STATE.get(ME))
+
+    def test_a_drain_that_started_during_the_chooser_says_the_rerun_could_not_be_applied(self):
+        # Same race, opposite choice, and the difference matters: FORCE_LOCAL
+        # has no route into a drain that is already on a pod, so a "Re-run
+        # try-on" tap is silently converted into a reuse unless the message says
+        # so. That silence is the exact failure this whole feature exists to
+        # remove — the user gets back the image they were trying to get away
+        # from and no hint that their choice did not take.
+        start_drain, msg = self._tap_after_a_drain_started(bot._CB_PHASE_A_RERUN)
+        start_drain.assert_not_called()
+        self.assertFalse(mailbox_path(bot._job_manifest_path(ME)).exists())
+        self.assertNotIn("Queued", msg)
+        self.assertIn("reused", msg)
+        # Names the recovery that actually works, rather than leaving the
+        # dropped choice unmentioned.
+        self.assertIn("/again", msg)
+        self.assertIsNone(bot._STATE.get(ME))
+
+
+class _AliveProc:
+    """Stands in for a Popen handle whose child has not exited: only .poll()
+    is ever read by run.drain_running / run.phase_a_running."""
+
+    def poll(self):
+        return None
+
+
+class TestPhaseABlocksManifestMutation(unittest.TestCase):
+    """A live Phase A reads the same manifest file a drain does, so the guards
+    that exist because drain.py reads that file have to cover it too.
+
+    Both guards are reached through their confirm BUTTON, not through the
+    `/clear` and `/wipe` commands: those only call `_ask_to_clear` /
+    `_ask_to_wipe`, which ask the question and return. The refusal lives in
+    `_clear_job` and `_wipe_chat`, one step later.
+    """
+
+    def setUp(self):
+        self._orig_root = bot.ROOT
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "batch").mkdir()
+        bot.ROOT = self.root
+        reset_bot_state()
+        # The per-chat path, not an arbitrary name: it is the exact argument
+        # both guards pass to busy(), so a fixture that spelled it differently
+        # would describe a file nothing reads.
+        self.manifest = bot._job_manifest_path(ME)
+        self.manifest.write_text("runs: []\n", encoding="utf-8")
+        self.tg = FakeTg()
+
+    def tearDown(self):
+        bot.ROOT = self._orig_root
+
+    def test_clear_is_refused_while_phase_a_runs(self):
+        # The refusal has to say which of busy()'s two halves is actually
+        # holding the file. Nothing here puts a drain anywhere, so the real
+        # drain_running answers False and naming one would be a lie about a
+        # pod that does not exist — and "wait for the drain" reads as "money
+        # is burning", which is the opposite of true during Phase A.
+        with mock.patch("tgbot.bot.busy", return_value=True):
+            bot.handle(self.tg, cb_from(ME, bot._CB_CLEAR_GO), allowed_user_id=ME)
+        self.assertIn("try-on phase is running", self.tg.messages[-1])
+
+    def test_wipe_is_refused_while_phase_a_runs(self):
+        # /wipe shares /clear's guard and adds its own, for the progress
+        # message that is the only thing telling the user a phase is still
+        # going — so a live Phase A has to stop the whole thing, not only the
+        # file half.
+        with mock.patch("tgbot.bot.busy", return_value=True):
+            bot.handle(self.tg, cb_from(ME, bot._CB_WIPE_GO), allowed_user_id=ME)
+        self.assertIn("try-on phase is running", self.tg.messages[-1])
+
+    def test_a_still_billed_pod_also_refuses_clear(self):
+        # The two tests above patch `busy`, which proves the guard CALLS it
+        # but not that it still answers True for the case it replaced. That
+        # case is the money one — a pod at $0.99/hour whose inputs are about
+        # to be deleted — so here it is asserted through the real predicate:
+        # a not-yet-exited handle in run._RUNNING and nothing patching busy
+        # or drain_running.
+        key = bot._job_manifest_path(ME).resolve()
+        orig_lease_path = run_mod.LEASE_PATH
+        run_mod.LEASE_PATH = Path(tempfile.mkdtemp()) / "no-lease.json"
+        run_mod._RUNNING[key] = _AliveProc()
+        try:
+            bot.handle(self.tg, cb_from(ME, bot._CB_CLEAR_GO), allowed_user_id=ME)
+        finally:
+            run_mod._RUNNING.pop(key, None)
+            run_mod.LEASE_PATH = orig_lease_path
+        self.assertIn("drain is running", self.tg.messages[-1])
+
+    def test_a_still_billed_pod_also_refuses_wipe(self):
+        # /wipe is the more destructive of the two guards — it takes the job's
+        # staged inputs AND the messages that tell the user a run is still
+        # going — so it is the one that more needs an unmocked proof. Same
+        # shape as /clear's above: a live handle in run._RUNNING, a lease path
+        # pointing nowhere, and nothing patched anywhere in the path.
+        key = bot._job_manifest_path(ME).resolve()
+        orig_lease_path = run_mod.LEASE_PATH
+        run_mod.LEASE_PATH = Path(tempfile.mkdtemp()) / "no-lease.json"
+        run_mod._RUNNING[key] = _AliveProc()
+        try:
+            bot.handle(self.tg, cb_from(ME, bot._CB_WIPE_GO), allowed_user_id=ME)
+        finally:
+            run_mod._RUNNING.pop(key, None)
+            run_mod.LEASE_PATH = orig_lease_path
+        self.assertIn("drain is running", self.tg.messages[-1])
+        # The refusal has to be the last word: were the guard to send it and
+        # then fall through, _wipe_chat would go on to sweep the ledger and
+        # report "Wiped." — the destructive half this test exists to prove did
+        # not happen. Asserted on its own rather than inferred from message
+        # order, since that order is the thing a future edit would change.
+        self.assertFalse(any("Wiped" in t for t in self.tg.screen),
+                         "_wipe_chat swept the chat despite refusing")
+
+
+class TestRunStartsPhaseAFirst(unittest.TestCase):
+    """[Yes, spend] on a manifest with local try-on now starts Phase A, not a
+    drain. The spend decision moves to the panel tick_phase_a renders.
+    """
+
+    def setUp(self):
+        self._orig_root = bot.ROOT
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "batch").mkdir()
+        (self.root / "out").mkdir()
+        bot.ROOT = self.root
+        # _offer_run_confirm reads GPU= and POD_VOLUME_ID= from here; without
+        # it the panel takes its fail-open branch for the wrong reason.
+        (self.root / ".env").write_text(
+            "GPU=NVIDIA GeForce RTX 5090\nPOD_VOLUME_ID=vol-1\n", encoding="utf-8")
+        reset_bot_state()
+        self.tg = FakeTg()
+
+    def tearDown(self):
+        bot.ROOT = self._orig_root
+
+    def _write(self, text: str) -> Path:
+        p = self.root / "batch" / "tg-1.yaml"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+        return p
+
+    TRYON = ("runs:\n  - id: runA\n    pipeline: tryon-motion-enhance\n"
+             "    inputs: {character: /tmp/c.png, outfit: /tmp/o.png, driver: /tmp/d.mp4}\n"
+             "    tryon: { provider: gemini }\n")
+    PLAIN = ("runs:\n  - id: runA\n    pipeline: motion-enhance\n"
+             "    inputs: {character: /tmp/c.png, driver: /tmp/d.mp4}\n")
+
+    def test_a_tryon_manifest_starts_phase_a_and_does_not_rent(self):
+        manifest = self._write(self.TRYON)
+        with mock.patch("tgbot.bot.start_phase_a") as phase_a, \
+             mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot.busy", return_value=False), \
+             mock.patch("tgbot.bot._start_progress") as progress:
+            bot._start_phase_a_and_report(self.tg, ME, manifest, ["tryon", "motion"])
+        phase_a.assert_called_once()
+        start_drain.assert_not_called()
+        # Asserted here, not only in TestProgressMessageOwnership: that class
+        # proves the marker works, this proves the launcher actually sets it.
+        # Without it the message stays owned by tick_progress, which reports a
+        # half-finished batch as done instead of showing the rent panel.
+        self.assertEqual(progress.call_args.kwargs.get("phase"), "local")
+
+    def test_phase_a_is_started_with_resume_when_a_journal_exists(self):
+        manifest = self._write(self.TRYON)
+        state_path_for(manifest).write_text(json.dumps(
+            {"batch": "2026-09-16-0900", "runs": {}}), encoding="utf-8")
+        with mock.patch("tgbot.bot.start_phase_a") as phase_a, \
+             mock.patch("tgbot.bot.busy", return_value=False), \
+             mock.patch("tgbot.bot._start_progress"):
+            bot._start_phase_a_and_report(self.tg, ME, manifest, ["tryon"])
+        self.assertIs(phase_a.call_args.kwargs["resume"], True)
+
+    def test_the_run_button_says_it_spends_gemini_quota(self):
+        # The trade the user accepted: quota goes before the money
+        # confirmation. It has to be on the button, not in a docstring — and
+        # the assertion is on the LABEL, because the fail-open branch puts the
+        # spend wording in the button rather than the message body.
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value={}), \
+             mock.patch("tgbot.bot._run_token", return_value="1"):
+            bot._offer_run_confirm(self.tg, ME, phase_a=True)
+        labels = [label for row in self.tg.buttons[-1] for label, *_ in row]
+        self.assertTrue(any("Gemini" in label for label in labels),
+                        f"no button mentions the quota: {labels}")
+
+    def test_without_phase_a_the_button_still_quotes_the_hourly_price(self):
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value={}), \
+             mock.patch("tgbot.bot._run_token", return_value="1"):
+            bot._offer_run_confirm(self.tg, ME)
+        labels = [label for row in self.tg.buttons[-1] for label, *_ in row]
+        self.assertTrue(any("$0.99/h" in label for label in labels), labels)
+
+    def test_a_plain_draft_is_offered_the_unchanged_single_tap(self):
+        # _offer_run_for_chat asks the DRAFT, not a manifest on disk: at
+        # _CB_RUN_ASK time the file may not have been written yet.
+        with mock.patch("tgbot.bot._job_has_local_tryon", return_value=False), \
+             mock.patch("tgbot.bot._offer_run_confirm") as offer:
+            bot._offer_run_for_chat(self.tg, ME)
+        # phase_a, not spend_cb: the two flows differ in what the button SAYS
+        # and where the _CB_RUN_GO handler GOES. spend_cb stays at its
+        # _CB_RUN_GO default in both.
+        self.assertIs(offer.call_args.kwargs["phase_a"], False)
+
+    def test_a_tryon_draft_is_offered_the_two_step_flow(self):
+        with mock.patch("tgbot.bot._job_has_local_tryon", return_value=True), \
+             mock.patch("tgbot.bot._offer_run_confirm") as offer:
+            bot._offer_run_for_chat(self.tg, ME)
+        self.assertIs(offer.call_args.kwargs["phase_a"], True)
+
+    def test_message_id_and_force_are_forwarded(self):
+        # Three of the four call sites re-render an existing message rather
+        # than sending a new one, and Refresh passes force=True to bypass the
+        # stock cache. Dropping either would silently regress the 2026-09-12
+        # edit-in-place behaviour.
+        with mock.patch("tgbot.bot._job_has_local_tryon", return_value=True), \
+             mock.patch("tgbot.bot._offer_run_confirm") as offer:
+            bot._offer_run_for_chat(self.tg, ME, message_id=42, force=True)
+        self.assertEqual(offer.call_args.kwargs["message_id"], 42)
+        self.assertIs(offer.call_args.kwargs["force"], True)
+
+    def test_run_go_starts_phase_a_for_a_tryon_draft(self):
+        # The actual user-facing behaviour of commit B, and the one nothing
+        # else in this task covers: [Yes, spend] on a try-on draft must NOT
+        # reach _do_confirm, which would rent a pod before the try-on exists.
+        with mock.patch("tgbot.bot._run_token", return_value="1"), \
+             mock.patch("tgbot.bot._job_has_local_tryon", return_value=True), \
+             mock.patch("tgbot.bot._do_phase_a") as do_phase_a, \
+             mock.patch("tgbot.bot._do_confirm") as do_confirm:
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_GO + "1"), allowed_user_id=ME)
+        do_phase_a.assert_called_once()
+        do_confirm.assert_not_called()
+
+    def test_run_go_still_confirms_directly_for_a_plain_draft(self):
+        with mock.patch("tgbot.bot._run_token", return_value="1"), \
+             mock.patch("tgbot.bot._job_has_local_tryon", return_value=False), \
+             mock.patch("tgbot.bot._do_phase_a") as do_phase_a, \
+             mock.patch("tgbot.bot._do_confirm") as do_confirm:
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_GO + "1"), allowed_user_id=ME)
+        do_confirm.assert_called_once()
+        do_phase_a.assert_not_called()
+
+    def test_run_go_still_refuses_a_stale_token(self):
+        with mock.patch("tgbot.bot._run_token", return_value="2"), \
+             mock.patch("tgbot.bot._job_has_local_tryon", return_value=True), \
+             mock.patch("tgbot.bot._do_phase_a") as do_phase_a, \
+             mock.patch("tgbot.bot._do_confirm") as do_confirm:
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_GO + "1"), allowed_user_id=ME)
+        do_phase_a.assert_not_called()
+        do_confirm.assert_not_called()
+
+    def test_manifest_write_ok_itself_is_busy_aware(self):
+        # Scope, stated because the old name for this test overclaimed it:
+        # this exercises the HELPER, not _render_and_validate's refusal path.
+        # The reason the helper has to answer busy() rather than
+        # drain_running() is that --phase-a-only is drain.py too, so a rewrite
+        # mid-Phase-A corrupts the input of a running child. Whether every
+        # caller then acts on that answer is a separate question:
+        # _render_and_validate only consults this helper for the
+        # mailbox-occupied case, and covers Phase A with a guard of its own —
+        # test_the_panel_refuses_to_rewrite_the_manifest_during_a_phase_a.
+        self._write(self.PLAIN)
+        with mock.patch("tgbot.bot.busy", return_value=True):
+            self.assertFalse(bot._manifest_write_ok(ME))
+        with mock.patch("tgbot.bot.busy", return_value=False):
+            self.assertTrue(bot._manifest_write_ok(ME))
+
+    def test_the_fail_open_body_does_not_promise_a_rental_for_phase_a(self):
+        # The stock check failed, so there is no picker to read — this one
+        # sentence IS the screen. Leaving it at "This rents a GPU pod at
+        # $0.99/hour" under a button that says "run try-on first" is the same
+        # bug the button relabel fixed, one line higher up.
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value={}), \
+             mock.patch("tgbot.bot._run_token", return_value="1"):
+            bot._offer_run_confirm(self.tg, ME, phase_a=True)
+        body = self.tg.screen[-1]
+        self.assertNotIn("rents a GPU pod", body)
+        self.assertIn("try-on", body)
+
+    def test_the_fail_open_body_still_names_the_rental_without_phase_a(self):
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value={}), \
+             mock.patch("tgbot.bot._run_token", return_value="1"):
+            bot._offer_run_confirm(self.tg, ME)
+        self.assertIn("rents a GPU pod at $0.99/hour", self.tg.screen[-1])
+
+    def _refuse_busy_phase_a(self, *, drain: bool):
+        """Drive _do_phase_a into its _manifest_write_ok refusal.
+
+        `drain` picks which half of busy()'s `or` is true, and it is patched
+        in tgbot.run rather than tgbot.bot because that is where _busy_reason
+        resolves drain_running — through the same module globals busy() uses.
+        A patch on tgbot.bot.drain_running would not reach it, and the test
+        would silently describe the other case.
+        """
+        with mock.patch("tgbot.bot.migration_running", return_value=False), \
+             mock.patch("tgbot.bot._jobs_for", return_value=[mock.Mock()]), \
+             mock.patch("tgbot.bot.busy", return_value=True), \
+             mock.patch("tgbot.run.drain_running", return_value=drain), \
+             mock.patch("tgbot.bot.start_phase_a") as start_phase_a:
+            bot._do_phase_a(self.tg, ME, dry_run=False)
+        start_phase_a.assert_not_called()
+        return self.tg.messages[-1]
+
+    def test_a_busy_manifest_refusal_names_confirm_when_a_drain_can_queue(self):
+        # Before [Run] routed try-on jobs here, this tap reached _do_confirm,
+        # which queues into the mailbox behind a running drain and replies
+        # "Queued". _do_phase_a cannot queue (that is out of its scope, by the
+        # plan), so the least it can do is name the command that still can —
+        # otherwise the feature looks removed rather than moved.
+        text = self._refuse_busy_phase_a(drain=True)
+        self.assertIn("a drain is running", text)
+        self.assertIn("/confirm still can", text)
+
+    def test_a_dry_run_launches_no_phase_a_at_all(self):
+        # `make bot-dry` documents itself as "invoking no jobs", and Phase A is
+        # a job: start_phase_a spawns `make drain … PHASE_A=1`, which calls
+        # Gemini for real. Before this guard, [Run] under --dry-run billed
+        # quota during what the Makefile promises is a no-op poll round — the
+        # only money a dry run could spend anywhere in this file.
+        with mock.patch("tgbot.bot.migration_running", return_value=False), \
+             mock.patch("tgbot.bot._jobs_for", return_value=[mock.Mock()]), \
+             mock.patch("tgbot.bot.busy", return_value=False), \
+             mock.patch("tgbot.bot.write_manifest") as write_manifest, \
+             mock.patch("tgbot.bot.start_phase_a") as start_phase_a:
+            bot._do_phase_a(self.tg, ME, dry_run=True)
+        start_phase_a.assert_not_called()
+        # The manifest write is part of the same no-op: it is what start_phase_a
+        # would have read, and rewriting it is a side effect a dry run has no
+        # business having either.
+        write_manifest.assert_not_called()
+        self.assertIn("dry run", self.tg.messages[-1])
+
+    def test_a_busy_manifest_refusal_does_not_send_a_phase_a_to_confirm(self):
+        # The contradiction, asserted as an absence. /confirm CANNOT queue
+        # behind a Phase A — _do_confirm's own guard refuses that exact state
+        # ("the try-on phase is still running … or /kill to stop it") — so
+        # naming it here would be one message in this file sending the user
+        # to another message in this file that turns them away. That is the
+        # `Đợi`-button-advising-/confirm-again bug the plan names, not a money
+        # bug: both refusals are individually right, together they dead-end.
+        text = self._refuse_busy_phase_a(drain=False)
+        self.assertIn("the try-on phase is running", text)
+        self.assertNotIn("/confirm still can", text)
+        # And it has to name a way OUT, not just refuse — the same two the
+        # other refusal for this state offers.
+        self.assertIn("/kill", text)
+
+
+class TestRunConfirmPanelIsParameterised(unittest.TestCase):
+    """Task 9 renders this same panel a second time, after Phase A, with a
+    different spend destination. Pinning the parameterisation here keeps the
+    refactor honest: the default must still be _CB_RUN_GO, or every existing
+    Run button in the chat changes meaning.
+    """
+
+    def setUp(self):
+        self._orig_root = bot.ROOT
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "batch").mkdir()
+        bot.ROOT = self.root
+        (self.root / ".env").write_text(
+            "GPU=NVIDIA GeForce RTX 5090\nPOD_VOLUME_ID=vol-1\n", encoding="utf-8")
+        reset_bot_state()
+        self.manifest = self.root / "batch" / "tg-1.yaml"
+        self.manifest.write_text("runs: []\n", encoding="utf-8")
+        self.tg = FakeTg()
+
+    def tearDown(self):
+        bot.ROOT = self._orig_root
+
+    def _stock(self):
+        return {"NVIDIA GeForce RTX 5090": [
+            Stock(gpu_id="NVIDIA GeForce RTX 5090", display_name="RTX 5090",
+                  datacenter_id="EU-RO-1", stock_status="available", price_per_hr=0.99)]}
+
+    def test_default_spend_callback_is_unchanged(self):
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
+            bot._offer_run_confirm(self.tg, ME)
+        flat = [data for row in self.tg.buttons[-1] for _, data, *_ in row]
+        self.assertTrue(any(d.startswith(bot._CB_RUN_GO) for d in flat))
+
+    def test_a_caller_supplied_spend_callback_replaces_it(self):
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
+            bot._offer_run_confirm(self.tg, ME, spend_cb="rec:retry:tg-1")
+        flat = [data for row in self.tg.buttons[-1] for _, data, *_ in row]
+        self.assertIn("rec:retry:tg-1", flat)
+        self.assertFalse(any(d.startswith(bot._CB_RUN_GO) for d in flat))
+
+    def test_the_no_stock_data_branch_honours_it_too(self):
+        # The fail-open branch mints its own spend button. Missing it would
+        # leave a panel that renders with one destination and spends with
+        # another, only when the stock check fails — i.e. only in production.
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", side_effect=RuntimeError("runpodctl down")):
+            bot._offer_run_confirm(self.tg, ME, spend_cb="rec:retry:tg-1")
+        flat = [data for row in self.tg.buttons[-1] for _, data, *_ in row]
+        self.assertIn("rec:retry:tg-1", flat)
+
+    def test_a_heading_replaces_the_choose_gpu_line(self):
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
+            bot._offer_run_confirm(self.tg, ME, heading="Try-on done — now rent?")
+        self.assertIn("Try-on done — now rent?", self.tg.screen[-1])
+        self.assertNotIn("Choose GPU", self.tg.screen[-1])
+
+
+class TestProgressMessageOwnership(unittest.TestCase):
+    """tick_progress and tick_phase_a read the SAME progress file, and
+    tick_progress runs first in the poll loop.
+
+    Without an explicit owner, the tick after Phase A exits goes: tick_progress
+    reads the file, finds drain_running() False (Phase A writes no lease and
+    registers no _RUNNING entry), takes its "Finished" branch, unlinks the file
+    and calls deliver_result. tick_phase_a then finds no file and returns. The
+    user gets a half-finished batch reported as done and never sees the rent
+    panel. This is the single easiest way to get commit B wrong and have every
+    unit test still pass, because nothing else in the suite runs both ticks.
+    """
+
+    def setUp(self):
+        self._orig_root = bot.ROOT
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "batch").mkdir()
+        (self.root / "out").mkdir()
+        bot.ROOT = self.root
+        reset_bot_state()
+        self.manifest = self.root / "batch" / "tg-1.yaml"
+        self.manifest.write_text("runs: []\n", encoding="utf-8")
+        state_path_for(self.manifest).write_text(json.dumps(
+            {"batch": "2026-09-16-0900", "runs": {}}), encoding="utf-8")
+        self.tg = FakeTg()
+        self._lease = mock.patch("tgbot.bot.lease_for", return_value=None)
+        self._lease.start()
+        self.addCleanup(self._lease.stop)
+
+    def tearDown(self):
+        bot.ROOT = self._orig_root
+
+    def _payload(self) -> dict:
+        return json.loads(bot._progress_path(ME).read_text(encoding="utf-8"))
+
+    def test_start_progress_records_the_phase(self):
+        with mock.patch("tgbot.bot._start_progress", wraps=bot._start_progress):
+            bot._start_progress(self.tg, ME, self.manifest, ["tryon"], phase="local")
+        self.assertEqual(self._payload()["phase"], "local")
+
+    def test_the_default_phase_is_absent_so_drains_keep_working(self):
+        bot._start_progress(self.tg, ME, self.manifest, ["tryon"])
+        self.assertIsNone(self._payload().get("phase"))
+
+    def test_tick_progress_ignores_a_phase_a_message(self):
+        bot._start_progress(self.tg, ME, self.manifest, ["tryon"], phase="local")
+        with mock.patch("tgbot.bot.deliver_result") as deliver, \
+             mock.patch("tgbot.bot.drain_running", return_value=False):
+            bot.tick_progress(self.tg, ME)
+        deliver.assert_not_called()
+        self.assertTrue(bot._progress_path(ME).exists())   # not unlinked
+
+    def test_tick_phase_a_ignores_a_drain_message(self):
+        bot._start_progress(self.tg, ME, self.manifest, ["tryon"])
+        with mock.patch("tgbot.bot.phase_a_exit", return_value=3), \
+             mock.patch("tgbot.bot._offer_run_confirm") as offer:
+            bot.tick_phase_a(self.tg, ME)
+        offer.assert_not_called()
+
+    def test_the_handoff_to_a_drain_gives_tick_progress_ownership_back(self):
+        # After the user taps spend, _do_resume calls _start_progress with no
+        # phase, rewriting the file. tick_phase_a must stop handling it even
+        # though _PHASE_A_RC still remembers exit 3 — a stale code plus a fresh
+        # file with no "offered" latch would re-send the rent panel over the
+        # top of a running drain.
+        bot._start_progress(self.tg, ME, self.manifest, ["tryon"], phase="local")
+        with mock.patch("tgbot.bot.phase_a_running", return_value=False), \
+             mock.patch("tgbot.bot.phase_a_exit", return_value=3), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value={}), \
+             mock.patch("tgbot.bot._offer_run_confirm") as offer:
+            bot.tick_phase_a(self.tg, ME)
+        offer.assert_called_once()
+        bot._start_progress(self.tg, ME, self.manifest, ["tryon", "motion"])
+        with mock.patch("tgbot.bot.phase_a_exit", return_value=3), \
+             mock.patch("tgbot.bot._offer_run_confirm") as offer2:
+            bot.tick_phase_a(self.tg, ME)
+        offer2.assert_not_called()
+
+
+class TestTickPhaseA(unittest.TestCase):
+    """Phase A finishes while nobody is watching; this tick is what turns its
+    exit code into the next thing the user sees.
+
+    Exit 3 is the interesting one: it means "local work done, a pod is still
+    wanted", and it is where the spend decision now lives.
+    """
+
+    def setUp(self):
+        self._orig_root = bot.ROOT
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "batch").mkdir()
+        (self.root / "out").mkdir()
+        bot.ROOT = self.root
+        reset_bot_state()
+        # _PHASE_A/_PHASE_A_RC live in tgbot.run, so reset_bot_state() — which
+        # clears bot's own per-chat dicts — does not reach them. A handle
+        # leaked by an earlier test would make busy() answer True here, and
+        # busy() is what _do_resume now gates on.
+        run_mod._PHASE_A.clear()
+        run_mod._PHASE_A_RC.clear()
+        # The per-chat path, not an arbitrary name: the spend button carries
+        # _run_token(ME), which IS this file's mtime_ns, and its handler
+        # resumes _job_manifest_path(ME). A manifest under any other name makes
+        # the token "0" (stat fails) and the resume path a file that does not
+        # exist, so the end-to-end test below would fail for a reason that has
+        # nothing to do with what it is testing.
+        self.manifest = bot._job_manifest_path(ME)
+        self.manifest.write_text(
+            "runs:\n  - id: runA\n    pipeline: tryon-motion-enhance\n"
+            "    inputs: {character: /tmp/c.png, outfit: /tmp/o.png, driver: /tmp/d.mp4}\n"
+            "    tryon: { provider: gemini }\n", encoding="utf-8")
+        state_path_for(self.manifest).write_text(json.dumps(
+            {"batch": "2026-09-16-0900", "runs": {}}), encoding="utf-8")
+        self.tg = FakeTg()
+        # lease_for reads run.LEASE_PATH, which points at the repo's real
+        # batch/pod-lease.json. _start_progress calls it, so without this patch
+        # the test reads whatever lease happens to be on the machine running
+        # the suite — and on a box mid-drain that is a real one naming a real
+        # manifest. Patched rather than redirected: Phase A has no lease by
+        # definition, so None is also the truthful value.
+        self._lease = mock.patch("tgbot.bot.lease_for", return_value=None)
+        self._lease.start()
+        self.addCleanup(self._lease.stop)
+        # phase="local" is what makes tick_phase_a own this message at all —
+        # without it the tick returns at its first guard and every test below
+        # passes while asserting nothing.
+        bot._start_progress(self.tg, ME, self.manifest, ["tryon", "motion", "enhance"],
+                            phase="local")
+
+    def tearDown(self):
+        bot.ROOT = self._orig_root
+
+    def _payload(self) -> dict:
+        return json.loads(bot._progress_path(ME).read_text(encoding="utf-8"))
+
+    def _mark_seen_running(self) -> None:
+        """Put the progress file in the state a bot restart orphans it in.
+
+        Rewrites the payload setUp already produced rather than building one by
+        hand: message_id, manifest and stages have to stay the ones the tick
+        reads, and the only difference from a live Phase A is that this
+        process's _PHASE_A is empty (setUp clears it).
+        """
+        payload = self._payload()
+        payload["seen_running"] = True
+        bot._progress_path(ME).write_text(json.dumps(payload, indent=2),
+                                          encoding="utf-8")
+
+    def test_still_running_only_redraws(self):
+        with mock.patch("tgbot.bot.phase_a_running", return_value=True), \
+             mock.patch("tgbot.bot.phase_a_exit", return_value=None):
+            bot.tick_phase_a(self.tg, ME)
+        # `edits`, not `buttons[-1]`: _start_progress sends with no keyboard,
+        # so tg.buttons[-1] is None and an assertion flattened from it is False
+        # whatever the tick did — this test could not fail while it read that.
+        # The redraw is the half its name claims, so assert it happened;
+        # callback_data() spans sends AND edits (see its docstring), which is
+        # what makes the "no spend button" half mean something.
+        self.assertEqual(len(self.tg.edits), 1)
+        self.assertIn("running the try-on over the API", self.tg.edits[-1][1])
+        self.assertFalse(any(d.startswith(bot._CB_PHASE_A_SPEND)
+                             for d in self.tg.callback_data()))
+
+    def test_the_first_tick_that_sees_the_child_alive_latches_it(self):
+        # `seen_running` is what separates a restart orphan from a Phase A that
+        # has not been started yet — both look identical to the tick. It has to
+        # be durable (the restart is the case) and set on the first tick that
+        # can prove the child existed.
+        with mock.patch("tgbot.bot.phase_a_running", return_value=True), \
+             mock.patch("tgbot.bot.phase_a_exit", return_value=None):
+            bot.tick_phase_a(self.tg, ME)
+        payload = self._payload()
+        self.assertIs(payload["seen_running"], True)
+        self.assertEqual(payload["phase"], "local")   # ownership untouched
+
+    def test_a_restart_orphan_is_cleared_and_reported_not_delivered(self):
+        # A restart empties _PHASE_A and _PHASE_A_RC, so phase_a_exit answers
+        # None forever: tick_phase_a returns at its rc-is-None guard,
+        # tick_progress returns at the ownership guard, and /kill cannot reach
+        # it either (_ask_kill gates on drain_running, which Phase A never
+        # sets). Nothing would ever clear the file — a message frozen at
+        # "running the try-on" and a poll loop stuck at its 2s cadence for the
+        # life of the chat.
+        self._mark_seen_running()
+        with mock.patch("tgbot.bot._preserved_tryon", return_value=(2, 3)), \
+             mock.patch("tgbot.bot.deliver_result") as deliver:
+            bot.tick_phase_a(self.tg, ME)
+        self.assertFalse(bot._progress_path(ME).exists())
+        # The whole reason recovery unlinks instead of dropping the `phase`
+        # key: handing the message back to tick_progress makes its next tick
+        # take the "Finished" branch and deliver a half-done batch.
+        deliver.assert_not_called()
+        text = self.tg.messages[-1].lower()
+        # Must not claim the child died — a hand-run bot's Phase A may still be
+        # alive; only systemd (Restart=always, KillMode=control-group) reliably
+        # takes it down with the process.
+        for claim in ("died", "crashed", "killed", "failed", "stopped",
+                      "timed out"):
+            self.assertNotIn(claim, text)
+        self.assertIn("restarted", text)
+        self.assertIn("nothing was rented", text)
+        # How many try-ons survived, and that Run will not pay for them twice.
+        self.assertIn("2/3", self.tg.messages[-1])
+        self.assertIn("skip", text)
+
+    def test_the_orphan_report_falls_back_when_the_count_is_unknown(self):
+        # _preserved_tryon returns (0, 0) for a manifest it cannot read — the
+        # card at _deliver_provision_failure falls back to generic wording for
+        # the same reason: a number it could not check is worse than none.
+        self._mark_seen_running()
+        with mock.patch("tgbot.bot._preserved_tryon", return_value=(0, 0)):
+            bot.tick_phase_a(self.tg, ME)
+        self.assertFalse(bot._progress_path(ME).exists())
+        text = self.tg.messages[-1].lower()
+        self.assertNotIn("0/0", text)
+        self.assertIn("nothing already finished was lost", text)
+
+    def test_a_phase_a_that_has_not_started_yet_is_not_an_orphan(self):
+        # The detection race, and the reason `seen_running` exists: "phase ==
+        # local, not running, exit is None" is ALSO true in the window between
+        # Task 10's _start_progress(..., phase="local") and its
+        # start_phase_a(...). Recovering on that bare triple would unlink the
+        # progress file of a Phase A that is about to start. setUp leaves the
+        # file in exactly that window — this must pass before AND after the
+        # recovery lands, which is what proves the flag is doing the work.
+        before = list(self.tg.messages)
+        with mock.patch("tgbot.bot.deliver_result") as deliver:
+            bot.tick_phase_a(self.tg, ME)
+        self.assertTrue(bot._progress_path(ME).exists())
+        self.assertEqual(self.tg.messages, before)   # and said nothing
+        deliver.assert_not_called()
+
+    def test_a_resume_is_refused_while_a_phase_a_child_is_still_alive(self):
+        # busy(), not drain_running(): a live Phase A writes no lease and
+        # registers no _RUNNING entry, so drain_running answers False for it —
+        # and _do_resume is about to hand the same manifest to drain.py, which
+        # reads it while the child is still writing the journal. Two writers on
+        # batch/<name>.state.json is the corruption run.busy's own docstring
+        # names it as the predicate for. Asserted through the REAL busy (only
+        # the handle is faked), not by patching it.
+        run_mod._PHASE_A[self.manifest.resolve()] = _AliveProc()
+        self.addCleanup(run_mod._PHASE_A.pop, self.manifest.resolve(), None)
+        with mock.patch("tgbot.bot.migration_running", return_value=False), \
+             mock.patch("tgbot.bot.start_drain") as start_drain:
+            bot._do_resume(self.tg, ME, self.manifest, dry_run=False)
+        start_drain.assert_not_called()
+        self.assertIn("already running", self.tg.messages[-1])
+
+    def test_exit_three_offers_the_rent_decision_with_fresh_stock(self):
+        with mock.patch("tgbot.bot.phase_a_running", return_value=False), \
+             mock.patch("tgbot.bot.phase_a_exit", return_value=3), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value={}), \
+             mock.patch("tgbot.bot._offer_run_confirm") as offer:
+            bot.tick_phase_a(self.tg, ME)
+        offer.assert_called_once()
+        # The whole point: the panel is rendered AFTER Phase A, so the stock it
+        # shows was measured now, and its spend button must not route back
+        # through _do_confirm (whose _STATE this chat no longer has).
+        # The token, not the stem: _job_manifest_path(ME) IS the file the stem
+        # names, and once Phase A has exited busy() is False, so nothing stops
+        # _maybe_show_manifest rewriting it while the panel sits unanswered.
+        self.assertEqual(offer.call_args.kwargs["spend_cb"],
+                         bot._CB_PHASE_A_SPEND + bot._run_token(ME))
+
+    def test_exit_three_clears_the_progress_file_so_the_poll_can_idle(self):
+        # The plan's headline path, and the one branch that used not to unlink.
+        # Left behind, the file keeps `animating = _progress_path(...).exists()`
+        # True forever, so the poll loop never returns to its 50s idle cadence
+        # and spins at 2s — roughly 30 Telegram calls a minute instead of ~1.2 —
+        # under a progress message frozen at "running the try-on" with nothing
+        # running. No other path clears it: _CB_RUN_NO only replies, _do_kill's
+        # unlink is unreachable because _ask_kill gates on drain_running, and
+        # _clear_job never touches _progress_path.
+        with mock.patch("tgbot.bot.phase_a_running", return_value=False), \
+             mock.patch("tgbot.bot.phase_a_exit", return_value=3), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value={}), \
+             mock.patch("tgbot.bot._offer_run_confirm") as offer:
+            bot.tick_phase_a(self.tg, ME)
+        offer.assert_called_once()
+        self.assertFalse(bot._progress_path(ME).exists())
+
+    def test_the_file_is_cleared_even_when_rendering_the_panel_raises(self):
+        # The unlink has to precede the render, not follow it. _offer_run_confirm
+        # sends a Telegram message and so can raise TgError — flood limits and
+        # network failures are routine, which is why tick_progress wraps its own
+        # edit in try/except TgError. An unlink written behind a raise never
+        # runs, and the state that leaves behind is the one the test above
+        # exists to prevent: the file survives, `animating =
+        # _progress_path(...).exists()` pins the poll loop at 2s forever, and
+        # the message stays frozen on "running the try-on" with nothing running
+        # and no path left to clear it. Losing the panel is the cheaper failure
+        # — /status still reports the batch and /again still reloads it.
+        # assertRaises rather than a tolerant catch: it is what proves the mock
+        # really fired, so this test cannot pass vacuously once the unlink moves.
+        from tgbot.tgclient import TgError
+        with mock.patch("tgbot.bot.phase_a_running", return_value=False), \
+             mock.patch("tgbot.bot.phase_a_exit", return_value=3), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value={}), \
+             mock.patch("tgbot.bot._offer_run_confirm",
+                        side_effect=TgError("Too Many Requests",
+                                            retry_after=42.0)):
+            with self.assertRaises(TgError):
+                bot.tick_phase_a(self.tg, ME)
+        self.assertFalse(bot._progress_path(ME).exists())
+
+    def test_the_terminal_edit_raising_still_runs_the_exit_zero_dispatch(self):
+        # Same class of bug as the panel above, one step earlier and shared by
+        # ALL THREE terminal branches: the edit_message call that renders the
+        # "offered" progress text runs before the rc dispatch, for every rc.
+        # `offered: True` is already on disk by this point (written just above
+        # in tick_phase_a), so a TgError here that is left to propagate skips
+        # the dispatch entirely — for rc == 0 that means deliver_result is
+        # never called (the user's finished videos never arrive) and the
+        # progress file is stranded, pinning the poll loop's 2s cadence
+        # forever. Unlike the two return-based TgError handlers elsewhere in
+        # this file, this one must NOT return: this is the terminal tick, rc
+        # will not change on a later poll, and the branch below already does
+        # its own unlink — swallowing and falling through is what actually
+        # closes the failure mode. assertRaises rather than a tolerant catch
+        # is what proves the mock really fired.
+        from tgbot.tgclient import TgError
+        with mock.patch("tgbot.bot.phase_a_running", return_value=False), \
+             mock.patch("tgbot.bot.phase_a_exit", return_value=0), \
+             mock.patch.object(self.tg, "edit_message",
+                               side_effect=TgError("Too Many Requests",
+                                                    retry_after=42.0)), \
+             mock.patch("tgbot.bot.deliver_result") as deliver:
+            bot.tick_phase_a(self.tg, ME)
+        deliver.assert_called_once()
+        self.assertFalse(bot._progress_path(ME).exists())
+
+    def test_the_exit_three_path_previews_a_tryon_that_finished_in_its_last_tick(self):
+        # deliver_result sends _final/*.mp4 only, so a try-on image recorded
+        # done inside the final tick is never shown unless this branch previews
+        # it — and it is never shown later either, because the exit-3 path
+        # unlinks the progress file that _deliver_tryon_previews dedupes with.
+        with mock.patch("tgbot.bot.phase_a_running", return_value=False), \
+             mock.patch("tgbot.bot.phase_a_exit", return_value=3), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value={}), \
+             mock.patch("tgbot.bot._offer_run_confirm"), \
+             mock.patch("tgbot.bot._deliver_tryon_previews") as previews:
+            bot.tick_phase_a(self.tg, ME)
+        previews.assert_called_once()
+
+    def test_the_panel_it_offers_reaches_start_drain_with_state_cleared(self):
+        # The §6.3 condition that rules _do_confirm out, end to end: by the
+        # time Phase A finishes, _do_confirm has already cleared _STATE, so a
+        # panel wired to _CB_RUN_GO would answer "no complete job yet" for a
+        # batch whose try-on images are on disk. _do_resume needs no _STATE.
+        bot._STATE.clear()
+        bot._BASKET.clear()
+        with mock.patch("tgbot.bot.phase_a_running", return_value=False), \
+             mock.patch("tgbot.bot.phase_a_exit", return_value=3), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value={}), \
+             mock.patch("tgbot.bot.busy", return_value=False), \
+             mock.patch("tgbot.bot.migration_running", return_value=False), \
+             mock.patch("tgbot.bot._start_progress"), \
+             mock.patch("tgbot.bot.start_drain") as start_drain:
+            bot.tick_phase_a(self.tg, ME)
+            spend = next(d for d in self.tg.callback_data()
+                         if d.startswith(bot._CB_PHASE_A_SPEND))
+            bot.handle(self.tg, cb_from(ME, spend), allowed_user_id=ME)
+        start_drain.assert_called_once()
+        self.assertIs(start_drain.call_args.kwargs["resume"], True)
+        # The path comes from chat_id, the way _CB_RUN_GO reaches _do_confirm:
+        # the token proves WHICH manifest was reviewed, it is not itself a path.
+        self.assertEqual(start_drain.call_args.args[0], self.manifest)
+
+    def test_a_spend_button_whose_manifest_was_rewritten_is_refused(self):
+        # The harm _run_token exists to prevent, on the button that spends the
+        # money: rent $0.99/hour against inputs the user never reviewed. The
+        # panel sits unanswered while nothing holds the manifest — Phase A has
+        # exited, so busy() is False and _maybe_show_manifest is free to write.
+        with mock.patch("tgbot.bot.phase_a_running", return_value=False), \
+             mock.patch("tgbot.bot.phase_a_exit", return_value=3), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value={}), \
+             mock.patch("tgbot.bot.start_drain") as start_drain:
+            bot.tick_phase_a(self.tg, ME)
+            spend = next(d for d in self.tg.callback_data()
+                         if d.startswith(bot._CB_PHASE_A_SPEND))
+            import os
+            # utime, not a rewrite: the same effect on mtime_ns without
+            # depending on the filesystem giving two writes inside one test
+            # distinguishable timestamps.
+            os.utime(self.manifest, ns=(1_000_000_000, 1_000_000_000))
+            self.assertNotEqual(spend[len(bot._CB_PHASE_A_SPEND):],
+                                bot._run_token(ME))   # stale, as intended
+            bot.handle(self.tg, cb_from(ME, spend), allowed_user_id=ME)
+        start_drain.assert_not_called()
+        self.assertIn("the job changed", self.tg.messages[-1])
+
+    def test_exit_zero_delivers_results_and_offers_nothing_to_rent(self):
+        with mock.patch("tgbot.bot.phase_a_running", return_value=False), \
+             mock.patch("tgbot.bot.phase_a_exit", return_value=0), \
+             mock.patch("tgbot.bot.deliver_result") as deliver, \
+             mock.patch("tgbot.bot._offer_run_confirm") as offer:
+            bot.tick_phase_a(self.tg, ME)
+        deliver.assert_called_once()
+        offer.assert_not_called()
+
+    def test_a_failed_phase_a_neither_rents_nor_delivers(self):
+        # drain.py:331 already refuses to rent after a failed local phase. The
+        # bot must not become a second, laxer copy of that rule.
+        with mock.patch("tgbot.bot.phase_a_running", return_value=False), \
+             mock.patch("tgbot.bot.phase_a_exit", return_value=1), \
+             mock.patch("tgbot.bot.deliver_result") as deliver, \
+             mock.patch("tgbot.bot._offer_run_confirm") as offer:
+            bot.tick_phase_a(self.tg, ME)
+        deliver.assert_not_called()
+        offer.assert_not_called()
+        self.assertIn("try-on", self.tg.messages[-1].lower())
+
+    def test_no_progress_file_is_a_silent_no_op(self):
+        bot._progress_path(ME).unlink()
+        with mock.patch("tgbot.bot.phase_a_exit", return_value=3), \
+             mock.patch("tgbot.bot._offer_run_confirm") as offer:
+            bot.tick_phase_a(self.tg, ME)
+        offer.assert_not_called()
+
+    def test_the_panel_is_offered_once_not_every_tick(self):
+        # phase_a_exit keeps answering 3 after the process is reaped, by design.
+        # Two things stop the 2s poll re-sending the panel: every terminal
+        # branch unlinks the progress file, and the durable `offered` latch
+        # covers the window between writing it and rendering — a crash there
+        # leaves the file on disk with the latch set, and a restart cannot
+        # re-send either.
+        with mock.patch("tgbot.bot.phase_a_running", return_value=False), \
+             mock.patch("tgbot.bot.phase_a_exit", return_value=3), \
+             mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value={}), \
+             mock.patch("tgbot.bot._offer_run_confirm") as offer:
+            bot.tick_phase_a(self.tg, ME)
+            bot.tick_phase_a(self.tg, ME)
+        offer.assert_called_once()
+
+    def test_status_during_phase_a_does_not_say_it_is_waiting_for_a_pod(self):
+        # /status renders through the same progress_text the on-screen message
+        # uses, and its own comment promises the two "can never disagree with
+        # what is already on screen". Without the phase they did: no lease plus
+        # an empty journal is exactly the combination that renders "waiting for
+        # the pod — nothing recorded yet", the inference spec §6.5 exists to
+        # remove, about a phase that deliberately runs before any pod exists.
+        bot.handle(self.tg, cmd_from(ME, "/status"), allowed_user_id=ME)
+        self.assertNotIn("waiting for the pod", self.tg.messages[-1])
+        self.assertIn("running the try-on over the API", self.tg.messages[-1])
 
 
 if __name__ == "__main__":

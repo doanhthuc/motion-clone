@@ -1,4 +1,5 @@
 # scripts/tests/test_batch_tgrun.py
+import ast
 import json
 import subprocess
 import sys
@@ -27,6 +28,14 @@ class TestProgressText(unittest.TestCase):
         self.manifest.write_text("runs: []", encoding="utf-8")
         import json
         state_path_for(self.manifest).write_text(json.dumps(STATE), encoding="utf-8")
+        # The journal shape Phase A actually produces: a batch id but no run
+        # recorded yet. STATE above has runs recorded, so the "nothing recorded
+        # yet" line never fires for it — asserting on self.manifest would test
+        # a branch that cannot run.
+        self.empty = Path(tempfile.mkdtemp()) / "none.yaml"
+        self.empty.write_text("runs: []", encoding="utf-8")
+        state_path_for(self.empty).write_text(
+            json.dumps({"batch": "2026-09-16-0900", "runs": {}}), encoding="utf-8")
 
     def test_names_every_stage_and_its_status(self):
         text = progress_text(self.manifest, lease=None)
@@ -43,6 +52,27 @@ class TestProgressText(unittest.TestCase):
         empty = Path(tempfile.mkdtemp()) / "none.yaml"
         empty.write_text("runs: []", encoding="utf-8")
         self.assertIsInstance(progress_text(empty, lease=None), str)
+
+    def test_phase_a_does_not_claim_to_be_waiting_for_a_pod(self):
+        # There is no pod to wait for during Phase A — that is the entire
+        # point of running it first. Inferring the phase from the absence of
+        # a lease is what made this line a lie.
+        text = progress_text(self.empty, lease=None, phase="local")
+        self.assertNotIn("waiting for the pod", text)
+        self.assertIn("try-on", text.lower())
+
+    def test_no_phase_keeps_the_pod_wording(self):
+        self.assertIn("waiting for the pod",
+                      progress_text(self.empty, lease=None))
+
+    def test_phase_a_replaces_the_nothing_recorded_line(self):
+        empty = Path(tempfile.mkdtemp()) / "none.yaml"
+        empty.write_text("runs: []", encoding="utf-8")
+        state_path_for(empty).write_text(
+            json.dumps({"batch": "2026-09-16-0900", "runs": {}}), encoding="utf-8")
+        text = progress_text(empty, lease=None, phase="local")
+        self.assertNotIn("waiting for the pod", text)
+        self.assertIn("running the try-on", text.lower())
 
 
 class _FakeProc:
@@ -168,6 +198,328 @@ class TestStartDrain(unittest.TestCase):
             start_drain(self.manifest, dry_run=True)
         self.assertTrue(self.manifest.with_suffix(".drain.log").exists())
         self.assertIsNot(popen.call_args.kwargs["stdout"], subprocess.PIPE)
+
+
+class TestStartDrainArgv(unittest.TestCase):
+    """start_drain's argv is the money gate's only output. These assert on the
+    list it would run, never on a real `make`."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.manifest = self.tmp / "tg-1.yaml"
+        self.manifest.write_text("runs: []\n", encoding="utf-8")
+        self._orig_running = dict(run_mod._RUNNING)
+
+    def tearDown(self):
+        run_mod._RUNNING.clear()
+        run_mod._RUNNING.update(self._orig_running)
+
+    def _argv(self, **kwargs) -> list[str]:
+        with mock.patch.object(run_mod.subprocess, "Popen") as popen:
+            popen.return_value = _FakeProc(poll_return=None)
+            run_mod.start_drain(self.manifest, **kwargs)
+        return popen.call_args.args[0]
+
+    def test_force_local_becomes_the_make_variable(self):
+        self.assertIn("FORCE_LOCAL=1",
+                      self._argv(dry_run=False, resume=True, force_local=True))
+
+    def test_omitted_force_local_adds_nothing(self):
+        self.assertNotIn("FORCE_LOCAL=1", self._argv(dry_run=False))
+
+    def test_force_local_does_not_imply_confirm(self):
+        # A dry run stays a dry run no matter what else is set: CONFIRM=yes is
+        # gated on dry_run alone, and that gate is the whole money invariant.
+        argv = self._argv(dry_run=True, force_local=True)
+        self.assertIn("FORCE_LOCAL=1", argv)
+        self.assertNotIn("CONFIRM=yes", argv)
+
+
+class TestStartPhaseA(unittest.TestCase):
+    """Phase A is a second subprocess launcher sitting next to the one that
+    holds the money gate, so its argv is asserted with the same care.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.manifest = self.tmp / "tg-1.yaml"
+        self.manifest.write_text("runs: []\n", encoding="utf-8")
+        self._orig_running = dict(run_mod._RUNNING)
+        self._orig_phase_a = dict(run_mod._PHASE_A)
+        self._orig_phase_a_rc = dict(run_mod._PHASE_A_RC)
+        self._orig_lease_path = run_mod.LEASE_PATH
+        run_mod._RUNNING.clear()
+        run_mod._PHASE_A.clear()
+        # Cleared as well as saved, matching _RUNNING and _PHASE_A above:
+        # start_phase_a pops from this dict and phase_a_exit writes into it,
+        # so an uncleared one carries a previous test's exit code forward.
+        # Keys are tempdir-unique today, which is exactly the sort of accident
+        # an isolation fixture is supposed to make impossible.
+        run_mod._PHASE_A_RC.clear()
+        run_mod.LEASE_PATH = Path(tempfile.mkdtemp()) / "no-lease.json"
+
+    def tearDown(self):
+        run_mod._RUNNING.clear()
+        run_mod._RUNNING.update(self._orig_running)
+        run_mod._PHASE_A.clear()
+        run_mod._PHASE_A.update(self._orig_phase_a)
+        # _PHASE_A_RC is cleared here as well as saved: phase_a_exit() writes
+        # into it by design (that is what makes the tick idempotent), so two of
+        # these tests mutate it and an unrestored dict would carry an exit code
+        # into whatever runs next.
+        run_mod._PHASE_A_RC.clear()
+        run_mod._PHASE_A_RC.update(self._orig_phase_a_rc)
+        run_mod.LEASE_PATH = self._orig_lease_path
+
+    def _argv(self, **kwargs) -> list[str]:
+        with mock.patch.object(run_mod.subprocess, "Popen") as popen:
+            popen.return_value = _FakeProc(poll_return=None)
+            run_mod.start_phase_a(self.manifest, **kwargs)
+        return popen.call_args.args[0]
+
+    def test_never_appends_confirm_yes(self):
+        # THE invariant. grep -rn CONFIRM scripts/tgbot/ must still show one
+        # executable hit, inside start_drain's dry_run gate, and this function
+        # must not be a second one.
+        for kwargs in ({}, {"resume": True}, {"force_local": True},
+                       {"resume": True, "force_local": True}):
+            self.assertNotIn("CONFIRM=yes", self._argv(**kwargs))
+
+    def test_confirm_yes_still_appears_in_exactly_one_executable_line(self):
+        # The argv assertion above only covers start_phase_a's own call. This
+        # is the repo-wide grep run.py:259 has always asked a human to do, made
+        # a test: a third launcher added later that appends CONFIRM=yes
+        # somewhere else fails here instead of silently becoming a second way
+        # to rent a pod.
+        #
+        # AST, not text search. Measured 2026-09-17, re-measured after
+        # stop_phase_a landed (it sits above drain_running, so every line
+        # number below it moved): `grep -n CONFIRM=yes run.py` returns NINE
+        # lines, of which exactly one (run.py:283) is executable. The other
+        # eight sit in FOUR docstring bodies — the AST nodes at lines 1
+        # (module), 256 (start_drain), 298 (start_phase_a) and 386
+        # (drain_running) — and two of them defeat the obvious shortcuts
+        # directly: line 274 wraps the string in literal double quotes, so
+        # searching for the quoted form finds prose, and line 402 wraps it in
+        # backticks, so it is not even greppable as `"CONFIRM=yes"`. Neither
+        # "skip lines starting with a comment or a triple quote" nor "search
+        # for the quoted form" gives one hit. Walking the tree and excluding
+        # docstring nodes does, and comments are not nodes at all.
+        root = Path(run_mod.__file__).resolve().parent
+        hits = []
+        for path in sorted(root.rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            docstrings = set()
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef,
+                                     ast.AsyncFunctionDef)) \
+                        and node.body and isinstance(node.body[0], ast.Expr) \
+                        and isinstance(node.body[0].value, ast.Constant) \
+                        and isinstance(node.body[0].value.value, str):
+                    docstrings.add(id(node.body[0].value))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Constant) and isinstance(node.value, str) \
+                        and "CONFIRM=yes" in node.value and id(node) not in docstrings:
+                    hits.append(f"{path.name}:{node.lineno}: {node.value!r}")
+        self.assertEqual(
+            len(hits), 1,
+            "CONFIRM=yes must appear in exactly one executable string literal "
+            f"in scripts/tgbot/ — start_drain's dry_run gate. Found: {hits}")
+        self.assertIn("run.py", hits[0])
+
+    def test_sets_the_phase_a_variable(self):
+        self.assertIn("PHASE_A=1", self._argv())
+
+    def test_forwards_resume_and_force_local(self):
+        argv = self._argv(resume=True, force_local=True)
+        self.assertIn("RESUME=1", argv)
+        self.assertIn("FORCE_LOCAL=1", argv)
+
+    def test_a_live_phase_a_does_not_make_drain_running_true(self):
+        # drain_running True routes a job into the mailbox so chain_or_teardown
+        # picks it up on a pod already paid for. Phase A has no pod, so
+        # reusing _RUNNING would queue a job into its own mailbox.
+        run_mod._PHASE_A[self.manifest.resolve()] = _FakeProc(poll_return=None)
+        self.assertFalse(run_mod.drain_running(self.manifest))
+        self.assertTrue(run_mod.phase_a_running(self.manifest))
+        self.assertTrue(run_mod.busy(self.manifest))
+
+    def test_busy_is_true_for_a_drain_too(self):
+        run_mod._RUNNING[self.manifest.resolve()] = _FakeProc(poll_return=None)
+        self.assertTrue(run_mod.busy(self.manifest))
+        self.assertFalse(run_mod.phase_a_running(self.manifest))
+
+    def test_exit_code_is_none_while_running_and_read_once_finished(self):
+        # A live handle first, not an empty dict: without it this assertion
+        # passes through phase_a_exit's no-handle branch (_PHASE_A.get() is
+        # None -> _PHASE_A_RC.get() is None) and never reaches the "still
+        # running" branch its name claims to cover.
+        run_mod._PHASE_A[self.manifest.resolve()] = _FakeProc(poll_return=None)
+        self.assertIsNone(run_mod.phase_a_exit(self.manifest))
+        run_mod._PHASE_A[self.manifest.resolve()] = _FakeProc(poll_return=3)
+        self.assertEqual(run_mod.phase_a_exit(self.manifest), 3)
+
+    def test_the_recorded_code_survives_the_handle_being_reaped(self):
+        # The record-once half, exercised by actually removing the handle
+        # rather than by polling one fake twice. Task 9's tick reads the code
+        # after the child is gone; if phase_a_exit only ever answered from a
+        # live poll, that tick would get None and leave the chat holding a
+        # progress message and no panel.
+        key = self.manifest.resolve()
+        run_mod._PHASE_A[key] = _FakeProc(poll_return=3)
+        self.assertEqual(run_mod.phase_a_exit(self.manifest), 3)
+        run_mod._PHASE_A.pop(key)
+        self.assertEqual(run_mod.phase_a_exit(self.manifest), 3)
+
+    def test_a_fresh_start_discards_the_previous_runs_exit_code(self):
+        # start_phase_a's _PHASE_A_RC.pop keeps that dict from ever holding a
+        # code that predates the current live handle. No tick can observe the
+        # stale code today — after a re-run the live handle is back in
+        # _PHASE_A, so phase_a_exit returns at its "still running" branch
+        # (rc is None) and never consults _PHASE_A_RC at all. The invariant is
+        # for any future DIRECT reader of the dict, which would have no such
+        # protection.
+        key = self.manifest.resolve()
+        run_mod._PHASE_A_RC[key] = 7
+        with mock.patch.object(run_mod.subprocess, "Popen") as popen:
+            popen.return_value = _FakeProc(poll_return=None)
+            run_mod.start_phase_a(self.manifest)
+        self.assertNotIn(key, run_mod._PHASE_A_RC)
+
+    def test_start_registers_the_handle_phase_a_running_reads(self):
+        # The whole chain, with nothing installed by hand. _argv() mocks Popen
+        # and throws the registration away, and every phase_a_running test
+        # above puts the handle into _PHASE_A itself — so a typo in
+        # start_phase_a's `key = manifest_path.resolve()` (run.py:323) would
+        # otherwise pass this entire suite while every real Phase A ran
+        # invisible to busy() and to the tick.
+        with mock.patch.object(run_mod.subprocess, "Popen") as popen:
+            popen.return_value = _FakeProc(poll_return=None)
+            run_mod.start_phase_a(self.manifest)
+        self.assertTrue(run_mod.phase_a_running(self.manifest))
+        self.assertTrue(run_mod.busy(self.manifest))
+        self.assertFalse(run_mod.drain_running(self.manifest))
+
+    def test_a_finished_phase_a_is_no_longer_busy(self):
+        run_mod._PHASE_A[self.manifest.resolve()] = _FakeProc(poll_return=0)
+        self.assertFalse(run_mod.phase_a_running(self.manifest))
+        self.assertFalse(run_mod.busy(self.manifest))
+        # This fake answers 0 on every poll and is never removed, so what this
+        # covers is a finished-but-still-registered child. The code surviving
+        # an actual reap is test_the_recorded_code_survives_the_handle_being_
+        # reaped above.
+        self.assertEqual(run_mod.phase_a_exit(self.manifest), 0)
+
+
+class _StopProc:
+    """A Phase A handle stop_phase_a can act on.
+
+    Not _FakeProc: that one only models .poll(), and stopping a child is
+    terminate() -> wait() -> kill(). A real Popen starts reporting the
+    negative signal number once the child is down, which is what lets
+    phase_a_exit answer after a stop, so this one models that too.
+    """
+
+    def __init__(self, *, poll_return=None, wait_raises=False):
+        self._poll_return = poll_return
+        self._wait_raises = wait_raises
+        self.terminated = 0
+        self.killed = 0
+
+    def poll(self):
+        return self._poll_return
+
+    def terminate(self):
+        self.terminated += 1
+        self._poll_return = -15          # SIGTERM, as a real Popen reports it
+
+    def wait(self, timeout=None):
+        if self._wait_raises:
+            raise subprocess.TimeoutExpired(cmd="make drain", timeout=timeout)
+        return self._poll_return
+
+    def kill(self):
+        self.killed += 1
+        self._poll_return = -9           # SIGKILL
+
+
+class TestStopPhaseA(unittest.TestCase):
+    """stop_phase_a is the only brake on a Phase A that is already spending.
+
+    It exists because moving Phase A out of the drain's Popen took it out of
+    _RUNNING, which is the dict _do_kill terminates — after that move /kill
+    gates on drain_running (False during Phase A) and answers "there is no pod
+    to kill" while a 12-run batch of hosted try-on calls keeps going.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.manifest = self.tmp / "tg-1.yaml"
+        self.manifest.write_text("runs: []\n", encoding="utf-8")
+        self._orig_phase_a = dict(run_mod._PHASE_A)
+        self._orig_phase_a_rc = dict(run_mod._PHASE_A_RC)
+        self._orig_lease_path = run_mod.LEASE_PATH
+        run_mod._PHASE_A.clear()
+        run_mod._PHASE_A_RC.clear()
+        # Redirected even though stop_phase_a never reads it: the last test
+        # here calls busy(), which reaches drain_running() -> lease_for() ->
+        # read_lease(LEASE_PATH). That is the real batch/pod-lease.json on any
+        # machine that has run a drain, and TestDrainRunning.setUp above states
+        # the rule — a test must never touch it.
+        run_mod.LEASE_PATH = Path(tempfile.mkdtemp()) / "no-lease.json"
+
+    def tearDown(self):
+        run_mod._PHASE_A.clear()
+        run_mod._PHASE_A.update(self._orig_phase_a)
+        run_mod._PHASE_A_RC.clear()
+        run_mod._PHASE_A_RC.update(self._orig_phase_a_rc)
+        run_mod.LEASE_PATH = self._orig_lease_path
+
+    def test_false_when_no_phase_a_was_started(self):
+        # Nothing to stop is not an error: the caller has no way to know
+        # whether the child already finished and was reaped.
+        self.assertFalse(run_mod.stop_phase_a(self.manifest))
+
+    def test_false_when_the_child_already_exited(self):
+        proc = _StopProc(poll_return=0)
+        run_mod._PHASE_A[self.manifest.resolve()] = proc
+        self.assertFalse(run_mod.stop_phase_a(self.manifest))
+        self.assertEqual(proc.terminated, 0,
+                         "an already-exited child was signalled anyway")
+
+    def test_terminates_a_live_child_and_returns_true(self):
+        proc = _StopProc()
+        run_mod._PHASE_A[self.manifest.resolve()] = proc
+        self.assertTrue(run_mod.stop_phase_a(self.manifest))
+        self.assertEqual(proc.terminated, 1)
+        self.assertEqual(proc.killed, 0, "SIGKILL without waiting for SIGTERM")
+
+    def test_escalates_to_kill_when_sigterm_is_ignored(self):
+        # Same three-step shape _do_kill uses (bot.py:4169-4176): a child that
+        # ignores SIGTERM must not be allowed to outlive the stop and keep
+        # billing Gemini quota.
+        proc = _StopProc(wait_raises=True)
+        run_mod._PHASE_A[self.manifest.resolve()] = proc
+        self.assertTrue(run_mod.stop_phase_a(self.manifest))
+        self.assertEqual(proc.terminated, 1)
+        self.assertEqual(proc.killed, 1)
+
+    def test_leaves_the_handle_so_the_exit_code_is_still_reportable(self):
+        # Deliberately NOT popped, and NOT written into _PHASE_A_RC either:
+        # phase_a_exit is the single writer of that dict, and it records the
+        # negative signal code on its next poll. That code is what Task 9's
+        # failure branch shows the user, so popping here would strand the chat.
+        key = self.manifest.resolve()
+        proc = _StopProc()
+        run_mod._PHASE_A[key] = proc
+        self.assertTrue(run_mod.stop_phase_a(self.manifest))
+        self.assertIn(key, run_mod._PHASE_A)
+        self.assertNotIn(key, run_mod._PHASE_A_RC)
+        self.assertEqual(run_mod.phase_a_exit(self.manifest), -15)
+        # And the stopped child no longer holds the manifest, so the
+        # file-safety guards release and the user can /clear straight away.
+        self.assertFalse(run_mod.phase_a_running(self.manifest))
+        self.assertFalse(run_mod.busy(self.manifest))
 
 
 class TestEstimateMinutes(unittest.TestCase):
