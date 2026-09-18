@@ -753,6 +753,17 @@ def deliver_result(tg: Tg, chat_id: int, manifest_path: Path) -> None:
     batch_dir = ROOT / "out" / batch_id
     failures = failed_job_ids(state)
     outputs = final_files(batch_dir)
+    # Only this manifest's runs, for the reason _journal_is_resumable gives: a
+    # batch that inherited an older job's journal also shares its out/ dir,
+    # and would otherwise resend that job's videos as if they were new.
+    try:
+        current = {run.id for run in load_manifest(manifest_path).runs}
+    except (ManifestError, OSError, UnicodeDecodeError):
+        current = None
+    if current:
+        outputs = [p for p in outputs if p.stem in current]
+        failures = [(run_id, job_id) for run_id, job_id in failures
+                    if run_id in current]
 
     if outputs:
         tg.send_message(chat_id, f"{ICON_ANNOUNCE_CE} <b>Done</b> · {_esc(batch_id)} · "
@@ -1734,6 +1745,7 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
                 # comment for why _STATE cannot be relied on here. The path
                 # comes from chat_id, the way _CB_RUN_GO's branch reaches
                 # _do_confirm; the token proved which manifest was reviewed.
+                _PHASE_A_OFFERED.pop(chat_id, None)
                 _do_resume(tg, chat_id, _job_manifest_path(chat_id),
                            dry_run=dry_run)
 
@@ -2877,6 +2889,10 @@ def _migrate_progress_message_path(chat_id: int) -> Path:
 
 
 _ANIM_PAUSE: dict[int, float] = {}      # chat_id -> time.time() to resume at
+# chat_id -> the _run_token tick_phase_a rendered the rent panel for. In memory
+# on purpose: after a restart the fallback is the "run try-on first" screen,
+# and a resumed Phase A skips every try-on already on disk.
+_PHASE_A_OFFERED: dict[int, str] = {}
 
 # While a drain runs the poll drops from a 50s long-poll to 2s, and each spin
 # redraws one frame. Measured against the real API on 2026-09-01: 0.48 edits/s
@@ -3615,10 +3631,8 @@ def tick_phase_a(tg: Tg, chat_id: int, *, dry_run: bool = False) -> None:
         # whenever it sends a preview, so an earlier unlink would be undone and
         # leave the file stranded with `offered` already set.
         path.unlink(missing_ok=True)
-        _offer_run_confirm(
-            tg, chat_id,
-            spend_cb=f"{_CB_PHASE_A_SPEND}{_run_token(chat_id)}",
-            heading=f"{ICON_NVIDIA_CE} <b>Try-on finished</b> — now rent a GPU?")
+        _PHASE_A_OFFERED[chat_id] = _run_token(chat_id)
+        _offer_rent_after_phase_a(tg, chat_id)
     elif rc == 0:
         path.unlink(missing_ok=True)
         deliver_result(tg, chat_id, manifest_path)
@@ -4702,11 +4716,15 @@ def _offer_run_confirm(tg: Tg, chat_id: int, *, message_id: int | None = None,
     than duplicate — and the second one is the whole point of the change, since
     it measures stock at the moment of the decision instead of minutes before.
 
-    `phase_a` relabels the spend button, because with the try-on moved ahead
-    of the rental the first tap no longer rents anything: it spends Gemini
-    quota. Leaving the label at "Yes, spend $0.99/h" would make the button
-    promise a pod it does not start, and the GPU decision now happens on a
-    second panel rendered after the try-on results exist.
+    `phase_a` replaces the whole screen with a plain try-on confirm and returns
+    before any stock is read. With the try-on moved ahead of the rental the
+    first tap no longer rents anything: it spends Gemini quota. This used to
+    relabel only the spend button and still draw the full Choose GPU picker,
+    which the user reported live (2026-09-18) as the GPU panel showing up
+    before the try-on had run. It is the wrong question at that moment: the
+    stock it quoted would be minutes stale by the time a pod was rented, and
+    the real GPU decision happens on the second panel tick_phase_a renders
+    once the try-on results exist.
 
     `message_id` edits that message in place instead of sending a new one
     (see _edit_or_send) — set by every caller except the two that send a fresh
@@ -4723,6 +4741,17 @@ def _offer_run_confirm(tg: Tg, chat_id: int, *, message_id: int | None = None,
     # ends up rendering one destination and spending with another — only when
     # the stock check fails, i.e. only in production.
     spend_cb = spend_cb or (_CB_RUN_GO + _run_token(chat_id))
+    if phase_a:
+        # No Refresh button either: this screen shows no stock to refresh.
+        _edit_or_send(
+            tg, chat_id, message_id,
+            "This runs the try-on over the API first — Gemini quota, no GPU "
+            "rented yet. You choose the GPU after the try-on finishes, with "
+            "stock measured then.\nConfirm?",
+            [[("Yes — run try-on first (Gemini quota, no GPU yet)", spend_cb,
+               _ce_id(ICON_ROCKET_CE)),
+              ("Cancel", _CB_RUN_NO)]])
+        return
     wanted = [_PRIMARY_GPU_ID, *_FALLBACK_GPU_IDS]
     try:
         stock = ((stock_at(wanted) if force else stock_at_cached(wanted))
@@ -4731,25 +4760,14 @@ def _offer_run_confirm(tg: Tg, chat_id: int, *, message_id: int | None = None,
         stock = {}
 
     price = _gpu_price(configured, stock)
-    # Resolved once, for the same reason spend_cb is above: the fail-open
-    # branch and the normal one each mint a spend button, and two sites
-    # wording it independently is how a panel ends up promising a rental on
-    # one branch and Gemini quota on the other — only when the stock check
-    # fails, i.e. only in production.
-    spend_label = ("Yes — run try-on first (Gemini quota, no GPU yet)" if phase_a
-                   else f"Yes, spend ${price:.2f}/h")
+    # Resolved once: the fail-open branch and the normal one each mint a spend
+    # button, and two sites wording it independently is how they drift.
+    spend_label = f"Yes, spend ${price:.2f}/h"
     if not stock or not home_dc:
-        # The BODY moves with the label, not just the button. On this branch
-        # the stock check failed, so there is no picker to read and this one
-        # sentence is the entire screen — a rental promise here is the same
-        # bug the relabel fixed, one line higher and harder to notice because
-        # it only renders when runpodctl is down.
         _edit_or_send(
             tg, chat_id, message_id,
-            ("This runs the try-on over the API first — Gemini quota, no GPU "
-             "rented yet.\nConfirm?" if phase_a else
-             f"This rents a GPU pod at ${price:.2f}/hour and starts the job.\n"
-             "Confirm?"),
+            f"This rents a GPU pod at ${price:.2f}/hour and starts the job.\n"
+            "Confirm?",
             [[("Refresh", _CB_RUN_REFRESH + "m", _ce_id(ICON_REFRESH_CE))],
              [(spend_label, spend_cb, _ce_id(ICON_ROCKET_CE)),
               ("Cancel", _CB_RUN_NO)]])
@@ -4841,9 +4859,31 @@ def _offer_run_for_chat(tg: Tg, chat_id: int, *, message_id: int | None = None,
 
     Asks the DRAFT, not the manifest on disk: at _CB_RUN_ASK time the file may
     not have been written yet.
+
+    Once tick_phase_a has offered the rent panel for this exact manifest
+    (_PHASE_A_OFFERED holds its run token), every re-render goes back to THAT
+    panel. Without it, Switch GPU / Refresh / Back on the post-Phase-A panel
+    came through here, saw a try-on draft, and dropped the user back on the
+    "run try-on first" screen — a button that re-ran Phase A instead of
+    renting.
     """
+    if _PHASE_A_OFFERED.get(chat_id) == _run_token(chat_id):
+        _offer_rent_after_phase_a(tg, chat_id, message_id=message_id, force=force)
+        return
     _offer_run_confirm(tg, chat_id, message_id=message_id, force=force,
                        phase_a=_job_has_local_tryon(chat_id))
+
+
+def _offer_rent_after_phase_a(tg: Tg, chat_id: int, *,
+                              message_id: int | None = None,
+                              force: bool = False) -> None:
+    """The Choose GPU panel for a batch whose try-on is already on disk: its
+    spend button resumes into a rental (_CB_PHASE_A_SPEND) rather than
+    starting Phase A again."""
+    _offer_run_confirm(
+        tg, chat_id, message_id=message_id, force=force,
+        spend_cb=f"{_CB_PHASE_A_SPEND}{_run_token(chat_id)}",
+        heading=f"{ICON_NVIDIA_CE} <b>Try-on finished</b> — now rent a GPU?")
 
 
 def _offer_run_switch_menu(tg: Tg, chat_id: int, *, message_id: int | None = None,
@@ -5325,18 +5365,53 @@ def _job_has_local_tryon(chat_id: int) -> bool:
         return False
 
 
+def _journal_is_resumable(manifest_path: Path) -> bool:
+    """Is the journal beside this manifest an unfinished batch of THIS job?
+
+    The manifest path is one per chat (_job_manifest_path), so its journal
+    outlives the job that wrote it. Resuming just because a journal existed
+    attached a brand-new job to a batch that had finished two days earlier
+    (reported live 2026-09-18: batch 2026-09-16-1706 came back with its two
+    finished runs listed above the four new ones on the progress panel, the
+    new runs writing into the old out/ directory, and deliver_result about to
+    resend the old videos). Worse, a run id the old batch had finished would
+    have been skipped outright by run_batch's "already done" check.
+
+    So resume only when both hold:
+      - every run in the journal is a run of the current manifest, so the
+        journal was written for this job and not for an earlier one;
+      - at least one of them is not done yet, so there is something left to
+        continue.
+    A journal with a batch id but no runs yet also counts: Phase A writes its
+    batch id before the first Gemini call, and resuming it costs nothing.
+    Everything else starts a new batch. The worst case is paying Gemini again
+    for a job re-run unchanged after it finished, which is what a re-run is.
+    """
+    state = load_state(state_path_for(manifest_path))
+    if not state.get("batch"):
+        return False
+    runs = state.get("runs") or {}
+    if not runs:
+        return True
+    try:
+        current = {run.id for run in load_manifest(manifest_path).runs}
+    except (ManifestError, OSError, UnicodeDecodeError):
+        return False
+    if not set(runs) <= current:
+        return False
+    return any((entry or {}).get("status") != "done" for entry in runs.values())
+
+
 def _start_phase_a_and_report(tg: Tg, chat_id: int, manifest_path: Path,
                               stages: list[str]) -> None:
     """Launch Phase A and say what it is about to cost.
 
-    resume=True whenever a journal already exists for this manifest: Phase A
-    writes its batch id before the first Gemini call, so a journal means
-    try-ons may already be paid for, and resume is what makes them skipped
-    rather than billed twice. When there is no journal, resolve_batch_id's own
-    "RESUME=1 but nothing to continue" branch reports it and runs as new.
+    resume=True only when the journal is an unfinished batch of this same job
+    (_journal_is_resumable): Phase A writes its batch id before the first
+    Gemini call, so such a journal means try-ons may already be paid for, and
+    resume is what makes them skipped rather than billed twice.
     """
-    has_journal = bool(load_state(state_path_for(manifest_path)).get("batch"))
-    start_phase_a(manifest_path, resume=has_journal)
+    start_phase_a(manifest_path, resume=_journal_is_resumable(manifest_path))
     tg.send_message(
         chat_id,
         f"{ICON_ROCKET_CE} <b>Running the try-on over the API.</b>\n"
@@ -5427,6 +5502,7 @@ def _do_phase_a(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
         for stage in PIPELINES[other.pipeline]:
             if stage not in stages:
                 stages.append(stage)
+    _PHASE_A_OFFERED.pop(chat_id, None)
     _start_phase_a_and_report(tg, chat_id, live_path, stages)
 
 

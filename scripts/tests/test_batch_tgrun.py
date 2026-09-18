@@ -48,6 +48,24 @@ class TestProgressText(unittest.TestCase):
         text = progress_text(self.manifest, lease=None)
         self.assertIn("2026-08-31-2140", text)
 
+    def test_runs_not_in_this_manifest_are_not_listed(self):
+        # Reported live 2026-09-18: the journal still held a finished batch's
+        # runs, and the panel listed them above the ones actually running.
+        manifest = Path(tempfile.mkdtemp()) / "m.yaml"
+        manifest.write_text(
+            "runs:\n  - id: newRun\n    pipeline: motion-enhance\n"
+            "    inputs: {character: /tmp/c.png, driver: /tmp/d.mp4}\n",
+            encoding="utf-8")
+        state_path_for(manifest).write_text(json.dumps({
+            "batch": "2026-09-16-1706", "runs": {
+                "oldRun": {"status": "done", "stages": {
+                    "motion": {"status": "done"}, "enhance": {"status": "done"}}},
+                "newRun": {"status": "running", "stages": {
+                    "motion": {"status": "running"}}}}}), encoding="utf-8")
+        text = progress_text(manifest, lease=None)
+        self.assertEqual(text.count("enhance"), 1)
+        self.assertNotIn("2/2", text)
+
     def test_no_state_file_is_reported_not_crashed(self):
         empty = Path(tempfile.mkdtemp()) / "none.yaml"
         empty.write_text("runs: []", encoding="utf-8")

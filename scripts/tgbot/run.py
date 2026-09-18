@@ -210,6 +210,13 @@ def progress_text(manifest_path: Path, *, lease,
 
     elapsed = _elapsed(lease)
     runs = state.get("runs") or {}
+    # Only this manifest's runs. The journal is one per chat and can still
+    # hold a finished batch's runs — the panel listed two of them above the
+    # four actually running (reported live 2026-09-18). bot's
+    # _journal_is_resumable stops new batches inheriting them; this keeps a
+    # journal that already did from showing them.
+    if pipeline_by_run:
+        runs = {k: v for k, v in runs.items() if k in pipeline_by_run}
     if not runs:
         if phase == "local":
             lines.append(f"{_ICON_EYES_CE} running the try-on over the API — "

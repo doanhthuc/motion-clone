@@ -151,7 +151,7 @@ def reset_bot_state():
                  "_ANIM_PAUSE", "_ALBUM_KEY", "_FIDELITY",
                  "_PANEL_IS_PHOTO", "_STRIP", "_BASKET",
                  "_LEDGER", "_LEDGER_LOADED", "_MIGRATE_PROC",
-                 "_GPU_SUBS", "_GPU_SUBS_LOADED"):
+                 "_GPU_SUBS", "_GPU_SUBS_LOADED", "_PHASE_A_OFFERED"):
         # getattr, not bot._STATE etc: a name that disappears from bot.py
         # should fail here loudly rather than be silently skipped.
         getattr(bot, name).clear()
@@ -1873,7 +1873,8 @@ class TestFlow(unittest.TestCase):
         # EVERY alternative regardless of its own stock — the user chooses,
         # informed by the status shown next to each, rather than the bot
         # deciding an alternative isn't good enough to offer.
-        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+        with mock.patch("tgbot.bot._job_has_local_tryon", return_value=False), \
+             mock.patch("tgbot.bot.drain_running", return_value=False), \
              mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
              mock.patch("tgbot.bot.stock_at_cached",
                        return_value=self._stock_5090_low_4090_ok()):
@@ -1918,7 +1919,8 @@ class TestFlow(unittest.TestCase):
                      price_per_hr=0.72, datacenter_id="EU-RO-1", stock_status="Medium"),
             ],
         }
-        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+        with mock.patch("tgbot.bot._job_has_local_tryon", return_value=False), \
+             mock.patch("tgbot.bot.drain_running", return_value=False), \
              mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
              mock.patch("tgbot.bot.stock_at_cached", return_value=stock):
             self._fill_required_slots()
@@ -1957,7 +1959,8 @@ class TestFlow(unittest.TestCase):
             ],
             "NVIDIA RTX PRO 4500 Blackwell": [],
         }
-        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+        with mock.patch("tgbot.bot._job_has_local_tryon", return_value=False), \
+             mock.patch("tgbot.bot.drain_running", return_value=False), \
              mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
              mock.patch("tgbot.bot.stock_at_cached", return_value=stock):
             self._fill_required_slots()
@@ -2004,7 +2007,8 @@ class TestFlow(unittest.TestCase):
                      price_per_hr=0.72, datacenter_id="EU-RO-1", stock_status="Medium"),
             ],
         }
-        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+        with mock.patch("tgbot.bot._job_has_local_tryon", return_value=False), \
+             mock.patch("tgbot.bot.drain_running", return_value=False), \
              mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
              mock.patch("tgbot.bot.stock_at_cached", return_value=stock), \
              mock.patch("tgbot.bot.migration_running", return_value=False):
@@ -2026,7 +2030,8 @@ class TestFlow(unittest.TestCase):
                      price_per_hr=0.99, datacenter_id="EU-CZ-1", stock_status="High"),
             ],
         }
-        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+        with mock.patch("tgbot.bot._job_has_local_tryon", return_value=False), \
+             mock.patch("tgbot.bot.drain_running", return_value=False), \
              mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
              mock.patch("tgbot.bot.stock_at_cached", return_value=stock), \
              mock.patch("tgbot.bot.migration_running", return_value=False):
@@ -2345,7 +2350,8 @@ class TestFlow(unittest.TestCase):
             "NVIDIA GeForce RTX 4090": [],
             "NVIDIA RTX PRO 4500 Blackwell": [],
         }
-        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+        with mock.patch("tgbot.bot._job_has_local_tryon", return_value=False), \
+             mock.patch("tgbot.bot.drain_running", return_value=False), \
              mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
              mock.patch("tgbot.bot.stock_at_cached", return_value=stock):
             self._fill_required_slots()
@@ -2364,7 +2370,8 @@ class TestFlow(unittest.TestCase):
         self.assertEqual(icon, [bot._ce_id(bot.ICON_REFRESH_CE)])
 
     def test_refresh_bypasses_the_cache_with_an_interim_message(self):
-        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+        with mock.patch("tgbot.bot._job_has_local_tryon", return_value=False), \
+             mock.patch("tgbot.bot.drain_running", return_value=False), \
              mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
              mock.patch("tgbot.bot.stock_at_cached",
                        return_value=self._stock_5090_low_4090_ok()) as cached, \
@@ -2386,7 +2393,8 @@ class TestFlow(unittest.TestCase):
         self.assertIn("Current:", self.tg.edits[-1][1])
 
     def test_back_returns_to_the_main_screen_in_place(self):
-        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+        with mock.patch("tgbot.bot._job_has_local_tryon", return_value=False), \
+             mock.patch("tgbot.bot.drain_running", return_value=False), \
              mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
              mock.patch("tgbot.bot.stock_at_cached",
                        return_value=self._stock_5090_low_4090_ok()):
@@ -2432,7 +2440,8 @@ class TestFlow(unittest.TestCase):
                        datacenter_id="EU-CZ-1", stock_status="High")]
             for gpu in (bot._PRIMARY_GPU_ID, *bot._FALLBACK_GPU_IDS)
         }
-        with mock.patch("tgbot.bot.drain_running", return_value=False), \
+        with mock.patch("tgbot.bot._job_has_local_tryon", return_value=False), \
+             mock.patch("tgbot.bot.drain_running", return_value=False), \
              mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
              mock.patch("tgbot.bot.stock_at_cached", return_value=elsewhere_only):
             self._fill_required_slots()
@@ -3706,9 +3715,12 @@ class TestFlow(unittest.TestCase):
              mock.patch("tgbot.bot.drain_running", return_value=False):
             self._fill_required_slots()
         manifest = bot._job_manifest_path(ME)
+        # The manifest's real run id: progress_text lists only runs the
+        # manifest has (a journal can still hold an older batch's runs).
+        run_id = load_manifest(manifest).runs[0].id
         state_path_for(manifest).write_text(json.dumps(
             {"batch": "2026-08-31-2140",
-             "runs": {"job": {"status": "running",
+             "runs": {run_id: {"status": "running",
                               "stages": {"motion": {"status": "done", "sec": 247}}}}}),
             encoding="utf-8")
         bot.handle(self.tg, cmd_from(ME, "/status"), allowed_user_id=ME)
@@ -4622,6 +4634,22 @@ class TestDeliverResult(unittest.TestCase):
         joined = "\n".join(self.tg.messages)
         self.assertIn("Done", joined)
         self.assertIn("2026-08-31-2140", joined)
+        self.assertEqual([c for _, c in self.tg.documents], ["job.mp4"])
+
+    def test_videos_of_runs_not_in_this_manifest_are_not_resent(self):
+        # A batch that inherited an older job's journal shares its out/ dir;
+        # that job's videos must not come back as if they were new.
+        self.manifest.write_text(
+            "runs:\n  - id: job\n    pipeline: motion-enhance\n"
+            "    inputs: {character: /tmp/c.png, driver: /tmp/d.mp4}\n",
+            encoding="utf-8")
+        d = self._batch_dir("2026-09-16-1706")
+        (d / "_final" / "job.mp4").write_bytes(b"video")
+        (d / "_final" / "oldRun.mp4").write_bytes(b"video")
+        self._write_state({"batch": "2026-09-16-1706", "runs": {
+            "job": {"status": "done", "stages": {}},
+            "oldRun": {"status": "done", "stages": {}}}})
+        bot.deliver_result(self.tg, ME, self.manifest)
         self.assertEqual([c for _, c in self.tg.documents], ["job.mp4"])
 
     def test_failure_names_the_stage_that_broke(self):
@@ -6127,6 +6155,43 @@ class TestRunStartsPhaseAFirst(unittest.TestCase):
     PLAIN = ("runs:\n  - id: runA\n    pipeline: motion-enhance\n"
              "    inputs: {character: /tmp/c.png, driver: /tmp/d.mp4}\n")
 
+    def _journal(self, manifest, runs):
+        state_path_for(manifest).write_text(json.dumps(
+            {"batch": "2026-09-16-1706", "runs": runs}), encoding="utf-8")
+
+    def _resume_flag(self, manifest):
+        with mock.patch("tgbot.bot.start_phase_a") as phase_a, \
+             mock.patch("tgbot.bot._start_progress"):
+            bot._start_phase_a_and_report(self.tg, ME, manifest, ["tryon"])
+        return phase_a.call_args.kwargs["resume"]
+
+    def test_a_finished_older_batch_is_not_resumed(self):
+        # Reported live 2026-09-18: a new job resumed batch 2026-09-16-1706
+        # because the per-chat journal still held it, and the progress panel
+        # listed that batch's two finished runs above the new ones.
+        manifest = self._write(self.TRYON)
+        self._journal(manifest, {"oldRun": {"status": "done", "stages": {}}})
+        self.assertIs(self._resume_flag(manifest), False)
+
+    def test_an_unfinished_batch_of_the_same_job_is_resumed(self):
+        manifest = self._write(self.TRYON)
+        self._journal(manifest, {"runA": {"status": "pending", "stages": {
+            "tryon": {"status": "done"}}}})
+        self.assertIs(self._resume_flag(manifest), True)
+
+    def test_the_same_job_already_finished_starts_a_new_batch(self):
+        # Resuming would make run_batch skip every run as "already done" and
+        # hand back the old videos instead of making new ones.
+        manifest = self._write(self.TRYON)
+        self._journal(manifest, {"runA": {"status": "done", "stages": {}}})
+        self.assertIs(self._resume_flag(manifest), False)
+
+    def test_a_journal_mixing_in_another_jobs_runs_is_not_resumed(self):
+        manifest = self._write(self.TRYON)
+        self._journal(manifest, {"runA": {"status": "pending", "stages": {}},
+                                 "oldRun": {"status": "done", "stages": {}}})
+        self.assertIs(self._resume_flag(manifest), False)
+
     def test_a_tryon_manifest_starts_phase_a_and_does_not_rent(self):
         manifest = self._write(self.TRYON)
         with mock.patch("tgbot.bot.start_phase_a") as phase_a, \
@@ -6164,6 +6229,48 @@ class TestRunStartsPhaseAFirst(unittest.TestCase):
         labels = [label for row in self.tg.buttons[-1] for label, *_ in row]
         self.assertTrue(any("Gemini" in label for label in labels),
                         f"no button mentions the quota: {labels}")
+
+    def test_the_first_screen_of_a_tryon_draft_shows_no_gpu_picker(self):
+        # Reported live 2026-09-18: tapping Run on a try-on draft drew the
+        # full Choose GPU picker before the try-on had even started. The GPU
+        # question belongs to the panel after Phase A, so the first screen
+        # must not read stock at all, let alone list it.
+        stock = {"NVIDIA GeForce RTX 5090": [Stock(
+            gpu_id="NVIDIA GeForce RTX 5090", display_name="RTX 5090",
+            price_per_hr=0.99, datacenter_id="EU-RO-1", stock_status="Low")]}
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=stock) as cached, \
+             mock.patch("tgbot.bot._run_token", return_value="1"):
+            bot._offer_run_confirm(self.tg, ME, phase_a=True)
+        cached.assert_not_called()
+        body = self.tg.screen[-1]
+        self.assertNotIn("Choose GPU", body)
+        self.assertNotIn("RTX 5090", body)
+        data = [d for row in self.tg.buttons[-1] for _, d, *_ in row]
+        self.assertEqual(data, [bot._CB_RUN_GO + "1", bot._CB_RUN_NO])
+
+    def test_rerenders_after_phase_a_stay_on_the_rent_panel(self):
+        # Switch GPU / Refresh / Back on the post-Phase-A panel all come
+        # through _offer_run_for_chat. They used to see a try-on draft and fall
+        # back to the "run try-on first" screen, whose button re-ran Phase A.
+        with mock.patch("tgbot.bot._run_token", return_value="7"), \
+             mock.patch("tgbot.bot._job_has_local_tryon", return_value=True), \
+             mock.patch("tgbot.bot._offer_run_confirm") as offer:
+            bot._PHASE_A_OFFERED[ME] = "7"
+            bot._offer_run_for_chat(self.tg, ME, message_id=42, force=True)
+        kwargs = offer.call_args.kwargs
+        self.assertEqual(kwargs["spend_cb"], bot._CB_PHASE_A_SPEND + "7")
+        self.assertIn("Try-on finished", kwargs["heading"])
+        self.assertEqual(kwargs["message_id"], 42)
+        self.assertIs(kwargs["force"], True)
+
+    def test_a_changed_job_after_phase_a_gets_the_tryon_screen_again(self):
+        with mock.patch("tgbot.bot._run_token", return_value="8"), \
+             mock.patch("tgbot.bot._job_has_local_tryon", return_value=True), \
+             mock.patch("tgbot.bot._offer_run_confirm") as offer:
+            bot._PHASE_A_OFFERED[ME] = "7"
+            bot._offer_run_for_chat(self.tg, ME)
+        self.assertIs(offer.call_args.kwargs["phase_a"], True)
 
     def test_without_phase_a_the_button_still_quotes_the_hourly_price(self):
         with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
