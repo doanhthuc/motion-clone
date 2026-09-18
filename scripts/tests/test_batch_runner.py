@@ -1253,6 +1253,50 @@ class TestRunLocalPhase(unittest.TestCase):
             self.assertEqual(run_a["status"], "pending")
             self.assertNotIn("error", run_a)
 
+    def _journal_with_stale_error(self, tmp, later_stage=None):
+        manifest = load_manifest(_fixture_tryon(tmp, MANIFEST_TRYON_GEMINI))
+        with mock.patch("batchlib.runner.run_local_tryon",
+                        lambda run, params, s, out: (out.write_bytes(b"ok"), (1, 2))[1]):
+            result = run_local_phase(settings=GEMINI_SETTINGS, manifest=manifest,
+                                     out_root=tmp / "out", batch_id="2026-08-21-0900",
+                                     resume=False, log=lambda _m: None)
+        state = load_state(result.state_file)
+        state["runs"]["runA"]["status"] = "error"
+        state["runs"]["runA"]["error"] = "Gemini không trả ảnh: IMAGE_SAFETY"
+        if later_stage:
+            state["runs"]["runA"]["stages"][later_stage] = {"status": "error"}
+        result.state_file.write_text(json.dumps(state), encoding="utf-8")
+        return manifest, result.state_file
+
+    def test_a_reused_image_clears_a_failure_only_phase_a_could_have_left(self):
+        # The journal the VPS actually held on 2026-09-18: written before the
+        # fix above, so its image is done but the run still says "error", and
+        # every later Phase A skips it (reusable) without ever clearing it.
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            manifest, state_file = self._journal_with_stale_error(tmp)
+            with mock.patch("batchlib.runner.run_local_tryon") as call:
+                run_local_phase(settings=GEMINI_SETTINGS, manifest=manifest,
+                                out_root=tmp / "out", batch_id="2026-08-21-0900",
+                                resume=True, log=lambda _m: None)
+            call.assert_not_called()
+            run_a = load_state(state_file)["runs"]["runA"]
+            self.assertEqual(run_a["status"], "pending")
+            self.assertNotIn("error", run_a)
+
+    def test_a_pod_stage_failure_is_left_alone(self):
+        # A later stage in the journal means the error may be the pod's, and
+        # Phase A has no business erasing that.
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            manifest, state_file = self._journal_with_stale_error(tmp, later_stage="motion")
+            run_local_phase(settings=GEMINI_SETTINGS, manifest=manifest,
+                            out_root=tmp / "out", batch_id="2026-08-21-0900",
+                            resume=True, log=lambda _m: None)
+            run_a = load_state(state_file)["runs"]["runA"]
+            self.assertEqual(run_a["status"], "error")
+            self.assertIn("error", run_a)
+
     def test_ghi_ca_run_log_khong_chi_journal(self):
         # spec §4: hỏng ở Pha A phải vào journal VÀ run.log. stdout là thứ mất khi đóng
         # terminal — run.log là bản ghi còn lại, giống hệt giao ước của run_one.

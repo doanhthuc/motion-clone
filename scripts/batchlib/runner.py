@@ -609,6 +609,18 @@ def run_local_phase(*, settings: Settings, manifest: Manifest, out_root: Path, b
         # exist at the motion stage.
         if not force and local_tryon_reusable(run, stage_name, recorded, dest):
             log(f"    {run.id}/{stage_name}: bỏ qua (đã xong local, {dest.name})")
+            # A reused image also clears a failure only Phase A could have left:
+            # with no later stage in the journal, the pod never ran this run.
+            # Journals written before the success-path clearing below kept
+            # status "error" beside a done image (VPS, 2026-09-18), and a
+            # skip never reached that clearing.
+            later = PIPELINES[run.pipeline][PIPELINES[run.pipeline].index(stage_name) + 1:]
+            with lock:
+                if entry.get("status") == "error" and not any(
+                        entry["stages"].get(s) for s in later):
+                    entry["status"] = "pending"
+                    entry.pop("error", None)
+                    save_state(state_file, state)
             return False, None
         started = time.time()
 
