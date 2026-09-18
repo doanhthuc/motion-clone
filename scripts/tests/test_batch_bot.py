@@ -5179,6 +5179,66 @@ class TestGpuStockCommand(unittest.TestCase):
         self.assertEqual(flat_data, [bot._CB_GPU_REFRESH])
 
 
+class TestBalanceCommand(unittest.TestCase):
+    """/balance — RunPod prepaid balance and GPU-hour runway (2026-09-18)."""
+
+    def setUp(self):
+        self._orig_root = bot.ROOT
+        self.root = Path(tempfile.mkdtemp())
+        bot.ROOT = self.root
+        self.tg = FakeTg()
+
+    def tearDown(self):
+        bot.ROOT = self._orig_root
+
+    def _run(self, balance=7.25, price=0.99, gpu="NVIDIA GeForce RTX 5090"):
+        (self.root / ".env").write_text(f"GPU={gpu}\n", encoding="utf-8")
+        with mock.patch("tgbot.bot.account_balance", return_value=balance), \
+             mock.patch("tgbot.bot._panel_price", return_value=price):
+            bot.handle(self.tg, cmd_from(ME, "/balance"), allowed_user_id=ME)
+        return self.tg.messages[-1]
+
+    def test_reports_balance_and_runway_on_the_configured_gpu(self):
+        text = self._run(balance=7.25, price=0.99)
+        self.assertIn("$7.25", text)
+        self.assertIn("7h19m", text)       # 7.25 / 0.99 = 7.32h
+        self.assertIn("RTX 5090", text)
+        self.assertIn("$0.99/h", text)
+        self.assertNotIn("top up", text)
+
+    def test_runway_follows_a_fallback_gpu_price(self):
+        text = self._run(balance=7.20, price=0.72, gpu="NVIDIA RTX PRO 4500 Blackwell")
+        self.assertIn("10h00m", text)
+        self.assertIn("RTX PRO 4500", text)
+
+    def test_warns_when_under_an_hour_of_runway(self):
+        text = self._run(balance=0.50, price=0.99)
+        self.assertIn("top up", text)
+
+    def test_never_shows_current_spend_per_hr(self):
+        # CLAUDE.md: currentSpendPerHr is not a cost source here.
+        self.assertNotIn("spend", self._run().lower())
+
+    def test_a_runpodctl_failure_is_reported_with_a_retry_button(self):
+        with mock.patch("tgbot.bot.account_balance", side_effect=RuntimeError("boom")):
+            bot.handle(self.tg, cmd_from(ME, "/balance"), allowed_user_id=ME)
+        self.assertIn("couldn't reach runpodctl", self.tg.messages[-1])
+        flat_data = [data for row in self.tg.buttons[-1] for _, data, *_ in row]
+        self.assertEqual(flat_data, [bot._CB_BALANCE_REFRESH])
+
+    def test_refresh_edits_in_place(self):
+        self._run()
+        with mock.patch("tgbot.bot.account_balance", return_value=3.0), \
+             mock.patch("tgbot.bot._panel_price", return_value=0.99):
+            bot.handle(self.tg, cb_from(ME, bot._CB_BALANCE_REFRESH), allowed_user_id=ME)
+        self.assertEqual(len(self.tg.messages), 1)
+        self.assertIn("Refreshing", self.tg.edits[-2][1])
+        self.assertIn("$3.00", self.tg.edits[-1][1])
+
+    def test_is_registered_in_the_command_menu(self):
+        self.assertIn("balance", [c for c, _ in bot.BOT_COMMANDS])
+
+
 class TestGpuSubscribe(unittest.TestCase):
     """/subscribe + /unsubscribe — a one-shot watch on a (GPU, datacenter)
     pair, added 2026-09-12 on the user's own request: "subscribe loại gpu

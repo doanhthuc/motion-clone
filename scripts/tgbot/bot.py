@@ -64,6 +64,7 @@ from tgbot.run import (LEASE_PATH, _RUNNING, busy, drain_running,
                        progress_text, start_drain, start_phase_a,
                        stop_phase_a, summary_text)
 from batchlib_ext.gpu_stock import stock_at, stock_at_cached, volume_datacenter
+from batchlib_ext.runpod_account import account_balance
 from batchlib_ext.handoff import handoff_path, mailbox_path, read_handoff
 from batchlib_ext.lease import clear_lease
 from batchlib_ext.migrate_lease import read_migrate_lease
@@ -1389,6 +1390,7 @@ _CB_RUN_REFRESH = "run:refresh:"
 # The /gpu report's own Refresh button — separate from _CB_RUN_REFRESH
 # because /gpu has no submenus to disambiguate between.
 _CB_GPU_REFRESH = "gpu:refresh"
+_CB_BALANCE_REFRESH = "bal:refresh"
 # /subscribe's two-step chooser (pick a GPU, then pick a datacenter for it)
 # and /unsubscribe's per-row remove button. Short "gs:" (GPU Subscribe) so
 # none of the three is a prefix of another — same constraint _CB_PIPE_ASK's
@@ -1622,6 +1624,12 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
             if msg_id is not None:
                 tg.edit_message(chat_id, msg_id, "🔄 Refreshing stock…")
             _report_gpu_stock(tg, chat_id, message_id=msg_id, force=True)
+
+        elif data == _CB_BALANCE_REFRESH:
+            msg_id = (query.get("message") or {}).get("message_id")
+            if msg_id is not None:
+                tg.edit_message(chat_id, msg_id, "🔄 Refreshing balance…")
+            _report_balance(tg, chat_id, message_id=msg_id)
 
         elif data.startswith(_CB_GPUSUB_PICK):
             msg_id = (query.get("message") or {}).get("message_id")
@@ -3942,6 +3950,39 @@ def _report_gpu_stock(tg: Tg, chat_id: int, *, message_id: int | None = None,
                  [[("Refresh", _CB_GPU_REFRESH, _ce_id(ICON_REFRESH_CE))]], parse_mode=PARSE_HTML)
 
 
+# Below this many hours of runway, /balance warns before a rent is attempted:
+# one motion job runs ~40 minutes on the 5090, plus pod setup, so under an
+# hour a single job may not finish before the balance runs dry.
+_LOW_RUNWAY_HOURS = 1.0
+
+
+def _report_balance(tg: Tg, chat_id: int, *, message_id: int | None = None) -> None:
+    """/balance — the RunPod prepaid balance, and how many hours of the
+    configured GPU it buys. Free, no pod rented.
+
+    Runway uses the same $/h the [Run] button quotes (_panel_price), so the
+    two never disagree. It ignores the Network Volume's own monthly charge,
+    which is small next to a GPU hour — hence "≈".
+    """
+    buttons = [[("Refresh", _CB_BALANCE_REFRESH, _ce_id(ICON_REFRESH_CE))]]
+    try:
+        balance = account_balance()
+    except RuntimeError as exc:
+        _edit_or_send(tg, chat_id, message_id, f"couldn't reach runpodctl: {exc}", buttons)
+        return
+
+    configured = env_get(ROOT / ".env", "GPU") or _PRIMARY_GPU_ID
+    gpu_name = _GPU_DISPLAY_SHORT.get(configured, configured)
+    price = _panel_price()
+    hours = balance / price if price > 0 else 0.0
+    lines = [f"{ICON_MONEY_CE} <b>RunPod balance: ${balance:.2f}</b>",
+             f"⏱ ≈ {_fmt_elapsed(hours * 3600)} of {_esc(gpu_name)} at ${price:.2f}/h"]
+    if hours < _LOW_RUNWAY_HOURS:
+        lines.append(f"{ICON_WARN} Under {_LOW_RUNWAY_HOURS:g}h — top up before renting, "
+                     "one motion job may not finish.")
+    _edit_or_send(tg, chat_id, message_id, "\n".join(lines), buttons, parse_mode=PARSE_HTML)
+
+
 # One-shot GPU-stock watches: (gpu_id, datacenter_id) pairs a chat asked to
 # hear about the moment they stop being sold out. Own file per chat, not
 # folded into the draft — same reasoning as _LEDGER's (2026-09-02): a
@@ -5882,6 +5923,10 @@ def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
         _report_gpu_stock(tg, chat_id)
         return
 
+    if text.startswith("/balance"):
+        _report_balance(tg, chat_id)
+        return
+
     if text.startswith("/subscribe"):
         _offer_gpu_sub_targets(tg, chat_id)
         return
@@ -5962,6 +6007,7 @@ BOT_COMMANDS = [
     ("tryon", "just the try-on image, when the result looks wrong"),
     ("wipe", "delete every message in this chat, yours and mine"),
     ("gpu", "check RunPod 5090 stock before you rent — free"),
+    ("balance", "RunPod balance and how many GPU hours it buys — free"),
     ("subscribe", "get a message the moment a GPU has stock in a region"),
     ("unsubscribe", "stop watching a GPU/region — list and remove"),
     ("kill", "EMERGENCY STOP - destroys the pod right now, abandons the run"),
