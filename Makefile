@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: batch-mcp-check batch-coverage check-comfy-nodes help setup dev down clean gpu-preflight gpu-provision gpu-wait gpu-bootstrap gpu-fe gpu-up gpu-down gpu-destroy gpu-db-dump gpu-db-check gpu-status gpu-logs batch-test batch-params check-batch-params batch-scan batch-validate batch batch-clean watchdog-dry drain bot-dry
+.PHONY: gpu-facelock batch-mcp-check batch-coverage check-comfy-nodes help setup dev down clean gpu-preflight gpu-provision gpu-wait gpu-bootstrap gpu-fe gpu-up gpu-down gpu-destroy gpu-db-dump gpu-db-check gpu-status gpu-logs batch-test batch-params check-batch-params batch-scan batch-validate batch batch-clean watchdog-dry drain bot-dry
 
 help: ## Show this help
 	@echo "motion-clone — make targets:"
@@ -218,6 +218,9 @@ gpu-db-check: ## Bản dump mới nhất bao lâu rồi, có nạp lại đượ
 
 gpu-smoke: ## Prove the pod really works end-to-end (SMOKE_REF=img SMOKE_DRIVER=vid for a motion job, +SMOKE_PRODUCT=img for tryon, SMOKE_PROMPT="..." for create-image)
 	@bash scripts/pod-smoke.sh
+
+gpu-facelock: ## Install faceLock on the pod (insightface swap; needed before faceLock=1 does anything)
+	@bash scripts/pod-facelock.sh
 
 gpu-status: ## Is the pod up, and is the backend answering?
 	@curl -sf https://$(call env,DOMAIN)/health >/dev/null 2>&1 \

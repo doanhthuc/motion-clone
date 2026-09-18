@@ -361,6 +361,15 @@ if ! curl -sf "https://$DOMAIN/health" >/dev/null 2>&1; then
   fi
 fi
 
+# ── faceLock ──────────────────────────────────────────────────────────────────
+# camera-motion turns faceLock on by default (batchlib/pipelines.py). Without this install the
+# worker only warns and returns the un-swapped video, so every camera job would silently lose the
+# fix. Runs before the FE block below because that block can die(). A failed install is a warning,
+# not a stop: the worker already treats a missing faceLock as "keep the original output".
+log "installing faceLock (identity swap used by camera-motion)…"
+bash scripts/pod-facelock.sh \
+  || warn "faceLock install failed — camera-motion jobs will run WITHOUT the face fix until 'make gpu-facelock' succeeds"
+
 log "pulling the FE .env block out of the setup log…"
 FE_BLOCK="$(grep -E '^(NUXT_MOTION_API_URL|NUXT_MOTION_API_KEY|NUXT_PUBLIC_MOTION_BACKEND_URL)=' "$LOG")"
 [ -n "$FE_BLOCK" ] || die "couldn't find the FE .env block in $LOG — setup may have failed partway; check the log"
