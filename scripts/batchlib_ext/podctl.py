@@ -89,10 +89,14 @@ class VastCtl:
     batchlib_ext.watchdog.DESTROYABLE_NAMES lets tier 3 destroy. An unlabelled instance is not
     ours to kill.
 
-    The JSON shape was checked against `vastai show instances-v1 --raw` (CLI 1.3.0,
-    2026-09-19) for the empty case only: `{"instances": [], "next_token": null, ...}`. That an
-    instance carries `id` and `label` is taken from the CLI's own column list and is confirmed
-    on the first real rental.
+    The JSON shape was first checked against `vastai show instances-v1 --raw` (CLI 1.3.0,
+    2026-09-19) for the empty case only: `{"instances": [], "next_token": null, ...}`. Live on
+    the VPS (CLI 1.7.0, 2026-09-19, real account) the empty case instead came back as a bare
+    `[]` — that shape crashed the code below (`AttributeError: 'list' object has no attribute
+    'get'`) until this fix. Both shapes are handled now; the bare-list one has no `next_token`
+    field to check at all, so `--all` is trusted to mean "everything" for it, same as the dict
+    shape when its `next_token` is null. That an instance carries `id` and `label` is taken from
+    the CLI's own column list and is confirmed on the first real rental.
     """
 
     def list_pods(self) -> list[PodInfo]:
@@ -106,17 +110,21 @@ class VastCtl:
         if out.returncode != 0:
             raise RuntimeError(f"vastai show instances-v1 failed: {out.stderr.strip()}")
         try:
-            data = json.loads(out.stdout or '{"instances": []}')
-            if data.get("next_token"):
-                # F4/I2: `--all` is supposed to fetch every page in one call, but if the CLI
-                # ever paginates anyway, silently returning only the first page could read a
-                # live instance as gone. Every caller (rent()'s instance_exists, the watchdog)
-                # already treats a raising listing as "unverifiable" — fail closed instead.
-                raise RuntimeError(
-                    "vastai listing may be incomplete (next_token is set)")
+            data = json.loads(out.stdout or "[]")
+            if isinstance(data, dict):
+                if data.get("next_token"):
+                    # F4/I2: `--all` is supposed to fetch every page in one call, but if the CLI
+                    # ever paginates anyway, silently returning only the first page could read a
+                    # live instance as gone. Every caller (rent()'s instance_exists, the
+                    # watchdog) already treats a raising listing as "unverifiable" — fail closed.
+                    raise RuntimeError(
+                        "vastai listing may be incomplete (next_token is set)")
+                instances = data["instances"]
+            else:
+                instances = data
             return [PodInfo(pod_id=str(i["id"]), name=str(i.get("label") or ""))
-                    for i in data["instances"]]
-        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+                    for i in instances]
+        except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as exc:
             snippet = out.stdout[:100] if out.stdout else "(empty)"
             raise RuntimeError(
                 f"vastai returned invalid JSON: {exc} — output: {snippet}") from exc

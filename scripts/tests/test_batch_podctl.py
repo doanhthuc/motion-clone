@@ -227,6 +227,22 @@ class TestVastCtl(unittest.TestCase):
         self.assertEqual(VastCtl().list_pods(), [])
 
     @patch("subprocess.run")
+    def test_a_bare_list_is_the_shape_cli_1_7_0_actually_returns_for_no_instances(self, mock_run):
+        # Verified live on the VPS, real account, CLI 1.7.0, 2026-09-19: the empty case is `[]`,
+        # not `{"instances": [], "next_token": null}` (CLI 1.3.0's shape, still handled above).
+        # Before this test existed, `data.get("next_token")` crashed with AttributeError on this
+        # exact output and the watchdog's Vast reconciliation silently never ran.
+        mock_run.return_value = MagicMock(returncode=0, stdout="[]", stderr="")
+        self.assertEqual(VastCtl().list_pods(), [])
+
+    @patch("subprocess.run")
+    def test_a_bare_list_with_instances_maps_id_and_label(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stderr="", stdout=json.dumps(
+            [{"id": 1, "label": "motion-transfer"}, {"id": 2, "label": None}]))
+        self.assertEqual(VastCtl().list_pods(),
+                         [PodInfo("1", "motion-transfer"), PodInfo("2", "")])
+
+    @patch("subprocess.run")
     def test_a_set_next_token_means_the_listing_may_be_incomplete_and_raises(self, mock_run):
         # F4/I2: rent() (instance_exists) and pod_watchdog.py both treat a raising listing as
         # "unverifiable" and fail closed. `--all` is supposed to fetch every page in one call,

@@ -658,9 +658,14 @@ bandwidth, and the invoice is the truth), never at RunPod's flat $0.99;
 - `--label motion-transfer` survives `create` and comes back as `label` in `show instances-v1`.
   All of tier 3's Vast authority rests on this — if the label does not round-trip, the watchdog
   can never tell a motion-transfer instance from anyone else's on the same account.
-- `vastai` is installed and authenticated on the VPS watchdog host — **currently it is NOT
-  installed there**. Until it is, no Vast instance has a watchdog backstop at all; the lease and
-  the operator are the only ceilings.
+- `vastai` is installed and authenticated on the VPS watchdog host — done 2026-09-19: `pip install`
+  into its own venv (`/opt/vastai-venv`, avoiding a conflict with Debian's system `urllib3`),
+  symlinked to `/usr/local/bin/vastai` so `pod-watchdog.service`'s default PATH finds it, key copied
+  to `/root/.config/vastai/`. `vastai show user --raw` confirmed from that host: real account, $10.70
+  credit. Installing it immediately surfaced a real bug (see the `instances-v1` bullet below): the
+  empty-account listing crashed, so tier 3's Vast reconciliation had never actually run before this
+  day even once `vastai` existed there. What is still unverified is everything else below this
+  line — a working, un-crashing CLI is not the same as a watchdog that has reaped a real instance.
 - `vastai show instance <id> --raw` returns `actual_status` with the literal string `running`
   (not `"Running"`, not some other spelling) once the instance is up.
 - `machine_id=… gpu_name=… num_gpus=1 disk_space>=… reliability>… rentable=true` is a valid
@@ -669,7 +674,13 @@ bandwidth, and the invoice is the truth), never at RunPod's flat $0.99;
   silently disappears — with no error, just a search that always falls back to the base query.
 - `show instances-v1 --raw --all` returns everything in one page. `VastCtl.list_pods` now raises
   if `next_token` is set rather than trusting that, but the assumption itself — that `--all` is
-  enough — is still unverified against a real account with many instances.
+  enough — is still unverified against a real account with many instances. Its empty-account shape
+  was wrong until 2026-09-19: the code assumed CLI 1.3.0's `{"instances": [], "next_token": null}`,
+  but the real VPS account on CLI 1.7.0 returned a bare `[]` and crashed with `AttributeError:
+  'list' object has no attribute 'get'` (caught by `pod_watchdog.py`'s broad except and logged as
+  "cannot list vast pods", so it failed safe rather than crashing the process — but tier 3's Vast
+  reconciliation was still a no-op the whole time). `list_pods` now accepts both shapes; only the
+  dict one still carries a `next_token` to check.
 - A scoreboard `pull_s` (create-to-running time) is specific to the IMAGE it was measured with —
   the 35s warm-pull figure recorded here was one image on machine 144253, not a general property
   of that machine.
@@ -679,8 +690,10 @@ bandwidth, and the invoice is the truth), never at RunPod's flat $0.99;
   hangs or the `wait` never returns, the pod is still billing — check `/tmp/preload-models.log`
   over SSH before assuming a stuck bootstrap is something else.
 - The bot on the VPS needs `vastai` installed and logged in: it runs the quote, reads the credit
-  and starts the drain there — the same gap as the watchdog host, and it is **not installed there
-  yet**. Without it the Vast tab renders and says so, and no button spends.
+  and starts the drain there — the same host and the same install as the watchdog bullet above
+  (2026-09-19), confirmed live from `tgbot.bot._vast_enabled()`, `vast_account.account_credit()`
+  and `vast_quote.fetch_quote()` all running against the real account from that process. What is
+  still unverified is a real spend: no button has ever been tapped end to end.
 - The panel's cold-start and session-cost figures are estimates built from two hosts (warm 4.4 min,
   cold 9.3 min, `BOOT_AFTER_RUNNING_S` = 17 + 200 + 15 s measured on one warm host) and from
   `MEASURED_STAGE_SEC`. The first paid sessions are what calibrate them.
