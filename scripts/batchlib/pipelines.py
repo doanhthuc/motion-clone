@@ -83,9 +83,23 @@ STAGES: dict[str, Stage] = {
         # try-on image toward the driver. Re-swapping job 4cf001de's output on 18/09/2026 put
         # the try-on face back on all 452 frames in 22s of GPU time; judged by eye on video.
         # A default rather than a lock, so a manifest can still set faceLock: 0 to A/B.
+        #
+        # faceLockRestore + faceLockBlend: default ON 19/09/2026 at doanhthuc's direction, ahead of
+        # a GPU/video re-check — flagging the evidence gap here rather than overstating it. What IS
+        # measured: (1) faceLockRestore (CodeFormer after the swap) fixes inswapper_128's waxy/flat
+        # texture, stable frame-to-frame, but pulls toward CodeFormer's own fuller-lip/bigger-eye
+        # prior — see batch/2026-09-18-face-identity-ab.yaml arm E and this doc's 18/09 addendum:
+        # motions-studio/feature/face-restore-motion-delivery.md. (2) faceLockBlend=0.3 (swap_video.py's
+        # _swap_blended) counters inswapper's own lip-fullness bias by keeping more of Wan's own face
+        # through the swap — confirmed shrinking lip fullness on ONE still frame via a local CPU test
+        # only (no GPU, no video, no temporal-stability or identity-retention check). The combination
+        # (does 0.3 blend counteract or compound CodeFormer's own lip inflation?) is UNVERIFIED — arm F
+        # in the manifest above exists to answer that but has not been run. A manifest can override
+        # either back to what it was A/B'd against: faceLockRestore: 0, faceLockBlend: 1.0.
         defaults={"bodyProportionLock": False, "poseStrength": 0.9,
                   "clipStrength": 1.2, "naturalNails": True,
-                  "removeWristAccessories": True, "faceLock": 1},
+                  "removeWristAccessories": True, "faceLock": 1,
+                  "faceLockRestore": 1, "faceLockBlend": 0.3},
         locked_params={"cameraAwareMotion": True, "fitDriver": True},
     ),
 }
