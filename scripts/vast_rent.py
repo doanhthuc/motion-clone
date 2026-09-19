@@ -47,6 +47,8 @@ DEFAULT_PULL_DEADLINE_S = 8 * 60         # must stay < the watchdog's GRACE_MIN 
 MAX_PULL_RETRIES = 2                     # spec §3.2: at most 2 retries after the first pull
 MAX_CREATE_FAILURES = 6                  # offers vanish between search and create
 POLL_S = 10
+VERIFY_POLLS = 3                         # Vast destroys asynchronously: re-list a few times
+VERIFY_SLEEP_S = 3
 FAILED_STATUSES = frozenset({"exited", "error", "offline", "unknown_error"})
 KNOWN_GOOD_QUERIES = 3
 
@@ -59,11 +61,20 @@ class NoOffers(RentError):
     pass
 
 
+class AmbiguousCreate(RentError):
+    """A create whose outcome is unknown: an instance may exist. Never create another one."""
+
+
+class _CommandTimeout(RentError):
+    pass
+
+
 class VastApi(Protocol):
     def search_offers(self, query: str) -> list[dict]: ...
     def create_instance(self, offer_id, *, image: str, disk_gb: int, label: str) -> str: ...
     def instance_status(self, instance_id: str) -> dict: ...
     def destroy_instance(self, instance_id: str) -> None: ...
+    def instance_exists(self, instance_id: str) -> bool: ...
     def ssh_url(self, instance_id: str) -> str: ...
 
 
@@ -71,6 +82,8 @@ class RealVastApi:
     def _run(self, argv: list[str], timeout: int):
         try:
             return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            raise _CommandTimeout(f"{argv[0]} timed out after {timeout}s") from exc
         except (OSError, subprocess.SubprocessError) as exc:
             raise RentError(f"could not run {argv[0]}: {exc}") from exc
 
@@ -87,20 +100,35 @@ class RealVastApi:
         return data
 
     def create_instance(self, offer_id, *, image: str, disk_gb: int, label: str) -> str:
-        out = self._run(["vastai", "create", "instance", str(offer_id), "--image", image,
-                         "--disk", str(disk_gb), "--ssh", "--direct", "--label", label,
-                         "--cancel-unavail", "--raw"], 120)
+        def ambiguous(detail: str) -> AmbiguousCreate:
+            return AmbiguousCreate(
+                f"vastai create for offer {offer_id} gave no clear answer ({detail}) — an "
+                f"instance labelled {label} may exist. Check `vastai show instances-v1`; the "
+                f"watchdog's tier 3 reaps an unleased labelled instance after ~10 minutes.")
+
+        try:
+            out = self._run(["vastai", "create", "instance", str(offer_id), "--image", image,
+                             "--disk", str(disk_gb), "--ssh", "--direct", "--label", label,
+                             "--cancel-unavail", "--raw"], 120)
+        except _CommandTimeout as exc:
+            raise ambiguous(str(exc)) from exc
         if out.returncode != 0:
             raise RentError(f"vastai create failed for offer {offer_id}: "
                             f"{(out.stderr or out.stdout).strip()}")
+        # From here the exit code says the request was accepted: anything we cannot read is
+        # AMBIGUOUS, not "no instance" — creating another one could leave two billing.
         try:
             data = json.loads(out.stdout)
         except json.JSONDecodeError:
-            data = {}
+            raise ambiguous(f"unreadable reply: {out.stdout.strip()[:120]!r}") from None
+        if not isinstance(data, dict):
+            raise ambiguous(f"unexpected reply: {out.stdout.strip()[:120]!r}")
+        if "success" in data and not data["success"]:
+            raise RentError(f"vastai create failed for offer {offer_id}: "
+                            f"{out.stdout.strip()[:200]}")
         new_id = data.get("new_contract") or data.get("id")
-        if not data.get("success", True) or not new_id:
-            raise RentError(f"vastai create for offer {offer_id} returned no instance id: "
-                            f"{out.stdout.strip()[:200]} — check 'vastai show instances-v1'")
+        if not new_id:
+            raise ambiguous(f"no instance id in the reply: {out.stdout.strip()[:120]!r}")
         return str(new_id)
 
     def instance_status(self, instance_id: str) -> dict:
@@ -115,6 +143,14 @@ class RealVastApi:
 
     def destroy_instance(self, instance_id: str) -> None:
         VastCtl().destroy(str(instance_id))
+
+    def instance_exists(self, instance_id: str) -> bool:
+        try:
+            pods = VastCtl().list_pods()
+        except RuntimeError as exc:
+            raise RentError(f"could not verify whether instance {instance_id} still exists: "
+                            f"{exc}") from exc
+        return any(p.pod_id == str(instance_id) for p in pods)
 
     def ssh_url(self, instance_id: str) -> str:
         out = self._run(["vastai", "ssh-url", str(instance_id)], 60)
@@ -135,9 +171,19 @@ class RentConfig:
     pin: str | None = None
 
     @property
-    def query(self) -> str:
+    def filters(self) -> str:
         return (f"gpu_name={self.gpu} num_gpus=1 disk_space>={self.disk_gb} "
                 f"reliability>{self.reliability} rentable=true")
+
+    @property
+    def query(self) -> str:
+        return self.filters
+
+    def machine_query(self, machine_id: int) -> str:
+        # Same filters as the base search: rank() does not re-check GPU model, GPU count, disk
+        # or reliability, so a known-good host's other-GPU or multi-GPU offer would otherwise
+        # rank first and be rented.
+        return f"machine_id={machine_id} {self.filters}"
 
 
 @dataclass(frozen=True)
@@ -156,7 +202,7 @@ def gather_offers(api: VastApi, cfg: RentConfig, board: Scoreboard, log) -> list
     offers = list(api.search_offers(cfg.query))
     for machine_id in board.known_good(limit=KNOWN_GOOD_QUERIES):
         try:
-            offers += api.search_offers(f"machine_id={machine_id} rentable=true")
+            offers += api.search_offers(cfg.machine_query(machine_id))
         except RentError as exc:
             log(f"machine_id={machine_id} lookup failed: {exc}")
     return dedupe(offers)
@@ -181,17 +227,54 @@ def _wait_running(api: VastApi, instance_id: str, deadline_s: float, *, now, sle
         sleep(POLL_S)
 
 
-def _abandon(api: VastApi, instance_id: str, on_released, log, *, best_effort: bool) -> None:
+def _safe(fn: Callable[[], None], what: str, log) -> None:
+    """Run advisory bookkeeping: a failure is logged, never allowed to abort a rent."""
+    try:
+        fn()
+    except Exception as exc:
+        log(f"could not update {what}: {exc}")
+
+
+def _still_listed(api: VastApi, instance_id: str, polls: int, sleep) -> str | None:
+    """None once the instance is gone; otherwise why we cannot say it is."""
+    why = "unknown"
+    for n in range(polls):
+        try:
+            if not api.instance_exists(instance_id):
+                return None
+            why = "it is still listed after the destroy"
+        except Exception as exc:
+            why = f"it could not be verified gone ({exc})"
+        if n < polls - 1:
+            sleep(VERIFY_SLEEP_S)
+    return why
+
+
+def _abandon(api: VastApi, instance_id: str, on_released, log, sleep, *,
+             best_effort: bool) -> None:
+    """Destroy `instance_id` and PROVE it is gone by re-listing; an exit code proves nothing.
+
+    best_effort=True is the unwinding path (an exception is already in flight): check once and
+    never raise, but say STILL BILLING loudly. Otherwise a failure raises, so the caller stops
+    renting instead of stacking a second instance on a first that still bills.
+    """
+    destroy_err = None
     try:
         api.destroy_instance(instance_id)
     except Exception as exc:
-        if best_effort:
-            log(f"could not destroy {instance_id} while unwinding: {exc}")
-            return
-        raise RentError(
-            f"instance {instance_id} could NOT be destroyed ({exc}) — it is STILL BILLING. "
-            f"Destroy it by hand: vastai destroy instance {instance_id}") from exc
-    on_released(instance_id)
+        destroy_err = exc
+    problem = _still_listed(api, instance_id, 1 if best_effort else VERIFY_POLLS, sleep)
+    if problem is None:
+        _safe(lambda: on_released(instance_id),
+              f"GPU_INSTANCE_ID after destroying {instance_id} (.env may hold a stale id)", log)
+        return
+    why = f"the destroy failed ({destroy_err}) and {problem}" if destroy_err else problem
+    msg = (f"instance {instance_id}: {why} — it is STILL BILLING. "
+           f"Destroy it by hand: vastai destroy instance {instance_id}")
+    if best_effort:
+        log(msg)
+        return
+    raise RentError(msg) from destroy_err
 
 
 def _record(board: Scoreboard, machine_id: int | None, pull_s: float | None, outcome: str,
@@ -222,34 +305,46 @@ def rent(api: VastApi, cfg: RentConfig, board: Scoreboard, *, confirm: bool,
 
     pulls = 0
     create_failures = 0
+    bad_machines: set = set()        # one machine can carry several offers: don't retry a failure
     for cand in ranked:
         if pulls >= 1 + MAX_PULL_RETRIES:
             break
+        if cand.machine_id is not None and cand.machine_id in bad_machines:
+            continue
         try:
             instance_id = api.create_instance(cand.offer["id"], image=cfg.image,
                                               disk_gb=cfg.disk_gb, label=VAST_LABEL)
+        except AmbiguousCreate:
+            raise                    # an instance may exist: stop, never create a second one
         except RuntimeError as exc:
             create_failures += 1
             log(f"create failed for offer {cand.offer['id']}: {exc}")
             if create_failures >= MAX_CREATE_FAILURES:
                 break
             continue
+        # Say the id at once (stderr), before any bookkeeping that could fail.
+        log(f"created instance {instance_id} from offer {cand.offer['id']} "
+            f"(machine {cand.machine_id})")
         pulls += 1
-        on_created(instance_id)
         try:
+            # First inside the try: if recording the id fails or Ctrl-C lands here, the
+            # instance we just created must still be destroyed.
+            on_created(instance_id)
             state, elapsed = _wait_running(api, instance_id, cfg.pull_deadline_s,
                                            now=now, sleep=sleep, log=log)
         except BaseException:
-            _abandon(api, instance_id, on_released, log, best_effort=True)
+            _abandon(api, instance_id, on_released, log, sleep, best_effort=True)
             raise
         if state == "running":
             _record(board, cand.machine_id, elapsed, "ok", now())
-            persist()
+            _safe(persist, "the machine scoreboard", log)
             return RentResult(instance_id, cand, ranked, elapsed)
-        _abandon(api, instance_id, on_released, log, best_effort=False)
+        _abandon(api, instance_id, on_released, log, sleep, best_effort=False)
+        if cand.machine_id is not None:
+            bad_machines.add(cand.machine_id)
         _record(board, cand.machine_id, elapsed,
                 "slow_pull" if state == "timeout" else "failed", now())
-        persist()
+        _safe(persist, "the machine scoreboard", log)
         log(f"offer {cand.offer['id']} (machine {cand.machine_id}): {state} after "
             f"{elapsed:.0f}s — destroyed, trying the next machine")
     raise RentError(f"no machine reached 'running' within {cfg.pull_deadline_s:.0f}s "
