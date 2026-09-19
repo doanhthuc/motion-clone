@@ -327,7 +327,30 @@ class TestVastCtl(unittest.TestCase):
         with self.assertRaises(RuntimeError) as cm:
             VastCtl().destroy("1")
         self.assertIn("no such instance", str(cm.exception))
+
+    @patch("subprocess.run", side_effect=FileNotFoundError("vastai"))
+    def test_a_missing_binary_is_a_runtime_error_not_a_crash(self, _run):
+        # The VPS may not have vastai installed. A FileNotFoundError escaping list_pods() would
+        # abort the whole watchdog tick and blind the RunPod scan too; tick() only catches
+        # RuntimeError, so that is what a provider that cannot be listed must raise.
+        with self.assertRaises(RuntimeError) as cm:
+            VastCtl().list_pods()
+        self.assertIn("vastai", str(cm.exception))
+
+    @patch("time.sleep")
+    @patch("subprocess.run", side_effect=FileNotFoundError("vastai"))
+    def test_destroy_with_a_missing_binary_is_a_runtime_error(self, _run, _sleep):
+        with self.assertRaises(RuntimeError):
+            VastCtl().destroy("1")
+
+    @patch("subprocess.run",
+           side_effect=subprocess.TimeoutExpired(cmd="vastai", timeout=60))
+    def test_a_hung_cli_is_a_runtime_error(self, _run):
+        with self.assertRaises(RuntimeError):
+            VastCtl().list_pods()
 ```
+
+Add `import subprocess` to the imports at the top of `scripts/tests/test_batch_podctl.py` (it currently imports `json`, `sys`, `unittest`, `Path` and `unittest.mock` names, not `subprocess`).
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -354,8 +377,13 @@ class VastCtl:
     """
 
     def list_pods(self) -> list[PodInfo]:
-        out = subprocess.run(["vastai", "show", "instances-v1", "--raw", "--all"],
-                             capture_output=True, text=True, timeout=60)
+        try:
+            out = subprocess.run(["vastai", "show", "instances-v1", "--raw", "--all"],
+                                 capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError) as exc:
+            # OSError covers a vastai that is not installed (likely on the VPS); tick() catches
+            # only RuntimeError, so anything else would take the RunPod scan down with it.
+            raise RuntimeError(f"could not run vastai: {exc}") from exc
         if out.returncode != 0:
             raise RuntimeError(f"vastai show instances-v1 failed: {out.stderr.strip()}")
         try:
@@ -373,8 +401,11 @@ class VastCtl:
         The prompt is answered by piping `y` rather than passing `-y`, so this works on CLI
         versions that predate the flag (the Makefile's gpu-destroy does the same).
         """
-        out = subprocess.run(["vastai", "destroy", "instance", pod_id],
-                             input="y\n", capture_output=True, text=True, timeout=120)
+        try:
+            out = subprocess.run(["vastai", "destroy", "instance", pod_id],
+                                 input="y\n", capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(f"could not run vastai: {exc}") from exc
         if out.returncode != 0:
             raise RuntimeError(
                 f"vastai destroy instance {pod_id} failed: {out.stderr.strip()}")
