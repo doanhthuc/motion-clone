@@ -199,16 +199,20 @@ else
 	@# Verify against the same listing VastCtl.list_pods reads (instances-v1, --all because the
 	@# default page hides instances). If the listing itself fails we know nothing: say so and keep
 	@# .env, whose id is the only handle for destroying it by hand. The id is matched as a JSON
-	@# value so 12345 does not match 123456.
+	@# value so 12345 does not match 123456. Two more ways to know nothing: output that exits 0 but
+	@# is not a listing (an auth error has no instance id either, and read as "gone"; the real shape,
+	@# checked 2026-09-19, is {"instances": [...], "next_token": ..., "success": true}), and an id
+	@# with trailing whitespace in .env, which never matched a row (the id is stripped before use).
 	@listing="$$(vastai show instances-v1 --raw --all 2>&1)"; rc=$$?; \
-	if [ $$rc -ne 0 ]; then \
-		echo "COULD NOT VERIFY — instance $(call env,GPU_INSTANCE_ID) may still be billing."; \
+	case "$$listing" in *'"instances"'*) shape=ok;; *) shape=bad;; esac; \
+	if [ $$rc -ne 0 ] || [ "$$shape" != ok ]; then \
+		echo "COULD NOT VERIFY — instance $(strip $(call env,GPU_INSTANCE_ID)) may still be billing."; \
 		echo "$$listing"; \
-		echo "Check by hand: vastai show instances-v1 --raw --all (then vastai destroy instance $(call env,GPU_INSTANCE_ID))"; \
+		echo "Check by hand: vastai show instances-v1 --raw --all (then vastai destroy instance $(strip $(call env,GPU_INSTANCE_ID)))"; \
 		exit 1; \
-	elif printf '%s\n' "$$listing" | grep -Eq '"id": *$(call env,GPU_INSTANCE_ID)([^0-9]|$$)'; then \
-		echo "STILL ALIVE — instance $(call env,GPU_INSTANCE_ID) was NOT destroyed and is STILL BILLING."; \
-		echo "Destroy it by hand: vastai destroy instance $(call env,GPU_INSTANCE_ID)"; \
+	elif printf '%s\n' "$$listing" | grep -Eq '"id": *$(strip $(call env,GPU_INSTANCE_ID))([^0-9]|$$)'; then \
+		echo "STILL ALIVE — instance $(strip $(call env,GPU_INSTANCE_ID)) was NOT destroyed and is STILL BILLING."; \
+		echo "Destroy it by hand: vastai destroy instance $(strip $(call env,GPU_INSTANCE_ID))"; \
 		exit 1; \
 	else \
 		echo "destroyed — verified gone from 'vastai show instances-v1'"; \

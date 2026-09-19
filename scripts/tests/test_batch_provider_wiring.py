@@ -136,9 +136,12 @@ class TestGpuDestroyVastVerifyBehaviour(unittest.TestCase):
 
     ID = "12345"
 
-    def _destroy(self, listing: str, rc: int = 0) -> tuple[subprocess.CompletedProcess, bool]:
+    def _destroy(self, listing: str, rc: int = 0,
+                 env_id: str | None = None) -> tuple[subprocess.CompletedProcess, bool]:
         d = Path(tempfile.mkdtemp())
-        (d / ".env").write_text(f"GPU_PROVIDER=runpod\nGPU_INSTANCE_ID={self.ID}\n", encoding="utf-8")
+        # env_id lets a test put trailing whitespace on the id in .env.
+        gpu_id = env_id if env_id is not None else self.ID
+        (d / ".env").write_text(f"GPU_PROVIDER=runpod\nGPU_INSTANCE_ID={gpu_id}\n", encoding="utf-8")
         (d / "Makefile").write_text((ROOT / "Makefile").read_text(encoding="utf-8"), encoding="utf-8")
         (d / "scripts").mkdir()
         (d / "scripts" / "env-clear-pod.sh").write_text(
@@ -168,22 +171,46 @@ class TestGpuDestroyVastVerifyBehaviour(unittest.TestCase):
         self.assertFalse(cleared, ".env was cleared although nothing was verified")
 
     def test_an_instance_still_listed_is_still_alive_and_keeps_env(self):
-        out, cleared = self._destroy(f'[\n  {{\n    "id": {self.ID},\n    "label": "x"\n  }}\n]')
+        out, cleared = self._destroy(
+            f'{{"instances": [\n  {{\n    "id": {self.ID},\n    "label": "x"\n  }}\n], "next_token": null}}')
         self.assertNotEqual(out.returncode, 0)
         self.assertIn("STILL ALIVE", out.stdout)
         self.assertFalse(cleared)
 
     def test_a_longer_id_that_merely_starts_with_ours_does_not_count(self):
-        out, cleared = self._destroy(f'[{{"id": {self.ID}6, "label": "x"}}]')
+        out, cleared = self._destroy(f'{{"instances": [{{"id": {self.ID}6, "label": "x"}}]}}')
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn("verified gone from 'vastai show instances-v1'", out.stdout)
         self.assertTrue(cleared)
 
     def test_a_gone_instance_is_verified_and_env_cleared(self):
-        out, cleared = self._destroy("[]")
+        out, cleared = self._destroy('{"instances": [], "next_token": null}')
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn("verified gone", out.stdout)
         self.assertTrue(cleared)
+
+    def test_output_that_is_not_a_listing_is_not_read_as_gone_even_with_exit_zero(self):
+        # An auth error printed by a CLI that still exits 0 contains no instance id either, and
+        # used to read as "verified gone" while the instance kept billing.
+        out, cleared = self._destroy("Error: invalid API key", rc=0)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("COULD NOT VERIFY", out.stdout)
+        self.assertFalse(cleared, ".env was cleared although nothing was verified")
+
+    def test_an_empty_listing_object_is_gone(self):
+        out, cleared = self._destroy('{"instances": [], "next_token": null}')
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("verified gone", out.stdout)
+        self.assertTrue(cleared)
+
+    def test_trailing_whitespace_on_the_env_id_still_finds_a_live_instance(self):
+        # `GPU_INSTANCE_ID=12345   ` expanded into the id regex and never matched a real row, so a
+        # live instance read as gone.
+        out, cleared = self._destroy(
+            '{"instances": [{"id": 12345, "label": "x"}]}', env_id="12345   ")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("STILL ALIVE", out.stdout)
+        self.assertFalse(cleared)
 
 
 class TestLeaseDecidesTheDestroyProvider(unittest.TestCase):
