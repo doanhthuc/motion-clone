@@ -625,7 +625,7 @@ phase_ollama() {
 }
 
 phase_comfyui() {
-  say "7/11 · GPU / ComfyUI native — chỉ custom node của $FEATURE, KHÔNG tải model"
+  say "7/11 · GPU / ComfyUI native — chỉ custom node của $FEATURE, KHÔNG tải model (trừ khi VAST_MODEL_IDS được đặt cho Vast)"
   COMFY_DIR="${COMFY_DIR:-$HOME_DIR/ComfyUI}"
   set_kv COMFY_MODELS_DIR "$COMFY_DIR/models"
   GPU_OK=0
@@ -674,6 +674,23 @@ phase_comfyui() {
         git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git "$COMFY_DIR" || warn "clone ComfyUI lỗi."
       fi
     fi
+
+    # Background the manifest's model download here (Vast only -- RunPod already has a
+    # persistent Network Volume and its own manual CPU-pod preload workflow, see
+    # docs/gpu-pod.md#preload). $COMFY_DIR/models already exists from the ComfyUI clone above.
+    # Measured 2026-09-19 (spec section 3.3): ~34.4 GB in 137s, well inside the ~200s the
+    # pip/custom-node install below takes on its own, so running both together costs about what
+    # the slower one costs alone instead of the sum of the two.
+    PRELOAD_PID=""
+    if [ -n "${VAST_MODEL_IDS:-}" ]; then
+      say "    Vast: bắt đầu tải model của manifest, chạy nền song song với cài đặt bên dưới…"
+      ID_ARGS=()
+      for _id in $VAST_MODEL_IDS; do ID_ARGS+=(--id "$_id"); done
+      ( MODELS_DIR="$COMFY_DIR/models" CATALOG="$CATALOG_FILE" bash "$ROOT/setup/preload-models.sh" "${ID_ARGS[@]}" \
+          >/tmp/preload-models.log 2>&1 ) &
+      PRELOAD_PID=$!
+    fi
+
     [ -x "$COMFY_DIR/venv/bin/python" ] || python3 -m venv "$COMFY_DIR/venv"
     CPIP="$COMFY_DIR/venv/bin/pip"
     "$CPIP" install -q --upgrade pip wheel >/dev/null
@@ -730,6 +747,27 @@ phase_comfyui() {
       warn "SageAttention không phù hợp GPU này → giữ sdpa."
     fi
     ok "ComfyUI + custom node ($(echo $COMFY_NODES | wc -w) node) ở $COMFY_DIR"
+
+    if [ -n "$PRELOAD_PID" ]; then
+      say "    đợi tải model của manifest xong (chạy nền ở trên)…"
+      PRELOAD_OK=1
+      wait "$PRELOAD_PID" || PRELOAD_OK=0
+      # A missing catalog id is NOT a preload-models.sh failure (its own UNKNOWN handling is a
+      # deliberate skip-and-warn for manual callers) -- but for THIS automated, registry-driven
+      # call it means the box will silently run a motion job without a model it needs (e.g.
+      # wan-vitpose-onnx missing -> silent DWPose fallback), so it must not be treated as success
+      # here even though the script itself exits 0.
+      if grep -q 'không có trong catalog' /tmp/preload-models.log 2>/dev/null; then
+        PRELOAD_OK=0
+      fi
+      if [ "$PRELOAD_OK" = 1 ]; then
+        ok "model của manifest đã tải xong (/tmp/preload-models.log)"
+      else
+        die "tải model của manifest LỖI hoặc THIẾU id trong catalog — xem /tmp/preload-models.log.
+  Sửa xong thì chạy lại tay:
+    CATALOG=$CATALOG_FILE MODELS_DIR=$COMFY_DIR/models bash setup/preload-models.sh --id <id> [--id <id> ...]"
+      fi
+    fi
 
     # Thư mục uploads (model user tự upload) + extra_model_paths.
     UP="$COMFY_DIR/models/uploads"; mkdir -p "$UP"/{loras,checkpoints,unet,vae,text_encoders,clip_vision} "$UP/.tmp"

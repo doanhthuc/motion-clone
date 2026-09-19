@@ -93,6 +93,52 @@ class TestProgressText(unittest.TestCase):
         self.assertIn("running the try-on", text.lower())
 
 
+class TestProgressTextProvider(unittest.TestCase):
+    """A Vast run must never be priced at the flat RunPod $0.99/h (spec §3.5)."""
+
+    def setUp(self):
+        self.manifest = Path(tempfile.mkdtemp()) / "m.yaml"
+        self.manifest.write_text("runs: []", encoding="utf-8")
+        state_path_for(self.manifest).write_text(json.dumps(STATE), encoding="utf-8")
+        self.now = 1_000_000.0
+
+    def _text(self, provider_of_lease=None, **kwargs):
+        lease = None
+        if provider_of_lease is not None:
+            lease = Lease(pod_id="p1", provisioned_at=self.now - 3600.0,
+                          manifest=str(self.manifest), abs_max_min=240,
+                          provider=provider_of_lease)
+        with mock.patch("time.time", return_value=self.now):
+            return progress_text(self.manifest, lease=lease, **kwargs)
+
+    def test_a_runpod_lease_keeps_the_flat_rate_line(self):
+        text = self._text("runpod")
+        self.assertIn("60m00s on the pod · 💸 $0.99 so far", text)
+        self.assertNotIn("Vast", text)
+
+    def test_a_vast_lease_with_a_quoted_rate_shows_an_estimate_at_that_rate(self):
+        text = self._text("vast", usd_per_hr=0.90)
+        self.assertIn("60m00s on Vast.ai · 💸 ≈$0.90 so far (quoted $0.90/h)", text)
+        self.assertNotIn("$0.99", text)
+
+    def test_a_vast_lease_without_a_rate_shows_time_only_not_the_runpod_figure(self):
+        text = self._text("vast")
+        self.assertIn("60m00s on Vast.ai", text)
+        self.assertNotIn("💸", text)
+
+    def test_the_lease_provider_outranks_the_argument(self):
+        text = self._text("vast", provider="runpod", usd_per_hr=0.90)
+        self.assertIn("on Vast.ai", text)
+
+    def test_with_no_lease_the_argument_names_who_we_are_waiting_for(self):
+        empty = Path(tempfile.mkdtemp()) / "none.yaml"
+        empty.write_text("runs: []", encoding="utf-8")
+        state_path_for(empty).write_text(
+            json.dumps({"batch": "2026-09-16-0900", "runs": {}}), encoding="utf-8")
+        self.assertIn("waiting for Vast.ai", progress_text(empty, lease=None, provider="vast"))
+        self.assertIn("waiting for the pod", progress_text(empty, lease=None))
+
+
 class _FakeProc:
     """Stands in for subprocess.Popen: only .poll() is ever read by drain_running."""
     def __init__(self, poll_return):
@@ -209,6 +255,25 @@ class TestStartDrain(unittest.TestCase):
         argv = self._argv_for(dry_run=False)
         self.assertEqual(argv, ["make", "drain", f"FILE={self.manifest}", "CONFIRM=yes"])
 
+    def test_a_vast_provider_is_forwarded_before_the_confirm_gate(self):
+        with mock.patch("tgbot.run.subprocess.Popen") as popen:
+            start_drain(self.manifest, dry_run=False, gpu_provider="vast")
+        self.assertEqual(popen.call_args[0][0],
+                         ["make", "drain", f"FILE={self.manifest}", "PROVIDER=vast",
+                          "CONFIRM=yes"])
+
+    def test_a_vast_dry_run_forwards_the_provider_and_still_never_confirms(self):
+        with mock.patch("tgbot.run.subprocess.Popen") as popen:
+            start_drain(self.manifest, dry_run=True, gpu_provider="vast")
+        self.assertEqual(popen.call_args[0][0],
+                         ["make", "drain", f"FILE={self.manifest}", "PROVIDER=vast"])
+
+    def test_an_unknown_provider_is_refused_before_anything_starts(self):
+        with mock.patch("tgbot.run.subprocess.Popen") as popen:
+            with self.assertRaises(ValueError):
+                start_drain(self.manifest, dry_run=False, gpu_provider="aws")
+        popen.assert_not_called()
+
     def test_output_goes_to_a_log_file_beside_the_manifest_not_a_pipe(self):
         # A drain runs for the lifetime of a rented pod. A Popen pipe nobody
         # reads fills its OS buffer and deadlocks the child mid-batch.
@@ -216,6 +281,16 @@ class TestStartDrain(unittest.TestCase):
             start_drain(self.manifest, dry_run=True)
         self.assertTrue(self.manifest.with_suffix(".drain.log").exists())
         self.assertIsNot(popen.call_args.kwargs["stdout"], subprocess.PIPE)
+
+    def test_runs_in_its_own_process_group(self):
+        # F2/C2: a bare `proc.terminate()` (SIGTERM to this one process) does not reach
+        # drain.py's `finally` or the vast_rent.py it spawns, and the bot's SIGTERM used to be
+        # sent to only THIS Popen — an orphaned vast_rent.py kept renting after /kill gave up.
+        # start_new_session=True puts make/drain.py/vast_rent together in one process group so
+        # a single killpg reaches all of them (bot.py's _do_kill).
+        with mock.patch("tgbot.run.subprocess.Popen") as popen:
+            start_drain(self.manifest, dry_run=True)
+        self.assertTrue(popen.call_args.kwargs.get("start_new_session"))
 
 
 class TestStartDrainArgv(unittest.TestCase):

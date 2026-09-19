@@ -353,6 +353,344 @@ Muốn thuê máy chậm vẫn được — script nói rõ phân bố `disk_bw`
 RunPod không cần hai biến này: secure cloud là phần cứng datacenter đồng đều, không có phương sai
 kiểu chợ.
 
+> **Price note, re-measured 2026-09-19.** The `$0.336/hr` above is from 2026-08-01 and no longer
+> holds. Across 40 RTX 5090 offers that day, the cheapest one passing `MIN_DISK_BW=3000` +
+> `MIN_CPU_GHZ=2.5` was **$0.536/hr**; the machine actually rented for the cold-start probe below
+> was **$0.822/hr**. Still well under RunPod's measured $1.00/hr, but the gap is ~45%, not ~66%.
+
+<a id="vast-ghcr"></a>
+### Vast cold start: the wire is fast, the image pull is not — measured twice, 2026-09-19
+
+Probe to answer "can a stateless vast box (no Network Volume, models pulled at boot) reach a usable
+state inside 10 minutes?" Two RTX 5090 hosts, both rented with the real prebuilt image (60 layers,
+17.38 GB compressed). Total spend for both probes: **$0.277.**
+
+| | Washington US | Bulgaria |
+|---|---|---|
+| Price / advertised `inet_down` | $0.822/hr / 1593 Mbps | $0.8185/hr / 2038 Mbps |
+| `vastai create` → `running` (image pull + container start) | **556 s** | **325 s** |
+| `aria2c -x16` from **huggingface.co** | 241.7 MB/s | **295.8 MB/s** |
+| `aria2c -x16` from **ghcr.io** (one 4 GB image layer) | 15.9 MB/s | **229.8 MB/s** |
+| **R2** download, 4 GiB, presigned GET, `aria2c -x16` cold / warm / `-x4` | not measured | **196.6 / 204.5 / 192.6 MB/s** |
+| **R2** upload, 4 GiB, one stream, presigned PUT | not measured | 46.5 MB/s |
+
+What this settles, and what it overturns:
+
+- **The first probe's headline was wrong.** It concluded "ghcr.io is ~15× slower than HuggingFace, and
+  that is the bottleneck". The second host reads ghcr at 229.8 MB/s — 14× faster — so the 15.9 MB/s at
+  Washington was a property of that host's route (or a transient throttle), not of ghcr. The docker
+  pull there also finished at ≥31 MB/s effective, *faster* than the 15.9 MB/s single-blob probe, which
+  means that probe was not even a fair stand-in for what `docker pull` does.
+- **On the fast host the wire is not the bottleneck either.** 17.38 GB at 229.8 MB/s is ~76 s of
+  transfer, yet create→running took 325 s. Roughly **250 s is not network**: layer decompress/extract
+  (32-41 GB unpacked, per the section below), container creation, Vast's own scheduling. This split is
+  inferred from subtraction, not measured directly.
+- **R2 is fast enough, and needs few streams.** ~197-205 MB/s from Bulgaria: ~80% of the advertised
+  `inet_down`, a bit under HuggingFace (295.8) and ghcr (229.8) on the same wire. Cold and warm are the
+  same (no cache effect), and `-x4` (192.6) is within 2% of `-x16` (196.6) — for one large file on
+  this host, more than ~4 streams bought nothing. 34.4 GB of models is ~170 s from R2 vs ~116 s from HF.
+- **Models do not need to live in R2.** 31 of 32 catalog models already come from huggingface.co,
+  which was the *fastest* source on both hosts. R2's job is replacing MinIO (material + output, tens
+  of MB per job), not carrying weights.
+
+**The lever is the host's layer cache: 325 s cold → 35 s warm.** Re-renting the *same machine*
+(`machine_id=144253`, offer `45089956`, listed again 15 minutes after the first destroy) with the same
+image reached `running` in **35 s** against 325 s on its first rental — **−89%**. vast hosts keep docker
+layers after the instance is destroyed. So ~290 s of the cold start is pull + extract; raw transfer
+alone would be ~76 s at the measured 229.8 MB/s, and the remaining ~214 s is *inferred* to be
+decompress / extract / disk / container creation (not separately measured). Not yet known: how long a
+host keeps the cache (only a 15-minute gap was tested) and how often a known machine is rentable.
+`vastai search offers 'machine_id=<id>'` returns that machine's offers directly, outside the ~40-row
+random sample above, so a known machine can be probed deterministically.
+
+Serial budget with Bulgaria numbers (108 s bootstrap is the *RunPod* figure, not yet measured on vast):
+
+| | image | + bootstrap | + models (HF … R2) | total |
+|---|---|---|---|---|
+| host cache **warm** | 35 s | 108 s | 116–170 s | **259–313 s** |
+| host cache **cold** | 325 s | 108 s | 116–170 s | **549–603 s** |
+
+Why "slim base + `/opt/mtc-prebuilt` tarball from R2" is *not* the first thing to try: of the 17.38 GB,
+**10.56 GB (61%, 34 layers) is the `runpod/pytorch` base** and 6.81 GB (26 layers) is ours, so thinning
+would help — but the Dockerfile also bakes `postgresql`, `nodejs` + `pm2`, `ffmpeg`/`aria2`, Ollama
+(unpacked into `/usr`) and MinIO into *system* layers, so a tarball of `/opt/mtc-prebuilt` alone does
+not restore a working box on a thin base; it would take a separate vast Dockerfile (RunPod needs a
+`runpod/*` base for its `/start.sh`, [§1](#runpod-gotchas)). The base's own torch 2.8/cu128 is dead
+weight — the venvs deliberately do not inherit it (`Dockerfile:41-45`) — which makes that route
+plausible later, but the warm-cache result makes it lower priority. Not tried.
+
+**Do not extrapolate boot time from `inet_down` for a docker pull.** The line-rate model (70% of
+advertised) predicted 116 s for the Washington pull and got 556 s (4.8×); for the 34.4 GB aria2c model
+download it predicted ~150 s and the measured 241.7 MB/s implies 142 s. Good for multi-connection HTTP,
+worthless for `docker pull`.
+
+**Bandwidth is billed per GB, from ~$0 to $40/TB.** `internet_down_cost_per_tb` across qualifying 5090
+offers: Hungary a flat **$40/TB** (a 50 GB boot = $2.00; 28 of 66 qualifying offers, also the priciest
+per hour), Czechia $2.7-38.7, US $0.7-10.7, Spain $9.3, **Bulgaria $1.37**, Puerto Rico ~$0. Pick by
+*total session cost*, never by count of hosts in a region. Also: vast's SSH **proxy** (`ssh4.vast.ai`)
+rejected the registered key on the Bulgarian host while the **direct** `ip:port` accepted it — use
+`vastai ssh-url` / the direct address, and `-o IdentitiesOnly=yes -i <key>` when the agent holds several.
+
+<a id="vast-e2e"></a>
+### A full stateless vast session works end to end — measured 2026-09-19
+
+One RTX 5090 (Bulgaria, `machine_id=144253`, $0.8185/hr, image layers already cached from earlier
+rentals), `GPU_PROVIDER=vast`, `POD_VOLUME` empty, `MTC_PREBUILT=1`, `SETUP_PROFILE=full`,
+`JOB_TYPES_OVERRIDE=motion`. **`make gpu-smoke` with a real motion job: `✓ smoke test passed`, exit 0**;
+the output (544×960, 33 frames @16 fps) was inspected frame by frame — one coherent character, pose
+changing across frames, not a blank/black file that merely clears the size floor. Session cost
+**$0.19 for 10.8 minutes** (rental ~$0.15 + ~$0.05 bandwidth for the 34.4 GB of models).
+
+| Step | Measured |
+|---|---|
+| `vastai create` → `running` (cache warm) | 32 s |
+| SSH answering (direct address) | 49 s after create |
+| `make gpu-bootstrap` (exit 0) | 200 s — ran *concurrently* with the model download |
+| 8 models, 34.4 GB (`preload-models.sh --group "Wan 2.2 Animate (motion-transfer)"`) | 137 s ≈ 251 MB/s, 0 errors |
+| link models into `$COMFY_DIR/models` (`cp -aln`, hard links) + `pm2 restart comfyui` | 0.01 s + ~15 s |
+| `gpu-smoke` layers 1-4 (tunnel, API+Postgres, PM2, Wan nodes), 7 (motion job) | 101 s total; 5-6 skip cleanly without a volume |
+
+Overlapping the model download with bootstrap works: network (models) and CPU/disk (bootstrap) do
+not starve each other enough to matter, so setup costs `max(200, 137)` s, not the sum. Automated
+end to end that is ≈ 32 + 17 + 200 + 15 ≈ **265 s (4.4 min) on a warm host**, and ≈ 557 s (9.3 min)
+on a cold one (325 s image pull instead of 32 s) — both under 10 minutes, the cold one narrowly.
+
+How it was run (all manual — this is the list of things a vast fallback has to automate):
+
+1. `.env`: `GPU_PROVIDER=vast`, `POD_VOLUME=` (empty), `JOB_TYPES_OVERRIDE=` only the types whose
+   models will be loaded (a type claimed without its models fails; a type missing from the list sits
+   `queued` forever). `make gpu-preflight` passes; its POD_VOLUME warning is expected.
+2. Rent by `machine_id`, not by the sampled search: `vastai search offers 'machine_id=N rentable=true'`.
+3. **Write the direct SSH address** (`vastai ssh-url <id>`) into `GPU_SSH_HOST/PORT`. `pod-wait.sh`
+   writes vast's *proxy* address, which rejected the registered key on this host.
+4. Copy `preload-models.sh` + the catalog to the box and start the download in the background with
+   `POD_VOLUME=/root/vol CATALOG=<catalog-motion-transfer.json>` — `preload-models.sh` only needs
+   `[ -d "$POD_VOLUME" ]`, unlike `pod-volume.sh:73` which demands a real mountpoint.
+5. Start `make gpu-bootstrap` at the same time. Afterwards `cp -aln /root/vol/comfy-models/. $COMFY_DIR/models/`
+   (same filesystem, so instant and no second 34 GB) and `pm2 restart comfyui`.
+6. `SMOKE_REF=… SMOKE_DRIVER=… make gpu-smoke`, then destroy. **vast has no `--terminate-after`**:
+   this run armed a 45-minute `vastai destroy` in the background as its only guard against forgetting.
+
+Found on the way, not caused by vast:
+
+- **The prebuilt image is stale.** Bootstrap logged `node_modules dựng sẵn thiếu dependency → cài lại
+  tại chỗ` for image `sha-0cbe433`: `api/package.json` has moved on, so `npm install` reruns at every
+  boot. That is part of why this bootstrap took 200 s against the 108 s measured on RunPod (the model
+  download running alongside is the other suspect; the two are not separated).
+- **`make gpu-bootstrap` prints `NUXT_MOTION_API_KEY` in its final output** and emails the connection
+  details each run. Anything capturing that log (CI, a chat transcript) captures the key.
+- `make gpu-preflight` reports `DS_DEFAULT_JOB_TYPES` in `lib-deploy-shape.sh` out of step with
+  `mc-dispatcher.js`; irrelevant to `WORKER_SOURCE=local`.
+
+Still unproven: how long a host keeps its layer cache (longest gap tried: ~10 min), how often a known
+machine is rentable, what a host dropping mid-job costs, and every job type except `motion`
+(tryon / create-image need other model groups — 31 GB for `Qwen-Image-Edit` alone).
+
+<a id="vast-search-sampling"></a>
+### `vastai search offers` returns a ~40-row random sample, not the market. Measured 2026-09-19
+
+Three *identical* queries seconds apart returned 40 offers each (a server-side cap — `--limit 1000`
+still returns 40), and intersected at only **13**; their union was **67**. Pinning a known-good,
+still-listed offer with `OFFER=<id>` failed **3 of 4 attempts** while renting the probe machine
+above, each time with `offer … is not in the current results`. `machine_id` is only marginally more
+stable than the offer `id` (21 vs 13 rows in common).
+
+Consequence for anything automated: **search and rent must be one atomic motion with retry.**
+"Search, decide, rent later" is not reliable on vast — the best machine you found a minute ago may
+simply be invisible to the next call. `pod-provision.sh` hands the Vast branch to
+`scripts/vast_rent.py` (2026-09-19), which retries across the candidates already found by that
+one search — it does not re-search between attempts, so an `OFFER=` pin (which names a single
+row from that one search) is still flaky by construction; the retry loop only helps once the
+list of candidates is in hand.
+
+<a id="vast-provider"></a>
+### Running one batch on Vast — `PROVIDER=vast` (2026-09-19)
+
+`make drain FILE=batch/<name>.yaml PROVIDER=vast CONFIRM=yes` rents on Vast for that run only. The
+root `.env` keeps `GPU_PROVIDER=runpod`; the provider travels in the process environment and in the
+lease (`batch/pod-lease.json`, field `provider`). A Vast run never has a Network Volume, whatever
+`POD_VOLUME` says in `.env`.
+
+What guards a Vast instance: the lease (tiers 1–2, destroyed through `vastai`) and the label
+`motion-transfer` that `pod-provision.sh` puts on every instance it creates (tier 3, which now lists
+Vast as well as RunPod). `/kill` in the Telegram bot reads the lease's provider. **There is no
+`--terminate-after` on Vast** — the lease's `abs_max_min` is the only hard ceiling.
+
+These guards run only where `vastai` is installed and logged in. On the machine that runs
+`scripts/pod_watchdog.py` (the VPS's `pod-watchdog.service`), `make watchdog-dry` must **not** log
+`cannot list vast pods`; without it every Vast tier degrades to log-and-skip and the only ceiling
+left is the human.
+
+Run the drain on the machine whose `batch/pod-lease.json` the watchdog reads (the VPS). A
+`make drain … PROVIDER=vast` started on a laptop writes its lease on the laptop; the VPS watchdog then
+sees the labelled instance as an unclaimed orphan and tier 3 destroys it about 10 minutes in.
+
+Manual teardown: `make gpu-destroy` picks the provider from the lease when the lease's pod id equals
+`.env`'s `GPU_INSTANCE_ID`. If there is no matching lease, it falls back to `.env`'s
+`GPU_INSTANCE_OWNER` marker (`vast:<id>`, written by `vast_rent.py` the moment it creates an
+instance) — again only when its id matches. If neither matches, use `make gpu-destroy
+GPU_PROVIDER=vast` explicitly — otherwise `.env`'s `runpod` decides.
+
+**Teardown after a rent that fails partway (2026-09-19).** A rent that fails AFTER creating an
+instance (STILL BILLING abandon, `AmbiguousCreate`, an unwind that could not destroy) leaves
+`GPU_INSTANCE_ID` and `GPU_INSTANCE_OWNER=vast:<id>` in `.env` with **no lease at all** — the
+lease rule above cannot help, because a lease is only written once a rent succeeds. The owner
+marker is exactly for this case: `make gpu-destroy` picks Vast from it (id-guarded, so a stale
+marker for some other pod can never steer the destroy) and verifies as usual. The bot's `/kill`
+gets the same behaviour, since it also just runs `make gpu-destroy`. The STILL BILLING message
+`vast_rent.py` prints on this path names `make gpu-destroy GPU_PROVIDER=vast` first (it works
+without a lease) and the raw `vastai destroy instance <id>` as a fallback.
+
+**`/kill` during provisioning (2026-09-19).** Provisioning can take up to ~24 minutes (three
+create attempts × an 8-minute pull deadline, plus verify polls), and `/kill` can land at any
+point in that window. The bot signals the WHOLE process group `start_drain` launched (`make`,
+`drain.py`, and the `vast_rent.py` it spawns), not just the one Popen it tracks — a single
+`os.killpg(..., SIGTERM)` reaches all three, so `vast_rent.py`'s own unwind (destroy the
+just-created instance, verify it, clear `.env`) actually runs instead of being orphaned. The bot
+waits up to 30s for that unwind to finish; if it has not by then, it escalates to
+`os.killpg(..., SIGKILL)` and runs `make gpu-destroy` regardless, exactly as before. Afterwards,
+if anything looks off, check `vastai show instances-v1 --raw --all` directly — that is the same
+listing the destroy verify itself reads.
+
+A failed job is **not** inspectable after `gpu-destroy` on Vast (the database dies with the box, unlike
+RunPod's volume). When anything failed, `teardown()` pulls the post-mortem before destroying:
+`pod-job.log` into `out/<batch>/runs/*/`, and `pod-worker.log` (from `make gpu-logs LOG=worker`) into
+`out/<batch>/`.
+
+**How a machine is chosen (2026-09-19).** `pod-provision.sh` hands the Vast branch to
+`scripts/vast_rent.py`. It searches (a random ~40-row sample) plus a `machine_id=` query for the
+machines it has measured as fast, drops offers that fail the filters (price cap `MAX_DPH`,
+`MIN_DISK_BW`, `MIN_CPU_GHZ`, advertised bandwidth `VAST_MIN_INET_MBPS` default 1000, bandwidth
+price `VAST_MAX_DOWN_USD_PER_TB` default 20, direct ports, blacklist), and ranks the rest by
+`dph × ready_seconds / 3600 + GB × $/TB / 1000`. `ready_seconds` is the machine's own measured
+time from AFTER `vastai create` returns until `actual_status` reads `running` (not from before the
+create call — the search and rank steps before it are not part of this figure), read from
+`batch/vast-machines.json` (git-ignored), or 556 s — the slowest ever seen — for a machine nobody
+has measured. `VAST_GB` is the manifest's actual download size PLUS the measured base-image pull
+(`VAST_IMAGE_GB`, `drain.py`) — computed and exported by `drain.py`'s `provision()` before
+renting; it falls back to the `vast_rent.py` default of 60 only when `pod-provision.sh`/
+`vast_rent.py` is run directly, outside `drain.py`. Every instance is created
+with `--label motion-transfer --cancel-unavail`. If it
+is not `running` after `VAST_PULL_DEADLINE_S` (default 480, clamped to stay under the watchdog's
+10-minute grace minus 60s slack) it is destroyed, the machine is blacklisted for a day, and the
+next candidate is tried — at most two retries. If an abandoned instance cannot be destroyed the
+rent stops and prints `STILL BILLING` with its id, naming `make gpu-destroy GPU_PROVIDER=vast` as
+the recovery. Defaults that are assumptions, calibrated as data arrives: the 1000 Mbps floor and
+the $20/TB ceiling derive from two hosts; the 8-minute deadline derives from the price spread of a
+66-offer search (it must also stay under the watchdog's grace, and a test enforces that).
+
+`pod-wait.sh` uses the direct address from `vastai ssh-url` when it answers (the
+`sshX.vast.ai` proxy rejected the registered key on one host), and the proxy otherwise —
+`parse_ssh_url` now rejects a line that merely LOOKS like `host:port` but is not one (e.g. an
+error such as `Error:404`, which used to be parsed as host `Error` port `404`), and
+`pod-wait.sh` itself falls back to the proxy after 4 consecutive failed ssh probes against a
+direct address, so a plausible-looking but unreachable one cannot lock the wait loop out of the
+proxy for the rest of the timeout.
+
+Not implemented yet, so the first paid session is not surprised by it: `-o IdentitiesOnly=yes -i
+<key>` for ssh when the agent holds several keys (measured need 2026-09-19 — no failure seen yet,
+but nothing here picks a specific key if the ssh-agent offers more than one).
+
+<a id="vast-bot"></a>
+### Choosing Vast from the Telegram bot (2026-09-19)
+
+The Choose GPU screen opens with a `[RunPod] [Vast]` row. RunPod is the default and its screen is
+otherwise unchanged — its own spend button now names `runpod` explicitly in its callback data too
+(`run:go:<token>:runpod` etc., since 2026-09-19; a button minted before that fix has no suffix and
+still falls back to `.env`'s `GPU_PROVIDER`, so keep that at `runpod` on the bot's host regardless).
+The Vast tab shows the best qualifying 5090 offer with its $/h and
+location, this batch's bandwidth and estimated session cost, the cold start, and your Vast credit —
+and no datacenter, stock, Switch-GPU or migrate lines, because a Vast rental has no volume. Its spend
+button is hidden, with the reasons written out, unless all of these hold:
+
+- the manifest's pipeline is listed in `VAST_ENABLED_PIPELINES` (`.env` or the environment,
+  comma-separated). The design's own recommendation was to ship this empty and add a pipeline only
+  after its own paid Vast session — as of 2026-09-19 only the `motion` stage had actually run there —
+  but `.env.example`'s default was set to every pipeline the bot offers that same day, on explicit
+  request, ahead of that per-pipeline verification: the first real rental for each of the other five
+  IS the verification run;
+- every stage has a model-registry entry (`make check-vast-models` keeps the repo side honest);
+- a machine passes the filters. The quote is `VAST_QUOTE=1 bash scripts/pod-provision.sh`, i.e.
+  `vast_rent.py --quote`: one JSON line, never a rental (about 4 s measured, bounded at 120 s);
+- `vastai show user --raw` answers and its `credit` covers the estimated session.
+
+The provider rides in the spend button's callback data (`run:go:<token>:vast`,
+`pa:spend:<token>:vast`, `pa:reuse|rerun:<token>:vast`) and reaches `drain.py --provider vast` for
+that run only; the bot never writes it to `.env`. The spend handlers re-check the same conditions
+when the button is tapped, because buttons outlive the state they were drawn for — all of them except
+the marketplace search, which is replaced by a price quote fetched for this batch's download size in
+the last ten minutes (none, or an older or differently sized one, refuses). A refusal spends nothing,
+keeps the draft, and leaves the panel usable. A RunPod stock-out card gains **Rent on Vast instead**,
+which opens the same panel for that batch, and only while that card's failure is still outstanding.
+
+A job assembled while a drain is already running is queued onto that pod: writing it into the
+mailbox is the queueing, and `drain.py` claims it when the current job ends. A Vast pod has only the
+models of the batch it was rented for, so such a job is checked BEFORE the mailbox write — its
+pipeline must be enabled, its stages registered, and every model it needs already on the pod — and
+is refused otherwise ("Not queued"; the files are kept, and it can be run as its own rental). A
+RunPod pod mounts the whole model volume and is exempt.
+
+The tap-time check needs a price quote from this bot process (the panel fetches it). After a bot
+restart an old Vast spend button therefore refuses ("no current Vast price quote"), and the quote
+cannot be re-fetched from that old panel. For a batch without a local try-on, tap Run and then the
+Vast tab. For a try-on batch, tap Run again (Phase A resumes from the journal, so try-ons already on
+disk are not paid for twice) and open the Vast tab on the rent panel it draws, or use the stock-out
+card's **Rent on Vast instead**.
+
+`GPU=` in `.env` holds the RunPod spelling; `pod-provision.sh` translates it for Vast (`VAST_GPU`
+overrides). Before 2026-09-19 a Vast search with the RunPod name failed outright ("invalid JSON"),
+which only shows once the bot drives a Vast run.
+
+The progress message prices a Vast pod at the rate quoted on the panel (`≈$… so far`, an estimate —
+the offer actually rented can differ, it counts from the lease and leaves out pull time and
+bandwidth, and the invoice is the truth), never at RunPod's flat $0.99;
+`/kill` gives the minutes and no dollar figure for a Vast pod.
+
+**First paid session — assumptions that are NOT verified yet:**
+- The exact `vastai ssh-url` output text (parsed tolerantly) and the `create --raw` reply keys.
+  When `vastai create` prints non-JSON with exit 0 after an offer vanishes, it is **unverified**
+  what text is printed (the code stops at the first vanished offer, tagged `AmbiguousCreate`,
+  instead of moving to the next candidate) — the watchdog reaps the unleased labelled instance
+  after ~10 minutes, and the operator is told to check `vastai show instances-v1`.
+- In `make gpu-destroy`, the destroy verify reads an exit-0 listing that does not contain
+  `"instances"` (the listing key, even on empty) as "could not verify"; error text that itself
+  contains that token is still read as a valid listing (parked hardening: match `"instances": [`).
+- `--label motion-transfer` survives `create` and comes back as `label` in `show instances-v1`.
+  All of tier 3's Vast authority rests on this — if the label does not round-trip, the watchdog
+  can never tell a motion-transfer instance from anyone else's on the same account.
+- `vastai` is installed and authenticated on the VPS watchdog host — **currently it is NOT
+  installed there**. Until it is, no Vast instance has a watchdog backstop at all; the lease and
+  the operator are the only ceilings.
+- `vastai show instance <id> --raw` returns `actual_status` with the literal string `running`
+  (not `"Running"`, not some other spelling) once the instance is up.
+- `machine_id=… gpu_name=… num_gpus=1 disk_space>=… reliability>… rentable=true` is a valid
+  combined query. If Vast rejects (or silently empties) a query with this many clauses, the
+  known-good `machine_id=` lookups never return anything and the scoreboard's whole value
+  silently disappears — with no error, just a search that always falls back to the base query.
+- `show instances-v1 --raw --all` returns everything in one page. `VastCtl.list_pods` now raises
+  if `next_token` is set rather than trusting that, but the assumption itself — that `--all` is
+  enough — is still unverified against a real account with many instances.
+- A scoreboard `pull_s` (create-to-running time) is specific to the IMAGE it was measured with —
+  the 35s warm-pull figure recorded here was one image on machine 144253, not a general property
+  of that machine.
+- The parallel model download inside `phase_comfyui` (`lib-feature.sh`): backgrounding
+  `preload-models.sh` right after the ComfyUI clone and `wait`-ing for it before the rest of
+  bootstrap continues has been read through and shellchecked, but never run on a live pod. If it
+  hangs or the `wait` never returns, the pod is still billing — check `/tmp/preload-models.log`
+  over SSH before assuming a stuck bootstrap is something else.
+- The bot on the VPS needs `vastai` installed and logged in: it runs the quote, reads the credit
+  and starts the drain there — the same gap as the watchdog host, and it is **not installed there
+  yet**. Without it the Vast tab renders and says so, and no button spends.
+- The panel's cold-start and session-cost figures are estimates built from two hosts (warm 4.4 min,
+  cold 9.3 min, `BOOT_AFTER_RUNNING_S` = 17 + 200 + 15 s measured on one warm host) and from
+  `MEASURED_STAGE_SEC`. The first paid sessions are what calibrate them.
+- A quote blocks the bot's poll loop while it runs (about 4 s measured, bounded at 120 s): if Vast's
+  API is slow the whole bot, progress edits included, pauses that long.
+- The bot has never been run against a real Vast rental end to end. The tab, the callbacks and the
+  refusals are covered by unit tests with the network patched out.
+
+Design: `docs/superpowers/specs/2026-09-19-vast-fallback-design.md`.
+
 <a id="costs"></a>
 ## Costs — pod dừng vẫn tính tiền
 

@@ -79,3 +79,60 @@ class RunpodCtl:
             raise RuntimeError(
                 f"runpodctl pod delete {pod_id} failed: {out.stderr.strip()}")
         time.sleep(DELETE_SETTLE_SEC)
+
+
+class VastCtl:
+    """The same list/destroy contract as RunpodCtl, over the vastai CLI.
+
+    Instances are identified to the watchdog by their `label`: pod-provision.sh creates every
+    one with `--label motion-transfer`, which is exactly the name
+    batchlib_ext.watchdog.DESTROYABLE_NAMES lets tier 3 destroy. An unlabelled instance is not
+    ours to kill.
+
+    The JSON shape was checked against `vastai show instances-v1 --raw` (CLI 1.3.0,
+    2026-09-19) for the empty case only: `{"instances": [], "next_token": null, ...}`. That an
+    instance carries `id` and `label` is taken from the CLI's own column list and is confirmed
+    on the first real rental.
+    """
+
+    def list_pods(self) -> list[PodInfo]:
+        try:
+            out = subprocess.run(["vastai", "show", "instances-v1", "--raw", "--all"],
+                                 capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError) as exc:
+            # OSError covers a vastai that is not installed (likely on the VPS); tick() catches
+            # only RuntimeError, so anything else would take the RunPod scan down with it.
+            raise RuntimeError(f"could not run vastai: {exc}") from exc
+        if out.returncode != 0:
+            raise RuntimeError(f"vastai show instances-v1 failed: {out.stderr.strip()}")
+        try:
+            data = json.loads(out.stdout or '{"instances": []}')
+            if data.get("next_token"):
+                # F4/I2: `--all` is supposed to fetch every page in one call, but if the CLI
+                # ever paginates anyway, silently returning only the first page could read a
+                # live instance as gone. Every caller (rent()'s instance_exists, the watchdog)
+                # already treats a raising listing as "unverifiable" — fail closed instead.
+                raise RuntimeError(
+                    "vastai listing may be incomplete (next_token is set)")
+            return [PodInfo(pod_id=str(i["id"]), name=str(i.get("label") or ""))
+                    for i in data["instances"]]
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            snippet = out.stdout[:100] if out.stdout else "(empty)"
+            raise RuntimeError(
+                f"vastai returned invalid JSON: {exc} — output: {snippet}") from exc
+
+    def destroy(self, pod_id: str) -> None:
+        """Ask Vast to destroy the instance. Exit code is NOT proof — the caller re-lists.
+
+        The prompt is answered by piping `y` rather than passing `-y`, so this works on CLI
+        versions that predate the flag (the Makefile's gpu-destroy does the same).
+        """
+        try:
+            out = subprocess.run(["vastai", "destroy", "instance", pod_id],
+                                 input="y\n", capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(f"could not run vastai: {exc}") from exc
+        if out.returncode != 0:
+            raise RuntimeError(
+                f"vastai destroy instance {pod_id} failed: {out.stderr.strip()}")
+        time.sleep(DELETE_SETTLE_SEC)

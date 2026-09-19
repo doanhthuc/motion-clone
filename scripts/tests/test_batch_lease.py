@@ -30,6 +30,30 @@ class TestLease(unittest.TestCase):
         clear_lease(self.tmp)
         self.assertIsNone(read_lease(self.tmp))
 
+    def test_provider_defaults_to_runpod(self):
+        self.assertEqual(Lease("a", 1.0, "b.yaml", 240).provider, "runpod")
+
+    def test_provider_roundtrip(self):
+        lease = Lease(pod_id="777", provisioned_at=1000.0, manifest="batch/x.yaml",
+                      abs_max_min=240, provider="vast")
+        write_lease(self.tmp, lease)
+        self.assertEqual(read_lease(self.tmp), lease)
+
+    def test_a_lease_written_before_providers_existed_reads_as_runpod(self):
+        # Leases already on the VPS have no "provider" key. They must stay valid, or the
+        # watchdog would treat a live RunPod pod's lease as garbage and reap it as an orphan.
+        self.tmp.write_text(
+            '{"pod_id": "abc", "provisioned_at": 5.0, "manifest": "batch/x.yaml", '
+            '"abs_max_min": 90}', encoding="utf-8")
+        self.assertEqual(read_lease(self.tmp),
+                         Lease("abc", 5.0, "batch/x.yaml", 90, provider="runpod"))
+
+    def test_an_empty_provider_reads_as_runpod(self):
+        self.tmp.write_text(
+            '{"pod_id": "abc", "provisioned_at": 5.0, "manifest": "m", '
+            '"abs_max_min": 90, "provider": ""}', encoding="utf-8")
+        self.assertEqual(read_lease(self.tmp).provider, "runpod")
+
 
 if __name__ == "__main__":
     unittest.main()

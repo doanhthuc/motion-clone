@@ -2,8 +2,13 @@
 #
 # Find and rent a GPU pod for the motion-transfer backend (motions-studio). Runs on YOUR LAPTOP.
 #
-#   bash scripts/pod-provision.sh              # search + print the exact create command (safe)
+#   bash scripts/pod-provision.sh              # dry run (safe) — see below for what it prints
 #   CONFIRM=yes bash scripts/pod-provision.sh  # actually rent it
+#
+# What the dry run prints depends on GPU_PROVIDER: RunPod still prints the exact create command
+# (a single offer). Vast hands off to vast_rent.py, which searches, ranks and prints a RANKED
+# SHORTLIST plus the chosen offer id — there is no single "create command" on that branch
+# (updated 2026-09-19; F10 in the vast-rent-and-select final fix wave).
 #
 # Never rents anything unless you pass CONFIRM=yes — renting bills by the hour from the moment
 # the instance is created, so this shows you the command and lets you read it first.
@@ -468,145 +473,41 @@ $RAW"
   exit 0
 fi
 
-# --- vast.ai branch — the validated default path. --------------------------------------------
+# --- vast.ai branch — selection, rent, retry and cleanup live in scripts/vast_rent.py ----------
+# It ranks by time-to-ready and total cost (not $/hour), remembers what each machine actually did
+# (batch/vast-machines.json), abandons a slow pull, labels every instance `motion-transfer` (the
+# name the watchdog may destroy) and writes GPU_INSTANCE_ID itself. Dry run unless CONFIRM=yes.
+# Design: docs/superpowers/specs/2026-09-19-vast-fallback-design.md §3.2.
 command -v vastai >/dev/null || die "vastai CLI not found:  pip install vastai  &&  vastai set api-key <key>"
+command -v python3 >/dev/null || die "python3 needed to run scripts/vast_rent.py"
 
-QUERY="gpu_name=${GPU} num_gpus=1 disk_space>=${DISK} reliability>${RELIABILITY} rentable=true"
-log "searching: $QUERY  (<= \$${MAX_DPH}/hr)"
-OFFERS="$(vastai search offers "$QUERY" -o 'dph+' --raw 2>/dev/null)" || die "vastai search failed — is your API key set?"
-
-command -v python3 >/dev/null || die "python3 needed to read the offer list"
-
-# The offer list goes via a temp FILE, not a pipe: python needs stdin for its own heredoc, and
-# inlining the script with -c means fighting two levels of shell quoting.
-TMP="$(mktemp)"
-trap 'rm -f "$TMP"' EXIT
-printf '%s' "$OFFERS" > "$TMP"
-
-BEST="$(OFFERS_FILE="$TMP" MAX_DPH="$MAX_DPH" SKIP="$SKIP" OFFER="$OFFER" MIN_DISK_BW="$MIN_DISK_BW" MIN_CPU_GHZ="$MIN_CPU_GHZ" python3 - <<'PY'
-import json, os, sys
-
-try:
-    offers = json.load(open(os.environ["OFFERS_FILE"]))
-except Exception as e:
-    sys.exit(f"could not parse the offer list: {e}")
-
-if not isinstance(offers, list) or not offers:
-    sys.exit("no offers matched the search at all — loosen GPU= or DISK=")
-
-pinned = os.environ.get("OFFER", "").strip()
-if pinned:
-    if not any(str(o["id"]) == pinned for o in offers):
-        sys.exit(f"offer {pinned} is not in the current results (gone, or filtered out)")
-    print(pinned)
-    raise SystemExit
-
-skip = {s.strip() for s in os.environ.get("SKIP", "").split(",") if s.strip()}
-cap = float(os.environ["MAX_DPH"])
-min_bw = float(os.environ.get("MIN_DISK_BW") or 0)
-min_ghz = float(os.environ.get("MIN_CPU_GHZ") or 0)
-
-# Filter on DISK BANDWIDTH and CPU CLOCK, not just price and reliability.
-#
-# NOTE: keep every quote in this heredoc balanced, apostrophes included. It sits inside $(...) and
-# bash 3.2 — the /bin/bash macOS still ships — counts quotes even in here, so a single unpaired one
-# breaks the whole file with an "unexpected EOF" that points at the last line and tells you nothing.
-#
-# vast is a marketplace of machines other people own, and the hardware spread is enormous: measured
-# across 64 RTX 5090 offers on 2026-08-01, disk_bw ran min 395 / median 3641 / max 12800 MB/s — a
-# 32x range at the same GPU. Sorting by dph and taking rows[0] therefore systematically picks the
-# SLOWEST disk, because cheap and slow correlate.
-#
-# setup-motion-transfer.sh is almost entirely disk and CPU work: apt Postgres, unpacking ~3-4GB of
-# torch wheels, cloning six custom nodes and installing their pip deps. On a 395 MB/s disk that is
-# a 1-2 hour job; on a fast one it is 10-20 minutes. Same script, same GPU, same price bracket.
-#
-# Filtered here rather than in the vast query string so a failure prints the actual distribution
-# instead of an empty result set, and so the grammar of `vastai search offers` cannot break it.
-def fast_enough(o):
-    return (o.get("disk_bw") or 0) >= min_bw and (o.get("cpu_ghz") or 0) >= min_ghz
-
-affordable = [o for o in offers if o.get("dph_total", 99) <= cap and str(o["id"]) not in skip]
-if not affordable:
-    cheapest = min(o.get("dph_total", 99) for o in offers)
-    sys.exit(f"nothing at or under ${cap:.2f}/hr (cheapest was ${cheapest:.2f}) — retry with MAX_DPH={cheapest + 0.05:.2f}")
-
-rows = sorted((o for o in affordable if fast_enough(o)), key=lambda o: o["dph_total"])
-
-if not rows:
-    bws = sorted((o.get("disk_bw") or 0) for o in affordable)
-    best_bw = bws[-1] if bws else 0
-    print(
-        f"{len(affordable)} offer(s) under ${cap:.2f}/hr, but none meet "
-        f"disk_bw>={min_bw:.0f} MB/s and cpu_ghz>={min_ghz:.1f}.\n"
-        f"  disk_bw available here: min={bws[0]:.0f} median={bws[len(bws)//2]:.0f} max={best_bw:.0f} MB/s\n"
-        f"  Raise MAX_DPH to reach faster machines, or lower the bar with\n"
-        f"    MIN_DISK_BW={max(0, best_bw - 1):.0f} bash scripts/pod-provision.sh\n"
-        f"  Renting under the bar is allowed — it just means setup takes hours instead of minutes.",
-        file=sys.stderr,
-    )
-    raise SystemExit(1)
-
-skipped = len(affordable) - len(rows)
-print(f"{len(rows)} offer(s) under the cap and fast enough"
-      f"{f' ({skipped} rejected as too slow)' if skipped else ''}:\n", file=sys.stderr)
-for o in rows[:5]:
-    gb = o.get("gpu_ram", 0) / 1024
-    print(
-        f"  id={o['id']:<12} ${o['dph_total']:.3f}/hr  {o.get('gpu_name')}  "
-        f"{gb:.0f}GB  disk={o.get('disk_bw', 0):.0f}MB/s  cpu={o.get('cpu_ghz', 0):.1f}GHz  "
-        f"down={o.get('inet_down', 0):.0f}Mbps  "
-        f"rel={o.get('reliability2', 0):.3f}  {o.get('geolocation', '?')}",
-        file=sys.stderr,
-    )
-print(rows[0]["id"])
-PY
-)" || die "could not pick an offer — see the message above"
-
-echo
-log "pick: offer $BEST"
-
-CREATE=(vastai create instance "$BEST" --image "$IMAGE" --disk "$DISK" --ssh --direct)
-
-echo
-echo "  ${CREATE[*]}"
-echo
-
-if [ "${CONFIRM:-}" != "yes" ]; then
-  cat <<EOF
-$(warn "Dry run — nothing rented.")
-
-  Read the command above, then:   CONFIRM=yes bash scripts/pod-provision.sh
-
-  After it rents (GPU_INSTANCE_ID is saved to .env for you automatically):
-    1. make gpu-wait          # waits for SSH, writes GPU_SSH_HOST/GPU_SSH_PORT into .env for you
-    2. make gpu-bootstrap     # rsyncs motions-studio + runs the SETUP_PROFILE setup script on the pod
-    3. make gpu-status        # confirm the backend answers at https://\$DOMAIN
-
-  Also set a 15-minute idle auto-stop in the Vast UI — not to save money in the normal case, but
-  as a net for the night you forget 'make gpu-down'. A stopped pod still bills for its disk every
-  hour it exists (see docs/gpu-pod.md#costs).
-EOF
-  exit 0
+# The Telegram bot's .env carries the RunPod spelling of the GPU ("NVIDIA GeForce RTX 5090"); the
+# Vast marketplace spells it RTX_5090, and a name with spaces is not even one search token. Measured
+# 2026-09-19: a marketplace search filtered on gpu_name=NVIDIA GeForce RTX 5090 fails with "invalid
+# JSON", while gpu_name=RTX_5090 returned 4 qualifying offers. VAST_GPU wins when set; otherwise the
+# two RunPod names this repo uses are translated, and any other name with a space is refused by name
+# rather than sent to a search that can only fail.
+VAST_GPU="${VAST_GPU:-$(env_get VAST_GPU)}"
+if [ -z "$VAST_GPU" ]; then
+  case "$GPU" in
+    "NVIDIA GeForce RTX 5090") VAST_GPU=RTX_5090 ;;
+    "NVIDIA GeForce RTX 4090") VAST_GPU=RTX_4090 ;;
+    *" "*) die "GPU='$GPU' is a RunPod name, and Vast spells GPUs differently (e.g. RTX_5090).
+    Set VAST_GPU=RTX_5090 (or the Vast name you want) in .env or the environment." ;;
+    *) VAST_GPU="$GPU" ;;
+  esac
 fi
 
-log "renting…"
-RAW="$("${CREATE[@]}" --raw)" || die "create failed"
-NEW_ID="$(printf '%s' "$RAW" | python3 -c 'import sys,json
-try: d = json.load(sys.stdin)
-except Exception: d = {}
-print(d.get("new_contract") or d.get("id") or "")' 2>/dev/null)"
-
-if [ -n "$NEW_ID" ]; then
-  if grep -qE '^GPU_INSTANCE_ID=' .env 2>/dev/null; then
-    sed -i.bak -E "s#^GPU_INSTANCE_ID=.*#GPU_INSTANCE_ID=$NEW_ID#" .env && rm -f .env.bak
-  else
-    printf 'GPU_INSTANCE_ID=%s\n' "$NEW_ID" >> .env
-  fi
-  log "rented — instance $NEW_ID (saved to .env as GPU_INSTANCE_ID). Next: make gpu-wait"
-else
-  warn "rented, but couldn't parse the instance id from the response — find it with 'vastai show instances'"
-  echo "$RAW"
-  echo
-  log "put the instance id in .env as GPU_INSTANCE_ID, then: make gpu-wait"
+VAST_ARGS=(--gpu "$VAST_GPU" --disk "$DISK" --image "$IMAGE" --max-dph "$MAX_DPH"
+           --reliability "$RELIABILITY" --min-disk-bw "$MIN_DISK_BW" --min-cpu-ghz "$MIN_CPU_GHZ")
+[ -n "$OFFER" ] && VAST_ARGS+=(--offer "$OFFER")
+[ -n "$SKIP" ] && VAST_ARGS+=(--skip "$SKIP")
+# VAST_QUOTE=1 is the bot's price check: vast_rent.py prints one JSON line and rents nothing. It
+# outranks CONFIRM=yes on purpose, so a quote can never turn into a rental whatever else is set.
+if [ "${VAST_QUOTE:-}" = "1" ]; then
+  VAST_ARGS+=(--quote)
+elif [ "${CONFIRM:-}" = "yes" ]; then
+  VAST_ARGS+=(--confirm)
 fi
+
+exec python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/vast_rent.py" "${VAST_ARGS[@]}"

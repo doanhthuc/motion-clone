@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: gpu-facelock batch-mcp-check batch-coverage check-comfy-nodes help setup dev down clean gpu-preflight gpu-provision gpu-wait gpu-bootstrap gpu-fe gpu-up gpu-down gpu-destroy gpu-db-dump gpu-db-check gpu-status gpu-logs batch-test batch-params check-batch-params batch-scan batch-validate batch batch-clean watchdog-dry drain bot-dry
+.PHONY: gpu-facelock batch-mcp-check batch-coverage check-comfy-nodes help setup dev down clean gpu-preflight gpu-provision gpu-wait gpu-bootstrap gpu-fe gpu-up gpu-down gpu-destroy gpu-db-dump gpu-db-check gpu-status gpu-logs batch-test batch-params check-batch-params check-vast-models batch-scan batch-validate batch batch-clean watchdog-dry drain bot-dry
 
 help: ## Show this help
 	@echo "motion-clone — make targets:"
@@ -29,6 +29,41 @@ clean: down ## Remove FE node_modules/.nuxt/.output (keeps motions/.env)
 
 env = $(shell grep -E '^$(1)=' .env 2>/dev/null | cut -d= -f2- | sed -E 's/[[:space:]]*\#.*$$//' | tr -d '"')
 
+# The provider of THIS run, in this order:
+#   1. an exported/command-line GPU_PROVIDER (drain.py exports it for a Vast run, so the root
+#      .env can keep saying runpod);
+#   2. else the provider recorded in the lease (batch/pod-lease.json) — but only when the
+#      lease's pod id is the instance id this invocation is about to destroy;
+#   3. else the provider recorded in .env's GPU_INSTANCE_OWNER marker ("vast:<id>", written by
+#      vast_rent.py the moment it creates an instance) — but only when the marker's id is the
+#      instance id this invocation is about to destroy;
+#   4. else .env's GPU_PROVIDER.
+# Why the lease: a hand-typed `make gpu-destroy` after a Vast run has GPU_PROVIDER unset, so .env's
+# runpod won — `runpodctl pod delete <vast id> || true`, a RunPod re-list that finds nothing, a
+# "destroyed — verified" line, and .env wiped over a Vast instance that keeps billing.
+# Why the owner marker: the lease is only written once a rent SUCCEEDS (batchlib_ext.lease.write_lease
+# runs after `make gpu-wait`). A rent that fails AFTER creating an instance (STILL BILLING abandon,
+# AmbiguousCreate, an unwind that could not destroy) leaves GPU_INSTANCE_ID set with no lease at
+# all — .env's runpod would win, same failure as above, and the operator's only handle on the
+# instance (its id) would be wiped by the "verified gone" RunPod branch. The marker is the id's own
+# receipt of who rented it, so it survives exactly the case the lease cannot cover.
+# Why the id match, in both cases: a stale lease or marker a crash left for some OTHER pod must
+# never steer the destroy of the pod .env names. A lease with no "provider" key (written before
+# providers existed) yields an empty provider and falls through; an owner marker with no colon or
+# an empty id half is ignored the same way.
+# Plain sed, not python: these lines run on every make invocation. write_lease uses
+# json.dumps(indent=2), so "pod_id" and "provider" each sit on their own line.
+LEASE_FILE ?= batch/pod-lease.json
+LEASE_POD := $(shell sed -n 's/.*"pod_id": *"\([^"]*\)".*/\1/p' $(LEASE_FILE) 2>/dev/null)
+LEASE_PROVIDER := $(shell sed -n 's/.*"provider": *"\([^"]*\)".*/\1/p' $(LEASE_FILE) 2>/dev/null)
+CURRENT_INSTANCE_ID := $(or $(GPU_INSTANCE_ID),$(call env,GPU_INSTANCE_ID))
+OWNER_RAW := $(call env,GPU_INSTANCE_OWNER)
+OWNER_PROVIDER := $(word 1,$(subst :, ,$(OWNER_RAW)))
+OWNER_ID := $(word 2,$(subst :, ,$(OWNER_RAW)))
+GPU_PROVIDER_EFF := $(or $(GPU_PROVIDER),$(if $(and $(LEASE_POD),$(filter $(LEASE_POD),$(CURRENT_INSTANCE_ID))),$(LEASE_PROVIDER)),$(if $(and $(OWNER_ID),$(filter $(OWNER_ID),$(CURRENT_INSTANCE_ID))),$(OWNER_PROVIDER)),$(call env,GPU_PROVIDER))
+# A Network Volume is RunPod-only — a Vast box has none, whatever .env says.
+POD_VOLUME_EFF := $(if $(filter runpod,$(GPU_PROVIDER_EFF)),$(call env,POD_VOLUME))
+
 scrub-check: ## Gate: fail if any third-party credential or personal email is tracked
 	@bash motions-studio/setup/scrub-secrets.sh --check
 
@@ -49,6 +84,9 @@ batch-params: ## Liệt kê param một job type nhận (TYPE=motion|tryon|enhan
 
 check-batch-params: ## Gate: scripts/batch-params.json phải khớp linux.py
 	@python3 scripts/batch_params.py --check
+
+check-vast-models: ## Gate: every batch-manifest stage has a Vast model-registry entry, ids match the catalog
+	@python3 scripts/check_vast_models.py
 
 batch-scan: ## Quét thư mục material → manifest nháp (DIR=~/materials MODE=pair|cross)
 	@test -n "$(DIR)" || { echo "cần DIR=~/materials (4 ngăn: characters outfits backgrounds drivers)"; exit 1; }
@@ -78,11 +116,12 @@ watchdog-dry: ## Report what the watchdog would destroy right now — destroys n
 bot-dry: ## One polling round against the local Bot API, invoking no jobs
 	@python3 scripts/tgbot/bot.py --once --dry-run
 
-drain: ## Rent a pod, run FILE, destroy it (dry run unless CONFIRM=yes; PHASE_A=1 stops before renting)
-	@test -n "$(FILE)" || { echo "usage: make drain FILE=batch/….yaml [CONFIRM=yes] [RESUME=1] [FORCE_LOCAL=1] [PHASE_A=1]"; exit 1; }
+drain: ## Rent a pod, run FILE, destroy it (dry run unless CONFIRM=yes; PROVIDER=vast|runpod overrides .env for this run; PHASE_A=1 stops before renting)
+	@test -n "$(FILE)" || { echo "usage: make drain FILE=batch/….yaml [CONFIRM=yes] [RESUME=1] [FORCE_LOCAL=1] [PHASE_A=1] [PROVIDER=vast|runpod]"; exit 1; }
 	@python3 scripts/drain.py --file "$(FILE)" \
 		$(if $(filter yes,$(CONFIRM)),--yes) $(if $(RESUME),--resume) \
-		$(if $(FORCE_LOCAL),--force-local) $(if $(PHASE_A),--phase-a-only)
+		$(if $(FORCE_LOCAL),--force-local) $(if $(PHASE_A),--phase-a-only) \
+		$(if $(PROVIDER),--provider $(PROVIDER))
 
 gpu-preflight: ## Check root .env is complete BEFORE you spend money on a pod
 	@bash scripts/gpu-preflight.sh
@@ -101,7 +140,7 @@ gpu-fe: ## Re-deploy ONLY the frontend to the pod (rsync + build + PM2 restart, 
 
 gpu-up: ## Start the pod and wait until the backend answers
 	@test -n "$(call env,GPU_INSTANCE_ID)" || { echo "set GPU_INSTANCE_ID in .env (see docs/gpu-pod.md)"; exit 1; }
-ifeq ($(shell grep -E '^GPU_PROVIDER=' .env 2>/dev/null | cut -d= -f2),runpod)
+ifeq ($(GPU_PROVIDER_EFF),runpod)
 	@runpodctl pod start $(call env,GPU_INSTANCE_ID)
 else
 	@vastai start instance $(call env,GPU_INSTANCE_ID)
@@ -130,11 +169,11 @@ gpu-down: ## Pause the pod for a short break (container disk keeps billing — p
 	@# và chết ngay ở `make -n`, đúng bẫy mà M10 đã gặp với `$$0,99`.
 	@ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
 		-p $(call env,GPU_SSH_PORT) root@$(call env,GPU_SSH_HOST) \
-		"cd ~/motion-backend && POD_VOLUME='$(call env,POD_VOLUME)' \
+		"cd ~/motion-backend && POD_VOLUME='$(POD_VOLUME_EFF)' \
 		 $(if $(call env,PG_DUMP_KEEP),PG_DUMP_KEEP='$(call env,PG_DUMP_KEEP)') \
 		 bash ./setup/pod-pgdump.sh --dump" \
 		|| echo "!! sao lưu DB thất bại — vẫn dừng pod. DB còn trên container disk, chỉ mất nếu gpu-destroy."
-ifeq ($(shell grep -E '^GPU_PROVIDER=' .env 2>/dev/null | cut -d= -f2),runpod)
+ifeq ($(GPU_PROVIDER_EFF),runpod)
 	@runpodctl pod stop $(call env,GPU_INSTANCE_ID)
 else
 	@vastai stop instance $(call env,GPU_INSTANCE_ID)
@@ -153,13 +192,15 @@ gpu-destroy: ## DEFAULT when done — destroy the pod (DB is restored from the v
 	@# "pod đã dừng?" là khẳng định một nguyên nhân ta không biết, ngay lúc người dùng cần biết nhất.
 	@# POD_VOLUME / PG_DUMP_KEEP: xem chú thích ở gpu-down — không truyền POD_VOLUME thì đây là
 	@# no-op trên pod đầu tiên, tức đúng lúc trước một thao tác KHÔNG HOÀN TÁC ĐƯỢC.
+ifeq ($(GPU_PROVIDER_EFF),runpod)
 	@ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
 		-p $(call env,GPU_SSH_PORT) root@$(call env,GPU_SSH_HOST) \
-		"cd ~/motion-backend && POD_VOLUME='$(call env,POD_VOLUME)' \
+		"cd ~/motion-backend && POD_VOLUME='$(POD_VOLUME_EFF)' \
 		 $(if $(call env,PG_DUMP_KEEP),PG_DUMP_KEEP='$(call env,PG_DUMP_KEEP)') \
 		 bash ./setup/pod-pgdump.sh --dump" \
 		|| echo "!! sao lưu lần cuối KHÔNG thành công (lý do ở ngay trên) — vẫn XOÁ pod theo yêu cầu."
-ifeq ($(shell grep -E '^GPU_PROVIDER=' .env 2>/dev/null | cut -d= -f2),runpod)
+endif
+ifeq ($(GPU_PROVIDER_EFF),runpod)
 	@runpodctl pod delete $(call env,GPU_INSTANCE_ID) || true
 	@sleep 3
 	@if runpodctl pod list -o json 2>/dev/null | grep -q '$(call env,GPU_INSTANCE_ID)'; then \
@@ -172,14 +213,32 @@ ifeq ($(shell grep -E '^GPU_PROVIDER=' .env 2>/dev/null | cut -d= -f2),runpod)
 		echo "NOTE: the Network Volume still exists and still bills monthly — that is deliberate."; \
 	fi
 else
-	@printf 'y\n' | vastai destroy instance $(call env,GPU_INSTANCE_ID)
+	@# `|| true`: an already-gone instance makes this exit non-zero (RunPod's branch already
+	@# has the same guard on `pod delete`). The verify below IS the check — a destroy error
+	@# here must not abort make before it runs and .env never gets cleared over an instance
+	@# that is, in fact, already gone (F3/I1, 2026-09-19).
+	@printf 'y\n' | vastai destroy instance $(call env,GPU_INSTANCE_ID) || true
 	@sleep 3
-	@if vastai show instances 2>/dev/null | grep -q '\b$(call env,GPU_INSTANCE_ID)\b'; then \
-		echo "STILL ALIVE — instance $(call env,GPU_INSTANCE_ID) was NOT destroyed and is STILL BILLING."; \
-		echo "Destroy it by hand: vastai destroy instance $(call env,GPU_INSTANCE_ID)"; \
+	@# Verify against the same listing VastCtl.list_pods reads (instances-v1, --all because the
+	@# default page hides instances). If the listing itself fails we know nothing: say so and keep
+	@# .env, whose id is the only handle for destroying it by hand. The id is matched as a JSON
+	@# value so 12345 does not match 123456. Two more ways to know nothing: output that exits 0 but
+	@# is not a listing (an auth error has no instance id either, and read as "gone"; the real shape,
+	@# checked 2026-09-19, is {"instances": [...], "next_token": ..., "success": true}), and an id
+	@# with trailing whitespace in .env, which never matched a row (the id is stripped before use).
+	@listing="$$(vastai show instances-v1 --raw --all 2>&1)"; rc=$$?; \
+	case "$$listing" in *'"instances"'*) shape=ok;; *) shape=bad;; esac; \
+	if [ $$rc -ne 0 ] || [ "$$shape" != ok ]; then \
+		echo "COULD NOT VERIFY — instance $(strip $(call env,GPU_INSTANCE_ID)) may still be billing."; \
+		echo "$$listing"; \
+		echo "Check by hand: vastai show instances-v1 --raw --all (then vastai destroy instance $(strip $(call env,GPU_INSTANCE_ID)))"; \
+		exit 1; \
+	elif printf '%s\n' "$$listing" | grep -Eq '"id": *$(strip $(call env,GPU_INSTANCE_ID))([^0-9]|$$)'; then \
+		echo "STILL ALIVE — instance $(strip $(call env,GPU_INSTANCE_ID)) was NOT destroyed and is STILL BILLING."; \
+		echo "Destroy it by hand: vastai destroy instance $(strip $(call env,GPU_INSTANCE_ID))"; \
 		exit 1; \
 	else \
-		echo "destroyed — verified gone from 'vastai show instances'"; \
+		echo "destroyed — verified gone from 'vastai show instances-v1'"; \
 		bash scripts/env-clear-pod.sh; \
 	fi
 endif

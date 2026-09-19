@@ -28,10 +28,12 @@ LONGEST_STAGE_MIN = max(s.timeout_min for s in STAGES.values())
 # below — kept separate rather than merged into this one, so a lease-shape
 # change for one can never silently change the other's scope.
 #
-# HAND-COPIED LIST. The one place a pod name is created is the `--name` flag at
-# scripts/pod-provision.sh:393, which carries the matching pointer back here.
-# There is no `make check-*` gate tying the two together yet (CLAUDE.md's "four
-# registries" drift class), so changing either one means changing both by hand.
+# HAND-COPIED LIST. A RunPod pod gets this name from the `--name` flag, and a
+# Vast instance from the `--label` flag on the vast create command, both in
+# scripts/pod-provision.sh. The Vast label is tied to this set by
+# scripts/tests/test_batch_provider_wiring.py::TestVastInstancesAreLabelled; the
+# RunPod `--name` still has no such gate, so changing either one there means
+# changing both by hand.
 DESTROYABLE_NAMES = frozenset({"motion-transfer"})
 
 # 2026-09-02: this repo used to stand up these two pods BY HAND for the

@@ -9,6 +9,8 @@ from batchlib.pipelines import PIPELINES, STAGES, effective_stage_params
 from batchlib.runner import stage_dest
 from batchlib_ext.gpu_stock import Stock
 from batchlib_ext.handoff import Handoff, handoff_path, mailbox_path, write_handoff
+from batchlib_ext.lease import Lease
+from batchlib_ext.vast_quote import VastQuote
 from batchlib_ext.migrate_lease import MigrateLease, write_migrate_lease
 from batchlib_ext.provision_failure import (ProvisionFailure,
                                             provision_failure_path,
@@ -1347,17 +1349,9 @@ class TestMigrateSyncDetail(unittest.TestCase):
         self.assertIn("(100%)", detail)
 
 
-class TestFlow(unittest.TestCase):
-    """The state machine Task 7 adds: files in, an ambiguous image asked
-    about (never guessed), the manifest shown once every required slot is
-    filled, and /confirm as the only reachable path to start_drain.
-
-    Real files on disk, real `make batch-validate`: only `probe()` is faked
-    (no real ffprobe/media needed) — everything downstream of it, including
-    the manifest text and the free validation gate, runs for real, against
-    the real repo (`bot._REPO_ROOT`), so a passing test here is evidence the
-    generated manifest actually validates, not just that a string was built.
-    """
+class _FlowFixture(unittest.TestCase):
+    """TestFlow's setUp/tearDown and job-building helpers, with no tests of their own, so a
+    class that needs a real drafted job can share them without re-running every TestFlow test."""
 
     def setUp(self):
         self._orig_root = bot.ROOT
@@ -1434,6 +1428,19 @@ class TestFlow(unittest.TestCase):
             bot.handle(self.tg, cmd_from(ME, "character"), allowed_user_id=ME)
             bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME)
             bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME)
+
+
+class TestFlow(_FlowFixture):
+    """The state machine Task 7 adds: files in, an ambiguous image asked
+    about (never guessed), the manifest shown once every required slot is
+    filled, and /confirm as the only reachable path to start_drain.
+
+    Real files on disk, real `make batch-validate`: only `probe()` is faked
+    (no real ffprobe/media needed) — everything downstream of it, including
+    the manifest text and the free validation gate, runs for real, against
+    the real repo (`bot._REPO_ROOT`), so a passing test here is evidence the
+    generated manifest actually validates, not just that a string was built.
+    """
 
     # ---- the control panel (2026-09-01) ------------------------------------
     #
@@ -4942,7 +4949,8 @@ class TestProvisionFailureRecoveryButtons(unittest.TestCase):
              mock.patch("tgbot.bot.start_drain") as start_drain:
             bot.handle(self.tg, cb_from(ME, f"{bot._CB_RECOVER_RETRY}tg-1"),
                        allowed_user_id=ME)
-        start_drain.assert_called_once_with(self.manifest, dry_run=False, resume=True)
+        start_drain.assert_called_once_with(self.manifest, dry_run=False, resume=True,
+                                            gpu_provider="runpod")
         # Retry keeps the GPU the batch already failed on — switching is the
         # other button's job, and silently rewriting .env's GPU= would change
         # what every LATER batch rents too.
@@ -4971,7 +4979,8 @@ class TestProvisionFailureRecoveryButtons(unittest.TestCase):
                       allowed_user_id=ME)
         self.assertEqual(env_get(self.root / ".env", "GPU"),
                          "NVIDIA GeForce RTX 4090")
-        start_drain.assert_called_once_with(self.manifest, dry_run=False, resume=True)
+        start_drain.assert_called_once_with(self.manifest, dry_run=False, resume=True,
+                                            gpu_provider="runpod")
         self.assertFalse(provision_failure_path(self.manifest).exists())
 
     def test_switch_refuses_a_stale_button_from_an_older_bot_version(self):
@@ -5055,7 +5064,8 @@ class TestMigrationResumesRecoveredManifest(unittest.TestCase):
              mock.patch("tgbot.bot.migration_running", return_value=False), \
              mock.patch("tgbot.bot.start_drain") as start_drain:
             bot.tick_migration_progress(self.tg, ME)
-        start_drain.assert_called_once_with(self.manifest, dry_run=False, resume=True)
+        start_drain.assert_called_once_with(self.manifest, dry_run=False, resume=True,
+                                            gpu_provider="runpod")
         self.assertFalse(bot._migrate_resume_marker().exists())
 
     def test_a_failed_migration_does_not_resume_anything(self):
@@ -5598,13 +5608,82 @@ class TestKillCommand(unittest.TestCase):
         bot._RUNNING[self.manifest.resolve()] = proc
         ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="destroyed",
                                          stderr="")
-        with mock.patch("tgbot.bot.subprocess.run", return_value=ok) as run, \
+        with mock.patch("tgbot.bot.os.killpg") as killpg, \
+             mock.patch("tgbot.bot.subprocess.run", return_value=ok) as run, \
              mock.patch("tgbot.bot.clear_lease") as clear_lease:
             bot.handle(self.tg, cb_from(ME, bot._CB_KILL_GO), allowed_user_id=ME)
-        proc.terminate.assert_called_once()
+        killpg.assert_called_once_with(proc.pid, bot.signal.SIGTERM)
         self.assertEqual(run.call_args.args[0], ["make", "gpu-destroy"])
         clear_lease.assert_called_once()
         self.assertIn("Killed. Pod destroyed", self.tg.messages[-1])
+
+    def test_a_group_kill_falls_back_to_terminate_when_the_group_is_gone(self):
+        # os.killpg raises ProcessLookupError when the process group no longer exists (e.g. the
+        # child already exited on its own) — fall back to proc.terminate() rather than crash.
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        bot._RUNNING[self.manifest.resolve()] = proc
+        ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with mock.patch("tgbot.bot.os.killpg", side_effect=ProcessLookupError), \
+             mock.patch("tgbot.bot.subprocess.run", return_value=ok), \
+             mock.patch("tgbot.bot.clear_lease"):
+            bot.handle(self.tg, cb_from(ME, bot._CB_KILL_GO), allowed_user_id=ME)
+        proc.terminate.assert_called_once()
+
+    def test_a_hung_group_is_escalated_to_a_group_sigkill(self):
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        proc.wait.side_effect = subprocess.TimeoutExpired(cmd="make", timeout=30)
+        bot._RUNNING[self.manifest.resolve()] = proc
+        ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with mock.patch("tgbot.bot.os.killpg") as killpg, \
+             mock.patch("tgbot.bot.subprocess.run", return_value=ok), \
+             mock.patch("tgbot.bot.clear_lease"):
+            bot.handle(self.tg, cb_from(ME, bot._CB_KILL_GO), allowed_user_id=ME)
+        self.assertEqual(killpg.call_args_list,
+                         [mock.call(proc.pid, bot.signal.SIGTERM),
+                          mock.call(proc.pid, bot.signal.SIGKILL)])
+        proc.wait.assert_called_once()
+        self.assertEqual(proc.wait.call_args.kwargs.get("timeout"), 30)
+
+    def test_kill_destroys_on_the_leases_provider_not_the_env_files(self):
+        # The bot's own environment says nothing about the run: without this, /kill on a Vast
+        # batch would run `make gpu-destroy` against .env's provider (RunPod) and leave the
+        # Vast instance billing while telling the user it was destroyed.
+        lease = Lease(pod_id="777", provisioned_at=0.0, manifest=str(self.manifest),
+                      abs_max_min=60, provider="vast")
+        ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with mock.patch("tgbot.bot.lease_for", return_value=lease), \
+             mock.patch("tgbot.bot.subprocess.run", return_value=ok) as run, \
+             mock.patch("tgbot.bot.clear_lease"):
+            bot.handle(self.tg, cb_from(ME, bot._CB_KILL_GO), allowed_user_id=ME)
+        self.assertEqual(run.call_args.args[0], ["make", "gpu-destroy"])
+        self.assertEqual(run.call_args.kwargs["env"]["GPU_PROVIDER"], "vast")
+
+    def test_kill_without_a_lease_leaves_the_environment_alone(self):
+        ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with mock.patch("tgbot.bot.lease_for", return_value=None), \
+             mock.patch("tgbot.bot.read_lease", return_value=None), \
+             mock.patch("tgbot.bot.subprocess.run", return_value=ok) as run, \
+             mock.patch("tgbot.bot.clear_lease"):
+            bot.handle(self.tg, cb_from(ME, bot._CB_KILL_GO), allowed_user_id=ME)
+        self.assertIsNone(run.call_args.kwargs.get("env"))
+
+    def test_kill_finds_the_lease_of_a_chained_link(self):
+        # On chained links, drain.py's chain_or_teardown rewrites lease.manifest to the
+        # claimed link, so lease_for(manifest_path) returns None. The kill must fall back
+        # to the global lease file to get the correct provider.
+        lease = Lease(pod_id="777", provisioned_at=0.0,
+                      manifest=str(self.root / "batch" / f"tg-{ME}-123.yaml"),
+                      abs_max_min=60, provider="vast")
+        ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with mock.patch("tgbot.bot.lease_for", return_value=None), \
+             mock.patch("tgbot.bot.read_lease", return_value=lease), \
+             mock.patch("tgbot.bot.subprocess.run", return_value=ok) as run, \
+             mock.patch("tgbot.bot.clear_lease"):
+            bot.handle(self.tg, cb_from(ME, bot._CB_KILL_GO), allowed_user_id=ME)
+        self.assertEqual(run.call_args.args[0], ["make", "gpu-destroy"])
+        self.assertEqual(run.call_args.kwargs["env"]["GPU_PROVIDER"], "vast")
 
     def test_a_dead_tracked_process_is_left_alone(self):
         proc = mock.Mock()
@@ -5617,14 +5696,19 @@ class TestKillCommand(unittest.TestCase):
         proc.terminate.assert_not_called()
 
     def test_a_hung_process_is_escalated_to_a_hard_kill(self):
+        # The group-kill primitive (os.killpg) is unavailable here (ProcessLookupError, as if
+        # the group were already gone) so both the initial signal and the timeout escalation
+        # fall back to the plain Popen methods.
         proc = mock.Mock()
         proc.poll.return_value = None
-        proc.wait.side_effect = subprocess.TimeoutExpired(cmd="make", timeout=5)
+        proc.wait.side_effect = subprocess.TimeoutExpired(cmd="make", timeout=30)
         bot._RUNNING[self.manifest.resolve()] = proc
         ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
-        with mock.patch("tgbot.bot.subprocess.run", return_value=ok), \
+        with mock.patch("tgbot.bot.os.killpg", side_effect=ProcessLookupError), \
+             mock.patch("tgbot.bot.subprocess.run", return_value=ok), \
              mock.patch("tgbot.bot.clear_lease"):
             bot.handle(self.tg, cb_from(ME, bot._CB_KILL_GO), allowed_user_id=ME)
+        proc.terminate.assert_called_once()
         proc.kill.assert_called_once()
 
     def test_a_failed_destroy_is_reported_honestly_not_claimed_as_success(self):
@@ -6476,7 +6560,9 @@ class TestRunConfirmPanelIsParameterised(unittest.TestCase):
              mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
             bot._offer_run_confirm(self.tg, ME, spend_cb="rec:retry:tg-1")
         flat = [data for row in self.tg.buttons[-1] for _, data, *_ in row]
-        self.assertIn("rec:retry:tg-1", flat)
+        # The RunPod screen always names its own provider explicitly (_RUNPOD_SUFFIX), on top of
+        # whatever spend_cb the caller supplied.
+        self.assertIn("rec:retry:tg-1" + bot._RUNPOD_SUFFIX, flat)
         self.assertFalse(any(d.startswith(bot._CB_RUN_GO) for d in flat))
 
     def test_the_no_stock_data_branch_honours_it_too(self):
@@ -6487,7 +6573,7 @@ class TestRunConfirmPanelIsParameterised(unittest.TestCase):
              mock.patch("tgbot.bot.stock_at_cached", side_effect=RuntimeError("runpodctl down")):
             bot._offer_run_confirm(self.tg, ME, spend_cb="rec:retry:tg-1")
         flat = [data for row in self.tg.buttons[-1] for _, data, *_ in row]
-        self.assertIn("rec:retry:tg-1", flat)
+        self.assertIn("rec:retry:tg-1" + bot._RUNPOD_SUFFIX, flat)
 
     def test_a_heading_replaces_the_choose_gpu_line(self):
         with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
@@ -7345,3 +7431,748 @@ class TestTryonFailureRetry(unittest.TestCase):
         self._notice()
         self.assertFalse(any("Regenerating" in m and "failed" in m
                              for m in self.tg.messages))
+
+
+
+# ---- Vast as a second GPU provider (spec §3.5, Plan 4) --------------------------------------------
+
+import contextlib
+
+
+@contextlib.contextmanager
+def contextlib_exit_stack(patchers):
+    """Start every patcher, stop them all on exit (mock.patch objects have no shared `with`)."""
+    with contextlib.ExitStack() as stack:
+        for patcher in patchers:
+            stack.enter_context(patcher)
+        yield
+
+
+_MOTION_MANIFEST = ("runs:\n  - id: runA\n    pipeline: motion-enhance\n"
+                    "    inputs: {character: /tmp/c.png, driver: /tmp/d.mp4}\n")
+
+
+def _vast_quote(**over):
+    base = dict(offer_id=4401, machine_id=55, dph=0.90, gpu="RTX 5090", location="Bulgaria, BG",
+                ready_s=556.0, known=False, bandwidth_usd=0.10, gb=51.8, qualifying=4,
+                fetched_at=time.time())
+    base.update(over)
+    return VastQuote(**base)
+
+
+def _quote_sized_by(size_fn):
+    """A `vast_last_quote` stand-in whose quote is FOR the batch under test: the tap gate ignores a
+    quote fetched for another download size, so a fixed size would only hold by coincidence. The
+    size is read on the first call and kept, because a confirm clears the draft it came from."""
+    box = []
+
+    def last_quote():
+        if not box:
+            box.append(size_fn())
+        return _vast_quote(gb=box[0])
+    return last_quote
+
+
+class _VastBase(unittest.TestCase):
+    """A chat whose motion-enhance manifest is on disk and whose rent panel has been offered
+    (the state tick_phase_a leaves), with the Vast network calls patched out."""
+
+    ENV = ("GPU=NVIDIA GeForce RTX 5090\nPOD_VOLUME_ID=vol-1\n"
+           "VAST_ENABLED_PIPELINES=motion-enhance\n")
+
+    def setUp(self):
+        self._orig_root = bot.ROOT
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "batch").mkdir()
+        (self.root / "out").mkdir()
+        bot.ROOT = self.root
+        (self.root / ".env").write_text(self.ENV, encoding="utf-8")
+        reset_bot_state()
+        run_mod._PHASE_A.clear()
+        run_mod._PHASE_A_RC.clear()
+        self.manifest = bot._job_manifest_path(ME)
+        self.manifest.write_text(_MOTION_MANIFEST, encoding="utf-8")
+        state_path_for(self.manifest).write_text(
+            json.dumps({"batch": "2026-09-19-1200", "runs": {}}), encoding="utf-8")
+        self.tg = FakeTg()
+        self.token = bot._run_token(ME)
+        self.assertNotEqual(self.token, "0", "the manifest must exist or every token is 0")
+        # os.environ outranks .env for the enabled list; a developer's shell must not leak in.
+        env = mock.patch.dict("os.environ", {}, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        import os
+        os.environ.pop("VAST_ENABLED_PIPELINES", None)
+        for name, value in (("lease_for", None),):
+            patcher = mock.patch(f"tgbot.bot.{name}", return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.credit = mock.patch("tgbot.bot.vast_credit", return_value=25.0)
+        self.last = mock.patch(
+            "tgbot.bot.vast_last_quote", side_effect=_quote_sized_by(self._batch_gb))
+        self.credit_mock = self.credit.start()
+        self.last.start()
+        for patcher in (self.credit, self.last):
+            self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        bot.ROOT = self._orig_root
+        reset_bot_state()
+
+    def _batch_gb(self) -> float:
+        """The download size the panel and the gate compute for this fixture's manifest."""
+        import drain
+        return drain.vast_download_gb(load_manifest(self.manifest))
+
+    def _latch(self):
+        bot._PHASE_A_OFFERED[ME] = bot._run_token(ME)
+
+    def _last_buttons(self):
+        return [d for row in (self.tg.screen_buttons[-1] or []) for _, d, *_ in row]
+
+    def _spend_buttons(self):
+        return [d for d in self._last_buttons()
+                if d.startswith((bot._CB_RUN_GO, bot._CB_PHASE_A_SPEND))]
+
+
+class TestVastCallbackSuffix(_VastBase):
+    def test_split_provider(self):
+        self.assertEqual(bot._split_provider("123"), ("123", None))
+        self.assertEqual(bot._split_provider("123:vast"), ("123", "vast"))
+        self.assertEqual(bot._split_provider("123:runpod"), ("123", "runpod"))
+        self.assertIsNone(bot._split_provider("123:aws"))
+        self.assertIsNone(bot._split_provider("123:vast:x"))
+
+    def test_the_longest_vast_spend_button_fits_the_64_byte_cap(self):
+        token = "9" * 19       # mtime_ns is 19 digits today
+        for prefix in (bot._CB_RUN_GO, bot._CB_PHASE_A_SPEND, bot._CB_PHASE_A_REUSE,
+                       bot._CB_PHASE_A_RERUN):
+            for suffix in (bot._VAST_SUFFIX, bot._RUNPOD_SUFFIX):
+                self.assertLessEqual(len(f"{prefix}{token}{suffix}".encode()), 64,
+                                     f"{prefix} + {suffix}")
+
+    def _press(self, data):
+        bot.handle(self.tg, cb_from(ME, data), allowed_user_id=ME)
+
+    def test_run_go_without_a_suffix_is_a_default_provider_spend(self):
+        with mock.patch("tgbot.bot._job_has_local_tryon", return_value=False), \
+             mock.patch("tgbot.bot._do_confirm") as confirm:
+            self._press(bot._CB_RUN_GO + self.token)
+        confirm.assert_called_once_with(self.tg, ME, dry_run=False, gpu_provider=None)
+
+    def test_run_go_with_the_vast_suffix_spends_on_vast(self):
+        with mock.patch("tgbot.bot._job_has_local_tryon", return_value=False), \
+             mock.patch("tgbot.bot._do_confirm") as confirm:
+            self._press(bot._CB_RUN_GO + self.token + bot._VAST_SUFFIX)
+        confirm.assert_called_once_with(self.tg, ME, dry_run=False, gpu_provider="vast")
+
+    def test_an_unknown_suffix_or_a_stale_token_spends_nothing(self):
+        with mock.patch("tgbot.bot._job_has_local_tryon", return_value=False), \
+             mock.patch("tgbot.bot._do_confirm") as confirm:
+            self._press(bot._CB_RUN_GO + self.token + ":aws")
+            self._press(bot._CB_RUN_GO + "1" + bot._VAST_SUFFIX)
+        confirm.assert_not_called()
+        self.assertEqual(sum("the job changed" in m for m in self.tg.messages), 2)
+
+    def test_the_reuse_and_rerun_choosers_carry_the_provider_through(self):
+        with mock.patch("tgbot.bot._do_confirm") as confirm:
+            self._press(bot._CB_PHASE_A_REUSE + self.token + bot._VAST_SUFFIX)
+            self._press(bot._CB_PHASE_A_RERUN + self.token + bot._RUNPOD_SUFFIX)
+            self._press(bot._CB_PHASE_A_RERUN + self.token)
+        self.assertEqual(confirm.call_args_list, [
+            mock.call(self.tg, ME, dry_run=False, phase_a_choice="reuse", gpu_provider="vast"),
+            mock.call(self.tg, ME, dry_run=False, phase_a_choice="rerun", gpu_provider="runpod"),
+            mock.call(self.tg, ME, dry_run=False, phase_a_choice="rerun", gpu_provider=None)])
+
+    def test_the_post_phase_a_spend_resumes_on_the_chosen_provider(self):
+        self._latch()
+        with mock.patch("tgbot.bot._do_resume", return_value=True) as resume:
+            self._press(bot._CB_PHASE_A_SPEND + self.token + bot._VAST_SUFFIX)
+        resume.assert_called_once_with(self.tg, ME, self.manifest, dry_run=False,
+                                       gpu_provider="vast")
+        self.assertNotIn(ME, bot._PHASE_A_OFFERED)
+
+    def test_a_refused_spend_leaves_the_rent_panel_re_renderable(self):
+        self._latch()
+        with mock.patch("tgbot.bot._do_resume", return_value=False):
+            self._press(bot._CB_PHASE_A_SPEND + self.token + bot._VAST_SUFFIX)
+        self.assertIn(ME, bot._PHASE_A_OFFERED)
+
+
+class TestVastResume(_VastBase):
+    def _resume(self, **kwargs):
+        with mock.patch("tgbot.bot.busy", return_value=False), \
+             mock.patch("tgbot.bot.migration_running", return_value=kwargs.pop("migrating", False)), \
+             mock.patch("tgbot.bot._start_progress") as progress, \
+             mock.patch("tgbot.bot.start_drain") as start_drain:
+            started = bot._do_resume(self.tg, ME, self.manifest, dry_run=False, **kwargs)
+        return started, start_drain, progress
+
+    def test_a_vast_resume_starts_the_drain_on_vast_and_records_it_in_progress(self):
+        started, start_drain, progress = self._resume(gpu_provider="vast")
+        self.assertTrue(started)
+        start_drain.assert_called_once_with(self.manifest, dry_run=False, resume=True,
+                                            gpu_provider="vast")
+        self.assertEqual(progress.call_args.kwargs["gpu_provider"], "vast")
+        self.assertIn("on Vast.ai", self.tg.messages[-1])
+
+    def test_a_migration_in_flight_does_not_block_a_vast_resume(self):
+        started, start_drain, _ = self._resume(gpu_provider="vast", migrating=True)
+        self.assertTrue(started)
+        start_drain.assert_called_once()
+
+    def test_a_migration_in_flight_still_blocks_the_default_resume(self):
+        started, start_drain, _ = self._resume(migrating=True)
+        self.assertFalse(started)
+        start_drain.assert_not_called()
+
+    def test_the_default_resume_is_unchanged_and_says_nothing_about_vast(self):
+        started, start_drain, progress = self._resume()
+        self.assertTrue(started)
+        start_drain.assert_called_once_with(self.manifest, dry_run=False, resume=True)
+        self.assertNotIn("gpu_provider", progress.call_args.kwargs)
+        self.assertNotIn("Vast", self.tg.messages[-1])
+
+    def test_a_vast_resume_for_an_unmeasured_pipeline_is_refused_and_spends_nothing(self):
+        (self.root / ".env").write_text("GPU=x\n", encoding="utf-8")
+        started, start_drain, progress = self._resume(gpu_provider="vast")
+        self.assertFalse(started)
+        start_drain.assert_not_called()
+        progress.assert_not_called()
+        self.assertIn("Not renting on Vast", self.tg.messages[-1])
+        self.assertIn("nothing was spent", self.tg.messages[-1])
+
+    def test_a_vast_resume_with_an_unreadable_account_is_refused(self):
+        self.credit_mock.side_effect = RuntimeError("no api key")
+        started, start_drain, _ = self._resume(gpu_provider="vast")
+        self.assertFalse(started)
+        start_drain.assert_not_called()
+        self.assertIn("no api key", self.tg.messages[-1])
+
+    def test_a_quote_older_than_ten_minutes_no_longer_backs_a_spend(self):
+        # The right SIZE, so age is the only thing wrong with it.
+        stale = _vast_quote(gb=self._batch_gb(), fetched_at=time.time() - 3600)
+        with mock.patch("tgbot.bot.vast_last_quote", return_value=stale):
+            started, start_drain, _ = self._resume(gpu_provider="vast")
+        self.assertFalse(started)
+        start_drain.assert_not_called()
+        self.assertIn("no current Vast price quote", self.tg.messages[-1])
+
+    def test_a_quote_fetched_for_another_batchs_download_size_no_longer_backs_a_spend(self):
+        other = _vast_quote(gb=10.0)
+        with mock.patch("tgbot.bot.vast_last_quote", return_value=other):
+            started, start_drain, _ = self._resume(gpu_provider="vast")
+        self.assertFalse(started)
+        start_drain.assert_not_called()
+        self.assertIn("no current Vast price quote", self.tg.messages[-1])
+
+    def test_a_vast_resume_with_too_little_credit_is_refused(self):
+        self.credit_mock.return_value = 0.05
+        started, start_drain, _ = self._resume(gpu_provider="vast")
+        self.assertFalse(started)
+        start_drain.assert_not_called()
+        self.assertIn("below this session's estimate", self.tg.messages[-1])
+
+    def test_a_vast_resume_with_no_price_quote_is_refused_and_spends_nothing(self):
+        # The quote lives in memory; a bot restart empties it while the button stays in the chat.
+        with mock.patch("tgbot.bot.vast_last_quote", return_value=None):
+            started, start_drain, progress = self._resume(gpu_provider="vast")
+        self.assertFalse(started)
+        start_drain.assert_not_called()
+        progress.assert_not_called()
+        self.assertIn("Not renting on Vast", self.tg.messages[-1])
+        self.assertIn("no current Vast price quote", self.tg.messages[-1])
+
+
+class TestVastConfirm(_FlowFixture):
+    """_do_confirm, the fresh-spend gate, with the provider the Vast tab minted."""
+
+    def setUp(self):
+        super().setUp()
+        (self.root / ".env").write_text(
+            "VAST_ENABLED_PIPELINES=tryon-motion-enhance\n", encoding="utf-8")
+        import os
+        env = mock.patch.dict("os.environ", {}, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("VAST_ENABLED_PIPELINES", None)
+        self.credit = mock.patch("tgbot.bot.vast_credit", return_value=25.0)
+        self.last = mock.patch(
+            "tgbot.bot.vast_last_quote",
+            side_effect=_quote_sized_by(
+                lambda: bot.vast_download_gb(bot._draft_manifest(ME))))
+        self.credit_mock = self.credit.start()
+        self.last.start()
+        self.addCleanup(self.credit.stop)
+        self.addCleanup(self.last.stop)
+
+    def _confirm(self, **kwargs):
+        with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot._start_progress") as progress, \
+             mock.patch("tgbot.bot._job_has_local_tryon", return_value=False), \
+             mock.patch("tgbot.bot.drain_running",
+                        return_value=kwargs.pop("running", False)), \
+             mock.patch("tgbot.bot.migration_running",
+                        return_value=kwargs.pop("migrating", False)):
+            self._fill_required_slots()
+            bot._do_confirm(self.tg, ME, dry_run=False, **kwargs)
+        return start_drain, progress
+
+    def test_a_vast_confirm_starts_the_drain_on_vast_and_names_the_rate(self):
+        start_drain, progress = self._confirm(gpu_provider="vast")
+        start_drain.assert_called_once()
+        self.assertEqual(start_drain.call_args.kwargs["gpu_provider"], "vast")
+        self.assertEqual(progress.call_args.kwargs["gpu_provider"], "vast")
+        started = next(m for m in self.tg.messages if "Started" in m)
+        self.assertIn("Vast.ai at about $0.90/hour", started)
+        self.assertNotIn("$0.99", started)
+
+    def _chooser_buttons(self, **kwargs):
+        with mock.patch("tgbot.bot._preserved_tryon", return_value=(1, 1)), \
+             mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot._job_has_local_tryon", return_value=False), \
+             mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.migration_running", return_value=False):
+            self._fill_required_slots()
+            bot._do_confirm(self.tg, ME, dry_run=False, **kwargs)
+        start_drain.assert_not_called()          # the chooser stops before anything is rented
+        return [d for row in (self.tg.buttons[-1] or []) for _, d, *_ in row]
+
+    def test_the_reuse_and_rerun_chooser_carries_the_vast_choice(self):
+        flat = self._chooser_buttons(gpu_provider="vast")
+        token = bot._run_token(ME)
+        self.assertIn(f"{bot._CB_PHASE_A_REUSE}{token}:vast", flat)
+        self.assertIn(f"{bot._CB_PHASE_A_RERUN}{token}:vast", flat)
+
+    def test_the_default_chooser_has_no_suffix(self):
+        flat = self._chooser_buttons()
+        token = bot._run_token(ME)
+        self.assertIn(f"{bot._CB_PHASE_A_REUSE}{token}", flat)
+        self.assertIn(f"{bot._CB_PHASE_A_RERUN}{token}", flat)
+
+    def test_the_reuse_and_rerun_chooser_carries_the_runpod_choice(self):
+        # An explicit "runpod" tap on _CB_RUN_GO (2026-09-19 fix) must survive into this
+        # chooser too, or the loophole it closed reopens one screen later.
+        flat = self._chooser_buttons(gpu_provider="runpod")
+        token = bot._run_token(ME)
+        self.assertIn(f"{bot._CB_PHASE_A_REUSE}{token}:runpod", flat)
+        self.assertIn(f"{bot._CB_PHASE_A_RERUN}{token}:runpod", flat)
+
+    def test_a_migration_in_flight_does_not_block_a_vast_confirm(self):
+        start_drain, _ = self._confirm(gpu_provider="vast", migrating=True)
+        start_drain.assert_called_once()
+
+    def test_the_default_confirm_is_unchanged(self):
+        start_drain, progress = self._confirm()
+        start_drain.assert_called_once()
+        self.assertNotIn("gpu_provider", start_drain.call_args.kwargs)
+        self.assertNotIn("gpu_provider", progress.call_args.kwargs)
+        self.assertIn("on one pod at $0.99/hour",
+                      next(m for m in self.tg.messages if "Started" in m))
+
+    def test_a_refused_vast_confirm_spends_nothing_and_keeps_the_draft_and_its_token(self):
+        (self.root / ".env").write_text("GPU=x\n", encoding="utf-8")
+        with mock.patch("tgbot.bot._job_has_local_tryon", return_value=False), \
+             mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.migration_running", return_value=False), \
+             mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot._start_progress"):
+            self._fill_required_slots()
+            before = bot._run_token(ME)
+            bot._do_confirm(self.tg, ME, dry_run=False, gpu_provider="vast")
+            after = bot._run_token(ME)
+        start_drain.assert_not_called()
+        self.assertNotEqual(before, "0")
+        self.assertEqual(before, after, "the refusal rewrote the manifest and killed the panel")
+        self.assertIn(ME, bot._STATE)          # the draft survives, so the user can go back
+        self.assertIn("Not renting on Vast", self.tg.messages[-1])
+
+    def test_a_vast_confirm_with_no_price_quote_spends_nothing_and_keeps_the_draft(self):
+        with mock.patch("tgbot.bot.vast_last_quote", return_value=None), \
+             mock.patch("tgbot.bot._job_has_local_tryon", return_value=False), \
+             mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.migration_running", return_value=False), \
+             mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot._start_progress") as progress:
+            self._fill_required_slots()
+            before = bot._run_token(ME)
+            bot._do_confirm(self.tg, ME, dry_run=False, gpu_provider="vast")
+            after = bot._run_token(ME)
+        start_drain.assert_not_called()
+        progress.assert_not_called()
+        self.assertNotEqual(before, "0")
+        self.assertEqual(before, after, "the refusal rewrote the manifest and killed the panel")
+        self.assertIn(ME, bot._STATE)
+        self.assertIn("Not renting on Vast", self.tg.messages[-1])
+        self.assertIn("no current Vast price quote", self.tg.messages[-1])
+
+    def test_a_job_queued_onto_a_running_drain_is_not_a_new_vast_rental(self):
+        (self.root / ".env").write_text("GPU=x\n", encoding="utf-8")   # nothing enabled
+        start_drain, _ = self._confirm(gpu_provider="vast", running=True)
+        start_drain.assert_not_called()          # queued, not launched
+        self.assertTrue(any("Queued" in m for m in self.tg.messages))
+        self.assertFalse(any("Not renting on Vast" in m for m in self.tg.messages))
+
+
+class TestVastProgressBilling(_VastBase):
+    def test_billing_kwargs_reads_provider_and_rate_and_ignores_junk(self):
+        self.assertEqual(bot._billing_kwargs({"gpu_provider": "vast", "usd_per_hr": 0.9}),
+                         {"provider": "vast", "usd_per_hr": 0.9})
+        self.assertEqual(bot._billing_kwargs({}), {})
+        self.assertEqual(bot._billing_kwargs(None), {})
+        self.assertEqual(bot._billing_kwargs({"usd_per_hr": True}), {})
+
+    def test_a_vast_progress_file_records_the_provider_and_the_quoted_rate(self):
+        bot._start_progress(self.tg, ME, self.manifest, ["motion"], gpu_provider="vast")
+        payload = json.loads(bot._progress_path(ME).read_text(encoding="utf-8"))
+        self.assertEqual((payload["gpu_provider"], payload["usd_per_hr"]), ("vast", 0.90))
+
+    def test_a_runpod_progress_file_is_unchanged(self):
+        bot._start_progress(self.tg, ME, self.manifest, ["motion"])
+        payload = json.loads(bot._progress_path(ME).read_text(encoding="utf-8"))
+        self.assertNotIn("gpu_provider", payload)
+        self.assertNotIn("usd_per_hr", payload)
+
+    def test_the_message_is_priced_at_the_quoted_rate_not_the_runpod_one(self):
+        lease = Lease(pod_id="i1", provisioned_at=time.time() - 3600, manifest=str(self.manifest),
+                      abs_max_min=240, provider="vast")
+        with mock.patch("tgbot.bot.lease_for", return_value=lease):
+            bot._start_progress(self.tg, ME, self.manifest, ["motion"], gpu_provider="vast")
+        self.assertIn("on Vast.ai", self.tg.messages[-1])
+        self.assertIn("quoted $0.90/h", self.tg.messages[-1])
+        self.assertNotIn("$0.99", self.tg.messages[-1])
+
+
+class TestVastPicker(_VastBase):
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch("tgbot.bot.vast_fetch_quote", return_value=_vast_quote())
+        self.fetch_mock = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _stock(self):
+        return {"NVIDIA GeForce RTX 5090": [
+            Stock(gpu_id="NVIDIA GeForce RTX 5090", display_name="RTX 5090",
+                  datacenter_id="EU-RO-1", stock_status="available", price_per_hr=0.99)]}
+
+    def _runpod_panel(self):
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
+            bot._offer_run_confirm(self.tg, ME)
+
+    def _vast_panel(self, **kwargs):
+        with mock.patch("tgbot.bot.stock_at_cached") as stock, \
+             mock.patch("tgbot.bot.stock_at") as live:
+            bot._offer_run_confirm(self.tg, ME, gpu_provider="vast", **kwargs)
+        stock.assert_not_called()        # no datacenter or stock lines on the Vast tab
+        live.assert_not_called()
+
+    def test_the_runpod_screen_gains_a_provider_row_and_keeps_its_own_buttons(self):
+        self._runpod_panel()
+        first = self.tg.screen_buttons[-1][0]
+        self.assertEqual([(label, data) for label, data, *_ in first],
+                         [("RunPod ✓", bot._CB_RUN_RUNPOD), ("Vast", bot._CB_RUN_VAST)])
+        # Names its own provider explicitly, same as Vast's tab always has (2026-09-19 fix:
+        # a bare button here used to fall back to .env's GPU_PROVIDER on the tap).
+        self.assertIn(bot._CB_RUN_GO + self.token + bot._RUNPOD_SUFFIX, self._last_buttons())
+
+    def test_the_fail_open_runpod_screen_has_the_row_too(self):
+        with mock.patch("tgbot.bot.volume_datacenter", return_value=None):
+            bot._offer_run_confirm(self.tg, ME)
+        buttons = self._last_buttons()
+        self.assertIn(bot._CB_RUN_VAST, buttons)
+        self.assertTrue(any(d.endswith(bot._RUNPOD_SUFFIX) for d in buttons))
+
+    def test_the_phase_a_try_on_confirm_has_no_provider_row(self):
+        bot._offer_run_confirm(self.tg, ME, phase_a=True)
+        self.assertNotIn(bot._CB_RUN_VAST, self._last_buttons())
+
+    def test_the_vast_tab_shows_the_offer_and_a_vast_spend_button(self):
+        self._latch()
+        self._vast_panel()
+        text = self.tg.screen[-1]
+        for expected in ("$0.90/h", "Bulgaria, BG", "Vast credit: $25.00", "Estimated session"):
+            self.assertIn(expected, text)
+        self.assertNotIn("Switch GPU", text)
+        self.assertNotIn("Other regions", text)
+        buttons = self._last_buttons()
+        self.assertIn(bot._CB_RUN_GO + self.token + ":vast", buttons)
+        self.assertIn(bot._CB_RUN_REFRESH + "v", buttons)
+        first = self.tg.screen_buttons[-1][0]
+        self.assertEqual([label for label, *_ in first], ["RunPod", "Vast ✓"])
+
+    def test_the_quote_is_sized_to_this_manifests_download(self):
+        self._latch()
+        self._vast_panel()
+        import drain
+        expected = drain.vast_download_gb(load_manifest(self.manifest))
+        self.assertAlmostEqual(self.fetch_mock.call_args.args[0], expected)
+        self.assertIs(self.fetch_mock.call_args.kwargs["force"], False)
+
+    def test_the_post_phase_a_vast_spend_button_resumes_and_carries_the_provider(self):
+        self._latch()
+        bot._offer_rent_after_phase_a(self.tg, ME, gpu_provider="vast")
+        self.assertIn(bot._CB_PHASE_A_SPEND + self.token + ":vast", self._last_buttons())
+        self.assertIn("Try-on finished", self.tg.screen[-1])
+
+    def test_a_pipeline_nobody_has_measured_gets_no_spend_button_and_says_why(self):
+        (self.root / ".env").write_text("GPU=x\n", encoding="utf-8")
+        self._latch()
+        self._vast_panel()
+        self.assertEqual(self._spend_buttons(), [])
+        self.assertIn("no measured Vast session for motion-enhance", self.tg.screen[-1])
+        self.assertIn("$0.90/h", self.tg.screen[-1])       # the tab still renders the offer
+
+    def test_no_qualifying_machine_gets_no_spend_button(self):
+        self.fetch_mock.side_effect = RuntimeError("0 of 40 offers qualify (40 over price cap).")
+        self._latch()
+        self._vast_panel()
+        self.assertEqual(self._spend_buttons(), [])
+        self.assertIn("40 over price cap", self.tg.screen[-1])
+
+    def test_an_unreadable_account_gets_no_spend_button(self):
+        self.credit_mock.side_effect = RuntimeError("no api key")
+        self._latch()
+        self._vast_panel()
+        self.assertEqual(self._spend_buttons(), [])
+        self.assertIn("no api key", self.tg.screen[-1])
+
+    def test_the_vast_tab_button_draws_the_panel_and_refresh_forces_a_new_quote(self):
+        self._latch()
+        with mock.patch("tgbot.bot.stock_at_cached"):
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_VAST), allowed_user_id=ME)
+            self.assertIn("Vast.ai", self.tg.screen[-1])
+            self.assertIs(self.fetch_mock.call_args.kwargs["force"], False)
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_REFRESH + "v"), allowed_user_id=ME)
+        self.assertIs(self.fetch_mock.call_args.kwargs["force"], True)
+        self.assertIn(bot._CB_PHASE_A_SPEND + self.token + ":vast", self._last_buttons())
+
+    def test_the_vast_tab_with_no_job_at_all_says_so_instead_of_drawing(self):
+        bot._PHASE_A_OFFERED.clear()
+        bot.handle(self.tg, cb_from(ME, bot._CB_RUN_VAST), allowed_user_id=ME)
+        self.assertIn("no complete job yet", self.tg.messages[-1])
+        self.fetch_mock.assert_not_called()
+
+    def test_the_runpod_tab_goes_back_to_the_stock_screen(self):
+        self._latch()
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_VAST), allowed_user_id=ME)
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_RUNPOD), allowed_user_id=ME)
+        self.assertIn("Try-on finished", self.tg.screen[-1])
+        self.assertIn("RTX 5090", self.tg.screen[-1])
+        self.assertIn(bot._CB_PHASE_A_SPEND + self.token + bot._RUNPOD_SUFFIX,
+                      self._last_buttons())
+
+
+class TestVastProgressRender(_VastBase):
+    """tick_progress and /status price a running Vast pod from its progress file."""
+
+    def test_a_later_render_reads_the_rate_back_from_the_file(self):
+        bot._start_progress(self.tg, ME, self.manifest, ["motion"], gpu_provider="vast")
+        payload = json.loads(bot._progress_path(ME).read_text(encoding="utf-8"))
+        lease = Lease(pod_id="i1", provisioned_at=time.time() - 3600, manifest=str(self.manifest),
+                      abs_max_min=240, provider="vast")
+        with mock.patch("tgbot.bot.lease_for", return_value=lease), \
+             mock.patch("tgbot.bot.drain_running", return_value=True):
+            bot.tick_progress(self.tg, ME)
+        self.assertIn("quoted $0.90/h", self.tg.screen[-1])
+
+
+class TestVastRecoveryAndKill(unittest.TestCase):
+    """The stock-out card's Rent on Vast button, and /kill's wording for a Vast pod."""
+
+    def setUp(self):
+        self._orig_root = bot.ROOT
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "batch").mkdir()
+        (self.root / "out").mkdir()
+        bot.ROOT = self.root
+        (self.root / ".env").write_text(
+            "GPU=NVIDIA GeForce RTX 5090\nPOD_VOLUME_ID=vol-1\n", encoding="utf-8")
+        reset_bot_state()
+        self.manifest = self.root / "batch" / "tg-1.yaml"
+        self.manifest.write_text(_MOTION_MANIFEST, encoding="utf-8")
+        state_path_for(self.manifest).write_text(
+            json.dumps({"batch": "2026-09-14-1421", "runs": {}}), encoding="utf-8")
+        write_provision_failure(provision_failure_path(self.manifest), ProvisionFailure(
+            gpu="NVIDIA GeForce RTX 5090", datacenter="EU-RO-1",
+            stock_out=True, detail="hết máy ..."))
+        self.tg = FakeTg()
+
+    def tearDown(self):
+        bot.ROOT = self._orig_root
+        reset_bot_state()
+
+    def test_the_stock_out_card_offers_rent_on_vast(self):
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value={}):
+            bot.deliver_result(self.tg, ME, self.manifest)
+        flat = [data for row in self.tg.buttons[-1] for _, data, *_ in row]
+        self.assertIn(f"{bot._CB_RECOVER_VAST}tg-1", flat)
+
+    def test_a_non_stock_out_failure_card_has_no_vast_button(self):
+        write_provision_failure(provision_failure_path(self.manifest), ProvisionFailure(
+            gpu="NVIDIA GeForce RTX 5090", datacenter="EU-RO-1", stock_out=False,
+            detail="some API error"))
+        bot.deliver_result(self.tg, ME, self.manifest)
+        flat = [data for rows in self.tg.buttons if rows for row in rows for _, data, *_ in row]
+        self.assertFalse([d for d in flat if d.startswith(bot._CB_RECOVER_VAST)])
+
+    def _outstanding_failure_for_this_chat(self):
+        write_provision_failure(provision_failure_path(bot._job_manifest_path(ME)),
+                                ProvisionFailure(gpu="NVIDIA GeForce RTX 5090",
+                                                 datacenter="EU-RO-1", stock_out=True,
+                                                 detail="hết máy ..."))
+
+    def _tap_vast_card(self):
+        stem = bot._job_manifest_path(ME).stem
+        with mock.patch("tgbot.bot._offer_run_for_chat") as offer:
+            bot.handle(self.tg, cb_from(ME, f"{bot._CB_RECOVER_VAST}{stem}"),
+                       allowed_user_id=ME)
+        return offer
+
+    def test_tapping_it_for_this_chats_batch_latches_the_rent_panel_on_vast(self):
+        self._outstanding_failure_for_this_chat()
+        offer = self._tap_vast_card()
+        self.assertEqual(bot._PHASE_A_OFFERED.get(ME), bot._run_token(ME))
+        self.assertEqual(offer.call_args.kwargs["gpu_provider"], "vast")
+
+    def test_a_card_whose_failure_was_already_resolved_opens_nothing(self):
+        # No sentinel: a resume (or a newer batch) cleared the failure this card reported.
+        offer = self._tap_vast_card()
+        offer.assert_not_called()
+        self.assertNotIn(ME, bot._PHASE_A_OFFERED)
+        self.assertIn("earlier batch", self.tg.messages[-1])
+
+    def test_a_card_tapped_while_a_new_job_is_being_assembled_opens_nothing(self):
+        self._outstanding_failure_for_this_chat()
+        bot._STATE[ME] = bot.Job(slots={}, probes={}, pipeline="motion-enhance",
+                                 provider="gemini")
+        offer = self._tap_vast_card()
+        offer.assert_not_called()
+        self.assertNotIn(ME, bot._PHASE_A_OFFERED)
+
+    def test_tapping_it_for_another_batchs_card_opens_nothing(self):
+        with mock.patch("tgbot.bot._offer_run_for_chat") as offer:
+            bot.handle(self.tg, cb_from(ME, f"{bot._CB_RECOVER_VAST}tg-999"),
+                       allowed_user_id=ME)
+            bot.handle(self.tg, cb_from(ME, bot._CB_RECOVER_VAST), allowed_user_id=ME)
+        offer.assert_not_called()
+        self.assertNotIn(ME, bot._PHASE_A_OFFERED)
+
+    def _kill_ask(self, provider):
+        lease = Lease(pod_id="p1", provisioned_at=time.time() - 3600, manifest=str(self.manifest),
+                      abs_max_min=240, provider=provider)
+        with mock.patch("tgbot.bot.drain_running", return_value=True), \
+             mock.patch("tgbot.bot.phase_a_running", return_value=False), \
+             mock.patch("tgbot.bot.lease_for", return_value=lease):
+            bot._ask_kill(self.tg, ME)
+        return self.tg.messages[-1]
+
+    def test_kill_quotes_the_runpod_rate_only_for_a_runpod_pod(self):
+        self.assertIn("($0.99) on the pod", self._kill_ask("runpod"))
+        vast = self._kill_ask("vast")
+        self.assertIn("already 60 min on the pod", vast)
+        self.assertNotIn("$0.99", vast)
+
+
+
+
+class TestVastQueueGate(_FlowFixture):
+    """A job assembled while a drain runs is written into its mailbox, and drain.py claims
+    whatever sits there when the current job ends (batchlib_ext/handoff.py) — so a Vast pod, which
+    only has the first manifest's models, must be protected BEFORE that write."""
+
+    LIVE = ("runs:\n  - id: runA\n    pipeline: tryon-motion-enhance\n"
+            "    inputs: {character: /tmp/c.png, outfit: /tmp/o.png, driver: /tmp/d.mp4}\n"
+            "    tryon: { provider: gemini }\n")
+
+    def setUp(self):
+        super().setUp()
+        import os
+        env = mock.patch.dict("os.environ", {}, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("VAST_ENABLED_PIPELINES", None)
+        self.live = bot._job_manifest_path(ME)
+        self.mailbox = mailbox_path(self.live)
+
+    def _lease(self, provider):
+        return Lease(pod_id="p1", provisioned_at=time.time(), manifest=str(self.live),
+                     abs_max_min=240, provider=provider)
+
+    def _assemble_while_draining(self, provider, *, enabled, on_pod_models=None):
+        (self.root / ".env").write_text(
+            f"VAST_ENABLED_PIPELINES={enabled}\n" if enabled else "GPU=x\n", encoding="utf-8")
+        self.live.write_text(self.LIVE, encoding="utf-8")
+        lease = self._lease(provider) if provider else None
+        patches = [mock.patch("tgbot.bot.drain_running", return_value=True),
+                   mock.patch("tgbot.bot.lease_for", return_value=lease),
+                   mock.patch("tgbot.bot.read_lease", return_value=lease),
+                   mock.patch("tgbot.bot.start_drain")]
+        if on_pod_models is not None:
+            patches.append(mock.patch("tgbot.bot.models_for_manifest",
+                                      side_effect=on_pod_models))
+        with contextlib_exit_stack(patches):
+            self._fill_required_slots()
+
+    def test_a_pipeline_not_enabled_for_vast_is_not_queued_onto_a_vast_pod(self):
+        self._assemble_while_draining("vast", enabled="")
+        self.assertFalse(self.mailbox.exists(), "the job was queued onto a Vast pod")
+        self.assertTrue(any("Not queued" in m and "no measured Vast session" in m
+                            for m in self.tg.messages))
+
+    def test_a_job_needing_models_the_pod_lacks_is_not_queued(self):
+        self._assemble_while_draining(
+            "vast", enabled="tryon-motion-enhance",
+            on_pod_models=[frozenset({"wan-a"}), frozenset({"wan-a", "swap-sam3"})])
+        self.assertFalse(self.mailbox.exists())
+        self.assertTrue(any("also needs swap-sam3" in m for m in self.tg.messages))
+
+    def test_a_draft_that_cannot_be_resolved_fails_closed_instead_of_crashing(self):
+        # 2026-09-19 review finding: models_for_manifest(draft) used to run outside the try/except
+        # that only guarded the on-pod read, so a KeyError from the draft's own side (e.g. a
+        # pipeline outside PIPELINES — never assembled by the bot's own picker, but the gate must
+        # still fail closed rather than raise) would propagate uncaught.
+        self._assemble_while_draining(
+            "vast", enabled="tryon-motion-enhance",
+            on_pod_models=[frozenset({"wan-a"}), KeyError("no such pipeline")])
+        self.assertFalse(self.mailbox.exists(), "the job was queued despite an unresolvable draft")
+        self.assertTrue(any("Not queued" in m and "could not determine the models" in m
+                            for m in self.tg.messages))
+
+    def test_a_job_whose_models_the_pod_already_has_is_queued_as_before(self):
+        self._assemble_while_draining("vast", enabled="tryon-motion-enhance")
+        self.assertTrue(self.mailbox.exists())
+        self.assertFalse(any("Not queued" in m for m in self.tg.messages))
+
+    def test_a_runpod_pod_is_exempt_whatever_is_enabled(self):
+        self._assemble_while_draining("runpod", enabled="")
+        self.assertTrue(self.mailbox.exists())
+        self.assertFalse(any("Not queued" in m for m in self.tg.messages))
+
+    def test_with_no_lease_at_all_the_queue_behaves_as_it_always_did(self):
+        self._assemble_while_draining(None, enabled="")
+        self.assertTrue(self.mailbox.exists())
+
+    def test_confirm_takes_a_job_back_out_of_the_mailbox_if_the_pod_no_longer_qualifies(self):
+        # Rendered while nothing was draining and the pipeline enabled; then a Vast drain appears
+        # and the enabled list has been emptied before the tap.
+        (self.root / ".env").write_text("VAST_ENABLED_PIPELINES=tryon-motion-enhance\n",
+                                        encoding="utf-8")
+        with mock.patch("tgbot.bot.drain_running", return_value=False):
+            self._fill_required_slots()
+        self.assertTrue(self.live.exists())
+        self.mailbox.write_text("runs: []\n", encoding="utf-8")     # what a queued render leaves
+        (self.root / ".env").write_text("GPU=x\n", encoding="utf-8")
+        lease = self._lease("vast")
+        with mock.patch("tgbot.bot.drain_running", return_value=True), \
+             mock.patch("tgbot.bot.lease_for", return_value=lease), \
+             mock.patch("tgbot.bot.read_lease", return_value=lease), \
+             mock.patch("tgbot.bot.start_drain") as start_drain:
+            bot._do_confirm(self.tg, ME, dry_run=False)
+        start_drain.assert_not_called()
+        self.assertFalse(self.mailbox.exists(), "a refused job was left in the mailbox")
+        self.assertTrue(any("Not queued" in m for m in self.tg.messages))
+        self.assertIn(ME, bot._STATE)                                # the draft survives

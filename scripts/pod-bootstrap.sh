@@ -14,6 +14,8 @@ warn() { printf '\033[33m !!\033[0m %s\n' "$*"; }
 die()  { printf '\033[31m ✗ \033[0m%s\n' "$*" >&2; exit 1; }
 
 env_get() { grep -E "^$1=" .env 2>/dev/null | cut -d= -f2- | sed -E 's/[[:space:]]*#.*$//' | tr -d '"'; }
+# shellcheck source=lib-gpu-provider.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib-gpu-provider.sh"
 
 HOST="$(env_get GPU_SSH_HOST)"
 PORT="$(env_get GPU_SSH_PORT)"
@@ -52,7 +54,7 @@ fi
 # MTC_PREBUILT=1: the pod image already ships /opt/mtc-prebuilt (ComfyUI + venv +
 #   api node_modules). Skips ~20-35 min of installing. Requires the image built from
 #   motions-studio/worker-image/Dockerfile — the setup script dies if .ready is absent.
-POD_VOLUME="$(env_get POD_VOLUME)"
+POD_VOLUME="$(pod_volume)"
 MTC_PREBUILT="$(env_get MTC_PREBUILT)"
 MODELS_MIN_GB="$(env_get MODELS_MIN_GB)"
 # ALD 05/08/2026 - Khoá JOB_TYPES hẹp hơn profile khai. Profile nói phần mềm chạy được gì;
@@ -181,6 +183,7 @@ CF_TUNNEL_TOKEN='$CF_TUNNEL_TOKEN' CORS_ORIGINS='$CORS_ORIGINS' HF_TOKEN='' \
 ${FE_DOMAIN:+CF_FE_DOMAIN='$FE_DOMAIN' CF_FE_PORT='$FE_PORT' FRONTEND_URL='https://$FE_DOMAIN'} \
 MTC_PREBUILT='${MTC_PREBUILT:-0}' \
 ${JOB_TYPES_OVERRIDE:+JOB_TYPES_OVERRIDE='$JOB_TYPES_OVERRIDE'} \
+${VAST_MODEL_IDS:+VAST_MODEL_IDS='$VAST_MODEL_IDS'} \
 ${POD_VOLUME:+POD_VOLUME='$POD_VOLUME'} \
 ${MOTION_VRAM_MAX_FRAMES:+MOTION_VRAM_MAX_FRAMES='$MOTION_VRAM_MAX_FRAMES'} \
 ${MOTION_FLASHVSR_CHUNK:+MOTION_FLASHVSR_CHUNK='$MOTION_FLASHVSR_CHUNK'} \

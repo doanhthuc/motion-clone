@@ -1,4 +1,5 @@
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -455,6 +456,225 @@ class TestMigrationTiers(unittest.TestCase):
         self.assertEqual(pods_api.destroyed, ["stray"])
         self.assertIn("migration tier 1/2 failed, falling through to tier 3",
                       "\n".join(self.logs))
+
+
+class TestTwoProviders(unittest.TestCase):
+    """A Vast instance must be as well guarded as a RunPod pod (spec §3.4)."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.lease_path = Path(self.temp_dir.name) / "pod-lease.json"
+        self.patcher = patch.object(pod_watchdog, "LEASE_PATH", self.lease_path)
+        self.patcher.start()
+        # Same isolation as TestMigrationTiers: never read the developer's real
+        # batch/volume-migrate-lease.json.
+        self.migrate_patcher = patch.object(pod_watchdog, "MIGRATE_LEASE_PATH",
+                                            Path(self.temp_dir.name) / "migrate-lease.json")
+        self.migrate_patcher.start()
+        self.logs: list[str] = []
+        self.log_patcher = patch.object(pod_watchdog, "log", self.logs.append)
+        self.log_patcher.start()
+
+    def tearDown(self):
+        self.log_patcher.stop()
+        self.migrate_patcher.stop()
+        self.patcher.stop()
+        self.temp_dir.cleanup()
+
+    def _lease(self, provider: str, *, abs_max_min: int = 10) -> Lease:
+        return Lease(pod_id="777", provisioned_at=0.0, manifest="batch/test.yaml",
+                     abs_max_min=abs_max_min, provider=provider)
+
+    def test_a_vast_lease_is_destroyed_through_the_vast_control_not_runpod(self):
+        write_lease(self.lease_path, self._lease("vast"))
+        runpod, vast = FakePods(), FakePods()
+
+        pod_watchdog.tick(runpod, {}, now=1000.0 * 60.0, dry_run=False,
+                          extra_apis={"vast": vast})
+
+        self.assertEqual(vast.destroyed, ["777"])
+        self.assertEqual(runpod.destroyed, [],
+                         "a vast lease was sent to runpodctl, which cannot destroy it")
+        self.assertFalse(self.lease_path.is_file())
+
+    def test_a_runpod_lease_still_goes_through_runpod(self):
+        write_lease(self.lease_path, self._lease("runpod"))
+        runpod, vast = FakePods(), FakePods()
+
+        pod_watchdog.tick(runpod, {}, now=1000.0 * 60.0, dry_run=False,
+                          extra_apis={"vast": vast})
+
+        self.assertEqual(runpod.destroyed, ["777"])
+        self.assertEqual(vast.destroyed, [])
+
+    def test_tier_three_reaps_an_unleased_vast_instance_past_grace(self):
+        # The instance was created but drain never wrote a lease (or it was lost): the label
+        # `motion-transfer` is what gives tier 3 the authority to kill it.
+        runpod, vast = FakePods(), FakePods()
+        vast.pods = [PodInfo("888", "motion-transfer")]
+
+        pod_watchdog.tick(runpod, {"888": 0.0}, now=11 * 60.0, dry_run=False,
+                          extra_apis={"vast": vast})
+
+        self.assertEqual(vast.destroyed, ["888"])
+        self.assertEqual(runpod.destroyed, [])
+
+    def test_an_unlabelled_vast_instance_is_never_destroyed(self):
+        runpod, vast = FakePods(), FakePods()
+        vast.pods = [PodInfo("999", "")]
+
+        pod_watchdog.tick(runpod, {"999": 0.0}, now=600 * 60.0, dry_run=False,
+                          extra_apis={"vast": vast})
+
+        self.assertEqual(vast.destroyed, [])
+
+    def test_a_leased_vast_instance_is_not_an_orphan(self):
+        write_lease(self.lease_path, self._lease("vast", abs_max_min=10_000))
+        runpod, vast = FakePods(), FakePods()
+        vast.pods = [PodInfo("777", "motion-transfer")]
+
+        pod_watchdog.tick(runpod, {"777": 0.0}, now=11 * 60.0, dry_run=False,
+                          extra_apis={"vast": vast})
+
+        self.assertEqual(vast.destroyed, [])
+
+    def test_a_failing_runpod_listing_does_not_stop_the_vast_scan(self):
+        runpod, vast = FakePods(), FakePods()
+        runpod._list_error = "runpodctl not configured"
+        vast.pods = [PodInfo("888", "motion-transfer")]
+
+        pod_watchdog.tick(runpod, {"888": 0.0}, now=11 * 60.0, dry_run=False,
+                          extra_apis={"vast": vast})
+
+        self.assertEqual(vast.destroyed, ["888"])
+        self.assertIn("cannot list runpod pods", "\n".join(self.logs))
+
+    def test_a_failing_vast_listing_does_not_stop_the_runpod_scan(self):
+        runpod, vast = FakePods(), FakePods()
+        runpod.pods = [PodInfo("stray", "motion-transfer")]
+        vast._list_error = "bad api key"
+
+        pod_watchdog.tick(runpod, {"stray": 0.0}, now=11 * 60.0, dry_run=False,
+                          extra_apis={"vast": vast})
+
+        self.assertEqual(runpod.destroyed, ["stray"])
+        self.assertIn("cannot list vast pods", "\n".join(self.logs))
+
+    def test_a_failing_listing_keeps_the_first_seen_of_pods_it_could_not_see(self):
+        # Not seeing a provider must not reset the grace clock of its instances, or an orphan
+        # would get a fresh 10 minutes every time the CLI hiccuped.
+        runpod, vast = FakePods(), FakePods()
+        vast._list_error = "bad api key"
+
+        out = pod_watchdog.tick(runpod, {"888": 100.0}, now=200.0, dry_run=False,
+                                extra_apis={"vast": vast})
+
+        self.assertEqual(out.get("888"), 100.0)
+
+    def test_a_hung_runpodctl_does_not_stop_the_vast_scan(self):
+        # RunpodCtl.list_pods does not turn TimeoutExpired / FileNotFoundError into RuntimeError,
+        # and RunPod is listed first: the listing loop must skip on ANY failure, not only one type.
+        runpod, vast = FakePods(), FakePods()
+
+        def hung():
+            raise subprocess.TimeoutExpired(cmd="runpodctl", timeout=60)
+        runpod.list_pods = hung
+        vast.pods = [PodInfo("888", "motion-transfer")]
+
+        pod_watchdog.tick(runpod, {"888": 0.0}, now=11 * 60.0, dry_run=False,
+                          extra_apis={"vast": vast})
+
+        self.assertEqual(vast.destroyed, ["888"])
+        self.assertIn("cannot list runpod pods", "\n".join(self.logs))
+
+    def test_one_failing_destroy_does_not_skip_the_next_orphan(self):
+        # Kill order is RunPod first; a RunPod orphan whose delete keeps raising must not keep
+        # a Vast orphan billing.
+        runpod, vast = FakePods(), FakePods()
+        runpod.pods = [PodInfo("rp-stuck", "motion-transfer")]
+        vast.pods = [PodInfo("888", "motion-transfer")]
+
+        def failing_destroy(pod_id):
+            raise RuntimeError("runpodctl pod delete failed")
+        runpod.destroy = failing_destroy
+
+        pod_watchdog.tick(runpod, {"rp-stuck": 0.0, "888": 0.0}, now=11 * 60.0,
+                          dry_run=False, extra_apis={"vast": vast})
+
+        self.assertEqual(vast.destroyed, ["888"])
+        joined = "\n".join(self.logs)
+        self.assertIn("DESTROY NOT CONFIRMED", joined)
+        self.assertIn("STILL BILLING", joined)
+        self.assertIn("rp-stuck", joined)
+
+    def test_a_lease_for_an_unconfigured_provider_is_reported_and_tier_three_still_runs(self):
+        write_lease(self.lease_path, self._lease("nope", abs_max_min=10_000))
+        runpod = FakePods()
+        runpod.pods = [PodInfo("stray", "motion-transfer")]
+
+        pod_watchdog.tick(runpod, {"stray": 0.0}, now=11 * 60.0, dry_run=False)
+
+        joined = "\n".join(self.logs)
+        self.assertIn("tier 1/2 failed, falling through to tier 3", joined)
+        self.assertEqual(runpod.destroyed, ["stray"])
+        self.assertTrue(self.lease_path.is_file(), "an unknown-provider lease was cleared")
+
+
+class GonePods:
+    """destroy() raises like a CLI told to delete something that no longer exists."""
+    def __init__(self, pods):
+        self.pods = pods
+
+    def list_pods(self):
+        return list(self.pods)
+
+    def destroy(self, pod_id):
+        raise RuntimeError(f"no such instance {pod_id}")
+
+
+class TestAlreadyGoneDestroy(unittest.TestCase):
+    def test_a_destroy_error_for_an_instance_no_longer_listed_counts_as_destroyed(self):
+        self.assertTrue(pod_watchdog.destroy_verified(GonePods([]), "777"))
+
+    def test_a_destroy_error_for_an_instance_still_listed_is_still_an_error(self):
+        with self.assertRaises(RuntimeError) as cm:
+            pod_watchdog.destroy_verified(GonePods([PodInfo("777", "motion-transfer")]), "777")
+        self.assertIn("no such instance", str(cm.exception))
+
+    def test_when_neither_the_destroy_nor_the_listing_works_it_is_not_verified(self):
+        api = GonePods([])
+
+        def broken():
+            raise RuntimeError("cannot list")
+
+        api.list_pods = broken
+        with self.assertRaises(RuntimeError) as cm:
+            pod_watchdog.destroy_verified(api, "777")
+        # F5/I3: the LISTING error is what must propagate here, not the (also real) destroy
+        # error being swallowed silently — an unverifiable destroy is not success, and the
+        # reason surfaced needs to say WHY it could not be checked.
+        self.assertIn("cannot list", str(cm.exception))
+
+    def test_an_already_gone_destroy_is_logged_not_silent(self):
+        # F5/I3: before this, the "destroy errored but it's not listed, treat as gone" branch
+        # returned True with no log line at all — the ONLY branch of destroy_verified that
+        # didn't say what it decided.
+        logs = []
+        with patch.object(pod_watchdog, "log", logs.append):
+            self.assertTrue(pod_watchdog.destroy_verified(GonePods([]), "777"))
+        self.assertTrue(any("777" in m and "not listed" in m for m in logs), logs)
+
+    def test_an_expired_lease_for_an_already_gone_instance_is_cleared(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lease_path = Path(tmp) / "pod-lease.json"
+            write_lease(lease_path, Lease("777", 0.0, "batch/test.yaml", 10, provider="vast"))
+            with patch.object(pod_watchdog, "LEASE_PATH", lease_path), \
+                 patch.object(pod_watchdog, "MIGRATE_LEASE_PATH", Path(tmp) / "m.json"), \
+                 patch.object(pod_watchdog, "log", lambda *_: None):
+                pod_watchdog.tick(FakePods(), {}, now=1000.0 * 60.0, dry_run=False,
+                                  extra_apis={"vast": GonePods([])})
+            self.assertFalse(lease_path.is_file(),
+                             "the lease of an instance that is already gone was kept forever")
 
 
 class TestOnceExitCode(unittest.TestCase):
