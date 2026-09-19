@@ -497,8 +497,11 @@ stable than the offer `id` (21 vs 13 rows in common).
 
 Consequence for anything automated: **search and rent must be one atomic motion with retry.**
 "Search, decide, rent later" is not reliable on vast — the best machine you found a minute ago may
-simply be invisible to the next call. `pod-provision.sh` does search-then-create in one run, which
-is right, but it has no retry loop and its `OFFER=` pin is therefore flaky by construction.
+simply be invisible to the next call. `pod-provision.sh` hands the Vast branch to
+`scripts/vast_rent.py` (2026-09-19), which retries across the candidates already found by that
+one search — it does not re-search between attempts, so an `OFFER=` pin (which names a single
+row from that one search) is still flaky by construction; the retry loop only helps once the
+list of candidates is in hand.
 
 <a id="vast-provider"></a>
 ### Running one batch on Vast — `PROVIDER=vast` (2026-09-19)
@@ -523,8 +526,31 @@ Run the drain on the machine whose `batch/pod-lease.json` the watchdog reads (th
 sees the labelled instance as an unclaimed orphan and tier 3 destroys it about 10 minutes in.
 
 Manual teardown: `make gpu-destroy` picks the provider from the lease when the lease's pod id equals
-`.env`'s `GPU_INSTANCE_ID`. If there is no matching lease, use `make gpu-destroy GPU_PROVIDER=vast`
-explicitly — otherwise `.env`'s `runpod` decides.
+`.env`'s `GPU_INSTANCE_ID`. If there is no matching lease, it falls back to `.env`'s
+`GPU_INSTANCE_OWNER` marker (`vast:<id>`, written by `vast_rent.py` the moment it creates an
+instance) — again only when its id matches. If neither matches, use `make gpu-destroy
+GPU_PROVIDER=vast` explicitly — otherwise `.env`'s `runpod` decides.
+
+**Teardown after a rent that fails partway (2026-09-19).** A rent that fails AFTER creating an
+instance (STILL BILLING abandon, `AmbiguousCreate`, an unwind that could not destroy) leaves
+`GPU_INSTANCE_ID` and `GPU_INSTANCE_OWNER=vast:<id>` in `.env` with **no lease at all** — the
+lease rule above cannot help, because a lease is only written once a rent succeeds. The owner
+marker is exactly for this case: `make gpu-destroy` picks Vast from it (id-guarded, so a stale
+marker for some other pod can never steer the destroy) and verifies as usual. The bot's `/kill`
+gets the same behaviour, since it also just runs `make gpu-destroy`. The STILL BILLING message
+`vast_rent.py` prints on this path names `make gpu-destroy GPU_PROVIDER=vast` first (it works
+without a lease) and the raw `vastai destroy instance <id>` as a fallback.
+
+**`/kill` during provisioning (2026-09-19).** Provisioning can take up to ~24 minutes (three
+create attempts × an 8-minute pull deadline, plus verify polls), and `/kill` can land at any
+point in that window. The bot signals the WHOLE process group `start_drain` launched (`make`,
+`drain.py`, and the `vast_rent.py` it spawns), not just the one Popen it tracks — a single
+`os.killpg(..., SIGTERM)` reaches all three, so `vast_rent.py`'s own unwind (destroy the
+just-created instance, verify it, clear `.env`) actually runs instead of being orphaned. The bot
+waits up to 30s for that unwind to finish; if it has not by then, it escalates to
+`os.killpg(..., SIGKILL)` and runs `make gpu-destroy` regardless, exactly as before. Afterwards,
+if anything looks off, check `vastai show instances-v1 --raw --all` directly — that is the same
+listing the destroy verify itself reads.
 
 A failed job is **not** inspectable after `gpu-destroy` on Vast (the database dies with the box, unlike
 RunPod's volume). When anything failed, `teardown()` pulls the post-mortem before destroying:
@@ -537,29 +563,58 @@ machines it has measured as fast, drops offers that fail the filters (price cap 
 `MIN_DISK_BW`, `MIN_CPU_GHZ`, advertised bandwidth `VAST_MIN_INET_MBPS` default 1000, bandwidth
 price `VAST_MAX_DOWN_USD_PER_TB` default 20, direct ports, blacklist), and ranks the rest by
 `dph × ready_seconds / 3600 + GB × $/TB / 1000`. `ready_seconds` is the machine's own measured
-create-to-running time from `batch/vast-machines.json` (git-ignored), or 556 s — the slowest ever
-seen — for a machine nobody has measured. `VAST_GB` (default 60) is what the rental will download;
-Plan 3 passes the exact figure per batch. Every instance is created with `--label motion-transfer
---cancel-unavail`. If it is not `running` after `VAST_PULL_DEADLINE_S` (default 480) it is
-destroyed, the machine is blacklisted for a day, and the next candidate is tried — at most two
-retries. If an abandoned instance cannot be destroyed the rent stops and prints `STILL BILLING`
-with its id. Defaults that are assumptions, calibrated as data arrives: the 1000 Mbps floor, the
-$20/TB ceiling and the 8-minute deadline (both derive from two hosts; the deadline must stay under
-the watchdog's 10-minute grace, and a test enforces that).
+time from AFTER `vastai create` returns until `actual_status` reads `running` (not from before the
+create call — the search and rank steps before it are not part of this figure), read from
+`batch/vast-machines.json` (git-ignored), or 556 s — the slowest ever seen — for a machine nobody
+has measured. `VAST_GB` (default 60) is what the rental will download; Plan 3 passes the exact
+figure per batch. Every instance is created with `--label motion-transfer --cancel-unavail`. If it
+is not `running` after `VAST_PULL_DEADLINE_S` (default 480, clamped to stay under the watchdog's
+10-minute grace minus 60s slack) it is destroyed, the machine is blacklisted for a day, and the
+next candidate is tried — at most two retries. If an abandoned instance cannot be destroyed the
+rent stops and prints `STILL BILLING` with its id, naming `make gpu-destroy GPU_PROVIDER=vast` as
+the recovery. Defaults that are assumptions, calibrated as data arrives: the 1000 Mbps floor and
+the $20/TB ceiling derive from two hosts; the 8-minute deadline derives from the price spread of a
+66-offer search (it must also stay under the watchdog's grace, and a test enforces that).
 
 `pod-wait.sh` uses the direct address from `vastai ssh-url` when it answers (the
-`sshX.vast.ai` proxy rejected the registered key on one host), and the proxy otherwise.
+`sshX.vast.ai` proxy rejected the registered key on one host), and the proxy otherwise —
+`parse_ssh_url` now rejects a line that merely LOOKS like `host:port` but is not one (e.g. an
+error such as `Error:404`, which used to be parsed as host `Error` port `404`), and
+`pod-wait.sh` itself falls back to the proxy after 4 consecutive failed ssh probes against a
+direct address, so a plausible-looking but unreachable one cannot lock the wait loop out of the
+proxy for the rest of the timeout.
 
-Still unverified until the first paid session: the exact `vastai ssh-url` output text (parsed
-tolerantly) and the `create --raw` reply keys. When `vastai create` prints non-JSON with exit 0
-after an offer vanishes, it is **unverified** what text is printed (the code stops at the first
-vanished offer, tagged `AmbiguousCreate`, instead of moving to the next candidate) — the
-watchdog reaps the unleased labelled instance after ~10 minutes, and the operator is told to check
-`vastai show instances-v1`. In `make gpu-destroy`, the destroy verify reads an exit-0 listing that
-does not contain `"instances"` (the listing key, even on empty) as "could not verify"; error
-text that itself contains that token is still read as a valid listing (parked hardening: match
-`"instances": [`). Once `vastai ssh-url` returns a direct address the SSH proxy is not tried again
-while `ssh-url` keeps answering if that address is unreachable from the network.
+Not implemented yet, so the first paid session is not surprised by it: `-o IdentitiesOnly=yes -i
+<key>` for ssh when the agent holds several keys (measured need 2026-09-19 — no failure seen yet,
+but nothing here picks a specific key if the ssh-agent offers more than one).
+
+**First paid session — assumptions that are NOT verified yet:**
+- The exact `vastai ssh-url` output text (parsed tolerantly) and the `create --raw` reply keys.
+  When `vastai create` prints non-JSON with exit 0 after an offer vanishes, it is **unverified**
+  what text is printed (the code stops at the first vanished offer, tagged `AmbiguousCreate`,
+  instead of moving to the next candidate) — the watchdog reaps the unleased labelled instance
+  after ~10 minutes, and the operator is told to check `vastai show instances-v1`.
+- In `make gpu-destroy`, the destroy verify reads an exit-0 listing that does not contain
+  `"instances"` (the listing key, even on empty) as "could not verify"; error text that itself
+  contains that token is still read as a valid listing (parked hardening: match `"instances": [`).
+- `--label motion-transfer` survives `create` and comes back as `label` in `show instances-v1`.
+  All of tier 3's Vast authority rests on this — if the label does not round-trip, the watchdog
+  can never tell a motion-transfer instance from anyone else's on the same account.
+- `vastai` is installed and authenticated on the VPS watchdog host — **currently it is NOT
+  installed there**. Until it is, no Vast instance has a watchdog backstop at all; the lease and
+  the operator are the only ceilings.
+- `vastai show instance <id> --raw` returns `actual_status` with the literal string `running`
+  (not `"Running"`, not some other spelling) once the instance is up.
+- `machine_id=… gpu_name=… num_gpus=1 disk_space>=… reliability>… rentable=true` is a valid
+  combined query. If Vast rejects (or silently empties) a query with this many clauses, the
+  known-good `machine_id=` lookups never return anything and the scoreboard's whole value
+  silently disappears — with no error, just a search that always falls back to the base query.
+- `show instances-v1 --raw --all` returns everything in one page. `VastCtl.list_pods` now raises
+  if `next_token` is set rather than trusting that, but the assumption itself — that `--all` is
+  enough — is still unverified against a real account with many instances.
+- A scoreboard `pull_s` (create-to-running time) is specific to the IMAGE it was measured with —
+  the 35s warm-pull figure recorded here was one image on machine 144253, not a general property
+  of that machine.
 
 Not yet automated: per-batch model download (Plan 3).
 Design: `docs/superpowers/specs/2026-09-19-vast-fallback-design.md`.
