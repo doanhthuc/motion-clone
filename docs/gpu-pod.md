@@ -531,7 +531,36 @@ RunPod's volume). When anything failed, `teardown()` pulls the post-mortem befor
 `pod-job.log` into `out/<batch>/runs/*/`, and `pod-worker.log` (from `make gpu-logs LOG=worker`) into
 `out/<batch>/`.
 
-Not yet automated: choosing the machine, per-batch model download, the pull deadline.
+**How a machine is chosen (2026-09-19).** `pod-provision.sh` hands the Vast branch to
+`scripts/vast_rent.py`. It searches (a random ~40-row sample) plus a `machine_id=` query for the
+machines it has measured as fast, drops offers that fail the filters (price cap `MAX_DPH`,
+`MIN_DISK_BW`, `MIN_CPU_GHZ`, advertised bandwidth `VAST_MIN_INET_MBPS` default 1000, bandwidth
+price `VAST_MAX_DOWN_USD_PER_TB` default 20, direct ports, blacklist), and ranks the rest by
+`dph × ready_seconds / 3600 + GB × $/TB / 1000`. `ready_seconds` is the machine's own measured
+create-to-running time from `batch/vast-machines.json` (git-ignored), or 556 s — the slowest ever
+seen — for a machine nobody has measured. `VAST_GB` (default 60) is what the rental will download;
+Plan 3 passes the exact figure per batch. Every instance is created with `--label motion-transfer
+--cancel-unavail`. If it is not `running` after `VAST_PULL_DEADLINE_S` (default 480) it is
+destroyed, the machine is blacklisted for a day, and the next candidate is tried — at most two
+retries. If an abandoned instance cannot be destroyed the rent stops and prints `STILL BILLING`
+with its id. Defaults that are assumptions, calibrated as data arrives: the 1000 Mbps floor, the
+$20/TB ceiling and the 8-minute deadline (both derive from two hosts; the deadline must stay under
+the watchdog's 10-minute grace, and a test enforces that).
+
+`pod-wait.sh` uses the direct address from `vastai ssh-url` when it answers (the
+`sshX.vast.ai` proxy rejected the registered key on one host), and the proxy otherwise.
+
+Still unverified until the first paid session: the exact `vastai ssh-url` output text (parsed
+tolerantly) and the `create --raw` reply keys. When `vastai create` prints non-JSON with exit 0
+after an offer vanishes, the rent stops at that offer's failure, tagged `AmbiguousCreate` — the
+watchdog reaps the unleased labelled instance after ~10 minutes, and the operator is told to check
+`vastai show instances-v1`. In `make gpu-destroy`, the destroy verify reads an exit-0 listing that
+does not contain `"instances"` (the pagination key, even on empty) as "could not verify"; error
+text that itself contains that token is still read as a valid listing (hardened to match on
+`"instances": [`). Once `vastai ssh-url` returns a direct address the SSH proxy is never retried
+if that address is unreachable from the network.
+
+Not yet automated: per-batch model download, the pull deadline on Plan 3.
 Design: `docs/superpowers/specs/2026-09-19-vast-fallback-design.md`.
 
 <a id="costs"></a>
