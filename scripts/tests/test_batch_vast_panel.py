@@ -104,18 +104,25 @@ class TestSpendBlockers(unittest.TestCase):
         self.assertEqual(self._blockers(quote=_quote()), [])
 
     def test_the_static_reasons_apply_at_tap_time_too(self):
-        self.assertEqual(len(self._blockers(enabled=frozenset())), 1)
+        self.assertEqual(len(self._blockers(enabled=frozenset(), quote=_quote())), 1)
 
     def test_credit_below_the_last_quotes_estimate_blocks(self):
         reasons = self._blockers(credit=0.05, quote=_quote())
         self.assertEqual(len(reasons), 1)
         self.assertIn("below this session's estimate", reasons[0])
 
-    def test_with_no_quote_yet_only_a_readable_account_is_required(self):
-        self.assertEqual(self._blockers(credit=0.05, quote=None), [])
+    def test_with_no_quote_the_spend_is_refused_even_when_credit_is_ample(self):
+        # A missing quote at the tap means the bot restarted since the panel was drawn.
+        for credit in (10.0, 0.05):
+            reasons = self._blockers(credit=credit, quote=None)
+            self.assertEqual(len(reasons), 1)
+            self.assertIn("no current Vast price quote", reasons[0])
+
+    def test_with_no_quote_an_unreadable_account_adds_its_own_second_reason(self):
         reasons = self._blockers(credit=RuntimeError("no api key"), quote=None)
-        self.assertEqual(len(reasons), 1)
-        self.assertIn("no api key", reasons[0])
+        self.assertEqual(len(reasons), 2)
+        self.assertIn("no current Vast price quote", reasons[0])
+        self.assertIn("no api key", reasons[1])
 
 
 class TestBuildView(unittest.TestCase):

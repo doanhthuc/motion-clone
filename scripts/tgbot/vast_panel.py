@@ -99,9 +99,21 @@ def spend_blockers(manifest: Manifest, enabled: frozenset[str], *,
                    credit_fn: Callable[[], float], quote: VastQuote | None) -> list[str]:
     """The reasons to refuse a Vast spend at the moment of the tap. A subset of what the panel
     shows: no marketplace search here (a stale button must not stall the bot for a search), so the
-    estimate the credit is compared with comes from the last quote, when there is one."""
+    estimate the credit is compared with comes from the last quote.
+
+    No quote is itself a reason. The panel never draws a spend button without one (`can_spend`),
+    so a missing quote at the tap means the process restarted since the panel was drawn — the quote
+    is in memory, the button's run token (the manifest mtime) survives a restart. With no price
+    there is nothing to compare the credit with, and a stale button must not slip through as the
+    one case where the credit check compares nothing. The credit is still read, so an unreadable
+    account adds its own reason."""
     reasons = static_blockers(manifest, enabled)
-    session = None if quote is None else session_usd(quote, gpu_seconds(manifest))
+    if quote is None:
+        reasons.append("no current Vast price quote — open the Vast tab (Refresh) "
+                       "and tap spend again")
+        session = None
+    else:
+        session = session_usd(quote, gpu_seconds(manifest))
     return reasons + _credit_check(credit_fn, session)[1]
 
 

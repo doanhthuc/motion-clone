@@ -7608,6 +7608,16 @@ class TestVastResume(_VastBase):
         start_drain.assert_not_called()
         self.assertIn("below this session's estimate", self.tg.messages[-1])
 
+    def test_a_vast_resume_with_no_price_quote_is_refused_and_spends_nothing(self):
+        # The quote lives in memory; a bot restart empties it while the button stays in the chat.
+        with mock.patch("tgbot.bot.vast_last_quote", return_value=None):
+            started, start_drain, progress = self._resume(gpu_provider="vast")
+        self.assertFalse(started)
+        start_drain.assert_not_called()
+        progress.assert_not_called()
+        self.assertIn("Not renting on Vast", self.tg.messages[-1])
+        self.assertIn("no current Vast price quote", self.tg.messages[-1])
+
 
 class TestVastConfirm(_FlowFixture):
     """_do_confirm, the fresh-spend gate, with the provider the Vast tab minted."""
@@ -7677,6 +7687,25 @@ class TestVastConfirm(_FlowFixture):
         self.assertEqual(before, after, "the refusal rewrote the manifest and killed the panel")
         self.assertIn(ME, bot._STATE)          # the draft survives, so the user can go back
         self.assertIn("Not renting on Vast", self.tg.messages[-1])
+
+    def test_a_vast_confirm_with_no_price_quote_spends_nothing_and_keeps_the_draft(self):
+        with mock.patch("tgbot.bot.vast_last_quote", return_value=None), \
+             mock.patch("tgbot.bot._job_has_local_tryon", return_value=False), \
+             mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.migration_running", return_value=False), \
+             mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot._start_progress") as progress:
+            self._fill_required_slots()
+            before = bot._run_token(ME)
+            bot._do_confirm(self.tg, ME, dry_run=False, gpu_provider="vast")
+            after = bot._run_token(ME)
+        start_drain.assert_not_called()
+        progress.assert_not_called()
+        self.assertNotEqual(before, "0")
+        self.assertEqual(before, after, "the refusal rewrote the manifest and killed the panel")
+        self.assertIn(ME, bot._STATE)
+        self.assertIn("Not renting on Vast", self.tg.messages[-1])
+        self.assertIn("no current Vast price quote", self.tg.messages[-1])
 
     def test_a_job_queued_onto_a_running_drain_is_not_a_new_vast_rental(self):
         (self.root / ".env").write_text("GPU=x\n", encoding="utf-8")   # nothing enabled
