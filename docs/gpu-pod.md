@@ -566,8 +566,11 @@ price `VAST_MAX_DOWN_USD_PER_TB` default 20, direct ports, blacklist), and ranks
 time from AFTER `vastai create` returns until `actual_status` reads `running` (not from before the
 create call — the search and rank steps before it are not part of this figure), read from
 `batch/vast-machines.json` (git-ignored), or 556 s — the slowest ever seen — for a machine nobody
-has measured. `VAST_GB` (default 60) is what the rental will download; Plan 3 passes the exact
-figure per batch. Every instance is created with `--label motion-transfer --cancel-unavail`. If it
+has measured. `VAST_GB` is the manifest's actual download size (`batchlib.vast_models.total_download_gb`),
+computed and exported by `drain.py`'s `provision()` before renting; it falls back to the
+`vast_rent.py` default of 60 only when nothing in the manifest needs any extra model (or when
+`pod-provision.sh`/`vast_rent.py` is run directly, outside `drain.py`). Every instance is created
+with `--label motion-transfer --cancel-unavail`. If it
 is not `running` after `VAST_PULL_DEADLINE_S` (default 480, clamped to stay under the watchdog's
 10-minute grace minus 60s slack) it is destroyed, the machine is blacklisted for a day, and the
 next candidate is tried — at most two retries. If an abandoned instance cannot be destroyed the
@@ -615,8 +618,12 @@ but nothing here picks a specific key if the ssh-agent offers more than one).
 - A scoreboard `pull_s` (create-to-running time) is specific to the IMAGE it was measured with —
   the 35s warm-pull figure recorded here was one image on machine 144253, not a general property
   of that machine.
+- The parallel model download inside `phase_comfyui` (`lib-feature.sh`): backgrounding
+  `preload-models.sh` right after the ComfyUI clone and `wait`-ing for it before the rest of
+  bootstrap continues has been read through and shellchecked, but never run on a live pod. If it
+  hangs or the `wait` never returns, the pod is still billing — check `/tmp/preload-models.log`
+  over SSH before assuming a stuck bootstrap is something else.
 
-Not yet automated: per-batch model download (Plan 3).
 Design: `docs/superpowers/specs/2026-09-19-vast-fallback-design.md`.
 
 <a id="costs"></a>

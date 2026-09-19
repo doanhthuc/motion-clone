@@ -21,6 +21,7 @@ from batch_run import EXIT_NEEDS_POD
 from batchlib.config import env_get, load_settings
 from batchlib.manifest import Manifest, load_manifest, load_state, state_path_for
 from batchlib.pipelines import PIPELINES, STAGES
+from batchlib.vast_models import models_for_manifest, total_download_gb
 from batchlib_ext.gpu_stock import volume_datacenter
 from batchlib_ext.handoff import Handoff, claim_mailbox, handoff_path, write_handoff
 from batchlib_ext.lease import Lease, clear_lease, read_lease, write_lease
@@ -95,7 +96,7 @@ def pod_max_hours(ceiling_min: int, configured: str) -> str:
 _STOCK_OUT_MARKER = "không tự xoay sang card khác"
 
 
-def provision(*, ceiling_min: int, manifest_path: Path) -> str:
+def provision(*, ceiling_min: int, manifest_path: Path, manifest: Manifest) -> str:
     """Rent a pod and return its instance id. Does NOT wait or bootstrap.
 
     Split from the wait so main() can write the lease in between. The pod is
@@ -115,6 +116,11 @@ def provision(*, ceiling_min: int, manifest_path: Path) -> str:
     leave behind. stderr is captured for that classification but still
     written through to this process's own stderr so it keeps landing in the
     drain log exactly as before.
+
+    `manifest` is used only to size VAST_GB (the bandwidth-cost term vast_select.rank uses) to
+    this run's actual download -- never to decide what pipeline/params to run; batch_run.py owns
+    that. Only set for the same explicit non-runpod --provider case POD_VOLUME= already is,
+    below, so a RunPod run's rent command is unchanged.
     """
     hours = pod_max_hours(ceiling_min, env_get(ROOT / ".env", "POD_MAX_HOURS"))
     # A vast run has no volume. `.env` keeps the RunPod one for the home provider, and
@@ -123,8 +129,13 @@ def provision(*, ceiling_min: int, manifest_path: Path) -> str:
     # chosen the old behaviour is byte-for-byte unchanged.
     chosen = os.environ.get("GPU_PROVIDER", "")
     no_volume = "POD_VOLUME= " if chosen and chosen != "runpod" else ""
+    vast_gb = ""
+    if chosen and chosen != "runpod":
+        gb = total_download_gb(manifest)
+        if gb > 0:
+            vast_gb = f"VAST_GB={gb:.1f} "
     result = subprocess.run(
-        f"{no_volume}POD_MAX_HOURS={hours} CONFIRM=yes bash scripts/pod-provision.sh",
+        f"{no_volume}{vast_gb}POD_MAX_HOURS={hours} CONFIRM=yes bash scripts/pod-provision.sh",
         shell=True, cwd=ROOT, stderr=subprocess.PIPE, text=True)
     if result.stderr:
         sys.stderr.write(result.stderr)
@@ -153,9 +164,20 @@ def provision(*, ceiling_min: int, manifest_path: Path) -> str:
     return pod_id
 
 
-def wait_and_bootstrap() -> None:
-    """Block until the pod answers SSH, then install the backend on it."""
+def wait_and_bootstrap(manifest: Manifest) -> None:
+    """Block until the pod answers SSH, then install the backend on it.
+
+    Exports VAST_MODEL_IDS (space-separated catalog ids) for pod-bootstrap.sh to forward to the
+    remote setup script, which backgrounds a preload-models.sh run for them in parallel with its
+    own install -- only for the same explicit non-runpod --provider case provision() gates
+    VAST_GB on, so a RunPod bootstrap is unchanged.
+    """
     sh("bash", "scripts/pod-wait.sh")
+    chosen = os.environ.get("GPU_PROVIDER", "")
+    if chosen and chosen != "runpod":
+        ids = models_for_manifest(manifest)
+        if ids:
+            os.environ["VAST_MODEL_IDS"] = " ".join(sorted(ids))
     sh("bash", "scripts/pod-bootstrap.sh")
 
 
@@ -376,7 +398,7 @@ def main() -> int:
         print(f"local phase failed (exit {rc}) — NOT renting a pod", file=sys.stderr)
         return rc
 
-    pod_id = provision(ceiling_min=ceiling, manifest_path=manifest_path)
+    pod_id = provision(ceiling_min=ceiling, manifest_path=manifest_path, manifest=manifest)
     # The lease is written HERE, between provisioning and waiting — not after
     # bootstrap. The pod bills from the line above, and tier 3's grace window is
     # 10 minutes while bootstrap is 284s prebuilt (docs/gpu-pod.md:81) and ~30 min
@@ -391,7 +413,7 @@ def main() -> int:
     try:
         # Inside the try, so a wait/bootstrap failure still reaches teardown.
         # Tiers 1 and 2 now cover this phase too, because the lease exists.
-        wait_and_bootstrap()
+        wait_and_bootstrap(manifest)
         # --resume, always: phase A already journalled the try-on stages, and
         # resume is what makes them skipped rather than paid for twice.
         rc = batch_run("--file", str(manifest_path), "--resume")

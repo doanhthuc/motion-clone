@@ -674,6 +674,23 @@ phase_comfyui() {
         git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git "$COMFY_DIR" || warn "clone ComfyUI lỗi."
       fi
     fi
+
+    # Background the manifest's model download here (Vast only -- RunPod already has a
+    # persistent Network Volume and its own manual CPU-pod preload workflow, see
+    # docs/gpu-pod.md#preload). $COMFY_DIR/models already exists from the ComfyUI clone above.
+    # Measured 2026-09-19 (spec section 3.3): ~34.4 GB in 137s, well inside the ~200s the
+    # pip/custom-node install below takes on its own, so running both together costs about what
+    # the slower one costs alone instead of the sum of the two.
+    PRELOAD_PID=""
+    if [ -n "${VAST_MODEL_IDS:-}" ]; then
+      say "    Vast: bắt đầu tải model của manifest, chạy nền song song với cài đặt bên dưới…"
+      ID_ARGS=()
+      for _id in $VAST_MODEL_IDS; do ID_ARGS+=(--id "$_id"); done
+      ( MODELS_DIR="$COMFY_DIR/models" bash "$ROOT/setup/preload-models.sh" "${ID_ARGS[@]}" \
+          >/tmp/preload-models.log 2>&1 ) &
+      PRELOAD_PID=$!
+    fi
+
     [ -x "$COMFY_DIR/venv/bin/python" ] || python3 -m venv "$COMFY_DIR/venv"
     CPIP="$COMFY_DIR/venv/bin/pip"
     "$CPIP" install -q --upgrade pip wheel >/dev/null
@@ -730,6 +747,16 @@ phase_comfyui() {
       warn "SageAttention không phù hợp GPU này → giữ sdpa."
     fi
     ok "ComfyUI + custom node ($(echo $COMFY_NODES | wc -w) node) ở $COMFY_DIR"
+
+    if [ -n "$PRELOAD_PID" ]; then
+      say "    đợi tải model của manifest xong (chạy nền ở trên)…"
+      if wait "$PRELOAD_PID"; then
+        ok "model của manifest đã tải xong (/tmp/preload-models.log)"
+      else
+        warn "tải model của manifest LỖI — xem /tmp/preload-models.log. Chạy lại tay:"
+        warn "  MODELS_DIR=$COMFY_DIR/models bash setup/preload-models.sh --id <id> [--id <id> ...]"
+      fi
+    fi
 
     # Thư mục uploads (model user tự upload) + extra_model_paths.
     UP="$COMFY_DIR/models/uploads"; mkdir -p "$UP"/{loras,checkpoints,unet,vae,text_encoders,clip_vision} "$UP/.tmp"
