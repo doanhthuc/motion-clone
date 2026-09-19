@@ -80,6 +80,14 @@ picker/spend-button half of the design (§3.5) is Plan 4, not this one.
 | `motions-studio/setup/lib-feature.sh` | `phase_comfyui` backgrounds `preload-models.sh` right after the ComfyUI clone, `wait`s for it before returning. |
 | `docs/gpu-pod.md` | Update the `VAST_GB` note (§`vast-provider`) to say it's implemented; add the parallel-download step to the "NOT verified yet" list. |
 
+> **Superseded by the final-review fix wave (commit `d79c458`, plus one follow-up `2c97715`):**
+> Task 4 Step 1's `VAST_GB` code block and Task 4 Step 8's `die`/`warn` code block below are the
+> PRE-fix versions — kept as-is because this plan is a step-numbered execution record, not living
+> documentation. The as-built, correct versions are in `scripts/drain.py` (`VAST_IMAGE_GB`, no
+> `if gb > 0` guard) and `motions-studio/setup/lib-feature.sh` (`die` on preload failure/unknown
+> catalog id, plus the `CATALOG=$CATALOG_FILE` — not `\$CATALOG_FILE` — hint text). `docs/gpu-pod.md`
+> reflects the as-built behavior and is the one to trust if this plan's steps and that doc disagree.
+
 ---
 
 ### Task 1: The model registry
