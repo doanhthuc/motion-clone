@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: gpu-facelock batch-mcp-check batch-coverage check-comfy-nodes help setup dev down clean gpu-preflight gpu-provision gpu-wait gpu-bootstrap gpu-fe gpu-up gpu-down gpu-destroy gpu-db-dump gpu-db-check gpu-status gpu-logs batch-test batch-params check-batch-params batch-scan batch-validate batch batch-clean watchdog-dry drain bot-dry
+.PHONY: gpu-facelock batch-mcp-check batch-coverage check-comfy-nodes help setup dev down clean gpu-preflight gpu-provision gpu-wait gpu-bootstrap gpu-fe gpu-up gpu-down gpu-destroy gpu-db-dump gpu-db-check gpu-status gpu-logs batch-test batch-params check-batch-params check-vast-models batch-scan batch-validate batch batch-clean watchdog-dry drain bot-dry
 
 help: ## Show this help
 	@echo "motion-clone — make targets:"
@@ -84,6 +84,9 @@ batch-params: ## Liệt kê param một job type nhận (TYPE=motion|tryon|enhan
 
 check-batch-params: ## Gate: scripts/batch-params.json phải khớp linux.py
 	@python3 scripts/batch_params.py --check
+
+check-vast-models: ## Gate: every batch-manifest stage has a Vast model-registry entry, ids match the catalog
+	@python3 scripts/check_vast_models.py
 
 batch-scan: ## Quét thư mục material → manifest nháp (DIR=~/materials MODE=pair|cross)
 	@test -n "$(DIR)" || { echo "cần DIR=~/materials (4 ngăn: characters outfits backgrounds drivers)"; exit 1; }

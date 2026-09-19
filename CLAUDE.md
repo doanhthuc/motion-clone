@@ -25,8 +25,8 @@ anything that starts a pod.
   Postgres data and MinIO. Never suggest deleting it casually.
 - Never assert cost from `currentSpendPerHr`. Use `runpodctl billing pods` (real invoice).
 - Free gates that catch mistakes **before** spending: `make gpu-preflight`, `make batch-validate`,
-  `make batch-test`, `make check-job-types`, `make check-comfy-nodes`, `make check-batch-params`.
-  Run them instead of "just trying it on the pod".
+  `make batch-test`, `make check-job-types`, `make check-comfy-nodes`, `make check-batch-params`,
+  `make check-vast-models`. Run them instead of "just trying it on the pod".
 
 ## Commands
 
@@ -60,6 +60,7 @@ python3 -m unittest discover -s scripts/tests -p 'test_batch_run.py'   # single 
 make check-job-types                              # the 4 job-type lists must agree
 make check-comfy-nodes                            # the 4 ComfyUI custom-node lists must agree
 make check-batch-params                           # scripts/batch-params.json vs linux.py
+make check-vast-models                            # scripts/batchlib/vast_models.py vs PIPELINES/catalog
 make batch-coverage [FULL=1]
 motions-studio/setup/scrub-secrets.sh --check     # MUST exit 0 before every commit — repo is public
 
