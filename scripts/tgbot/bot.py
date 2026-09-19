@@ -14,6 +14,7 @@ import contextlib
 import hashlib
 import html
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -5078,9 +5079,13 @@ def _do_kill(tg: Tg, chat_id: int) -> None:
             proc.kill()
 
     tg.send_message(chat_id, "🛑 destroying the pod…")
+    # The lease says which cloud rented the pod. The bot's own environment does not, and a bare
+    # `make gpu-destroy` would fall back to .env's provider. Read before clear_lease below.
+    lease = lease_for(manifest_path)
+    kill_env = {**os.environ, "GPU_PROVIDER": lease.provider} if lease is not None else None
     try:
         result = subprocess.run(["make", "gpu-destroy"], cwd=_REPO_ROOT,
-                                capture_output=True, text=True, timeout=180)
+                                capture_output=True, text=True, timeout=180, env=kill_env)
         destroyed = result.returncode == 0
         output = (result.stdout + result.stderr).strip()[-TAIL_CHARS:]
         detail = "" if destroyed else f"\n<blockquote expandable>{_esc(output)}</blockquote>"

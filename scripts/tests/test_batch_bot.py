@@ -9,6 +9,7 @@ from batchlib.pipelines import PIPELINES, STAGES, effective_stage_params
 from batchlib.runner import stage_dest
 from batchlib_ext.gpu_stock import Stock
 from batchlib_ext.handoff import Handoff, handoff_path, mailbox_path, write_handoff
+from batchlib_ext.lease import Lease
 from batchlib_ext.migrate_lease import MigrateLease, write_migrate_lease
 from batchlib_ext.provision_failure import (ProvisionFailure,
                                             provision_failure_path,
@@ -5605,6 +5606,28 @@ class TestKillCommand(unittest.TestCase):
         self.assertEqual(run.call_args.args[0], ["make", "gpu-destroy"])
         clear_lease.assert_called_once()
         self.assertIn("Killed. Pod destroyed", self.tg.messages[-1])
+
+    def test_kill_destroys_on_the_leases_provider_not_the_env_files(self):
+        # The bot's own environment says nothing about the run: without this, /kill on a Vast
+        # batch would run `make gpu-destroy` against .env's provider (RunPod) and leave the
+        # Vast instance billing while telling the user it was destroyed.
+        lease = Lease(pod_id="777", provisioned_at=0.0, manifest=str(self.manifest),
+                      abs_max_min=60, provider="vast")
+        ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with mock.patch("tgbot.bot.lease_for", return_value=lease), \
+             mock.patch("tgbot.bot.subprocess.run", return_value=ok) as run, \
+             mock.patch("tgbot.bot.clear_lease"):
+            bot.handle(self.tg, cb_from(ME, bot._CB_KILL_GO), allowed_user_id=ME)
+        self.assertEqual(run.call_args.args[0], ["make", "gpu-destroy"])
+        self.assertEqual(run.call_args.kwargs["env"]["GPU_PROVIDER"], "vast")
+
+    def test_kill_without_a_lease_leaves_the_environment_alone(self):
+        ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with mock.patch("tgbot.bot.lease_for", return_value=None), \
+             mock.patch("tgbot.bot.subprocess.run", return_value=ok) as run, \
+             mock.patch("tgbot.bot.clear_lease"):
+            bot.handle(self.tg, cb_from(ME, bot._CB_KILL_GO), allowed_user_id=ME)
+        self.assertIsNone(run.call_args.kwargs.get("env"))
 
     def test_a_dead_tracked_process_is_left_alone(self):
         proc = mock.Mock()
