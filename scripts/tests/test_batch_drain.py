@@ -1,4 +1,4 @@
-import json, sys, tempfile, unittest
+import json, os, sys, tempfile, unittest
 from pathlib import Path
 from unittest import mock
 
@@ -530,6 +530,79 @@ class TestPhaseAOnly(unittest.TestCase):
             rc = self._main()
         self.assertEqual(rc, 0)
         br.assert_not_called()
+
+
+class TestProvider(unittest.TestCase):
+    """The provider of a run follows the run — env and lease — never the root .env."""
+
+    def _manifest_path(self) -> Path:
+        return Path(tempfile.mkdtemp()) / "tg-1.yaml"
+
+    def test_effective_provider_prefers_the_environment(self):
+        with mock.patch.dict(os.environ, {"GPU_PROVIDER": "vast"}), \
+             mock.patch.object(drain, "env_get", return_value="runpod"):
+            self.assertEqual(drain.effective_provider(), "vast")
+
+    def test_effective_provider_falls_back_to_dotenv_then_vast(self):
+        env = {k: v for k, v in os.environ.items() if k != "GPU_PROVIDER"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            with mock.patch.object(drain, "env_get", return_value="runpod"):
+                self.assertEqual(drain.effective_provider(), "runpod")
+            # pod-provision.sh:21 defaults to vast when nothing says otherwise.
+            with mock.patch.object(drain, "env_get", return_value=""):
+                self.assertEqual(drain.effective_provider(), "vast")
+
+    def test_provision_passes_no_volume_off_runpod(self):
+        # pod-provision.sh dies on POD_VOLUME set with a non-runpod provider. `.env` keeps the
+        # RunPod volume for the home provider, so a vast run has to blank it for the child.
+        with mock.patch.dict(os.environ, {"GPU_PROVIDER": "vast"}), \
+             mock.patch.object(drain.subprocess, "run") as mock_run, \
+             mock.patch.object(drain, "env_get", side_effect=["8", "777"]):
+            mock_run.return_value = mock.Mock(returncode=0, stderr="")
+            drain.provision(ceiling_min=120, manifest_path=self._manifest_path())
+        self.assertIn("POD_VOLUME= ", mock_run.call_args[0][0])
+
+    def test_provision_leaves_the_volume_alone_on_runpod(self):
+        with mock.patch.dict(os.environ, {"GPU_PROVIDER": "runpod"}), \
+             mock.patch.object(drain.subprocess, "run") as mock_run, \
+             mock.patch.object(drain, "env_get", side_effect=["8", "pod-xyz"]):
+            mock_run.return_value = mock.Mock(returncode=0, stderr="")
+            drain.provision(ceiling_min=120, manifest_path=self._manifest_path())
+        self.assertNotIn("POD_VOLUME", mock_run.call_args[0][0])
+
+    def test_provision_is_unchanged_when_no_provider_was_chosen(self):
+        env = {k: v for k, v in os.environ.items() if k != "GPU_PROVIDER"}
+        with mock.patch.dict(os.environ, env, clear=True), \
+             mock.patch.object(drain.subprocess, "run") as mock_run, \
+             mock.patch.object(drain, "env_get", side_effect=["8", "pod-xyz"]):
+            mock_run.return_value = mock.Mock(returncode=0, stderr="")
+            drain.provision(ceiling_min=120, manifest_path=self._manifest_path())
+        self.assertNotIn("POD_VOLUME", mock_run.call_args[0][0])
+
+    def test_main_exports_the_provider_and_writes_it_into_the_lease(self):
+        tmp = Path(tempfile.mkdtemp())
+        manifest = tmp / "tg-1.yaml"
+        manifest.write_text(
+            "runs:\n  - id: a\n    pipeline: motion-enhance\n"
+            "    inputs: {character: /tmp/c.png, driver: /tmp/d.mp4}\n", encoding="utf-8")
+        seen_env = {}
+
+        def fake_provision(**_kw):
+            seen_env["GPU_PROVIDER"] = os.environ.get("GPU_PROVIDER")
+            return "777"
+
+        with mock.patch.dict(os.environ, {}, clear=False), \
+             mock.patch.object(sys, "argv", ["drain.py", "--file", str(manifest),
+                                             "--yes", "--provider", "vast"]), \
+             mock.patch.object(drain, "batch_run", side_effect=[drain.EXIT_NEEDS_POD, 0]), \
+             mock.patch.object(drain, "provision", side_effect=fake_provision), \
+             mock.patch.object(drain, "write_lease") as mock_write_lease, \
+             mock.patch.object(drain, "wait_and_bootstrap"), \
+             mock.patch.object(drain, "chain_or_teardown"):
+            self.assertEqual(drain.main(), 0)
+        self.assertEqual(seen_env["GPU_PROVIDER"], "vast")
+        lease = mock_write_lease.call_args[0][1]
+        self.assertEqual((lease.pod_id, lease.provider), ("777", "vast"))
 
 
 if __name__ == "__main__":

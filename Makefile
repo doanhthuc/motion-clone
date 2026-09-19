@@ -78,11 +78,12 @@ watchdog-dry: ## Report what the watchdog would destroy right now — destroys n
 bot-dry: ## One polling round against the local Bot API, invoking no jobs
 	@python3 scripts/tgbot/bot.py --once --dry-run
 
-drain: ## Rent a pod, run FILE, destroy it (dry run unless CONFIRM=yes; PHASE_A=1 stops before renting)
-	@test -n "$(FILE)" || { echo "usage: make drain FILE=batch/….yaml [CONFIRM=yes] [RESUME=1] [FORCE_LOCAL=1] [PHASE_A=1]"; exit 1; }
+drain: ## Rent a pod, run FILE, destroy it (dry run unless CONFIRM=yes; PROVIDER=vast|runpod overrides .env for this run; PHASE_A=1 stops before renting)
+	@test -n "$(FILE)" || { echo "usage: make drain FILE=batch/….yaml [CONFIRM=yes] [RESUME=1] [FORCE_LOCAL=1] [PHASE_A=1] [PROVIDER=vast|runpod]"; exit 1; }
 	@python3 scripts/drain.py --file "$(FILE)" \
 		$(if $(filter yes,$(CONFIRM)),--yes) $(if $(RESUME),--resume) \
-		$(if $(FORCE_LOCAL),--force-local) $(if $(PHASE_A),--phase-a-only)
+		$(if $(FORCE_LOCAL),--force-local) $(if $(PHASE_A),--phase-a-only) \
+		$(if $(PROVIDER),--provider $(PROVIDER))
 
 gpu-preflight: ## Check root .env is complete BEFORE you spend money on a pod
 	@bash scripts/gpu-preflight.sh

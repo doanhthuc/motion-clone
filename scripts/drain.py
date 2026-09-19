@@ -10,6 +10,7 @@ this process dies partway.
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 import time
@@ -44,6 +45,12 @@ def abs_max_min(manifest: Manifest) -> int:
 
 def sh(*argv: str) -> None:
     subprocess.run(argv, check=True, cwd=ROOT)
+
+
+def effective_provider() -> str:
+    """The cloud THIS run rents from. Same order as pod-provision.sh:21: the process
+    environment (set by --provider), then .env, then vast."""
+    return os.environ.get("GPU_PROVIDER") or env_get(ROOT / ".env", "GPU_PROVIDER") or "vast"
 
 
 def pod_max_hours(ceiling_min: int, configured: str) -> str:
@@ -110,8 +117,14 @@ def provision(*, ceiling_min: int, manifest_path: Path) -> str:
     drain log exactly as before.
     """
     hours = pod_max_hours(ceiling_min, env_get(ROOT / ".env", "POD_MAX_HOURS"))
+    # A vast run has no volume. `.env` keeps the RunPod one for the home provider, and
+    # pod-provision.sh dies on POD_VOLUME set with a non-runpod provider — so blank it for the
+    # child. Only an EXPLICIT non-runpod provider (from --provider) triggers this; with none
+    # chosen the old behaviour is byte-for-byte unchanged.
+    chosen = os.environ.get("GPU_PROVIDER", "")
+    no_volume = "POD_VOLUME= " if chosen and chosen != "runpod" else ""
     result = subprocess.run(
-        f"POD_MAX_HOURS={hours} CONFIRM=yes bash scripts/pod-provision.sh",
+        f"{no_volume}POD_MAX_HOURS={hours} CONFIRM=yes bash scripts/pod-provision.sh",
         shell=True, cwd=ROOT, stderr=subprocess.PIPE, text=True)
     if result.stderr:
         sys.stderr.write(result.stderr)
@@ -305,7 +318,14 @@ def main() -> int:
                     help="run the local try-on phase and exit; never rent a pod")
     ap.add_argument("--yes", action="store_true",
                     help="required to actually rent — without it, dry run")
+    ap.add_argument("--provider", choices=("runpod", "vast"),
+                    help="rent from this cloud for this run only; .env is never rewritten")
     args = ap.parse_args()
+    if args.provider:
+        # Exported, not written to .env: every child (provision, wait, bootstrap,
+        # `make gpu-destroy`, `make gpu-logs`) inherits it, and a crash cannot leave the
+        # root .env pointing at the wrong cloud.
+        os.environ["GPU_PROVIDER"] = args.provider
 
     manifest_path = Path(args.file)
     manifest = load_manifest(manifest_path)
@@ -366,7 +386,8 @@ def main() -> int:
     # would fire on a live batch at 105 minutes.
     write_lease(LEASE_PATH, Lease(pod_id=pod_id, provisioned_at=time.time(),
                                   manifest=str(manifest_path.resolve()),
-                                  abs_max_min=ceiling))
+                                  abs_max_min=ceiling,
+                                  provider=effective_provider()))
     try:
         # Inside the try, so a wait/bootstrap failure still reaches teardown.
         # Tiers 1 and 2 now cover this phase too, because the lease exists.
