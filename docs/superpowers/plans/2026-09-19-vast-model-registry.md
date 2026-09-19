@@ -29,11 +29,15 @@ picker/spend-button half of the design (§3.5) is Plan 4, not this one.
 
 ## Global Constraints
 
-- Registry scope is exactly the spec's §3.3 table — do not invent mappings for engines or stages
-  the spec did not measure (e.g. character-swap's `wananimate` engine, enhance's `seedvr2`
-  engine). An unmodelled combination gets **zero** extra catalog ids, which is correct for
-  `seedvr2` (it is not in this catalog at all) and merely conservative for `wananimate` (out of
-  scope until the design is extended — see spec §5 "Not proven").
+- Registry scope is exactly the spec's §3.3 table, corrected against the real default this plan
+  got wrong on first draft: `run_character_swap`'s public `engine` param defaults to
+  `"wananimate"`, not `"scail2"` (`motions-studio/worker/worker_runtime/linux.py:5466-5468`,
+  `raise`s on anything else). `wananimate` reuses `build_wan_workflow` (the Wan 2.2 Animate group)
+  plus `_apply_swap_to_wan_workflow`, which also loads `sam3.1_multiplex_fp16.safetensors`
+  (`linux.py:2193-2210`) — so the DEFAULT character-swap case needs the Wan Animate group **plus**
+  `swap-sam3`, and the spec's §3.3 table (the SCAIL-2/SAM3 group) applies only when a manifest
+  sets `engine: scail2` explicitly. `enhance`'s `seedvr2` engine is still correctly unmodelled
+  (zero extra ids — it is not in this catalog at all, spec §5 "Not proven").
 - faceLock/faceLockRestore are **not** modelled in the registry: `scripts/pod-facelock.sh` is
   already installed unconditionally by `pod-bootstrap.sh` on both providers regardless of manifest
   content (`scripts/pod-bootstrap.sh:366-373`), so no per-batch entry can turn it on or off.
@@ -104,17 +108,23 @@ need must be known BEFORE the pod boots, to (a) give vast_select.rank's bandwidt
 download size instead of a flat 60 GB guess, and (b) start the download in parallel with the backend
 install instead of leaving ComfyUI to discover a missing model at job time.
 
-Scope, matching the spec's approved table exactly (section 3.3) -- do not extend past it without
-updating the spec first:
-  - motion, camera-motion              -> the Wan 2.2 Animate group (8 ids, ~34.4 GB)
-  - character-swap                     -> the SCAIL-2/SAM3 group (5 ids, ~28.3 GB) -- the scail2
-                                           engine, the only one the spec measured; the wananimate
-                                           engine variant reuses the Wan Animate group instead and
-                                           is not modelled here (spec section 5, "Not proven")
-  - enhance, engine=flashvsr (default) -> the 4 flashvsr-* ids (~9.3 GB)
-  - enhance, any other engine          -> nothing extra: ffmpeg lanczos needs no model, and
-                                           seedvr2 is not in this catalog (not offered on Vast)
-  - tryon, camera-tryon                -> nothing extra
+Scope, matching the spec's approved table (section 3.3), corrected against the real runtime
+default `run_character_swap` actually uses (verified against
+motions-studio/worker/worker_runtime/linux.py:5466-5468, 2193-2210 while implementing this task
+-- the spec's table alone would have under-specified this):
+  - motion, camera-motion                 -> the Wan 2.2 Animate group (8 ids, ~34.4 GB)
+  - character-swap, engine=wananimate     -> DEFAULT (run_character_swap's own default when no
+    (default, or unset)                      `engine` param is given, linux.py:5466). Reuses
+                                              build_wan_workflow (the Wan Animate group) plus
+                                              _apply_swap_to_wan_workflow, which also loads
+                                              sam3.1_multiplex_fp16.safetensors (linux.py:2203) ->
+                                              the Wan Animate group PLUS swap-sam3.
+  - character-swap, engine=scail2         -> the SCAIL-2/SAM3 group (5 ids, ~28.3 GB) -- opt-in
+                                              only, matches the spec's section 3.3 table exactly.
+  - enhance, engine=flashvsr (default)    -> the 4 flashvsr-* ids (~9.3 GB)
+  - enhance, any other engine             -> nothing extra: ffmpeg lanczos needs no model, and
+                                              seedvr2 is not in this catalog (not offered on Vast)
+  - tryon, camera-tryon                   -> nothing extra
 
 faceLock/faceLockRestore (camera-motion's on-by-default identity fix) are NOT modelled here: they
 are installed unconditionally by pod-bootstrap.sh (scripts/pod-facelock.sh) on both providers
@@ -140,6 +150,10 @@ CHARACTER_SWAP_IDS = frozenset({
     "swap-sam3", "swap-scail2-unet", "swap-scail2-umt5-fp8",
     "swap-scail2-lightx2v-r64", "swap-scail2-dpo",
 })
+# character-swap's DEFAULT engine (linux.py:5466 -- "wananimate" when the manifest gives no
+# `engine` override, or gives that value explicitly): reuses the Wan Animate diffusion model plus
+# the SAM3 segmentation checkpoint _apply_swap_to_wan_workflow loads (linux.py:2203).
+WANANIMATE_SWAP_IDS = WAN_ANIMATE_IDS | frozenset({"swap-sam3"})
 FLASHVSR_IDS = frozenset({
     "flashvsr-lq-proj", "flashvsr-tc-decoder", "flashvsr-streaming-dmd", "flashvsr-wan22-vae",
 })
@@ -158,6 +172,16 @@ def _enhance_ids(params: dict) -> frozenset[str]:
     return frozenset()
 
 
+def _character_swap_ids(params: dict) -> frozenset[str]:
+    # run_character_swap (linux.py:5466) raises on anything other than these two values, and
+    # defaults to "wananimate" when `engine` is not given -- so an unset/blank engine must
+    # resolve the same way as the explicit default, not fall through to some third case.
+    engine = str(params.get("engine") or "wananimate").strip().lower()
+    if engine == "scail2":
+        return CHARACTER_SWAP_IDS
+    return WANANIMATE_SWAP_IDS
+
+
 # One resolver per Stage name (scripts/batchlib/pipelines.py's STAGES keys). Every stage any
 # PIPELINES entry can reach MUST have an entry here, or check_drift() below fails -- the same
 # drift class check-job-types.mjs guards, for this registry instead of the job-type lists.
@@ -166,7 +190,7 @@ STAGE_MODEL_IDS: dict[str, Resolver] = {
     "camera-tryon": lambda params: frozenset(),
     "motion": lambda params: WAN_ANIMATE_IDS,
     "camera-motion": lambda params: WAN_ANIMATE_IDS,
-    "character-swap": lambda params: CHARACTER_SWAP_IDS,
+    "character-swap": _character_swap_ids,
     "enhance": _enhance_ids,
 }
 
@@ -243,8 +267,8 @@ from pathlib import Path
 
 from batchlib.manifest import Manifest, Run
 from batchlib.vast_models import (ALL_REGISTRY_IDS, CHARACTER_SWAP_IDS, FLASHVSR_IDS,
-                                  WAN_ANIMATE_IDS, check_drift, models_for_manifest,
-                                  resolve_stage, total_download_gb)
+                                  WAN_ANIMATE_IDS, WANANIMATE_SWAP_IDS, check_drift,
+                                  models_for_manifest, resolve_stage, total_download_gb)
 
 
 def _run(run_id: str, pipeline: str, stage_params: dict | None = None) -> Run:
@@ -262,8 +286,20 @@ class TestResolveStage(unittest.TestCase):
     def test_camera_motion_needs_the_same_group_as_plain_motion(self):
         self.assertEqual(resolve_stage("camera-motion", {}), WAN_ANIMATE_IDS)
 
-    def test_character_swap_needs_the_scail2_sam3_group(self):
-        self.assertEqual(resolve_stage("character-swap", {}), CHARACTER_SWAP_IDS)
+    def test_character_swap_defaults_to_wananimate_which_reuses_the_wan_animate_group(self):
+        # run_character_swap's own default when no `engine` param is given (linux.py:5466).
+        self.assertEqual(resolve_stage("character-swap", {}), WANANIMATE_SWAP_IDS)
+
+    def test_character_swap_explicit_wananimate_matches_the_default(self):
+        self.assertEqual(resolve_stage("character-swap", {"engine": "wananimate"}),
+                         WANANIMATE_SWAP_IDS)
+
+    def test_character_swap_explicit_scail2_needs_the_scail2_sam3_group(self):
+        self.assertEqual(resolve_stage("character-swap", {"engine": "scail2"}),
+                         CHARACTER_SWAP_IDS)
+
+    def test_wananimate_swap_group_is_the_wan_animate_group_plus_sam3(self):
+        self.assertEqual(WANANIMATE_SWAP_IDS, WAN_ANIMATE_IDS | {"swap-sam3"})
 
     def test_tryon_and_camera_tryon_need_nothing_extra(self):
         self.assertEqual(resolve_stage("tryon", {}), frozenset())
@@ -288,10 +324,14 @@ class TestModelsForManifest(unittest.TestCase):
     def test_unions_ids_across_every_run_and_stage(self):
         m = _manifest(
             _run("r1", "motion-enhance"),
-            _run("r2", "character-swap"),
+            _run("r2", "character-swap", {"character-swap": {"engine": "scail2"}}),
         )
         ids = models_for_manifest(m)
         self.assertEqual(ids, WAN_ANIMATE_IDS | FLASHVSR_IDS | CHARACTER_SWAP_IDS)
+
+    def test_a_default_character_swap_run_needs_the_wananimate_group(self):
+        m = _manifest(_run("r1", "character-swap"))
+        self.assertEqual(models_for_manifest(m), WANANIMATE_SWAP_IDS)
 
     def test_a_manifest_with_only_tryon_needs_nothing_extra(self):
         m = _manifest(_run("r1", "tryon-motion-enhance",
@@ -506,8 +546,9 @@ CATALOG="${CATALOG:-$ROOT/comfyui/catalog.json}"
 VOL="${POD_VOLUME:-}"
 # A plain destination directory, no volume needed -- Vast has no Network Volume (spec
 # docs/superpowers/specs/2026-09-19-vast-fallback-design.md section 3.3), so on Vast this points
-# straight at $COMFY_DIR/models instead of $POD_VOLUME/comfy-models. POD_VOLUME still wins when
-# both happen to be set, so the existing RunPod flow is unchanged when this is left unset.
+# straight at $COMFY_DIR/models instead of $POD_VOLUME/comfy-models. MODELS_DIR wins when both
+# happen to be set (see MODELS= below); RunPod only ever sets POD_VOLUME, so its flow is
+# completely unchanged when this is left unset.
 DEST="${MODELS_DIR:-}"
 ```
 

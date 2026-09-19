@@ -32,8 +32,9 @@ CATALOG="${CATALOG:-$ROOT/comfyui/catalog.json}"
 VOL="${POD_VOLUME:-}"
 # A plain destination directory, no volume needed -- Vast has no Network Volume (spec
 # docs/superpowers/specs/2026-09-19-vast-fallback-design.md section 3.3), so on Vast this points
-# straight at $COMFY_DIR/models instead of $POD_VOLUME/comfy-models. POD_VOLUME still wins when
-# both happen to be set, so the existing RunPod flow is unchanged when this is left unset.
+# straight at $COMFY_DIR/models instead of $POD_VOLUME/comfy-models. MODELS_DIR wins when both
+# happen to be set (see MODELS= below); RunPod only ever sets POD_VOLUME, so its flow is
+# completely unchanged when this is left unset.
 DEST="${MODELS_DIR:-}"
 MODE=""; SEL_GROUPS=(); SEL_IDS=(); DRY=0
 
