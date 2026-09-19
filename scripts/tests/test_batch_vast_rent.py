@@ -1,5 +1,8 @@
 import io
 import json
+import os
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -15,6 +18,12 @@ from batchlib_ext.podctl import PodInfo
 from batchlib_ext.vast_scoreboard import MachineRecord, Scoreboard, load_board
 from batchlib_ext.vast_select import Criteria
 from batchlib_ext.watchdog import DESTROYABLE_NAMES, GRACE_MIN
+
+# Known-good env vars that override a CLI default via _cfg_get: a poisoned value crashes
+# argparse's own default= expression before it ever looks at argv (F9). Shared between
+# TestMain.setUp and its hermeticity test so both name the same set.
+_VAST_RENT_ENV_KEYS = ("VAST_MIN_INET_MBPS", "VAST_MAX_DOWN_USD_PER_TB", "VAST_GB",
+                       "VAST_PULL_DEADLINE_S", "MAX_DPH")
 
 
 def offer(id, machine_id, dph=0.40, **over):
@@ -237,6 +246,19 @@ class TestRent(unittest.TestCase):
         self.assertIn("STILL BILLING", str(cm.exception))
         self.assertEqual(len(api.created), 1, "kept renting while an instance was undestroyed")
 
+    def test_still_billing_names_the_makefile_recovery_first(self):
+        # F1: `make gpu-destroy GPU_PROVIDER=vast` now finds the instance through the owner
+        # marker even with no lease, so it is the recovery path named first — the raw vastai
+        # command stays as the fallback for when make itself is unavailable.
+        api = FakeVast([offer(1, 11), offer(2, 22)], statuses={"i1": ["loading"]},
+                       destroy_fail={"i1"})
+        with self.assertRaises(vast_rent.RentError) as cm:
+            run_rent(api)
+        msg = str(cm.exception)
+        self.assertIn("make gpu-destroy GPU_PROVIDER=vast", msg)
+        self.assertIn("vastai destroy instance i1", msg)
+        self.assertLess(msg.index("make gpu-destroy"), msg.index("vastai destroy instance"))
+
     def test_an_interrupt_while_waiting_destroys_the_new_instance(self):
         api = FakeVast([offer(1, 11)], statuses={"i1": ["loading"]})
         clock = Clock()
@@ -245,6 +267,22 @@ class TestRent(unittest.TestCase):
             raise KeyboardInterrupt
 
         with self.assertRaises(KeyboardInterrupt):
+            vast_rent.rent(api, cfg(), Scoreboard({}), confirm=True, now=clock.now,
+                           sleep=boom, log=lambda m: None, on_created=lambda i: None,
+                           on_released=lambda i: None, persist=lambda: None)
+        self.assertEqual(api.destroyed, ["i1"])
+
+    def test_a_system_exit_while_waiting_destroys_the_new_instance(self):
+        # F2/C2: SIGTERM/SIGHUP are turned into SystemExit by _on_signal so this path (already
+        # proven for KeyboardInterrupt above) also covers a killpg-delivered signal, not just
+        # Ctrl-C.
+        api = FakeVast([offer(1, 11)], statuses={"i1": ["loading"]})
+        clock = Clock()
+
+        def boom(_s):
+            raise SystemExit(143)
+
+        with self.assertRaises(SystemExit):
             vast_rent.rent(api, cfg(), Scoreboard({}), confirm=True, now=clock.now,
                            sleep=boom, log=lambda m: None, on_created=lambda i: None,
                            on_released=lambda i: None, persist=lambda: None)
@@ -273,6 +311,25 @@ class TestRent(unittest.TestCase):
 
     def test_the_label_is_one_tier_three_may_destroy(self):
         self.assertIn(vast_rent.VAST_LABEL, DESTROYABLE_NAMES)
+
+    def test_a_stuck_loading_status_is_named_in_the_log_and_the_final_error(self):
+        api = FakeVast([offer(1, 11)], statuses={"i1": ["loading"]})
+        logs = []
+        with self.assertRaises(vast_rent.RentError) as cm:
+            rent_direct(api, logs)
+        self.assertTrue(any("last status 'loading'" in m for m in logs), logs)
+        self.assertIn("last status: 'loading'", str(cm.exception))
+        self.assertIn("empty status reads: 0", str(cm.exception))
+
+    def test_a_status_that_never_reads_is_named_explicitly(self):
+        api = FakeVast([offer(1, 11)])
+        api.instance_status = lambda iid: {}
+        logs = []
+        with self.assertRaises(vast_rent.RentError) as cm:
+            rent_direct(api, logs)
+        self.assertTrue(any("last status None" in m and "empty reads" in m for m in logs), logs)
+        self.assertIn("could not read a status at all", "\n".join(logs) + str(cm.exception))
+        self.assertIn("last status: None; empty status reads:", str(cm.exception))
 
 
 def rent_direct(api, logs, *, config=None, board=None, sleep=None, **hooks):
@@ -441,6 +498,22 @@ class TestParseSshUrl(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertIsNone(vast_rent.parse_ssh_url(text))
 
+    def test_an_error_line_that_looks_like_host_colon_port_is_rejected(self):
+        # F8/I7: `vastai ssh-url` printing an error ("Error:404") used to parse as a host
+        # named "Error" on port 404 and lock pod-wait.sh onto an address that never answers.
+        self.assertIsNone(vast_rent.parse_ssh_url("Error:404"))
+
+    def test_a_bare_word_with_no_dot_is_rejected(self):
+        # Picked reject, not accept: a name with no dot is indistinguishable from an error
+        # word before a colon, which is exactly the case above.
+        self.assertIsNone(vast_rent.parse_ssh_url("localhost:22"))
+
+    def test_an_empty_host_is_rejected(self):
+        self.assertIsNone(vast_rent.parse_ssh_url(":22"))
+
+    def test_a_host_with_a_space_is_rejected(self):
+        self.assertIsNone(vast_rent.parse_ssh_url("host with space:22"))
+
 
 class TestRealVastApi(unittest.TestCase):
     def _run(self, stdout="", rc=0, stderr=""):
@@ -545,18 +618,61 @@ class TestRealVastApi(unittest.TestCase):
         self.assertIn("could not verify", str(cm.exception))
 
 
+class TestSignalHandling(unittest.TestCase):
+    """F2/C2: an orphaned `python3 vast_rent.py` (the bot's SIGTERM only reached the `make
+    drain` Popen, not its process group) kept renting after /kill gave up on it. SIGTERM/SIGHUP
+    must become SystemExit so the existing unwind (destroy the just-created instance) runs."""
+
+    def test_on_signal_raises_system_exit_with_128_plus_signum(self):
+        with self.assertRaises(SystemExit) as cm:
+            vast_rent._on_signal(signal.SIGTERM, None)
+        self.assertEqual(cm.exception.code, 128 + signal.SIGTERM)
+
+    def test_confirm_installs_handlers_for_sigterm_and_sighup(self):
+        with mock.patch.object(vast_rent.signal, "signal") as sig:
+            self._main_for_signal_check("--confirm")
+        signals_installed = {call.args[0] for call in sig.call_args_list}
+        self.assertEqual(signals_installed, {signal.SIGTERM, signal.SIGHUP})
+        for call in sig.call_args_list:
+            self.assertEqual(call.args[1], vast_rent._on_signal)
+
+    def test_dry_run_installs_no_handler(self):
+        with mock.patch.object(vast_rent.signal, "signal") as sig:
+            self._main_for_signal_check()
+        sig.assert_not_called()
+
+    def _main_for_signal_check(self, *argv):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        (tmp / ".env").write_text("", encoding="utf-8")
+        with mock.patch.object(vast_rent, "ROOT", tmp), \
+             mock.patch.object(vast_rent, "BOARD_PATH", tmp / "vast-machines.json"), \
+             mock.patch.object(vast_rent, "make_api", return_value=FakeVast([offer(7, 70)])), \
+             redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            vast_rent.main(["--gpu", "RTX_5090", "--disk", "120", "--image", "img:t",
+                           "--max-dph", "0.60", "--reliability", "0.95",
+                           "--min-disk-bw", "3000", "--min-cpu-ghz", "2.5", *argv])
+
+
 class TestMain(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         (self.tmp / ".env").write_text("GPU_INSTANCE_ID=old\n", encoding="utf-8")
+        # F9: TestMain is not hermetic — a real shell that exports e.g. VAST_GB overrides the
+        # CLI default via _cfg_get and changes what these tests exercise, or crashes _parse()
+        # outright if the value is not a float. Isolate the whole test method's environment
+        # (restored by patch.dict itself), then remove the specific keys _cfg_get reads.
+        env_patch = mock.patch.dict(os.environ, {}, clear=False)
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
+        for key in _VAST_RENT_ENV_KEYS:
+            os.environ.pop(key, None)
         self.patches = [mock.patch.object(vast_rent, "ROOT", self.tmp),
                         mock.patch.object(vast_rent, "BOARD_PATH", self.tmp / "vast-machines.json")]
         for p in self.patches:
             p.start()
-
-    def tearDown(self):
-        for p in self.patches:
-            p.stop()
+            self.addCleanup(p.stop)
 
     def _main(self, api, *argv):
         out, err = io.StringIO(), io.StringIO()
@@ -604,6 +720,61 @@ class TestMain(unittest.TestCase):
         api.ssh_url = lambda iid: "not an address"
         rc, out, _ = self._main(api, "--ssh-target", "1")
         self.assertEqual((rc, out), (1, ""))
+
+    def test_hermetic_against_a_poisoned_outer_environment(self):
+        # Simulates a shell that already exports VAST_GB (measured need 2026-09-19: _cfg_get
+        # reads it straight into argparse's default= expression, so an unparseable value
+        # crashes _parse() before argv is even looked at). Re-poisoning here and re-running the
+        # SAME isolation the fixture uses proves that mechanism actually neutralizes it, not
+        # merely that this one test happened to run after a clean setUp.
+        with mock.patch.dict(os.environ, {"VAST_GB": "abc"}):
+            for key in _VAST_RENT_ENV_KEYS:
+                os.environ.pop(key, None)
+            rc, out, err = self._main(FakeVast([offer(7, 70)]))
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out.strip(), "7")
+
+    def test_confirm_writes_the_owner_marker_alongside_the_instance_id(self):
+        # F1/C1: the marker is what lets `make gpu-destroy` find Vast even when .env's
+        # GPU_PROVIDER still says runpod and no lease was ever written.
+        rc, _, _ = self._main(FakeVast([offer(7, 70)]), "--confirm")
+        self.assertEqual(rc, 0)
+        self.assertIn("GPU_INSTANCE_OWNER=vast:i1",
+                      (self.tmp / ".env").read_text(encoding="utf-8"))
+
+    def test_still_billing_leaves_both_the_id_and_the_owner_marker(self):
+        # A rent that ends in STILL BILLING (destroy could not be verified) must NOT clear
+        # either key: they are the only handle left on an instance that keeps costing money.
+        # A near-zero --pull-deadline times out on the FIRST poll (elapsed >= deadline before
+        # ever calling the real time.sleep(POLL_S)), so this needs no real clock patching —
+        # main() wires rent() to the real time module and cannot take a fake one.
+        api = FakeVast([offer(7, 70)], statuses={"i1": ["loading"]}, destroy_noop={"i1"})
+        rc, _, err = self._main(api, "--confirm", "--pull-deadline", "0.01")
+        self.assertEqual(rc, 1)
+        self.assertIn("STILL BILLING", err)
+        env_text = (self.tmp / ".env").read_text(encoding="utf-8")
+        self.assertIn("GPU_INSTANCE_ID=i1", env_text)
+        self.assertIn("GPU_INSTANCE_OWNER=vast:i1", env_text)
+
+    def test_a_normally_abandoned_instance_clears_both_the_id_and_the_owner_marker(self):
+        api = FakeVast([offer(7, 70)], statuses={"i1": ["exited"]})
+        rc, _, _ = self._main(api, "--confirm")
+        self.assertEqual(rc, 1)
+        env_text = (self.tmp / ".env").read_text(encoding="utf-8")
+        self.assertNotIn("GPU_INSTANCE_ID=i1", env_text)
+        self.assertIn("GPU_INSTANCE_OWNER=\n", env_text)
+
+    def test_a_pull_deadline_beyond_the_watchdog_grace_is_clamped_and_warns(self):
+        # GRACE_MIN * 60 - 60 == 540 with GRACE_MIN == 10.
+        rc, _, err = self._main(FakeVast([offer(7, 70)]), "--pull-deadline", "900")
+        self.assertEqual(rc, 0)
+        self.assertIn("900", err)
+        self.assertIn("540", err)
+
+    def test_a_pull_deadline_inside_the_grace_is_untouched(self):
+        rc, _, err = self._main(FakeVast([offer(7, 70)]), "--pull-deadline", "300")
+        self.assertEqual(rc, 0)
+        self.assertNotIn("clamped", err)
 
 
 if __name__ == "__main__":

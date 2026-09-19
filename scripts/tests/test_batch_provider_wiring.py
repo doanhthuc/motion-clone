@@ -136,8 +136,8 @@ class TestGpuDestroyVastVerifyBehaviour(unittest.TestCase):
 
     ID = "12345"
 
-    def _destroy(self, listing: str, rc: int = 0,
-                 env_id: str | None = None) -> tuple[subprocess.CompletedProcess, bool]:
+    def _destroy(self, listing: str, rc: int = 0, env_id: str | None = None,
+                 destroy_rc: int = 0) -> tuple[subprocess.CompletedProcess, bool]:
         d = Path(tempfile.mkdtemp())
         # env_id lets a test put trailing whitespace on the id in .env.
         gpu_id = env_id if env_id is not None else self.ID
@@ -151,7 +151,7 @@ class TestGpuDestroyVastVerifyBehaviour(unittest.TestCase):
         bin_dir.mkdir()
         (bin_dir / "vastai").write_text(
             '#!/bin/bash\n'
-            'if [ "$1" = destroy ]; then cat >/dev/null; exit 0; fi\n'
+            f'if [ "$1" = destroy ]; then cat >/dev/null; exit {destroy_rc}; fi\n'
             f'cat "{d}/listing.txt"; exit {rc}\n', encoding="utf-8")
         (bin_dir / "sleep").write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
         for f in bin_dir.iterdir():
@@ -161,6 +161,23 @@ class TestGpuDestroyVastVerifyBehaviour(unittest.TestCase):
         out = subprocess.run(["make", "gpu-destroy", "GPU_PROVIDER=vast"], cwd=d, env=env,
                              capture_output=True, text=True)
         return out, (d / "env-cleared").exists()
+
+    def test_a_destroy_error_for_an_instance_already_gone_still_verifies_and_clears(self):
+        # F3/I1: the destroy line had no `|| true` (unlike the RunPod branch's `pod delete …
+        # || true`), so a destroy error for an instance already gone aborted `make` before the
+        # verify below ever ran, and .env was never cleared even though the goal — the
+        # instance not existing — was already met.
+        out, cleared = self._destroy('{"instances": [], "next_token": null}', destroy_rc=1)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("verified gone", out.stdout)
+        self.assertTrue(cleared)
+
+    def test_a_destroy_error_for_an_instance_still_listed_is_still_alive(self):
+        out, cleared = self._destroy(
+            f'{{"instances": [{{"id": {self.ID}, "label": "x"}}]}}', destroy_rc=1)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("STILL ALIVE", out.stdout)
+        self.assertFalse(cleared)
 
     def test_a_listing_that_errors_is_not_read_as_gone(self):
         out, cleared = self._destroy("Traceback: unknown command", rc=2)
@@ -269,6 +286,128 @@ class TestLeaseDecidesTheDestroyProvider(unittest.TestCase):
         self.assertNotIn("runpodctl pod delete", out.stdout)
 
 
+class TestOwnerMarkerDecidesTheDestroyProvider(unittest.TestCase):
+    """F1/C1: a rent that fails AFTER creating a Vast instance (STILL BILLING abandon,
+    AmbiguousCreate, an unwind that could not destroy) leaves GPU_INSTANCE_ID set with NO
+    lease at all — the lease rule above cannot help. GPU_INSTANCE_OWNER=vast:<id> is
+    vast_rent.py's own receipt and must count only when its id matches the instance being
+    destroyed. Runs the real Makefile in a scratch dir with its own .env — never the real
+    repo's — so this can never read or steer a real rented instance."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        (self.tmp / "Makefile").write_text((ROOT / "Makefile").read_text(encoding="utf-8"),
+                                           encoding="utf-8")
+        (self.tmp / "print.mk").write_text("print-%: ; @echo $($*)\n", encoding="utf-8")
+
+    def _eff(self, env_file: str, *extra: str, env: dict | None = None) -> str:
+        (self.tmp / ".env").write_text(env_file, encoding="utf-8")
+        e = {k: v for k, v in os.environ.items() if k not in ("GPU_PROVIDER", "GPU_INSTANCE_ID")}
+        e.update(env or {})
+        out = subprocess.run(
+            ["make", "-s", "-f", "Makefile", "-f", "print.mk", "print-GPU_PROVIDER_EFF", *extra],
+            cwd=self.tmp, env=e, capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return out.stdout.strip()
+
+    def test_a_matching_owner_marker_picks_vast(self):
+        self.assertEqual(
+            self._eff("GPU_PROVIDER=runpod\nGPU_INSTANCE_ID=777\nGPU_INSTANCE_OWNER=vast:777\n"),
+            "vast")
+
+    def test_a_mismatched_owner_marker_is_ignored(self):
+        self.assertEqual(
+            self._eff("GPU_PROVIDER=runpod\nGPU_INSTANCE_ID=777\nGPU_INSTANCE_OWNER=vast:999\n"),
+            "runpod")
+
+    def test_no_owner_key_falls_through_to_dotenv(self):
+        self.assertEqual(self._eff("GPU_PROVIDER=runpod\nGPU_INSTANCE_ID=777\n"), "runpod")
+
+    def test_an_exported_provider_beats_the_marker(self):
+        self.assertEqual(
+            self._eff("GPU_PROVIDER=runpod\nGPU_INSTANCE_ID=777\nGPU_INSTANCE_OWNER=vast:777\n",
+                      env={"GPU_PROVIDER": "runpod"}),
+            "runpod")
+
+    def test_a_matching_lease_beats_a_mismatching_marker(self):
+        # "mismatching" here means the marker's PROVIDER disagrees with the lease's, while both
+        # ids match the instance being destroyed — precedence, not id-guarding, is under test.
+        lease = self.tmp / "pod-lease.json"
+        lease.write_text(json.dumps({"pod_id": "777", "provider": "runpod",
+                                     "manifest": "batch/x.yaml"}, indent=2), encoding="utf-8")
+        self.assertEqual(
+            self._eff("GPU_PROVIDER=\nGPU_INSTANCE_ID=777\nGPU_INSTANCE_OWNER=vast:777\n",
+                      f"LEASE_FILE={lease}"),
+            "runpod")
+
+
+class TestGpuDestroyFollowsTheOwnerMarker(unittest.TestCase):
+    """End to end (F1 test f): a fake vastai AND a fake runpodctl on PATH, .env exactly as in
+    the reproduced C1 bug (runpod-flavoured .env, dangling Vast id, no lease). `make
+    gpu-destroy` must pick vast from the owner marker and never call runpodctl."""
+
+    def test_a_dangling_owner_marker_destroys_via_vastai_not_runpodctl(self):
+        d = Path(tempfile.mkdtemp())
+        (d / ".env").write_text(
+            "GPU_PROVIDER=runpod\nGPU_INSTANCE_ID=777\nGPU_INSTANCE_OWNER=vast:777\n",
+            encoding="utf-8")
+        (d / "Makefile").write_text((ROOT / "Makefile").read_text(encoding="utf-8"),
+                                    encoding="utf-8")
+        (d / "scripts").mkdir()
+        (d / "scripts" / "env-clear-pod.sh").write_text(
+            f'#!/bin/bash\ntouch "{d}/env-cleared"\n', encoding="utf-8")
+        bin_dir = d / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "vastai").write_text(
+            '#!/bin/bash\n'
+            f'if [ "$1" = destroy ]; then cat >/dev/null; touch "{d}/vastai-destroy-called"; '
+            'exit 0; fi\n'
+            'echo \'{"instances": [], "next_token": null}\'; exit 0\n', encoding="utf-8")
+        (bin_dir / "runpodctl").write_text(
+            f'#!/bin/bash\ntouch "{d}/runpodctl-called"\nexit 0\n', encoding="utf-8")
+        (bin_dir / "sleep").write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+        for f in bin_dir.iterdir():
+            f.chmod(0o755)
+        env = {k: v for k, v in os.environ.items() if k not in ("GPU_PROVIDER", "GPU_INSTANCE_ID")}
+        env["PATH"] = f"{bin_dir}:{env['PATH']}"
+        out = subprocess.run(["make", "gpu-destroy"], cwd=d, env=env,
+                             capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertTrue((d / "vastai-destroy-called").exists())
+        self.assertFalse((d / "runpodctl-called").exists())
+
+
+class TestEnvClearPodClearsTheOwnerMarker(unittest.TestCase):
+    """F1 test g: env-clear-pod.sh must clear GPU_INSTANCE_OWNER along with the other three
+    keys, keep the file's line count (its own gate), and no-op when the key is absent. Runs
+    against an explicit tmp .env passed on the command line — never the real one."""
+
+    def test_clears_the_owner_key_and_keeps_the_line_count(self):
+        d = Path(tempfile.mkdtemp())
+        env_file = d / ".env"
+        env_file.write_text(
+            "GPU_PROVIDER=runpod\nGPU_INSTANCE_ID=777\nGPU_INSTANCE_OWNER=vast:777\n"
+            "GPU_SSH_HOST=1.2.3.4\nGPU_SSH_PORT=40022\n", encoding="utf-8")
+        before = len(env_file.read_text(encoding="utf-8").splitlines())
+        out = subprocess.run(["bash", str(ROOT / "scripts" / "env-clear-pod.sh"), str(env_file)],
+                             capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        after_text = env_file.read_text(encoding="utf-8")
+        self.assertEqual(len(after_text.splitlines()), before)
+        self.assertIn("GPU_INSTANCE_OWNER=\n", after_text)
+        self.assertNotIn("vast:777", after_text)
+
+    def test_a_missing_owner_key_is_a_no_op(self):
+        d = Path(tempfile.mkdtemp())
+        env_file = d / ".env"
+        env_file.write_text("GPU_PROVIDER=runpod\nGPU_INSTANCE_ID=777\n", encoding="utf-8")
+        out = subprocess.run(["bash", str(ROOT / "scripts" / "env-clear-pod.sh"), str(env_file)],
+                             capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(env_file.read_text(encoding="utf-8"),
+                         "GPU_PROVIDER=runpod\nGPU_INSTANCE_ID=\n")
+
+
 class TestVastInstancesAreLabelled(unittest.TestCase):
     def test_the_rent_function_labels_with_a_name_tier_three_may_destroy(self):
         # Two hand-copied names that must agree: the label vast_rent.py puts on every instance
@@ -286,12 +425,23 @@ class TestVastInstancesAreLabelled(unittest.TestCase):
 
 
 class TestPodWaitDirectAddress(unittest.TestCase):
-    def test_the_vast_probe_asks_for_the_direct_address_and_keeps_the_proxy_as_fallback(self):
+    def test_the_vast_probe_uses_a_quoted_variable_for_the_script_path(self):
+        # F8/I7: was a literal, unquoted `python3 $(cd ... )/vast_rent.py` — word-split on any
+        # path containing a space and re-computed the cd/pwd on every single poll.
         text = (ROOT / "scripts" / "pod-wait.sh").read_text(encoding="utf-8")
-        self.assertIn("vast_rent.py --ssh-target", text)
+        self.assertIn('VAST_RENT="$(cd', text)
+        self.assertIn('"$VAST_RENT" --ssh-target', text)
         # the proxy values are still read, as the fallback when ssh-url gives nothing
         self.assertIn('"ssh_host"', text)
         self.assertIn('"ssh_port"', text)
+
+    def test_the_direct_address_falls_back_to_the_proxy_after_four_failures(self):
+        # F8/I7: a bogus "direct" address (or a real one that just never answers) used to lock
+        # pod-wait.sh onto it for the rest of the run, with no way back to the proxy values.
+        text = (ROOT / "scripts" / "pod-wait.sh").read_text(encoding="utf-8")
+        self.assertIn("DIRECT_FAILS=0", text)
+        self.assertIn("USING_DIRECT", text)
+        self.assertIn('"$DIRECT_FAILS" -lt 4', text)
 
 
 if __name__ == "__main__":

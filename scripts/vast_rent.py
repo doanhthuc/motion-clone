@@ -24,6 +24,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import signal
 import subprocess
 import sys
 import time
@@ -38,6 +40,7 @@ from batchlib_ext.vast_scoreboard import (MachineRecord, Scoreboard, load_board,
                                           save_board)
 from batchlib_ext.vast_select import (Criteria, Ranked, dedupe, explain_rejections,
                                       format_table, rank)
+from batchlib_ext.watchdog import GRACE_MIN
 
 ROOT = Path(__file__).resolve().parents[1]
 BOARD_PATH = ROOT / "batch" / "vast-machines.json"
@@ -208,8 +211,32 @@ def gather_offers(api: VastApi, cfg: RentConfig, board: Scoreboard, log) -> list
     return dedupe(offers)
 
 
-def _wait_running(api: VastApi, instance_id: str, deadline_s: float, *, now, sleep, log):
+@dataclass(frozen=True)
+class WaitOutcome:
+    """`_wait_running`'s return, extended (backwards compatibly — the one caller unpacks named
+    fields, not positions) with what it saw along the way: distinguishing "still pulling" from
+    "reading the wrong field" used to require re-running a rent for another ~24 minutes to find
+    out (measured 2026-09-19)."""
+    state: str                    # "running" | "failed" | "timeout"
+    elapsed: float
+    last_status: str | None       # last NON-EMPTY actual_status seen, or None if every read
+                                  # was empty/unreadable
+    empty_reads: int
+
+
+def _status_note(outcome: WaitOutcome, instance_id: str) -> str:
+    note = f"last status {outcome.last_status!r}, {outcome.empty_reads} empty reads"
+    if outcome.last_status is None:
+        note += (f" — could not read a status at all: check "
+                f"`vastai show instance {instance_id} --raw`")
+    return note
+
+
+def _wait_running(api: VastApi, instance_id: str, deadline_s: float, *, now, sleep,
+                  log) -> WaitOutcome:
     start = now()
+    last_status: str | None = None
+    empty_reads = 0
     while True:
         try:
             status = str((api.instance_status(instance_id) or {}).get("actual_status")
@@ -217,13 +244,17 @@ def _wait_running(api: VastApi, instance_id: str, deadline_s: float, *, now, sle
         except RuntimeError as exc:
             status = ""
             log(f"status check failed (will retry): {exc}")
+        if status:
+            last_status = status
+        else:
+            empty_reads += 1
         elapsed = now() - start
         if status == "running":
-            return "running", elapsed
+            return WaitOutcome("running", elapsed, last_status, empty_reads)
         if status in FAILED_STATUSES:
-            return "failed", elapsed
+            return WaitOutcome("failed", elapsed, last_status, empty_reads)
         if elapsed >= deadline_s:
-            return "timeout", elapsed
+            return WaitOutcome("timeout", elapsed, last_status, empty_reads)
         sleep(POLL_S)
 
 
@@ -270,7 +301,8 @@ def _abandon(api: VastApi, instance_id: str, on_released, log, sleep, *,
         return
     why = f"the destroy failed ({destroy_err}) and {problem}" if destroy_err else problem
     msg = (f"instance {instance_id}: {why} — it is STILL BILLING. "
-           f"Destroy it by hand: vastai destroy instance {instance_id}")
+           f"Destroy it by hand: `make gpu-destroy GPU_PROVIDER=vast` (verifies it is gone), "
+           f"or `vastai destroy instance {instance_id}`")
     if best_effort:
         log(msg)
         return
@@ -306,6 +338,7 @@ def rent(api: VastApi, cfg: RentConfig, board: Scoreboard, *, confirm: bool,
     pulls = 0
     create_failures = 0
     bad_machines: set = set()        # one machine can carry several offers: don't retry a failure
+    last_outcome: WaitOutcome | None = None
     for cand in ranked:
         if pulls >= 1 + MAX_PULL_RETRIES:
             break
@@ -322,19 +355,21 @@ def rent(api: VastApi, cfg: RentConfig, board: Scoreboard, *, confirm: bool,
             if create_failures >= MAX_CREATE_FAILURES:
                 break
             continue
-        # Say the id at once (stderr), before any bookkeeping that could fail.
-        log(f"created instance {instance_id} from offer {cand.offer['id']} "
-            f"(machine {cand.machine_id})")
-        pulls += 1
         try:
-            # First inside the try: if recording the id fails or Ctrl-C lands here, the
-            # instance we just created must still be destroyed.
+            # Logging the id and counting the pull are FIRST inside the unwinding try, before
+            # `on_created`: a broken stderr pipe or a Ctrl-C landing in that window must not
+            # orphan the instance we just created (F10 — this used to sit above the try).
+            log(f"created instance {instance_id} from offer {cand.offer['id']} "
+                f"(machine {cand.machine_id})")
+            pulls += 1
             on_created(instance_id)
-            state, elapsed = _wait_running(api, instance_id, cfg.pull_deadline_s,
-                                           now=now, sleep=sleep, log=log)
+            outcome = _wait_running(api, instance_id, cfg.pull_deadline_s,
+                                    now=now, sleep=sleep, log=log)
         except BaseException:
             _abandon(api, instance_id, on_released, log, sleep, best_effort=True)
             raise
+        last_outcome = outcome
+        state, elapsed = outcome.state, outcome.elapsed
         if state == "running":
             _record(board, cand.machine_id, elapsed, "ok", now())
             _safe(persist, "the machine scoreboard", log)
@@ -346,9 +381,34 @@ def rent(api: VastApi, cfg: RentConfig, board: Scoreboard, *, confirm: bool,
                 "slow_pull" if state == "timeout" else "failed", now())
         _safe(persist, "the machine scoreboard", log)
         log(f"offer {cand.offer['id']} (machine {cand.machine_id}): {state} after "
-            f"{elapsed:.0f}s — destroyed, trying the next machine")
+            f"{elapsed:.0f}s ({_status_note(outcome, instance_id)}) — destroyed, trying the "
+            f"next machine")
+    tail = ""
+    if last_outcome is not None:
+        tail = (f" — last status: {last_outcome.last_status!r}; "
+                f"empty status reads: {last_outcome.empty_reads}")
+        if last_outcome.last_status is None:
+            tail += (" (could not read a status at all — check "
+                    "`vastai show instance <id> --raw`)")
     raise RentError(f"no machine reached 'running' within {cfg.pull_deadline_s:.0f}s "
-                    f"after {pulls} pull attempt(s) and {create_failures} failed create(s)")
+                    f"after {pulls} pull attempt(s) and {create_failures} failed create(s){tail}")
+
+
+_IPV4_RE = re.compile(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$")
+_HOSTNAME_CHARS_RE = re.compile(r"^[A-Za-z0-9.-]+$")
+
+
+def _looks_like_host(host: str) -> bool:
+    """Reject anything that is not plausibly a host: an IPv4 literal, or a name containing a
+    dot and only [A-Za-z0-9.-]. Guards F8/I7: `vastai ssh-url` can print an error line (e.g.
+    "Error:404") that the old parser read as host="Error" port="404" — pod-wait.sh then locked
+    onto an address that never answers, with no way back to the proxy. A bare word with no dot
+    (e.g. "localhost") is rejected rather than accepted for the same reason: it is
+    indistinguishable from an error word before a colon.
+    """
+    if _IPV4_RE.match(host):
+        return True
+    return "." in host and bool(_HOSTNAME_CHARS_RE.match(host))
 
 
 def parse_ssh_url(text: str) -> tuple[str, str] | None:
@@ -359,7 +419,7 @@ def parse_ssh_url(text: str) -> tuple[str, str] | None:
             s = s.split("@", 1)[1]
         s = s.split("/")[0]
         host, sep, port = s.rpartition(":")
-        if sep and host and port.isdigit() and " " not in host:
+        if sep and host and port.isdigit() and " " not in host and _looks_like_host(host):
             return host, port
     return None
 
@@ -395,6 +455,24 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
     return ap.parse_args(argv)
 
 
+def _on_signal(signum: int, frame) -> None:
+    """SIGTERM/SIGHUP -> SystemExit, so the `except BaseException` unwind in `rent()` (destroy
+    the just-created instance, clear .env) runs. Python's default handler for these kills the
+    process outright — `finally` and `except` never see it — which is exactly how F2/C2's
+    orphaned `make drain` kept renting after the bot's /kill gave up on it."""
+    raise SystemExit(128 + signum)
+
+
+def _write_owner(env_path: Path, iid: str) -> None:
+    env_set(env_path, "GPU_INSTANCE_ID", iid)
+    env_set(env_path, "GPU_INSTANCE_OWNER", f"vast:{iid}")
+
+
+def _clear_owner(env_path: Path, iid: str) -> None:
+    env_set(env_path, "GPU_INSTANCE_ID", "")
+    env_set(env_path, "GPU_INSTANCE_OWNER", "")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse(argv)
     api = make_api()
@@ -415,21 +493,35 @@ def main(argv: list[str] | None = None) -> int:
             _stderr(f"missing --{required.replace('_', '-')}")
             return 2
 
+    # F7/I5: the deadline must stay under the watchdog's grace (tier 3 reaps an unleased
+    # labelled instance GRACE_MIN minutes after it first sees it) with a minute of slack for
+    # bookkeeping — see test_the_pull_deadline_leaves_room_inside_the_watchdog_grace.
+    pull_deadline = min(args.pull_deadline, GRACE_MIN * 60 - 60)
+    if pull_deadline < args.pull_deadline:
+        _stderr(f"--pull-deadline {args.pull_deadline:.0f}s exceeds the watchdog grace "
+                f"({GRACE_MIN * 60:.0f}s) minus 60s slack — clamped to {pull_deadline:.0f}s")
+
     criteria = Criteria(
         max_dph=args.max_dph, min_disk_bw=args.min_disk_bw, min_cpu_ghz=args.min_cpu_ghz,
         min_inet_mbps=args.min_inet_mbps, max_down_usd_per_tb=args.max_down_usd_per_tb,
         skip_offers=frozenset(s.strip() for s in args.skip.split(",") if s.strip()))
     cfg = RentConfig(gpu=args.gpu, disk_gb=args.disk, image=args.image,
                      reliability=args.reliability, criteria=criteria, gb=args.gb,
-                     pull_deadline_s=args.pull_deadline, pin=args.offer or None)
+                     pull_deadline_s=pull_deadline, pin=args.offer or None)
     board = load_board(BOARD_PATH)
     env_path = ROOT / ".env"
     _stderr(f"searching: {cfg.query}  (<= ${args.max_dph:.2f}/hr, ~{args.gb:.0f} GB to download)")
+    if args.confirm:
+        # Only for a real rent: a dry run must not change signal handling. SIGHUP too, not just
+        # SIGTERM — a killpg from a detached session (F2) can deliver either depending on how
+        # the controlling terminal/session was set up.
+        signal.signal(signal.SIGTERM, _on_signal)
+        signal.signal(signal.SIGHUP, _on_signal)
     try:
         result = rent(
             api, cfg, board, confirm=args.confirm,
-            on_created=lambda iid: env_set(env_path, "GPU_INSTANCE_ID", iid),
-            on_released=lambda iid: env_set(env_path, "GPU_INSTANCE_ID", ""),
+            on_created=lambda iid: _write_owner(env_path, iid),
+            on_released=lambda iid: _clear_owner(env_path, iid),
             persist=lambda: save_board(BOARD_PATH, board))
     except RentError as exc:
         print(f"\033[31m ✗ \033[0m{exc}", file=sys.stderr)

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ════════════════════════════════════════════════════════════════════════════
-# env-clear-pod.sh — xoá GIÁ TRỊ của ba khoá định danh pod trong .env sau khi pod đã bị xoá.
+# env-clear-pod.sh — xoá GIÁ TRỊ của bốn khoá định danh pod trong .env sau khi pod đã bị xoá.
 #
 #   bash scripts/env-clear-pod.sh [.env]
 #
@@ -21,7 +21,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 ENV_FILE="${1:-.env}"
-KEYS='GPU_INSTANCE_ID|GPU_SSH_HOST|GPU_SSH_PORT'
+KEYS='GPU_INSTANCE_ID|GPU_SSH_HOST|GPU_SSH_PORT|GPU_INSTANCE_OWNER'
 
 [ -f "$ENV_FILE" ] || { echo " !! không thấy $ENV_FILE — bỏ qua, không có gì để xoá"; exit 0; }
 
@@ -33,13 +33,13 @@ ORIG_MODE="$(_mode "$ENV_FILE")"
 # mktemp CẠNH file đích, không phải /tmp: mv chỉ nguyên tử trong cùng filesystem, và .env có thể
 # nằm trên một mount khác /tmp. Nguyên tử là điều kiện để .env không bao giờ ở trạng thái viết dở
 # — nó giữ POSTGRES_PASSWORD, API_KEY và mọi thứ khác của pod.
-TMP="$(mktemp "$ENV_FILE.XXXXXX")" || { echo " ✗ không tạo được file tạm cạnh $ENV_FILE — xoá tay ba khoá: $KEYS" >&2; exit 1; }
+TMP="$(mktemp "$ENV_FILE.XXXXXX")" || { echo " ✗ không tạo được file tạm cạnh $ENV_FILE — xoá tay các khoá: $KEYS" >&2; exit 1; }
 trap 'rm -f "$TMP"' EXIT
 
 # Xoá PHẦN GIÁ TRỊ, giữ lại dòng `KEY=`. Xoá cả dòng sẽ làm `make gpu-preflight` báo "thiếu khoá"
 # thay vì "chưa có pod" — hai chuyện khác nhau, và cái sau mới đúng.
 if ! sed -E "s/^($KEYS)=.*/\1=/" "$ENV_FILE" > "$TMP"; then
-  echo " ✗ sed lỗi — $ENV_FILE giữ nguyên. Xoá tay ba khoá: $KEYS" >&2
+  echo " ✗ sed lỗi — $ENV_FILE giữ nguyên. Xoá tay các khoá: $KEYS" >&2
   exit 1
 fi
 
@@ -48,12 +48,12 @@ fi
 OLD_N="$(wc -l < "$ENV_FILE" | tr -d ' ')"
 NEW_N="$(wc -l < "$TMP" | tr -d ' ')"
 if [ ! -s "$TMP" ] || [ "$NEW_N" != "$OLD_N" ]; then
-  echo " ✗ file kết quả lệch dòng ($OLD_N → $NEW_N) — KHÔNG ghi đè. Xoá tay ba khoá: $KEYS" >&2
+  echo " ✗ file kết quả lệch dòng ($OLD_N → $NEW_N) — KHÔNG ghi đè. Xoá tay các khoá: $KEYS" >&2
   exit 1
 fi
 
 [ -n "$ORIG_MODE" ] && chmod "$ORIG_MODE" "$TMP" 2>/dev/null
-mv "$TMP" "$ENV_FILE" || { echo " ✗ mv thất bại — $ENV_FILE giữ nguyên. Xoá tay ba khoá: $KEYS" >&2; exit 1; }
+mv "$TMP" "$ENV_FILE" || { echo " ✗ mv thất bại — $ENV_FILE giữ nguyên. Xoá tay các khoá: $KEYS" >&2; exit 1; }
 trap - EXIT
 
-echo " ✓ đã xoá GPU_INSTANCE_ID / GPU_SSH_HOST / GPU_SSH_PORT trong $ENV_FILE"
+echo " ✓ đã xoá GPU_INSTANCE_ID / GPU_SSH_HOST / GPU_SSH_PORT / GPU_INSTANCE_OWNER trong $ENV_FILE"
