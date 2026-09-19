@@ -616,9 +616,12 @@ the button is tapped, because buttons outlive the state they were drawn for; a r
 keeps the draft, and leaves the panel usable. A RunPod stock-out card gains **Rent on Vast instead**,
 which opens the same panel for that batch.
 
-The tap-time check needs a price quote from this bot process (the panel fetches it): after a bot
-restart, an old Vast spend button refuses ("no current Vast price quote") until you open the Vast
-tab or press Refresh.
+The tap-time check needs a price quote from this bot process (the panel fetches it). After a bot
+restart an old Vast spend button therefore refuses ("no current Vast price quote"), and the quote
+cannot be re-fetched from that old panel. For a batch without a local try-on, tap Run and then the
+Vast tab. For a try-on batch, tap Run again (Phase A resumes from the journal, so try-ons already on
+disk are not paid for twice) and open the Vast tab on the rent panel it draws, or use the stock-out
+card's **Rent on Vast instead**.
 
 `GPU=` in `.env` holds the RunPod spelling; `pod-provision.sh` translates it for Vast (`VAST_GPU`
 overrides). Before 2026-09-19 a Vast search with the RunPod name failed outright ("invalid JSON"),

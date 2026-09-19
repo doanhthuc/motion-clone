@@ -109,7 +109,7 @@ def spend_blockers(manifest: Manifest, enabled: frozenset[str], *,
     account adds its own reason."""
     reasons = static_blockers(manifest, enabled)
     if quote is None:
-        reasons.append("no current Vast price quote — open the Vast tab (Refresh) "
+        reasons.append("no current Vast price quote — reopen the rent panel, open its Vast tab "
                        "and tap spend again")
         session = None
     else:
