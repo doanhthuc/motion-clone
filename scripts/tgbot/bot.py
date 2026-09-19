@@ -717,6 +717,8 @@ def _deliver_provision_failure(tg: Tg, chat_id: int, manifest_path: Path,
                         f"${e.price_per_hr:.2f}/h",
                         f"{_CB_RECOVER_MIGRATE}{e.datacenter_id}:{stem}")])
 
+    buttons.append([("☁ Rent on Vast instead", f"{_CB_RECOVER_VAST}{stem}")])
+
     short = _GPU_SHORT.get(failure.gpu)
     if short is not None:
         # ICON_CRITICAL_CE, same as _offer_gpu_sub_datacenters' own "none"
@@ -1503,6 +1505,10 @@ _CB_RECOVER_MIGRATE = "rec:mig:"   # + "<to_dc>:<manifest stem>"
 # just failed on. A user whose card had scrolled away had no way to resume
 # without /confirm, which minted a new batch id and re-ran every try-on.
 _CB_RECOVER_RETRY = "rec:retry:"   # + "<manifest stem>"
+# Opens the Vast tab of the rent panel for the batch whose RunPod rental just failed (spec §3.5).
+# Carries the stem like the other recovery buttons, and is only honoured for the manifest THIS chat
+# is on: it opens a panel, it never spends — the spend button on that panel carries its own token.
+_CB_RECOVER_VAST = "rec:vast:"     # + "<manifest stem>"
 
 # The reuse-or-rerun chooser _do_confirm sends when the journal already holds
 # a matching try-on. Both carry _run_token for the same reason the spend
@@ -1905,6 +1911,21 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
             else:
                 _do_resume(tg, chat_id, ROOT / "batch" / f"{stem}.yaml",
                            dry_run=dry_run)
+
+        elif data.startswith(_CB_RECOVER_VAST):
+            stem = data[len(_CB_RECOVER_VAST):]
+            if not stem or stem != _job_manifest_path(chat_id).stem:
+                tg.send_message(chat_id, "that button is from an earlier batch; "
+                                         "check /status")
+            else:
+                # The same latch tick_phase_a sets, so every re-render of this panel (Refresh,
+                # the [RunPod] tab, Back) stays on the rent panel and its spend button resumes
+                # into a rental instead of dropping to the "run try-on first" screen.
+                _PHASE_A_OFFERED[chat_id] = _run_token(chat_id)
+                # The interstitial becomes the panel: the search takes a few seconds and an
+                # unchanged chat for that long reads as a dead button.
+                wait_id = tg.send_message(chat_id, "🔄 Asking Vast for offers…")
+                _offer_run_for_chat(tg, chat_id, message_id=wait_id, gpu_provider="vast")
 
         elif data.startswith(_CB_RECOVER_SWITCH):
             short, _, stem = data[len(_CB_RECOVER_SWITCH):].partition(":")
@@ -3467,7 +3488,7 @@ def tick_progress(tg: Tg, chat_id: int) -> None:
         # a brand new job that had nothing to do with the old handoff.
         hpath.unlink(missing_ok=True)
         final_text = progress_text(manifest_path, lease=lease_for(manifest_path),
-                                   stages=stages)
+                                   stages=stages, **_billing_kwargs(payload))
         tg.edit_message(chat_id, message_id, final_text, parse_mode=PARSE_HTML)
         path.unlink(missing_ok=True)
         _ANIM_PAUSE.pop(chat_id, None)
@@ -3502,7 +3523,7 @@ def tick_progress(tg: Tg, chat_id: int) -> None:
         return
 
     text = progress_text(manifest_path, lease=lease_for(manifest_path),
-                         stages=stages)
+                         stages=stages, **_billing_kwargs(payload))
     if running:
         try:
             if not tg.edit_message(chat_id, message_id, text,
@@ -5172,7 +5193,10 @@ def _ask_kill(tg: Tg, chat_id: int) -> None:
     spent = ""
     if lease is not None:
         mins = int((time.time() - lease.provisioned_at) / 60)
-        spent = f" — already {mins} min (${mins / 60 * 0.99:.2f}) on the pod"
+        # RunPod's flat rate is only true of RunPod; a Vast pod is priced by its own offer, which
+        # the lease does not carry, so it gets the time and no invented dollar figure.
+        spent = (f" — already {mins} min (${mins / 60 * 0.99:.2f}) on the pod"
+                 if lease.provider == "runpod" else f" — already {mins} min on the pod")
     tg.send_message(
         chat_id,
         f"{ICON_WARN} This destroys the pod right now{spent}. Whatever is mid-render "
@@ -6370,6 +6394,7 @@ def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
         # never disagree with what is already on screen.
         stages = None
         phase = None
+        payload: dict = {}
         prog = _progress_path(chat_id)
         if prog.exists():
             try:
@@ -6387,7 +6412,8 @@ def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
         tg.send_message(chat_id,
                         progress_text(manifest_path,
                                       lease=lease_for(manifest_path),
-                                      stages=stages, phase=phase),
+                                      stages=stages, phase=phase,
+                                      **_billing_kwargs(payload)),
                         parse_mode=PARSE_HTML)
         return
 

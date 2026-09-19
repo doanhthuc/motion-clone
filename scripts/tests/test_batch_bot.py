@@ -7867,3 +7867,90 @@ class TestVastPicker(_VastBase):
         self.assertIn("Try-on finished", self.tg.screen[-1])
         self.assertIn("RTX 5090", self.tg.screen[-1])
         self.assertIn(bot._CB_PHASE_A_SPEND + self.token, self._last_buttons())
+
+
+class TestVastProgressRender(_VastBase):
+    """tick_progress and /status price a running Vast pod from its progress file."""
+
+    def test_a_later_render_reads_the_rate_back_from_the_file(self):
+        bot._start_progress(self.tg, ME, self.manifest, ["motion"], gpu_provider="vast")
+        payload = json.loads(bot._progress_path(ME).read_text(encoding="utf-8"))
+        lease = Lease(pod_id="i1", provisioned_at=time.time() - 3600, manifest=str(self.manifest),
+                      abs_max_min=240, provider="vast")
+        with mock.patch("tgbot.bot.lease_for", return_value=lease), \
+             mock.patch("tgbot.bot.drain_running", return_value=True):
+            bot.tick_progress(self.tg, ME)
+        self.assertIn("quoted $0.90/h", self.tg.screen[-1])
+
+
+class TestVastRecoveryAndKill(unittest.TestCase):
+    """The stock-out card's Rent on Vast button, and /kill's wording for a Vast pod."""
+
+    def setUp(self):
+        self._orig_root = bot.ROOT
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "batch").mkdir()
+        (self.root / "out").mkdir()
+        bot.ROOT = self.root
+        (self.root / ".env").write_text(
+            "GPU=NVIDIA GeForce RTX 5090\nPOD_VOLUME_ID=vol-1\n", encoding="utf-8")
+        reset_bot_state()
+        self.manifest = self.root / "batch" / "tg-1.yaml"
+        self.manifest.write_text(_MOTION_MANIFEST, encoding="utf-8")
+        state_path_for(self.manifest).write_text(
+            json.dumps({"batch": "2026-09-14-1421", "runs": {}}), encoding="utf-8")
+        write_provision_failure(provision_failure_path(self.manifest), ProvisionFailure(
+            gpu="NVIDIA GeForce RTX 5090", datacenter="EU-RO-1",
+            stock_out=True, detail="hết máy ..."))
+        self.tg = FakeTg()
+
+    def tearDown(self):
+        bot.ROOT = self._orig_root
+        reset_bot_state()
+
+    def test_the_stock_out_card_offers_rent_on_vast(self):
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value={}):
+            bot.deliver_result(self.tg, ME, self.manifest)
+        flat = [data for row in self.tg.buttons[-1] for _, data, *_ in row]
+        self.assertIn(f"{bot._CB_RECOVER_VAST}tg-1", flat)
+
+    def test_a_non_stock_out_failure_card_has_no_vast_button(self):
+        write_provision_failure(provision_failure_path(self.manifest), ProvisionFailure(
+            gpu="NVIDIA GeForce RTX 5090", datacenter="EU-RO-1", stock_out=False,
+            detail="some API error"))
+        bot.deliver_result(self.tg, ME, self.manifest)
+        flat = [data for rows in self.tg.buttons if rows for row in rows for _, data, *_ in row]
+        self.assertFalse([d for d in flat if d.startswith(bot._CB_RECOVER_VAST)])
+
+    def test_tapping_it_for_this_chats_batch_latches_the_rent_panel_on_vast(self):
+        stem = bot._job_manifest_path(ME).stem
+        with mock.patch("tgbot.bot._offer_run_for_chat") as offer:
+            bot.handle(self.tg, cb_from(ME, f"{bot._CB_RECOVER_VAST}{stem}"),
+                       allowed_user_id=ME)
+        self.assertIn(ME, bot._PHASE_A_OFFERED)
+        self.assertEqual(offer.call_args.kwargs["gpu_provider"], "vast")
+
+    def test_tapping_it_for_another_batchs_card_opens_nothing(self):
+        with mock.patch("tgbot.bot._offer_run_for_chat") as offer:
+            bot.handle(self.tg, cb_from(ME, f"{bot._CB_RECOVER_VAST}tg-999"),
+                       allowed_user_id=ME)
+            bot.handle(self.tg, cb_from(ME, bot._CB_RECOVER_VAST), allowed_user_id=ME)
+        offer.assert_not_called()
+        self.assertNotIn(ME, bot._PHASE_A_OFFERED)
+
+    def _kill_ask(self, provider):
+        lease = Lease(pod_id="p1", provisioned_at=time.time() - 3600, manifest=str(self.manifest),
+                      abs_max_min=240, provider=provider)
+        with mock.patch("tgbot.bot.drain_running", return_value=True), \
+             mock.patch("tgbot.bot.phase_a_running", return_value=False), \
+             mock.patch("tgbot.bot.lease_for", return_value=lease):
+            bot._ask_kill(self.tg, ME)
+        return self.tg.messages[-1]
+
+    def test_kill_quotes_the_runpod_rate_only_for_a_runpod_pod(self):
+        self.assertIn("($0.99) on the pod", self._kill_ask("runpod"))
+        vast = self._kill_ask("vast")
+        self.assertIn("already 60 min on the pod", vast)
+        self.assertNotIn("$0.99", vast)
+
