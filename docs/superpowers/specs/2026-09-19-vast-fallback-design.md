@@ -57,10 +57,16 @@ gate, with one measured Vast session per new pipeline family before its button i
   watchdog's source of truth.
 - Makefile targets that read the provider with `grep .env` change to prefer `$(GPU_PROVIDER)` from the
   environment.
-- **Pitfall:** `pod-provision.sh` resolves values as `${VAR:-$(env_get VAR)}`. `:-` treats an empty
-  value as unset and falls back to `.env`, so "override to empty" silently fails. The volume variables
-  must use `${VAR-…}` (no colon), otherwise the script dies on `POD_VOLUME=… but GPU_PROVIDER=vast`, or
-  worse, attaches the RunPod volume path on Vast.
+- **Correction (found while planning, 2026-09-19).** `pod-provision.sh` already prefers the environment
+  for `GPU_PROVIDER` (line 21) and reads `POD_VOLUME` with `${POD_VOLUME-…}` (line 142), so it needs
+  only `POD_VOLUME=` passed empty. The gap is elsewhere: `pod-wait.sh`, `pod-bootstrap.sh`,
+  `pod-smoke.sh` and every Makefile target read **only** `.env` through their own `env_get`, so an
+  exported override never reaches them and `pod-bootstrap.sh` would wire the RunPod volume onto a Vast
+  box. Rather than teach each script "override to empty", a **Vast run never has a volume**: those
+  scripts derive `POD_VOLUME` as empty whenever the effective provider is not `runpod`
+  (`scripts/lib-gpu-provider.sh`, and `GPU_PROVIDER_EFF` / `POD_VOLUME_EFF` in the Makefile).
+- The bot's `/kill` (`_do_kill`) also runs `make gpu-destroy` with the bot's own environment, which
+  would destroy against `.env`'s provider. It must pass the lease's provider.
 - `start_drain` (`tgbot/run.py`) forwards the provider; the bot never writes it to `.env`.
 - Naming: in bot code the new concept is `gpu_provider`, to keep it apart from the try-on `provider`.
 
