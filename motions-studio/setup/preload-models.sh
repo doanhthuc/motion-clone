@@ -205,6 +205,7 @@ fi
 # (ollama-models/), nên pod sau `ollama list` là thấy sẵn, không pull lại.
 OLLAMA_READY=0
 ollama_setup() {
+  [ -n "$VOL" ] || die "ollama model cần POD_VOLUME (MODELS_DIR chỉ hỗ trợ model ComfyUI, không có chỗ ổn định cho Ollama)"
   [ "$OLLAMA_READY" = 1 ] && return 0
   export OLLAMA_MODELS="$VOL/ollama-models"
   mkdir -p "$OLLAMA_MODELS" || die "không tạo được $OLLAMA_MODELS"
@@ -265,6 +266,10 @@ done < "$PLAN"
 
 say "kết quả"
 printf '  tải xong: %d · lỗi: %d · đã có sẵn: %d\n' "$DONE" "$FAIL" "$NSKIP"
-printf '  tổng comfy-models: %s\n' "$(du -sh "$MODELS" 2>/dev/null | cut -f1)"
+printf '  tổng %s: %s\n' "${DEST:+model (không qua volume)}${DEST:-comfy-models}" "$(du -sh "$MODELS" 2>/dev/null | cut -f1)"
 [ "$FAIL" -eq 0 ] || die "$FAIL file chưa xong — chạy lại script, nó bỏ qua file đã đủ cỡ"
-ok "volume sẵn sàng — pod sau dựng lên là có model, không phải tải lại"
+if [ -n "$DEST" ]; then
+  ok "model sẵn sàng tại $DEST (không phải volume — mất khi pod bị huỷ)"
+else
+  ok "volume sẵn sàng — pod sau dựng lên là có model, không phải tải lại"
+fi

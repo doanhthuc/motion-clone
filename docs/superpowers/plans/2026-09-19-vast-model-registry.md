@@ -860,14 +860,24 @@ def _manifest_with_a_motion_run() -> Manifest:
     ])
 ```
 
+`mock.patch.dict(os.environ, ..., clear=False)` restores the WHOLE dict on `__exit__`, silently
+erasing any key the code under test set inside the block — so an assertion checking `os.environ`
+must run INSIDE the `with`, never after it, or it passes regardless of what the code did. Use a
+manifest with real stages (`_manifest_with_a_motion_run()`), not `_empty_manifest()`, for every
+test that means to prove the *provider* gate specifically -- an empty manifest's `ids`/`gb` are
+already `frozenset()`/`0.0` on their own, so a test built on one can't tell the provider check
+from the emptiness check apart, and would keep "passing" even if the `chosen != "runpod"`
+condition were deleted entirely.
+
 ```python
 class TestWaitAndBootstrap(unittest.TestCase):
-    def test_runpod_does_not_set_vast_model_ids(self):
-        m = _empty_manifest()
+    def test_runpod_does_not_set_vast_model_ids_even_with_a_real_manifest(self):
+        m = _manifest_with_a_motion_run()  # NOT _empty_manifest() -- see note above
+        os.environ.pop("VAST_MODEL_IDS", None)
         with mock.patch.object(drain, "sh") as mock_sh, \
              mock.patch.dict(os.environ, {"GPU_PROVIDER": "runpod"}, clear=False):
             drain.wait_and_bootstrap(m)
-        self.assertNotIn("VAST_MODEL_IDS", os.environ)
+            self.assertNotIn("VAST_MODEL_IDS", os.environ)  # inside the block, not after
         mock_sh.assert_any_call("bash", "scripts/pod-bootstrap.sh")
 
     def test_vast_with_models_sets_vast_model_ids(self):
@@ -880,15 +890,16 @@ class TestWaitAndBootstrap(unittest.TestCase):
         os.environ.pop("VAST_MODEL_IDS", None)  # don't leak into later tests
 
     def test_vast_with_no_models_needed_does_not_set_the_env_var(self):
-        m = _empty_manifest()
+        m = _empty_manifest()  # this test's whole point IS the emptiness case -- correct here
         os.environ.pop("VAST_MODEL_IDS", None)
         with mock.patch.object(drain, "sh"), \
              mock.patch.dict(os.environ, {"GPU_PROVIDER": "vast"}, clear=False):
             drain.wait_and_bootstrap(m)
-        self.assertNotIn("VAST_MODEL_IDS", os.environ)
+            self.assertNotIn("VAST_MODEL_IDS", os.environ)  # inside the block, not after
 ```
 
-Add the matching `provision()` case:
+Add the matching `provision()` cases -- one proving the Vast path adds `VAST_GB`, one proving the
+RunPod path does not (using the SAME non-empty manifest, so only the provider differs):
 
 ```python
     def test_explicit_vast_provider_adds_vast_gb(self):
@@ -899,6 +910,15 @@ Add the matching `provision()` case:
             drain.provision(ceiling_min=60, manifest_path=Path("x.yaml"), manifest=m)
         cmd = mock_run.call_args[0][0]
         self.assertIn("VAST_GB=34.4", cmd)
+
+    def test_runpod_provider_does_not_add_vast_gb_even_with_a_real_manifest(self):
+        m = _manifest_with_a_motion_run()  # NOT _empty_manifest() -- see note above the class
+        with mock.patch.object(drain.subprocess, "run") as mock_run, \
+             mock.patch.object(drain, "env_get", side_effect=["8", "pod-xyz"]), \
+             mock.patch.dict(os.environ, {"GPU_PROVIDER": "runpod"}, clear=False):
+            drain.provision(ceiling_min=60, manifest_path=Path("x.yaml"), manifest=m)
+        cmd = mock_run.call_args[0][0]
+        self.assertNotIn("VAST_GB=", cmd)
 ```
 
 Use `mock.patch.dict(os.environ, ..., clear=False)` (not a bare assignment) so a test failure never
@@ -962,7 +982,16 @@ Insert a new block between the closing `fi` and the `venv` line:
       say "    Vast: bắt đầu tải model của manifest, chạy nền song song với cài đặt bên dưới…"
       ID_ARGS=()
       for _id in $VAST_MODEL_IDS; do ID_ARGS+=(--id "$_id"); done
-      ( MODELS_DIR="$COMFY_DIR/models" bash "$ROOT/setup/preload-models.sh" "${ID_ARGS[@]}" \
+      # CATALOG=$CATALOG_FILE, NOT preload-models.sh's own default (comfyui/catalog.json): the
+      # ids in VAST_MODEL_IDS come from batchlib.vast_models, which resolves against the box's
+      # LOCKED catalog (CATALOG_FILE, e.g. catalog-motion-transfer.json) -- the unfiltered
+      # catalog.json is missing ids that are ONLY in the locked one (wan-vitpose-onnx,
+      # wan-yolo10m-onnx), and a missing id is silently skipped as UNKNOWN (preload-models.sh's
+      # own design, correct for its normal manual use), not a download failure -- so the wrong
+      # catalog here would make this block print success while every motion job afterwards
+      # silently fell back to DWPose (lib-feature.sh's own comment two screens down explains why).
+      ( CATALOG="$CATALOG_FILE" MODELS_DIR="$COMFY_DIR/models" \
+        bash "$ROOT/setup/preload-models.sh" "${ID_ARGS[@]}" \
           >/tmp/preload-models.log 2>&1 ) &
       PRELOAD_PID=$!
     fi
@@ -989,7 +1018,7 @@ becomes:
         ok "model của manifest đã tải xong (/tmp/preload-models.log)"
       else
         warn "tải model của manifest LỖI — xem /tmp/preload-models.log. Chạy lại tay:"
-        warn "  MODELS_DIR=$COMFY_DIR/models bash setup/preload-models.sh --id <id> [--id <id> ...]"
+        warn "  CATALOG=\$CATALOG_FILE MODELS_DIR=$COMFY_DIR/models bash setup/preload-models.sh --id <id> [--id <id> ...]"
       fi
     fi
 

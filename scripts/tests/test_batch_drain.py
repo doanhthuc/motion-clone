@@ -173,7 +173,17 @@ class TestProvision(unittest.TestCase):
             mock_run.return_value = mock.Mock(returncode=0, stderr="")
             drain.provision(ceiling_min=60, manifest_path=Path("x.yaml"), manifest=m)
         cmd = mock_run.call_args[0][0]
-        self.assertIn("VAST_GB=34.4", cmd)
+        self.assertIn("VAST_GB=51.8", cmd)
+
+    def test_a_manifest_needing_no_models_still_gets_the_image_floor(self):
+        m = _empty_manifest()
+        with mock.patch.object(drain.subprocess, "run") as mock_run, \
+             mock.patch.object(drain, "env_get", side_effect=["8", "pod-xyz"]), \
+             mock.patch.dict(os.environ, {"GPU_PROVIDER": "vast"}, clear=False):
+            mock_run.return_value = mock.Mock(returncode=0, stderr="")
+            drain.provision(ceiling_min=60, manifest_path=Path("x.yaml"), manifest=m)
+        cmd = mock_run.call_args[0][0]
+        self.assertIn(f"VAST_GB={drain.VAST_IMAGE_GB:.1f}", cmd)
 
     def test_runpod_provider_does_not_add_vast_gb_even_with_a_real_manifest(self):
         # Same manifest as the Vast case above (34.4 GB of real downloads) --

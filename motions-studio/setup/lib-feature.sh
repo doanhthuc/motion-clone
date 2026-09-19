@@ -625,7 +625,7 @@ phase_ollama() {
 }
 
 phase_comfyui() {
-  say "7/11 · GPU / ComfyUI native — chỉ custom node của $FEATURE, KHÔNG tải model"
+  say "7/11 · GPU / ComfyUI native — chỉ custom node của $FEATURE, KHÔNG tải model (trừ khi VAST_MODEL_IDS được đặt cho Vast)"
   COMFY_DIR="${COMFY_DIR:-$HOME_DIR/ComfyUI}"
   set_kv COMFY_MODELS_DIR "$COMFY_DIR/models"
   GPU_OK=0
@@ -750,11 +750,22 @@ phase_comfyui() {
 
     if [ -n "$PRELOAD_PID" ]; then
       say "    đợi tải model của manifest xong (chạy nền ở trên)…"
-      if wait "$PRELOAD_PID"; then
+      PRELOAD_OK=1
+      wait "$PRELOAD_PID" || PRELOAD_OK=0
+      # A missing catalog id is NOT a preload-models.sh failure (its own UNKNOWN handling is a
+      # deliberate skip-and-warn for manual callers) -- but for THIS automated, registry-driven
+      # call it means the box will silently run a motion job without a model it needs (e.g.
+      # wan-vitpose-onnx missing -> silent DWPose fallback), so it must not be treated as success
+      # here even though the script itself exits 0.
+      if grep -q 'không có trong catalog' /tmp/preload-models.log 2>/dev/null; then
+        PRELOAD_OK=0
+      fi
+      if [ "$PRELOAD_OK" = 1 ]; then
         ok "model của manifest đã tải xong (/tmp/preload-models.log)"
       else
-        warn "tải model của manifest LỖI — xem /tmp/preload-models.log. Chạy lại tay:"
-        warn "  MODELS_DIR=$COMFY_DIR/models CATALOG=$CATALOG_FILE bash setup/preload-models.sh --id <id> [--id <id> ...]"
+        die "tải model của manifest LỖI hoặc THIẾU id trong catalog — xem /tmp/preload-models.log.
+  Sửa xong thì chạy lại tay:
+    CATALOG=\$CATALOG_FILE MODELS_DIR=$COMFY_DIR/models bash setup/preload-models.sh --id <id> [--id <id> ...]"
       fi
     fi
 

@@ -566,10 +566,10 @@ price `VAST_MAX_DOWN_USD_PER_TB` default 20, direct ports, blacklist), and ranks
 time from AFTER `vastai create` returns until `actual_status` reads `running` (not from before the
 create call — the search and rank steps before it are not part of this figure), read from
 `batch/vast-machines.json` (git-ignored), or 556 s — the slowest ever seen — for a machine nobody
-has measured. `VAST_GB` is the manifest's actual download size (`batchlib.vast_models.total_download_gb`),
-computed and exported by `drain.py`'s `provision()` before renting; it falls back to the
-`vast_rent.py` default of 60 only when nothing in the manifest needs any extra model (or when
-`pod-provision.sh`/`vast_rent.py` is run directly, outside `drain.py`). Every instance is created
+has measured. `VAST_GB` is the manifest's actual download size PLUS the measured base-image pull
+(`VAST_IMAGE_GB`, `drain.py`) — computed and exported by `drain.py`'s `provision()` before
+renting; it falls back to the `vast_rent.py` default of 60 only when `pod-provision.sh`/
+`vast_rent.py` is run directly, outside `drain.py`. Every instance is created
 with `--label motion-transfer --cancel-unavail`. If it
 is not `running` after `VAST_PULL_DEADLINE_S` (default 480, clamped to stay under the watchdog's
 10-minute grace minus 60s slack) it is destroyed, the machine is blacklisted for a day, and the
