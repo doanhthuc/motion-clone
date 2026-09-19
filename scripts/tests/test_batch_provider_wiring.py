@@ -258,5 +258,14 @@ class TestVastInstancesAreLabelled(unittest.TestCase):
         self.assertNotIn("vastai search offers", text)
 
 
+class TestPodWaitDirectAddress(unittest.TestCase):
+    def test_the_vast_probe_asks_for_the_direct_address_and_keeps_the_proxy_as_fallback(self):
+        text = (ROOT / "scripts" / "pod-wait.sh").read_text(encoding="utf-8")
+        self.assertIn("vast_rent.py --ssh-target", text)
+        # the proxy values are still read, as the fallback when ssh-url gives nothing
+        self.assertIn('"ssh_host"', text)
+        self.assertIn('"ssh_port"', text)
+
+
 if __name__ == "__main__":
     unittest.main()

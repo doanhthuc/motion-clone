@@ -115,6 +115,17 @@ except Exception: print("")' 2>/dev/null)"
   PORT="$(printf '%s' "$raw" | python3 -c 'import sys,json
 try: print(json.load(sys.stdin).get("ssh_port") or "")
 except Exception: print("")' 2>/dev/null)"
+
+  # Prefer the DIRECT address (`vastai ssh-url`) over the sshX.vast.ai proxy above: measured
+  # 2026-09-19, the proxy rejected the registered key on one host while the direct ip:port
+  # accepted it. `ssh-url` may not answer while the instance is still loading — then the proxy
+  # values stay, and the ssh probe in the main loop decides whether anything is reachable.
+  local direct
+  if direct="$(python3 $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/vast_rent.py --ssh-target "$ID" 2>/dev/null)" \
+     && [ -n "$direct" ]; then
+    HOST="${direct% *}"
+    PORT="${direct#* }"
+  fi
 }
 
 TIMEOUT="${TIMEOUT:-25}"   # minutes
