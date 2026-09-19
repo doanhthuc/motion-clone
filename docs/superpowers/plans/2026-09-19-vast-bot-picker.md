@@ -14,6 +14,8 @@
 
 Every code block below is the literal diff or file produced by running these seven tasks **in order in a scratch git worktree from `67cf59e`**, with each task's tests passing at its own commit (Task 4: 652 bot tests, Task 5: 664, Task 6: 670, all green; the rest of the suite is green at the end). The protective behaviours were also **mutation-checked**: 12 deliberate breakages (migration guard applied to Vast, no refusal in `_do_resume`, refusal moved after the manifest write, Vast gate applied to a queued job, provider not forwarded to `start_drain`, spend button always shown, Vast priced at the RunPod rate, latch dropped on refusal, unknown suffix accepted, `/kill` quoting the RunPod rate, credit never checked, static blockers emptied) were each caught by at least one test, and the unmodified baseline passed. **No live Telegram or Vast rental was involved**: the bot's UI was exercised only through the repo's `FakeTg`, and the only real network calls made while planning were read-only (`vastai show user --raw` and dry-run searches; nothing was rented — `vastai show instances-v1` listed zero instances afterwards).
 
+> **Superseded by review fix rounds (as built):** Task 4's fix commit `08dede0` made `spend_blockers` refuse when there is no price quote in the bot process (the diffs embedded in Tasks 3 and 4 predate it: the panel suite is 24 tests, and the bot suite is 654 / 666 / 672 tests after Tasks 4 / 5 / 6, not 652 / 664 / 670). Task 7's fix commit `7f6dfb0` reworded the post-restart recovery paragraph in `docs/gpu-pod.md` and the refusal string in `scripts/tgbot/vast_panel.py`, because the Vast tab cannot be re-opened from an old panel for a try-on batch. For those points read the code, not the blocks embedded below.
+
 ## Global Constraints
 
 Every task's requirements implicitly include this section.
@@ -2796,7 +2798,7 @@ git commit -m "bot: offer Vast from the RunPod stock-out card; price a Vast pod 
 ```diff
 --- a/docs/gpu-pod.md
 +++ b/docs/gpu-pod.md
-@@ -591,6 +591,39 @@ Not implemented yet, so the first paid session is not surprised by it: `-o Ident
+@@ -591,6 +591,43 @@ Not implemented yet, so the first paid session is not surprised by it: `-o Ident
  <key>` for ssh when the agent holds several keys (measured need 2026-09-19 — no failure seen yet,
  but nothing here picks a specific key if the ssh-agent offers more than one).
  
@@ -2824,6 +2826,10 @@ git commit -m "bot: offer Vast from the RunPod stock-out card; price a Vast pod 
 +the button is tapped, because buttons outlive the state they were drawn for; a refusal spends nothing,
 +keeps the draft, and leaves the panel usable. A RunPod stock-out card gains **Rent on Vast instead**,
 +which opens the same panel for that batch.
++
++The tap-time check needs a price quote from this bot process (the panel fetches it): after a bot
++restart, an old Vast spend button refuses ("no current Vast price quote") until you open the Vast
++tab or press Refresh.
 +
 +`GPU=` in `.env` holds the RunPod spelling; `pod-provision.sh` translates it for Vast (`VAST_GPU`
 +overrides). Before 2026-09-19 a Vast search with the RunPod name failed outright ("invalid JSON"),
