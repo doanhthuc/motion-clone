@@ -1368,3 +1368,17 @@ EOF
 **Placeholder scan:** none — every code step carries the code.
 
 **Type consistency:** `Lease(..., provider: str = "runpod")` used identically in Tasks 2, 4, 5, 7; `tick(..., extra_apis=)` defined in Task 4 and only called with that name; `VastCtl.list_pods/destroy` match `PodControl`; `gpu_provider`/`pod_volume` (Task 6) match the names asserted in `TestProviderHelpers`; `GPU_PROVIDER_EFF`/`POD_VOLUME_EFF` used consistently in the Makefile edits; `effective_provider()` (Task 5) is the only new `drain` symbol referenced by tests.
+
+## Carry-forward to Plans 2–3
+
+Found by the whole-branch review; none of these is fixed on this branch.
+
+1. `vastai` must be installed and authenticated on the VPS (watchdog + bot host) before anything can rent on Vast from the bot.
+2. The first paid Vast session must confirm that `--label motion-transfer` survives `create` and comes back as `label` (and `id`) in `vastai show instances-v1 --raw` — all of tier 3's Vast authority rests on it.
+3. `scripts/tgbot/run.py start_drain` must forward `PROVIDER=`; until then the bot cannot start a Vast run and `_do_kill`'s provider handling is untriggered in production.
+4. `batch/vast-machines.json` must be added to `.gitignore` (spec §3.2 step 5).
+5. Plan 2's rent function must write `GPU_INSTANCE_ID` before the lease and never inherit a stale one (`pod-provision.sh` warns instead of dying when `vastai create` succeeds but the id cannot be parsed, and `drain.provision` then reads the previous `GPU_INSTANCE_ID` into a `provider=vast` lease). Every abandoned rent attempt must carry the label; use `--cancel-unavail`.
+6. Known, deferred watchdog hazards:
+   - (M4) `destroy_verified` destroys before it lists, so destroying an already-gone instance raises and the lease is never cleared (`drain_running` stays true and the bot refuses the next `/confirm`) — same shape on RunPod.
+   - (M5) `VastCtl()` on a box without `vastai` logs one failure line per minute; rate-limit the message but keep the `"vast"` key in `apis`.
+   - (M6) `POD_VOLUME_EFF` is empty when `.env` names no provider at all (already refused by `pod-provision.sh:158`); and the "tier 3: 0 pod(s) visible" line reads as "nothing is billing" when every provider failed to list.

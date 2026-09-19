@@ -513,11 +513,25 @@ What guards a Vast instance: the lease (tiers 1–2, destroyed through `vastai`)
 Vast as well as RunPod). `/kill` in the Telegram bot reads the lease's provider. **There is no
 `--terminate-after` on Vast** — the lease's `abs_max_min` is the only hard ceiling.
 
-A failed job is **not** inspectable after `gpu-destroy` on Vast (the database dies with the box, unlike
-RunPod's volume). `teardown()` pulls `pod-job.log` into `out/<batch>/runs/*/` before destroying when a
-stage failed; that is the only post-mortem.
+These guards run only where `vastai` is installed and logged in. On the machine that runs
+`scripts/pod_watchdog.py` (the VPS's `pod-watchdog.service`), `make watchdog-dry` must **not** log
+`cannot list vast pods`; without it every Vast tier degrades to log-and-skip and the only ceiling
+left is the human.
 
-Not yet automated (Plan 2): choosing the machine, per-batch model download, the pull deadline.
+Run the drain on the machine whose `batch/pod-lease.json` the watchdog reads (the VPS). A
+`make drain … PROVIDER=vast` started on a laptop writes its lease on the laptop; the VPS watchdog then
+sees the labelled instance as an unclaimed orphan and tier 3 destroys it about 10 minutes in.
+
+Manual teardown: `make gpu-destroy` picks the provider from the lease when the lease's pod id equals
+`.env`'s `GPU_INSTANCE_ID`. If there is no matching lease, use `make gpu-destroy GPU_PROVIDER=vast`
+explicitly — otherwise `.env`'s `runpod` decides.
+
+A failed job is **not** inspectable after `gpu-destroy` on Vast (the database dies with the box, unlike
+RunPod's volume). When anything failed, `teardown()` pulls the post-mortem before destroying:
+`pod-job.log` into `out/<batch>/runs/*/`, and `pod-worker.log` (from `make gpu-logs LOG=worker`) into
+`out/<batch>/`.
+
+Not yet automated: choosing the machine, per-batch model download, the pull deadline.
 Design: `docs/superpowers/specs/2026-09-19-vast-fallback-design.md`.
 
 <a id="costs"></a>

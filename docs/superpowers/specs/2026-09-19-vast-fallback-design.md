@@ -141,8 +141,9 @@ model set is catalog ids **plus setup steps**. DWPose and RIFE self-download on 
 
 ### 3.4 Teardown net covers both providers
 
-- `podctl.VastCtl` implementing `PodControl` (`list_pods`, `destroy`). `list_pods` returns only
-  instances labelled `motion-transfer`. `destroy` pipes `y` (the CLI asks `[y/N]` and exits 0 without
+- `podctl.VastCtl` implementing `PodControl` (`list_pods`, `destroy`). `list_pods` returns every
+  instance with its label as `PodInfo.name`; it is `reconcile` and `DESTROYABLE_NAMES` in the watchdog
+  that limit destruction to instances labelled `motion-transfer`. `destroy` pipes `y` (the CLI asks `[y/N]` and exits 0 without
   deleting on EOF) and the caller re-lists to verify — `pod_watchdog.destroy_verified` already does
   this through the protocol.
 - The watchdog holds `provider → PodControl`. Tiers 1–2 pick the control from `lease.provider`. Tier 3
