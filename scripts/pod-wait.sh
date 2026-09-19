@@ -32,6 +32,20 @@ if [ "$PROVIDER" = "runpod" ]; then
   command -v runpodctl >/dev/null || { echo "runpodctl not found — brew install runpod/runpodctl/runpodctl"; exit 1; }
 fi
 
+# vast_rent.py's own path, resolved ONCE before the loop (not re-computed, unquoted, on every
+# single poll — F8/I7, 2026-09-19): a $(cd "$(dirname ...)" && pwd) inline in the middle of an
+# `if` condition word-splits on any path containing a space and reruns two subshells every 15s
+# for no reason.
+VAST_RENT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/vast_rent.py"
+
+# DIRECT_FAILS / USING_DIRECT (F8/I7): a bogus "direct" address (vast_rent.py's parse_ssh_url
+# rejects the worst offenders now, but a real address that just never answers is not something
+# it can detect) used to lock this loop onto it for the rest of the run, with no way back to the
+# sshX.vast.ai proxy. After 4 consecutive ssh probes fail against a direct address, stop asking
+# for it and fall back to the proxy values from `show instance` for the remaining polls.
+DIRECT_FAILS=0
+USING_DIRECT=0
+
 # probe — sets STATUS / HOST / PORT for the current pod. One function, two providers, so the
 # retry/timeout/billing logic below stays provider-agnostic.
 #
@@ -120,11 +134,18 @@ except Exception: print("")' 2>/dev/null)"
   # 2026-09-19, the proxy rejected the registered key on one host while the direct ip:port
   # accepted it. `ssh-url` may not answer while the instance is still loading — then the proxy
   # values stay, and the ssh probe in the main loop decides whether anything is reachable.
+  #
+  # But only while it has not already failed 4 times in a row (F8/I7): a direct address that
+  # LOOKS valid but never answers (parse_ssh_url rejects the obvious garbage, not a real
+  # unreachable host) must not lock this loop out of the proxy for the rest of the timeout.
+  USING_DIRECT=0
   local direct
-  if direct="$(python3 $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/vast_rent.py --ssh-target "$ID" 2>/dev/null)" \
+  if [ "$DIRECT_FAILS" -lt 4 ] \
+     && direct="$(python3 "$VAST_RENT" --ssh-target "$ID" 2>/dev/null)" \
      && [ -n "$direct" ]; then
     HOST="${direct% *}"
     PORT="${direct#* }"
+    USING_DIRECT=1
   fi
 }
 
@@ -162,6 +183,8 @@ while :; do
       echo
       echo "✓ up after ${MINS}m — root@${HOST}:${PORT} (saved to .env) — next: make gpu-bootstrap"
       exit 0
+    elif [ "$USING_DIRECT" = 1 ]; then
+      DIRECT_FAILS=$((DIRECT_FAILS + 1))
     fi
   fi
 
@@ -188,7 +211,10 @@ EOF
   "Pull complete" lines still advancing → it is working, just slow. Wait, or TIMEOUT=40 make gpu-wait.
   Every layer parked on "Waiting" for many minutes → actually wedged. Only then:
       vastai destroy instance $ID -y
-      SKIP=$ID CONFIRM=yes make gpu-provision
+      CONFIRM=yes make gpu-provision
+
+  No SKIP= here (F10, 2026-09-19): SKIP filters OFFER ids, and the id above is an INSTANCE id —
+  the scoreboard already blacklists a slow machine on its own after this destroy.
 EOF
     fi
     exit 1

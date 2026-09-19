@@ -648,8 +648,21 @@ class TestAlreadyGoneDestroy(unittest.TestCase):
             raise RuntimeError("cannot list")
 
         api.list_pods = broken
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(RuntimeError) as cm:
             pod_watchdog.destroy_verified(api, "777")
+        # F5/I3: the LISTING error is what must propagate here, not the (also real) destroy
+        # error being swallowed silently — an unverifiable destroy is not success, and the
+        # reason surfaced needs to say WHY it could not be checked.
+        self.assertIn("cannot list", str(cm.exception))
+
+    def test_an_already_gone_destroy_is_logged_not_silent(self):
+        # F5/I3: before this, the "destroy errored but it's not listed, treat as gone" branch
+        # returned True with no log line at all — the ONLY branch of destroy_verified that
+        # didn't say what it decided.
+        logs = []
+        with patch.object(pod_watchdog, "log", logs.append):
+            self.assertTrue(pod_watchdog.destroy_verified(GonePods([]), "777"))
+        self.assertTrue(any("777" in m and "not listed" in m for m in logs), logs)
 
     def test_an_expired_lease_for_an_already_gone_instance_is_cleared(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -48,15 +48,23 @@ def destroy_verified(pods_api, pod_id: str) -> bool:
     lease instead of silently declaring victory.
 
     If destroy raises, the instance may be already gone; re-list to confirm.
+
+    Only RuntimeError is treated as "maybe already gone": VastCtl and RunpodCtl both normalise
+    their own OSError/TimeoutExpired (missing binary, hung CLI) into RuntimeError before it
+    reaches here, so anything else propagates uncaught — it is not this function's ambiguous
+    case to resolve.
     """
     try:
         pods_api.destroy(pod_id)
-    except RuntimeError:
+    except RuntimeError as exc:
         # A destroy of something that is already gone exits non-zero. What matters is whether it
         # is still LISTED: gone means the goal is met; still listed means the error is real.
         # If the listing itself raises, that propagates — an unverifiable destroy is not success.
         if any(p.pod_id == pod_id for p in pods_api.list_pods()):
             raise
+        # F5/I3: this used to `return True` with no log line at all — the only branch of this
+        # function that decided something without saying so.
+        log(f"destroy of {pod_id} errored ({exc}) but it is not listed — treating as already gone")
         return True
     still_there = any(p.pod_id == pod_id for p in pods_api.list_pods())
     return not still_there

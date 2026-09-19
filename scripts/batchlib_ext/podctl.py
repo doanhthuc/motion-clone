@@ -107,6 +107,13 @@ class VastCtl:
             raise RuntimeError(f"vastai show instances-v1 failed: {out.stderr.strip()}")
         try:
             data = json.loads(out.stdout or '{"instances": []}')
+            if data.get("next_token"):
+                # F4/I2: `--all` is supposed to fetch every page in one call, but if the CLI
+                # ever paginates anyway, silently returning only the first page could read a
+                # live instance as gone. Every caller (rent()'s instance_exists, the watchdog)
+                # already treats a raising listing as "unverifiable" — fail closed instead.
+                raise RuntimeError(
+                    "vastai listing may be incomplete (next_token is set)")
             return [PodInfo(pod_id=str(i["id"]), name=str(i.get("label") or ""))
                     for i in data["instances"]]
         except (json.JSONDecodeError, KeyError, TypeError) as exc:

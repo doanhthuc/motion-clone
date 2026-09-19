@@ -227,6 +227,24 @@ class TestVastCtl(unittest.TestCase):
         self.assertEqual(VastCtl().list_pods(), [])
 
     @patch("subprocess.run")
+    def test_a_set_next_token_means_the_listing_may_be_incomplete_and_raises(self, mock_run):
+        # F4/I2: rent() (instance_exists) and pod_watchdog.py both treat a raising listing as
+        # "unverifiable" and fail closed. `--all` is supposed to fetch every page in one call,
+        # but if the CLI ever paginates anyway, silently returning only the first page could
+        # read a live instance as gone.
+        mock_run.return_value = MagicMock(returncode=0, stderr="", stdout=json.dumps(
+            {"instances": [{"id": 1, "label": "x"}], "next_token": "abc123"}))
+        with self.assertRaises(RuntimeError) as cm:
+            VastCtl().list_pods()
+        self.assertIn("next_token", str(cm.exception))
+
+    @patch("subprocess.run")
+    def test_a_null_next_token_is_a_normal_complete_listing(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stderr="", stdout=json.dumps(
+            {"instances": [{"id": 1, "label": "x"}], "next_token": None}))
+        self.assertEqual(VastCtl().list_pods(), [PodInfo("1", "x")])
+
+    @patch("subprocess.run")
     def test_nonzero_exit_raises_runtime_error_with_stderr(self, mock_run):
         # Returning [] would read as "no instances" and tier 3 would do nothing — the safe
         # direction when we cannot see. Raising lets the watchdog say so and skip this provider.

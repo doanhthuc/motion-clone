@@ -2,8 +2,13 @@
 #
 # Find and rent a GPU pod for the motion-transfer backend (motions-studio). Runs on YOUR LAPTOP.
 #
-#   bash scripts/pod-provision.sh              # search + print the exact create command (safe)
+#   bash scripts/pod-provision.sh              # dry run (safe) — see below for what it prints
 #   CONFIRM=yes bash scripts/pod-provision.sh  # actually rent it
+#
+# What the dry run prints depends on GPU_PROVIDER: RunPod still prints the exact create command
+# (a single offer). Vast hands off to vast_rent.py, which searches, ranks and prints a RANKED
+# SHORTLIST plus the chosen offer id — there is no single "create command" on that branch
+# (updated 2026-09-19; F10 in the vast-rent-and-select final fix wave).
 #
 # Never rents anything unless you pass CONFIRM=yes — renting bills by the hour from the moment
 # the instance is created, so this shows you the command and lets you read it first.
