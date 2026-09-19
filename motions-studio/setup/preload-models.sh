@@ -266,7 +266,8 @@ done < "$PLAN"
 
 say "kết quả"
 printf '  tải xong: %d · lỗi: %d · đã có sẵn: %d\n' "$DONE" "$FAIL" "$NSKIP"
-printf '  tổng %s: %s\n' "${DEST:+model (không qua volume)}${DEST:-comfy-models}" "$(du -sh "$MODELS" 2>/dev/null | cut -f1)"
+if [ -n "$DEST" ]; then LABEL="model (không qua volume)"; else LABEL="comfy-models"; fi
+printf '  tổng %s: %s\n' "$LABEL" "$(du -sh "$MODELS" 2>/dev/null | cut -f1)"
 [ "$FAIL" -eq 0 ] || die "$FAIL file chưa xong — chạy lại script, nó bỏ qua file đã đủ cỡ"
 if [ -n "$DEST" ]; then
   ok "model sẵn sàng tại $DEST (không phải volume — mất khi pod bị huỷ)"

@@ -765,7 +765,7 @@ phase_comfyui() {
       else
         die "tải model của manifest LỖI hoặc THIẾU id trong catalog — xem /tmp/preload-models.log.
   Sửa xong thì chạy lại tay:
-    CATALOG=\$CATALOG_FILE MODELS_DIR=$COMFY_DIR/models bash setup/preload-models.sh --id <id> [--id <id> ...]"
+    CATALOG=$CATALOG_FILE MODELS_DIR=$COMFY_DIR/models bash setup/preload-models.sh --id <id> [--id <id> ...]"
       fi
     fi
 
