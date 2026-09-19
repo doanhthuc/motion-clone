@@ -1,4 +1,5 @@
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -563,6 +564,42 @@ class TestTwoProviders(unittest.TestCase):
                                 extra_apis={"vast": vast})
 
         self.assertEqual(out.get("888"), 100.0)
+
+    def test_a_hung_runpodctl_does_not_stop_the_vast_scan(self):
+        # RunpodCtl.list_pods does not turn TimeoutExpired / FileNotFoundError into RuntimeError,
+        # and RunPod is listed first: the listing loop must skip on ANY failure, not only one type.
+        runpod, vast = FakePods(), FakePods()
+
+        def hung():
+            raise subprocess.TimeoutExpired(cmd="runpodctl", timeout=60)
+        runpod.list_pods = hung
+        vast.pods = [PodInfo("888", "motion-transfer")]
+
+        pod_watchdog.tick(runpod, {"888": 0.0}, now=11 * 60.0, dry_run=False,
+                          extra_apis={"vast": vast})
+
+        self.assertEqual(vast.destroyed, ["888"])
+        self.assertIn("cannot list runpod pods", "\n".join(self.logs))
+
+    def test_one_failing_destroy_does_not_skip_the_next_orphan(self):
+        # Kill order is RunPod first; a RunPod orphan whose delete keeps raising must not keep
+        # a Vast orphan billing.
+        runpod, vast = FakePods(), FakePods()
+        runpod.pods = [PodInfo("rp-stuck", "motion-transfer")]
+        vast.pods = [PodInfo("888", "motion-transfer")]
+
+        def failing_destroy(pod_id):
+            raise RuntimeError("runpodctl pod delete failed")
+        runpod.destroy = failing_destroy
+
+        pod_watchdog.tick(runpod, {"rp-stuck": 0.0, "888": 0.0}, now=11 * 60.0,
+                          dry_run=False, extra_apis={"vast": vast})
+
+        self.assertEqual(vast.destroyed, ["888"])
+        joined = "\n".join(self.logs)
+        self.assertIn("DESTROY NOT CONFIRMED", joined)
+        self.assertIn("STILL BILLING", joined)
+        self.assertIn("rp-stuck", joined)
 
     def test_a_lease_for_an_unconfigured_provider_is_reported_and_tier_three_still_runs(self):
         write_lease(self.lease_path, self._lease("nope", abs_max_min=10_000))

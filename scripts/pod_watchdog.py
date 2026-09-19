@@ -140,7 +140,11 @@ def tick(pods_api, first_seen: dict[str, float], *, now: float,
     for provider_name, api in apis.items():
         try:
             listed = api.list_pods()
-        except RuntimeError as exc:
+        except Exception as exc:
+            # Any failure, not only RuntimeError: RunpodCtl.list_pods lets TimeoutExpired and
+            # FileNotFoundError through, and RunPod is listed first, so a hung or missing
+            # runpodctl would otherwise stop the Vast scan. Skip-only: a provider that could not
+            # be listed adds nothing to the kill set.
             # Not seeing is not the same as nothing being there. Skip this provider.
             log(f"cannot list {provider_name} pods, skipping its reconciliation: {exc}")
             any_failed = True
@@ -164,7 +168,16 @@ def tick(pods_api, first_seen: dict[str, float], *, now: float,
     for pod_id in kill:
         log(f"KILL {pod_id} — orphan, no lease claims it")
         if not dry_run:
-            if not destroy_verified(owner[pod_id], pod_id):
+            # Per-orphan guard: destroy_verified raises RuntimeError on a non-zero destroy exit
+            # or a failed re-list, and one stuck orphan (RunPod is killed first) must not keep
+            # every later one, on any provider, billing for the rest of the tick.
+            try:
+                confirmed = destroy_verified(owner[pod_id], pod_id)
+            except Exception as exc:
+                log(f"DESTROY NOT CONFIRMED for {pod_id} — destroy raised {exc!r}; it is "
+                    f"STILL BILLING. Retrying next tick. Delete it by hand at the provider.")
+                continue
+            if not confirmed:
                 log(f"DESTROY NOT CONFIRMED for {pod_id} — still in its provider's "
                     f"listing and STILL BILLING. Retrying next tick. Delete it "
                     f"by hand at the provider.")
