@@ -595,7 +595,8 @@ but nothing here picks a specific key if the ssh-agent offers more than one).
 ### Choosing Vast from the Telegram bot (2026-09-19)
 
 The Choose GPU screen opens with a `[RunPod] [Vast]` row. RunPod is the default and its screen is
-unchanged apart from that row. The Vast tab shows the best qualifying 5090 offer with its $/h and
+unchanged apart from that row — but the RunPod tab's spend button passes no provider, so `.env`'s
+`GPU_PROVIDER` decides: keep it at `runpod` on the bot's host. The Vast tab shows the best qualifying 5090 offer with its $/h and
 location, this batch's bandwidth and estimated session cost, the cold start, and your Vast credit —
 and no datacenter, stock, Switch-GPU or migrate lines, because a Vast rental has no volume. Its spend
 button is hidden, with the reasons written out, unless all of these hold:
@@ -611,10 +612,19 @@ button is hidden, with the reasons written out, unless all of these hold:
 
 The provider rides in the spend button's callback data (`run:go:<token>:vast`,
 `pa:spend:<token>:vast`, `pa:reuse|rerun:<token>:vast`) and reaches `drain.py --provider vast` for
-that run only; the bot never writes it to `.env`. The spend handlers re-check the same conditions when
-the button is tapped, because buttons outlive the state they were drawn for; a refusal spends nothing,
+that run only; the bot never writes it to `.env`. The spend handlers re-check the same conditions
+when the button is tapped, because buttons outlive the state they were drawn for — all of them except
+the marketplace search, which is replaced by a price quote fetched for this batch's download size in
+the last ten minutes (none, or an older or differently sized one, refuses). A refusal spends nothing,
 keeps the draft, and leaves the panel usable. A RunPod stock-out card gains **Rent on Vast instead**,
-which opens the same panel for that batch.
+which opens the same panel for that batch, and only while that card's failure is still outstanding.
+
+A job assembled while a drain is already running is queued onto that pod: writing it into the
+mailbox is the queueing, and `drain.py` claims it when the current job ends. A Vast pod has only the
+models of the batch it was rented for, so such a job is checked BEFORE the mailbox write — its
+pipeline must be enabled, its stages registered, and every model it needs already on the pod — and
+is refused otherwise ("Not queued"; the files are kept, and it can be run as its own rental). A
+RunPod pod mounts the whole model volume and is exempt.
 
 The tap-time check needs a price quote from this bot process (the panel fetches it). After a bot
 restart an old Vast spend button therefore refuses ("no current Vast price quote"), and the quote
@@ -628,7 +638,8 @@ overrides). Before 2026-09-19 a Vast search with the RunPod name failed outright
 which only shows once the bot drives a Vast run.
 
 The progress message prices a Vast pod at the rate quoted on the panel (`≈$… so far`, an estimate —
-the offer actually rented can differ and the invoice is the truth), never at RunPod's flat $0.99;
+the offer actually rented can differ, it counts from the lease and leaves out pull time and
+bandwidth, and the invoice is the truth), never at RunPod's flat $0.99;
 `/kill` gives the minutes and no dollar figure for a Vast pod.
 
 **First paid session — assumptions that are NOT verified yet:**

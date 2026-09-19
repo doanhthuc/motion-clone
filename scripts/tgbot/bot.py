@@ -34,6 +34,7 @@ from batchlib.manifest import (Manifest, ManifestError, load_manifest, load_stat
                                save_state, state_path_for)
 from batchlib.pipelines import (PIPELINES, effective_stage_params,
                                optional_roles, required_roles)
+from batchlib.vast_models import models_for_manifest
 from batchlib.runner import (_local_tryon_stage, has_local_tryon,
                              preserved_local_tryon, stage_dest)
 # Not `from batchlib_ext...` or `scripts/batchlib/...` — drain.py itself lives
@@ -56,7 +57,8 @@ from tgbot.ingest import (Probe, describe, probe, quality_warning,
 from tgbot.job import (DEFAULT_PROVIDER, Job, _tryon_stage, _unique_ids, missing_slots,
                        render_manifest, run_id_for, slot_for, write_manifest)
 from tgbot.preview import sheet, slot_preview
-from tgbot.vast_panel import build_view as vast_build_view, parse_enabled, spend_blockers
+from tgbot.vast_panel import (build_view as vast_build_view, parse_enabled, spend_blockers,
+                              static_blockers)
 # `run as run_mod` alongside the from-imports, for exactly one caller:
 # _busy_reason, which has to resolve drain_running through tgbot.run's OWN
 # globals so it cannot disagree with the busy() that just returned True. See
@@ -1086,6 +1088,14 @@ def _render_and_validate(tg: Tg, chat_id: int) -> bool:
     # is actively reading. The mailbox is a different file: safe to write,
     # validate, and show a live panel for, exactly like an ordinary job.
     manifest_path = _active_manifest_path(chat_id)
+    if manifest_path != live_path:
+        # Writing the mailbox IS queueing: drain.py claims whatever sits there when the current
+        # job ends, with no further tap. So a job bound for a Vast pod is checked BEFORE the write
+        # (leaving _LAST_VALIDATE unset, like the two guards above: never attempted).
+        refusal = _vast_queue_refusal(chat_id, live_path)
+        if refusal is not None:
+            tg.send_message(chat_id, refusal, parse_mode=PARSE_HTML)
+            return False
     write_manifest(_jobs_for(chat_id), manifest_path,
                    now=time.strftime("%Y-%m-%d %H:%M:%S"))
 
@@ -1447,9 +1457,10 @@ _CB_RUN_MIGRATE_MENU = "run:mgmenu"
 _CB_RUN_BACK = "run:back"
 # The two tabs of the Choose GPU screen (spec §3.5). Exact matches, no trailing colon, and neither
 # is a prefix of another key here. Not _CB_RUN_BACK for RunPod: Back insists on a drafted job in
-# memory, which the rent panel drawn after Phase A may not have any more (a bot restart clears it),
-# while these two accept the panel's own run token instead — so the tabs behave the same as each
-# other wherever they are shown.
+# memory (_STATE), which the rent panel drawn after Phase A may no longer have while the bot is
+# still up (the draft is persisted across a restart, _STATE is what gets cleared on submit), while
+# these two accept the panel's own run token instead — so the tabs behave the same as each other
+# wherever they are shown.
 _CB_RUN_RUNPOD = "run:rp"
 _CB_RUN_VAST = "run:vast"
 # The provider a spend button was minted for rides IN its callback data, after the run token:
@@ -1914,7 +1925,12 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
 
         elif data.startswith(_CB_RECOVER_VAST):
             stem = data[len(_CB_RECOVER_VAST):]
-            if not stem or stem != _job_manifest_path(chat_id).stem:
+            live_manifest = _job_manifest_path(chat_id)
+            # This chat's batch, AND the failure that card reported is still outstanding, AND no new
+            # job is being assembled: the stem is the same for every batch of a chat, so an old
+            # card would otherwise re-open the rent panel for whatever is on disk now.
+            still_failed = read_provision_failure(provision_failure_path(live_manifest)) is not None
+            if not stem or stem != live_manifest.stem or not still_failed or chat_id in _STATE:
                 tg.send_message(chat_id, "that button is from an earlier batch; "
                                          "check /status")
             else:
@@ -5597,6 +5613,51 @@ def _vast_enabled() -> frozenset[str]:
                          or env_get(ROOT / ".env", "VAST_ENABLED_PIPELINES"))
 
 
+# How long a price quote may back a Vast spend: the panel's own cache lives 60 s, and a person
+# reading a panel and tapping takes minutes; ten minutes covers that without trusting a quote from
+# yesterday. The GB tolerance is rounding: vast_quote keys its cache on the size to 0.1 GB.
+_QUOTE_MAX_AGE_S = 600.0
+_QUOTE_GB_TOLERANCE = 0.15
+
+
+def _vast_queue_refusal(chat_id: int, live_path: Path) -> str | None:
+    """Why the job being assembled must NOT be queued onto the drain running now; None means it
+    may. Only a Vast pod needs this.
+
+    A job queued while a drain runs is claimed by drain.py's chain_or_teardown and run on the SAME
+    pod (scripts/batchlib_ext/handoff.py). A Vast pod has only the models of the manifest it was
+    rented for (wait_and_bootstrap sets VAST_MODEL_IDS from that manifest alone) and no volume to
+    fall back on, so a queued job whose pipeline was never enabled for Vast, or that needs a model
+    the pod lacks, would run on a billing box and fail — or sit queued — at the worker. RunPod's pod
+    mounts the whole model volume, so it is exempt. The lease says which cloud the drain is on;
+    lease_for misses a chained link (its lease points at the claimed manifest), so it falls back to
+    the global lease file exactly as _do_kill does."""
+    lease = lease_for(live_path) or read_lease(LEASE_PATH)
+    if lease is None or lease.provider != "vast":
+        return None
+    draft = _draft_manifest(chat_id)
+    if draft is None:
+        return None
+    reasons = static_blockers(draft, _vast_enabled())
+    if not reasons:
+        try:
+            on_pod = models_for_manifest(load_manifest(live_path))
+        except (ManifestError, OSError, KeyError):
+            reasons.append("could not read the manifest this pod was rented for, so its models "
+                           "are unknown")
+        else:
+            missing = sorted(models_for_manifest(draft) - on_pod)
+            if missing:
+                reasons.append("this pod only has the models for the batch it was rented for; "
+                               f"this job also needs {', '.join(missing)}")
+    if not reasons:
+        return None
+    return (f"{ICON_WARN} <b>Not queued</b> — the pod running now is on Vast.ai, and nothing was "
+            "added to it:\n" + "\n".join(f"• {_esc(reason)}" for reason in reasons)
+            + "\nYour files are kept. Wait for the current job to finish, then Run this one as "
+              "its own rental.")
+
+
 def _vast_refusal(manifest: Manifest | None) -> str | None:
     """Why a Vast spend must NOT start now, as HTML for the chat; None means it may.
 
@@ -5606,8 +5667,15 @@ def _vast_refusal(manifest: Manifest | None) -> str | None:
     compared with the estimate from the last quote, so a stale tap cannot stall the bot."""
     if manifest is None:
         return f"{ICON_WARN} <b>Not renting on Vast</b> — no manifest to check. Nothing was spent."
-    reasons = spend_blockers(manifest, _vast_enabled(), credit_fn=vast_credit,
-                             quote=vast_last_quote())
+    quote = vast_last_quote()
+    # A quote counts only while it is still about THIS rental: fetched for this batch's download
+    # size and recently enough that the offer and the price are plausibly still there. Anything
+    # else is treated as no quote, so the gate refuses instead of comparing the credit with the
+    # wrong batch's estimate (or a day-old one).
+    if quote is not None and (time.time() - quote.fetched_at > _QUOTE_MAX_AGE_S
+                              or abs(quote.gb - vast_download_gb(manifest)) > _QUOTE_GB_TOLERANCE):
+        quote = None
+    reasons = spend_blockers(manifest, _vast_enabled(), credit_fn=vast_credit, quote=quote)
     if not reasons:
         return None
     return (f"{ICON_WARN} <b>Not renting on Vast</b> — nothing was spent:\n"
@@ -5895,6 +5963,15 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool,
     # here is what it used to be, and re-deriving a path a guard already acted
     # on is how the two can quietly stop being the same file.
     running = drain_running(live_path)
+    if running and phase_a_choice is None:
+        # _render_and_validate already checked the draft before it wrote the mailbox; the pod or
+        # the enabled list may have changed since, so check again — and take the job back OUT of
+        # the mailbox on a refusal, because a file left there would still be claimed.
+        refusal = _vast_queue_refusal(chat_id, live_path)
+        if refusal is not None:
+            mailbox_path(live_path).unlink(missing_ok=True)
+            tg.send_message(chat_id, refusal, parse_mode=PARSE_HTML)
+            return
     if gpu_provider == "vast" and not running:
         refusal = _vast_refusal(_draft_manifest(chat_id))
         if refusal is not None:
@@ -5938,6 +6015,7 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool,
         reusable, total = _preserved_tryon(manifest_path)
         if reusable:
             token = _run_token(chat_id)
+            suffix = _VAST_SUFFIX if gpu_provider == "vast" else ""
             tg.send_message(
                 chat_id,
                 f"{ICON_ASK_CE} <b>Try-on already ran</b> for these exact inputs "
@@ -5945,9 +6023,9 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool,
                 "Reusing it costs no Gemini quota. Re-running replaces those "
                 "images and pays for them again.",
                 parse_mode=PARSE_HTML,
-                buttons=[[("Reuse — no Gemini spend", _CB_PHASE_A_REUSE + token,
+                buttons=[[("Reuse — no Gemini spend", _CB_PHASE_A_REUSE + token + suffix,
                            _ce_id(ICON_OK_CE)),
-                          ("Re-run try-on", _CB_PHASE_A_RERUN + token,
+                          ("Re-run try-on", _CB_PHASE_A_RERUN + token + suffix,
                            _ce_id(ICON_ROCKET_CE))]])
             return
     # BEFORE start_drain and before the state clear: this is the last instant

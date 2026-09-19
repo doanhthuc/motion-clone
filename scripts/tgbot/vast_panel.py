@@ -54,7 +54,7 @@ def static_blockers(manifest: Manifest, enabled: frozenset[str]) -> list[str]:
         if pipeline not in enabled:
             reasons.append(
                 f"no measured Vast session for {pipeline} yet — add it to "
-                "VAST_ENABLED_PIPELINES in .env after the paid check (docs/gpu-pod.md#vast-provider)")
+                "VAST_ENABLED_PIPELINES in .env after the paid check (docs/gpu-pod.md#vast-bot)")
     stages = _unique(stage for run in manifest.runs for stage in PIPELINES.get(run.pipeline, []))
     for stage in stages:
         if stage not in STAGE_MODEL_IDS:
@@ -132,7 +132,7 @@ class VastView:
 def build_view(manifest: Manifest, *, gb: float, enabled: frozenset[str],
                quote_fn: Callable[[], VastQuote], credit_fn: Callable[[], float]) -> VastView:
     blockers = static_blockers(manifest, enabled)
-    lines = ["<b>Vast.ai</b> — one RTX 5090, rented for this batch only"]
+    lines = ["<b>Vast.ai</b> — one GPU, rented for this batch only"]
     quote: VastQuote | None = None
     session: float | None = None
     try:

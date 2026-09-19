@@ -180,13 +180,24 @@ model set is catalog ids **plus setup steps**. DWPose and RIFE self-download on 
 
 **As built (Plan 4, 2026-09-19), where it differs from the above:**
 - The RunPod tab is its own callback, `run:rp`, not `run:back`: Back insists on a drafted job in
-  memory, which the rent panel drawn after Phase A may no longer have after a bot restart.
+  memory (`_STATE`), which the rent panel drawn after Phase A may no longer have while the bot is
+  still up (the draft itself is persisted across a restart).
+- The try-on confirm that precedes Phase A has no provider row: that tap rents nothing, and the GPU
+  is chosen on the rent panel drawn after the try-on ("both renderings carry the choice" above means
+  the two stock screens).
+- A Vast panel does not survive a bot restart: the tap-time gate needs a price quote from the running
+  process, so an old spend button refuses until the panel is drawn again (the spec's "survives a bot
+  restart" holds for the callback data, not for the quote).
+- A job queued onto a Vast pod that is already running is checked before it is written into the
+  mailbox (the write is the queueing): enabled pipeline, registered stages, and every model already
+  on the pod, which only has the first manifest's models.
 - The quote is `VAST_QUOTE=1 bash scripts/pod-provision.sh` (`vast_rent.py --quote`), so the search
   filters come from the one place that derives them; the bot never re-derives them.
 - "One measured session per pipeline family before its button is enabled" is the
   `VAST_ENABLED_PIPELINES` list, empty by default.
-- The spend handlers re-check the hidden-button conditions (minus the marketplace search) at tap
-  time, before the manifest is rewritten, so a refusal does not invalidate the panel's own buttons.
+- The spend handlers re-check the hidden-button conditions at tap time, before the manifest is
+  rewritten, so a refusal does not invalidate the panel's own buttons. The marketplace search is
+  replaced by a price quote for this batch's download size fetched in the last ten minutes.
 - `pod-provision.sh` translates the RunPod GPU name in `.env` to Vast's spelling (`VAST_GPU`); the
   bot's `.env` holds the RunPod one, and a search with it failed outright.
 - The progress and `/kill` text price a Vast pod at the rate quoted on the panel, or give time only.

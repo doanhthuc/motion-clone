@@ -444,10 +444,6 @@ class TestPodWaitDirectAddress(unittest.TestCase):
         self.assertIn('"$DIRECT_FAILS" -lt 4', text)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 # One qualifying offer, shaped like `vastai search offers --raw` rows (same fields the ranker reads).
 _FAKE_OFFER = {"id": 4401, "machine_id": 55, "gpu_name": "RTX 5090", "dph_total": 0.45,
                "inet_down": 1800.0, "internet_down_cost_per_tb": 2.0, "disk_bw": 3800.0,
@@ -528,3 +524,7 @@ class TestProvisionVastBranch(unittest.TestCase):
         out = self._run(GPU="RTX_5090")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(out.stdout.strip().splitlines()[-1], "4401")
+
+
+if __name__ == "__main__":
+    unittest.main()
