@@ -243,13 +243,19 @@ class TestLeaseDecidesTheDestroyProvider(unittest.TestCase):
 
 
 class TestVastInstancesAreLabelled(unittest.TestCase):
-    def test_create_labels_the_instance_with_a_name_tier_three_may_destroy(self):
-        # Two hand-copied lists (this label, watchdog.DESTROYABLE_NAMES) that must agree; the
-        # comment above DESTROYABLE_NAMES admits no gate ties them together. This is that gate.
+    def test_the_rent_function_labels_with_a_name_tier_three_may_destroy(self):
+        # Two hand-copied names that must agree: the label vast_rent.py puts on every instance
+        # and watchdog.DESTROYABLE_NAMES. This is the gate the comment above DESTROYABLE_NAMES
+        # says did not exist.
+        import vast_rent
+        self.assertIn(vast_rent.VAST_LABEL, DESTROYABLE_NAMES)
+
+    def test_pod_provision_hands_the_vast_branch_to_the_rent_function(self):
         text = (ROOT / "scripts" / "pod-provision.sh").read_text(encoding="utf-8")
-        found = re.search(r"CREATE=\(vastai create instance .*--label (\S+?)\)", text)
-        self.assertIsNotNone(found, "the vast create command carries no --label")
-        self.assertIn(found.group(1), DESTROYABLE_NAMES)
+        self.assertIn("vast_rent.py", text)
+        # The old cheapest-first search and the raw `vastai create` are gone from the script.
+        self.assertNotIn("vastai create instance", text)
+        self.assertNotIn("vastai search offers", text)
 
 
 if __name__ == "__main__":
