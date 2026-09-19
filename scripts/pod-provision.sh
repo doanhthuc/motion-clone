@@ -566,7 +566,10 @@ PY
 echo
 log "pick: offer $BEST"
 
-CREATE=(vastai create instance "$BEST" --image "$IMAGE" --disk "$DISK" --ssh --direct)
+# --label motion-transfer is what gives the watchdog's tier 3 authority to reap this instance if
+# no lease ever claims it (batchlib_ext.watchdog.DESTROYABLE_NAMES; test_batch_provider_wiring.py
+# keeps the two in step).
+CREATE=(vastai create instance "$BEST" --image "$IMAGE" --disk "$DISK" --ssh --direct --label motion-transfer)
 
 echo
 echo "  ${CREATE[*]}"

@@ -25,7 +25,9 @@ env_set() {
   fi
 }
 
-PROVIDER="$(env_get GPU_PROVIDER)"; PROVIDER="${PROVIDER:-vast}"
+# shellcheck source=lib-gpu-provider.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib-gpu-provider.sh"
+PROVIDER="$(gpu_provider)"
 if [ "$PROVIDER" = "runpod" ]; then
   command -v runpodctl >/dev/null || { echo "runpodctl not found — brew install runpod/runpodctl/runpodctl"; exit 1; }
 fi

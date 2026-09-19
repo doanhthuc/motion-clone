@@ -29,6 +29,12 @@ clean: down ## Remove FE node_modules/.nuxt/.output (keeps motions/.env)
 
 env = $(shell grep -E '^$(1)=' .env 2>/dev/null | cut -d= -f2- | sed -E 's/[[:space:]]*\#.*$$//' | tr -d '"')
 
+# The provider of THIS run. drain.py exports GPU_PROVIDER for a Vast run so the root .env can keep
+# saying runpod; a bare `make gpu-destroy` with nothing exported still reads .env as it always did.
+GPU_PROVIDER_EFF := $(or $(GPU_PROVIDER),$(call env,GPU_PROVIDER))
+# A Network Volume is RunPod-only — a Vast box has none, whatever .env says.
+POD_VOLUME_EFF := $(if $(filter runpod,$(GPU_PROVIDER_EFF)),$(call env,POD_VOLUME))
+
 scrub-check: ## Gate: fail if any third-party credential or personal email is tracked
 	@bash motions-studio/setup/scrub-secrets.sh --check
 
@@ -102,7 +108,7 @@ gpu-fe: ## Re-deploy ONLY the frontend to the pod (rsync + build + PM2 restart, 
 
 gpu-up: ## Start the pod and wait until the backend answers
 	@test -n "$(call env,GPU_INSTANCE_ID)" || { echo "set GPU_INSTANCE_ID in .env (see docs/gpu-pod.md)"; exit 1; }
-ifeq ($(shell grep -E '^GPU_PROVIDER=' .env 2>/dev/null | cut -d= -f2),runpod)
+ifeq ($(GPU_PROVIDER_EFF),runpod)
 	@runpodctl pod start $(call env,GPU_INSTANCE_ID)
 else
 	@vastai start instance $(call env,GPU_INSTANCE_ID)
@@ -131,11 +137,11 @@ gpu-down: ## Pause the pod for a short break (container disk keeps billing — p
 	@# và chết ngay ở `make -n`, đúng bẫy mà M10 đã gặp với `$$0,99`.
 	@ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
 		-p $(call env,GPU_SSH_PORT) root@$(call env,GPU_SSH_HOST) \
-		"cd ~/motion-backend && POD_VOLUME='$(call env,POD_VOLUME)' \
+		"cd ~/motion-backend && POD_VOLUME='$(POD_VOLUME_EFF)' \
 		 $(if $(call env,PG_DUMP_KEEP),PG_DUMP_KEEP='$(call env,PG_DUMP_KEEP)') \
 		 bash ./setup/pod-pgdump.sh --dump" \
 		|| echo "!! sao lưu DB thất bại — vẫn dừng pod. DB còn trên container disk, chỉ mất nếu gpu-destroy."
-ifeq ($(shell grep -E '^GPU_PROVIDER=' .env 2>/dev/null | cut -d= -f2),runpod)
+ifeq ($(GPU_PROVIDER_EFF),runpod)
 	@runpodctl pod stop $(call env,GPU_INSTANCE_ID)
 else
 	@vastai stop instance $(call env,GPU_INSTANCE_ID)
@@ -154,13 +160,15 @@ gpu-destroy: ## DEFAULT when done — destroy the pod (DB is restored from the v
 	@# "pod đã dừng?" là khẳng định một nguyên nhân ta không biết, ngay lúc người dùng cần biết nhất.
 	@# POD_VOLUME / PG_DUMP_KEEP: xem chú thích ở gpu-down — không truyền POD_VOLUME thì đây là
 	@# no-op trên pod đầu tiên, tức đúng lúc trước một thao tác KHÔNG HOÀN TÁC ĐƯỢC.
+ifeq ($(GPU_PROVIDER_EFF),runpod)
 	@ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
 		-p $(call env,GPU_SSH_PORT) root@$(call env,GPU_SSH_HOST) \
-		"cd ~/motion-backend && POD_VOLUME='$(call env,POD_VOLUME)' \
+		"cd ~/motion-backend && POD_VOLUME='$(POD_VOLUME_EFF)' \
 		 $(if $(call env,PG_DUMP_KEEP),PG_DUMP_KEEP='$(call env,PG_DUMP_KEEP)') \
 		 bash ./setup/pod-pgdump.sh --dump" \
 		|| echo "!! sao lưu lần cuối KHÔNG thành công (lý do ở ngay trên) — vẫn XOÁ pod theo yêu cầu."
-ifeq ($(shell grep -E '^GPU_PROVIDER=' .env 2>/dev/null | cut -d= -f2),runpod)
+endif
+ifeq ($(GPU_PROVIDER_EFF),runpod)
 	@runpodctl pod delete $(call env,GPU_INSTANCE_ID) || true
 	@sleep 3
 	@if runpodctl pod list -o json 2>/dev/null | grep -q '$(call env,GPU_INSTANCE_ID)'; then \

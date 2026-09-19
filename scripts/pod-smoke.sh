@@ -35,10 +35,12 @@ bad()  { printf '\033[31m ✗ \033[0m%s\n' "$*"; FAILED=$((FAILED + 1)); }
 
 FAILED=0
 env_get() { grep -E "^$1=" "$ROOT/.env" 2>/dev/null | cut -d= -f2- | sed -E 's/[[:space:]]*#.*$//' | tr -d '"'; }
+# shellcheck source=lib-gpu-provider.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib-gpu-provider.sh"
 
 DOMAIN="$(env_get DOMAIN)"
 HOST="$(env_get GPU_SSH_HOST)"; PORT="$(env_get GPU_SSH_PORT)"
-POD_VOLUME="$(env_get POD_VOLUME)"
+POD_VOLUME="$(pod_volume)"
 MODELS_MIN_GB="$(env_get MODELS_MIN_GB)"
 TIMEOUT_MIN="${SMOKE_TIMEOUT_MIN:-20}"
 # Layer 7 (mp4) and layers 8-9 (PNG) need different size floors. A real photographic PNG from
