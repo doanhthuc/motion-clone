@@ -3,6 +3,7 @@
 These run `make -n` (prints the recipe, executes nothing) and small bash snippets; no rental,
 no network.
 """
+import json
 import os
 import re
 import subprocess
@@ -114,6 +115,131 @@ class TestGpuDestroyTarget(unittest.TestCase):
         self.assertIn("runpodctl pod delete", out.stdout)
         self.assertNotIn("vastai destroy instance", out.stdout)
         self.assertIn("pod-pgdump.sh --dump", out.stdout)
+
+
+class TestGpuDestroyVerifiesAgainstTheV1Listing(unittest.TestCase):
+    def test_the_vast_verify_uses_instances_v1_not_the_deprecated_listing(self):
+        # `vastai show instances 2>/dev/null | grep -q` printed "destroyed — verified gone" over a
+        # live instance whenever the deprecated command errored (stderr dropped, grep finds
+        # nothing). VastCtl.list_pods already reads instances-v1 --raw --all.
+        out = _make("gpu-destroy", env={"GPU_PROVIDER": "vast"})
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("instances-v1", out.stdout)
+        self.assertNotIn("vastai show instances 2>/dev/null", out.stdout)
+        self.assertIn("COULD NOT VERIFY", out.stdout)
+
+
+class TestGpuDestroyVastVerifyBehaviour(unittest.TestCase):
+    """Run the real recipe against a fake `vastai` in a scratch dir: its own .env, a stubbed
+    env-clear-pod.sh (the marker file says whether .env WOULD have been wiped) and a no-op sleep.
+    Nothing here can reach a real instance or the real .env."""
+
+    ID = "12345"
+
+    def _destroy(self, listing: str, rc: int = 0) -> tuple[subprocess.CompletedProcess, bool]:
+        d = Path(tempfile.mkdtemp())
+        (d / ".env").write_text(f"GPU_PROVIDER=runpod\nGPU_INSTANCE_ID={self.ID}\n", encoding="utf-8")
+        (d / "Makefile").write_text((ROOT / "Makefile").read_text(encoding="utf-8"), encoding="utf-8")
+        (d / "scripts").mkdir()
+        (d / "scripts" / "env-clear-pod.sh").write_text(
+            f'#!/bin/bash\ntouch "{d}/env-cleared"\n', encoding="utf-8")
+        (d / "listing.txt").write_text(listing, encoding="utf-8")
+        bin_dir = d / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "vastai").write_text(
+            '#!/bin/bash\n'
+            'if [ "$1" = destroy ]; then cat >/dev/null; exit 0; fi\n'
+            f'cat "{d}/listing.txt"; exit {rc}\n', encoding="utf-8")
+        (bin_dir / "sleep").write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+        for f in bin_dir.iterdir():
+            f.chmod(0o755)
+        env = {k: v for k, v in os.environ.items() if k not in ("GPU_PROVIDER", "GPU_INSTANCE_ID")}
+        env["PATH"] = f"{bin_dir}:{env['PATH']}"
+        out = subprocess.run(["make", "gpu-destroy", "GPU_PROVIDER=vast"], cwd=d, env=env,
+                             capture_output=True, text=True)
+        return out, (d / "env-cleared").exists()
+
+    def test_a_listing_that_errors_is_not_read_as_gone(self):
+        out, cleared = self._destroy("Traceback: unknown command", rc=2)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("COULD NOT VERIFY", out.stdout)
+        self.assertIn("Traceback: unknown command", out.stdout)
+        self.assertNotIn("verified gone", out.stdout)
+        self.assertFalse(cleared, ".env was cleared although nothing was verified")
+
+    def test_an_instance_still_listed_is_still_alive_and_keeps_env(self):
+        out, cleared = self._destroy(f'[\n  {{\n    "id": {self.ID},\n    "label": "x"\n  }}\n]')
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("STILL ALIVE", out.stdout)
+        self.assertFalse(cleared)
+
+    def test_a_longer_id_that_merely_starts_with_ours_does_not_count(self):
+        out, cleared = self._destroy(f'[{{"id": {self.ID}6, "label": "x"}}]')
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("verified gone from 'vastai show instances-v1'", out.stdout)
+        self.assertTrue(cleared)
+
+    def test_a_gone_instance_is_verified_and_env_cleared(self):
+        out, cleared = self._destroy("[]")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("verified gone", out.stdout)
+        self.assertTrue(cleared)
+
+
+class TestLeaseDecidesTheDestroyProvider(unittest.TestCase):
+    """A hand-typed `make gpu-destroy` after a Vast run runs in a shell where GPU_PROVIDER is unset,
+    so .env's runpod would win: `runpodctl pod delete <vast id> || true`, a RunPod re-list that
+    finds nothing, "destroyed — verified", and .env cleared over a still-billing Vast instance.
+    The lease knows the provider, but only counts when its pod id is the one being destroyed."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        # make 3.81 has no --eval: print a variable through a second makefile instead.
+        self.print_mk = self.tmp / "print.mk"
+        self.print_mk.write_text("print-%: ; @echo $($*)\n", encoding="utf-8")
+        self.absent = str(self.tmp / "no-such-lease.json")
+
+    def _lease(self, **fields) -> str:
+        path = self.tmp / "pod-lease.json"
+        # Same shape as batchlib_ext.lease.write_lease: json.dumps(indent=2), one key per line.
+        path.write_text(json.dumps(fields, indent=2), encoding="utf-8")
+        return str(path)
+
+    def _eff(self, lease_file: str, *extra: str, env: dict | None = None) -> str:
+        e = {k: v for k, v in os.environ.items() if k not in ("GPU_PROVIDER", "GPU_INSTANCE_ID")}
+        e.update(env or {})
+        out = subprocess.run(
+            ["make", "-s", "-f", "Makefile", "-f", str(self.print_mk), "print-GPU_PROVIDER_EFF",
+             f"LEASE_FILE={lease_file}", *extra],
+            cwd=ROOT, env=e, capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return out.stdout.strip()
+
+    def test_a_matching_vast_lease_picks_vast(self):
+        lease = self._lease(pod_id="777", provider="vast", manifest="batch/x.yaml")
+        self.assertEqual(self._eff(lease, "GPU_INSTANCE_ID=777"), "vast")
+
+    def test_a_lease_for_another_pod_is_ignored(self):
+        lease = self._lease(pod_id="999", provider="vast", manifest="batch/x.yaml")
+        self.assertEqual(self._eff(lease, "GPU_INSTANCE_ID=777"),
+                         self._eff(self.absent, "GPU_INSTANCE_ID=777"))
+
+    def test_a_lease_without_a_provider_key_falls_through(self):
+        lease = self._lease(pod_id="777", manifest="batch/x.yaml")
+        self.assertEqual(self._eff(lease, "GPU_INSTANCE_ID=777"),
+                         self._eff(self.absent, "GPU_INSTANCE_ID=777"))
+
+    def test_an_exported_provider_beats_a_matching_lease(self):
+        lease = self._lease(pod_id="777", provider="vast", manifest="batch/x.yaml")
+        self.assertEqual(
+            self._eff(lease, "GPU_INSTANCE_ID=777", env={"GPU_PROVIDER": "runpod"}), "runpod")
+
+    def test_gpu_destroy_follows_a_matching_vast_lease(self):
+        lease = self._lease(pod_id="777", provider="vast", manifest="batch/x.yaml")
+        out = _make("gpu-destroy", f"LEASE_FILE={lease}", "GPU_INSTANCE_ID=777")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("vastai destroy instance", out.stdout)
+        self.assertNotIn("runpodctl pod delete", out.stdout)
 
 
 class TestVastInstancesAreLabelled(unittest.TestCase):

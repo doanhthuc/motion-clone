@@ -29,9 +29,22 @@ clean: down ## Remove FE node_modules/.nuxt/.output (keeps motions/.env)
 
 env = $(shell grep -E '^$(1)=' .env 2>/dev/null | cut -d= -f2- | sed -E 's/[[:space:]]*\#.*$$//' | tr -d '"')
 
-# The provider of THIS run. drain.py exports GPU_PROVIDER for a Vast run so the root .env can keep
-# saying runpod; a bare `make gpu-destroy` with nothing exported still reads .env as it always did.
-GPU_PROVIDER_EFF := $(or $(GPU_PROVIDER),$(call env,GPU_PROVIDER))
+# The provider of THIS run, in this order: an exported/command-line GPU_PROVIDER (drain.py exports it
+# for a Vast run, so the root .env can keep saying runpod); else the provider recorded in the lease
+# (batch/pod-lease.json) — but only when the lease's pod id is the instance id this invocation is
+# about to destroy; else .env's GPU_PROVIDER.
+# Why the lease: a hand-typed `make gpu-destroy` after a Vast run has GPU_PROVIDER unset, so .env's
+# runpod won — `runpodctl pod delete <vast id> || true`, a RunPod re-list that finds nothing, a
+# "destroyed — verified" line, and .env wiped over a Vast instance that keeps billing.
+# Why the id match: a stale lease a crash left for some OTHER pod must never steer the destroy of the
+# pod .env names. A lease with no "provider" key (written before providers existed) yields an empty
+# provider and falls through to .env, as before.
+# Plain sed, not python: these lines run on every make invocation. write_lease uses
+# json.dumps(indent=2), so "pod_id" and "provider" each sit on their own line.
+LEASE_FILE ?= batch/pod-lease.json
+LEASE_POD := $(shell sed -n 's/.*"pod_id": *"\([^"]*\)".*/\1/p' $(LEASE_FILE) 2>/dev/null)
+LEASE_PROVIDER := $(shell sed -n 's/.*"provider": *"\([^"]*\)".*/\1/p' $(LEASE_FILE) 2>/dev/null)
+GPU_PROVIDER_EFF := $(or $(GPU_PROVIDER),$(if $(and $(LEASE_POD),$(filter $(LEASE_POD),$(or $(GPU_INSTANCE_ID),$(call env,GPU_INSTANCE_ID)))),$(LEASE_PROVIDER)),$(call env,GPU_PROVIDER))
 # A Network Volume is RunPod-only — a Vast box has none, whatever .env says.
 POD_VOLUME_EFF := $(if $(filter runpod,$(GPU_PROVIDER_EFF)),$(call env,POD_VOLUME))
 
@@ -183,12 +196,22 @@ ifeq ($(GPU_PROVIDER_EFF),runpod)
 else
 	@printf 'y\n' | vastai destroy instance $(call env,GPU_INSTANCE_ID)
 	@sleep 3
-	@if vastai show instances 2>/dev/null | grep -q '\b$(call env,GPU_INSTANCE_ID)\b'; then \
+	@# Verify against the same listing VastCtl.list_pods reads (instances-v1, --all because the
+	@# default page hides instances). If the listing itself fails we know nothing: say so and keep
+	@# .env, whose id is the only handle for destroying it by hand. The id is matched as a JSON
+	@# value so 12345 does not match 123456.
+	@listing="$$(vastai show instances-v1 --raw --all 2>&1)"; rc=$$?; \
+	if [ $$rc -ne 0 ]; then \
+		echo "COULD NOT VERIFY — instance $(call env,GPU_INSTANCE_ID) may still be billing."; \
+		echo "$$listing"; \
+		echo "Check by hand: vastai show instances-v1 --raw --all (then vastai destroy instance $(call env,GPU_INSTANCE_ID))"; \
+		exit 1; \
+	elif printf '%s\n' "$$listing" | grep -Eq '"id": *$(call env,GPU_INSTANCE_ID)([^0-9]|$$)'; then \
 		echo "STILL ALIVE — instance $(call env,GPU_INSTANCE_ID) was NOT destroyed and is STILL BILLING."; \
 		echo "Destroy it by hand: vastai destroy instance $(call env,GPU_INSTANCE_ID)"; \
 		exit 1; \
 	else \
-		echo "destroyed — verified gone from 'vastai show instances'"; \
+		echo "destroyed — verified gone from 'vastai show instances-v1'"; \
 		bash scripts/env-clear-pod.sh; \
 	fi
 endif

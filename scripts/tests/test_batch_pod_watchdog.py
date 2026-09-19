@@ -466,12 +466,18 @@ class TestTwoProviders(unittest.TestCase):
         self.lease_path = Path(self.temp_dir.name) / "pod-lease.json"
         self.patcher = patch.object(pod_watchdog, "LEASE_PATH", self.lease_path)
         self.patcher.start()
+        # Same isolation as TestMigrationTiers: never read the developer's real
+        # batch/volume-migrate-lease.json.
+        self.migrate_patcher = patch.object(pod_watchdog, "MIGRATE_LEASE_PATH",
+                                            Path(self.temp_dir.name) / "migrate-lease.json")
+        self.migrate_patcher.start()
         self.logs: list[str] = []
         self.log_patcher = patch.object(pod_watchdog, "log", self.logs.append)
         self.log_patcher.start()
 
     def tearDown(self):
         self.log_patcher.stop()
+        self.migrate_patcher.stop()
         self.patcher.stop()
         self.temp_dir.cleanup()
 
