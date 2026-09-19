@@ -326,6 +326,25 @@ class TestChainOrTeardown(unittest.TestCase):
         self.assertEqual(handoff["status"], "running")
         self.assertEqual(handoff["manifest"], str(nxt))
 
+    def test_a_chained_link_keeps_the_leases_provider(self):
+        # The lease is rewritten for every chained job. Dropping the provider would reset a
+        # Vast lease to "runpod" mid-batch, and the watchdog would then try to destroy a Vast
+        # instance through runpodctl.
+        tmpdir = tempfile.mkdtemp()
+        original = self._original(tmpdir)
+        nxt = Path(tmpdir) / "tg-1-999.yaml"
+        nxt.write_text(NEXT_YAML, encoding="utf-8")
+        old_lease = Lease(pod_id="777", provisioned_at=1000.0,
+                          manifest=str(original.resolve()), abs_max_min=330,
+                          provider="vast")
+        with mock.patch.object(drain, "claim_mailbox", side_effect=[nxt, None]), \
+             mock.patch.object(drain, "batch_run", return_value=0), \
+             mock.patch.object(drain, "read_lease", return_value=old_lease), \
+             mock.patch.object(drain, "write_lease") as mock_write_lease, \
+             mock.patch.object(drain, "teardown"):
+            chain_or_teardown(original)
+        self.assertEqual(mock_write_lease.call_args[0][1].provider, "vast")
+
     def test_no_lease_on_disk_does_not_crash_the_handoff(self):
         # A missing lease is possible if something else already cleared it —
         # the handoff must not depend on it existing to report success.

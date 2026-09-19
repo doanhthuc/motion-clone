@@ -253,7 +253,8 @@ def chain_or_teardown(original_manifest: Path) -> None:
                 write_lease(LEASE_PATH, Lease(
                     pod_id=lease.pod_id, provisioned_at=lease.provisioned_at,
                     manifest=str(nxt.resolve()),
-                    abs_max_min=lease.abs_max_min + abs_max_min(nxt_manifest)))
+                    abs_max_min=lease.abs_max_min + abs_max_min(nxt_manifest),
+                    provider=lease.provider))
             write_handoff(hpath, Handoff(status="running", manifest=str(nxt)))
             current = nxt
         except Exception as exc:

@@ -16,6 +16,7 @@ class Lease:
     provisioned_at: float   # unix seconds, set once at provision time
     manifest: str           # path to the manifest this pod was rented for
     abs_max_min: int        # tier-2 ceiling, computed once at provision time
+    provider: str = "runpod"   # which cloud rented it; decides which CLI can destroy it
 
 
 def write_lease(path: Path, lease: Lease) -> None:
@@ -38,7 +39,8 @@ def read_lease(path: Path) -> Lease | None:
         return Lease(pod_id=str(raw["pod_id"]),
                      provisioned_at=float(raw["provisioned_at"]),
                      manifest=str(raw["manifest"]),
-                     abs_max_min=int(raw["abs_max_min"]))
+                     abs_max_min=int(raw["abs_max_min"]),
+                     provider=str(raw.get("provider") or "runpod"))
     except (OSError, ValueError, KeyError, TypeError):
         return None
 
