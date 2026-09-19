@@ -591,6 +591,43 @@ Not implemented yet, so the first paid session is not surprised by it: `-o Ident
 <key>` for ssh when the agent holds several keys (measured need 2026-09-19 — no failure seen yet,
 but nothing here picks a specific key if the ssh-agent offers more than one).
 
+<a id="vast-bot"></a>
+### Choosing Vast from the Telegram bot (2026-09-19)
+
+The Choose GPU screen opens with a `[RunPod] [Vast]` row. RunPod is the default and its screen is
+unchanged apart from that row. The Vast tab shows the best qualifying 5090 offer with its $/h and
+location, this batch's bandwidth and estimated session cost, the cold start, and your Vast credit —
+and no datacenter, stock, Switch-GPU or migrate lines, because a Vast rental has no volume. Its spend
+button is hidden, with the reasons written out, unless all of these hold:
+
+- the manifest's pipeline is listed in `VAST_ENABLED_PIPELINES` (`.env` or the environment,
+  comma-separated). Empty by default: the spec wants one measured Vast session per pipeline family
+  before its button exists, and as of 2026-09-19 only the `motion` stage has ever run on Vast. Add a
+  name after its paid session;
+- every stage has a model-registry entry (`make check-vast-models` keeps the repo side honest);
+- a machine passes the filters. The quote is `VAST_QUOTE=1 bash scripts/pod-provision.sh`, i.e.
+  `vast_rent.py --quote`: one JSON line, never a rental (about 4 s measured, bounded at 120 s);
+- `vastai show user --raw` answers and its `credit` covers the estimated session.
+
+The provider rides in the spend button's callback data (`run:go:<token>:vast`,
+`pa:spend:<token>:vast`, `pa:reuse|rerun:<token>:vast`) and reaches `drain.py --provider vast` for
+that run only; the bot never writes it to `.env`. The spend handlers re-check the same conditions when
+the button is tapped, because buttons outlive the state they were drawn for; a refusal spends nothing,
+keeps the draft, and leaves the panel usable. A RunPod stock-out card gains **Rent on Vast instead**,
+which opens the same panel for that batch.
+
+The tap-time check needs a price quote from this bot process (the panel fetches it): after a bot
+restart, an old Vast spend button refuses ("no current Vast price quote") until you open the Vast
+tab or press Refresh.
+
+`GPU=` in `.env` holds the RunPod spelling; `pod-provision.sh` translates it for Vast (`VAST_GPU`
+overrides). Before 2026-09-19 a Vast search with the RunPod name failed outright ("invalid JSON"),
+which only shows once the bot drives a Vast run.
+
+The progress message prices a Vast pod at the rate quoted on the panel (`≈$… so far`, an estimate —
+the offer actually rented can differ and the invoice is the truth), never at RunPod's flat $0.99;
+`/kill` gives the minutes and no dollar figure for a Vast pod.
+
 **First paid session — assumptions that are NOT verified yet:**
 - The exact `vastai ssh-url` output text (parsed tolerantly) and the `create --raw` reply keys.
   When `vastai create` prints non-JSON with exit 0 after an offer vanishes, it is **unverified**
@@ -623,6 +660,16 @@ but nothing here picks a specific key if the ssh-agent offers more than one).
   bootstrap continues has been read through and shellchecked, but never run on a live pod. If it
   hangs or the `wait` never returns, the pod is still billing — check `/tmp/preload-models.log`
   over SSH before assuming a stuck bootstrap is something else.
+- The bot on the VPS needs `vastai` installed and logged in: it runs the quote, reads the credit
+  and starts the drain there — the same gap as the watchdog host, and it is **not installed there
+  yet**. Without it the Vast tab renders and says so, and no button spends.
+- The panel's cold-start and session-cost figures are estimates built from two hosts (warm 4.4 min,
+  cold 9.3 min, `BOOT_AFTER_RUNNING_S` = 17 + 200 + 15 s measured on one warm host) and from
+  `MEASURED_STAGE_SEC`. The first paid sessions are what calibrate them.
+- A quote blocks the bot's poll loop while it runs (about 4 s measured, bounded at 120 s): if Vast's
+  API is slow the whole bot, progress edits included, pauses that long.
+- The bot has never been run against a real Vast rental end to end. The tab, the callbacks and the
+  refusals are covered by unit tests with the network patched out.
 
 Design: `docs/superpowers/specs/2026-09-19-vast-fallback-design.md`.
 

@@ -178,6 +178,19 @@ model set is catalog ids **plus setup steps**. DWPose and RIFE self-download on 
   (`batchlib_ext/vast_account.py`, modelled on `runpod_account.py`), or no machine passing the filters.
 - Progress text gains the provider and the running estimated cost.
 
+**As built (Plan 4, 2026-09-19), where it differs from the above:**
+- The RunPod tab is its own callback, `run:rp`, not `run:back`: Back insists on a drafted job in
+  memory, which the rent panel drawn after Phase A may no longer have after a bot restart.
+- The quote is `VAST_QUOTE=1 bash scripts/pod-provision.sh` (`vast_rent.py --quote`), so the search
+  filters come from the one place that derives them; the bot never re-derives them.
+- "One measured session per pipeline family before its button is enabled" is the
+  `VAST_ENABLED_PIPELINES` list, empty by default.
+- The spend handlers re-check the hidden-button conditions (minus the marketplace search) at tap
+  time, before the manifest is rewritten, so a refusal does not invalidate the panel's own buttons.
+- `pod-provision.sh` translates the RunPod GPU name in `.env` to Vast's spelling (`VAST_GPU`); the
+  bot's `.env` holds the RunPod one, and a search with it failed outright.
+- The progress and `/kill` text price a Vast pod at the rate quoted on the panel, or give time only.
+
 ## 4. Testing
 
 Free, no rental:
