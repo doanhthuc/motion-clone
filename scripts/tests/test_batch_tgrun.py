@@ -217,6 +217,16 @@ class TestStartDrain(unittest.TestCase):
         self.assertTrue(self.manifest.with_suffix(".drain.log").exists())
         self.assertIsNot(popen.call_args.kwargs["stdout"], subprocess.PIPE)
 
+    def test_runs_in_its_own_process_group(self):
+        # F2/C2: a bare `proc.terminate()` (SIGTERM to this one process) does not reach
+        # drain.py's `finally` or the vast_rent.py it spawns, and the bot's SIGTERM used to be
+        # sent to only THIS Popen — an orphaned vast_rent.py kept renting after /kill gave up.
+        # start_new_session=True puts make/drain.py/vast_rent together in one process group so
+        # a single killpg reaches all of them (bot.py's _do_kill).
+        with mock.patch("tgbot.run.subprocess.Popen") as popen:
+            start_drain(self.manifest, dry_run=True)
+        self.assertTrue(popen.call_args.kwargs.get("start_new_session"))
+
 
 class TestStartDrainArgv(unittest.TestCase):
     """start_drain's argv is the money gate's only output. These assert on the

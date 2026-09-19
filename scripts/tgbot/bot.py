@@ -17,6 +17,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -5032,19 +5033,37 @@ def _ask_kill(tg: Tg, chat_id: int) -> None:
         parse_mode=PARSE_HTML)
 
 
+def _signal_drain_group(proc, sig: int) -> None:
+    """Signal the WHOLE process group `start_drain` (tgbot/run.py) launched with
+    `start_new_session=True` — make, drain.py and the vast_rent.py it may spawn all sit in it.
+    A bare `proc.terminate()`/`proc.kill()` only reaches this one process; before F2 (2026-09-19)
+    that left an orphaned vast_rent.py that kept renting after /kill had already told the user
+    the pod was destroyed. Falls back to the plain Popen method when the group is already gone
+    (ProcessLookupError) or signalling it is not permitted for some other OS reason.
+    """
+    try:
+        os.killpg(proc.pid, sig)
+    except (ProcessLookupError, PermissionError, OSError):
+        (proc.terminate if sig == signal.SIGTERM else proc.kill)()
+
+
 def _do_kill(tg: Tg, chat_id: int) -> None:
     """The emergency stop (2026-09-02): destroy the pod right now, on request.
 
-    Two layers, because neither alone is trustworthy. Terminating the Popen
-    (only present when THIS bot process is the one that started the drain)
-    stops batch_run.py from moving on to its next stage, but SIGTERM does not
-    run drain.py's `finally: teardown()` — Python's default handler kills the
-    process outright rather than raising something `finally` could catch — so
-    `make gpu-destroy` is always run here directly afterwards too, exactly as
-    pod_watchdog.py's tier 3 does not trust a runner to clean up after itself.
-    `make gpu-destroy` already re-lists and verifies the pod is actually gone
-    (Makefile:161-167) rather than trusting its own exit code, so this reuses
-    that rather than re-deriving it.
+    Two layers, because neither alone is trustworthy. Signalling the Popen's process group
+    (only present when THIS bot process is the one that started the drain) stops batch_run.py
+    from moving on to its next stage, but SIGTERM does not run drain.py's `finally:
+    teardown()` — Python's default handler kills the process outright rather than raising
+    something `finally` could catch — so `make gpu-destroy` is always run here directly
+    afterwards too, exactly as pod_watchdog.py's tier 3 does not trust a runner to clean up
+    after itself. `make gpu-destroy` already re-lists and verifies the pod is actually gone
+    (Makefile:161-167) rather than trusting its own exit code, so this reuses that rather than
+    re-deriving it.
+
+    The wait is 30s, not the original 5s (F2/C2, 2026-09-19): vast_rent.py's own unwind (destroy
+    the just-created instance, verify it, clear .env) can itself take several seconds of API
+    calls, and 5s was cutting that off mid-unwind, escalating to SIGKILL while it was still
+    trying to destroy the very instance the kill was meant to stop.
 
     The Phase A branch returns before any of that, and must: nothing was
     rented, so `make gpu-destroy` here would tear down whatever unrelated pod
@@ -5072,11 +5091,11 @@ def _do_kill(tg: Tg, chat_id: int) -> None:
 
     proc = _RUNNING.get(manifest_path.resolve())
     if proc is not None and proc.poll() is None:
-        proc.terminate()
+        _signal_drain_group(proc, signal.SIGTERM)
         try:
-            proc.wait(timeout=5)
+            proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            _signal_drain_group(proc, signal.SIGKILL)
 
     tg.send_message(chat_id, "🛑 destroying the pod…")
     # The lease says which cloud rented the pod. The bot's own environment does not, and a bare

@@ -308,7 +308,15 @@ def start_drain(manifest_path: Path, *, dry_run: bool,
         # of this `with` is what lets the child (which can outlive this
         # function by hours) keep writing without this process holding a
         # second handle open for as long as the bot itself runs.
-        proc = subprocess.Popen(argv, cwd=ROOT, stdout=log_file, stderr=subprocess.STDOUT)
+        #
+        # start_new_session=True (F2/C2, 2026-09-19): puts `make`, drain.py and whatever it
+        # spawns (vast_rent.py) in their OWN process group/session, so bot.py's _do_kill can
+        # reach all of them with one os.killpg call. Without it, a bare SIGTERM to this single
+        # Popen does not run drain.py's `finally: teardown()` and leaves vast_rent.py orphaned —
+        # it kept renting up to MAX_PULL_RETRIES more instances after /kill had already told the
+        # user the pod was destroyed.
+        proc = subprocess.Popen(argv, cwd=ROOT, stdout=log_file, stderr=subprocess.STDOUT,
+                                start_new_session=True)
     _RUNNING[manifest_path.resolve()] = proc
     return proc
 

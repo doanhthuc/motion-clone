@@ -5599,13 +5599,43 @@ class TestKillCommand(unittest.TestCase):
         bot._RUNNING[self.manifest.resolve()] = proc
         ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="destroyed",
                                          stderr="")
-        with mock.patch("tgbot.bot.subprocess.run", return_value=ok) as run, \
+        with mock.patch("tgbot.bot.os.killpg") as killpg, \
+             mock.patch("tgbot.bot.subprocess.run", return_value=ok) as run, \
              mock.patch("tgbot.bot.clear_lease") as clear_lease:
             bot.handle(self.tg, cb_from(ME, bot._CB_KILL_GO), allowed_user_id=ME)
-        proc.terminate.assert_called_once()
+        killpg.assert_called_once_with(proc.pid, bot.signal.SIGTERM)
         self.assertEqual(run.call_args.args[0], ["make", "gpu-destroy"])
         clear_lease.assert_called_once()
         self.assertIn("Killed. Pod destroyed", self.tg.messages[-1])
+
+    def test_a_group_kill_falls_back_to_terminate_when_the_group_is_gone(self):
+        # os.killpg raises ProcessLookupError when the process group no longer exists (e.g. the
+        # child already exited on its own) — fall back to proc.terminate() rather than crash.
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        bot._RUNNING[self.manifest.resolve()] = proc
+        ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with mock.patch("tgbot.bot.os.killpg", side_effect=ProcessLookupError), \
+             mock.patch("tgbot.bot.subprocess.run", return_value=ok), \
+             mock.patch("tgbot.bot.clear_lease"):
+            bot.handle(self.tg, cb_from(ME, bot._CB_KILL_GO), allowed_user_id=ME)
+        proc.terminate.assert_called_once()
+
+    def test_a_hung_group_is_escalated_to_a_group_sigkill(self):
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        proc.wait.side_effect = subprocess.TimeoutExpired(cmd="make", timeout=30)
+        bot._RUNNING[self.manifest.resolve()] = proc
+        ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with mock.patch("tgbot.bot.os.killpg") as killpg, \
+             mock.patch("tgbot.bot.subprocess.run", return_value=ok), \
+             mock.patch("tgbot.bot.clear_lease"):
+            bot.handle(self.tg, cb_from(ME, bot._CB_KILL_GO), allowed_user_id=ME)
+        self.assertEqual(killpg.call_args_list,
+                         [mock.call(proc.pid, bot.signal.SIGTERM),
+                          mock.call(proc.pid, bot.signal.SIGKILL)])
+        proc.wait.assert_called_once()
+        self.assertEqual(proc.wait.call_args.kwargs.get("timeout"), 30)
 
     def test_kill_destroys_on_the_leases_provider_not_the_env_files(self):
         # The bot's own environment says nothing about the run: without this, /kill on a Vast
@@ -5657,14 +5687,19 @@ class TestKillCommand(unittest.TestCase):
         proc.terminate.assert_not_called()
 
     def test_a_hung_process_is_escalated_to_a_hard_kill(self):
+        # The group-kill primitive (os.killpg) is unavailable here (ProcessLookupError, as if
+        # the group were already gone) so both the initial signal and the timeout escalation
+        # fall back to the plain Popen methods.
         proc = mock.Mock()
         proc.poll.return_value = None
-        proc.wait.side_effect = subprocess.TimeoutExpired(cmd="make", timeout=5)
+        proc.wait.side_effect = subprocess.TimeoutExpired(cmd="make", timeout=30)
         bot._RUNNING[self.manifest.resolve()] = proc
         ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
-        with mock.patch("tgbot.bot.subprocess.run", return_value=ok), \
+        with mock.patch("tgbot.bot.os.killpg", side_effect=ProcessLookupError), \
+             mock.patch("tgbot.bot.subprocess.run", return_value=ok), \
              mock.patch("tgbot.bot.clear_lease"):
             bot.handle(self.tg, cb_from(ME, bot._CB_KILL_GO), allowed_user_id=ME)
+        proc.terminate.assert_called_once()
         proc.kill.assert_called_once()
 
     def test_a_failed_destroy_is_reported_honestly_not_claimed_as_success(self):
