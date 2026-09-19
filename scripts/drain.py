@@ -101,6 +101,12 @@ _STOCK_OUT_MARKER = "không tự xoay sang card khác"
 VAST_IMAGE_GB = 17.38
 
 
+def vast_download_gb(manifest: Manifest) -> float:
+    """GB a Vast rental for this manifest downloads: its models plus the base-image pull. One
+    definition for the rent command below and for the bot's price quote, so the two cannot drift."""
+    return total_download_gb(manifest) + VAST_IMAGE_GB
+
+
 def provision(*, ceiling_min: int, manifest_path: Path, manifest: Manifest) -> str:
     """Rent a pod and return its instance id. Does NOT wait or bootstrap.
 
@@ -137,8 +143,7 @@ def provision(*, ceiling_min: int, manifest_path: Path, manifest: Manifest) -> s
     no_volume = "POD_VOLUME= " if chosen and chosen != "runpod" else ""
     vast_gb = ""
     if chosen and chosen != "runpod":
-        gb = total_download_gb(manifest) + VAST_IMAGE_GB
-        vast_gb = f"VAST_GB={gb:.1f} "
+        vast_gb = f"VAST_GB={vast_download_gb(manifest):.1f} "
     result = subprocess.run(
         f"{no_volume}{vast_gb}POD_MAX_HOURS={hours} CONFIRM=yes bash scripts/pod-provision.sh",
         shell=True, cwd=ROOT, stderr=subprocess.PIPE, text=True)

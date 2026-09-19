@@ -41,7 +41,7 @@ from batchlib.runner import (_local_tryon_stage, has_local_tryon,
 # is already on sys.path (the insert above), so this is the plan's own "import
 # it, do not reimplement" for failed_job_ids rather than re-deriving "did this
 # run fail" from state.json by hand a second time.
-from drain import failed_job_ids
+from drain import failed_job_ids, vast_download_gb
 from batch_run import EXIT_NEEDS_POD
 import batch_clean
 # Absolute, NOT `from .tgclient import ...`. This file runs as
@@ -56,7 +56,7 @@ from tgbot.ingest import (Probe, describe, probe, quality_warning,
 from tgbot.job import (DEFAULT_PROVIDER, Job, _tryon_stage, _unique_ids, missing_slots,
                        render_manifest, run_id_for, slot_for, write_manifest)
 from tgbot.preview import sheet, slot_preview
-from tgbot.vast_panel import parse_enabled, spend_blockers
+from tgbot.vast_panel import build_view as vast_build_view, parse_enabled, spend_blockers
 # `run as run_mod` alongside the from-imports, for exactly one caller:
 # _busy_reason, which has to resolve drain_running through tgbot.run's OWN
 # globals so it cannot disagree with the busy() that just returned True. See
@@ -70,7 +70,7 @@ from tgbot.run import (LEASE_PATH, _RUNNING, busy, drain_running,
 from batchlib_ext.gpu_stock import stock_at, stock_at_cached, volume_datacenter
 from batchlib_ext.runpod_account import account_balance
 from batchlib_ext.vast_account import account_credit as vast_credit
-from batchlib_ext.vast_quote import last_quote as vast_last_quote
+from batchlib_ext.vast_quote import fetch_quote as vast_fetch_quote, last_quote as vast_last_quote
 from batchlib_ext.handoff import handoff_path, mailbox_path, read_handoff
 from batchlib_ext.lease import clear_lease, read_lease
 from batchlib_ext.migrate_lease import read_migrate_lease
@@ -1443,6 +1443,13 @@ _CB_RUN_MIGRATE_MENU = "run:mgmenu"
 # message), and only Back should ever pass its own message_id in to be
 # edited — passing the panel's id there would overwrite the manifest.
 _CB_RUN_BACK = "run:back"
+# The two tabs of the Choose GPU screen (spec §3.5). Exact matches, no trailing colon, and neither
+# is a prefix of another key here. Not _CB_RUN_BACK for RunPod: Back insists on a drafted job in
+# memory, which the rent panel drawn after Phase A may not have any more (a bot restart clears it),
+# while these two accept the panel's own run token instead — so the tabs behave the same as each
+# other wherever they are shown.
+_CB_RUN_RUNPOD = "run:rp"
+_CB_RUN_VAST = "run:vast"
 # The provider a spend button was minted for rides IN its callback data, after the run token:
 # "run:go:<token>:vast". Not in .env (a bot that dies mid-run would leave it behind) and not in
 # bot state (lost on restart, and shared between two panels). RunPod has no suffix, so every button
@@ -1674,6 +1681,22 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
             msg_id = (query.get("message") or {}).get("message_id")
             _offer_run_migrate_menu(tg, chat_id, message_id=msg_id)
 
+        elif data == _CB_RUN_VAST or data == _CB_RUN_RUNPOD:
+            msg_id = (query.get("message") or {}).get("message_id")
+            job = _STATE.get(chat_id)
+            # Back's guard, plus one more way in: the panel drawn after Phase A may have no draft
+            # job left in memory, only the manifest its run token names.
+            if (job is None or missing_slots(job)) \
+                    and _PHASE_A_OFFERED.get(chat_id) != _run_token(chat_id):
+                tg.send_message(chat_id, "no complete job yet — send the "
+                                         "required files first")
+            else:
+                on_vast = data == _CB_RUN_VAST
+                if on_vast and msg_id is not None:
+                    tg.edit_message(chat_id, msg_id, "🔄 Asking Vast for offers…")
+                _offer_run_for_chat(tg, chat_id, message_id=msg_id,
+                                    gpu_provider="vast" if on_vast else None)
+
         elif data == _CB_RUN_BACK:
             msg_id = (query.get("message") or {}).get("message_id")
             job = _STATE.get(chat_id)
@@ -1696,6 +1719,9 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
                 _offer_run_switch_menu(tg, chat_id, message_id=msg_id, force=True)
             elif view == "g":
                 _offer_run_migrate_menu(tg, chat_id, message_id=msg_id, force=True)
+            elif view == "v":
+                _offer_run_for_chat(tg, chat_id, message_id=msg_id, force=True,
+                                    gpu_provider="vast")
             else:
                 _offer_run_for_chat(tg, chat_id, message_id=msg_id, force=True)
 
@@ -4740,9 +4766,59 @@ def _edit_or_send(tg: Tg, chat_id: int, message_id: int | None, text: str,
     tg.send_message(chat_id, text, buttons=buttons, parse_mode=parse_mode)
 
 
+def _provider_row(active: str) -> list:
+    """The first row of the Choose GPU screen: [RunPod] [Vast], the active one ticked. Tapping the
+    ticked one just redraws the screen it is already on."""
+    return [("RunPod ✓" if active == "runpod" else "RunPod", _CB_RUN_RUNPOD),
+            ("Vast ✓" if active == "vast" else "Vast", _CB_RUN_VAST)]
+
+
+def _panel_manifest(chat_id: int) -> Manifest | None:
+    """The manifest the Choose GPU screen is deciding a rental for: the one on disk once Phase A
+    has offered its rent panel (its run token matches), otherwise the draft about to be written.
+    Neither read touches the live file's mtime."""
+    if _PHASE_A_OFFERED.get(chat_id) == _run_token(chat_id):
+        try:
+            return load_manifest(_job_manifest_path(chat_id))
+        except (ManifestError, OSError):
+            return None
+    return _draft_manifest(chat_id)
+
+
+def _offer_vast_panel(tg: Tg, chat_id: int, *, message_id: int | None, force: bool,
+                      spend_cb: str, heading: str | None) -> None:
+    """The Vast tab (spec §3.5): the offer, its price, this batch's bandwidth and session cost,
+    the cold start, and a spend button only when nothing blocks it. No datacenter or stock lines
+    and no Switch GPU / Other regions: v1 searches only the configured 5090 and a Vast rental has
+    no volume to migrate. The marketplace search is a blocking call of a few seconds (4 s measured
+    2026-09-19, bounded at 120 s), so the caller shows an interstitial first."""
+    manifest = _panel_manifest(chat_id)
+    if manifest is None:
+        _edit_or_send(tg, chat_id, message_id,
+                      "no complete job yet — send the required files first",
+                      [_provider_row("vast")])
+        return
+    gb = vast_download_gb(manifest)
+    view = vast_build_view(
+        manifest, gb=gb, enabled=_vast_enabled(),
+        quote_fn=lambda: vast_fetch_quote(gb, force=force, repo_root=_REPO_ROOT),
+        credit_fn=vast_credit)
+    lines = [heading or f"{ICON_NVIDIA_CE} <b>Choose GPU</b>", "", *view.lines]
+    buttons = [_provider_row("vast"),
+               [("Refresh", _CB_RUN_REFRESH + "v", _ce_id(ICON_REFRESH_CE))]]
+    if view.can_spend:
+        buttons.append([(f"Yes, spend ≈${view.session_usd:.2f} on Vast", spend_cb + _VAST_SUFFIX,
+                         _ce_id(ICON_ROCKET_CE)),
+                        ("Cancel", _CB_RUN_NO)])
+    else:
+        buttons.append([("Cancel", _CB_RUN_NO)])
+    _edit_or_send(tg, chat_id, message_id, "\n".join(lines), buttons, parse_mode=PARSE_HTML)
+
+
 def _offer_run_confirm(tg: Tg, chat_id: int, *, message_id: int | None = None,
                        force: bool = False, spend_cb: str | None = None,
-                       heading: str | None = None, phase_a: bool = False) -> None:
+                       heading: str | None = None, phase_a: bool = False,
+                       gpu_provider: str | None = None) -> None:
     """The step between [Run] and spending money: always lists every known
     GPU's live stock/price at the home datacenter and lets [Confirm] switch
     to any of them before renting (2026-09-02, widened from "only offer a
@@ -4789,6 +4865,11 @@ def _offer_run_confirm(tg: Tg, chat_id: int, *, message_id: int | None = None,
     message: the very first [Run] tap on the job panel, and tick_phase_a's
     post-Phase-A panel. `force` bypasses stock_at_cached's 60s TTL for a
     real live recheck, used only by the 🔄 Refresh button.
+
+    `gpu_provider` "vast" draws the Vast tab (_offer_vast_panel) instead of RunPod's stock screen;
+    None is the RunPod screen, which gains only the [RunPod] [Vast] row on top. The Phase A
+    try-on confirm below has no provider row on purpose: that tap rents nothing, and the GPU is
+    chosen on the panel drawn after the try-on finishes.
     """
     configured = env_get(ROOT / ".env", "GPU") or _PRIMARY_GPU_ID
     volume_id = env_get(ROOT / ".env", "POD_VOLUME_ID")
@@ -4810,6 +4891,10 @@ def _offer_run_confirm(tg: Tg, chat_id: int, *, message_id: int | None = None,
                _ce_id(ICON_ROCKET_CE)),
               ("Cancel", _CB_RUN_NO)]])
         return
+    if gpu_provider == "vast":
+        _offer_vast_panel(tg, chat_id, message_id=message_id, force=force,
+                          spend_cb=spend_cb, heading=heading)
+        return
     wanted = [_PRIMARY_GPU_ID, *_FALLBACK_GPU_IDS]
     try:
         stock = ((stock_at(wanted) if force else stock_at_cached(wanted))
@@ -4826,7 +4911,8 @@ def _offer_run_confirm(tg: Tg, chat_id: int, *, message_id: int | None = None,
             tg, chat_id, message_id,
             f"This rents a GPU pod at ${price:.2f}/hour and starts the job.\n"
             "Confirm?",
-            [[("Refresh", _CB_RUN_REFRESH + "m", _ce_id(ICON_REFRESH_CE))],
+            [_provider_row("runpod"),
+             [("Refresh", _CB_RUN_REFRESH + "m", _ce_id(ICON_REFRESH_CE))],
              [(spend_label, spend_cb, _ce_id(ICON_ROCKET_CE)),
               ("Cancel", _CB_RUN_NO)]])
         return
@@ -4875,7 +4961,7 @@ def _offer_run_confirm(tg: Tg, chat_id: int, *, message_id: int | None = None,
     # category button opens a submenu (_offer_run_switch_menu /
     # _offer_run_migrate_menu) with the same options one full-width button
     # per row, so nothing there is packed tight enough to truncate.
-    buttons = []
+    buttons = [_provider_row("runpod")]
     if switch_buttons:
         buttons.append([("Switch GPU type ▸", _CB_RUN_SWITCH_MENU, _ce_id(ICON_NVIDIA_CE))])
     if migrate_buttons:
@@ -4894,7 +4980,7 @@ def _offer_run_confirm(tg: Tg, chat_id: int, *, message_id: int | None = None,
 
 
 def _offer_run_for_chat(tg: Tg, chat_id: int, *, message_id: int | None = None,
-                        force: bool = False) -> None:
+                        force: bool = False, gpu_provider: str | None = None) -> None:
     """[Run]'s first screen, choosing between the two flows by manifest content.
 
     A chat whose draft has local try-on gets the two-step flow (Phase A, then
@@ -4924,24 +5010,30 @@ def _offer_run_for_chat(tg: Tg, chat_id: int, *, message_id: int | None = None,
     came through here, saw a try-on draft, and dropped the user back on the
     "run try-on first" screen — a button that re-ran Phase A instead of
     renting.
+
+    `gpu_provider` is threaded to whichever screen is drawn, so a Refresh or the Vast tab stays on
+    the provider the user chose.
     """
     if _PHASE_A_OFFERED.get(chat_id) == _run_token(chat_id):
-        _offer_rent_after_phase_a(tg, chat_id, message_id=message_id, force=force)
+        _offer_rent_after_phase_a(tg, chat_id, message_id=message_id, force=force,
+                                  gpu_provider=gpu_provider)
         return
     _offer_run_confirm(tg, chat_id, message_id=message_id, force=force,
-                       phase_a=_job_has_local_tryon(chat_id))
+                       phase_a=_job_has_local_tryon(chat_id), gpu_provider=gpu_provider)
 
 
 def _offer_rent_after_phase_a(tg: Tg, chat_id: int, *,
                               message_id: int | None = None,
-                              force: bool = False) -> None:
+                              force: bool = False,
+                              gpu_provider: str | None = None) -> None:
     """The Choose GPU panel for a batch whose try-on is already on disk: its
     spend button resumes into a rental (_CB_PHASE_A_SPEND) rather than
     starting Phase A again."""
     _offer_run_confirm(
         tg, chat_id, message_id=message_id, force=force,
         spend_cb=f"{_CB_PHASE_A_SPEND}{_run_token(chat_id)}",
-        heading=f"{ICON_NVIDIA_CE} <b>Try-on finished</b> — now rent a GPU?")
+        heading=f"{ICON_NVIDIA_CE} <b>Try-on finished</b> — now rent a GPU?",
+        gpu_provider=gpu_provider)
 
 
 def _offer_run_switch_menu(tg: Tg, chat_id: int, *, message_id: int | None = None,

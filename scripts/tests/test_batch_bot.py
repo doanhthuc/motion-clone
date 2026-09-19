@@ -7491,6 +7491,13 @@ class _VastBase(unittest.TestCase):
     def _latch(self):
         bot._PHASE_A_OFFERED[ME] = bot._run_token(ME)
 
+    def _last_buttons(self):
+        return [d for row in (self.tg.screen_buttons[-1] or []) for _, d, *_ in row]
+
+    def _spend_buttons(self):
+        return [d for d in self._last_buttons()
+                if d.startswith((bot._CB_RUN_GO, bot._CB_PHASE_A_SPEND))]
+
 
 class TestVastCallbackSuffix(_VastBase):
     def test_split_provider(self):
@@ -7742,3 +7749,121 @@ class TestVastProgressBilling(_VastBase):
         self.assertIn("on Vast.ai", self.tg.messages[-1])
         self.assertIn("quoted $0.90/h", self.tg.messages[-1])
         self.assertNotIn("$0.99", self.tg.messages[-1])
+
+
+class TestVastPicker(_VastBase):
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch("tgbot.bot.vast_fetch_quote", return_value=_vast_quote())
+        self.fetch_mock = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _stock(self):
+        return {"NVIDIA GeForce RTX 5090": [
+            Stock(gpu_id="NVIDIA GeForce RTX 5090", display_name="RTX 5090",
+                  datacenter_id="EU-RO-1", stock_status="available", price_per_hr=0.99)]}
+
+    def _runpod_panel(self):
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
+            bot._offer_run_confirm(self.tg, ME)
+
+    def _vast_panel(self, **kwargs):
+        with mock.patch("tgbot.bot.stock_at_cached") as stock, \
+             mock.patch("tgbot.bot.stock_at") as live:
+            bot._offer_run_confirm(self.tg, ME, gpu_provider="vast", **kwargs)
+        stock.assert_not_called()        # no datacenter or stock lines on the Vast tab
+        live.assert_not_called()
+
+    def test_the_runpod_screen_gains_a_provider_row_and_keeps_its_own_buttons(self):
+        self._runpod_panel()
+        first = self.tg.screen_buttons[-1][0]
+        self.assertEqual([(label, data) for label, data, *_ in first],
+                         [("RunPod ✓", bot._CB_RUN_RUNPOD), ("Vast", bot._CB_RUN_VAST)])
+        self.assertTrue(any(d.startswith(bot._CB_RUN_GO) and not d.endswith(":vast")
+                            for d in self._last_buttons()))
+
+    def test_the_fail_open_runpod_screen_has_the_row_too(self):
+        with mock.patch("tgbot.bot.volume_datacenter", return_value=None):
+            bot._offer_run_confirm(self.tg, ME)
+        self.assertIn(bot._CB_RUN_VAST, self._last_buttons())
+
+    def test_the_phase_a_try_on_confirm_has_no_provider_row(self):
+        bot._offer_run_confirm(self.tg, ME, phase_a=True)
+        self.assertNotIn(bot._CB_RUN_VAST, self._last_buttons())
+
+    def test_the_vast_tab_shows_the_offer_and_a_vast_spend_button(self):
+        self._latch()
+        self._vast_panel()
+        text = self.tg.screen[-1]
+        for expected in ("$0.90/h", "Bulgaria, BG", "Vast credit: $25.00", "Estimated session"):
+            self.assertIn(expected, text)
+        self.assertNotIn("Switch GPU", text)
+        self.assertNotIn("Other regions", text)
+        buttons = self._last_buttons()
+        self.assertIn(bot._CB_RUN_GO + self.token + ":vast", buttons)
+        self.assertIn(bot._CB_RUN_REFRESH + "v", buttons)
+        first = self.tg.screen_buttons[-1][0]
+        self.assertEqual([label for label, *_ in first], ["RunPod", "Vast ✓"])
+
+    def test_the_quote_is_sized_to_this_manifests_download(self):
+        self._latch()
+        self._vast_panel()
+        import drain
+        expected = drain.vast_download_gb(load_manifest(self.manifest))
+        self.assertAlmostEqual(self.fetch_mock.call_args.args[0], expected)
+        self.assertIs(self.fetch_mock.call_args.kwargs["force"], False)
+
+    def test_the_post_phase_a_vast_spend_button_resumes_and_carries_the_provider(self):
+        self._latch()
+        bot._offer_rent_after_phase_a(self.tg, ME, gpu_provider="vast")
+        self.assertIn(bot._CB_PHASE_A_SPEND + self.token + ":vast", self._last_buttons())
+        self.assertIn("Try-on finished", self.tg.screen[-1])
+
+    def test_a_pipeline_nobody_has_measured_gets_no_spend_button_and_says_why(self):
+        (self.root / ".env").write_text("GPU=x\n", encoding="utf-8")
+        self._latch()
+        self._vast_panel()
+        self.assertEqual(self._spend_buttons(), [])
+        self.assertIn("no measured Vast session for motion-enhance", self.tg.screen[-1])
+        self.assertIn("$0.90/h", self.tg.screen[-1])       # the tab still renders the offer
+
+    def test_no_qualifying_machine_gets_no_spend_button(self):
+        self.fetch_mock.side_effect = RuntimeError("0 of 40 offers qualify (40 over price cap).")
+        self._latch()
+        self._vast_panel()
+        self.assertEqual(self._spend_buttons(), [])
+        self.assertIn("40 over price cap", self.tg.screen[-1])
+
+    def test_an_unreadable_account_gets_no_spend_button(self):
+        self.credit_mock.side_effect = RuntimeError("no api key")
+        self._latch()
+        self._vast_panel()
+        self.assertEqual(self._spend_buttons(), [])
+        self.assertIn("no api key", self.tg.screen[-1])
+
+    def test_the_vast_tab_button_draws_the_panel_and_refresh_forces_a_new_quote(self):
+        self._latch()
+        with mock.patch("tgbot.bot.stock_at_cached"):
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_VAST), allowed_user_id=ME)
+            self.assertIn("Vast.ai", self.tg.screen[-1])
+            self.assertIs(self.fetch_mock.call_args.kwargs["force"], False)
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_REFRESH + "v"), allowed_user_id=ME)
+        self.assertIs(self.fetch_mock.call_args.kwargs["force"], True)
+        self.assertIn(bot._CB_PHASE_A_SPEND + self.token + ":vast", self._last_buttons())
+
+    def test_the_vast_tab_with_no_job_at_all_says_so_instead_of_drawing(self):
+        bot._PHASE_A_OFFERED.clear()
+        bot.handle(self.tg, cb_from(ME, bot._CB_RUN_VAST), allowed_user_id=ME)
+        self.assertIn("no complete job yet", self.tg.messages[-1])
+        self.fetch_mock.assert_not_called()
+
+    def test_the_runpod_tab_goes_back_to_the_stock_screen(self):
+        self._latch()
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_VAST), allowed_user_id=ME)
+            bot.handle(self.tg, cb_from(ME, bot._CB_RUN_RUNPOD), allowed_user_id=ME)
+        self.assertIn("Try-on finished", self.tg.screen[-1])
+        self.assertIn("RTX 5090", self.tg.screen[-1])
+        self.assertIn(bot._CB_PHASE_A_SPEND + self.token, self._last_buttons())

@@ -80,6 +80,16 @@ def _manifest_with_a_motion_run() -> Manifest:
     ])
 
 
+class TestVastDownloadGb(unittest.TestCase):
+    def test_is_the_manifests_models_plus_the_image_floor(self):
+        m = _manifest_with_a_motion_run()
+        self.assertAlmostEqual(drain.vast_download_gb(m),
+                               drain.total_download_gb(m) + drain.VAST_IMAGE_GB)
+
+    def test_an_empty_manifest_is_just_the_image(self):
+        self.assertAlmostEqual(drain.vast_download_gb(_empty_manifest()), drain.VAST_IMAGE_GB)
+
+
 class TestProvision(unittest.TestCase):
     def _manifest_path(self) -> Path:
         return Path(tempfile.mkdtemp()) / "tg-1.yaml"
