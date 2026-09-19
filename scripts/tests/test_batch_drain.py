@@ -175,16 +175,34 @@ class TestProvision(unittest.TestCase):
         cmd = mock_run.call_args[0][0]
         self.assertIn("VAST_GB=34.4", cmd)
 
+    def test_runpod_provider_does_not_add_vast_gb_even_with_a_real_manifest(self):
+        # Same manifest as the Vast case above (34.4 GB of real downloads) --
+        # the ONLY thing that must matter here is the provider gate, not
+        # whether the manifest happens to need any models.
+        m = _manifest_with_a_motion_run()
+        with mock.patch.object(drain.subprocess, "run") as mock_run, \
+             mock.patch.object(drain, "env_get", side_effect=["8", "pod-xyz"]), \
+             mock.patch.dict(os.environ, {"GPU_PROVIDER": "runpod"}, clear=False):
+            mock_run.return_value = mock.Mock(returncode=0, stderr="")
+            drain.provision(ceiling_min=60, manifest_path=Path("x.yaml"), manifest=m)
+        cmd = mock_run.call_args[0][0]
+        self.assertNotIn("VAST_GB", cmd)
+
 
 class TestWaitAndBootstrap(unittest.TestCase):
     def test_runpod_does_not_set_vast_model_ids(self):
-        m = _empty_manifest()
+        # A real manifest (not _empty_manifest()) so this actually exercises the
+        # provider gate -- an empty manifest would pass with the gate deleted.
+        m = _manifest_with_a_motion_run()
         os.environ.pop("VAST_MODEL_IDS", None)
         with mock.patch.object(drain, "sh") as mock_sh, \
              mock.patch.dict(os.environ, {"GPU_PROVIDER": "runpod"}, clear=False):
             drain.wait_and_bootstrap(m)
-        self.assertNotIn("VAST_MODEL_IDS", os.environ)
-        mock_sh.assert_any_call("bash", "scripts/pod-bootstrap.sh")
+            # Must be checked INSIDE the with block: patch.dict(..., clear=False)
+            # still restores the whole os.environ to its pre-with state on exit,
+            # which would silently erase a wrongly-set VAST_MODEL_IDS too.
+            self.assertNotIn("VAST_MODEL_IDS", os.environ)
+            mock_sh.assert_any_call("bash", "scripts/pod-bootstrap.sh")
 
     def test_vast_with_models_sets_vast_model_ids(self):
         m = _manifest_with_a_motion_run()
@@ -201,7 +219,7 @@ class TestWaitAndBootstrap(unittest.TestCase):
         with mock.patch.object(drain, "sh"), \
              mock.patch.dict(os.environ, {"GPU_PROVIDER": "vast"}, clear=False):
             drain.wait_and_bootstrap(m)
-        self.assertNotIn("VAST_MODEL_IDS", os.environ)
+            self.assertNotIn("VAST_MODEL_IDS", os.environ)
 
 
 class TestFailedJobIds(unittest.TestCase):

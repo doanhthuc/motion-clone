@@ -686,7 +686,7 @@ phase_comfyui() {
       say "    Vast: bắt đầu tải model của manifest, chạy nền song song với cài đặt bên dưới…"
       ID_ARGS=()
       for _id in $VAST_MODEL_IDS; do ID_ARGS+=(--id "$_id"); done
-      ( MODELS_DIR="$COMFY_DIR/models" bash "$ROOT/setup/preload-models.sh" "${ID_ARGS[@]}" \
+      ( MODELS_DIR="$COMFY_DIR/models" CATALOG="$CATALOG_FILE" bash "$ROOT/setup/preload-models.sh" "${ID_ARGS[@]}" \
           >/tmp/preload-models.log 2>&1 ) &
       PRELOAD_PID=$!
     fi
@@ -754,7 +754,7 @@ phase_comfyui() {
         ok "model của manifest đã tải xong (/tmp/preload-models.log)"
       else
         warn "tải model của manifest LỖI — xem /tmp/preload-models.log. Chạy lại tay:"
-        warn "  MODELS_DIR=$COMFY_DIR/models bash setup/preload-models.sh --id <id> [--id <id> ...]"
+        warn "  MODELS_DIR=$COMFY_DIR/models CATALOG=$CATALOG_FILE bash setup/preload-models.sh --id <id> [--id <id> ...]"
       fi
     fi
 
