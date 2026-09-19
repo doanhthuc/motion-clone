@@ -6,17 +6,23 @@ need must be known BEFORE the pod boots, to (a) give vast_select.rank's bandwidt
 download size instead of a flat 60 GB guess, and (b) start the download in parallel with the backend
 install instead of leaving ComfyUI to discover a missing model at job time.
 
-Scope, matching the spec's approved table exactly (section 3.3) -- do not extend past it without
-updating the spec first:
-  - motion, camera-motion              -> the Wan 2.2 Animate group (8 ids, ~34.4 GB)
-  - character-swap                     -> the SCAIL-2/SAM3 group (5 ids, ~28.3 GB) -- the scail2
-                                           engine, the only one the spec measured; the wananimate
-                                           engine variant reuses the Wan Animate group instead and
-                                           is not modelled here (spec section 5, "Not proven")
-  - enhance, engine=flashvsr (default) -> the 4 flashvsr-* ids (~9.3 GB)
-  - enhance, any other engine          -> nothing extra: ffmpeg lanczos needs no model, and
-                                           seedvr2 is not in this catalog (not offered on Vast)
-  - tryon, camera-tryon                -> nothing extra
+Scope, matching the spec's approved table (section 3.3), corrected against the real runtime
+default `run_character_swap` actually uses (verified against
+motions-studio/worker/worker_runtime/linux.py:5466-5468, 2193-2210 while implementing this task
+-- the spec's table alone would have under-specified this):
+  - motion, camera-motion                 -> the Wan 2.2 Animate group (8 ids, ~34.4 GB)
+  - character-swap, engine=wananimate     -> DEFAULT (run_character_swap's own default when no
+    (default, or unset)                      `engine` param is given, linux.py:5466). Reuses
+                                              build_wan_workflow (the Wan Animate group) plus
+                                              _apply_swap_to_wan_workflow, which also loads
+                                              sam3.1_multiplex_fp16.safetensors (linux.py:2203) ->
+                                              the Wan Animate group PLUS swap-sam3.
+  - character-swap, engine=scail2         -> the SCAIL-2/SAM3 group (5 ids, ~28.3 GB) -- opt-in
+                                              only, matches the spec's section 3.3 table exactly.
+  - enhance, engine=flashvsr (default)    -> the 4 flashvsr-* ids (~9.3 GB)
+  - enhance, any other engine             -> nothing extra: ffmpeg lanczos needs no model, and
+                                              seedvr2 is not in this catalog (not offered on Vast)
+  - tryon, camera-tryon                   -> nothing extra
 
 faceLock/faceLockRestore (camera-motion's on-by-default identity fix) are NOT modelled here: they
 are installed unconditionally by pod-bootstrap.sh (scripts/pod-facelock.sh) on both providers
@@ -42,6 +48,10 @@ CHARACTER_SWAP_IDS = frozenset({
     "swap-sam3", "swap-scail2-unet", "swap-scail2-umt5-fp8",
     "swap-scail2-lightx2v-r64", "swap-scail2-dpo",
 })
+# character-swap's DEFAULT engine (linux.py:5466 -- "wananimate" when the manifest gives no
+# `engine` override, or gives that value explicitly): reuses the Wan Animate diffusion model plus
+# the SAM3 segmentation checkpoint _apply_swap_to_wan_workflow loads (linux.py:2203).
+WANANIMATE_SWAP_IDS = WAN_ANIMATE_IDS | frozenset({"swap-sam3"})
 FLASHVSR_IDS = frozenset({
     "flashvsr-lq-proj", "flashvsr-tc-decoder", "flashvsr-streaming-dmd", "flashvsr-wan22-vae",
 })
@@ -60,6 +70,16 @@ def _enhance_ids(params: dict) -> frozenset[str]:
     return frozenset()
 
 
+def _character_swap_ids(params: dict) -> frozenset[str]:
+    # run_character_swap (linux.py:5466) raises on anything other than these two values, and
+    # defaults to "wananimate" when `engine` is not given -- so an unset/blank engine must
+    # resolve the same way as the explicit default, not fall through to some third case.
+    engine = str(params.get("engine") or "wananimate").strip().lower()
+    if engine == "scail2":
+        return CHARACTER_SWAP_IDS
+    return WANANIMATE_SWAP_IDS
+
+
 # One resolver per Stage name (scripts/batchlib/pipelines.py's STAGES keys). Every stage any
 # PIPELINES entry can reach MUST have an entry here, or check_drift() below fails -- the same
 # drift class check-job-types.mjs guards, for this registry instead of the job-type lists.
@@ -68,7 +88,7 @@ STAGE_MODEL_IDS: dict[str, Resolver] = {
     "camera-tryon": lambda params: frozenset(),
     "motion": lambda params: WAN_ANIMATE_IDS,
     "camera-motion": lambda params: WAN_ANIMATE_IDS,
-    "character-swap": lambda params: CHARACTER_SWAP_IDS,
+    "character-swap": _character_swap_ids,
     "enhance": _enhance_ids,
 }
 

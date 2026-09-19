@@ -7,8 +7,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batchlib.manifest import Manifest, Run
 from batchlib.vast_models import (ALL_REGISTRY_IDS, CHARACTER_SWAP_IDS, FLASHVSR_IDS,
-                                  WAN_ANIMATE_IDS, check_drift, models_for_manifest,
-                                  resolve_stage, total_download_gb)
+                                  WAN_ANIMATE_IDS, WANANIMATE_SWAP_IDS, check_drift,
+                                  models_for_manifest, resolve_stage, total_download_gb)
 
 
 def _run(run_id: str, pipeline: str, stage_params: dict | None = None) -> Run:
@@ -26,8 +26,20 @@ class TestResolveStage(unittest.TestCase):
     def test_camera_motion_needs_the_same_group_as_plain_motion(self):
         self.assertEqual(resolve_stage("camera-motion", {}), WAN_ANIMATE_IDS)
 
-    def test_character_swap_needs_the_scail2_sam3_group(self):
-        self.assertEqual(resolve_stage("character-swap", {}), CHARACTER_SWAP_IDS)
+    def test_character_swap_defaults_to_wananimate_which_reuses_the_wan_animate_group(self):
+        # run_character_swap's own default when no `engine` param is given (linux.py:5466).
+        self.assertEqual(resolve_stage("character-swap", {}), WANANIMATE_SWAP_IDS)
+
+    def test_character_swap_explicit_wananimate_matches_the_default(self):
+        self.assertEqual(resolve_stage("character-swap", {"engine": "wananimate"}),
+                         WANANIMATE_SWAP_IDS)
+
+    def test_character_swap_explicit_scail2_needs_the_scail2_sam3_group(self):
+        self.assertEqual(resolve_stage("character-swap", {"engine": "scail2"}),
+                         CHARACTER_SWAP_IDS)
+
+    def test_wananimate_swap_group_is_the_wan_animate_group_plus_sam3(self):
+        self.assertEqual(WANANIMATE_SWAP_IDS, WAN_ANIMATE_IDS | {"swap-sam3"})
 
     def test_tryon_and_camera_tryon_need_nothing_extra(self):
         self.assertEqual(resolve_stage("tryon", {}), frozenset())
@@ -52,10 +64,14 @@ class TestModelsForManifest(unittest.TestCase):
     def test_unions_ids_across_every_run_and_stage(self):
         m = _manifest(
             _run("r1", "motion-enhance"),
-            _run("r2", "character-swap"),
+            _run("r2", "character-swap", {"character-swap": {"engine": "scail2"}}),
         )
         ids = models_for_manifest(m)
         self.assertEqual(ids, WAN_ANIMATE_IDS | FLASHVSR_IDS | CHARACTER_SWAP_IDS)
+
+    def test_a_default_character_swap_run_needs_the_wananimate_group(self):
+        m = _manifest(_run("r1", "character-swap"))
+        self.assertEqual(models_for_manifest(m), WANANIMATE_SWAP_IDS)
 
     def test_a_manifest_with_only_tryon_needs_nothing_extra(self):
         m = _manifest(_run("r1", "tryon-motion-enhance",
