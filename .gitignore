@@ -43,6 +43,8 @@ batch/volume-migrate-lease.json
 # The bot's marker for a migration it has launched but whose lease has not been
 # written yet (tgbot/bot.py _migrate_launch_marker).
 batch/volume-migrate.launching.json
+# Per-machine history of Vast rentals (scripts/vast_rent.py): what each host actually did.
+batch/vast-machines.json
 # Which message the bot keeps edited for a migration. NOT covered by
 # `batch/*.progress.json` above — that glob needs a literal ".progress.json"
 # and this suffix is "-progress.json" — and the filename embeds the user's
