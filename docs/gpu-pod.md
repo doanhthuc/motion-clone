@@ -353,6 +353,153 @@ Muốn thuê máy chậm vẫn được — script nói rõ phân bố `disk_bw`
 RunPod không cần hai biến này: secure cloud là phần cứng datacenter đồng đều, không có phương sai
 kiểu chợ.
 
+> **Price note, re-measured 2026-09-19.** The `$0.336/hr` above is from 2026-08-01 and no longer
+> holds. Across 40 RTX 5090 offers that day, the cheapest one passing `MIN_DISK_BW=3000` +
+> `MIN_CPU_GHZ=2.5` was **$0.536/hr**; the machine actually rented for the cold-start probe below
+> was **$0.822/hr**. Still well under RunPod's measured $1.00/hr, but the gap is ~45%, not ~66%.
+
+<a id="vast-ghcr"></a>
+### Vast cold start: the wire is fast, the image pull is not — measured twice, 2026-09-19
+
+Probe to answer "can a stateless vast box (no Network Volume, models pulled at boot) reach a usable
+state inside 10 minutes?" Two RTX 5090 hosts, both rented with the real prebuilt image (60 layers,
+17.38 GB compressed). Total spend for both probes: **$0.277.**
+
+| | Washington US | Bulgaria |
+|---|---|---|
+| Price / advertised `inet_down` | $0.822/hr / 1593 Mbps | $0.8185/hr / 2038 Mbps |
+| `vastai create` → `running` (image pull + container start) | **556 s** | **325 s** |
+| `aria2c -x16` from **huggingface.co** | 241.7 MB/s | **295.8 MB/s** |
+| `aria2c -x16` from **ghcr.io** (one 4 GB image layer) | 15.9 MB/s | **229.8 MB/s** |
+| **R2** download, 4 GiB, presigned GET, `aria2c -x16` cold / warm / `-x4` | not measured | **196.6 / 204.5 / 192.6 MB/s** |
+| **R2** upload, 4 GiB, one stream, presigned PUT | not measured | 46.5 MB/s |
+
+What this settles, and what it overturns:
+
+- **The first probe's headline was wrong.** It concluded "ghcr.io is ~15× slower than HuggingFace, and
+  that is the bottleneck". The second host reads ghcr at 229.8 MB/s — 14× faster — so the 15.9 MB/s at
+  Washington was a property of that host's route (or a transient throttle), not of ghcr. The docker
+  pull there also finished at ≥31 MB/s effective, *faster* than the 15.9 MB/s single-blob probe, which
+  means that probe was not even a fair stand-in for what `docker pull` does.
+- **On the fast host the wire is not the bottleneck either.** 17.38 GB at 229.8 MB/s is ~76 s of
+  transfer, yet create→running took 325 s. Roughly **250 s is not network**: layer decompress/extract
+  (32-41 GB unpacked, per the section below), container creation, Vast's own scheduling. This split is
+  inferred from subtraction, not measured directly.
+- **R2 is fast enough, and needs few streams.** ~197-205 MB/s from Bulgaria: ~80% of the advertised
+  `inet_down`, a bit under HuggingFace (295.8) and ghcr (229.8) on the same wire. Cold and warm are the
+  same (no cache effect), and `-x4` (192.6) is within 2% of `-x16` (196.6) — for one large file on
+  this host, more than ~4 streams bought nothing. 34.4 GB of models is ~170 s from R2 vs ~116 s from HF.
+- **Models do not need to live in R2.** 31 of 32 catalog models already come from huggingface.co,
+  which was the *fastest* source on both hosts. R2's job is replacing MinIO (material + output, tens
+  of MB per job), not carrying weights.
+
+**The lever is the host's layer cache: 325 s cold → 35 s warm.** Re-renting the *same machine*
+(`machine_id=144253`, offer `45089956`, listed again 15 minutes after the first destroy) with the same
+image reached `running` in **35 s** against 325 s on its first rental — **−89%**. vast hosts keep docker
+layers after the instance is destroyed. So ~290 s of the cold start is pull + extract; raw transfer
+alone would be ~76 s at the measured 229.8 MB/s, and the remaining ~214 s is *inferred* to be
+decompress / extract / disk / container creation (not separately measured). Not yet known: how long a
+host keeps the cache (only a 15-minute gap was tested) and how often a known machine is rentable.
+`vastai search offers 'machine_id=<id>'` returns that machine's offers directly, outside the ~40-row
+random sample above, so a known machine can be probed deterministically.
+
+Serial budget with Bulgaria numbers (108 s bootstrap is the *RunPod* figure, not yet measured on vast):
+
+| | image | + bootstrap | + models (HF … R2) | total |
+|---|---|---|---|---|
+| host cache **warm** | 35 s | 108 s | 116–170 s | **259–313 s** |
+| host cache **cold** | 325 s | 108 s | 116–170 s | **549–603 s** |
+
+Why "slim base + `/opt/mtc-prebuilt` tarball from R2" is *not* the first thing to try: of the 17.38 GB,
+**10.56 GB (61%, 34 layers) is the `runpod/pytorch` base** and 6.81 GB (26 layers) is ours, so thinning
+would help — but the Dockerfile also bakes `postgresql`, `nodejs` + `pm2`, `ffmpeg`/`aria2`, Ollama
+(unpacked into `/usr`) and MinIO into *system* layers, so a tarball of `/opt/mtc-prebuilt` alone does
+not restore a working box on a thin base; it would take a separate vast Dockerfile (RunPod needs a
+`runpod/*` base for its `/start.sh`, [§1](#runpod-gotchas)). The base's own torch 2.8/cu128 is dead
+weight — the venvs deliberately do not inherit it (`Dockerfile:41-45`) — which makes that route
+plausible later, but the warm-cache result makes it lower priority. Not tried.
+
+**Do not extrapolate boot time from `inet_down` for a docker pull.** The line-rate model (70% of
+advertised) predicted 116 s for the Washington pull and got 556 s (4.8×); for the 34.4 GB aria2c model
+download it predicted ~150 s and the measured 241.7 MB/s implies 142 s. Good for multi-connection HTTP,
+worthless for `docker pull`.
+
+**Bandwidth is billed per GB, from ~$0 to $40/TB.** `internet_down_cost_per_tb` across qualifying 5090
+offers: Hungary a flat **$40/TB** (a 50 GB boot = $2.00; 28 of 66 qualifying offers, also the priciest
+per hour), Czechia $2.7-38.7, US $0.7-10.7, Spain $9.3, **Bulgaria $1.37**, Puerto Rico ~$0. Pick by
+*total session cost*, never by count of hosts in a region. Also: vast's SSH **proxy** (`ssh4.vast.ai`)
+rejected the registered key on the Bulgarian host while the **direct** `ip:port` accepted it — use
+`vastai ssh-url` / the direct address, and `-o IdentitiesOnly=yes -i <key>` when the agent holds several.
+
+<a id="vast-e2e"></a>
+### A full stateless vast session works end to end — measured 2026-09-19
+
+One RTX 5090 (Bulgaria, `machine_id=144253`, $0.8185/hr, image layers already cached from earlier
+rentals), `GPU_PROVIDER=vast`, `POD_VOLUME` empty, `MTC_PREBUILT=1`, `SETUP_PROFILE=full`,
+`JOB_TYPES_OVERRIDE=motion`. **`make gpu-smoke` with a real motion job: `✓ smoke test passed`, exit 0**;
+the output (544×960, 33 frames @16 fps) was inspected frame by frame — one coherent character, pose
+changing across frames, not a blank/black file that merely clears the size floor. Session cost
+**$0.19 for 10.8 minutes** (rental ~$0.15 + ~$0.05 bandwidth for the 34.4 GB of models).
+
+| Step | Measured |
+|---|---|
+| `vastai create` → `running` (cache warm) | 32 s |
+| SSH answering (direct address) | 49 s after create |
+| `make gpu-bootstrap` (exit 0) | 200 s — ran *concurrently* with the model download |
+| 8 models, 34.4 GB (`preload-models.sh --group "Wan 2.2 Animate (motion-transfer)"`) | 137 s ≈ 251 MB/s, 0 errors |
+| link models into `$COMFY_DIR/models` (`cp -aln`, hard links) + `pm2 restart comfyui` | 0.01 s + ~15 s |
+| `gpu-smoke` layers 1-4 (tunnel, API+Postgres, PM2, Wan nodes), 7 (motion job) | 101 s total; 5-6 skip cleanly without a volume |
+
+Overlapping the model download with bootstrap works: network (models) and CPU/disk (bootstrap) do
+not starve each other enough to matter, so setup costs `max(200, 137)` s, not the sum. Automated
+end to end that is ≈ 32 + 17 + 200 + 15 ≈ **265 s (4.4 min) on a warm host**, and ≈ 557 s (9.3 min)
+on a cold one (325 s image pull instead of 32 s) — both under 10 minutes, the cold one narrowly.
+
+How it was run (all manual — this is the list of things a vast fallback has to automate):
+
+1. `.env`: `GPU_PROVIDER=vast`, `POD_VOLUME=` (empty), `JOB_TYPES_OVERRIDE=` only the types whose
+   models will be loaded (a type claimed without its models fails; a type missing from the list sits
+   `queued` forever). `make gpu-preflight` passes; its POD_VOLUME warning is expected.
+2. Rent by `machine_id`, not by the sampled search: `vastai search offers 'machine_id=N rentable=true'`.
+3. **Write the direct SSH address** (`vastai ssh-url <id>`) into `GPU_SSH_HOST/PORT`. `pod-wait.sh`
+   writes vast's *proxy* address, which rejected the registered key on this host.
+4. Copy `preload-models.sh` + the catalog to the box and start the download in the background with
+   `POD_VOLUME=/root/vol CATALOG=<catalog-motion-transfer.json>` — `preload-models.sh` only needs
+   `[ -d "$POD_VOLUME" ]`, unlike `pod-volume.sh:73` which demands a real mountpoint.
+5. Start `make gpu-bootstrap` at the same time. Afterwards `cp -aln /root/vol/comfy-models/. $COMFY_DIR/models/`
+   (same filesystem, so instant and no second 34 GB) and `pm2 restart comfyui`.
+6. `SMOKE_REF=… SMOKE_DRIVER=… make gpu-smoke`, then destroy. **vast has no `--terminate-after`**:
+   this run armed a 45-minute `vastai destroy` in the background as its only guard against forgetting.
+
+Found on the way, not caused by vast:
+
+- **The prebuilt image is stale.** Bootstrap logged `node_modules dựng sẵn thiếu dependency → cài lại
+  tại chỗ` for image `sha-0cbe433`: `api/package.json` has moved on, so `npm install` reruns at every
+  boot. That is part of why this bootstrap took 200 s against the 108 s measured on RunPod (the model
+  download running alongside is the other suspect; the two are not separated).
+- **`make gpu-bootstrap` prints `NUXT_MOTION_API_KEY` in its final output** and emails the connection
+  details each run. Anything capturing that log (CI, a chat transcript) captures the key.
+- `make gpu-preflight` reports `DS_DEFAULT_JOB_TYPES` in `lib-deploy-shape.sh` out of step with
+  `mc-dispatcher.js`; irrelevant to `WORKER_SOURCE=local`.
+
+Still unproven: how long a host keeps its layer cache (longest gap tried: ~10 min), how often a known
+machine is rentable, what a host dropping mid-job costs, and every job type except `motion`
+(tryon / create-image need other model groups — 31 GB for `Qwen-Image-Edit` alone).
+
+<a id="vast-search-sampling"></a>
+### `vastai search offers` returns a ~40-row random sample, not the market. Measured 2026-09-19
+
+Three *identical* queries seconds apart returned 40 offers each (a server-side cap — `--limit 1000`
+still returns 40), and intersected at only **13**; their union was **67**. Pinning a known-good,
+still-listed offer with `OFFER=<id>` failed **3 of 4 attempts** while renting the probe machine
+above, each time with `offer … is not in the current results`. `machine_id` is only marginally more
+stable than the offer `id` (21 vs 13 rows in common).
+
+Consequence for anything automated: **search and rent must be one atomic motion with retry.**
+"Search, decide, rent later" is not reliable on vast — the best machine you found a minute ago may
+simply be invisible to the next call. `pod-provision.sh` does search-then-create in one run, which
+is right, but it has no retry loop and its `OFFER=` pin is therefore flaky by construction.
+
 <a id="costs"></a>
 ## Costs — pod dừng vẫn tính tiền
 
