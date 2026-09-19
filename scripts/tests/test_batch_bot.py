@@ -5624,10 +5624,27 @@ class TestKillCommand(unittest.TestCase):
     def test_kill_without_a_lease_leaves_the_environment_alone(self):
         ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
         with mock.patch("tgbot.bot.lease_for", return_value=None), \
+             mock.patch("tgbot.bot.read_lease", return_value=None), \
              mock.patch("tgbot.bot.subprocess.run", return_value=ok) as run, \
              mock.patch("tgbot.bot.clear_lease"):
             bot.handle(self.tg, cb_from(ME, bot._CB_KILL_GO), allowed_user_id=ME)
         self.assertIsNone(run.call_args.kwargs.get("env"))
+
+    def test_kill_finds_the_lease_of_a_chained_link(self):
+        # On chained links, drain.py's chain_or_teardown rewrites lease.manifest to the
+        # claimed link, so lease_for(manifest_path) returns None. The kill must fall back
+        # to the global lease file to get the correct provider.
+        lease = Lease(pod_id="777", provisioned_at=0.0,
+                      manifest=str(self.root / "batch" / f"tg-{ME}-123.yaml"),
+                      abs_max_min=60, provider="vast")
+        ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with mock.patch("tgbot.bot.lease_for", return_value=None), \
+             mock.patch("tgbot.bot.read_lease", return_value=lease), \
+             mock.patch("tgbot.bot.subprocess.run", return_value=ok) as run, \
+             mock.patch("tgbot.bot.clear_lease"):
+            bot.handle(self.tg, cb_from(ME, bot._CB_KILL_GO), allowed_user_id=ME)
+        self.assertEqual(run.call_args.args[0], ["make", "gpu-destroy"])
+        self.assertEqual(run.call_args.kwargs["env"]["GPU_PROVIDER"], "vast")
 
     def test_a_dead_tracked_process_is_left_alone(self):
         proc = mock.Mock()

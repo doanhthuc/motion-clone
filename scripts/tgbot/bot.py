@@ -68,7 +68,7 @@ from tgbot.run import (LEASE_PATH, _RUNNING, busy, drain_running,
 from batchlib_ext.gpu_stock import stock_at, stock_at_cached, volume_datacenter
 from batchlib_ext.runpod_account import account_balance
 from batchlib_ext.handoff import handoff_path, mailbox_path, read_handoff
-from batchlib_ext.lease import clear_lease
+from batchlib_ext.lease import clear_lease, read_lease
 from batchlib_ext.migrate_lease import read_migrate_lease
 from batchlib_ext.provision_failure import (clear_provision_failure,
                                             provision_failure_path,
@@ -5081,7 +5081,9 @@ def _do_kill(tg: Tg, chat_id: int) -> None:
     tg.send_message(chat_id, "🛑 destroying the pod…")
     # The lease says which cloud rented the pod. The bot's own environment does not, and a bare
     # `make gpu-destroy` would fall back to .env's provider. Read before clear_lease below.
-    lease = lease_for(manifest_path)
+    # On chained links, drain.py's chain_or_teardown rewrites lease.manifest to the claimed
+    # link, so lease_for(manifest_path) returns None; fall back to the global lease file.
+    lease = lease_for(manifest_path) or read_lease(LEASE_PATH)
     kill_env = {**os.environ, "GPU_PROVIDER": lease.provider} if lease is not None else None
     try:
         result = subprocess.run(["make", "gpu-destroy"], cwd=_REPO_ROOT,
