@@ -552,15 +552,16 @@ the watchdog's 10-minute grace, and a test enforces that).
 
 Still unverified until the first paid session: the exact `vastai ssh-url` output text (parsed
 tolerantly) and the `create --raw` reply keys. When `vastai create` prints non-JSON with exit 0
-after an offer vanishes, the rent stops at that offer's failure, tagged `AmbiguousCreate` — the
+after an offer vanishes, it is **unverified** what text is printed (the code stops at the first
+vanished offer, tagged `AmbiguousCreate`, instead of moving to the next candidate) — the
 watchdog reaps the unleased labelled instance after ~10 minutes, and the operator is told to check
 `vastai show instances-v1`. In `make gpu-destroy`, the destroy verify reads an exit-0 listing that
-does not contain `"instances"` (the pagination key, even on empty) as "could not verify"; error
-text that itself contains that token is still read as a valid listing (hardened to match on
-`"instances": [`). Once `vastai ssh-url` returns a direct address the SSH proxy is never retried
-if that address is unreachable from the network.
+does not contain `"instances"` (the listing key, even on empty) as "could not verify"; error
+text that itself contains that token is still read as a valid listing (parked hardening: match
+`"instances": [`). Once `vastai ssh-url` returns a direct address the SSH proxy is not tried again
+while `ssh-url` keeps answering if that address is unreachable from the network.
 
-Not yet automated: per-batch model download, the pull deadline on Plan 3.
+Not yet automated: per-batch model download (Plan 3).
 Design: `docs/superpowers/specs/2026-09-19-vast-fallback-design.md`.
 
 <a id="costs"></a>
