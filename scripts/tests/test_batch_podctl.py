@@ -1,4 +1,5 @@
 import json
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -6,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batchlib_ext.lease import Lease
-from batchlib_ext.podctl import PodInfo, RunpodCtl
+from batchlib_ext.podctl import PodInfo, RunpodCtl, VastCtl
 from batchlib_ext.watchdog import reconcile
 
 MIN = 60.0
@@ -192,6 +193,101 @@ class TestRunpodCtlListPods(unittest.TestCase):
         self.assertEqual(len(pods), 1)
         self.assertEqual(pods[0].pod_id, "pod-1")
         self.assertEqual(pods[0].name, "")
+
+
+class TestVastCtl(unittest.TestCase):
+    """VastCtl mirrors RunpodCtl's contract so pod_watchdog can treat both alike."""
+
+    @patch("subprocess.run")
+    def test_list_uses_the_non_deprecated_paginated_command_and_all_pages(self, mock_run):
+        # `vastai show instances` is deprecated; instances-v1 paginates 25 at a time unless
+        # --all is given, and a missed page is an instance the watchdog never sees.
+        mock_run.return_value = MagicMock(
+            returncode=0, stdout='{"instances": [], "next_token": null}', stderr="")
+        VastCtl().list_pods()
+        self.assertEqual(mock_run.call_args[0][0],
+                         ["vastai", "show", "instances-v1", "--raw", "--all"])
+
+    @patch("subprocess.run")
+    def test_list_maps_id_and_label(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stderr="", stdout=json.dumps({
+            "instances": [{"id": 51518664, "label": "motion-transfer"},
+                          {"id": 51518665, "label": None},
+                          {"id": 51518666}],
+            "next_token": None}))
+        pods = VastCtl().list_pods()
+        # ids are integers on vast; PodInfo.pod_id is a string everywhere else.
+        self.assertEqual(pods, [PodInfo("51518664", "motion-transfer"),
+                                PodInfo("51518665", ""),
+                                PodInfo("51518666", "")])
+
+    @patch("subprocess.run")
+    def test_empty_stdout_is_no_instances(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        self.assertEqual(VastCtl().list_pods(), [])
+
+    @patch("subprocess.run")
+    def test_nonzero_exit_raises_runtime_error_with_stderr(self, mock_run):
+        # Returning [] would read as "no instances" and tier 3 would do nothing — the safe
+        # direction when we cannot see. Raising lets the watchdog say so and skip this provider.
+        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="bad api key")
+        with self.assertRaises(RuntimeError) as cm:
+            VastCtl().list_pods()
+        self.assertIn("bad api key", str(cm.exception))
+
+    @patch("subprocess.run")
+    def test_malformed_output_raises_runtime_error(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout="ID  Machine  Status", stderr="")
+        with self.assertRaises(RuntimeError) as cm:
+            VastCtl().list_pods()
+        self.assertIn("invalid JSON", str(cm.exception))
+
+    @patch("subprocess.run")
+    def test_missing_instances_key_raises_runtime_error(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout='{"success": false}', stderr="")
+        with self.assertRaises(RuntimeError) as cm:
+            VastCtl().list_pods()
+        self.assertIn("invalid JSON", str(cm.exception))
+
+    @patch("time.sleep")
+    @patch("subprocess.run")
+    def test_destroy_answers_the_confirmation_prompt(self, mock_run, _sleep):
+        # `vastai destroy instance` asks [y/N] and treats EOF as N — then exits 0. Without the
+        # piped "y" this "succeeds" and deletes nothing (Makefile:144 records the same trap).
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        VastCtl().destroy("51518664")
+        self.assertEqual(mock_run.call_args[0][0],
+                         ["vastai", "destroy", "instance", "51518664"])
+        self.assertEqual(mock_run.call_args.kwargs["input"], "y\n")
+
+    @patch("time.sleep")
+    @patch("subprocess.run")
+    def test_destroy_raises_on_non_zero_exit(self, mock_run, _sleep):
+        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="no such instance")
+        with self.assertRaises(RuntimeError) as cm:
+            VastCtl().destroy("1")
+        self.assertIn("no such instance", str(cm.exception))
+
+    @patch("subprocess.run", side_effect=FileNotFoundError("vastai"))
+    def test_a_missing_binary_is_a_runtime_error_not_a_crash(self, _run):
+        # The VPS may not have vastai installed. A FileNotFoundError escaping list_pods() would
+        # abort the whole watchdog tick and blind the RunPod scan too; tick() only catches
+        # RuntimeError, so that is what a provider that cannot be listed must raise.
+        with self.assertRaises(RuntimeError) as cm:
+            VastCtl().list_pods()
+        self.assertIn("vastai", str(cm.exception))
+
+    @patch("time.sleep")
+    @patch("subprocess.run", side_effect=FileNotFoundError("vastai"))
+    def test_destroy_with_a_missing_binary_is_a_runtime_error(self, _run, _sleep):
+        with self.assertRaises(RuntimeError):
+            VastCtl().destroy("1")
+
+    @patch("subprocess.run",
+           side_effect=subprocess.TimeoutExpired(cmd="vastai", timeout=60))
+    def test_a_hung_cli_is_a_runtime_error(self, _run):
+        with self.assertRaises(RuntimeError):
+            VastCtl().list_pods()
 
 
 if __name__ == "__main__":
