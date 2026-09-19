@@ -1464,10 +1464,18 @@ _CB_RUN_BACK = "run:back"
 _CB_RUN_RUNPOD = "run:rp"
 _CB_RUN_VAST = "run:vast"
 # The provider a spend button was minted for rides IN its callback data, after the run token:
-# "run:go:<token>:vast". Not in .env (a bot that dies mid-run would leave it behind) and not in
-# bot state (lost on restart, and shared between two panels). RunPod has no suffix, so every button
-# already sitting in a chat keeps meaning exactly what it meant.
+# "run:go:<token>:vast" or "run:go:<token>:runpod". Not in .env (a bot that dies mid-run would
+# leave it behind) and not in bot state (lost on restart, and shared between two panels).
+#
+# The RunPod suffix was added after the RunPod-labelled screen shipped with none at all
+# (2026-09-19 review finding: a button that names RunPod but carries no provider still asks
+# start_drain to fall back to .env's GPU_PROVIDER, so a host misconfigured with
+# GPU_PROVIDER=vast would rent Vast from a tap that said "RunPod"). Every NEWLY minted RunPod
+# button now names its provider explicitly, same as Vast always has; a button already sitting in
+# a chat from before this fix has no suffix and keeps meaning exactly what it meant — .env — which
+# is the one case a suffix cannot retroactively fix.
 _VAST_SUFFIX = ":vast"
+_RUNPOD_SUFFIX = ":runpod"
 # + "m"/"s"/"g" — which screen to redraw (main / switch menu / migrate menu).
 _CB_RUN_REFRESH = "run:refresh:"
 # The /gpu report's own Refresh button — separate from _CB_RUN_REFRESH
@@ -1591,15 +1599,23 @@ _CB_PROVIDER_ASK = "prov-ask"
 
 
 def _split_provider(rest: str) -> tuple[str, str | None] | None:
-    """`<token>` -> (token, None); `<token>:vast` -> (token, "vast"); anything else -> None.
+    """`<token>` -> (token, None); `<token>:vast` -> (token, "vast"); `<token>:runpod` ->
+    (token, "runpod"); anything else -> None.
 
-    None means a suffix this version does not know — a button from a newer or older bot — and the
-    callers treat it like a stale token: refuse, spend nothing."""
+    `(token, None)` also means "not decided yet" for the Phase A try-on-first confirm, which mints
+    no suffix at all — that screen rents nothing, so there is no provider to name. A bare token
+    reaching a screen that DOES rent (the RunPod stock screen, since the runpod suffix above was
+    added) can only be a button minted before that fix; it still falls back to .env, unchanged.
+
+    A trailing suffix this version does not know (a button from a newer or older bot) returns
+    None outright — the callers treat that like a stale token: refuse, spend nothing."""
     token, sep, suffix = rest.partition(":")
     if not sep:
         return token, None
     if suffix == _VAST_SUFFIX[1:]:
         return token, "vast"
+    if suffix == _RUNPOD_SUFFIX[1:]:
+        return token, "runpod"
     return None
 
 
@@ -1920,8 +1936,10 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
                 tg.send_message(chat_id, "that button is from an older "
                                          "version of the bot; check /status")
             else:
+                # RunPod-only recovery card (_deliver_provision_failure): explicit, same
+                # reasoning as _RUNPOD_SUFFIX — never leave a RunPod-labelled tap to .env.
                 _do_resume(tg, chat_id, ROOT / "batch" / f"{stem}.yaml",
-                           dry_run=dry_run)
+                           dry_run=dry_run, gpu_provider="runpod")
 
         elif data.startswith(_CB_RECOVER_VAST):
             stem = data[len(_CB_RECOVER_VAST):]
@@ -1951,8 +1969,9 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
                                          "version of the bot; check /status")
             else:
                 env_set(ROOT / ".env", "GPU", gpu_id)
+                # Same RunPod-only recovery card, a different GPU type — still explicit.
                 _do_resume(tg, chat_id, ROOT / "batch" / f"{stem}.yaml",
-                          dry_run=dry_run)
+                          dry_run=dry_run, gpu_provider="runpod")
 
         elif data.startswith(_CB_RECOVER_MIGRATE):
             to_dc, _, stem = data[len(_CB_RECOVER_MIGRATE):].partition(":")
@@ -3880,8 +3899,10 @@ def tick_migration_progress(tg: Tg, chat_id: int, *, dry_run: bool = False) -> N
                 stem = None
             resume_marker.unlink(missing_ok=True)
             if stem:
+                # A Vast rental has no volume to migrate, so this path is RunPod-only —
+                # explicit, same reasoning as _RUNPOD_SUFFIX.
                 _do_resume(tg, chat_id, ROOT / "batch" / f"{stem}.yaml",
-                          dry_run=dry_run)
+                          dry_run=dry_run, gpu_provider="runpod")
         else:
             resume_marker.unlink(missing_ok=True)
 
@@ -4904,9 +4925,11 @@ def _offer_run_confirm(tg: Tg, chat_id: int, *, message_id: int | None = None,
     real live recheck, used only by the 🔄 Refresh button.
 
     `gpu_provider` "vast" draws the Vast tab (_offer_vast_panel) instead of RunPod's stock screen;
-    None is the RunPod screen, which gains only the [RunPod] [Vast] row on top. The Phase A
-    try-on confirm below has no provider row on purpose: that tap rents nothing, and the GPU is
-    chosen on the panel drawn after the try-on finishes.
+    anything else (None included) is the RunPod screen, which gains only the [RunPod] [Vast] row
+    on top — but mints its own spend button with an explicit `:runpod` suffix regardless of what
+    this parameter was, so the tap that follows never depends on .env. The Phase A try-on confirm
+    below has no provider row on purpose: that tap rents nothing, and the GPU is chosen on the
+    panel drawn after the try-on finishes.
     """
     configured = env_get(ROOT / ".env", "GPU") or _PRIMARY_GPU_ID
     volume_id = env_get(ROOT / ".env", "POD_VOLUME_ID")
@@ -4943,6 +4966,10 @@ def _offer_run_confirm(tg: Tg, chat_id: int, *, message_id: int | None = None,
     # Resolved once: the fail-open branch and the normal one each mint a spend
     # button, and two sites wording it independently is how they drift.
     spend_label = f"Yes, spend ${price:.2f}/h"
+    # This screen only ever rents RunPod (the vast branch above returned already), so its own
+    # spend button always names its provider explicitly — closing the .env fallback for every
+    # NEWLY minted button, same reasoning as _RUNPOD_SUFFIX's own comment.
+    runpod_spend_cb = spend_cb + _RUNPOD_SUFFIX
     if not stock or not home_dc:
         _edit_or_send(
             tg, chat_id, message_id,
@@ -4950,7 +4977,7 @@ def _offer_run_confirm(tg: Tg, chat_id: int, *, message_id: int | None = None,
             "Confirm?",
             [_provider_row("runpod"),
              [("Refresh", _CB_RUN_REFRESH + "m", _ce_id(ICON_REFRESH_CE))],
-             [(spend_label, spend_cb, _ce_id(ICON_ROCKET_CE)),
+             [(spend_label, runpod_spend_cb, _ce_id(ICON_ROCKET_CE)),
               ("Cancel", _CB_RUN_NO)]])
         return
 
@@ -5010,7 +5037,7 @@ def _offer_run_confirm(tg: Tg, chat_id: int, *, message_id: int | None = None,
     if sold_out:
         buttons.append([("Cancel", _CB_RUN_NO)])
     else:
-        buttons.append([(spend_label, spend_cb, _ce_id(ICON_ROCKET_CE)),
+        buttons.append([(spend_label, runpod_spend_cb, _ce_id(ICON_ROCKET_CE)),
                         ("Cancel", _CB_RUN_NO)])
     _edit_or_send(tg, chat_id, message_id, "\n".join(lines), buttons,
                  parse_mode=PARSE_HTML)
@@ -5510,8 +5537,9 @@ def _do_resume(tg: Tg, chat_id: int, manifest_path: Path, *, dry_run: bool,
     tg.send_message(chat_id, f"{ICON_ROCKET_CE} <b>Retrying</b> — renting a pod{where} "
                              f"again for {_esc(manifest_path.stem)}.",
                     parse_mode=PARSE_HTML)
-    # Only Vast passes a provider: a RunPod call stays exactly `start_drain(path, dry_run=..,
-    # resume=True)`, the call the RunPod-unchanged tests pin.
+    # Every caller now names its provider explicitly ("vast" from the panel, "runpod" from the
+    # RunPod-only recovery buttons) except _do_resume's own direct callers with none to give (e.g.
+    # a bare _do_resume(...) in a test) — those still fall back to .env exactly as before.
     provider_kwargs = {} if gpu_provider is None else {"gpu_provider": gpu_provider}
     start_drain(manifest_path, dry_run=dry_run, resume=True, **provider_kwargs)
     _start_progress(tg, chat_id, manifest_path, stages, **provider_kwargs)
@@ -5640,13 +5668,18 @@ def _vast_queue_refusal(chat_id: int, live_path: Path) -> str | None:
         return None
     reasons = static_blockers(draft, _vast_enabled())
     if not reasons:
+        # Both reads can raise KeyError: static_blockers tolerates a pipeline outside PIPELINES
+        # (PIPELINES.get(..., [])), but models_for_manifest indexes PIPELINES directly and does
+        # not — reachable only if a draft ever carried such a pipeline, which the bot's own job
+        # picker never assembles (2026-09-19 review finding), but the fail-closed answer must
+        # cover the draft's own manifest too, not only the on-pod one.
         try:
             on_pod = models_for_manifest(load_manifest(live_path))
-        except (ManifestError, OSError, KeyError):
-            reasons.append("could not read the manifest this pod was rented for, so its models "
-                           "are unknown")
-        else:
             missing = sorted(models_for_manifest(draft) - on_pod)
+        except (ManifestError, OSError, KeyError):
+            reasons.append("could not determine the models this job or the running pod needs, "
+                           "so its safety cannot be checked")
+        else:
             if missing:
                 reasons.append("this pod only has the models for the batch it was rented for; "
                                f"this job also needs {', '.join(missing)}")
@@ -6015,7 +6048,10 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool,
         reusable, total = _preserved_tryon(manifest_path)
         if reusable:
             token = _run_token(chat_id)
-            suffix = _VAST_SUFFIX if gpu_provider == "vast" else ""
+            # Carries whatever provider _CB_RUN_GO's tap already named (now always explicit for a
+            # newly minted RunPod button too, see _RUNPOD_SUFFIX) forward onto the chooser buttons
+            # below — dropping it here would silently return to the .env fallback one screen later.
+            suffix = f":{gpu_provider}" if gpu_provider else ""
             tg.send_message(
                 chat_id,
                 f"{ICON_ASK_CE} <b>Try-on already ran</b> for these exact inputs "
@@ -6057,7 +6093,7 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool,
         # same duplication already flagged at _preserved_tryon — plus a new
         # user-visible message that would need its own test. Revisit together
         # with that finding, not separately.
-        # Only Vast passes a provider — see _do_resume's identical line.
+        # See _do_resume's identical line — every caller here now names its provider explicitly.
         provider_kwargs = {} if gpu_provider is None else {"gpu_provider": gpu_provider}
         start_drain(manifest_path, dry_run=dry_run,
                     resume=phase_a_choice is not None,

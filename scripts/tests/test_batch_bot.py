@@ -4949,7 +4949,8 @@ class TestProvisionFailureRecoveryButtons(unittest.TestCase):
              mock.patch("tgbot.bot.start_drain") as start_drain:
             bot.handle(self.tg, cb_from(ME, f"{bot._CB_RECOVER_RETRY}tg-1"),
                        allowed_user_id=ME)
-        start_drain.assert_called_once_with(self.manifest, dry_run=False, resume=True)
+        start_drain.assert_called_once_with(self.manifest, dry_run=False, resume=True,
+                                            gpu_provider="runpod")
         # Retry keeps the GPU the batch already failed on — switching is the
         # other button's job, and silently rewriting .env's GPU= would change
         # what every LATER batch rents too.
@@ -4978,7 +4979,8 @@ class TestProvisionFailureRecoveryButtons(unittest.TestCase):
                       allowed_user_id=ME)
         self.assertEqual(env_get(self.root / ".env", "GPU"),
                          "NVIDIA GeForce RTX 4090")
-        start_drain.assert_called_once_with(self.manifest, dry_run=False, resume=True)
+        start_drain.assert_called_once_with(self.manifest, dry_run=False, resume=True,
+                                            gpu_provider="runpod")
         self.assertFalse(provision_failure_path(self.manifest).exists())
 
     def test_switch_refuses_a_stale_button_from_an_older_bot_version(self):
@@ -5062,7 +5064,8 @@ class TestMigrationResumesRecoveredManifest(unittest.TestCase):
              mock.patch("tgbot.bot.migration_running", return_value=False), \
              mock.patch("tgbot.bot.start_drain") as start_drain:
             bot.tick_migration_progress(self.tg, ME)
-        start_drain.assert_called_once_with(self.manifest, dry_run=False, resume=True)
+        start_drain.assert_called_once_with(self.manifest, dry_run=False, resume=True,
+                                            gpu_provider="runpod")
         self.assertFalse(bot._migrate_resume_marker().exists())
 
     def test_a_failed_migration_does_not_resume_anything(self):
@@ -6557,7 +6560,9 @@ class TestRunConfirmPanelIsParameterised(unittest.TestCase):
              mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()):
             bot._offer_run_confirm(self.tg, ME, spend_cb="rec:retry:tg-1")
         flat = [data for row in self.tg.buttons[-1] for _, data, *_ in row]
-        self.assertIn("rec:retry:tg-1", flat)
+        # The RunPod screen always names its own provider explicitly (_RUNPOD_SUFFIX), on top of
+        # whatever spend_cb the caller supplied.
+        self.assertIn("rec:retry:tg-1" + bot._RUNPOD_SUFFIX, flat)
         self.assertFalse(any(d.startswith(bot._CB_RUN_GO) for d in flat))
 
     def test_the_no_stock_data_branch_honours_it_too(self):
@@ -6568,7 +6573,7 @@ class TestRunConfirmPanelIsParameterised(unittest.TestCase):
              mock.patch("tgbot.bot.stock_at_cached", side_effect=RuntimeError("runpodctl down")):
             bot._offer_run_confirm(self.tg, ME, spend_cb="rec:retry:tg-1")
         flat = [data for row in self.tg.buttons[-1] for _, data, *_ in row]
-        self.assertIn("rec:retry:tg-1", flat)
+        self.assertIn("rec:retry:tg-1" + bot._RUNPOD_SUFFIX, flat)
 
     def test_a_heading_replaces_the_choose_gpu_line(self):
         with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
@@ -7534,6 +7539,7 @@ class TestVastCallbackSuffix(_VastBase):
     def test_split_provider(self):
         self.assertEqual(bot._split_provider("123"), ("123", None))
         self.assertEqual(bot._split_provider("123:vast"), ("123", "vast"))
+        self.assertEqual(bot._split_provider("123:runpod"), ("123", "runpod"))
         self.assertIsNone(bot._split_provider("123:aws"))
         self.assertIsNone(bot._split_provider("123:vast:x"))
 
@@ -7541,7 +7547,9 @@ class TestVastCallbackSuffix(_VastBase):
         token = "9" * 19       # mtime_ns is 19 digits today
         for prefix in (bot._CB_RUN_GO, bot._CB_PHASE_A_SPEND, bot._CB_PHASE_A_REUSE,
                        bot._CB_PHASE_A_RERUN):
-            self.assertLessEqual(len(f"{prefix}{token}{bot._VAST_SUFFIX}".encode()), 64, prefix)
+            for suffix in (bot._VAST_SUFFIX, bot._RUNPOD_SUFFIX):
+                self.assertLessEqual(len(f"{prefix}{token}{suffix}".encode()), 64,
+                                     f"{prefix} + {suffix}")
 
     def _press(self, data):
         bot.handle(self.tg, cb_from(ME, data), allowed_user_id=ME)
@@ -7569,9 +7577,11 @@ class TestVastCallbackSuffix(_VastBase):
     def test_the_reuse_and_rerun_choosers_carry_the_provider_through(self):
         with mock.patch("tgbot.bot._do_confirm") as confirm:
             self._press(bot._CB_PHASE_A_REUSE + self.token + bot._VAST_SUFFIX)
+            self._press(bot._CB_PHASE_A_RERUN + self.token + bot._RUNPOD_SUFFIX)
             self._press(bot._CB_PHASE_A_RERUN + self.token)
         self.assertEqual(confirm.call_args_list, [
             mock.call(self.tg, ME, dry_run=False, phase_a_choice="reuse", gpu_provider="vast"),
+            mock.call(self.tg, ME, dry_run=False, phase_a_choice="rerun", gpu_provider="runpod"),
             mock.call(self.tg, ME, dry_run=False, phase_a_choice="rerun", gpu_provider=None)])
 
     def test_the_post_phase_a_spend_resumes_on_the_chosen_provider(self):
@@ -7740,6 +7750,14 @@ class TestVastConfirm(_FlowFixture):
         self.assertIn(f"{bot._CB_PHASE_A_REUSE}{token}", flat)
         self.assertIn(f"{bot._CB_PHASE_A_RERUN}{token}", flat)
 
+    def test_the_reuse_and_rerun_chooser_carries_the_runpod_choice(self):
+        # An explicit "runpod" tap on _CB_RUN_GO (2026-09-19 fix) must survive into this
+        # chooser too, or the loophole it closed reopens one screen later.
+        flat = self._chooser_buttons(gpu_provider="runpod")
+        token = bot._run_token(ME)
+        self.assertIn(f"{bot._CB_PHASE_A_REUSE}{token}:runpod", flat)
+        self.assertIn(f"{bot._CB_PHASE_A_RERUN}{token}:runpod", flat)
+
     def test_a_migration_in_flight_does_not_block_a_vast_confirm(self):
         start_drain, _ = self._confirm(gpu_provider="vast", migrating=True)
         start_drain.assert_called_once()
@@ -7854,13 +7872,16 @@ class TestVastPicker(_VastBase):
         first = self.tg.screen_buttons[-1][0]
         self.assertEqual([(label, data) for label, data, *_ in first],
                          [("RunPod ✓", bot._CB_RUN_RUNPOD), ("Vast", bot._CB_RUN_VAST)])
-        self.assertTrue(any(d.startswith(bot._CB_RUN_GO) and not d.endswith(":vast")
-                            for d in self._last_buttons()))
+        # Names its own provider explicitly, same as Vast's tab always has (2026-09-19 fix:
+        # a bare button here used to fall back to .env's GPU_PROVIDER on the tap).
+        self.assertIn(bot._CB_RUN_GO + self.token + bot._RUNPOD_SUFFIX, self._last_buttons())
 
     def test_the_fail_open_runpod_screen_has_the_row_too(self):
         with mock.patch("tgbot.bot.volume_datacenter", return_value=None):
             bot._offer_run_confirm(self.tg, ME)
-        self.assertIn(bot._CB_RUN_VAST, self._last_buttons())
+        buttons = self._last_buttons()
+        self.assertIn(bot._CB_RUN_VAST, buttons)
+        self.assertTrue(any(d.endswith(bot._RUNPOD_SUFFIX) for d in buttons))
 
     def test_the_phase_a_try_on_confirm_has_no_provider_row(self):
         bot._offer_run_confirm(self.tg, ME, phase_a=True)
@@ -7940,7 +7961,8 @@ class TestVastPicker(_VastBase):
             bot.handle(self.tg, cb_from(ME, bot._CB_RUN_RUNPOD), allowed_user_id=ME)
         self.assertIn("Try-on finished", self.tg.screen[-1])
         self.assertIn("RTX 5090", self.tg.screen[-1])
-        self.assertIn(bot._CB_PHASE_A_SPEND + self.token, self._last_buttons())
+        self.assertIn(bot._CB_PHASE_A_SPEND + self.token + bot._RUNPOD_SUFFIX,
+                      self._last_buttons())
 
 
 class TestVastProgressRender(_VastBase):
@@ -8107,6 +8129,18 @@ class TestVastQueueGate(_FlowFixture):
             on_pod_models=[frozenset({"wan-a"}), frozenset({"wan-a", "swap-sam3"})])
         self.assertFalse(self.mailbox.exists())
         self.assertTrue(any("also needs swap-sam3" in m for m in self.tg.messages))
+
+    def test_a_draft_that_cannot_be_resolved_fails_closed_instead_of_crashing(self):
+        # 2026-09-19 review finding: models_for_manifest(draft) used to run outside the try/except
+        # that only guarded the on-pod read, so a KeyError from the draft's own side (e.g. a
+        # pipeline outside PIPELINES — never assembled by the bot's own picker, but the gate must
+        # still fail closed rather than raise) would propagate uncaught.
+        self._assemble_while_draining(
+            "vast", enabled="tryon-motion-enhance",
+            on_pod_models=[frozenset({"wan-a"}), KeyError("no such pipeline")])
+        self.assertFalse(self.mailbox.exists(), "the job was queued despite an unresolvable draft")
+        self.assertTrue(any("Not queued" in m and "could not determine the models" in m
+                            for m in self.tg.messages))
 
     def test_a_job_whose_models_the_pod_already_has_is_queued_as_before(self):
         self._assemble_while_draining("vast", enabled="tryon-motion-enhance")

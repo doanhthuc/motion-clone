@@ -194,7 +194,15 @@ model set is catalog ids **plus setup steps**. DWPose and RIFE self-download on 
 - The quote is `VAST_QUOTE=1 bash scripts/pod-provision.sh` (`vast_rent.py --quote`), so the search
   filters come from the one place that derives them; the bot never re-derives them.
 - "One measured session per pipeline family before its button is enabled" is the
-  `VAST_ENABLED_PIPELINES` list, empty by default.
+  `VAST_ENABLED_PIPELINES` list, and the mechanism ships empty by default (an operator sets it per
+  pipeline). `.env.example`'s own default was changed the same day, on explicit user request, to list
+  every pipeline `PIPELINES` currently has — ahead of a measured session for five of the six — so the
+  gate is enforced by the code but not, for this deployment, by the recommended rollout order.
+- A RunPod spend button also names its provider explicitly in its callback data (`run:go:<token>
+  :runpod` etc., same shape as Vast's `:vast`) — added after review found the original bare button
+  fell back to `.env`'s `GPU_PROVIDER` on the tap, so a host misconfigured with `GPU_PROVIDER=vast`
+  could rent Vast from a button labelled RunPod. A button minted before this fix keeps its old,
+  suffix-less meaning.
 - The spend handlers re-check the hidden-button conditions at tap time, before the manifest is
   rewritten, so a refusal does not invalidate the panel's own buttons. The marketplace search is
   replaced by a price quote for this batch's download size fetched in the last ten minutes.

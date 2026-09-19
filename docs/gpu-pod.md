@@ -595,16 +595,20 @@ but nothing here picks a specific key if the ssh-agent offers more than one).
 ### Choosing Vast from the Telegram bot (2026-09-19)
 
 The Choose GPU screen opens with a `[RunPod] [Vast]` row. RunPod is the default and its screen is
-unchanged apart from that row — but the RunPod tab's spend button passes no provider, so `.env`'s
-`GPU_PROVIDER` decides: keep it at `runpod` on the bot's host. The Vast tab shows the best qualifying 5090 offer with its $/h and
+otherwise unchanged — its own spend button now names `runpod` explicitly in its callback data too
+(`run:go:<token>:runpod` etc., since 2026-09-19; a button minted before that fix has no suffix and
+still falls back to `.env`'s `GPU_PROVIDER`, so keep that at `runpod` on the bot's host regardless).
+The Vast tab shows the best qualifying 5090 offer with its $/h and
 location, this batch's bandwidth and estimated session cost, the cold start, and your Vast credit —
 and no datacenter, stock, Switch-GPU or migrate lines, because a Vast rental has no volume. Its spend
 button is hidden, with the reasons written out, unless all of these hold:
 
 - the manifest's pipeline is listed in `VAST_ENABLED_PIPELINES` (`.env` or the environment,
-  comma-separated). Empty by default: the spec wants one measured Vast session per pipeline family
-  before its button exists, and as of 2026-09-19 only the `motion` stage has ever run on Vast. Add a
-  name after its paid session;
+  comma-separated). The design's own recommendation was to ship this empty and add a pipeline only
+  after its own paid Vast session — as of 2026-09-19 only the `motion` stage had actually run there —
+  but `.env.example`'s default was set to every pipeline the bot offers that same day, on explicit
+  request, ahead of that per-pipeline verification: the first real rental for each of the other five
+  IS the verification run;
 - every stage has a model-registry entry (`make check-vast-models` keeps the repo side honest);
 - a machine passes the filters. The quote is `VAST_QUOTE=1 bash scripts/pod-provision.sh`, i.e.
   `vast_rent.py --quote`: one JSON line, never a rental (about 4 s measured, bounded at 120 s);
