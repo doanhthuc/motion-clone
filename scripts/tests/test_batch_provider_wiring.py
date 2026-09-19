@@ -446,3 +446,85 @@ class TestPodWaitDirectAddress(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# One qualifying offer, shaped like `vastai search offers --raw` rows (same fields the ranker reads).
+_FAKE_OFFER = {"id": 4401, "machine_id": 55, "gpu_name": "RTX 5090", "dph_total": 0.45,
+               "inet_down": 1800.0, "internet_down_cost_per_tb": 2.0, "disk_bw": 3800.0,
+               "cpu_ghz": 3.0, "direct_port_count": 12, "rentable": True,
+               "geolocation": "Bulgaria, BG"}
+
+# A `vastai` that answers searches and fails loudly on anything else, so a rent attempt from a path
+# that must never rent shows up as exit 9 plus a "create" line in the log.
+_FAKE_VASTAI = f"""#!/usr/bin/env python3
+import json, os, sys
+with open(os.environ["FAKE_VASTAI_LOG"], "a", encoding="utf-8") as log:
+    log.write(" ".join(sys.argv[1:]) + "\\n")
+if sys.argv[1:3] == ["search", "offers"]:
+    print(json.dumps([{_FAKE_OFFER!r}]).replace("True", "true"))
+    sys.exit(0)
+sys.exit(9)
+"""
+
+
+class TestProvisionVastBranch(unittest.TestCase):
+    """The real pod-provision.sh against a fake `vastai` first on PATH: no network, no rental."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, self.tmp, ignore_errors=True)
+        (self.tmp / ".env").write_text("", encoding="utf-8")
+        self.bin = self.tmp / "bin"
+        self.bin.mkdir()
+        fake = self.bin / "vastai"
+        fake.write_text(_FAKE_VASTAI, encoding="utf-8")
+        fake.chmod(0o755)
+        self.log = self.tmp / "vastai.log"
+
+    def _run(self, **env):
+        base = {k: v for k, v in os.environ.items()
+                if k not in ("GPU", "GPU_PROVIDER", "POD_VOLUME", "CONFIRM", "VAST_QUOTE",
+                             "VAST_GPU", "VAST_GB", "OFFER", "SKIP", "MAX_DPH")}
+        base.update({"PATH": f"{self.bin}{os.pathsep}{base['PATH']}", "GPU_PROVIDER": "vast",
+                     "POD_VOLUME": "", "FAKE_VASTAI_LOG": str(self.log)})
+        base.update(env)
+        return subprocess.run(["bash", str(ROOT / "scripts" / "pod-provision.sh")], cwd=self.tmp,
+                              env=base, capture_output=True, text=True, timeout=60)
+
+    def _calls(self) -> list[str]:
+        return self.log.read_text(encoding="utf-8").splitlines() if self.log.exists() else []
+
+    def test_a_runpod_gpu_name_is_translated_to_the_vast_spelling(self):
+        out = self._run(GPU="NVIDIA GeForce RTX 5090", VAST_QUOTE="1")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("gpu_name=RTX_5090", self._calls()[0])
+        self.assertNotIn("GeForce", self._calls()[0])
+
+    def test_vast_gpu_overrides_the_translation(self):
+        out = self._run(GPU="NVIDIA GeForce RTX 5090", VAST_GPU="RTX_4090", VAST_QUOTE="1")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("gpu_name=RTX_4090", self._calls()[0])
+
+    def test_an_already_vast_spelled_gpu_passes_through_untouched(self):
+        out = self._run(GPU="RTX_5090", VAST_QUOTE="1")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("gpu_name=RTX_5090", self._calls()[0])
+
+    def test_an_unknown_runpod_name_is_refused_by_name_before_any_search(self):
+        out = self._run(GPU="NVIDIA RTX PRO 4500 Blackwell", VAST_QUOTE="1")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("VAST_GPU", out.stderr)
+        self.assertEqual(self._calls(), [])
+
+    def test_a_quote_prints_one_json_line_and_never_rents_even_with_confirm_set(self):
+        out = self._run(GPU="RTX_5090", VAST_QUOTE="1", CONFIRM="yes")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        quote = json.loads(out.stdout.strip().splitlines()[-1])
+        self.assertEqual(quote["offer_id"], 4401)
+        self.assertAlmostEqual(quote["dph"], 0.45)
+        self.assertFalse([c for c in self._calls() if c.startswith("create")], self._calls())
+
+    def test_without_a_quote_and_without_confirm_it_is_still_the_plain_dry_run(self):
+        out = self._run(GPU="RTX_5090")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout.strip().splitlines()[-1], "4401")

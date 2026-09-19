@@ -394,6 +394,19 @@ def rent(api: VastApi, cfg: RentConfig, board: Scoreboard, *, confirm: bool,
                     f"after {pulls} pull attempt(s) and {create_failures} failed create(s){tail}")
 
 
+def quote_json(result: RentResult, gb: float) -> str:
+    """The best offer and the terms that priced it, as one JSON line (`--quote`). The bot's
+    provider panel reads this instead of scraping the human-readable shortlist."""
+    best = result.chosen
+    offer = best.offer
+    return json.dumps({
+        "offer_id": offer.get("id"), "machine_id": best.machine_id,
+        "dph": float(offer["dph_total"]), "gpu": offer.get("gpu_name"),
+        "location": offer.get("geolocation"), "ready_s": best.ready_s, "known": best.known,
+        "bandwidth_usd": best.bandwidth_usd, "gb": gb, "qualifying": len(result.ranked)},
+        sort_keys=True)
+
+
 _IPV4_RE = re.compile(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$")
 _HOSTNAME_CHARS_RE = re.compile(r"^[A-Za-z0-9.-]+$")
 
@@ -451,6 +464,9 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
     ap.add_argument("--skip", default="")
     ap.add_argument("--offer", default="")
     ap.add_argument("--confirm", action="store_true")
+    ap.add_argument("--quote", action="store_true",
+                    help="dry run that prints ONE JSON line (the best offer and its cost terms); "
+                         "never rents, and cannot be combined with --confirm")
     ap.add_argument("--ssh-target", metavar="INSTANCE_ID")
     return ap.parse_args(argv)
 
@@ -493,6 +509,10 @@ def main(argv: list[str] | None = None) -> int:
             _stderr(f"missing --{required.replace('_', '-')}")
             return 2
 
+    if args.quote and args.confirm:
+        _stderr("--quote and --confirm are mutually exclusive: a quote never rents")
+        return 2
+
     # F7/I5: the deadline must stay under the watchdog's grace (tier 3 reaps an unleased
     # labelled instance GRACE_MIN minutes after it first sees it) with a minute of slack for
     # bookkeeping — see test_the_pull_deadline_leaves_room_inside_the_watchdog_grace.
@@ -527,6 +547,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\033[31m ✗ \033[0m{exc}", file=sys.stderr)
         return 1
 
+    if args.quote:
+        print(quote_json(result, args.gb))
+        return 0
     if not args.confirm:
         _stderr(f"\n{len(result.ranked)} qualifying offer(s), best first:\n"
                 f"{format_table(result.ranked)}\n\n"

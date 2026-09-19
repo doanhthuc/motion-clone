@@ -481,10 +481,33 @@ fi
 command -v vastai >/dev/null || die "vastai CLI not found:  pip install vastai  &&  vastai set api-key <key>"
 command -v python3 >/dev/null || die "python3 needed to run scripts/vast_rent.py"
 
-VAST_ARGS=(--gpu "$GPU" --disk "$DISK" --image "$IMAGE" --max-dph "$MAX_DPH"
+# The Telegram bot's .env carries the RunPod spelling of the GPU ("NVIDIA GeForce RTX 5090"); the
+# Vast marketplace spells it RTX_5090, and a name with spaces is not even one search token. Measured
+# 2026-09-19: a marketplace search filtered on gpu_name=NVIDIA GeForce RTX 5090 fails with "invalid
+# JSON", while gpu_name=RTX_5090 returned 4 qualifying offers. VAST_GPU wins when set; otherwise the
+# two RunPod names this repo uses are translated, and any other name with a space is refused by name
+# rather than sent to a search that can only fail.
+VAST_GPU="${VAST_GPU:-$(env_get VAST_GPU)}"
+if [ -z "$VAST_GPU" ]; then
+  case "$GPU" in
+    "NVIDIA GeForce RTX 5090") VAST_GPU=RTX_5090 ;;
+    "NVIDIA GeForce RTX 4090") VAST_GPU=RTX_4090 ;;
+    *" "*) die "GPU='$GPU' is a RunPod name, and Vast spells GPUs differently (e.g. RTX_5090).
+    Set VAST_GPU=RTX_5090 (or the Vast name you want) in .env or the environment." ;;
+    *) VAST_GPU="$GPU" ;;
+  esac
+fi
+
+VAST_ARGS=(--gpu "$VAST_GPU" --disk "$DISK" --image "$IMAGE" --max-dph "$MAX_DPH"
            --reliability "$RELIABILITY" --min-disk-bw "$MIN_DISK_BW" --min-cpu-ghz "$MIN_CPU_GHZ")
 [ -n "$OFFER" ] && VAST_ARGS+=(--offer "$OFFER")
 [ -n "$SKIP" ] && VAST_ARGS+=(--skip "$SKIP")
-[ "${CONFIRM:-}" = "yes" ] && VAST_ARGS+=(--confirm)
+# VAST_QUOTE=1 is the bot's price check: vast_rent.py prints one JSON line and rents nothing. It
+# outranks CONFIRM=yes on purpose, so a quote can never turn into a rental whatever else is set.
+if [ "${VAST_QUOTE:-}" = "1" ]; then
+  VAST_ARGS+=(--quote)
+elif [ "${CONFIRM:-}" = "yes" ]; then
+  VAST_ARGS+=(--confirm)
+fi
 
 exec python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/vast_rent.py" "${VAST_ARGS[@]}"

@@ -711,6 +711,30 @@ class TestMain(unittest.TestCase):
         self.assertEqual(api.destroyed, ["i1"])
         self.assertNotIn("GPU_INSTANCE_ID=i1", (self.tmp / ".env").read_text(encoding="utf-8"))
 
+    def test_quote_prints_one_json_line_and_rents_nothing(self):
+        api = FakeVast([offer(7, 70)])
+        rc, out, _ = self._main(api, "--quote")
+        self.assertEqual(rc, 0)
+        quote = json.loads(out)
+        self.assertEqual(quote["offer_id"], 7)
+        self.assertEqual(quote["machine_id"], 70)
+        self.assertAlmostEqual(quote["dph"], 0.40)
+        self.assertFalse(quote["known"])
+        self.assertEqual(quote["qualifying"], 1)
+        self.assertEqual(api.create_attempts, [])
+
+    def test_quote_and_confirm_together_are_refused_before_any_search(self):
+        api = FakeVast([offer(7, 70)])
+        rc, out, _ = self._main(api, "--quote", "--confirm")
+        self.assertEqual((rc, out), (2, ""))
+        self.assertEqual(api.queries, [])
+        self.assertEqual(api.create_attempts, [])
+
+    def test_quote_with_no_qualifying_offer_exits_1_with_the_reason(self):
+        rc, out, err = self._main(FakeVast([offer(7, 70, dph=0.99)]), "--quote")
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn("over price cap", err)
+
     def test_ssh_target_prints_host_and_port(self):
         rc, out, _ = self._main(FakeVast([]), "--ssh-target", "51518664")
         self.assertEqual((rc, out.strip()), (0, "1.2.3.4 40022"))
