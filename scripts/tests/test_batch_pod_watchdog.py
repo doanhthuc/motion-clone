@@ -620,6 +620,50 @@ class TestTwoProviders(unittest.TestCase):
         self.assertTrue(self.lease_path.is_file(), "an unknown-provider lease was cleared")
 
 
+class GonePods:
+    """destroy() raises like a CLI told to delete something that no longer exists."""
+    def __init__(self, pods):
+        self.pods = pods
+
+    def list_pods(self):
+        return list(self.pods)
+
+    def destroy(self, pod_id):
+        raise RuntimeError(f"no such instance {pod_id}")
+
+
+class TestAlreadyGoneDestroy(unittest.TestCase):
+    def test_a_destroy_error_for_an_instance_no_longer_listed_counts_as_destroyed(self):
+        self.assertTrue(pod_watchdog.destroy_verified(GonePods([]), "777"))
+
+    def test_a_destroy_error_for_an_instance_still_listed_is_still_an_error(self):
+        with self.assertRaises(RuntimeError) as cm:
+            pod_watchdog.destroy_verified(GonePods([PodInfo("777", "motion-transfer")]), "777")
+        self.assertIn("no such instance", str(cm.exception))
+
+    def test_when_neither_the_destroy_nor_the_listing_works_it_is_not_verified(self):
+        api = GonePods([])
+
+        def broken():
+            raise RuntimeError("cannot list")
+
+        api.list_pods = broken
+        with self.assertRaises(RuntimeError):
+            pod_watchdog.destroy_verified(api, "777")
+
+    def test_an_expired_lease_for_an_already_gone_instance_is_cleared(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lease_path = Path(tmp) / "pod-lease.json"
+            write_lease(lease_path, Lease("777", 0.0, "batch/test.yaml", 10, provider="vast"))
+            with patch.object(pod_watchdog, "LEASE_PATH", lease_path), \
+                 patch.object(pod_watchdog, "MIGRATE_LEASE_PATH", Path(tmp) / "m.json"), \
+                 patch.object(pod_watchdog, "log", lambda *_: None):
+                pod_watchdog.tick(FakePods(), {}, now=1000.0 * 60.0, dry_run=False,
+                                  extra_apis={"vast": GonePods([])})
+            self.assertFalse(lease_path.is_file(),
+                             "the lease of an instance that is already gone was kept forever")
+
+
 class TestOnceExitCode(unittest.TestCase):
     """Minor: --once must fail loudly. make watchdog-dry is acceptance step A1."""
 

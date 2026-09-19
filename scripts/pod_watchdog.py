@@ -46,8 +46,18 @@ def destroy_verified(pods_api, pod_id: str) -> bool:
     does this. The check goes through the injected PodControl rather than inside
     RunpodCtl.destroy so a fake with a no-op destroy proves the caller keeps its
     lease instead of silently declaring victory.
+
+    If destroy raises, the instance may be already gone; re-list to confirm.
     """
-    pods_api.destroy(pod_id)
+    try:
+        pods_api.destroy(pod_id)
+    except RuntimeError:
+        # A destroy of something that is already gone exits non-zero. What matters is whether it
+        # is still LISTED: gone means the goal is met; still listed means the error is real.
+        # If the listing itself raises, that propagates — an unverifiable destroy is not success.
+        if any(p.pod_id == pod_id for p in pods_api.list_pods()):
+            raise
+        return True
     still_there = any(p.pod_id == pod_id for p in pods_api.list_pods())
     return not still_there
 
