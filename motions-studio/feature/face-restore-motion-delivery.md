@@ -3,6 +3,33 @@
 > Trạng thái: **PLAN — chưa triển khai** (17/07/2026, hoãn vì client đang sử dụng hệ thống).
 > Điều kiện tiên quyết: cài node + model trên box `.165` (bước 1) — cần restart ComfyUI, chỉ làm lúc vắng job.
 
+> 18/09/2026: a second, independent consumer now wants the same node+model — `_apply_facelock_restore`
+> (linux.py, wired right after `_apply_face_lock`) runs CodeFormer on the faceLock swap's output to fix
+> its own flatter/waxier face (inswapper_128's fixed 128x128 working resolution), gated by
+> `params.faceLockRestore`, default off. Same failure mode, same fix, different upstream cause (ESRGAN
+> not knowing faces here vs. inswapper's fixed low-res crop there). Installing Step 1 below unblocks
+> both this delivery-pass feature AND faceLockRestore — do it once.
+>
+> **18/09/2026 — TESTED for faceLockRestore, TRADE-OFF not a clear win or loss.** Installed the node +
+> model on a pod (RTX PRO 4500, EU-RO-1) and ran `batch/2026-09-18-face-identity-ab.yaml` arm E against
+> the same reference/driver as arms A-D. CodeFormer *did* fix the waxy/mushy texture (visibly sharper
+> than plain faceLock). But at fidelity 0.5 it also pulled the face toward its own generic "pretty"
+> prior — fuller/redder lips, bigger eyes, a more oval face shape — noticeably further from both the
+> reference photo and the plain-swap output, not closer. Re-ran at fidelity 0.7 (this doc's own §3.4
+> mitigation guess) expecting less drift: no visible difference from 0.5 at either of two timestamps
+> checked — likely because inswapper's swap has already destroyed the fine identity detail before
+> CodeFormer ever sees the frame, so there's nothing distinctive left for a higher fidelity to "stick
+> to". Checked frame-to-frame stability too (§3.4's flicker worry, and the actual original complaint
+> that started this): burst of 18 consecutive frames at 5.0-5.6s came back stable, no visible flicker —
+> so the restore pass does NOT reintroduce the per-frame-independence risk this doc's plan worried about.
+> **Net: this is a genuine, stable improvement on texture, traded for a genuine, stable shift away from
+> the reference person's exact likeness — a product call (matches-the-photo vs. looks-polished), not a
+> bug to fix or a regression to avoid.** doanhthuc's read after seeing both: fidelity 0.5 is acceptable.
+> Not tested: fidelity above 0.7, a different face-detection backend, or a different restore model
+> entirely (GFPGAN) — any of those would need fresh measurement before trying again, not just re-reading
+> this note. Evidence not kept (out/2026-09-18-2300 and out/2026-09-18-2333 are gitignored `out/`,
+> cleaned up on a normal `batch-clean` pass same as any other run).
+
 ## 1. Vấn đề & chẩn đoán (đã xác minh từ DB job 17/07)
 
 Răng trong output motion bị "bể pixel" (vỡ khối). Chẩn đoán từ job `074be83e` (motion, faceSource=liveportrait,

@@ -431,8 +431,18 @@ def _apply_face_lock(src_mp4, ref_image, tmp_dir, params, job_id):
         return src_mp4
     dst = os.path.join(tmp_dir, "facelock.mp4")
     api_progress(job_id, 0.91, "khóa mặt người mẫu (faceLock)")
+    # 19/09/2026 - faceLockBlend: inswapper_128 renders fuller lips than the reference photo, confirmed
+    # on real jobs' native pre-enhance output (see swap_video.py's _swap_blended comment for the fix
+    # itself). 1.0 = today's behavior unchanged (also the fast path — skips the reimplemented merge).
     try:
-        r = subprocess.run([py, script, "--ref", ref_image, "--inp", src_mp4, "--out", dst],
+        _blend = float(params.get("faceLockBlend", params.get("face_lock_blend",
+                       os.environ.get("MOTION_FACELOCK_BLEND_DEFAULT", "1.0"))))
+    except Exception:
+        _blend = 1.0
+    _blend = max(0.0, min(1.0, _blend))
+    try:
+        r = subprocess.run([py, script, "--ref", ref_image, "--inp", src_mp4, "--out", dst,
+                            "--blend", f"{_blend:.3f}"],
                            capture_output=True, text=True, timeout=1800)
         if r.returncode != 0 or not (os.path.isfile(dst) and os.path.getsize(dst) > 1024):
             api_log(job_id, f"faceLock lỗi (giữ output gốc): {((r.stderr or '') + (r.stdout or ''))[-400:]}", "warn")
@@ -463,6 +473,93 @@ def _apply_face_lock(src_mp4, ref_image, tmp_dir, params, job_id):
         api_log(job_id, f"faceLock lỗi (giữ output gốc): {e}", "warn")
     return src_mp4
 # #endregion
+
+
+# faceLock restore (18/09/2026): inswapper_128 works at a fixed 128x128 internally, so when the
+# swapped face fills a large part of the frame the result comes back flatter/waxier than Wan's own
+# render — confirmed by eye on batch/2026-09-18-face-identity-ab.yaml (evidence in .smoke/ab-face/,
+# facelock-final.mp4 vs original-final.mp4). Same symptom class and same fix already scoped (but not
+# shipped) for the ESRGAN delivery pass in motions-studio/feature/face-restore-motion-delivery.md —
+# this reuses the same node/model/env vars so a box that installs one gets both for free.
+# TESTED 18/09/2026 on a pod: fixes the waxy texture, stable frame-to-frame (checked, no flicker), but
+# shifts likeness toward CodeFormer's own generic prior (fuller lips, bigger eyes, more oval face)
+# rather than the exact reference person — fidelity 0.5 vs 0.7 made no visible difference either way.
+# Reviewed by doanhthuc: fidelity 0.5 is an acceptable trade-off. Full writeup: face-restore-motion-
+# delivery.md's 18/09 addendum. Default OFF (params.faceLockRestore / env MOTION_FACELOCK_RESTORE_DEFAULT)
+# until that install is standard on every box. Missing node/model = warn + keep the plain swap, never
+# fails the job.
+def build_facelock_restore_workflow(video_name, fps, prefix="facelock-restore", fidelity=0.5, frames_per_batch=16):
+    _frm = os.environ.get("MOTION_FACE_RESTORE_MODEL", "codeformer-v0.1.0.pth")
+    _fd = os.environ.get("MOTION_FACE_DETECT", "retinaface_resnet50")
+    return {
+        "05": {"class_type": "VHS_BatchManager", "inputs": {"frames_per_batch": int(frames_per_batch)}},
+        "10": {"class_type": "VHS_LoadVideo", "inputs": {
+               "video": video_name, "force_rate": 0, "custom_width": 0, "custom_height": 0,
+               "frame_load_cap": 0, "skip_first_frames": 0, "select_every_nth": 1,
+               "format": "AnimateDiff", "meta_batch": ["05", 0]}},
+        "20": {"class_type": "FaceRestoreModelLoader", "inputs": {"model_name": _frm}},
+        "30": {"class_type": "FaceRestoreCFWithModel", "inputs": {
+               "facerestore_model": ["20", 0], "image": ["10", 0], "facedetection": _fd,
+               "codeformer_fidelity": max(0.0, min(1.0, float(fidelity)))}},
+        "110": {"class_type": "VHS_VideoCombine", "inputs": {
+                "images": ["30", 0], "frame_rate": int(fps), "loop_count": 0, "filename_prefix": prefix,
+                "format": "video/h264-mp4", "pix_fmt": "yuv420p", "crf": 16,
+                "pingpong": False, "save_output": True, "meta_batch": ["05", 0]}},
+    }
+
+
+def _apply_facelock_restore(src_mp4, tmp_dir, params, job_id):
+    _default = os.environ.get("MOTION_FACELOCK_RESTORE_DEFAULT", "0")
+    want = str(params.get("faceLockRestore", params.get("face_lock_restore", _default))).strip().lower() \
+        not in ("0", "false", "no", "off", "none", "")
+    if not want:
+        return src_mp4
+    if not _comfy_has_node("FaceRestoreCFWithModel"):
+        api_log(job_id, "faceLockRestore on but node FaceRestoreCFWithModel is missing "
+                         "(install mav-rik/facerestore_cf + codeformer-v0.1.0.pth — see "
+                         "motions-studio/feature/face-restore-motion-delivery.md) — skipping, keeping the plain swap", "warn")
+        return src_mp4
+    try:
+        fidelity = float(params.get("faceLockFidelity", params.get("face_lock_fidelity", 0.5)))
+    except Exception:
+        fidelity = 0.5
+    try:
+        fps = _video_fps(src_mp4) or int(params.get("render_fps", params.get("fps", 16)) or 16)
+        frames = _video_nframes(src_mp4) or 0
+        fpb = max(1, int(os.environ.get("MOTION_FACELOCK_RESTORE_BATCH", "16")))
+        api_progress(job_id, 0.92, "phục hồi chi tiết mặt (CodeFormer)")
+        name = comfy_upload(src_mp4)
+        prefix = f"flrestore-{job_id[:8]}-{int(time.time()) % 100000}"
+        comfy_submit(build_facelock_restore_workflow(name, fps, prefix=prefix, fidelity=fidelity, frames_per_batch=fpb))
+        # VHS meta-batch requeues its own prompt per chunk, so comfy_poll's single-prompt wait doesn't
+        # apply — mirror the moov-atom-finalize wait already used in _apply_motion_detail_upscale (~843).
+        _deadline = time.time() + max(300, frames * 1.5)
+        _hb = 0.0
+        out = None
+        while time.time() < _deadline:
+            out = _comfy_prefixed_output(prefix)
+            if out:
+                break
+            now = time.time()
+            if now - _hb > 15:
+                api_heartbeat(job_id); _hb = now
+            if api_job_cancelled(job_id):
+                comfy_interrupt(); raise RuntimeError("job cancelled — stopped ComfyUI")
+            time.sleep(5)
+        if not out:
+            comfy_interrupt()
+            raise RuntimeError("CodeFormer pass returned no MP4 (deadline exceeded)")
+        if _has_audio(src_mp4):
+            muxed = os.path.join(tmp_dir, "facelock_restore_audio.mp4")
+            subprocess.run(["ffmpeg", "-nostdin", "-y", "-v", "error", "-i", out, "-i", str(src_mp4),
+                            "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-shortest", muxed],
+                           check=True, capture_output=True, timeout=600)
+            out = muxed
+        api_log(job_id, f"faceLockRestore OK (fidelity {fidelity:.2f})", "info")
+        return out
+    except Exception as e:
+        api_log(job_id, f"faceLockRestore lỗi (giữ bản swap): {e}", "warn")
+        return src_mp4
 
 
 # #region ALD 27/07/2026 - DRIFT-FIX: trị "màu ngả dần (tím/cam) theo thời lượng" của Motion Transfer.
@@ -5286,6 +5383,11 @@ def run_motion(job):
     # ALD 05/07/2026 - faceLock (opt-in faceLock=1 / env MOTION_FACELOCK_DEFAULT=1): khóa identity mặt về ảnh
     # mẫu bằng inswapper. Sau grade/audio, TRƯỚC RIFE/upload. Giữ audio (mux lại bên trong). Tắt/chưa cài = no-op.
     out_mp4 = _apply_face_lock(out_mp4, ref_local, tmp, params, job_id)
+    # 18/09/2026 - optional CodeFormer pass right after the swap, to fix the flatter/waxier face inswapper_128
+    # leaves behind. Opt-in, tested (fidelity 0.5 = acceptable trade-off, see _apply_facelock_restore
+    # above). No-op unless params.faceLockRestore=1 (needs faceLock=1 too, since it restores the swap's
+    # output, not the raw video).
+    out_mp4 = _apply_facelock_restore(out_mp4, tmp, params, job_id)
 
     # ── Nội suy fps (RIFE) — opt-in, pass RIÊNG (Wan đã offload) tránh OOM. Tối đa 30s (≈481 frame @16fps).
     # ALD 16/06/2026 - ĐÃ BỎ 60fps (chỉ còn: Gốc 16fps · 30fps RIFE ×2). Preset MAX render NATIVE 30fps

@@ -27,6 +27,15 @@
       },
       "faceLock": {
         "why": "_apply_face_lock:424 — post-render identity swap back to the reference face (insightface/inswapper_128), called by run_motion at linux.py:5288 but defined outside it, so the AST scanner misses it. Needs ~/facelock on the pod (make gpu-facelock); missing install is a warn and the original output is kept."
+      },
+      "faceLockBlend": {
+        "why": "_apply_face_lock:424 (passed through to swap_video.py --blend, see its _swap_blended) — merge strength 0..1 for the post-render swap. Added 19/09/2026: inswapper_128 renders visibly fuller lips than the reference photo, confirmed on a real job's own native pre-enhance output, so it's the swap model's own geometry bias — not an enhance artifact, and CodeFormer restore made it worse, not better. Default 1.0 (today's behavior, unchanged, and the fast path since it skips the reimplemented merge). Lower values keep more of Wan's own rendered face; local CPU test (no GPU) showed lip fullness genuinely shrinking from 1.0 down to 0.3 with no visible seam. NOT YET TESTED on GPU/video — only a single still frame so far, temporal stability and identity retention at lower values unverified."
+      },
+      "faceLockRestore": {
+        "why": "_apply_facelock_restore:497 — CodeFormer pass right after faceLock's swap, to fix the flatter/waxier face inswapper_128 leaves behind (its internal working res is fixed at 128x128). Called by run_motion at linux.py:5375 but defined outside it. Opt-in, default off. TESTED 18/09/2026 on a pod (see motions-studio/feature/face-restore-motion-delivery.md's 18/09 addendum) — fixes the waxy texture and frame-to-frame result is stable (checked, no flicker), but shifts likeness toward CodeFormer's generic prior (fuller lips, bigger eyes, more oval face) rather than the exact reference person. Reviewed by doanhthuc: fidelity 0.5 is an acceptable trade-off. Needs the ComfyUI node+model (facerestore_cf + codeformer-v0.1.0.pth) — missing node is a warn and the plain swap is kept."
+      },
+      "faceLockFidelity": {
+        "why": "_apply_facelock_restore:497 — CodeFormer's own codeformer_fidelity knob (0=beautify/hallucinate more, 1=stick to the swapped input). Only has effect when faceLockRestore=1. Default 0.5. TESTED 0.5 vs 0.7 on a pod 18/09/2026: no visible difference in identity drift between the two — raising fidelity did NOT reduce it, contrary to face-restore-motion-delivery.md's untested guess. Not tried: above 0.7."
       }
     },
     "api": {

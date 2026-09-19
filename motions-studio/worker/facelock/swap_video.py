@@ -16,6 +16,50 @@ def _area(f):
     return (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1])
 
 
+# 19/09/2026 - inswapper_128 consistently renders fuller/bigger lips than the reference photo,
+# confirmed on a real job's own native 544x960 output (before any enhance pass) so it's this
+# model's own geometry bias, not an enhance artifact and not fixable by fidelity/restore knobs
+# (already tried CodeFormer at 0.5/0.7 — made lips fuller, not less). paste_back=True has no
+# blend knob upstream, so this reimplements insightface's own INSwapper.get(paste_back=True)
+# (python-package/insightface/model_zoo/inswapper.py on deepinsight/insightface, read 19/09/2026)
+# with one change: the merge mask is scaled by `blend` before compositing, so less of Wan's
+# original face gets replaced — trading identity-lock strength for less geometry distortion.
+# Drops upstream's fake_diff computation: read the source, that mask is built but never used in
+# the final merge there (the line assigning it is commented out) — dead weight, not a behavior
+# this needs to match. blend=1.0 (default) skips all of this and calls the unmodified upstream
+# method, so today's output is bit-for-bit unchanged unless a caller opts into blend<1.
+def _swap_blended(swapper, frame, tgt, src_face, blend):
+    if blend >= 0.999:
+        return swapper.get(frame, tgt, src_face, paste_back=True)
+    import cv2
+    import numpy as np
+
+    bgr_fake, M = swapper.get(frame, tgt, src_face, paste_back=False)
+    target_img = frame
+    IM = cv2.invertAffineTransform(M)
+    aimg_h, aimg_w = bgr_fake.shape[:2]
+    img_white = np.full((aimg_h, aimg_w), 255, dtype=np.float32)
+    bgr_fake_warp = cv2.warpAffine(bgr_fake, IM, (target_img.shape[1], target_img.shape[0]), borderValue=0.0)
+    img_white = cv2.warpAffine(img_white, IM, (target_img.shape[1], target_img.shape[0]), borderValue=0.0)
+    img_white[img_white > 20] = 255
+    img_mask = img_white
+    mask_h_inds, mask_w_inds = np.where(img_mask == 255)
+    if mask_h_inds.size == 0:
+        return target_img
+    mask_h = np.max(mask_h_inds) - np.min(mask_h_inds)
+    mask_w = np.max(mask_w_inds) - np.min(mask_w_inds)
+    mask_size = int(np.sqrt(mask_h * mask_w))
+    k = max(mask_size // 10, 10)
+    img_mask = cv2.erode(img_mask, np.ones((k, k), np.uint8), iterations=1)
+    k = max(mask_size // 20, 5)
+    blur_size = (2 * k + 1, 2 * k + 1)
+    img_mask = cv2.GaussianBlur(img_mask, blur_size, 0)
+    img_mask = (img_mask / 255.0) * float(blend)
+    img_mask = np.reshape(img_mask, [img_mask.shape[0], img_mask.shape[1], 1])
+    fake_merged = img_mask * bgr_fake_warp + (1 - img_mask) * target_img.astype(np.float32)
+    return fake_merged.astype(np.uint8)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ref", required=True, help="ảnh mẫu (nguồn identity)")
@@ -23,6 +67,8 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--det", type=int, default=640, help="det_size SCRFD")
     ap.add_argument("--crf", type=int, default=15)
+    ap.add_argument("--blend", type=float, default=1.0,
+                     help="merge strength 0..1 (1.0 = today's behavior, lower keeps more of Wan's own face)")
     args = ap.parse_args()
 
     import cv2
@@ -99,7 +145,7 @@ def main():
         else:
             tgt = None
         if tgt is not None:
-            frame = swapper.get(frame, tgt, src_face, paste_back=True)
+            frame = _swap_blended(swapper, frame, tgt, src_face, args.blend)
             swapped += 1
         ff.stdin.write(frame.tobytes())
         n += 1
