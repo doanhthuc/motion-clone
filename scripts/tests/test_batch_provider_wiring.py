@@ -81,6 +81,18 @@ class TestScriptsUseTheHelpers(unittest.TestCase):
             text = (ROOT / "scripts" / name).read_text(encoding="utf-8")
             self.assertIn("lib-gpu-provider.sh", text, name)
 
+    def test_smoke_sources_the_helper_through_root_not_its_own_location(self):
+        # pod-smoke.sh does `cd "$(dirname "$0")/.."` before sourcing, so a BASH_SOURCE-relative
+        # path is resolved from the NEW cwd and breaks for any relative $0 other than
+        # `bash scripts/pod-smoke.sh` from the repo root. Then pod_volume is "command not found",
+        # POD_VOLUME comes out empty, and layers 5-6 print a false "POD_VOLUME not set" skip.
+        text = (ROOT / "scripts" / "pod-smoke.sh").read_text(encoding="utf-8")
+        src = [ln for ln in text.splitlines()
+               if ln.startswith(". ") and "lib-gpu-provider.sh" in ln]
+        self.assertEqual(len(src), 1, src)
+        self.assertIn("$ROOT/scripts/lib-gpu-provider.sh", src[0])
+        self.assertNotIn("BASH_SOURCE", src[0])
+
     def test_bootstrap_and_smoke_no_longer_read_the_volume_straight_from_dotenv(self):
         for name in ("pod-bootstrap.sh", "pod-smoke.sh"):
             text = (ROOT / "scripts" / name).read_text(encoding="utf-8")
