@@ -30,6 +30,11 @@ die()  { printf '\n\033[1;31m  ✗ %s\033[0m\n' "$*"; exit 1; }
 
 CATALOG="${CATALOG:-$ROOT/comfyui/catalog.json}"
 VOL="${POD_VOLUME:-}"
+# A plain destination directory, no volume needed -- Vast has no Network Volume (spec
+# docs/superpowers/specs/2026-09-19-vast-fallback-design.md section 3.3), so on Vast this points
+# straight at $COMFY_DIR/models instead of $POD_VOLUME/comfy-models. POD_VOLUME still wins when
+# both happen to be set, so the existing RunPod flow is unchanged when this is left unset.
+DEST="${MODELS_DIR:-}"
 MODE=""; SEL_GROUPS=(); SEL_IDS=(); DRY=0
 
 while [ $# -gt 0 ]; do
@@ -66,15 +71,17 @@ PY
   exit 0
 fi
 
-[ -n "$VOL" ] || die "cần POD_VOLUME=<đường mount volume>, vd POD_VOLUME=/workspace"
-[ -d "$VOL" ] || die "$VOL không tồn tại — volume chưa mount?"
+if [ -z "$DEST" ]; then
+  [ -n "$VOL" ] || die "cần POD_VOLUME=<đường mount volume> hoặc MODELS_DIR=<thư mục đích>"
+  [ -d "$VOL" ] || die "$VOL không tồn tại — volume chưa mount?"
+fi
 command -v aria2c >/dev/null 2>&1 || {
   say "cài aria2 …"
   (apt-get update -qq && apt-get install -y -qq aria2) >/dev/null 2>&1 \
     || die "không cài được aria2c (apt-get install aria2)"
 }
 
-MODELS="$VOL/comfy-models"
+MODELS="${DEST:-$VOL/comfy-models}"
 mkdir -p "$MODELS" || die "không tạo được $MODELS"
 
 # ── Chọn mục cần tải, và CHECK DUNG LƯỢNG TRƯỚC ─────────────────────────────
@@ -164,7 +171,7 @@ NSKIP=$(awk -F'\t' '$1=="SKIP"{n++} END{print n+0}' "$PLAN")
 #   • `%d` trong mawk (awk mặc định Ubuntu) là int 32-bit → 42803400000 bị KẸP thành 2147483647,
 #     tức 42.8GB hiện ra thành "2.1GB đã dùng" — sai mà trông vẫn hợp lý, loại tệ nhất.
 # %.0f dùng double, đúng tới 2^53 byte.
-USED=$(du -sb "$VOL" 2>/dev/null | awk '{printf "%.0f", $1}')
+USED=$(du -sb "${DEST:-$VOL}" 2>/dev/null | awk '{printf "%.0f", $1}')
 if [ -n "${VOLUME_GB:-}" ] && [ "${USED:-0}" -gt 0 ]; then
   AVAIL=$(( VOLUME_GB * 1000000000 - USED ))
   [ "$AVAIL" -lt 0 ] && AVAIL=0
