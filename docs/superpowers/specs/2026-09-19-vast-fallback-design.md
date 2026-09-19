@@ -50,9 +50,11 @@ gate, with one measured Vast session per new pipeline family before its button i
 
 ### 3.1 Provider follows the run, not `.env`
 
-- `drain.py --provider vast|runpod` (default: `.env`'s `GPU_PROVIDER`). It exports `GPU_PROVIDER` and an
-  **empty** `POD_VOLUME` / `POD_VOLUME_ID` to every child (`pod-provision.sh`, `pod-wait.sh`,
-  `pod-bootstrap.sh`, `make gpu-destroy`, `make gpu-logs`). `.env` keeps `runpod` as the home value.
+- `drain.py --provider vast|runpod` (default: `.env`'s `GPU_PROVIDER`). It exports `GPU_PROVIDER` to
+  every child and passes an empty `POD_VOLUME` to `pod-provision.sh` only. The other scripts and the
+  Makefile prefer the exported provider and derive an empty volume off RunPod (`scripts/lib-gpu-provider.sh`,
+  `GPU_PROVIDER_EFF`/`POD_VOLUME_EFF`), which they resolve environment-first, then `.env`, then `vast`
+  (the same order as `pod-provision.sh:21`). `.env` keeps `runpod` as the home value.
 - `Lease.provider` (default `"runpod"` when absent, so leases already on the VPS stay valid) is the
   watchdog's source of truth.
 - Makefile targets that read the provider with `grep .env` change to prefer `$(GPU_PROVIDER)` from the

@@ -500,6 +500,26 @@ Consequence for anything automated: **search and rent must be one atomic motion 
 simply be invisible to the next call. `pod-provision.sh` does search-then-create in one run, which
 is right, but it has no retry loop and its `OFFER=` pin is therefore flaky by construction.
 
+<a id="vast-provider"></a>
+### Running one batch on Vast — `PROVIDER=vast` (2026-09-19)
+
+`make drain FILE=batch/<name>.yaml PROVIDER=vast CONFIRM=yes` rents on Vast for that run only. The
+root `.env` keeps `GPU_PROVIDER=runpod`; the provider travels in the process environment and in the
+lease (`batch/pod-lease.json`, field `provider`). A Vast run never has a Network Volume, whatever
+`POD_VOLUME` says in `.env`.
+
+What guards a Vast instance: the lease (tiers 1–2, destroyed through `vastai`) and the label
+`motion-transfer` that `pod-provision.sh` puts on every instance it creates (tier 3, which now lists
+Vast as well as RunPod). `/kill` in the Telegram bot reads the lease's provider. **There is no
+`--terminate-after` on Vast** — the lease's `abs_max_min` is the only hard ceiling.
+
+A failed job is **not** inspectable after `gpu-destroy` on Vast (the database dies with the box, unlike
+RunPod's volume). `teardown()` pulls `pod-job.log` into `out/<batch>/runs/*/` before destroying when a
+stage failed; that is the only post-mortem.
+
+Not yet automated (Plan 2): choosing the machine, per-batch model download, the pull deadline.
+Design: `docs/superpowers/specs/2026-09-19-vast-fallback-design.md`.
+
 <a id="costs"></a>
 ## Costs — pod dừng vẫn tính tiền
 
