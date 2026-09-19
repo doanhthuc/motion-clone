@@ -84,22 +84,24 @@ STAGES: dict[str, Stage] = {
         # the try-on face back on all 452 frames in 22s of GPU time; judged by eye on video.
         # A default rather than a lock, so a manifest can still set faceLock: 0 to A/B.
         #
-        # faceLockRestore + faceLockBlend: default ON 19/09/2026 at doanhthuc's direction, ahead of
-        # a GPU/video re-check — flagging the evidence gap here rather than overstating it. What IS
-        # measured: (1) faceLockRestore (CodeFormer after the swap) fixes inswapper_128's waxy/flat
-        # texture, stable frame-to-frame, but pulls toward CodeFormer's own fuller-lip/bigger-eye
-        # prior — see batch/2026-09-18-face-identity-ab.yaml arm E and this doc's 18/09 addendum:
-        # motions-studio/feature/face-restore-motion-delivery.md. (2) faceLockBlend=0.3 (swap_video.py's
-        # _swap_blended) counters inswapper's own lip-fullness bias by keeping more of Wan's own face
-        # through the swap — confirmed shrinking lip fullness on ONE still frame via a local CPU test
-        # only (no GPU, no video, no temporal-stability or identity-retention check). The combination
-        # (does 0.3 blend counteract or compound CodeFormer's own lip inflation?) is UNVERIFIED — arm F
-        # in the manifest above exists to answer that but has not been run. A manifest can override
-        # either back to what it was A/B'd against: faceLockRestore: 0, faceLockBlend: 1.0.
+        # faceLockRestore: CodeFormer after the swap, fixing inswapper_128's waxy/flat texture.
+        # Stable frame-to-frame, but pulls toward CodeFormer's own fuller-lip/bigger-eye prior —
+        # see batch/2026-09-18-face-identity-ab.yaml arm E and the 18/09 addendum in
+        # motions-studio/feature/face-restore-motion-delivery.md.
+        #
+        # faceLockBlend stays at 1.0 (swap_video.py's fast path, the unmodified upstream merge).
+        # 19/09/2026 it was defaulted to 0.3 to counter inswapper's lip-fullness bias, on the
+        # strength of ONE still frame from a local CPU test. Reverted the same day: the first
+        # video batch to run with it came back with the face visibly blended toward the driver.
+        # That is what the knob does by construction — _swap_blended scales the merge mask, so
+        # blend=0.3 composites 30% swapped face over 70% of Wan's own face, and Wan's face is the
+        # one following the driver (poseStrength 0.9, clipStrength 1.2, driver face crop per frame).
+        # Diluting the swap cannot fix lip size without diluting identity by the same factor; a
+        # future attempt at the lip bias needs a knob that does not scale the whole merge.
         defaults={"bodyProportionLock": False, "poseStrength": 0.9,
                   "clipStrength": 1.2, "naturalNails": True,
                   "removeWristAccessories": True, "faceLock": 1,
-                  "faceLockRestore": 1, "faceLockBlend": 0.3},
+                  "faceLockRestore": 1, "faceLockBlend": 1.0},
         locked_params={"cameraAwareMotion": True, "fitDriver": True},
     ),
 }
