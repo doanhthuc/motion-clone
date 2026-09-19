@@ -30,7 +30,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batchlib.config import env_get, env_set
 from batchlib.local_tryon import is_local_provider, qwen_max_configured
-from batchlib.manifest import (ManifestError, load_manifest, load_state,
+from batchlib.manifest import (Manifest, ManifestError, load_manifest, load_state,
                                save_state, state_path_for)
 from batchlib.pipelines import (PIPELINES, effective_stage_params,
                                optional_roles, required_roles)
@@ -56,6 +56,7 @@ from tgbot.ingest import (Probe, describe, probe, quality_warning,
 from tgbot.job import (DEFAULT_PROVIDER, Job, _tryon_stage, _unique_ids, missing_slots,
                        render_manifest, run_id_for, slot_for, write_manifest)
 from tgbot.preview import sheet, slot_preview
+from tgbot.vast_panel import parse_enabled, spend_blockers
 # `run as run_mod` alongside the from-imports, for exactly one caller:
 # _busy_reason, which has to resolve drain_running through tgbot.run's OWN
 # globals so it cannot disagree with the busy() that just returned True. See
@@ -68,6 +69,8 @@ from tgbot.run import (LEASE_PATH, _RUNNING, busy, drain_running,
                        stop_phase_a, summary_text)
 from batchlib_ext.gpu_stock import stock_at, stock_at_cached, volume_datacenter
 from batchlib_ext.runpod_account import account_balance
+from batchlib_ext.vast_account import account_credit as vast_credit
+from batchlib_ext.vast_quote import last_quote as vast_last_quote
 from batchlib_ext.handoff import handoff_path, mailbox_path, read_handoff
 from batchlib_ext.lease import clear_lease, read_lease
 from batchlib_ext.migrate_lease import read_migrate_lease
@@ -1440,6 +1443,11 @@ _CB_RUN_MIGRATE_MENU = "run:mgmenu"
 # message), and only Back should ever pass its own message_id in to be
 # edited — passing the panel's id there would overwrite the manifest.
 _CB_RUN_BACK = "run:back"
+# The provider a spend button was minted for rides IN its callback data, after the run token:
+# "run:go:<token>:vast". Not in .env (a bot that dies mid-run would leave it behind) and not in
+# bot state (lost on restart, and shared between two panels). RunPod has no suffix, so every button
+# already sitting in a chat keeps meaning exactly what it meant.
+_VAST_SUFFIX = ":vast"
 # + "m"/"s"/"g" — which screen to redraw (main / switch menu / migrate menu).
 _CB_RUN_REFRESH = "run:refresh:"
 # The /gpu report's own Refresh button — separate from _CB_RUN_REFRESH
@@ -1556,6 +1564,19 @@ _CB_PIPE_ASK = "pipe-ask"
 # Same shape, same "-ask" not ":ask" reasoning as _CB_PIPE_ASK above.
 _CB_PROVIDER = "prov:"
 _CB_PROVIDER_ASK = "prov-ask"
+
+
+def _split_provider(rest: str) -> tuple[str, str | None] | None:
+    """`<token>` -> (token, None); `<token>:vast` -> (token, "vast"); anything else -> None.
+
+    None means a suffix this version does not know — a button from a newer or older bot — and the
+    callers treat it like a stale token: refuse, spend nothing."""
+    token, sep, suffix = rest.partition(":")
+    if not sep:
+        return token, None
+    if suffix == _VAST_SUFFIX[1:]:
+        return token, "vast"
+    return None
 
 
 def _run_token(chat_id: int) -> str:
@@ -1709,7 +1730,8 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
                 _remove_gpu_sub(tg, chat_id, msg_id, short, dc)
 
         elif data.startswith(_CB_RUN_GO):
-            if data[len(_CB_RUN_GO):] != _run_token(chat_id):
+            parsed = _split_provider(data[len(_CB_RUN_GO):])
+            if parsed is None or parsed[0] != _run_token(chat_id):
                 tg.send_message(chat_id,
                                 "the job changed since that button was sent, so "
                                 "nothing ran. Check the manifest above and "
@@ -1722,22 +1744,25 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
                 # produces. Nothing has been spent yet at this point.
                 _do_phase_a(tg, chat_id, dry_run=dry_run)
             else:
-                _do_confirm(tg, chat_id, dry_run=dry_run)
+                _do_confirm(tg, chat_id, dry_run=dry_run, gpu_provider=parsed[1])
 
         elif data.startswith(_CB_PHASE_A_REUSE) or data.startswith(_CB_PHASE_A_RERUN):
             reuse = data.startswith(_CB_PHASE_A_REUSE)
             prefix = _CB_PHASE_A_REUSE if reuse else _CB_PHASE_A_RERUN
-            if data[len(prefix):] != _run_token(chat_id):
+            parsed = _split_provider(data[len(prefix):])
+            if parsed is None or parsed[0] != _run_token(chat_id):
                 tg.send_message(chat_id,
                                 "the job changed since that button was sent, so "
                                 "nothing ran. Check the manifest above and "
                                 "confirm again.")
             else:
                 _do_confirm(tg, chat_id, dry_run=dry_run,
-                            phase_a_choice="reuse" if reuse else "rerun")
+                            phase_a_choice="reuse" if reuse else "rerun",
+                            gpu_provider=parsed[1])
 
         elif data.startswith(_CB_PHASE_A_SPEND):
-            if data[len(_CB_PHASE_A_SPEND):] != _run_token(chat_id):
+            parsed = _split_provider(data[len(_CB_PHASE_A_SPEND):])
+            if parsed is None or parsed[0] != _run_token(chat_id):
                 tg.send_message(chat_id,
                                 "the job changed since that button was sent, so "
                                 "nothing ran. Check the manifest above and "
@@ -1747,9 +1772,14 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
                 # comment for why _STATE cannot be relied on here. The path
                 # comes from chat_id, the way _CB_RUN_GO's branch reaches
                 # _do_confirm; the token proved which manifest was reviewed.
-                _PHASE_A_OFFERED.pop(chat_id, None)
-                _do_resume(tg, chat_id, _job_manifest_path(chat_id),
-                           dry_run=dry_run)
+                #
+                # The latch is dropped only once the rental really started: a refusal
+                # (a Vast spend the gate turned down, a migration in flight) leaves the
+                # panel it came from re-renderable instead of falling back to the
+                # "run try-on first" screen.
+                if _do_resume(tg, chat_id, _job_manifest_path(chat_id),
+                              dry_run=dry_run, gpu_provider=parsed[1]):
+                    _PHASE_A_OFFERED.pop(chat_id, None)
 
         elif data.startswith(_CB_TRYON_REGEN):
             index, _, token = data[len(_CB_TRYON_REGEN):].partition(":")
@@ -2921,7 +2951,8 @@ def _progress_path(chat_id: int) -> Path:
 def _start_progress(tg: Tg, chat_id: int, manifest_path: Path,
                     stages: list[str], *, phase: str | None = None,
                     sent_tryon: list[str] | None = None,
-                    regen: dict | None = None) -> None:
+                    regen: dict | None = None,
+                    gpu_provider: str | None = None) -> None:
     """Send the first progress message and record it for later edits.
 
     `phase` names which tick owns the resulting message: "local" while Phase A
@@ -2936,15 +2967,40 @@ def _start_progress(tg: Tg, chat_id: int, manifest_path: Path,
     records a single-image regeneration — both only from _regen_tryon: a
     regeneration re-runs Phase A on the same manifest, and without the seed
     every OTHER image would be sent a second time.
+
+    `gpu_provider` is "vast" for a Vast rental and records, in the same file, the provider and the
+    hourly rate QUOTED on the panel the user tapped (vast_last_quote — an estimate: the offer
+    actually rented can differ). tick_progress and /status read both back, so every later render
+    prices the run at its own rate instead of RunPod's flat $0.99. Absent for RunPod, so that
+    file and its message are exactly what they were.
     """
+    billing: dict = {}
+    if gpu_provider == "vast":
+        quote = vast_last_quote()
+        billing = {"gpu_provider": "vast",
+                   **({"usd_per_hr": quote.dph} if quote is not None else {})}
     text = progress_text(manifest_path, lease=lease_for(manifest_path),
-                         stages=stages, phase=phase)
+                         stages=stages, phase=phase, **_billing_kwargs(billing))
     message_id = tg.send_message(chat_id, text, parse_mode=PARSE_HTML)
     _progress_path(chat_id).write_text(json.dumps({
         "manifest": str(manifest_path), "message_id": message_id,
         "stages": stages, "sent_tryon": sorted(sent_tryon or []),
         **({"phase": phase} if phase else {}),
-        **({"regen": regen} if regen else {})}, indent=2), encoding="utf-8")
+        **({"regen": regen} if regen else {}),
+        **billing}, indent=2), encoding="utf-8")
+
+
+def _billing_kwargs(payload: dict | None) -> dict:
+    """progress_text's provider/usd_per_hr, read back from a progress file's payload. Empty for a
+    RunPod run (and for a file written before Vast existed), which keeps its old rendering."""
+    payload = payload or {}
+    out: dict = {}
+    if payload.get("gpu_provider"):
+        out["provider"] = str(payload["gpu_provider"])
+    rate = payload.get("usd_per_hr")
+    if isinstance(rate, (int, float)) and not isinstance(rate, bool):
+        out["usd_per_hr"] = float(rate)
+    return out
 
 
 def _deliver_tryon_previews(tg: Tg, chat_id: int, manifest_path: Path,
@@ -5253,7 +5309,8 @@ def _again(tg: Tg, chat_id: int) -> None:
                          note=f"reusing the last batch — {len(jobs)} job(s)")
 
 
-def _do_resume(tg: Tg, chat_id: int, manifest_path: Path, *, dry_run: bool) -> None:
+def _do_resume(tg: Tg, chat_id: int, manifest_path: Path, *, dry_run: bool,
+               gpu_provider: str | None = None) -> bool:
     """Continue a batch whose pod rental already failed once — reached only
     from the recovery buttons _deliver_provision_failure offers, after the
     user picked a different GPU (_CB_RECOVER_SWITCH) or asked to retry the
@@ -5272,12 +5329,18 @@ def _do_resume(tg: Tg, chat_id: int, manifest_path: Path, *, dry_run: bool) -> N
     reached for a manifest that already has a recorded batch id (proof it
     already passed the money gate once), so it is not a second way to spend
     money the user has not already agreed to.
+
+    `gpu_provider` is "vast" when the user picked Vast on the panel, None for everything else
+    (drain then uses .env's provider, as it always did). A Vast rental has no Network Volume, so
+    the migration guard does not apply to it, and it must pass _vast_refusal — the same checks the
+    panel's hidden spend button shows — before anything is started. Returns True only when a drain
+    was started, so a caller can tell a refusal from a launch.
     """
-    if migration_running():
+    if gpu_provider != "vast" and migration_running():
         tg.send_message(chat_id, "a volume migration is in progress for this "
                                  "pod's datacenter — wait for it to finish "
                                  "before retrying")
-        return
+        return False
     # busy(), not drain_running(): this is about to hand the manifest to
     # drain.py, which READS it — the predicate run.busy's own docstring names
     # for exactly that. A live Phase A holds no lease and registers no _RUNNING
@@ -5289,28 +5352,38 @@ def _do_resume(tg: Tg, chat_id: int, manifest_path: Path, *, dry_run: bool) -> N
     # the thing running was a drain.
     if busy(manifest_path):
         tg.send_message(chat_id, "already running — nothing to resume")
-        return
+        return False
     state = load_state(state_path_for(manifest_path))
     if not state.get("batch"):
         tg.send_message(chat_id, f"nothing to resume for {_esc(manifest_path.stem)} "
                                  "— that batch never started")
-        return
+        return False
     try:
         manifest = load_manifest(manifest_path)
     except ManifestError as exc:
         tg.send_message(chat_id, f"could not resume — {_esc(str(exc))}")
-        return
+        return False
+    if gpu_provider == "vast":
+        refusal = _vast_refusal(manifest)
+        if refusal is not None:
+            tg.send_message(chat_id, refusal, parse_mode=PARSE_HTML)
+            return False
     clear_provision_failure(provision_failure_path(manifest_path))
     stages: list[str] = []
     for run in manifest.runs:
         for stage in PIPELINES[run.pipeline]:
             if stage not in stages:
                 stages.append(stage)
-    tg.send_message(chat_id, f"{ICON_ROCKET_CE} <b>Retrying</b> — renting a pod "
+    where = " on Vast.ai" if gpu_provider == "vast" else ""
+    tg.send_message(chat_id, f"{ICON_ROCKET_CE} <b>Retrying</b> — renting a pod{where} "
                              f"again for {_esc(manifest_path.stem)}.",
                     parse_mode=PARSE_HTML)
-    start_drain(manifest_path, dry_run=dry_run, resume=True)
-    _start_progress(tg, chat_id, manifest_path, stages)
+    # Only Vast passes a provider: a RunPod call stays exactly `start_drain(path, dry_run=..,
+    # resume=True)`, the call the RunPod-unchanged tests pin.
+    provider_kwargs = {} if gpu_provider is None else {"gpu_provider": gpu_provider}
+    start_drain(manifest_path, dry_run=dry_run, resume=True, **provider_kwargs)
+    _start_progress(tg, chat_id, manifest_path, stages, **provider_kwargs)
+    return True
 
 
 def _manifest_write_ok(chat_id: int) -> bool:
@@ -5378,17 +5451,51 @@ def _job_has_local_tryon(chat_id: int) -> bool:
     either, and _do_confirm reports that properly. Silently doing nothing would
     be worse than falling through.
     """
+    manifest = _draft_manifest(chat_id)
+    return manifest is not None and has_local_tryon(manifest)
+
+
+def _draft_manifest(chat_id: int) -> Manifest | None:
+    """The manifest this chat's drafted jobs WOULD write, loaded back from a throwaway file — or
+    None when there is no job or it will not render. The one place that answers "what is about to
+    be submitted" without touching the live manifest file, whose mtime is the run token that every
+    button in the chat is checked against."""
     queued = _jobs_for(chat_id)
     if not queued:
-        return False
+        return None
     try:
         text = render_manifest(queued, now=time.strftime("%Y-%m-%d %H:%M:%S"))
         with tempfile.TemporaryDirectory() as d:
             probe = Path(d) / "probe.yaml"
             probe.write_text(text, encoding="utf-8")
-            return has_local_tryon(load_manifest(probe))
+            return load_manifest(probe)
     except (ManifestError, OSError):
-        return False
+        return None
+
+
+def _vast_enabled() -> frozenset[str]:
+    """Pipelines allowed to rent on Vast: VAST_ENABLED_PIPELINES from the environment, then .env.
+    Empty by default — spec §1 wants one measured Vast session per pipeline family before its
+    spend button exists, and as of 2026-09-19 none has been run through the bot."""
+    return parse_enabled(os.environ.get("VAST_ENABLED_PIPELINES")
+                         or env_get(ROOT / ".env", "VAST_ENABLED_PIPELINES"))
+
+
+def _vast_refusal(manifest: Manifest | None) -> str | None:
+    """Why a Vast spend must NOT start now, as HTML for the chat; None means it may.
+
+    The money-gate twin of the panel's hidden spend button. Telegram keeps buttons tappable
+    forever, so a button drawn when the account was funded and the pipeline enabled can be tapped
+    after either changed — the panel alone is not a gate. No marketplace search here: the credit is
+    compared with the estimate from the last quote, so a stale tap cannot stall the bot."""
+    if manifest is None:
+        return f"{ICON_WARN} <b>Not renting on Vast</b> — no manifest to check. Nothing was spent."
+    reasons = spend_blockers(manifest, _vast_enabled(), credit_fn=vast_credit,
+                             quote=vast_last_quote())
+    if not reasons:
+        return None
+    return (f"{ICON_WARN} <b>Not renting on Vast</b> — nothing was spent:\n"
+            + "\n".join(f"• {_esc(reason)}" for reason in reasons))
 
 
 def _journal_is_resumable(manifest_path: Path) -> bool:
@@ -5533,7 +5640,8 @@ def _do_phase_a(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
 
 
 def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool,
-                phase_a_choice: str | None = None) -> None:
+                phase_a_choice: str | None = None,
+                gpu_provider: str | None = None) -> None:
     """THE money gate for a FRESH spend decision. The only OTHER function
     that may call start_drain is _do_resume, which continues a manifest
     already confirmed here once — see its own docstring for why that is not
@@ -5557,11 +5665,17 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool,
 
     `grep -rn "start_drain" scripts/tgbot/bot.py` must show exactly two call
     sites: this one, and _do_resume's.
+
+    `gpu_provider` is "vast" when the panel's Vast tab minted the button, None otherwise. Vast has
+    no Network Volume, so the migration guard below does not apply to it; and a NEW Vast rental
+    (not a job queued onto a pod already running) must pass _vast_refusal, evaluated BEFORE the
+    manifest is rewritten — that rewrite changes its mtime, which is the run token, and would kill
+    the very panel the user is about to tap again after a refusal.
     """
     # Checked before anything else, including completeness — a migration mid-
     # copy is moving the Network Volume this pod would mount, so renting must
     # not be allowed to race it regardless of how complete the job is.
-    if migration_running():
+    if gpu_provider != "vast" and migration_running():
         tg.send_message(chat_id, "a volume migration is in progress for this pod's "
                                  "datacenter — wait for it to finish before renting")
         return
@@ -5665,6 +5779,11 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool,
     # here is what it used to be, and re-deriving a path a guard already acted
     # on is how the two can quietly stop being the same file.
     running = drain_running(live_path)
+    if gpu_provider == "vast" and not running:
+        refusal = _vast_refusal(_draft_manifest(chat_id))
+        if refusal is not None:
+            tg.send_message(chat_id, refusal, parse_mode=PARSE_HTML)
+            return
     manifest_path = mailbox_path(live_path) if running else live_path
     # Re-written on the FIRST entry, even when `validated` was cached True: the
     # cache only remembers that the JOB CONTENT was valid, not which file it
@@ -5744,9 +5863,12 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool,
         # same duplication already flagged at _preserved_tryon — plus a new
         # user-visible message that would need its own test. Revisit together
         # with that finding, not separately.
+        # Only Vast passes a provider — see _do_resume's identical line.
+        provider_kwargs = {} if gpu_provider is None else {"gpu_provider": gpu_provider}
         start_drain(manifest_path, dry_run=dry_run,
                     resume=phase_a_choice is not None,
-                    force_local=phase_a_choice == "rerun")
+                    force_local=phase_a_choice == "rerun",
+                    **provider_kwargs)
     # Clear in-memory state so the next file starts a fresh job rather
     # than mutating one already handed to a running drain. The manifest
     # itself, and the drain's own journal, stay on disk regardless.
@@ -5827,12 +5949,19 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool,
                 "rental, and no second Gemini call.",
                 parse_mode=PARSE_HTML)
     else:
+        if gpu_provider == "vast":
+            quote = vast_last_quote()
+            rate = f"about ${quote.dph:.2f}/hour (quoted)" if quote is not None else "Vast's hourly rate"
+            where = f"on Vast.ai at {rate}"
+        else:
+            where = "on one pod at $0.99/hour"
         tg.send_message(chat_id,
-                        f"{ICON_ROCKET_CE} <b>Started.</b> {submitted_count} job(s) on one pod at "
-                        "$0.99/hour.\nI will keep the message below updated and "
+                        f"{ICON_ROCKET_CE} <b>Started.</b> {submitted_count} job(s) {where}."
+                        "\nI will keep the message below updated and "
                         "send the results when it finishes — no need to ask.",
                         parse_mode=PARSE_HTML)
-        _start_progress(tg, chat_id, manifest_path, stages)
+        _start_progress(tg, chat_id, manifest_path, stages,
+                        **({} if gpu_provider is None else {"gpu_provider": gpu_provider}))
     return
 
 

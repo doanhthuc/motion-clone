@@ -10,6 +10,7 @@ from batchlib.runner import stage_dest
 from batchlib_ext.gpu_stock import Stock
 from batchlib_ext.handoff import Handoff, handoff_path, mailbox_path, write_handoff
 from batchlib_ext.lease import Lease
+from batchlib_ext.vast_quote import VastQuote
 from batchlib_ext.migrate_lease import MigrateLease, write_migrate_lease
 from batchlib_ext.provision_failure import (ProvisionFailure,
                                             provision_failure_path,
@@ -1348,17 +1349,9 @@ class TestMigrateSyncDetail(unittest.TestCase):
         self.assertIn("(100%)", detail)
 
 
-class TestFlow(unittest.TestCase):
-    """The state machine Task 7 adds: files in, an ambiguous image asked
-    about (never guessed), the manifest shown once every required slot is
-    filled, and /confirm as the only reachable path to start_drain.
-
-    Real files on disk, real `make batch-validate`: only `probe()` is faked
-    (no real ffprobe/media needed) — everything downstream of it, including
-    the manifest text and the free validation gate, runs for real, against
-    the real repo (`bot._REPO_ROOT`), so a passing test here is evidence the
-    generated manifest actually validates, not just that a string was built.
-    """
+class _FlowFixture(unittest.TestCase):
+    """TestFlow's setUp/tearDown and job-building helpers, with no tests of their own, so a
+    class that needs a real drafted job can share them without re-running every TestFlow test."""
 
     def setUp(self):
         self._orig_root = bot.ROOT
@@ -1435,6 +1428,19 @@ class TestFlow(unittest.TestCase):
             bot.handle(self.tg, cmd_from(ME, "character"), allowed_user_id=ME)
             bot.handle(self.tg, doc_from(ME, "outfit-id"), allowed_user_id=ME)
             bot.handle(self.tg, cmd_from(ME, "outfit"), allowed_user_id=ME)
+
+
+class TestFlow(_FlowFixture):
+    """The state machine Task 7 adds: files in, an ambiguous image asked
+    about (never guessed), the manifest shown once every required slot is
+    filled, and /confirm as the only reachable path to start_drain.
+
+    Real files on disk, real `make batch-validate`: only `probe()` is faked
+    (no real ffprobe/media needed) — everything downstream of it, including
+    the manifest text and the free validation gate, runs for real, against
+    the real repo (`bot._REPO_ROOT`), so a passing test here is evidence the
+    generated manifest actually validates, not just that a string was built.
+    """
 
     # ---- the control panel (2026-09-01) ------------------------------------
     #
@@ -7420,3 +7426,290 @@ class TestTryonFailureRetry(unittest.TestCase):
         self._notice()
         self.assertFalse(any("Regenerating" in m and "failed" in m
                              for m in self.tg.messages))
+
+
+
+# ---- Vast as a second GPU provider (spec §3.5, Plan 4) --------------------------------------------
+
+_MOTION_MANIFEST = ("runs:\n  - id: runA\n    pipeline: motion-enhance\n"
+                    "    inputs: {character: /tmp/c.png, driver: /tmp/d.mp4}\n")
+
+
+def _vast_quote(**over):
+    base = dict(offer_id=4401, machine_id=55, dph=0.90, gpu="RTX 5090", location="Bulgaria, BG",
+                ready_s=556.0, known=False, bandwidth_usd=0.10, gb=51.8, qualifying=4,
+                fetched_at=0.0)
+    base.update(over)
+    return VastQuote(**base)
+
+
+class _VastBase(unittest.TestCase):
+    """A chat whose motion-enhance manifest is on disk and whose rent panel has been offered
+    (the state tick_phase_a leaves), with the Vast network calls patched out."""
+
+    ENV = ("GPU=NVIDIA GeForce RTX 5090\nPOD_VOLUME_ID=vol-1\n"
+           "VAST_ENABLED_PIPELINES=motion-enhance\n")
+
+    def setUp(self):
+        self._orig_root = bot.ROOT
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "batch").mkdir()
+        (self.root / "out").mkdir()
+        bot.ROOT = self.root
+        (self.root / ".env").write_text(self.ENV, encoding="utf-8")
+        reset_bot_state()
+        run_mod._PHASE_A.clear()
+        run_mod._PHASE_A_RC.clear()
+        self.manifest = bot._job_manifest_path(ME)
+        self.manifest.write_text(_MOTION_MANIFEST, encoding="utf-8")
+        state_path_for(self.manifest).write_text(
+            json.dumps({"batch": "2026-09-19-1200", "runs": {}}), encoding="utf-8")
+        self.tg = FakeTg()
+        self.token = bot._run_token(ME)
+        self.assertNotEqual(self.token, "0", "the manifest must exist or every token is 0")
+        # os.environ outranks .env for the enabled list; a developer's shell must not leak in.
+        env = mock.patch.dict("os.environ", {}, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        import os
+        os.environ.pop("VAST_ENABLED_PIPELINES", None)
+        for name, value in (("lease_for", None),):
+            patcher = mock.patch(f"tgbot.bot.{name}", return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.credit = mock.patch("tgbot.bot.vast_credit", return_value=25.0)
+        self.last = mock.patch("tgbot.bot.vast_last_quote", return_value=_vast_quote())
+        self.credit_mock = self.credit.start()
+        self.last.start()
+        for patcher in (self.credit, self.last):
+            self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        bot.ROOT = self._orig_root
+        reset_bot_state()
+
+    def _latch(self):
+        bot._PHASE_A_OFFERED[ME] = bot._run_token(ME)
+
+
+class TestVastCallbackSuffix(_VastBase):
+    def test_split_provider(self):
+        self.assertEqual(bot._split_provider("123"), ("123", None))
+        self.assertEqual(bot._split_provider("123:vast"), ("123", "vast"))
+        self.assertIsNone(bot._split_provider("123:aws"))
+        self.assertIsNone(bot._split_provider("123:vast:x"))
+
+    def test_the_longest_vast_spend_button_fits_the_64_byte_cap(self):
+        token = "9" * 19       # mtime_ns is 19 digits today
+        for prefix in (bot._CB_RUN_GO, bot._CB_PHASE_A_SPEND, bot._CB_PHASE_A_REUSE,
+                       bot._CB_PHASE_A_RERUN):
+            self.assertLessEqual(len(f"{prefix}{token}{bot._VAST_SUFFIX}".encode()), 64, prefix)
+
+    def _press(self, data):
+        bot.handle(self.tg, cb_from(ME, data), allowed_user_id=ME)
+
+    def test_run_go_without_a_suffix_is_a_default_provider_spend(self):
+        with mock.patch("tgbot.bot._job_has_local_tryon", return_value=False), \
+             mock.patch("tgbot.bot._do_confirm") as confirm:
+            self._press(bot._CB_RUN_GO + self.token)
+        confirm.assert_called_once_with(self.tg, ME, dry_run=False, gpu_provider=None)
+
+    def test_run_go_with_the_vast_suffix_spends_on_vast(self):
+        with mock.patch("tgbot.bot._job_has_local_tryon", return_value=False), \
+             mock.patch("tgbot.bot._do_confirm") as confirm:
+            self._press(bot._CB_RUN_GO + self.token + bot._VAST_SUFFIX)
+        confirm.assert_called_once_with(self.tg, ME, dry_run=False, gpu_provider="vast")
+
+    def test_an_unknown_suffix_or_a_stale_token_spends_nothing(self):
+        with mock.patch("tgbot.bot._job_has_local_tryon", return_value=False), \
+             mock.patch("tgbot.bot._do_confirm") as confirm:
+            self._press(bot._CB_RUN_GO + self.token + ":aws")
+            self._press(bot._CB_RUN_GO + "1" + bot._VAST_SUFFIX)
+        confirm.assert_not_called()
+        self.assertEqual(sum("the job changed" in m for m in self.tg.messages), 2)
+
+    def test_the_reuse_and_rerun_choosers_carry_the_provider_through(self):
+        with mock.patch("tgbot.bot._do_confirm") as confirm:
+            self._press(bot._CB_PHASE_A_REUSE + self.token + bot._VAST_SUFFIX)
+            self._press(bot._CB_PHASE_A_RERUN + self.token)
+        self.assertEqual(confirm.call_args_list, [
+            mock.call(self.tg, ME, dry_run=False, phase_a_choice="reuse", gpu_provider="vast"),
+            mock.call(self.tg, ME, dry_run=False, phase_a_choice="rerun", gpu_provider=None)])
+
+    def test_the_post_phase_a_spend_resumes_on_the_chosen_provider(self):
+        self._latch()
+        with mock.patch("tgbot.bot._do_resume", return_value=True) as resume:
+            self._press(bot._CB_PHASE_A_SPEND + self.token + bot._VAST_SUFFIX)
+        resume.assert_called_once_with(self.tg, ME, self.manifest, dry_run=False,
+                                       gpu_provider="vast")
+        self.assertNotIn(ME, bot._PHASE_A_OFFERED)
+
+    def test_a_refused_spend_leaves_the_rent_panel_re_renderable(self):
+        self._latch()
+        with mock.patch("tgbot.bot._do_resume", return_value=False):
+            self._press(bot._CB_PHASE_A_SPEND + self.token + bot._VAST_SUFFIX)
+        self.assertIn(ME, bot._PHASE_A_OFFERED)
+
+
+class TestVastResume(_VastBase):
+    def _resume(self, **kwargs):
+        with mock.patch("tgbot.bot.busy", return_value=False), \
+             mock.patch("tgbot.bot.migration_running", return_value=kwargs.pop("migrating", False)), \
+             mock.patch("tgbot.bot._start_progress") as progress, \
+             mock.patch("tgbot.bot.start_drain") as start_drain:
+            started = bot._do_resume(self.tg, ME, self.manifest, dry_run=False, **kwargs)
+        return started, start_drain, progress
+
+    def test_a_vast_resume_starts_the_drain_on_vast_and_records_it_in_progress(self):
+        started, start_drain, progress = self._resume(gpu_provider="vast")
+        self.assertTrue(started)
+        start_drain.assert_called_once_with(self.manifest, dry_run=False, resume=True,
+                                            gpu_provider="vast")
+        self.assertEqual(progress.call_args.kwargs["gpu_provider"], "vast")
+        self.assertIn("on Vast.ai", self.tg.messages[-1])
+
+    def test_a_migration_in_flight_does_not_block_a_vast_resume(self):
+        started, start_drain, _ = self._resume(gpu_provider="vast", migrating=True)
+        self.assertTrue(started)
+        start_drain.assert_called_once()
+
+    def test_a_migration_in_flight_still_blocks_the_default_resume(self):
+        started, start_drain, _ = self._resume(migrating=True)
+        self.assertFalse(started)
+        start_drain.assert_not_called()
+
+    def test_the_default_resume_is_unchanged_and_says_nothing_about_vast(self):
+        started, start_drain, progress = self._resume()
+        self.assertTrue(started)
+        start_drain.assert_called_once_with(self.manifest, dry_run=False, resume=True)
+        self.assertNotIn("gpu_provider", progress.call_args.kwargs)
+        self.assertNotIn("Vast", self.tg.messages[-1])
+
+    def test_a_vast_resume_for_an_unmeasured_pipeline_is_refused_and_spends_nothing(self):
+        (self.root / ".env").write_text("GPU=x\n", encoding="utf-8")
+        started, start_drain, progress = self._resume(gpu_provider="vast")
+        self.assertFalse(started)
+        start_drain.assert_not_called()
+        progress.assert_not_called()
+        self.assertIn("Not renting on Vast", self.tg.messages[-1])
+        self.assertIn("nothing was spent", self.tg.messages[-1])
+
+    def test_a_vast_resume_with_an_unreadable_account_is_refused(self):
+        self.credit_mock.side_effect = RuntimeError("no api key")
+        started, start_drain, _ = self._resume(gpu_provider="vast")
+        self.assertFalse(started)
+        start_drain.assert_not_called()
+        self.assertIn("no api key", self.tg.messages[-1])
+
+    def test_a_vast_resume_with_too_little_credit_is_refused(self):
+        self.credit_mock.return_value = 0.05
+        started, start_drain, _ = self._resume(gpu_provider="vast")
+        self.assertFalse(started)
+        start_drain.assert_not_called()
+        self.assertIn("below this session's estimate", self.tg.messages[-1])
+
+
+class TestVastConfirm(_FlowFixture):
+    """_do_confirm, the fresh-spend gate, with the provider the Vast tab minted."""
+
+    def setUp(self):
+        super().setUp()
+        (self.root / ".env").write_text(
+            "VAST_ENABLED_PIPELINES=tryon-motion-enhance\n", encoding="utf-8")
+        import os
+        env = mock.patch.dict("os.environ", {}, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("VAST_ENABLED_PIPELINES", None)
+        self.credit = mock.patch("tgbot.bot.vast_credit", return_value=25.0)
+        self.last = mock.patch("tgbot.bot.vast_last_quote", return_value=_vast_quote())
+        self.credit_mock = self.credit.start()
+        self.last.start()
+        self.addCleanup(self.credit.stop)
+        self.addCleanup(self.last.stop)
+
+    def _confirm(self, **kwargs):
+        with mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot._start_progress") as progress, \
+             mock.patch("tgbot.bot._job_has_local_tryon", return_value=False), \
+             mock.patch("tgbot.bot.drain_running",
+                        return_value=kwargs.pop("running", False)), \
+             mock.patch("tgbot.bot.migration_running",
+                        return_value=kwargs.pop("migrating", False)):
+            self._fill_required_slots()
+            bot._do_confirm(self.tg, ME, dry_run=False, **kwargs)
+        return start_drain, progress
+
+    def test_a_vast_confirm_starts_the_drain_on_vast_and_names_the_rate(self):
+        start_drain, progress = self._confirm(gpu_provider="vast")
+        start_drain.assert_called_once()
+        self.assertEqual(start_drain.call_args.kwargs["gpu_provider"], "vast")
+        self.assertEqual(progress.call_args.kwargs["gpu_provider"], "vast")
+        started = next(m for m in self.tg.messages if "Started" in m)
+        self.assertIn("Vast.ai at about $0.90/hour", started)
+        self.assertNotIn("$0.99", started)
+
+    def test_a_migration_in_flight_does_not_block_a_vast_confirm(self):
+        start_drain, _ = self._confirm(gpu_provider="vast", migrating=True)
+        start_drain.assert_called_once()
+
+    def test_the_default_confirm_is_unchanged(self):
+        start_drain, progress = self._confirm()
+        start_drain.assert_called_once()
+        self.assertNotIn("gpu_provider", start_drain.call_args.kwargs)
+        self.assertNotIn("gpu_provider", progress.call_args.kwargs)
+        self.assertIn("on one pod at $0.99/hour",
+                      next(m for m in self.tg.messages if "Started" in m))
+
+    def test_a_refused_vast_confirm_spends_nothing_and_keeps_the_draft_and_its_token(self):
+        (self.root / ".env").write_text("GPU=x\n", encoding="utf-8")
+        with mock.patch("tgbot.bot._job_has_local_tryon", return_value=False), \
+             mock.patch("tgbot.bot.drain_running", return_value=False), \
+             mock.patch("tgbot.bot.migration_running", return_value=False), \
+             mock.patch("tgbot.bot.start_drain") as start_drain, \
+             mock.patch("tgbot.bot._start_progress"):
+            self._fill_required_slots()
+            before = bot._run_token(ME)
+            bot._do_confirm(self.tg, ME, dry_run=False, gpu_provider="vast")
+            after = bot._run_token(ME)
+        start_drain.assert_not_called()
+        self.assertNotEqual(before, "0")
+        self.assertEqual(before, after, "the refusal rewrote the manifest and killed the panel")
+        self.assertIn(ME, bot._STATE)          # the draft survives, so the user can go back
+        self.assertIn("Not renting on Vast", self.tg.messages[-1])
+
+    def test_a_job_queued_onto_a_running_drain_is_not_a_new_vast_rental(self):
+        (self.root / ".env").write_text("GPU=x\n", encoding="utf-8")   # nothing enabled
+        start_drain, _ = self._confirm(gpu_provider="vast", running=True)
+        start_drain.assert_not_called()          # queued, not launched
+        self.assertTrue(any("Queued" in m for m in self.tg.messages))
+        self.assertFalse(any("Not renting on Vast" in m for m in self.tg.messages))
+
+
+class TestVastProgressBilling(_VastBase):
+    def test_billing_kwargs_reads_provider_and_rate_and_ignores_junk(self):
+        self.assertEqual(bot._billing_kwargs({"gpu_provider": "vast", "usd_per_hr": 0.9}),
+                         {"provider": "vast", "usd_per_hr": 0.9})
+        self.assertEqual(bot._billing_kwargs({}), {})
+        self.assertEqual(bot._billing_kwargs(None), {})
+        self.assertEqual(bot._billing_kwargs({"usd_per_hr": True}), {})
+
+    def test_a_vast_progress_file_records_the_provider_and_the_quoted_rate(self):
+        bot._start_progress(self.tg, ME, self.manifest, ["motion"], gpu_provider="vast")
+        payload = json.loads(bot._progress_path(ME).read_text(encoding="utf-8"))
+        self.assertEqual((payload["gpu_provider"], payload["usd_per_hr"]), ("vast", 0.90))
+
+    def test_a_runpod_progress_file_is_unchanged(self):
+        bot._start_progress(self.tg, ME, self.manifest, ["motion"])
+        payload = json.loads(bot._progress_path(ME).read_text(encoding="utf-8"))
+        self.assertNotIn("gpu_provider", payload)
+        self.assertNotIn("usd_per_hr", payload)
+
+    def test_the_message_is_priced_at_the_quoted_rate_not_the_runpod_one(self):
+        lease = Lease(pod_id="i1", provisioned_at=time.time() - 3600, manifest=str(self.manifest),
+                      abs_max_min=240, provider="vast")
+        with mock.patch("tgbot.bot.lease_for", return_value=lease):
+            bot._start_progress(self.tg, ME, self.manifest, ["motion"], gpu_provider="vast")
+        self.assertIn("on Vast.ai", self.tg.messages[-1])
+        self.assertIn("quoted $0.90/h", self.tg.messages[-1])
+        self.assertNotIn("$0.99", self.tg.messages[-1])

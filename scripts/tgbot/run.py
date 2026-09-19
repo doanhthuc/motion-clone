@@ -157,7 +157,9 @@ def _elapsed(lease) -> str:
 
 def progress_text(manifest_path: Path, *, lease,
                   stages: list[str] | None = None,
-                  phase: str | None = None) -> str:
+                  phase: str | None = None,
+                  provider: str | None = None,
+                  usd_per_hr: float | None = None) -> str:
     """Render one progress message from the journal alone. Returns HTML.
 
     A bar of `done/len(planned)` cells is discrete because the journal is
@@ -191,10 +193,17 @@ def progress_text(manifest_path: Path, *, lease,
     from the absence of a lease is how the message came to say "waiting for
     the pod" about a step that deliberately runs before any pod exists.
 
+    `provider` and `usd_per_hr` exist for Vast, whose price is not the flat $0.99 a RunPod 5090
+    costs: the lease's own provider wins when there is one, and the dollar figure is the rate
+    QUOTED when the user tapped spend, printed as an estimate ("≈") because the offer actually
+    rented can differ from the quote. With no rate known a Vast message shows time only — never
+    the RunPod figure. RunPod (or nothing) renders exactly as it always has.
+
     HTML (2026-08-31) because this is re-rendered into the same message every
     poll — the caller must send it with parse_mode="HTML", and every
     interpolated value here is escaped for that reason.
     """
+    on_vast = ((lease.provider if lease is not None else provider) or "runpod") == "vast"
     state = load_state(state_path_for(manifest_path))
     batch = state.get("batch") or "(not started yet)"
     try:
@@ -227,7 +236,8 @@ def progress_text(manifest_path: Path, *, lease,
             # phase where the only real question is whether anything is
             # happening at all, which `elapsed` answers and the journal cannot.
             tail = f" ({elapsed})" if elapsed else ""
-            lines.append(f"{_ICON_EYES_CE} waiting for the pod — "
+            where = "Vast.ai" if on_vast else "the pod"
+            lines.append(f"{_ICON_EYES_CE} waiting for {where} — "
                          f"nothing recorded yet{tail}")
     for run_id in sorted(runs):
         run = runs[run_id]
@@ -266,13 +276,19 @@ def progress_text(manifest_path: Path, *, lease,
         mins = (time.time() - lease.provisioned_at) / 60
         # Elapsed, not a prediction: the pod bills from provisioned_at whether
         # or not a stage is moving, so this is the number that costs money.
-        lines.append(f"\n⏱ {elapsed} on the pod · 💸 ${mins / 60 * 0.99:.2f} so far")
+        if on_vast:
+            cost = (f" · 💸 ≈${mins / 60 * usd_per_hr:.2f} so far (quoted ${usd_per_hr:.2f}/h)"
+                    if usd_per_hr else "")
+            lines.append(f"\n⏱ {elapsed} on Vast.ai{cost}")
+        else:
+            lines.append(f"\n⏱ {elapsed} on the pod · 💸 ${mins / 60 * 0.99:.2f} so far")
 
     return "\n".join(lines)
 
 
 def start_drain(manifest_path: Path, *, dry_run: bool,
-                resume: bool = False, force_local: bool = False) -> subprocess.Popen:
+                resume: bool = False, force_local: bool = False,
+                gpu_provider: str | None = None) -> subprocess.Popen:
     """Launch `make drain FILE=...`, appending CONFIRM=yes only when dry_run is False.
 
     This is the ONLY line in this module (in this repo) that may write the
@@ -293,12 +309,22 @@ def start_drain(manifest_path: Path, *, dry_run: bool,
     dry_run gate deliberately — the gate must stay the last thing appended so
     that "CONFIRM=yes appears iff dry_run is False" remains readable as a
     single trailing condition.
+
+    `gpu_provider` forwards PROVIDER=vast|runpod (Makefile:119, drain.py's --provider) so the cloud
+    follows THIS run and never .env: the bot must not rewrite .env for a per-batch choice, because a
+    bot that dies mid-run would leave the other provider's value behind. None appends nothing, and
+    the drain then uses .env's GPU_PROVIDER exactly as before. It sits before the dry_run gate for
+    the same reason force_local does.
     """
+    if gpu_provider is not None and gpu_provider not in ("runpod", "vast"):
+        raise ValueError(f"unknown gpu_provider {gpu_provider!r}")
     argv = ["make", "drain", f"FILE={manifest_path}"]
     if resume:
         argv.append("RESUME=1")
     if force_local:
         argv.append("FORCE_LOCAL=1")
+    if gpu_provider is not None:
+        argv.append(f"PROVIDER={gpu_provider}")
     if not dry_run:
         argv.append("CONFIRM=yes")
 
