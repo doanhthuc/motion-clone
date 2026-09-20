@@ -205,12 +205,19 @@ class TestLoad(unittest.TestCase):
 
 
 class TestValidate(unittest.TestCase):
-    def test_camera_pipeline_requires_background_and_driver(self):
+    def test_camera_pipeline_background_is_optional(self):
         text = CAMERA.replace("      background: bg.jpg\n", "")
         with tempfile.TemporaryDirectory() as d:
             errs = validate_manifest(load_manifest(_fixture(Path(d), text)),
                                      ast_params=AST, curated=CURATED)
-            self.assertTrue(any("background" in error for error in errs))
+            self.assertEqual(errs, [])
+
+    def test_camera_pipeline_still_requires_driver(self):
+        text = "\n".join(line for line in CAMERA.splitlines() if "driver:" not in line)
+        with tempfile.TemporaryDirectory() as d:
+            errs = validate_manifest(load_manifest(_fixture(Path(d), text)),
+                                     ast_params=AST, curated=CURATED)
+            self.assertTrue(any("driver" in error for error in errs), errs)
 
     def test_camera_alias_blocks_are_valid(self):
         with tempfile.TemporaryDirectory() as d:

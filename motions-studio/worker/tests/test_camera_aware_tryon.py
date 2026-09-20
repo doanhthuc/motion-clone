@@ -160,6 +160,45 @@ class CameraMotionWorkflowBoundaryTests(unittest.TestCase):
         self.assertIn("stiletto nails", negative)
         self.assertIn("white nail tips", negative)
 
+    def test_plain_motion_honours_the_hands_flags(self):
+        workflow = self._submit_motion((900, 1200), camera_aware=False,
+                                      appearance={"naturalNails": True, "removeWristAccessories": True})
+        positive = workflow["60"]["inputs"]["positive_prompt"]
+        negative = workflow["60"]["inputs"]["negative_prompt"]
+        self.assertIn("short, neatly trimmed, rounded natural fingernails", positive)
+        self.assertIn("bare wrists with no watch or bracelet", positive)
+        self.assertIn("nail polish", negative)
+        self.assertIn("wristwatch", negative)
+
+    def test_plain_motion_leaves_the_prompt_alone_without_the_flags(self):
+        workflow = self._submit_motion((900, 1200), camera_aware=False)
+        self.assertNotIn("fingernails", workflow["60"]["inputs"]["positive_prompt"])
+        self.assertNotIn("wristwatch", workflow["60"]["inputs"]["negative_prompt"])
+
+    def test_tryon_hands_prompts_follow_the_flags(self):
+        self.assertEqual(linux._tryon_hands_prompts({}), ("", ""))
+        self.assertEqual(linux._tryon_hands_prompts({"naturalNails": False, "removeWristAccessories": "off"}),
+                         ("", ""))
+        pos, neg = linux._tryon_hands_prompts({"naturalNails": True})
+        self.assertIn("natural fingernails", pos)
+        self.assertNotIn("watch", pos)
+        self.assertIn("nail polish", neg)
+        pos, neg = linux._tryon_hands_prompts({"remove_wrist_accessories": "true"})
+        self.assertIn("watch or bracelet", pos)
+        self.assertNotIn("fingernails", pos)
+        self.assertIn("wristwatch", neg)
+
+    def test_tryon_prompts_append_hands_last_and_are_unchanged_without_them(self):
+        hands = linux._tryon_hands_prompts({"naturalNails": True, "removeWristAccessories": True})
+        for garment in ("auto", "upper", "dress"):
+            with self.subTest(garment=garment):
+                base_pos, base_neg = linux._qwen_tryon_prompts(garment)
+                pos, neg = linux._qwen_tryon_prompts(garment, hands=hands)
+                self.assertEqual(pos, base_pos + " " + hands[0])
+                self.assertEqual(neg, base_neg + ", " + hands[1])
+                self.assertEqual(linux._gemini_tryon_prompt(garment, hands=hands),
+                                 linux._gemini_tryon_prompt(garment) + " " + hands[0])
+
     def test_camera_motion_bypasses_api_injected_dimensions_at_workflow_boundary(self):
         for driver_dims, expected in (((1920, 1080), (1280, 720)), ((900, 1200), (720, 960))):
             with self.subTest(driver_dims=driver_dims):
@@ -290,6 +329,35 @@ class CameraMotionWorkflowBoundaryTests(unittest.TestCase):
                     self.assertNotEqual(graph["42"]["class_type"], "VAEEncode")
                     w, h = linux._fit_aligned(90, 160, mp=linux.TRYON_MP, align=64)
                     self.assertEqual((graph["42"]["inputs"]["width"], graph["42"]["inputs"]["height"]), (w, h))
+
+    def test_without_background_composes_two_refs_with_reframe_prompt(self):
+        from PIL import Image
+        for provider in ("gemini", "qwen-max"):
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as d, ExitStack() as stack:
+                tmp = Path(d)
+                person, _background, guide = self.fixtures(tmp)
+                calls = []
+                generated = tmp / "generated.png"
+                Image.new("RGB", (160, 160), "black").save(generated)
+                def edit(images, prompt, key, out_path, **kwargs):
+                    calls.append((images, prompt, kwargs))
+                    shutil.copyfile(generated, out_path)
+                    return out_path
+                for name, replacement in {"_gemini_edit": edit, "_qwen_max_edit": edit,
+                                          "api_log": lambda *args, **kwargs: None}.items():
+                    stack.enter_context(mock.patch.object(linux, name, replacement))
+                out = linux._tryon_compose_camera("job", provider, str(person), None, str(guide),
+                                                  "camera", {"apiKey": "hf_" + "x" * 30})
+                self.assertEqual(linux._img_size(out), (90, 160))
+                self.assertEqual([part[0] for part in calls[0][0]], [person.read_bytes(), guide.read_bytes()])
+                self.assertEqual(calls[0][1], linux._load_camera_compose_prompt(reframe_only=True)[0])
+                self.assertNotEqual(calls[0][1], linux._load_camera_compose_prompt()[0])
+
+    def test_run_tryon_requires_camera_guide_but_not_background(self):
+        with self.assertRaises(RuntimeError) as cm:
+            linux.run_tryon({"id": "no-guide", "inputs": {"model": "m.png", "product": "p.png"},
+                             "params": {"cameraAware": True}})
+        self.assertIn("cameraGuide", str(cm.exception))
 
     def test_empty_or_undecodable_composition_is_rejected(self):
         self.assertTrue(hasattr(linux, "_tryon_compose_camera"), "camera composition helper missing")

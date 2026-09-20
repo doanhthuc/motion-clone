@@ -220,15 +220,48 @@ _GEMINI_WEARER_GUARD = (
     "the result.")
 
 
-def gemini_tryon_prompt(gt: str, extra: str = "") -> str:
+# Hands clauses for the garment edit — same wording as linux.py's _TRYON_*_POS/NEG (ported by hand, like
+# the rest of this file). Appended last and kept to one short sentence each; not yet measured on a real run.
+_TRYON_NAILS_POS = ("The person has short, neatly trimmed, rounded natural fingernails, flush with the "
+                    "fingertips, natural translucent flesh color, with no nail polish.")
+_TRYON_NAILS_NEG = ("painted nails, nail polish, colored nails, manicure, artificial nails, long nails, pointed "
+                    "nails, stiletto nails, almond nails, coffin nails, acrylic nails, gel nails, fake nails, "
+                    "French tips, white nail tips, claw-like nails")
+_TRYON_WRIST_POS = "Do not show a watch or bracelet on either wrist."
+_TRYON_WRIST_NEG = "watch, wristwatch, bracelet, wrist jewelry"
+
+
+def _flag(params: dict, *keys: str) -> bool:
+    for key in keys:
+        value = params.get(key)
+        if value is None or value == "":
+            continue
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in ("1", "true", "yes", "on", "enable", "enabled")
+    return False
+
+
+def tryon_hands_prompts(params: dict) -> tuple[str, str]:
+    """(positive, negative) hands clauses for the garment edit; ("", "") when neither flag is on."""
+    pos, neg = [], []
+    if _flag(params, "natural_nails", "naturalNails"):
+        pos.append(_TRYON_NAILS_POS); neg.append(_TRYON_NAILS_NEG)
+    if _flag(params, "remove_wrist_accessories", "removeWristAccessories"):
+        pos.append(_TRYON_WRIST_POS); neg.append(_TRYON_WRIST_NEG)
+    return " ".join(pos), ", ".join(neg)
+
+
+def gemini_tryon_prompt(gt: str, extra: str = "", hands: tuple[str, str] = ("", "")) -> str:
     # linux.py:3538-3543 — khoá mặt đứng ĐẦU prompt (chống "tryon đổi mặt").
     return ("CRITICAL: the person's face and facial identity must remain EXACTLY identical to "
             "image 1 — same facial structure, eyes, nose, lips, jawline, skin tone, makeup and "
             "expression; never beautify, reshape, swap or regenerate the face. "
-            ) + gemini_tryon_prompt_base(gt) + tryon_extra_clause(extra) + _GEMINI_WEARER_GUARD
+            ) + gemini_tryon_prompt_base(gt) + tryon_extra_clause(extra) + _GEMINI_WEARER_GUARD + (
+        " " + hands[0] if hands[0] else "")
 
 
-def qwen_tryon_prompts(gt: str, extra: str = "") -> tuple[str, str]:
+def qwen_tryon_prompts(gt: str, extra: str = "", hands: tuple[str, str] = ("", "")) -> tuple[str, str]:
     """Cổng linux.py:_qwen_tryon_prompts (3763-3889). Prompt Qwen-Image KHÁC hẳn Gemini (không dùng chung
     được — nhánh HF trên pod từng dùng nhầm prompt Gemini cho model họ Qwen và sản phẩm không áp lên người,
     xem linux.py:5521-5522); provider='qwen-max' ở local PHẢI dùng bộ prompt riêng này."""
@@ -321,6 +354,9 @@ def qwen_tryon_prompts(gt: str, extra: str = "") -> tuple[str, str]:
                      "pose, framing, or the room/background/setting visible in image 2.")
     pos = pos + " " + tryon_extra_clause(extra) + _compact_lock
     neg = neg + ", " + _face_neg + ", " + _hair_neg + ", " + _prop_neg + ", " + _src_neg
+    if hands[0]:
+        pos += " " + hands[0]
+        neg += ", " + hands[1]
     return pos, neg
 
 
@@ -609,17 +645,23 @@ def _gemini_or_qwen_max(gem_key, qwen_key, images, gem_prompt, qwen_prompt, out_
 
 def _camera_compose_local(provider, edited, background, guide, prompt, keys, out_path) -> Path:
     gem_key, qwen_key = keys
-    # Bước A - ghép nền (2 ảnh): reuse TRYON_BG_POS/NEG, cùng prompt đã dùng cho nhánh không
-    # camera-aware — KHÔNG viết prompt mới, giữ nguyên hành vi đã kiểm chứng của bước này.
-    bg_images = [(edited.read_bytes(), mime_of(edited)), (background.read_bytes(), mime_of(background))]
-    composed_path = out_path.with_suffix(".bgswap.png")
-    if provider == "qwen-max":
-        composed = qwen_max_edit(bg_images, TRYON_BG_POS, qwen_key, composed_path, negative_prompt=TRYON_BG_NEG)
+    # `background` is optional (20/09/2026). Without it bước A is skipped and bước B reframes the
+    # try-on result as-is, so the final image keeps the location of the character photo. Not yet
+    # measured on a real run — only the branch wiring is covered by tests.
+    if background is None:
+        composed = edited
     else:
-        composed = _gemini_or_qwen_max(gem_key, qwen_key, bg_images, TRYON_BG_POS, TRYON_BG_POS,
-                                       composed_path, gemini_aspect(img_size(edited)), qwen_negative=TRYON_BG_NEG)
-    if not composed or not img_size(composed):
-        raise JobError("camera composition: background swap returned an undecodable image")
+        # Bước A - ghép nền (2 ảnh): reuse TRYON_BG_POS/NEG, cùng prompt đã dùng cho nhánh không
+        # camera-aware — KHÔNG viết prompt mới, giữ nguyên hành vi đã kiểm chứng của bước này.
+        bg_images = [(edited.read_bytes(), mime_of(edited)), (background.read_bytes(), mime_of(background))]
+        composed_path = out_path.with_suffix(".bgswap.png")
+        if provider == "qwen-max":
+            composed = qwen_max_edit(bg_images, TRYON_BG_POS, qwen_key, composed_path, negative_prompt=TRYON_BG_NEG)
+        else:
+            composed = _gemini_or_qwen_max(gem_key, qwen_key, bg_images, TRYON_BG_POS, TRYON_BG_POS,
+                                           composed_path, gemini_aspect(img_size(edited)), qwen_negative=TRYON_BG_NEG)
+        if not composed or not img_size(composed):
+            raise JobError("camera composition: background swap returned an undecodable image")
 
     # Bước B - xoay góc máy (2 ảnh: bước A, camera-guide) — MỘT lệnh.
     dims = img_size(guide)
@@ -706,8 +748,8 @@ def run_local_tryon(run: Run, params: dict, settings: Settings, out_path: Path) 
     if model_path is None or product_path is None:
         raise JobError(f"run {run.id!r}: try-on local cần inputs.character và inputs.outfit")
     camera_aware = str(params.get("cameraAware") or "").lower().strip() in ("1", "true", "yes", "on")
-    if camera_aware and (background_path is None or run.inputs.get("driver") is None):
-        raise JobError(f"run {run.id!r}: camera-aware try-on requires background and driver")
+    if camera_aware and run.inputs.get("driver") is None:
+        raise JobError(f"run {run.id!r}: camera-aware try-on requires driver")
 
     garment = (str(params.get("garment_type") or params.get("garmentType") or "").lower().strip()
               or "auto")
@@ -720,6 +762,7 @@ def run_local_tryon(run: Run, params: dict, settings: Settings, out_path: Path) 
     # GEMINI_API_BASE (mock.patch.object(lt, "GEMINI_API_BASE", ...)) sẽ không có tác
     # dụng và code gọi thẳng ra Google thật thay vì fake HTTP server của test.
     extra_en = translate_vn_to_en(extra_raw, gem_key, base_url=GEMINI_API_BASE) if extra_raw else ""
+    hands = tryon_hands_prompts(params)
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp_dir = Path(tmp)
@@ -731,7 +774,7 @@ def run_local_tryon(run: Run, params: dict, settings: Settings, out_path: Path) 
                   (product_path.read_bytes(), mime_of(product_path))]
 
         if provider == "qwen-max":
-            pos_q, neg_q = qwen_tryon_prompts(garment, extra=extra_en)
+            pos_q, neg_q = qwen_tryon_prompts(garment, extra=extra_en, hands=hands)
             edited = qwen_max_edit(images, pos_q, qwen_key, tmp_dir / "pass1.png", negative_prompt=neg_q)
             if background_path is not None and not camera_aware:
                 edited = qwen_max_edit(
@@ -739,8 +782,8 @@ def run_local_tryon(run: Run, params: dict, settings: Settings, out_path: Path) 
                      (background_path.read_bytes(), mime_of(background_path))],
                     TRYON_BG_POS, qwen_key, tmp_dir / "pass2.png", negative_prompt=TRYON_BG_NEG)
         else:
-            prompt = gemini_tryon_prompt(garment, extra=extra_en)
-            pos_q, neg_q = qwen_tryon_prompts(garment, extra=extra_en)
+            prompt = gemini_tryon_prompt(garment, extra=extra_en, hands=hands)
+            pos_q, neg_q = qwen_tryon_prompts(garment, extra=extra_en, hands=hands)
             edited = _gemini_or_qwen_max(gem_key, qwen_key, images, prompt, pos_q, tmp_dir / "pass1.png",
                                         gemini_aspect(img_size(model_path)), qwen_negative=neg_q)
 

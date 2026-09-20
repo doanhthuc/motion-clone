@@ -36,6 +36,14 @@ class Stage:
     locked_params: dict[str, object] = field(default_factory=dict)
 
 
+# Bare wrists and plain natural nails, for the try-on image and the Wan render alike, so the video does not
+# bring back a watch or painted nails the garment edit removed. Stage-wide: reaches tryon-motion-enhance,
+# tryon-character-swap-enhance (tryon stage) and motion-enhance (motion stage). A manifest opts out per
+# stage with `naturalNails: false` / `removeWristAccessories: false`. camera-tryon / camera-motion keep their
+# own contract (the camera compose prompt asset, and camera-motion's defaults below).
+_HANDS_DEFAULTS = {"naturalNails": True, "removeWristAccessories": True}
+
+
 # min_bytes lấy đúng hai ngưỡng pod-smoke.sh đã dùng và đã chứng minh:
 #   mp4 100_000 (pod-smoke.sh:293) · ảnh 5_000 (pod-smoke.sh:44-49, đo thật tryon 1378 KB).
 STAGES: dict[str, Stage] = {
@@ -45,12 +53,14 @@ STAGES: dict[str, Stage] = {
                 "product": "material:outfit",
                 "background": "material:background?"},
         output_ext=".png", min_bytes=5_000, timeout_min=20, param_type="tryon",
+        defaults=dict(_HANDS_DEFAULTS),
     ),
     "motion": Stage(
         name="motion", job_type="motion",
         inputs={"ref": "prev|material:character",
                 "motion": "material:driver"},
         output_ext=".mp4", min_bytes=100_000, timeout_min=60, param_type="motion",
+        defaults=dict(_HANDS_DEFAULTS),
     ),
     "character-swap": Stage(
         name="character-swap", job_type="character-swap",
@@ -68,7 +78,7 @@ STAGES: dict[str, Stage] = {
         name="camera-tryon", job_type="tryon", param_type="tryon",
         inputs={"model": "material:character",
                 "product": "material:outfit",
-                "background": "material:background",
+                "background": "material:background?",
                 "cameraGuide": "material:driver"},
         output_ext=".png", min_bytes=5_000, timeout_min=20,
         defaults={"cameraGuideFrame": "middle"},
