@@ -68,7 +68,7 @@ STAGES: dict[str, Stage] = {
         name="camera-tryon", job_type="tryon", param_type="tryon",
         inputs={"model": "material:character",
                 "product": "material:outfit",
-                "background": "material:background",
+                "background": "material:background?",
                 "cameraGuide": "material:driver"},
         output_ext=".png", min_bytes=5_000, timeout_min=20,
         defaults={"cameraGuideFrame": "middle"},

@@ -122,7 +122,7 @@ The output aspect ratio follows the driver guide rather than the original charac
 
 Camera-aware execution is strict:
 
-- Missing `background` or `cameraGuide`: reject during manifest validation when running through batch or Telegram.
+- Missing `cameraGuide` (the `driver`): reject during manifest validation when running through batch or Telegram. `background` is optional as of 2026-09-20: without it the background-swap step is skipped and only the camera reframe runs.
 - Driver frame extraction failure: fail `camera-tryon` with a clear error.
 - Camera-compose provider failure: fail `camera-tryon`; do not return the ordinary try-on image and do not silently continue to Motion Control.
 - Model output with no decodable image: fail the stage.
@@ -155,7 +155,7 @@ The Telegram bot reads pipeline names and stage sequences from `batchlib.pipelin
 
 For the new pipeline:
 
-- `background` is required, so the bot must request it rather than label it optional.
+- `background` is optional as of 2026-09-20 (originally required); the bot labels it optional like it does for `tryon-motion-enhance`.
 - `driver` remains a required material and is reused by both `camera-tryon` and `camera-motion`.
 - Switching from another four-material pipeline keeps compatible uploaded slots.
 - Draft persistence stores the new pipeline name through restarts.

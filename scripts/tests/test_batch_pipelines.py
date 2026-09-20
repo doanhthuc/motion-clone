@@ -7,16 +7,16 @@ from batchlib.pipelines import (PIPELINES, STAGES, PipelineError, effective_stag
 
 
 class TestKhaiBao(unittest.TestCase):
-    def test_camera_pipeline_is_distinct_and_requires_all_four_materials(self):
+    def test_camera_pipeline_is_distinct_and_background_is_optional(self):
         self.assertEqual(
             PIPELINES["tryon-camera-motion-enhance"],
             ["camera-tryon", "camera-motion", "enhance"],
         )
         self.assertEqual(
             required_roles("tryon-camera-motion-enhance"),
-            {"character", "outfit", "background", "driver"},
+            {"character", "outfit", "driver"},
         )
-        self.assertEqual(optional_roles("tryon-camera-motion-enhance"), set())
+        self.assertEqual(optional_roles("tryon-camera-motion-enhance"), {"background"})
 
     def test_camera_aliases_keep_job_types_and_parameter_schemas_separate(self):
         self.assertEqual(STAGES["camera-tryon"].job_type, "tryon")

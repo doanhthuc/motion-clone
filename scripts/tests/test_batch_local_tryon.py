@@ -687,6 +687,47 @@ class TestCameraComposition(GeminiServerCase):
                 expected_h = max(16, round(math.sqrt(expected_area / (90 / 160)) / 16) * 16)
                 self.assertEqual((out_w, out_h), (expected_w, expected_h))
 
+    def test_camera_local_without_background_skips_background_swap(self):
+        from PIL import Image, ImageDraw
+        for provider in ("gemini", "qwen-max"):
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as d:
+                tmp = Path(d)
+                run = _run_gemini(tmp, background=False)
+                driver = tmp / "driver.mp4"
+                lt.subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+                                   "color=c=blue:s=90x160:d=1", str(driver)], check=True)
+                run.inputs["driver"] = driver
+                calls, generated = [], []
+                def edit(images, prompt, key, out_path, **kwargs):
+                    calls.append((images, prompt, kwargs))
+                    picture = Image.new("RGB", (160, 160), "black")
+                    ImageDraw.Draw(picture).rectangle((70, 70, 89, 89), fill="red")
+                    picture.save(out_path)
+                    generated.append(out_path.read_bytes())
+                    return out_path
+                out = tmp / "out.png"
+                settings = Settings(domain="x", api_key="x", instance_id="x",
+                                    gemini_api_key="AIza" + "x" * 35, dashscope_api_key="fake")
+                with mock.patch.object(lt, "gemini_edit", edit), mock.patch.object(lt, "qwen_max_edit", edit):
+                    lt.run_local_tryon(run, {"provider": provider, "cameraAware": True}, settings, out)
+                # pass 1 (model + outfit) then the camera reframe; no background swap in between.
+                self.assertEqual(len(calls), 2)
+                self.assertNotIn(lt.TRYON_BG_POS, [call[1] for call in calls])
+                self.assertEqual(len(calls[1][0]), 2)
+                self.assertEqual(calls[1][0][0][0], generated[0])
+                self.assertEqual(calls[1][1], lt.load_camera_compose_prompt()[0])
+                self.assertTrue(lt.img_size(out))
+
+    def test_camera_local_requires_driver(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            run = _run_gemini(tmp, background=True)
+            with self.assertRaises(JobError) as cm:
+                lt.run_local_tryon(run, {"provider": "gemini", "cameraAware": True},
+                                  Settings(domain="x", api_key="x", instance_id="x",
+                                           gemini_api_key="AIza" + "x" * 35), tmp / "out.png")
+            self.assertIn("driver", str(cm.exception))
+
     def test_invalid_guide_prevents_garment_call(self):
         with tempfile.TemporaryDirectory() as d:
             tmp = Path(d)

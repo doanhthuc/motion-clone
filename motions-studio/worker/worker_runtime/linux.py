@@ -3862,12 +3862,15 @@ def _img_size(path):
         return None
 
 
-def _load_camera_compose_prompt():
+def _load_camera_compose_prompt(reframe_only=False):
     # 15/09/2026 - asset này giờ CHỈ dùng ở pod (3 ảnh: người, nền, camera-guide trong một lệnh).
     # scripts/batchlib/local_tryon.py (batch runner) đã tách bước này làm 2 lệnh riêng và dùng asset
     # KHÁC (camera-reframe-only.json, chỉ 2 vai) — không sửa file này để "fix" bug ở đường local nữa,
     # 2 asset không còn đồng bộ nội dung một cách cố ý.
-    asset = Path(__file__).resolve().parents[1] / "assets/camera-aware-tryon.json"
+    # reframe_only: the 2-image variant (person already in its location + camera guide), used when the job
+    # carries no background — the same asset scripts/batchlib/local_tryon.py uses for its step B.
+    asset = Path(__file__).resolve().parents[1] / (
+        "assets/camera-reframe-only.json" if reframe_only else "assets/camera-aware-tryon.json")
     try:
         prompt = json.loads(asset.read_text(encoding="utf-8"))
     except Exception as exc:
@@ -5692,14 +5695,16 @@ def _tryon_camera_postprocess(out, guide_dims, params, job_id):
 
 
 def _tryon_compose_camera(job_id, provider, person_path, background_path, guide_path, prefix, params):
-    if (QWEN_EDIT_MAX_REFS < 3 and (provider not in ("gemini", "huggingface")
-                                  or (provider == "gemini" and TRYON_GEMINI_FALLBACK))):
-        raise RuntimeError("camera composition requires QWEN_EDIT_MAX_REFS >= 3")
+    # No background → 2 refs (person, guide) with the reframe-only prompt; the person's own location is kept.
+    # Not yet run on a pod: only the ref/prompt selection is covered by tests.
+    refs = (person_path, background_path, guide_path) if background_path else (person_path, guide_path)
+    if (QWEN_EDIT_MAX_REFS < len(refs) and (provider not in ("gemini", "huggingface")
+                                          or (provider == "gemini" and TRYON_GEMINI_FALLBACK))):
+        raise RuntimeError(f"camera composition requires QWEN_EDIT_MAX_REFS >= {len(refs)}")
     dims = _img_size(guide_path)
     if not dims or min(dims) <= 0:
         raise RuntimeError("camera guide: invalid image dimensions")
-    positive, negative = _load_camera_compose_prompt()
-    refs = (person_path, background_path, guide_path)
+    positive, negative = _load_camera_compose_prompt(reframe_only=not background_path)
     out = os.path.join(os.path.dirname(person_path), prefix + "-camera-compose.png")
     if provider in ("gemini", "qwen-max"):
         qwen_size = "*".join(map(str, _fit_aligned(*dims, mp=1.0, align=16)))
@@ -5740,8 +5745,8 @@ def run_tryon(job):
     # các flow đó chết với "tryon cần inputs.product". cleanOnly chỉ cần ảnh model, không cần sản phẩm.
     clean_only = str(params.get("cleanOnly") or params.get("clean_only") or "").lower().strip() in ("1", "true", "yes", "on")
     camera_aware = str(params.get("cameraAware") or "").lower().strip() in ("1", "true", "yes", "on")
-    if camera_aware and (not inputs.get("background") or not inputs.get("cameraGuide")):
-        raise RuntimeError("camera-aware try-on requires background and cameraGuide")
+    if camera_aware and not inputs.get("cameraGuide"):
+        raise RuntimeError("camera-aware try-on requires cameraGuide")
     if not model_key or (not product_key and (camera_aware or not clean_only)):
         raise RuntimeError("tryon cần inputs.model (người) + inputs.product (trang phục)")
     # ALD 16/08/2026 - KHÔI PHỤC đa-góc sản phẩm (theo yêu cầu user, đảo quyết định "tối giản" 20/07): FE vẫn có

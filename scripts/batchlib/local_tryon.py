@@ -609,17 +609,23 @@ def _gemini_or_qwen_max(gem_key, qwen_key, images, gem_prompt, qwen_prompt, out_
 
 def _camera_compose_local(provider, edited, background, guide, prompt, keys, out_path) -> Path:
     gem_key, qwen_key = keys
-    # Bước A - ghép nền (2 ảnh): reuse TRYON_BG_POS/NEG, cùng prompt đã dùng cho nhánh không
-    # camera-aware — KHÔNG viết prompt mới, giữ nguyên hành vi đã kiểm chứng của bước này.
-    bg_images = [(edited.read_bytes(), mime_of(edited)), (background.read_bytes(), mime_of(background))]
-    composed_path = out_path.with_suffix(".bgswap.png")
-    if provider == "qwen-max":
-        composed = qwen_max_edit(bg_images, TRYON_BG_POS, qwen_key, composed_path, negative_prompt=TRYON_BG_NEG)
+    # `background` is optional (20/09/2026). Without it bước A is skipped and bước B reframes the
+    # try-on result as-is, so the final image keeps the location of the character photo. Not yet
+    # measured on a real run — only the branch wiring is covered by tests.
+    if background is None:
+        composed = edited
     else:
-        composed = _gemini_or_qwen_max(gem_key, qwen_key, bg_images, TRYON_BG_POS, TRYON_BG_POS,
-                                       composed_path, gemini_aspect(img_size(edited)), qwen_negative=TRYON_BG_NEG)
-    if not composed or not img_size(composed):
-        raise JobError("camera composition: background swap returned an undecodable image")
+        # Bước A - ghép nền (2 ảnh): reuse TRYON_BG_POS/NEG, cùng prompt đã dùng cho nhánh không
+        # camera-aware — KHÔNG viết prompt mới, giữ nguyên hành vi đã kiểm chứng của bước này.
+        bg_images = [(edited.read_bytes(), mime_of(edited)), (background.read_bytes(), mime_of(background))]
+        composed_path = out_path.with_suffix(".bgswap.png")
+        if provider == "qwen-max":
+            composed = qwen_max_edit(bg_images, TRYON_BG_POS, qwen_key, composed_path, negative_prompt=TRYON_BG_NEG)
+        else:
+            composed = _gemini_or_qwen_max(gem_key, qwen_key, bg_images, TRYON_BG_POS, TRYON_BG_POS,
+                                           composed_path, gemini_aspect(img_size(edited)), qwen_negative=TRYON_BG_NEG)
+        if not composed or not img_size(composed):
+            raise JobError("camera composition: background swap returned an undecodable image")
 
     # Bước B - xoay góc máy (2 ảnh: bước A, camera-guide) — MỘT lệnh.
     dims = img_size(guide)
@@ -706,8 +712,8 @@ def run_local_tryon(run: Run, params: dict, settings: Settings, out_path: Path) 
     if model_path is None or product_path is None:
         raise JobError(f"run {run.id!r}: try-on local cần inputs.character và inputs.outfit")
     camera_aware = str(params.get("cameraAware") or "").lower().strip() in ("1", "true", "yes", "on")
-    if camera_aware and (background_path is None or run.inputs.get("driver") is None):
-        raise JobError(f"run {run.id!r}: camera-aware try-on requires background and driver")
+    if camera_aware and run.inputs.get("driver") is None:
+        raise JobError(f"run {run.id!r}: camera-aware try-on requires driver")
 
     garment = (str(params.get("garment_type") or params.get("garmentType") or "").lower().strip()
               or "auto")
