@@ -94,10 +94,13 @@ STAGES: dict[str, Stage] = {
         # the try-on face back on all 452 frames in 22s of GPU time; judged by eye on video.
         # A default rather than a lock, so a manifest can still set faceLock: 0 to A/B.
         #
-        # faceLockRestore: CodeFormer after the swap, fixing inswapper_128's waxy/flat texture.
-        # Stable frame-to-frame, but pulls toward CodeFormer's own fuller-lip/bigger-eye prior —
-        # see batch/2026-09-18-face-identity-ab.yaml arm E and the 18/09 addendum in
-        # motions-studio/feature/face-restore-motion-delivery.md.
+        # faceLockRestore: OFF since 20/09/2026, superseded by faceLockDetailKeep below. It was a
+        # CodeFormer pass after the swap, fixing inswapper_128's waxy/flat texture — stable
+        # frame-to-frame, but it put the detail back through a second model's prior (etched edges,
+        # fuller lips, bigger eyes), which users read as the face looking coarser than Wan's own.
+        # See batch/2026-09-18-face-identity-ab.yaml arm E and the 18/09 addendum in
+        # motions-studio/feature/face-restore-motion-delivery.md. Still a default, not a lock:
+        # faceLockRestore: 1 in a manifest brings it back.
         #
         # faceLockBlend stays at 1.0 (swap_video.py's fast path, the unmodified upstream merge).
         # 19/09/2026 it was defaulted to 0.3 to counter inswapper's lip-fullness bias, on the
@@ -108,10 +111,24 @@ STAGES: dict[str, Stage] = {
         # one following the driver (poseStrength 0.9, clipStrength 1.2, driver face crop per frame).
         # Diluting the swap cannot fix lip size without diluting identity by the same factor; a
         # future attempt at the lip bias needs a knob that does not scale the whole merge.
+        #
+        # faceLockDetailKeep (20/09/2026) is that other knob. It lowpasses the swap's change instead
+        # of scaling it, so Wan's skin grain and the hair strands over the forehead survive at full
+        # identity strength. The swap costs the face region 39% of its Laplacian variance
+        # (150.7 -> 92.4 on .smoke/ab-face/'s frame-aligned pair); measured on a 5090 20/09/2026
+        # (scripts/ab-facelock-detail.sh), sigma 2.0 puts back 147.3 of it with the identity shift
+        # intact (low-frequency band 1.04, high-frequency 0.71) and no added shimmer. sigma 3.0
+        # scored marginally higher on texture (148.6) but keeps less of the swap's own high
+        # frequencies (0.66), so 2.0 is the default. Reviewed by doanhthuc on video, the four arms
+        # side by side, before this became the default.
+        # What it does NOT fix: inswapper's fuller, redder lips. That is low-frequency geometry and
+        # rides straight through the lowpass — it needs a face-parser mask over the mouth, which is
+        # its own task and its own model.
         defaults={"bodyProportionLock": False, "poseStrength": 0.9,
                   "clipStrength": 1.2, "naturalNails": True,
                   "removeWristAccessories": True, "faceLock": 1,
-                  "faceLockRestore": 1, "faceLockBlend": 1.0},
+                  "faceLockRestore": 0, "faceLockBlend": 1.0,
+                  "faceLockDetailKeep": 2.0},
         locked_params={"cameraAwareMotion": True, "fitDriver": True},
     ),
 }

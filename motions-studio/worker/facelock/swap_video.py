@@ -28,8 +28,25 @@ def _area(f):
 # the final merge there (the line assigning it is commented out) — dead weight, not a behavior
 # this needs to match. blend=1.0 (default) skips all of this and calls the unmodified upstream
 # method, so today's output is bit-for-bit unchanged unless a caller opts into blend<1.
-def _swap_blended(swapper, frame, tgt, src_face, blend):
-    if blend >= 0.999:
+#
+# 20/09/2026 - detail_keep (sigma in frame pixels, 0 = off): transfer only the LOW-frequency part
+# of what the swap changed, so Wan's own high frequencies — skin grain, lashes, the hair strands
+# falling over the forehead — survive the swap instead of being replaced by inswapper's 128x128
+# render. Measured on .smoke/ab-face/, where original-02-camera-motion.mp4 and facelock-02.mp4 are
+# the same 452 frames with and without the swap: today's merge costs the face region 39% of its
+# Laplacian variance (150.7 -> 92.4, mean over frames 100-300).
+# MEASURED 20/09/2026 on a 5090 (scripts/ab-facelock-detail.sh, three swaps of that same render,
+# 33-35s each): sigma 2.0 -> 147.3, sigma 3.0 -> 148.6, i.e. 98% of Wan's own detail back. Frame-to
+# -frame change in the crop stayed at Wan's level (5.19 -> 5.22 mean abs delta, plain swap 5.00), so
+# it does not buy the texture back with shimmer. Splitting (arm - Wan) against (plain swap - Wan) by
+# band: the low-frequency part — the identity shift — survives at 1.04, while the high-frequency
+# overwrite drops to 0.71. That split is the whole point, and it is what `blend` cannot do: blend
+# scales the change's amplitude (so identity and texture dilute together — that is why the 0.3
+# default was reverted on 19/09), while this band-limits it and leaves the amplitude alone.
+# Not fixed by this: inswapper's fuller/redder lips, which are low-frequency geometry and so ride
+# through the lowpass — that needs a face-parser mask over the mouth, not a sigma.
+def _swap_blended(swapper, frame, tgt, src_face, blend, detail_keep=0.0):
+    if blend >= 0.999 and detail_keep <= 0:
         return swapper.get(frame, tgt, src_face, paste_back=True)
     import cv2
     import numpy as np
@@ -56,7 +73,14 @@ def _swap_blended(swapper, frame, tgt, src_face, blend):
     img_mask = cv2.GaussianBlur(img_mask, blur_size, 0)
     img_mask = (img_mask / 255.0) * float(blend)
     img_mask = np.reshape(img_mask, [img_mask.shape[0], img_mask.shape[1], 1])
-    fake_merged = img_mask * bgr_fake_warp + (1 - img_mask) * target_img.astype(np.float32)
+    target_f = target_img.astype(np.float32)
+    if detail_keep > 0:
+        # Same masked change as below (mask * (fake - target)), lowpassed before it is applied, so
+        # everything finer than `detail_keep` stays exactly as Wan rendered it. Blurring the change
+        # rather than the result is what keeps this from softening the frame.
+        delta = cv2.GaussianBlur(img_mask * (bgr_fake_warp - target_f), (0, 0), float(detail_keep))
+        return np.clip(target_f + delta, 0, 255).astype(np.uint8)
+    fake_merged = img_mask * bgr_fake_warp + (1 - img_mask) * target_f
     return fake_merged.astype(np.uint8)
 
 
@@ -69,6 +93,8 @@ def main():
     ap.add_argument("--crf", type=int, default=15)
     ap.add_argument("--blend", type=float, default=1.0,
                      help="merge strength 0..1 (1.0 = today's behavior, lower keeps more of Wan's own face)")
+    ap.add_argument("--detail-keep", type=float, default=0.0, dest="detail_keep",
+                     help="lowpass sigma in px for the swap's change (0 = off; ~2-3 keeps Wan's skin/hair texture)")
     args = ap.parse_args()
 
     import cv2
@@ -145,7 +171,7 @@ def main():
         else:
             tgt = None
         if tgt is not None:
-            frame = _swap_blended(swapper, frame, tgt, src_face, args.blend)
+            frame = _swap_blended(swapper, frame, tgt, src_face, args.blend, args.detail_keep)
             swapped += 1
         ff.stdin.write(frame.tobytes())
         n += 1

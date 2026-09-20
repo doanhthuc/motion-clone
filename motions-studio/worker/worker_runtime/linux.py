@@ -440,10 +440,28 @@ def _apply_face_lock(src_mp4, ref_image, tmp_dir, params, job_id):
     except Exception:
         _blend = 1.0
     _blend = max(0.0, min(1.0, _blend))
+    # 20/09/2026 - faceLockDetailKeep: lowpass sigma (px) for the swap's own change, so Wan's skin
+    # grain / lashes / the hair strands over the forehead survive instead of being replaced by
+    # inswapper's 128x128 render. 0 = off (today's behavior). Measured on .smoke/ab-face/'s
+    # frame-aligned pair: the swap costs the face region 39% of its Laplacian variance
+    # (150.7 -> 92.4). On a 5090 20/09/2026, sigma 2.0 restores it to 147.3 with no added
+    # frame-to-frame shimmer and the identity shift intact (scripts/ab-facelock-detail.sh; full
+    # numbers in swap_video.py's _swap_blended). Not the same knob as faceLockBlend — that one
+    # scales the change (identity dilutes with it), this one only band-limits it.
     try:
-        r = subprocess.run([py, script, "--ref", ref_image, "--inp", src_mp4, "--out", dst,
-                            "--blend", f"{_blend:.3f}"],
-                           capture_output=True, text=True, timeout=1800)
+        _detail_keep = float(params.get("faceLockDetailKeep", params.get("face_lock_detail_keep",
+                             os.environ.get("MOTION_FACELOCK_DETAIL_KEEP", "0"))))
+    except Exception:
+        _detail_keep = 0.0
+    _detail_keep = max(0.0, min(16.0, _detail_keep))
+    _cmd = [py, script, "--ref", ref_image, "--inp", src_mp4, "--out", dst, "--blend", f"{_blend:.3f}"]
+    if _detail_keep > 0:
+        # Only when asked: a pod installed before 20/09/2026 has a swap_video.py without this flag,
+        # and argparse would reject the whole run (warn + un-swapped output). Re-run make gpu-facelock
+        # on such a pod. Default path stays identical to what every installed pod already accepts.
+        _cmd += ["--detail-keep", f"{_detail_keep:.3f}"]
+    try:
+        r = subprocess.run(_cmd, capture_output=True, text=True, timeout=1800)
         if r.returncode != 0 or not (os.path.isfile(dst) and os.path.getsize(dst) > 1024):
             api_log(job_id, f"faceLock lỗi (giữ output gốc): {((r.stderr or '') + (r.stdout or ''))[-400:]}", "warn")
             return src_mp4

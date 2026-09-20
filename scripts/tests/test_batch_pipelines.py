@@ -42,6 +42,25 @@ class TestKhaiBao(unittest.TestCase):
         self.assertEqual(effective_stage_params("camera-motion", {"faceLock": 0})["faceLock"], 0)
         self.assertEqual(locked_stage_param_errors("camera-motion", {"faceLock": 0}), [])
 
+    def test_camera_motion_keeps_wans_face_texture_instead_of_restoring_it(self):
+        # 20/09/2026: the swap costs the face region 39% of its detail (Laplacian variance
+        # 150.7 -> 92.4 on .smoke/ab-face/'s frame-aligned pair). Two ways to put it back were
+        # measured on a pod; this pins the one that won.
+        got = effective_stage_params("camera-motion", {})
+        # detailKeep 2.0 restores 147.3 of that 150.7 by band-limiting the swap's own change, so
+        # the identity shift survives at full strength (low-freq band 1.04) — reviewed on video.
+        self.assertEqual(got["faceLockDetailKeep"], 2.0)
+        # CodeFormer was the earlier answer and is now redundant: it put detail back through a
+        # second model's prior (etched edges, fuller lips, bigger eyes — 18/09 addendum in
+        # motions-studio/feature/face-restore-motion-delivery.md), which was the other half of the
+        # complaint that started this.
+        self.assertEqual(got["faceLockRestore"], 0)
+        # Both stay overridable — the A/B against them has to remain possible.
+        self.assertEqual(
+            effective_stage_params("camera-motion", {"faceLockRestore": 1})["faceLockRestore"], 1)
+        self.assertEqual(
+            effective_stage_params("camera-motion", {"faceLockDetailKeep": 0})["faceLockDetailKeep"], 0)
+
     def test_plain_motion_does_not_get_face_lock(self):
         self.assertNotIn("faceLock", effective_stage_params("motion", {}))
 
