@@ -8009,7 +8009,8 @@ class TestVastRecoveryAndKill(unittest.TestCase):
              mock.patch("tgbot.bot.stock_at_cached", return_value={}):
             bot.deliver_result(self.tg, ME, self.manifest)
         flat = [data for row in self.tg.buttons[-1] for _, data, *_ in row]
-        self.assertIn(f"{bot._CB_RECOVER_VAST}tg-1", flat)
+        token = str(self.manifest.stat().st_mtime_ns)
+        self.assertIn(f"{bot._CB_RECOVER_VAST}tg-1:{token}", flat)
 
     def test_a_non_stock_out_failure_card_has_no_vast_button(self):
         write_provision_failure(provision_failure_path(self.manifest), ProvisionFailure(
@@ -8020,15 +8021,19 @@ class TestVastRecoveryAndKill(unittest.TestCase):
         self.assertFalse([d for d in flat if d.startswith(bot._CB_RECOVER_VAST)])
 
     def _outstanding_failure_for_this_chat(self):
+        bot._job_manifest_path(ME).write_text(_MOTION_MANIFEST, encoding="utf-8")
         write_provision_failure(provision_failure_path(bot._job_manifest_path(ME)),
                                 ProvisionFailure(gpu="NVIDIA GeForce RTX 5090",
                                                  datacenter="EU-RO-1", stock_out=True,
                                                  detail="hết máy ..."))
 
-    def _tap_vast_card(self):
+    def _tap_vast_card(self, token=None):
+        # The token the card was minted with; defaults to the manifest as it is now, i.e. a card
+        # sent for the batch that is still on disk.
         stem = bot._job_manifest_path(ME).stem
+        token = bot._run_token(ME) if token is None else token
         with mock.patch("tgbot.bot._offer_run_for_chat") as offer:
-            bot.handle(self.tg, cb_from(ME, f"{bot._CB_RECOVER_VAST}{stem}"),
+            bot.handle(self.tg, cb_from(ME, f"{bot._CB_RECOVER_VAST}{stem}:{token}"),
                        allowed_user_id=ME)
         return offer
 
@@ -8045,13 +8050,27 @@ class TestVastRecoveryAndKill(unittest.TestCase):
         self.assertNotIn(ME, bot._PHASE_A_OFFERED)
         self.assertIn("earlier batch", self.tg.messages[-1])
 
-    def test_a_card_tapped_while_a_new_job_is_being_assembled_opens_nothing(self):
+    def test_the_batchs_own_job_still_in_state_does_not_block_the_button(self):
+        # Regression, seen live 2026-09-20: the try-on -> rent flow never calls _do_confirm (it
+        # would clear _STATE before Phase A's results exist) and _do_resume does not clear it
+        # either, so the submitted batch's own job is still in _STATE when the stock-out card is
+        # tapped. A guard on `chat_id in _STATE` made the button dead for every try-on batch.
         self._outstanding_failure_for_this_chat()
-        bot._STATE[ME] = bot.Job(slots={}, probes={}, pipeline="motion-enhance",
+        bot._STATE[ME] = bot.Job(slots={}, probes={}, pipeline="tryon-motion-enhance",
                                  provider="gemini")
         offer = self._tap_vast_card()
+        offer.assert_called_once()
+        self.assertEqual(offer.call_args.kwargs["gpu_provider"], "vast")
+        self.assertEqual(bot._PHASE_A_OFFERED.get(ME), bot._run_token(ME))
+
+    def test_a_card_from_before_the_manifest_was_rewritten_opens_nothing(self):
+        # A new job assembled since (any complete job rewrites tg-<chat>.yaml, changing its
+        # mtime_ns) means the card reports a batch that is no longer on disk.
+        self._outstanding_failure_for_this_chat()
+        offer = self._tap_vast_card(token="1")
         offer.assert_not_called()
         self.assertNotIn(ME, bot._PHASE_A_OFFERED)
+        self.assertIn("earlier batch", self.tg.messages[-1])
 
     def test_tapping_it_for_another_batchs_card_opens_nothing(self):
         with mock.patch("tgbot.bot._offer_run_for_chat") as offer:

@@ -719,7 +719,8 @@ def _deliver_provision_failure(tg: Tg, chat_id: int, manifest_path: Path,
                         f"${e.price_per_hr:.2f}/h",
                         f"{_CB_RECOVER_MIGRATE}{e.datacenter_id}:{stem}")])
 
-    buttons.append([("☁ Rent on Vast instead", f"{_CB_RECOVER_VAST}{stem}")])
+    buttons.append([("☁ Rent on Vast instead",
+                     f"{_CB_RECOVER_VAST}{stem}:{_manifest_token(manifest_path)}")])
 
     short = _GPU_SHORT.get(failure.gpu)
     if short is not None:
@@ -1527,7 +1528,7 @@ _CB_RECOVER_RETRY = "rec:retry:"   # + "<manifest stem>"
 # Opens the Vast tab of the rent panel for the batch whose RunPod rental just failed (spec §3.5).
 # Carries the stem like the other recovery buttons, and is only honoured for the manifest THIS chat
 # is on: it opens a panel, it never spends — the spend button on that panel carries its own token.
-_CB_RECOVER_VAST = "rec:vast:"     # + "<manifest stem>"
+_CB_RECOVER_VAST = "rec:vast:"     # + "<manifest stem>:<_manifest_token>"
 
 # The reuse-or-rerun chooser _do_confirm sends when the journal already holds
 # a matching try-on. Both carry _run_token for the same reason the spend
@@ -1632,8 +1633,14 @@ def _run_token(chat_id: int) -> str:
     minted before it, with no extra state to keep in sync and nothing to lose
     across a restart.
     """
+    return _manifest_token(_job_manifest_path(chat_id))
+
+
+def _manifest_token(manifest_path: Path) -> str:
+    """`_run_token`'s stamp for an explicit manifest — for a button minted from a path
+    rather than from a chat (the stock-out card is handed the manifest it reports on)."""
     try:
-        return str(_job_manifest_path(chat_id).stat().st_mtime_ns)
+        return str(manifest_path.stat().st_mtime_ns)
     except OSError:
         return "0"
 
@@ -1942,13 +1949,21 @@ def _handle_callback(tg: Tg, chat_id: int, query: dict, *, dry_run: bool) -> Non
                            dry_run=dry_run, gpu_provider="runpod")
 
         elif data.startswith(_CB_RECOVER_VAST):
-            stem = data[len(_CB_RECOVER_VAST):]
+            stem, _, token = data[len(_CB_RECOVER_VAST):].partition(":")
             live_manifest = _job_manifest_path(chat_id)
-            # This chat's batch, AND the failure that card reported is still outstanding, AND no new
-            # job is being assembled: the stem is the same for every batch of a chat, so an old
-            # card would otherwise re-open the rent panel for whatever is on disk now.
+            # This chat's batch, AND the failure that card reported is still outstanding, AND the
+            # manifest on disk is the one the card was minted for: the stem is the same for every
+            # batch of a chat, so an old card would otherwise re-open the rent panel for whatever
+            # is on disk now. Any complete job assembled since rewrites the manifest, which is what
+            # the token catches.
+            #
+            # Deliberately NOT `chat_id in _STATE` (2026-09-20): the try-on -> rent flow keeps the
+            # submitted job in _STATE for good (_do_confirm, the only thing that clears it, is never
+            # called there, and _do_resume does not clear it), so that clause was true for every
+            # try-on batch and the button never worked on a card it was built for.
             still_failed = read_provision_failure(provision_failure_path(live_manifest)) is not None
-            if not stem or stem != live_manifest.stem or not still_failed or chat_id in _STATE:
+            if (not stem or stem != live_manifest.stem or not still_failed
+                    or token != _run_token(chat_id)):
                 tg.send_message(chat_id, "that button is from an earlier batch; "
                                          "check /status")
             else:
