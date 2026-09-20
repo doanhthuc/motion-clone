@@ -55,6 +55,12 @@ class TestKhaiBao(unittest.TestCase):
         # motions-studio/feature/face-restore-motion-delivery.md), which was the other half of the
         # complaint that started this.
         self.assertEqual(got["faceLockRestore"], 0)
+        # mouthKeep 1.3 holds an ellipse over the mouth out of the merge, so Wan's lip shape
+        # survives inswapper's fuller/redder lips — geometry the lowpass above cannot touch.
+        # Measured on the same re-swap harness: mean abs distance from Wan in the mouth box falls
+        # 6.518 -> 4.848 while the cheek stays put (5.447 -> 5.447), so it is not a quiet dilution
+        # of the swap. 2.5 got closer still but reaches the chin and philtrum; reviewed on video.
+        self.assertEqual(got["faceLockMouthKeep"], 1.3)
         # Both stay overridable — the A/B against them has to remain possible.
         self.assertEqual(
             effective_stage_params("camera-motion", {"faceLockRestore": 1})["faceLockRestore"], 1)

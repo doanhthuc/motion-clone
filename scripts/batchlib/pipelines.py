@@ -121,14 +121,24 @@ STAGES: dict[str, Stage] = {
         # scored marginally higher on texture (148.6) but keeps less of the swap's own high
         # frequencies (0.66), so 2.0 is the default. Reviewed by doanhthuc on video, the four arms
         # side by side, before this became the default.
-        # What it does NOT fix: inswapper's fuller, redder lips. That is low-frequency geometry and
-        # rides straight through the lowpass — it needs a face-parser mask over the mouth, which is
-        # its own task and its own model.
+        #
+        # faceLockMouthKeep is the other half, for the geometry the lowpass cannot touch:
+        # inswapper's fuller, redder lips. It holds an ellipse over the mouth out of the merge, so
+        # the lips stay exactly as Wan drew them — and Wan's already match the reference photo
+        # better than the swap's do. The ellipse is built from insightface's own 5-point kps, so it
+        # cost no new model: no parser, no landmark table. Measured on the same re-swap harness
+        # 20/09/2026, mean abs distance from Wan over 200 frames: the mouth box falls 6.518 -> 4.848
+        # at scale 1.3 while the cheek does not move (5.447 -> 5.447), i.e. it is not a quiet
+        # dilution of the swap. That kps[3]/kps[4] really are the mouth corners was verified on the
+        # same run by an oversized arm: the protected blob landed on (266,290), against a mouth
+        # centre measured by hand at (272,289). Scale 2.5 got closer to Wan still (3.311) but
+        # reaches the chin and philtrum, so it stays a diagnostic, not a candidate. Reviewed on
+        # video by doanhthuc, who picked 1.3 over 1.0.
         defaults={"bodyProportionLock": False, "poseStrength": 0.9,
                   "clipStrength": 1.2, "naturalNails": True,
                   "removeWristAccessories": True, "faceLock": 1,
                   "faceLockRestore": 0, "faceLockBlend": 1.0,
-                  "faceLockDetailKeep": 2.0},
+                  "faceLockDetailKeep": 2.0, "faceLockMouthKeep": 1.3},
         locked_params={"cameraAwareMotion": True, "fitDriver": True},
     ),
 }
