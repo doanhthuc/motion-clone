@@ -19,6 +19,7 @@ numpy/cv2 only exist in the worker's own venv, so this skips on a bare `python3 
 import importlib.util
 import os
 import sys
+import types
 import unittest
 
 try:
@@ -42,6 +43,22 @@ def _load_swap_video():
 CROP = 128           # inswapper_128's fixed working resolution
 SCALE = 2            # the aligned crop covers a 256x256 area of the frame
 ORIGIN = (140, 180)  # where that area sits in the synthetic frame (x, y)
+
+# insightface's 5-point kps, in its own order: left eye, right eye, nose, left mouth corner,
+# right mouth corner. Placed inside the swapped area above, mouth corners 50px apart — the same
+# spacing the real 544x960 render had at frame 120, where the hand-placed ellipse was measured.
+MOUTH_L = (247.0, 287.0)
+MOUTH_R = (297.0, 292.0)
+
+
+def _kps():
+    return np.array([[220.0, 230.0], [300.0, 235.0], [265.0, 265.0],
+                     list(MOUTH_L), list(MOUTH_R)], dtype=np.float32)
+
+
+def _mouth_centre():
+    return (int(round((MOUTH_L[0] + MOUTH_R[0]) / 2)),
+            int(round((MOUTH_L[1] + MOUTH_R[1]) / 2)))
 
 
 class _FakeSwapper:
@@ -104,8 +121,10 @@ class FaceLockDetailKeepTest(unittest.TestCase):
         self.wan_detail = _detail(self.frame)
         self.wan_tone = _tone(self.frame)
 
-    def _swap(self, **kw):
-        return self.mod._swap_blended(self.swapper, self.frame, object(), object(), 1.0, **kw)
+    def _swap(self, tgt=None, **kw):
+        if tgt is None:
+            tgt = types.SimpleNamespace(kps=_kps())
+        return self.mod._swap_blended(self.swapper, self.frame, tgt, object(), 1.0, **kw)
 
     def test_plain_merge_loses_wan_texture(self):
         """The baseline this fixes: today's full-strength merge flattens the region."""
@@ -132,10 +151,86 @@ class FaceLockDetailKeepTest(unittest.TestCase):
 
     def test_blend_one_and_no_detail_keep_is_still_the_upstream_fast_path(self):
         """Today's default must stay bit-for-bit what it was — the reimplemented merge is opt-in."""
-        self.mod._swap_blended(self.swapper, self.frame, object(), object(), 1.0)
+        tgt = types.SimpleNamespace(kps=_kps())
+        self.mod._swap_blended(self.swapper, self.frame, tgt, object(), 1.0)
         self.assertEqual(self.swapper.paste_back_calls, 1)
-        self.mod._swap_blended(self.swapper, self.frame, object(), object(), 1.0, detail_keep=2.0)
+        self.mod._swap_blended(self.swapper, self.frame, tgt, object(), 1.0, detail_keep=2.0)
         self.assertEqual(self.swapper.paste_back_calls, 1)
+        self.mod._swap_blended(self.swapper, self.frame, tgt, object(), 1.0, mouth_keep=1.0)
+        self.assertEqual(self.swapper.paste_back_calls, 1)
+
+
+@unittest.skipIf(cv2 is None, "needs cv2/numpy (worker venv)")
+class FaceLockMouthKeepTest(unittest.TestCase):
+    """inswapper_128 renders fuller, redder lips than the reference photo — its own bias, and
+    low-frequency geometry, so detail_keep's lowpass carries it straight through. mouth_keep holds
+    an ellipse over the mouth out of the merge entirely, so the lips stay exactly as Wan drew them.
+    The ellipse is built from insightface's own 5-point kps (mouth corners give centre, angle and
+    scale), so it needs no landmark model and no index table. Sizes here match the ones measured by
+    hand on a real 544x960 frame: semi-axes 0.64d x 0.30d at scale 1.0, where d is the distance
+    between the mouth corners."""
+
+    def setUp(self):
+        self.mod = _load_swap_video()
+        self.frame = _texture_frame()
+        self.swapper = _FakeSwapper(_flat_crop())
+        self.tgt = types.SimpleNamespace(kps=_kps())
+
+    def _swap(self, tgt=None, **kw):
+        return self.mod._swap_blended(self.swapper, self.frame, tgt or self.tgt, object(), 1.0, **kw)
+
+    def test_the_mouth_keeps_wans_own_pixels(self):
+        x, y = _mouth_centre()
+        out = self._swap(detail_keep=2.0, mouth_keep=1.0)
+        self.assertTrue(np.array_equal(out[y, x], self.frame[y, x]))
+
+    def test_the_rest_of_the_face_is_still_swapped(self):
+        """Protecting the lips must not protect the cheeks — that would just be a smaller swap."""
+        x, y = _mouth_centre()
+        cheek = (y - 60, x - 45)
+        plain = self._swap(detail_keep=2.0)
+        kept = self._swap(detail_keep=2.0, mouth_keep=1.0)
+        shift_plain = float(plain[cheek].astype(np.float32).mean() - self.frame[cheek].astype(np.float32).mean())
+        shift_kept = float(kept[cheek].astype(np.float32).mean() - self.frame[cheek].astype(np.float32).mean())
+        self.assertGreater(shift_plain, 10.0)
+        self.assertAlmostEqual(shift_kept, shift_plain, delta=0.15 * abs(shift_plain))
+
+    def test_a_bigger_scale_protects_more(self):
+        x, y = _mouth_centre()
+        probe = (y, x + 30)  # outside the 1.0 ellipse (semi-axis 0.64*50 = 32), inside a wider one
+        small = self._swap(detail_keep=2.0, mouth_keep=1.0)
+        big = self._swap(detail_keep=2.0, mouth_keep=1.6)
+        near = lambda o: abs(float(o[probe].astype(np.float32).mean())
+                             - float(self.frame[probe].astype(np.float32).mean()))
+        self.assertGreater(near(small), near(big))
+
+    def test_the_ellipse_follows_the_mouth_angle(self):
+        """A tilted head must tilt the mask, or it protects the chin on one side and the nose on
+        the other. Rotating the corners 90 degrees must move the protection with them."""
+        x, y = _mouth_centre()
+        flat = self._swap(detail_keep=2.0, mouth_keep=1.0)
+        turned = types.SimpleNamespace(kps=_kps())
+        turned.kps[3] = [x, y - 25.0]
+        turned.kps[4] = [x, y + 25.0]
+        out = self.mod._swap_blended(self.swapper, self.frame, turned, object(), 1.0,
+                                     detail_keep=2.0, mouth_keep=1.0)
+        along = (y + 28, x)   # along the vertical mouth axis: protected only when turned
+        delta = lambda o, p: abs(float(o[p].astype(np.float32).mean())
+                                 - float(self.frame[p].astype(np.float32).mean()))
+        self.assertLess(delta(out, along), delta(flat, along))
+
+    def test_a_face_without_kps_is_left_to_the_plain_merge(self):
+        """det gives kps for every face it finds, but the gap-filling branch reuses an older Face;
+        a missing or malformed kps must not take the whole run down."""
+        for bad in (None, np.zeros((0, 2), dtype=np.float32)):
+            out = self._swap(tgt=types.SimpleNamespace(kps=bad), detail_keep=2.0, mouth_keep=1.0)
+            self.assertEqual(out.shape, self.frame.shape)
+
+    def test_mouth_keep_works_without_detail_keep(self):
+        """The two knobs are independent: one fixes texture, the other geometry."""
+        x, y = _mouth_centre()
+        out = self._swap(mouth_keep=1.0)
+        self.assertTrue(np.array_equal(out[y, x], self.frame[y, x]))
 
 
 if __name__ == "__main__":

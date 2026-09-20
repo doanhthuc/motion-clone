@@ -44,9 +44,46 @@ def _area(f):
 # scales the change's amplitude (so identity and texture dilute together — that is why the 0.3
 # default was reverted on 19/09), while this band-limits it and leaves the amplitude alone.
 # Not fixed by this: inswapper's fuller/redder lips, which are low-frequency geometry and so ride
-# through the lowpass — that needs a face-parser mask over the mouth, not a sigma.
-def _swap_blended(swapper, frame, tgt, src_face, blend, detail_keep=0.0):
-    if blend >= 0.999 and detail_keep <= 0:
+# through the lowpass. That is what mouth_keep below is for — the two knobs are independent, one
+# for texture and one for geometry.
+#
+# 20/09/2026 - mouth_keep: hold an ellipse over the mouth out of the merge, so the lips stay
+# exactly as Wan drew them. inswapper renders fuller, redder lips than the reference photo — its
+# own bias, confirmed on a real job's native output — and because that is low-frequency GEOMETRY,
+# detail_keep's lowpass carries it through untouched. The ellipse comes from insightface's own
+# 5-point kps (index 3 and 4 are the mouth corners), so it needs no landmark or parser model and
+# no index table to get wrong: the corners give the centre, the angle, and the scale, which means
+# it tracks a tilted or receding head for free. Semi-axes 0.64d x 0.30d at scale 1.0, where d is
+# the distance between the corners — measured by hand on frame 120 of .smoke/ab-face/ (corners 50px
+# apart, the ellipse that put Wan's lip shape back was 32x15). 0 = off.
+# Keeping Wan's mouth is the right default direction twice over: Wan's lips already match the
+# reference photo better than the swap's do, and the mouth is where the driver's lip sync lives.
+def _mouth_protect(shape, tgt, mouth_keep):
+    """1.0 where the swap applies, ramping to 0.0 over the mouth. None when there is nothing to do."""
+    if mouth_keep <= 0:
+        return None
+    import cv2
+    import numpy as np
+
+    kps = getattr(tgt, "kps", None)
+    if kps is None or len(kps) < 5:
+        return None  # det always fills kps, but the gap-filling branch reuses an older Face
+    left, right = np.asarray(kps[3], dtype=np.float64), np.asarray(kps[4], dtype=np.float64)
+    dx, dy = right - left
+    d = float(np.hypot(dx, dy))
+    if d < 1.0:
+        return None
+    centre = ((left + right) / 2.0).astype(int)
+    axes = (max(1, int(round(0.64 * d * mouth_keep))), max(1, int(round(0.30 * d * mouth_keep))))
+    angle = float(np.degrees(np.arctan2(dy, dx)))
+    mask = np.zeros(shape[:2], dtype=np.float32)
+    cv2.ellipse(mask, (int(centre[0]), int(centre[1])), axes, angle, 0, 360, 1.0, -1)
+    mask = cv2.GaussianBlur(mask, (0, 0), max(2.0, 0.08 * d * mouth_keep))
+    return np.reshape(1.0 - mask, [mask.shape[0], mask.shape[1], 1])
+
+
+def _swap_blended(swapper, frame, tgt, src_face, blend, detail_keep=0.0, mouth_keep=0.0):
+    if blend >= 0.999 and detail_keep <= 0 and mouth_keep <= 0:
         return swapper.get(frame, tgt, src_face, paste_back=True)
     import cv2
     import numpy as np
@@ -74,12 +111,19 @@ def _swap_blended(swapper, frame, tgt, src_face, blend, detail_keep=0.0):
     img_mask = (img_mask / 255.0) * float(blend)
     img_mask = np.reshape(img_mask, [img_mask.shape[0], img_mask.shape[1], 1])
     target_f = target_img.astype(np.float32)
+    protect = _mouth_protect(target_img.shape, tgt, mouth_keep)
     if detail_keep > 0:
         # Same masked change as below (mask * (fake - target)), lowpassed before it is applied, so
         # everything finer than `detail_keep` stays exactly as Wan rendered it. Blurring the change
         # rather than the result is what keeps this from softening the frame.
         delta = cv2.GaussianBlur(img_mask * (bgr_fake_warp - target_f), (0, 0), float(detail_keep))
+        if protect is not None:
+            # After the blur, not before: blurring a hole in the mask would let the swap seep back
+            # into the middle of it. This way the ellipse's centre is guaranteed untouched.
+            delta = delta * protect
         return np.clip(target_f + delta, 0, 255).astype(np.uint8)
+    if protect is not None:
+        img_mask = img_mask * protect
     fake_merged = img_mask * bgr_fake_warp + (1 - img_mask) * target_f
     return fake_merged.astype(np.uint8)
 
@@ -95,6 +139,9 @@ def main():
                      help="merge strength 0..1 (1.0 = today's behavior, lower keeps more of Wan's own face)")
     ap.add_argument("--detail-keep", type=float, default=0.0, dest="detail_keep",
                      help="lowpass sigma in px for the swap's change (0 = off; ~2-3 keeps Wan's skin/hair texture)")
+    ap.add_argument("--mouth-keep", type=float, default=0.0, dest="mouth_keep",
+                     help="hold an ellipse over the mouth out of the swap, scaled by the mouth-corner "
+                          "distance (0 = off; 1.0 = semi-axes 0.64d x 0.30d, keeping Wan's lip shape)")
     args = ap.parse_args()
 
     import cv2
@@ -171,7 +218,7 @@ def main():
         else:
             tgt = None
         if tgt is not None:
-            frame = _swap_blended(swapper, frame, tgt, src_face, args.blend, args.detail_keep)
+            frame = _swap_blended(swapper, frame, tgt, src_face, args.blend, args.detail_keep, args.mouth_keep)
             swapped += 1
         ff.stdin.write(frame.tobytes())
         n += 1

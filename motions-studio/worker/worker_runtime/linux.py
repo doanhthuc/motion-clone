@@ -454,11 +454,25 @@ def _apply_face_lock(src_mp4, ref_image, tmp_dir, params, job_id):
     except Exception:
         _detail_keep = 0.0
     _detail_keep = max(0.0, min(16.0, _detail_keep))
+    # faceLockMouthKeep (20/09/2026): hold an ellipse over the mouth out of the swap, so Wan's own
+    # lip shape survives. inswapper renders fuller, redder lips than the reference photo, and that
+    # is low-frequency geometry, so faceLockDetailKeep's lowpass carries it straight through — this
+    # is the knob for it. Scaled by the mouth-corner distance from insightface's 5-point kps, so it
+    # follows head size and tilt. 0 = off. See swap_video.py's _mouth_protect.
+    try:
+        _mouth_keep = float(params.get("faceLockMouthKeep", params.get("face_lock_mouth_keep",
+                            os.environ.get("MOTION_FACELOCK_MOUTH_KEEP", "0"))))
+    except Exception:
+        _mouth_keep = 0.0
+    _mouth_keep = max(0.0, min(3.0, _mouth_keep))
     _cmd = [py, script, "--ref", ref_image, "--inp", src_mp4, "--out", dst, "--blend", f"{_blend:.3f}"]
+    # Both new flags go on the command line ONLY when asked for. A pod installed before 20/09/2026
+    # has a swap_video.py that does not know them, and argparse would reject the whole run (warn +
+    # un-swapped output, the job's GPU minutes already spent). Re-run make gpu-facelock on such a
+    # pod. The zero path stays exactly the command line every installed pod already accepts.
+    if _mouth_keep > 0:
+        _cmd += ["--mouth-keep", f"{_mouth_keep:.3f}"]
     if _detail_keep > 0:
-        # Only when asked: a pod installed before 20/09/2026 has a swap_video.py without this flag,
-        # and argparse would reject the whole run (warn + un-swapped output). Re-run make gpu-facelock
-        # on such a pod. Default path stays identical to what every installed pod already accepts.
         _cmd += ["--detail-keep", f"{_detail_keep:.3f}"]
     try:
         r = subprocess.run(_cmd, capture_output=True, text=True, timeout=1800)

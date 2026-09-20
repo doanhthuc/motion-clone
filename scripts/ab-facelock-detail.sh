@@ -18,8 +18,14 @@
 # render (~8 min) — each is one pass of inswapper, ~22s on a 5090 for 452 frames. The arms are
 # therefore also frame-aligned with each other, which a re-render with the same seed would not be.
 #
+# SECOND AXIS — mouth_keep (20/09/2026): inswapper's fuller, redder lips are low-frequency
+# geometry, so detail_keep carries them through untouched. --mouth-keep holds an ellipse over the
+# mouth out of the merge so Wan's lip shape survives. AB_ARMS sweeps the pair; each arm is
+# "<detail-keep>:<mouth-keep>" and costs the same ~35s as any other.
+#
 # USE (pod up and reachable — make gpu-wait):
 #   scripts/ab-facelock-detail.sh                       # .smoke/ab-face/ defaults, sigmas 0 2 3
+#   AB_ARMS="2:0 2:1.0 2:1.3" scripts/ab-facelock-detail.sh    # fix sigma, sweep the mouth mask
 #   AB_SIGMAS="0 1.5 2 3 4" scripts/ab-facelock-detail.sh
 #   AB_VIDEO=out/…/02-camera-motion.mp4 AB_REF=out/…/01-camera-tryon.png scripts/ab-facelock-detail.sh
 #
@@ -39,7 +45,12 @@ HOST="$(env_get GPU_SSH_HOST)"; PORT="$(env_get GPU_SSH_PORT)"
 
 VIDEO="${AB_VIDEO:-$ROOT/.smoke/ab-face/original-02-camera-motion.mp4}"
 REF="${AB_REF:-$ROOT/.smoke/ab-face/prepared-camera-tryon.png}"
-SIGMAS="${AB_SIGMAS:-0 2 3}"
+# An arm is "<detail-keep>:<mouth-keep>". AB_SIGMAS stays as the shorthand for sweeping detail
+# alone, so the 20/09 invocation that produced the committed numbers still reads the same.
+ARMSPEC="${AB_ARMS:-}"
+if [ -z "$ARMSPEC" ]; then
+  for SG in ${AB_SIGMAS:-0 2 3}; do ARMSPEC="$ARMSPEC $SG:0"; done
+fi
 [ -f "$VIDEO" ] || die "no Wan render at $VIDEO (set AB_VIDEO=…)"
 [ -f "$REF" ]   || die "no reference image at $REF (set AB_REF=…)"
 
@@ -63,23 +74,25 @@ log "uploading the Wan render + reference"
 scp "${SCP_OPTS[@]}" -q "$VIDEO" "root@$HOST:/root/ab-detail/in.mp4" || die "upload of the video failed"
 scp "${SCP_OPTS[@]}" -q "$REF"   "root@$HOST:/root/ab-detail/ref.png" || die "upload of the reference failed"
 
-ARMS=()
-for SG in $SIGMAS; do
-  log "swap with --detail-keep $SG"
+ARMS=(); LABELS=()
+for SPEC in $ARMSPEC; do
+  DK="${SPEC%%:*}"; MK="${SPEC##*:}"
+  TAG="d$DK-m$MK"
+  log "swap with --detail-keep $DK --mouth-keep $MK"
   START=$(date +%s)
   remote "/root/facelock/venv/bin/python /root/facelock/swap_video.py \
             --ref /root/ab-detail/ref.png --inp /root/ab-detail/in.mp4 \
-            --out /root/ab-detail/s$SG.mp4 --detail-keep $SG 2>&1 | tail -3" \
-    || die "the swap failed at sigma $SG"
-  scp "${SCP_OPTS[@]}" -q "root@$HOST:/root/ab-detail/s$SG.mp4" "$OUT/detailkeep-$SG.mp4" \
-    || die "download of sigma $SG failed"
-  ok "detailkeep-$SG.mp4 ($(( $(date +%s) - START ))s)"
-  ARMS+=("$OUT/detailkeep-$SG.mp4")
+            --out /root/ab-detail/$TAG.mp4 --detail-keep $DK --mouth-keep $MK 2>&1 | tail -3" \
+    || die "the swap failed at $SPEC"
+  scp "${SCP_OPTS[@]}" -q "root@$HOST:/root/ab-detail/$TAG.mp4" "$OUT/$TAG.mp4" \
+    || die "download of $SPEC failed"
+  ok "$TAG.mp4 ($(( $(date +%s) - START ))s)"
+  ARMS+=("$OUT/$TAG.mp4"); LABELS+=("$TAG")
 done
 
 # Judged by eye, on video, side by side — a still frame sent the 19/09 faceLockBlend default the
 # wrong way, and the face is small enough at 544x960 that a full-frame view hides the difference.
-log "building compare.mp4 (Wan | $SIGMAS)"
+log "building compare.mp4 (Wan | ${LABELS[*]})"
 INPUTS=(-i "$VIDEO"); for A in "${ARMS[@]}"; do INPUTS+=(-i "$A"); done
 N=$(( ${#ARMS[@]} + 1 ))
 FILTER=""
@@ -90,10 +103,12 @@ ffmpeg -nostdin -y -v error "${INPUTS[@]}" -filter_complex "$FILTER" -map "[v]" 
   -c:v libx264 -preset fast -crf 16 -pix_fmt yuv420p "$OUT/compare.mp4" \
   || die "ffmpeg could not build the comparison"
 
-ok "$OUT/compare.mp4  (left: Wan, then $SIGMAS)"
+ok "$OUT/compare.mp4  (left: Wan, then ${LABELS[*]})"
 echo
 echo "Watch compare.mp4 before deciding. What would make a sigma the wrong choice:"
 echo "  · doubled edges around the eyes or lips (Wan's old edge left next to the swap's new one)"
 echo "  · the face shimmering between frames where the plain swap sat still"
 echo "  · identity drifting back toward the driver — that would mean the lowpass ate the swap"
-echo "Then set it per job: camera-motion: { faceLockDetailKeep: <sigma> }"
+echo "  · with mouth-keep on: a visible ring around the lips, or a mouth that no longer matches"
+echo "    the rest of the face in colour"
+echo "Then set it per job: camera-motion: { faceLockDetailKeep: <sigma>, faceLockMouthKeep: <scale> }"
