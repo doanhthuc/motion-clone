@@ -150,6 +150,14 @@ người mẫu sẽ thế vào (ở `tryon-character-swap-enhance`, `character` 
 Khối param tên **đúng bằng tên chặng**: `tryon:` · `motion:` · `enhance:` · `character-swap:`
 (nhận `engine: wananimate|scail2`).
 
+**Bare wrists and natural nails (all pipelines).** The `tryon` and `motion` stages default to
+`naturalNails: true` and `removeWristAccessories: true`: the garment-edit prompt and the Wan prompt both
+ask for short unpainted natural nails and no watch or bracelet, so the video does not bring back what
+the try-on image lost. This reaches `tryon-motion-enhance`, `tryon-character-swap-enhance` (tryon stage)
+and `motion-enhance` (motion stage). Set either to `false` in that stage's block to opt out. The
+camera pipeline keeps its own wording (the camera compose prompt asset). Not yet measured on a real
+run: the added sentence goes last in the try-on prompt to limit the risk of diluting the garment command.
+
 ### 2.2.1 Camera-aware try-on motion
 
 `tryon-camera-motion-enhance` is a separate flow; existing

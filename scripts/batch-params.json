@@ -111,6 +111,8 @@
   },
   "tryon": {
     "extra": {
+      "naturalNails": {"why": "_tryon_hands_prompts reads it through _motion_bool, so the AST scanner never sees the name; appends the natural-nails sentence to the garment-edit prompt"},
+      "removeWristAccessories": {"why": "_tryon_hands_prompts reads it through _motion_bool, so the AST scanner never sees the name; appends the no-watch/bracelet sentence to the garment-edit prompt"},
       "cameraGuideFrame": {
         "why": "camera-aware try-on accepts only the representative middle frame policy"
       },

@@ -332,7 +332,9 @@ class TestChayThanhCong(unittest.TestCase):
             self.assertEqual(motion["params_sent"]["renderProfile"], "fast")
             self.assertEqual(motion["params_sent"]["frames"], 33)
             # …và param của manifest vẫn còn, nhưng ở khoá KHÁC: "xin gì" vs "được gì".
-            self.assertEqual(motion["params_manifest"], {"frames": 33})
+            # (defaults of the motion stage + what the manifest asked for)
+            self.assertEqual(motion["params_manifest"],
+                             {"naturalNails": True, "removeWristAccessories": True, "frames": 33})
 
     def test_index_tsv_cot_params_sent_cho_param_da_luu(self):
         # Cột params_sent của _index.tsv phải chở param THẬT. Trước bản sửa nó chở
@@ -349,7 +351,7 @@ class TestChayThanhCong(unittest.TestCase):
             sent = json.loads(motion_row[header.index("params_sent")])
             self.assertEqual(sent["detailUpscale"], False)
             self.assertEqual(json.loads(motion_row[header.index("params_manifest")]),
-                             {"frames": 33})
+                             {"naturalNails": True, "removeWristAccessories": True, "frames": 33})
 
 
 class TestHong(unittest.TestCase):

@@ -1614,10 +1614,10 @@ def build_wan_workflow(ref_name, motion_name, p, prefix="motion-out"):
         _clip_strength = max(_clip_strength, 1.35)
     _positive_prompt = str(p.get("positive_prompt") or MOTION_BASE_POSITIVE).strip()
     _negative_prompt = str(p.get("negative_prompt") or "色调艳丽，过曝，皮肤油光，高光反射，手臂反光，静态，细节模糊不清，最差质量，低质量，畸形，多余的手指, shiny oily skin, glossy plastic skin, specular highlights on skin, blown-out highlights, overexposed arms, flash glare").strip()
-    if _is_camera_aware_motion(p) and _motion_bool(p, "natural_nails", "naturalNails", default=False):
+    if _motion_bool(p, "natural_nails", "naturalNails", default=False):
         _positive_prompt += ", short, neatly trimmed, rounded natural fingernails, flush with the fingertips, natural translucent flesh color, unpainted nails"
         _negative_prompt += ", painted nails, nail polish, colored nails, manicure, artificial nails, long nails, pointed nails, stiletto nails, almond nails, coffin nails, acrylic nails, gel nails, fake nails, French tips, white nail tips, claw-like nails"
-    if _is_camera_aware_motion(p) and _motion_bool(p, "remove_wrist_accessories", "removeWristAccessories", default=False):
+    if _motion_bool(p, "remove_wrist_accessories", "removeWristAccessories", default=False):
         _positive_prompt += ", bare wrists with no watch or bracelet"
         _negative_prompt += ", watch, wristwatch, bracelet, wrist jewelry"
     if _body_lock:
@@ -3943,7 +3943,31 @@ def _tryon_extra_clause(extra):
     return ("ADDITIONAL USER INSTRUCTION — high priority, follow this exactly and let it OVERRIDE the general rules "
             f"where they conflict (e.g. keep or add the items the user names): {e}. ")
 
-def _qwen_tryon_prompts(gt, extra=None):
+# Hands clauses for the garment edit. Same wording as camera-aware-tryon.json / the Wan clauses in
+# build_wan_workflow, so a try-on image and the video rendered from it agree on nails and wrists.
+# Kept apart from the garment command and appended LAST: 20/07/2026's "prompt dài -> loãng lệnh" lesson
+# (see _qwen_tryon_prompts) is why these stay to one short sentence each. Not yet measured on a real
+# try-on run — whether the added sentence dilutes the garment command is still open.
+_TRYON_NAILS_POS = ("The person has short, neatly trimmed, rounded natural fingernails, flush with the "
+                    "fingertips, natural translucent flesh color, with no nail polish.")
+_TRYON_NAILS_NEG = ("painted nails, nail polish, colored nails, manicure, artificial nails, long nails, pointed "
+                    "nails, stiletto nails, almond nails, coffin nails, acrylic nails, gel nails, fake nails, "
+                    "French tips, white nail tips, claw-like nails")
+_TRYON_WRIST_POS = "Do not show a watch or bracelet on either wrist."
+_TRYON_WRIST_NEG = "watch, wristwatch, bracelet, wrist jewelry"
+
+
+def _tryon_hands_prompts(params):
+    """(positive, negative) hands clauses for the garment edit; ("", "") when neither flag is on."""
+    pos, neg = [], []
+    if _motion_bool(params, "natural_nails", "naturalNails", default=False):
+        pos.append(_TRYON_NAILS_POS); neg.append(_TRYON_NAILS_NEG)
+    if _motion_bool(params, "remove_wrist_accessories", "removeWristAccessories", default=False):
+        pos.append(_TRYON_WRIST_POS); neg.append(_TRYON_WRIST_NEG)
+    return " ".join(pos), ", ".join(neg)
+
+
+def _qwen_tryon_prompts(gt, extra=None, hands=("", "")):
     """(pos, neg) prompt try-on cho Qwen-Image-Edit (image1=model, image2(+3)=sản phẩm) — ALD 11/06/2026: tách
     từ build_qwen_tryon_workflow để nhánh HF (Qwen-Image-Edit-2511, CÙNG họ model) dùng chung, hết cảnh nhánh HF
     xài prompt viết cho Gemini → không áp sản phẩm. extra = ghi chú thêm của user (đã dịch EN ở run_tryon)."""
@@ -4076,16 +4100,20 @@ def _qwen_tryon_prompts(gt, extra=None):
     pos = pos + " " + _tryon_extra_clause(extra) + _COMPACT_LOCK
     # #endregion
     neg = neg + ", " + _FACE_NEG + ", " + _HAIR_NEG + ", " + _PROP_NEG + ", " + _SRC_NEG
+    if hands[0]:
+        pos += " " + hands[0]
+        neg += ", " + hands[1]
     return pos, neg
 
-def build_qwen_tryon_workflow(model_name, product_name, garment_type, prefix, target_wh=None, extra_prompt=None):
+def build_qwen_tryon_workflow(model_name, product_name, garment_type, prefix, target_wh=None, extra_prompt=None,
+                              hands=("", "")):
     # ALD 16/08/2026 - KHÔI PHỤC đa-góc (đảo "tối giản" 20/07 theo yêu cầu user): image1=model, image2=ảnh SP
     # chính, image3 (nếu có)=CÙNG sản phẩm góc khác (mặt sau/bên hông) — TextEncodeQwenImageEditPlus nhận tối đa 3 slot.
     product_names = [product_name] if isinstance(product_name, str) else list(product_name or [])[:2]
     if not product_names:
         raise RuntimeError("tryon: thiếu ảnh sản phẩm")
     gt = str(garment_type or "upper").lower().strip()
-    pos, neg = _qwen_tryon_prompts(gt, extra=extra_prompt)
+    pos, neg = _qwen_tryon_prompts(gt, extra=extra_prompt, hands=hands)
     if len(product_names) > 1:
         # Nói RÕ image3 là góc khác của CÙNG món đồ (thường ảnh 2 = mặt trước, ảnh 3 = mặt sau) —
         # không nói thì Qwen dễ hiểu nhầm là món THÊM và mặc chồng 2 lớp.
@@ -4282,7 +4310,7 @@ def _vixtts_tts(script, out_mp3, ref=None, language="vi", temperature=None):
     subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", wav, out_mp3], check=True, timeout=60)
     return out_mp3
 
-def _gemini_tryon_prompt(gt, extra=None):
+def _gemini_tryon_prompt(gt, extra=None, hands=("", "")):
     # ALD 01/07/2026 - chèn "Ghi chú thêm" của user (ưu tiên cao) trước câu chốt. Gemini hiểu tốt nên đặt cuối vẫn ăn.
     # ALD 04/07/2026 - KHÓA MẶT đặt đầu prompt (đồng bộ fix "tryon đổi mặt" bên _qwen_tryon_prompts).
     # 15/09/2026 - FIX "đổi hoàn toàn thành người khác": khi ảnh product/outfit tự nó là ảnh một người khác
@@ -4297,7 +4325,7 @@ def _gemini_tryon_prompt(gt, extra=None):
             " If a person, model or mannequin is wearing the product in image 2, ignore that wearer and their "
             "surroundings entirely and take ONLY the garment(s) shown — never copy their hair, face, body, pose, "
             "framing, or the room/background/setting visible in image 2." +
-            _tryon_extra_clause(extra))
+            _tryon_extra_clause(extra) + (" " + hands[0] if hands[0] else ""))
 
 def _gemini_tryon_prompt_base(gt):
     label = GARMENT_LABEL.get(gt, "garment")
@@ -5837,6 +5865,7 @@ def run_tryon(job):
     if extra_raw:
         extra_en = _translate_prompt_en(extra_raw, job_id) or extra_raw
         api_log(job_id, f"Ghi chú thêm try-on: {extra_en[:160]}", "info")
+    hands = _tryon_hands_prompts(params)
     # provider='gemini' → Gemini image-edit (Nano Banana): thay vật nhỏ (giày) chính xác hơn Qwen, API call
     # (không cần GPU). ALD 11/06/2026 - key CHỈ từ node API Key (nối cổng) / field node — env đã bỏ hẳn.
     if provider == "gemini":
@@ -5853,9 +5882,9 @@ def run_tryon(job):
         for p in p_locals:
             with open(p, "rb") as f: parts.append((f.read(), _mime(p)))
         out = os.path.join(tmp, "gemini_tryon.png")
-        prompt_g = _gemini_tryon_prompt(garment, extra=extra_en)
+        prompt_g = _gemini_tryon_prompt(garment, extra=extra_en, hands=hands)
         # ALD 25/08/2026 - prompt tương đương bên Qwen-Image, dùng khi TRYON_GEMINI_FALLBACK rớt sang Qwen-Max.
-        pos_q, neg_q = _qwen_tryon_prompts(garment, extra=extra_en)
+        pos_q, neg_q = _qwen_tryon_prompts(garment, extra=extra_en, hands=hands)
         # ALD 16/08/2026 - khôi phục đa-góc: p_locals có thể là 2 ảnh CÙNG sản phẩm (parts đã gửi hết bên trên).
         if len(p_locals) > 1:
             prompt_g += (" The two product images show the SAME single product from two angles — typically the "
@@ -5896,7 +5925,7 @@ def run_tryon(job):
         for p in p_locals:
             with open(p, "rb") as f: parts.append((f.read(), _mime(p)))
         out = os.path.join(tmp, "qwen_max_tryon.png")
-        pos_q, neg_q = _qwen_tryon_prompts(garment, extra=extra_en)
+        pos_q, neg_q = _qwen_tryon_prompts(garment, extra=extra_en, hands=hands)
         if len(p_locals) > 1:
             pos_q += (" The two product images show the SAME single product from two angles — typically the "
                       "front and the back. Use both views only to render that ONE product accurately; "
@@ -5926,7 +5955,7 @@ def run_tryon(job):
         # Qwen self-host (_qwen_tryon_prompts, có negative); image_size cap /8 theo ảnh model → hết mặt to sai tỉ lệ.
         # ALD 16/08/2026 - khôi phục đa-góc: gửi tối đa 2 ảnh SP (image_urls[1]=chính, [2]=góc khác).
         uris = [_hf_data_uri(m_local)] + [_hf_data_uri(p) for p in p_locals[:2]]
-        pos_t, neg_t = _qwen_tryon_prompts(garment, extra=extra_en)
+        pos_t, neg_t = _qwen_tryon_prompts(garment, extra=extra_en, hands=hands)
         if len(p_locals) > 1:
             pos_t += (" Image 2 and image 3 show the SAME single product from two angles — typically image 2 is "
                       "the front and image 3 is the back. Use both views only to render that ONE product "
@@ -5983,7 +6012,8 @@ def run_tryon(job):
     if dims:
         twh = _fit_aligned(dims[0], dims[1], mp=mp, align=64)
         api_log(job_id, f"tryon {garment}: {twh[0]}×{twh[1]} /64-aligned (mp~{mp})", "info")
-    pid = comfy_submit(build_qwen_tryon_workflow(m_name, p_names, garment, f"tryon-{job_id[:8]}", target_wh=twh, extra_prompt=extra_en))
+    pid = comfy_submit(build_qwen_tryon_workflow(m_name, p_names, garment, f"tryon-{job_id[:8]}", target_wh=twh, extra_prompt=extra_en,
+                                                 hands=hands))
     outputs = comfy_poll(pid, job_id, deadline_sec=600)
     api_progress(job_id, 0.9, "tải kết quả")
     out = comfy_fetch_output(outputs, exts=IMG_EXTS)

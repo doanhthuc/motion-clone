@@ -583,6 +583,56 @@ def _run_gemini(tmp: Path, background: bool = False) -> Run:
               stage_params={"tryon": {"provider": "gemini"}})
 
 
+class TestHandsPrompts(GeminiServerCase):
+    def test_flags_select_the_clauses(self):
+        self.assertEqual(lt.tryon_hands_prompts({}), ("", ""))
+        self.assertEqual(lt.tryon_hands_prompts({"naturalNails": False, "removeWristAccessories": "off"}),
+                         ("", ""))
+        pos, neg = lt.tryon_hands_prompts({"naturalNails": True})
+        self.assertIn("natural fingernails", pos)
+        self.assertNotIn("watch", pos)
+        self.assertIn("nail polish", neg)
+        pos, neg = lt.tryon_hands_prompts({"removeWristAccessories": True})
+        self.assertIn("watch or bracelet", pos)
+        self.assertIn("wristwatch", neg)
+
+    def test_prompts_append_hands_last_and_are_unchanged_without_them(self):
+        hands = lt.tryon_hands_prompts({"naturalNails": True, "removeWristAccessories": True})
+        for garment in ("auto", "upper", "dress"):
+            with self.subTest(garment=garment):
+                base_pos, base_neg = lt.qwen_tryon_prompts(garment)
+                pos, neg = lt.qwen_tryon_prompts(garment, hands=hands)
+                self.assertEqual(pos, base_pos + " " + hands[0])
+                self.assertEqual(neg, base_neg + ", " + hands[1])
+                self.assertEqual(lt.gemini_tryon_prompt(garment, hands=hands),
+                                 lt.gemini_tryon_prompt(garment) + " " + hands[0])
+
+    def test_run_local_tryon_sends_the_hands_clauses_only_when_flagged(self):
+        from PIL import Image
+        for provider in ("gemini", "qwen-max"):
+            for flagged in (True, False):
+                with self.subTest(provider=provider, flagged=flagged), tempfile.TemporaryDirectory() as d:
+                    tmp = Path(d)
+                    run = _run_gemini(tmp, background=False)
+                    calls = []
+                    def edit(images, prompt, key, out_path, **kwargs):
+                        calls.append((prompt, kwargs))
+                        Image.new("RGB", (160, 90), "red").save(out_path)
+                        return out_path
+                    params = {"provider": provider}
+                    if flagged:
+                        params.update(naturalNails=True, removeWristAccessories=True)
+                    settings = Settings(domain="x", api_key="x", instance_id="x",
+                                        gemini_api_key="AIza" + "x" * 35, dashscope_api_key="fake")
+                    with mock.patch.object(lt, "gemini_edit", edit), mock.patch.object(lt, "qwen_max_edit", edit):
+                        lt.run_local_tryon(run, params, settings, tmp / "out.png")
+                    self.assertEqual(len(calls), 1)
+                    self.assertEqual("natural fingernails" in calls[0][0], flagged)
+                    self.assertEqual("watch or bracelet" in calls[0][0], flagged)
+                    if provider == "qwen-max":
+                        self.assertEqual("wristwatch" in calls[0][1]["negative_prompt"], flagged)
+
+
 class TestCameraComposition(GeminiServerCase):
     def test_ordinary_path_ignores_driver_and_preserves_legacy_aspect(self):
         from PIL import Image

@@ -57,6 +57,21 @@ class TestKhaiBao(unittest.TestCase):
                          {"character", "outfit", "driver"})
         self.assertEqual(optional_roles("tryon-motion-enhance"), {"background"})
 
+    def test_tryon_and_motion_stages_default_to_bare_wrists_and_natural_nails(self):
+        for stage in ("tryon", "motion"):
+            with self.subTest(stage=stage):
+                got = effective_stage_params(stage, {})
+                self.assertIs(got["naturalNails"], True)
+                self.assertIs(got["removeWristAccessories"], True)
+        # A manifest can still opt out per stage.
+        got = effective_stage_params("tryon", {"naturalNails": False})
+        self.assertIs(got["naturalNails"], False)
+        self.assertIs(got["removeWristAccessories"], True)
+
+    def test_camera_tryon_is_not_given_the_stage_wide_hands_defaults(self):
+        # camera-tryon gets its hands wording from the camera compose prompt asset instead.
+        self.assertNotIn("naturalNails", effective_stage_params("camera-tryon", {}))
+
     def test_moi_chang_trong_pipeline_deu_co_trong_STAGES(self):
         for name, stages in PIPELINES.items():
             for s in stages:

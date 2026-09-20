@@ -160,6 +160,45 @@ class CameraMotionWorkflowBoundaryTests(unittest.TestCase):
         self.assertIn("stiletto nails", negative)
         self.assertIn("white nail tips", negative)
 
+    def test_plain_motion_honours_the_hands_flags(self):
+        workflow = self._submit_motion((900, 1200), camera_aware=False,
+                                      appearance={"naturalNails": True, "removeWristAccessories": True})
+        positive = workflow["60"]["inputs"]["positive_prompt"]
+        negative = workflow["60"]["inputs"]["negative_prompt"]
+        self.assertIn("short, neatly trimmed, rounded natural fingernails", positive)
+        self.assertIn("bare wrists with no watch or bracelet", positive)
+        self.assertIn("nail polish", negative)
+        self.assertIn("wristwatch", negative)
+
+    def test_plain_motion_leaves_the_prompt_alone_without_the_flags(self):
+        workflow = self._submit_motion((900, 1200), camera_aware=False)
+        self.assertNotIn("fingernails", workflow["60"]["inputs"]["positive_prompt"])
+        self.assertNotIn("wristwatch", workflow["60"]["inputs"]["negative_prompt"])
+
+    def test_tryon_hands_prompts_follow_the_flags(self):
+        self.assertEqual(linux._tryon_hands_prompts({}), ("", ""))
+        self.assertEqual(linux._tryon_hands_prompts({"naturalNails": False, "removeWristAccessories": "off"}),
+                         ("", ""))
+        pos, neg = linux._tryon_hands_prompts({"naturalNails": True})
+        self.assertIn("natural fingernails", pos)
+        self.assertNotIn("watch", pos)
+        self.assertIn("nail polish", neg)
+        pos, neg = linux._tryon_hands_prompts({"remove_wrist_accessories": "true"})
+        self.assertIn("watch or bracelet", pos)
+        self.assertNotIn("fingernails", pos)
+        self.assertIn("wristwatch", neg)
+
+    def test_tryon_prompts_append_hands_last_and_are_unchanged_without_them(self):
+        hands = linux._tryon_hands_prompts({"naturalNails": True, "removeWristAccessories": True})
+        for garment in ("auto", "upper", "dress"):
+            with self.subTest(garment=garment):
+                base_pos, base_neg = linux._qwen_tryon_prompts(garment)
+                pos, neg = linux._qwen_tryon_prompts(garment, hands=hands)
+                self.assertEqual(pos, base_pos + " " + hands[0])
+                self.assertEqual(neg, base_neg + ", " + hands[1])
+                self.assertEqual(linux._gemini_tryon_prompt(garment, hands=hands),
+                                 linux._gemini_tryon_prompt(garment) + " " + hands[0])
+
     def test_camera_motion_bypasses_api_injected_dimensions_at_workflow_boundary(self):
         for driver_dims, expected in (((1920, 1080), (1280, 720)), ((900, 1200), (720, 960))):
             with self.subTest(driver_dims=driver_dims):
