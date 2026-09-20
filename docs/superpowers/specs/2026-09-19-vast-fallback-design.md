@@ -124,10 +124,13 @@ A data registry `stage (+ params) → {catalog ids, extra setup steps}`, sizes f
 | `enhance` with FlashVSR | 4 `flashvsr-*` files | ≈9.3 GB |
 | `enhance` with Lanczos | none extra | 0 |
 | `character-swap` | `swap-sam3`, `swap-scail2-unet`, `swap-scail2-umt5-fp8`, `swap-scail2-lightx2v-r64`, `swap-scail2-dpo` | ≈28.3 GB |
-| `faceLock` / `faceLockRestore` on | `pod-facelock.sh` (insightface swap + CodeFormer) — **not in any catalog** | small |
+| `faceLock` on | `pod-facelock.sh` (insightface swap) — **not in any catalog** | small |
+| `faceLockRestore` on | the above plus CodeFormer (`facerestore_cf` node + model) | small |
 
-`camera-motion` turns `faceLock` and `faceLockRestore` on by default (`batchlib/pipelines.py`), so the
-model set is catalog ids **plus setup steps**. DWPose and RIFE self-download on first use.
+`camera-motion` turns `faceLock` on by default (`batchlib/pipelines.py`), so the model set is catalog
+ids **plus setup steps**. `faceLockRestore` was a default too until 20/09/2026, when
+`faceLockDetailKeep` replaced it — a box provisioned for camera-motion no longer needs CodeFormer
+unless a manifest asks for it. DWPose and RIFE self-download on first use.
 
 - `pod-bootstrap` starts the model download for the manifest's set **in parallel** with the backend
   install. Measured 2026-09-19: 34 GB in 137 s, in parallel with a 200 s bootstrap, so the download is
