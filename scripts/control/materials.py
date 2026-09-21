@@ -250,8 +250,9 @@ def resolve_material(staging_root: Path, owner: str, name: str) -> Path | None:
 
 
 def _in_use(batch_dir: Path, path: Path) -> bool:
-    """A busy run's manifest names this file. Only busy runs block: a finished
-    manifest keeps naming its inputs forever, and would make nothing deletable.
+    """A busy run's manifest, or the app's draft, names this file. Only busy
+    runs block: a finished manifest keeps naming its inputs forever, and would
+    make nothing deletable.
 
     Matches the whole path, not a bare substring: `needle in text` would also
     match `<path>.bak` or any other manifest value that merely starts with
@@ -268,6 +269,15 @@ def _in_use(batch_dir: Path, path: Path) -> bool:
                 return True
         except OSError:
             continue
+    # The phone's draft (control/drafts.py) names files it has not run yet;
+    # deleting one would leave the draft pointing at nothing. Not a manifest,
+    # so not gated on busy(): a draft is always "in use".
+    draft = batch_dir / f"{APP_OWNER}.draft.json"
+    try:
+        if pattern.search(draft.read_text(encoding="utf-8", errors="replace")):
+            return True
+    except OSError:
+        pass
     return False
 
 

@@ -7,12 +7,19 @@ DraftStore below.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import asdict
+import json
+import subprocess
+import uuid
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+import control
 from batchlib.pipelines import PIPELINES, optional_roles, required_roles
+from control import materials
+from tgbot import ingest
 from tgbot.ingest import Probe
-from tgbot.job import DEFAULT_PROVIDER, Job, _tryon_stage, missing_slots
+from tgbot.job import DEFAULT_PROVIDER, Job, _tryon_stage, missing_slots, run_id_for
+from tgbot.run import estimate_minutes
 
 # Try-on providers offered from the bot. gemini/qwen-max run directly from
 # THIS process (batchlib/runner.py's run_local_phase, invoked by drain.py's
@@ -141,3 +148,216 @@ def pipeline_catalog() -> list[dict]:
                           if _tryon_stage(name) is not None else []),
         })
     return catalog
+
+
+class DraftError(Exception):
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code, self.message = code, message
+
+
+@dataclass
+class _Draft:
+    job: Job
+    basket: list[Job] = field(default_factory=list)
+    # Tri-state, as the bot's _LAST_VALIDATE: None = never checked since the
+    # last change, True/False = the verdict of make batch-validate.
+    validated: bool | None = None
+    generation: int = 0
+
+
+_PATCH_KEYS = frozenset({"pipeline", "provider", "slots"})
+
+
+class DraftStore:
+    """One owner's draft, on disk at batch/<owner>.draft.json.
+
+    Read and written on every call under control.LOCK instead of cached in
+    memory: the file is a few KB, and a per-request read removes the bot's
+    load-once/save-in-finally envelope along with its check-then-act races.
+    Slow work (ffprobe here, make batch-validate in validate()) runs outside
+    the lock.
+    """
+
+    def __init__(self, batch_dir: Path, staging_root: Path, owner: str, *,
+                 default_pipeline: str, default_provider: str, probe=ingest.probe):
+        self.batch_dir, self.owner = batch_dir, owner
+        # Resolved once here so it matches materials.resolve_material's own
+        # resolved paths (control/paths.py's safe_child): on macOS /var is a
+        # symlink to /private/var, so an un-resolved staging_root silently
+        # failed every path.relative_to() in _material_id below, and every
+        # slot in the view came back with material_id: null (measured
+        # 2026-09-21, tempfile.mkdtemp() under /var/folders/...).
+        self.staging_root = staging_root.resolve()
+        self.default_pipeline, self.default_provider = default_pipeline, default_provider
+        self._probe = probe
+        self.path = batch_dir / f"{owner}.draft.json"
+
+    # -- persistence -------------------------------------------------------
+
+    def _fresh(self, generation: int = 0) -> _Draft:
+        return _Draft(job=Job(slots={}, probes={}, pipeline=self.default_pipeline,
+                              provider=self.default_provider), generation=generation)
+
+    def _load(self) -> _Draft:
+        if not self.path.exists():
+            return self._fresh()
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            [current] = load_jobs([payload["job"]])
+            if current.pipeline not in PIPELINES:
+                raise ValueError(f"unknown pipeline {current.pipeline!r}")
+            return _Draft(job=current, basket=load_jobs(payload["basket"]),
+                          validated=payload["validated"], generation=int(payload["generation"]))
+        except (ValueError, KeyError, TypeError):
+            # Moved aside, never deleted: it is the only copy of what the
+            # user had composed (same rule as the bot's _load_draft).
+            self.path.replace(self.path.with_name(self.path.name + ".bad"))
+            return self._fresh()
+
+    def _save(self, d: _Draft) -> None:
+        payload = {"job": dump_jobs([d.job])[0], "basket": dump_jobs(d.basket),
+                   "validated": d.validated, "generation": d.generation}
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_name(f"{self.path.name}.{uuid.uuid4().hex}.tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp.replace(self.path)
+
+    def _changed(self, d: _Draft) -> dict:
+        d.validated = None
+        d.generation += 1
+        self._save(d)
+        return self._view(d)
+
+    # -- rendering ---------------------------------------------------------
+
+    def _material_id(self, path: Path) -> str | None:
+        try:
+            rel = path.relative_to(self.staging_root)
+        except ValueError:
+            return None
+        return "/".join(rel.parts) if len(rel.parts) == 2 else None
+
+    def _missing(self, job: Job) -> list[str]:
+        present = {r for r, p in job.slots.items() if p.is_file()}
+        return sorted(required_roles(job.pipeline) - present)
+
+    def _view(self, d: _Draft) -> dict:
+        job = d.job
+        jobs = jobs_for(job, d.basket)
+        return {
+            "owner": self.owner, "pipeline": job.pipeline, "provider": job.provider,
+            "generation": d.generation,
+            "slots": {role: {"material_id": self._material_id(path), "name": path.name,
+                             "exists": path.is_file(), "probe": asdict(job.probes[role]),
+                             "warning": ingest.quality_warning(job.probes[role])}
+                      for role, path in sorted(job.slots.items())},
+            "required": sorted(required_roles(job.pipeline)),
+            "optional": sorted(optional_roles(job.pipeline)),
+            "missing": self._missing(job),
+            "validated": d.validated,
+            "batch": [{"digest": job_digest(b), "run_id": run_id_for(b), "pipeline": b.pipeline,
+                       "provider": b.provider,
+                       "slots": {r: self._material_id(p) for r, p in sorted(b.slots.items())}}
+                      for b in d.basket],
+            "jobs": len(jobs),
+            "estimate_min": sum(estimate_minutes(j) for j in jobs) if d.validated is True else None,
+        }
+
+    def view(self) -> dict:
+        with control.LOCK:
+            return self._view(self._load())
+
+    # -- mutations ---------------------------------------------------------
+
+    def _resolve(self, material_id) -> Path:
+        if not isinstance(material_id, str) or material_id.count("/") != 1:
+            raise DraftError("not_found", "no such material")
+        owner, name = material_id.split("/")
+        path = materials.resolve_material(self.staging_root, owner, name)
+        if path is None:
+            raise DraftError("not_found", f"no such material: {material_id}")
+        return path
+
+    def patch(self, body: dict) -> dict:
+        if not isinstance(body, dict) or not body or set(body) - _PATCH_KEYS:
+            raise DraftError("bad_request", "expected an object with pipeline, provider and/or slots")
+        pipeline, provider, slots = body.get("pipeline"), body.get("provider"), body.get("slots", {})
+        if pipeline is not None and not isinstance(pipeline, str):
+            raise DraftError("bad_request", "pipeline must be a string")
+        if provider is not None and not isinstance(provider, str):
+            raise DraftError("bad_request", "provider must be a string")
+        if not isinstance(slots, dict):
+            raise DraftError("bad_request", "slots must be an object of role -> material id or null")
+        if pipeline is not None and pipeline not in PIPELINES:
+            raise DraftError("unknown_pipeline", f"unknown pipeline {pipeline!r}")
+        if provider is not None and provider not in PROVIDER_LABELS:
+            raise DraftError("unknown_provider", f"unknown provider {provider!r}")
+
+        # Outside the lock: ffprobe takes up to 60 s per file (ingest.probe).
+        filled: dict[str, tuple[Path, Probe]] = {}
+        for role, material_id in slots.items():
+            if material_id is None:
+                continue
+            path = self._resolve(material_id)
+            try:
+                filled[role] = (path, self._probe(path))
+            except (RuntimeError, OSError, ValueError, subprocess.TimeoutExpired) as exc:
+                raise DraftError("unprobeable", f"{path.name} could not be read: {exc}")
+
+        with control.LOCK:
+            d = self._load()
+            target = pipeline or d.job.pipeline
+            usable = required_roles(target) | optional_roles(target)
+            for role in slots:
+                if role not in usable:
+                    raise DraftError("unknown_role", f"{target} has no {role!r} slot")
+            for role, (path, probed) in filled.items():
+                if probed.kind != role_kind(role):
+                    raise DraftError("wrong_kind",
+                                     f"{role} must be {role_kind(role)}, {path.name} is {probed.kind}")
+            if provider is not None and _tryon_stage(target) is None:
+                raise DraftError("not_applicable", f"{target} has no try-on stage to pick a provider for")
+            # Every check passed: apply. Nothing above wrote anything.
+            dropped = drop_unusable(d.job, target) if pipeline is not None else []
+            if provider is not None:
+                d.job.provider = provider
+            for role, material_id in slots.items():
+                if material_id is None:
+                    d.job.slots.pop(role, None)
+                    d.job.probes.pop(role, None)
+                else:
+                    d.job.slots[role], d.job.probes[role] = filled[role]
+            view = self._changed(d)
+        view["dropped"] = dropped
+        return view
+
+    def add_to_batch(self) -> dict:
+        with control.LOCK:
+            d = self._load()
+            if self._missing(d.job):
+                raise DraftError("missing_slots",
+                                 "fill every required slot first: " + ", ".join(self._missing(d.job)))
+            if any(signature(d.job) == signature(other) for other in d.basket):
+                raise DraftError("duplicate", "that exact job is already in the batch")
+            # Two copies: the batch entry and the job still being edited must
+            # not share slot dicts (bot's _add_to_batch).
+            d.basket.append(copy_job(d.job))
+            d.job = copy_job(d.job)
+            return self._changed(d)
+
+    def drop_from_batch(self, digest: str) -> dict:
+        with control.LOCK:
+            d = self._load()
+            index = next((i for i, b in enumerate(d.basket) if job_digest(b) == digest), None)
+            if index is None:
+                raise DraftError("not_found", "that entry is no longer in the batch")
+            d.basket.pop(index)
+            return self._changed(d)
+
+    def clear(self) -> dict:
+        with control.LOCK:
+            # The generation keeps counting, so a validate that started before
+            # the clear cannot record its verdict on the empty draft.
+            d = self._fresh(generation=self._load().generation)
+            return self._changed(d)

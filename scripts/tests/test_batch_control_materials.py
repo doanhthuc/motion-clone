@@ -328,6 +328,26 @@ class TestThumbConcurrency(unittest.TestCase):
         self.assertEqual(peak[0], 2)
 
 
+class TestDeleteVsAppDraft(unittest.TestCase):
+    def test_delete_refuses_material_the_app_draft_uses(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        batch, staging = tmp / "batch", tmp / "batch" / "tg-staging"
+        (staging / "app").mkdir(parents=True)
+        used, free = staging / "app" / "a.png", staging / "app" / "a.png.bak"
+        used.write_bytes(b"x"); free.write_bytes(b"x")
+        # .resolve(): the store always saves a resolved path (dump_jobs, fed
+        # by materials.resolve_material -> control.paths.safe_child), same
+        # reason the manifest tests above compare against self.a.resolve().
+        (batch / "app.draft.json").write_text(
+            json.dumps({"slots": {"character": str(used.resolve())}}, indent=2))
+        with self.assertRaises(materials.MaterialError) as cm:
+            materials.delete_material(staging, batch, "app", "a.png")
+        self.assertEqual(cm.exception.code, "in_use")
+        materials.delete_material(staging, batch, "app", "a.png.bak")   # whole-path match only
+        self.assertFalse(free.exists())
+
+
 class TestPruneThumbs(unittest.TestCase):
     def test_removes_thumbs_whose_source_is_gone(self):
         tmp = Path(tempfile.mkdtemp())
