@@ -7243,40 +7243,45 @@ class AppPod:
         ETag, and one that moves with the clock never gets a 304. The phone
         computes elapsed from `lease.provisioned_at` itself.
 
-        Takes `BOT_LOCK` like every read of bot state, which means a kill in
-        progress answers this with 503 bot_busy until the worker lets go: the
-        worker holds the lock for the whole destroy.
+        Takes NO `BOT_LOCK`, on purpose. The kill worker holds that lock for
+        the whole destroy (up to ~210 s), and this is the route the phone
+        polls to learn the kill finished: behind the lock it would answer
+        `503 bot_busy` for exactly as long as the answer is wanted. What it
+        reads is files, plus `last_kill` (only ever replaced whole, never
+        mutated) and whether the worker thread is alive (`kill_running`); a
+        snapshot that is a moment stale is fine for a status poll, and
+        nothing here decides anything that spends money.
         """
-        with _bot_locked() as busy_response:
-            if busy_response is not None:
-                return busy_response
-            manifest_path = _job_manifest_path(self.chat_id)
-            lease = lease_for(manifest_path) or read_lease(LEASE_PATH)
-            failure = read_provision_failure(provision_failure_path(manifest_path))
-            body = {
-                "run_id": self.run_id,
-                "gpu": env_get(ROOT / ".env", "GPU") or _PRIMARY_GPU_ID,
-                "lease": None if lease is None else {
-                    "provider": lease.provider,
-                    "provisioned_at": lease.provisioned_at,
-                    "abs_max_min": lease.abs_max_min,
-                    "quoted_usd_per_hr": quoted_usd_per_hr(lease.provider),
-                    # The stem only: the lease's manifest is an absolute path.
-                    "run_id": Path(lease.manifest).stem or None,
-                },
-                "migration": self._migration_state(),
-                # Plain again on the way out: the worker already stripped it,
-                # but this body is where "no absolute path, no HTML" is
-                # promised, so it does not rest on a writer elsewhere.
-                "last_kill": ({**self.last_kill,
-                               "message": _plain(str(self.last_kill.get("message", "")))}
-                              if self.last_kill else None),
-                "failed_rental": None if failure is None else {
-                    "gpu": _plain(failure.gpu),
-                    "datacenter": _plain(failure.datacenter) if failure.datacenter else None,
-                    "stock_out": failure.stock_out,
-                    "detail": _plain(failure.detail)},
-            }
+        manifest_path = _job_manifest_path(self.chat_id)
+        lease = lease_for(manifest_path) or read_lease(LEASE_PATH)
+        failure = read_provision_failure(provision_failure_path(manifest_path))
+        last_kill = self.last_kill
+        thread = self._kill_thread
+        body = {
+            "run_id": self.run_id,
+            "gpu": env_get(ROOT / ".env", "GPU") or _PRIMARY_GPU_ID,
+            "lease": None if lease is None else {
+                "provider": lease.provider,
+                "provisioned_at": lease.provisioned_at,
+                "abs_max_min": lease.abs_max_min,
+                "quoted_usd_per_hr": quoted_usd_per_hr(lease.provider),
+                # The stem only: the lease's manifest is an absolute path.
+                "run_id": Path(lease.manifest).stem or None,
+            },
+            "migration": self._migration_state(),
+            "kill_running": thread is not None and thread.is_alive(),
+            # Plain again on the way out: the worker already stripped it,
+            # but this body is where "no absolute path, no HTML" is
+            # promised, so it does not rest on a writer elsewhere.
+            "last_kill": ({**last_kill,
+                           "message": _plain(str(last_kill.get("message", "")))}
+                          if last_kill else None),
+            "failed_rental": None if failure is None else {
+                "gpu": _plain(failure.gpu),
+                "datacenter": _plain(failure.datacenter) if failure.datacenter else None,
+                "stock_out": failure.stock_out,
+                "detail": _plain(failure.detail)},
+        }
         return 200, body
 
     def gpu_stock(self, force: bool) -> tuple[int, dict]:

@@ -322,6 +322,22 @@ class TestAppPodKill(_PodFixture):
         release.set()
         self.pod._kill_thread.join(5)
 
+    def test_pod_is_readable_while_a_kill_runs_and_says_so(self):
+        self._live_drain()
+        _do_kill, entered, release = self._blocking_kill()
+        self.assertEqual(self.pod.kill(self.pod.run_id, "k1")[0], 202)
+        self.assertTrue(entered.wait(5))
+        status, body = self.pod.pod()
+        self.assertEqual(status, 200)
+        self.assertIs(body["kill_running"], True)
+        self.assertIsNone(body["last_kill"])
+        release.set()
+        self.pod._kill_thread.join(5)
+        status, body = self.pod.pod()
+        self.assertEqual(status, 200)
+        self.assertIs(body["kill_running"], False)
+        self.assertIsNotNone(body["last_kill"])
+
     def test_a_worker_exception_is_recorded_not_swallowed(self):
         self._live_drain()
         with mock.patch("tgbot.bot._do_kill", side_effect=RuntimeError("boom")):
@@ -720,8 +736,8 @@ class TestPodState(_PodFixture):
         self.assertEqual(status, 200)
         self.assertEqual(body, {
             "run_id": f"tg-{ME}", "gpu": bot._PRIMARY_GPU_ID, "lease": None,
-            "migration": self.IDLE_MIGRATION, "last_kill": None,
-            "failed_rental": None})
+            "migration": self.IDLE_MIGRATION, "kill_running": False,
+            "last_kill": None, "failed_rental": None})
 
     def test_pod_gpu_is_the_env_gpu(self):
         (self.root / ".env").write_text(f"GPU={P4090}\n", encoding="utf-8")
@@ -822,10 +838,14 @@ class TestPodState(_PodFixture):
         self.assertNotIn(str(self.root), text)
         self.assertNotIn("<b>", text)
 
-    def test_pod_is_503_while_the_bot_lock_is_held(self):
+    def test_pod_answers_while_the_bot_lock_is_held(self):
+        # The phone polls this route to learn a kill finished, and the kill
+        # worker holds BOT_LOCK for the whole destroy: behind the lock the
+        # poll would be a 503 for exactly as long as the answer is wanted.
         with _bot_lock_held_elsewhere(), mock.patch.object(bot, "BOT_LOCK_TIMEOUT_SEC", 0.05):
             status, body = self.pod.pod()
-        self.assertEqual((status, body["error"]["code"]), (503, "bot_busy"))
+        self.assertEqual(status, 200)
+        self.assertIs(body["kill_running"], False)
 
 
 class TestSetGpu(_PodFixture):
