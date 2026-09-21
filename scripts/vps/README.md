@@ -889,7 +889,8 @@ One-time setup:
 1. Zero Trust → Networks → Tunnels → create a tunnel (`motion-vps-api`), choose the Debian
    connector, and run the `cloudflared service install <token>` command it prints **on the VPS**.
    `systemctl status cloudflared` must be `active (running)`.
-2. In the tunnel, add a public hostname (e.g. `api-motion.<your domain>`) → `http://localhost:8787`.
+2. In the tunnel, add a public hostname (e.g. `api-motion.<your domain>`) → `http://127.0.0.1:8787`
+   (the server binds IPv4 only; `cloudflared` can resolve `localhost` to `::1` and fail to connect).
 3. Zero Trust → Access → Service Auth → create a service token. Copy the Client ID and Secret —
    the secret is shown once.
 4. Access → Applications → self-hosted app for that hostname, with one policy: action

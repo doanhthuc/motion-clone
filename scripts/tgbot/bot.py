@@ -6681,18 +6681,30 @@ def _start_control_api(tg: Tg, chat_id: int):
     if not token:
         log("control API disabled (CONTROL_API_TOKEN unset)")
         return None
+    server = None
     try:
         port = int(env_get(ROOT / ".env", "CONTROL_API_PORT") or 8787)
         server = make_server(token=token, batch_dir=ROOT / "batch", out_dir=ROOT / "out",
                              port=port, log=log)
-    except (OSError, ValueError) as exc:
+        start_in_thread(server)
+    except (OSError, ValueError, RuntimeError) as exc:
+        # RuntimeError: the OS refused to create the daemon thread (e.g. a
+        # thread-count limit). This used to sit outside the try/except, so
+        # that exception escaped _start_control_api and, with systemd
+        # Restart=always, crash-looped the whole bot — the phone API failing
+        # must never take Telegram down with it (spec §4.2: "the bot keeps
+        # polling").
         log(f"control API failed to start: {exc!r}")
+        if server is not None:
+            # start_in_thread can fail after make_server already bound the
+            # port; release it so a later retry or restart doesn't also fail
+            # with "address in use".
+            server.server_close()
         try:
             tg.send_message(chat_id, f"Phone API did not start: {exc}")
         except TgError:
             pass
         return None
-    start_in_thread(server)
     log(f"control API listening on 127.0.0.1:{port}")
     return server
 
