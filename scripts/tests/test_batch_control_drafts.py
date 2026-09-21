@@ -122,9 +122,9 @@ class StoreCase(unittest.TestCase):
         return self.store.patch({"slots": {"character": "app/me.png", "outfit": "app/dress.png",
                                            "driver": "app/dance.mp4"}})
 
-    def assertRefused(self, code, fn, *args):
+    def assertRefused(self, code, fn, *args, **kwargs):
         with self.assertRaises(drafts.DraftError) as cm:
-            fn(*args)
+            fn(*args, **kwargs)
         self.assertEqual(cm.exception.code, code)
 
 
@@ -331,6 +331,95 @@ class TestBatch(StoreCase):
         self.assertEqual((v["slots"], v["batch"]), ({}, []))
         self.assertGreater(v["generation"], g)
         self.assertTrue((self.staging / "app" / "me.png").exists())
+
+
+class TestValidate(StoreCase):
+    def fake_run(self, returncode=0, out="  ✓ manifest hợp lệ · 1 run\n", err="", before=None):
+        calls = []
+
+        def run(cmd, **kw):
+            calls.append((cmd, kw))
+            manifest = Path(cmd[2][len("FILE="):])
+            calls.append(manifest.read_text())
+            if before:
+                before()
+            return mock.Mock(returncode=returncode, stdout=out, stderr=err)
+        return run, calls
+
+    def test_nothing_to_validate(self):
+        self.assertRefused("nothing_to_validate", self.store.validate, repo_root=self.tmp)
+
+    def test_success_records_the_verdict_and_removes_the_manifest(self):
+        self.fill()
+        run, calls = self.fake_run()
+        result = self.store.validate(repo_root=self.tmp, run=run)
+        self.assertEqual((result["valid"], result["stale"]), (True, False))
+        self.assertTrue(result["draft"]["validated"])
+        self.assertIsNotNone(result["draft"]["estimate_min"])
+        cmd, kw = calls[0]
+        self.assertEqual(cmd[:2], ["make", "batch-validate"])
+        self.assertEqual(kw["cwd"], self.tmp)
+        self.assertEqual(kw["timeout"], drafts.VALIDATE_TIMEOUT_SEC)
+        self.assertIn("pipeline: tryon-motion-enhance", calls[1])
+        manifest = Path(cmd[2][len("FILE="):])
+        self.assertEqual(manifest.parent, self.batch / ".validate")
+        self.assertFalse(manifest.exists())
+        self.assertEqual(list(self.batch.glob("*.yaml")), [])
+
+    def test_failure_is_422_with_output_and_no_absolute_paths(self):
+        self.fill()
+        # DraftStore resolves staging_root, so a real batch-validate error
+        # names a staged file under self.tmp.resolve(), not self.tmp itself —
+        # on macOS these differ (/var -> /private/var). Use the resolved form
+        # so this actually exercises the stripping, not just the unresolved
+        # one repo_root happens to be passed as.
+        real = self.tmp.resolve()
+        run, _ = self.fake_run(returncode=1, err=f"✗ missing {real}/batch/tg-staging/app/me.png\n")
+        with self.assertRaises(drafts.DraftError) as cm:
+            self.store.validate(repo_root=self.tmp, run=run)
+        self.assertEqual(cm.exception.code, "invalid")
+        self.assertIn("batch/tg-staging/app/me.png", cm.exception.message)
+        self.assertNotIn(str(self.tmp), cm.exception.message)
+        self.assertNotIn(str(real), cm.exception.message)
+        self.assertIs(self.store.view()["validated"], False)
+
+    def test_timeout_is_recorded_as_failed(self):
+        self.fill()
+
+        def run(cmd, **kw):
+            raise drafts.subprocess.TimeoutExpired(cmd, kw["timeout"])
+
+        with self.assertRaises(drafts.DraftError) as cm:
+            self.store.validate(repo_root=self.tmp, run=run)
+        self.assertEqual(cm.exception.code, "invalid")
+        self.assertIn("90", cm.exception.message)
+
+    def test_a_change_during_validation_makes_the_verdict_stale(self):
+        self.fill()
+        run, _ = self.fake_run(before=lambda: self.store.patch({"provider": "qwen-max"}))
+        result = self.store.validate(repo_root=self.tmp, run=run)
+        self.assertTrue(result["stale"])
+        self.assertIsNone(self.store.view()["validated"])
+
+    def test_the_subprocess_runs_outside_the_lock(self):
+        self.fill()
+        got = []
+
+        def probe_lock():
+            # Acquire and release inside the same worker thread (RLock
+            # ownership is per-thread — see test_probe_runs_outside_the_lock).
+            def worker():
+                acquired = control.LOCK.acquire(timeout=1)
+                got.append(acquired)
+                if acquired:
+                    control.LOCK.release()
+
+            t = threading.Thread(target=worker)
+            t.start(); t.join()
+
+        run, _ = self.fake_run(before=probe_lock)
+        self.store.validate(repo_root=self.tmp, run=run)
+        self.assertEqual(got, [True])
 
 
 if __name__ == "__main__":

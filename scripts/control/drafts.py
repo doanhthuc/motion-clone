@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -18,8 +19,16 @@ from batchlib.pipelines import PIPELINES, optional_roles, required_roles
 from control import materials
 from tgbot import ingest
 from tgbot.ingest import Probe
-from tgbot.job import DEFAULT_PROVIDER, Job, _tryon_stage, missing_slots, run_id_for
+from tgbot.job import DEFAULT_PROVIDER, Job, _tryon_stage, missing_slots, run_id_for, write_manifest
 from tgbot.run import estimate_minutes
+
+# Cloudflare answers 524 when the origin sends nothing for 100 s, so the
+# phone's validate must finish (or give up) before that. The bot allows 120 s,
+# "~100x the observed runtime"; 90 s is still ~75x.
+VALIDATE_TIMEOUT_SEC = 90
+# The tail of the validator's output returned to the phone: enough for every
+# error line batch_run.py prints, bounded so a runaway log stays small.
+VALIDATE_OUTPUT_MAX_CHARS = 4000
 
 # Try-on providers offered from the bot. gemini/qwen-max run directly from
 # THIS process (batchlib/runner.py's run_local_phase, invoked by drain.py's
@@ -384,3 +393,49 @@ class DraftStore:
             # the clear cannot record its verdict on the empty draft.
             d = self._fresh(generation=self._load().generation)
             return self._changed(d)
+
+    def validate(self, *, repo_root: Path, run=None) -> dict:
+        """make batch-validate on what Run would submit. Free: no pod.
+
+        The manifest is rendered under the lock and checked outside it; the
+        verdict is recorded only if the draft did not change meanwhile.
+        """
+        with control.LOCK:
+            d = self._load()
+            jobs = self._jobs(d)
+            if not jobs:
+                raise DraftError("nothing_to_validate", "no complete job to validate yet")
+            generation = d.generation
+            # A subdirectory: materials._in_use and runs.list_runs scan
+            # batch/*.yaml, and this file is never a run.
+            manifest = self.batch_dir / ".validate" / f"{self.owner}-{uuid.uuid4().hex}.yaml"
+            write_manifest(jobs, manifest, now=time.strftime("%Y-%m-%d %H:%M:%S"))
+        run = run or subprocess.run
+        try:
+            result = run(["make", "batch-validate", f"FILE={manifest}"], cwd=repo_root,
+                         capture_output=True, text=True, timeout=VALIDATE_TIMEOUT_SEC)
+            ok, output = result.returncode == 0, (result.stdout + result.stderr).strip()
+        except subprocess.TimeoutExpired:
+            ok, output = False, f"make batch-validate did not finish within {VALIDATE_TIMEOUT_SEC}s"
+        finally:
+            manifest.unlink(missing_ok=True)
+        # Staged files are named by absolute path in the validator's errors.
+        # DraftStore resolves staging_root (macOS's /var is a symlink to
+        # /private/var), so those paths are under repo_root.resolve() even
+        # when the caller passed repo_root unresolved — strip both forms.
+        output = output.replace(str(repo_root) + "/", "")
+        resolved_root = repo_root.resolve()
+        if resolved_root != repo_root:
+            output = output.replace(str(resolved_root) + "/", "")
+        output = output[-VALIDATE_OUTPUT_MAX_CHARS:]
+
+        with control.LOCK:
+            d = self._load()
+            stale = d.generation != generation
+            if not stale:
+                d.validated = ok
+                self._save(d)          # a verdict is not a change: generation stays
+            view = self._view(d)
+        if not ok:
+            raise DraftError("invalid", output or "make batch-validate failed")
+        return {"valid": True, "stale": stale, "draft": view}
