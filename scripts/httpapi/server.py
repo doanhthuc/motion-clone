@@ -34,7 +34,7 @@ class ApiError(Exception):
 NOT_FOUND = ApiError(404, "not_found", "no such resource")
 
 _DOMAIN_STATUS = {"bad_request": 400, "forbidden": 403, "not_found": 404, "in_use": 409,
-                  "incomplete": 409, "conflict": 409, "too_many": 409, "too_large": 413,
+                  "incomplete": 409, "conflict": 409, "too_many": 409, "busy": 409, "too_large": 413,
                   "unprobeable": 422, "no_space": 507,
                   "unknown_pipeline": 422, "unknown_provider": 422, "unknown_role": 422,
                   "wrong_kind": 422, "not_applicable": 422, "missing_slots": 422,

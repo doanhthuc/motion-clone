@@ -15,6 +15,7 @@ import unicodedata
 import uuid
 from pathlib import Path
 
+import control
 from control.paths import safe_child
 import tgbot.run as run_mod
 from tgbot import ingest as ingest_mod
@@ -294,10 +295,18 @@ def delete_material(staging_root: Path, batch_dir: Path, owner: str, name: str) 
         # Telegram's /clear and /wipe own the chat directories; deleting a file
         # a Telegram draft points at would break that draft with no message.
         raise MaterialError("forbidden", "only material uploaded from the app can be deleted here")
-    reason = _in_use(batch_dir, path)
-    if reason is not None:
-        raise MaterialError("in_use", reason)
-    path.unlink(missing_ok=True)
+    # DraftStore.patch can add this same file to the app's draft between the
+    # _in_use check and the unlink below (its own ffprobe runs outside
+    # control.LOCK, same shape race as its "file deleted between resolve and
+    # apply" guard) — wrapping both steps in control.LOCK closes it from this
+    # side too. Verified no lock-ordering risk: nothing here takes
+    # control.LOCK while holding _STAGE_LOCK (stage_file) or uploads._LOCK,
+    # and drafts.py never takes those while holding control.LOCK.
+    with control.LOCK:
+        reason = _in_use(batch_dir, path)
+        if reason is not None:
+            raise MaterialError("in_use", reason)
+        path.unlink(missing_ok=True)
 
 
 def thumbnail(staging_root: Path, thumbs_root: Path, owner: str, name: str) -> Path:

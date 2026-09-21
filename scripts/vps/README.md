@@ -952,7 +952,7 @@ Composing a job from the phone, without touching Telegram:
 | `POST /v1/draft/add-to-batch` | commit the current draft as a batch entry, start editing a fresh copy |
 | `DELETE /v1/draft/batch/<digest>` | drop one batch entry (its digest, from `GET /v1/draft`'s `batch` list) |
 | `POST /v1/draft/clear` | reset to an empty draft on the default pipeline/provider |
-| `POST /v1/draft/validate` | `make batch-validate` on what `add-to-batch` would submit — free, no pod |
+| `POST /v1/draft/validate` | `make batch-validate` on what `add-to-batch` would submit — free, no pod. Only one runs at a time; a second call while one is in flight answers 409 `busy` instead of queueing. |
 
 The app's draft lives at `batch/app.draft.json`, separate from Telegram's own
 `batch/tg-<chat>.draft.json` — deleting or clearing it resets the phone's draft only, and Telegram's

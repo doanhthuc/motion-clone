@@ -156,6 +156,20 @@ class TestView(StoreCase):
         self.store.view()
         self.assertEqual(len(list(self.store.path.parent.glob("app.draft.json.*bad"))), 2)
 
+    def test_a_hand_edited_wrong_shaped_field_is_set_aside_too(self):
+        # "slots": [] has the right key with the wrong shape — load_jobs's
+        # own `.items()` call raises AttributeError, not KeyError/ValueError,
+        # so _load's except tuple has to name it explicitly or this crashes
+        # the request instead of falling back to a fresh draft.
+        self.store.path.parent.mkdir(parents=True, exist_ok=True)
+        self.store.path.write_text(json.dumps({
+            "job": {"pipeline": "motion-enhance", "provider": "qwen", "slots": [], "probes": {}},
+            "basket": [], "validated": None, "generation": 0}))
+        v = self.store.view()
+        self.assertEqual(v["slots"], {})
+        self.assertEqual(v["pipeline"], "tryon-motion-enhance")
+        self.assertEqual(len(list(self.store.path.parent.glob("app.draft.json.*bad"))), 1)
+
 
 class TestPatch(StoreCase):
     def test_fill_all_slots(self):
@@ -206,6 +220,23 @@ class TestPatch(StoreCase):
     def test_unprobeable(self):
         (self.staging / "app" / "broken.png").write_bytes(b"x")
         self.assertRefused("unprobeable", self.store.patch, {"slots": {"character": "app/broken.png"}})
+
+    def test_unprobeable_message_has_no_absolute_path(self):
+        # ffprobe's own stderr names the absolute staged path; that must
+        # never reach the phone verbatim.
+        path = self.staging / "app" / "broken.png"
+        path.write_bytes(b"x")
+
+        def bad_probe(p):
+            raise RuntimeError(f"{p}: Invalid data found when processing input")
+
+        self.store._probe = bad_probe
+        with self.assertRaises(drafts.DraftError) as cm:
+            self.store.patch({"slots": {"character": "app/broken.png"}})
+        self.assertEqual(cm.exception.code, "unprobeable")
+        self.assertNotIn(str(self.tmp), cm.exception.message)
+        self.assertNotIn(str(path), cm.exception.message)
+        self.assertIn("broken.png", cm.exception.message)
 
     def test_file_deleted_between_resolve_and_apply_is_not_found(self):
         # Closes the race between resolving/probing a path (outside
@@ -308,6 +339,21 @@ class TestBatch(StoreCase):
         v = self.store.drop_from_batch(digest)
         self.assertEqual(v["batch"], [])
 
+    def test_batch_run_ids_are_unique_like_the_manifest_gives_them(self):
+        # Same material, different provider: signature() (provider is part of
+        # it) lets both sit in the basket at once, but run_id_for hashes only
+        # the slots, so both entries get the same base id. The view must
+        # match what render_manifest/_unique_ids actually suffixes onto the
+        # manifest, or the app would show two rows named the same thing.
+        self.fill()
+        v = self.store.add_to_batch()
+        v = self.store.patch({"provider": "qwen-max"})
+        v = self.store.add_to_batch()
+        self.assertEqual(len(v["batch"]), 2)
+        run_ids = [b["run_id"] for b in v["batch"]]
+        self.assertEqual(len(set(run_ids)), 2)
+        self.assertTrue(run_ids[1].startswith(run_ids[0] + "-"))
+
     def test_concurrent_adds_make_one_entry(self):
         self.fill()
         errors = []
@@ -339,7 +385,10 @@ class TestValidate(StoreCase):
 
         def run(cmd, **kw):
             calls.append((cmd, kw))
-            manifest = Path(cmd[2][len("FILE="):])
+            # cmd is [sys.executable, "scripts/batch_run.py", "--file",
+            # <manifest>, "--validate-only"] — see drafts.validate's comment
+            # on why this runs the validator directly instead of `make`.
+            manifest = Path(cmd[3])
             calls.append(manifest.read_text())
             if before:
                 before()
@@ -357,11 +406,13 @@ class TestValidate(StoreCase):
         self.assertTrue(result["draft"]["validated"])
         self.assertIsNotNone(result["draft"]["estimate_min"])
         cmd, kw = calls[0]
-        self.assertEqual(cmd[:2], ["make", "batch-validate"])
+        self.assertEqual(cmd[0], sys.executable)
+        self.assertEqual(cmd[1:3], ["scripts/batch_run.py", "--file"])
+        self.assertEqual(cmd[4], "--validate-only")
         self.assertEqual(kw["cwd"], self.tmp)
         self.assertEqual(kw["timeout"], drafts.VALIDATE_TIMEOUT_SEC)
         self.assertIn("pipeline: tryon-motion-enhance", calls[1])
-        manifest = Path(cmd[2][len("FILE="):])
+        manifest = Path(cmd[3])
         self.assertEqual(manifest.parent, self.batch / ".validate")
         self.assertFalse(manifest.exists())
         self.assertEqual(list(self.batch.glob("*.yaml")), [])
@@ -401,6 +452,25 @@ class TestValidate(StoreCase):
         self.assertTrue(result["stale"])
         self.assertIsNone(self.store.view()["validated"])
 
+    def test_a_stale_failed_validate_is_a_200_not_a_raise(self):
+        # The draft this verdict is about no longer exists by the time the
+        # subprocess answers (edited mid-run), so a failing verdict is stale
+        # information about a gone draft, not an error the caller must fix.
+        self.fill()
+        run, _ = self.fake_run(returncode=1, err="✗ nope\n",
+                               before=lambda: self.store.patch({"provider": "qwen-max"}))
+        result = self.store.validate(repo_root=self.tmp, run=run)
+        self.assertEqual((result["valid"], result["stale"]), (False, True))
+        self.assertIn("nope", result["output"])
+        self.assertIsNone(self.store.view()["validated"])
+
+    def test_a_stale_successful_validate_has_no_output_key(self):
+        self.fill()
+        run, _ = self.fake_run(before=lambda: self.store.patch({"provider": "qwen-max"}))
+        result = self.store.validate(repo_root=self.tmp, run=run)
+        self.assertEqual((result["valid"], result["stale"]), (True, True))
+        self.assertNotIn("output", result)
+
     def test_the_subprocess_runs_outside_the_lock(self):
         self.fill()
         got = []
@@ -420,6 +490,45 @@ class TestValidate(StoreCase):
         run, _ = self.fake_run(before=probe_lock)
         self.store.validate(repo_root=self.tmp, run=run)
         self.assertEqual(got, [True])
+
+    def test_a_second_validate_while_one_is_running_gets_busy(self):
+        self.fill()
+        entered, release = threading.Event(), threading.Event()
+
+        def blocking_run(cmd, **kw):
+            entered.set()
+            release.wait(5)
+            return mock.Mock(returncode=0, stdout="ok", stderr="")
+
+        t = threading.Thread(target=self.store.validate,
+                             kwargs={"repo_root": self.tmp, "run": blocking_run})
+        t.start()
+        try:
+            self.assertTrue(entered.wait(5))
+            other_run, _ = self.fake_run()
+            self.assertRefused("busy", self.store.validate, repo_root=self.tmp, run=other_run)
+        finally:
+            release.set()
+            t.join(5)
+        self.assertFalse(t.is_alive())
+
+    def test_write_manifest_failure_leaves_no_partial_manifest(self):
+        self.fill()
+
+        def bad_write(jobs, path, *, now):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("partial")          # what an interrupted write leaves behind
+            raise OSError("disk full")
+
+        with mock.patch("control.drafts.write_manifest", side_effect=bad_write):
+            with self.assertRaises(OSError):
+                self.store.validate(repo_root=self.tmp)
+        self.assertEqual(list((self.batch / ".validate").glob("*")), [])
+        # The semaphore from fix 1 must also be released on this path, or
+        # every validate call after this one would wrongly answer "busy".
+        other_run, _ = self.fake_run()
+        result = self.store.validate(repo_root=self.tmp, run=other_run)
+        self.assertTrue(result["valid"])
 
 
 if __name__ == "__main__":

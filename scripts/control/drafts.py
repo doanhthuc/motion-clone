@@ -9,6 +9,8 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import sys
+import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -19,7 +21,7 @@ from batchlib.pipelines import PIPELINES, optional_roles, required_roles
 from control import materials
 from tgbot import ingest
 from tgbot.ingest import Probe
-from tgbot.job import DEFAULT_PROVIDER, Job, _tryon_stage, missing_slots, run_id_for, write_manifest
+from tgbot.job import DEFAULT_PROVIDER, Job, _tryon_stage, _unique_ids, missing_slots, write_manifest
 from tgbot.run import estimate_minutes
 
 # Cloudflare answers 524 when the origin sends nothing for 100 s, so the
@@ -29,6 +31,12 @@ VALIDATE_TIMEOUT_SEC = 90
 # The tail of the validator's output returned to the phone: enough for every
 # error line batch_run.py prints, bounded so a runaway log stays small.
 VALIDATE_OUTPUT_MAX_CHARS = 4000
+# One validate at a time: `make batch-validate` peaks ~111 MB RSS for 0.38s
+# (measured 2026-09-21) on a 1 GB box already running Postgres-adjacent
+# processes, so a second one stacking on top of the first is a real risk, not
+# a theoretical one. Non-blocking: a second caller gets a fast "busy" instead
+# of queueing behind the first for up to VALIDATE_TIMEOUT_SEC.
+_VALIDATE_SLOTS = threading.BoundedSemaphore(1)
 
 # Try-on providers offered from the bot. gemini/qwen-max run directly from
 # THIS process (batchlib/runner.py's run_local_phase, invoked by drain.py's
@@ -218,8 +226,11 @@ class DraftStore:
                 raise ValueError(f"unknown pipeline {current.pipeline!r}")
             return _Draft(job=current, basket=load_jobs(payload["basket"]),
                           validated=payload["validated"], generation=int(payload["generation"]))
-        except (ValueError, KeyError, TypeError):
-            # Moved aside, never deleted: it is the only copy of what the
+        except (ValueError, KeyError, TypeError, AttributeError):
+            # AttributeError: a hand-edited draft can carry the right keys
+            # with the wrong shape (e.g. "slots": [] instead of {}), and
+            # load_jobs's own `.items()` call raises that, not KeyError —
+            # measured 2026-09-21. Moved aside, never deleted: it is the only copy of what the
             # user had composed (same rule as the bot's _load_draft). A
             # unique suffix, not a fixed ".bad", so a second corrupt file
             # never overwrites the first one moved aside.
@@ -271,6 +282,14 @@ class DraftStore:
     def _view(self, d: _Draft) -> dict:
         job = d.job
         jobs = self._jobs(d)
+        # _unique_ids, not a per-entry run_id_for: two basket entries can share
+        # every slot and differ only by provider (signature() counts that as a
+        # different job, so both can sit in the basket at once), and
+        # render_manifest suffixes the second one "-2" so the runner doesn't
+        # overwrite one output with the other. The view must show the id the
+        # manifest will actually give each row, or the app's batch list would
+        # print the same run_id twice.
+        basket_ids = _unique_ids(d.basket)
         return {
             "owner": self.owner, "pipeline": job.pipeline, "provider": job.provider,
             "generation": d.generation,
@@ -282,10 +301,10 @@ class DraftStore:
             "optional": sorted(optional_roles(job.pipeline)),
             "missing": self._missing(job),
             "validated": d.validated,
-            "batch": [{"digest": job_digest(b), "run_id": run_id_for(b), "pipeline": b.pipeline,
+            "batch": [{"digest": job_digest(b), "run_id": run_id, "pipeline": b.pipeline,
                        "provider": b.provider,
                        "slots": {r: self._material_id(p) for r, p in sorted(b.slots.items())}}
-                      for b in d.basket],
+                      for b, run_id in zip(d.basket, basket_ids)],
             "jobs": len(jobs),
             "estimate_min": sum(estimate_minutes(j) for j in jobs) if d.validated is True else None,
         }
@@ -328,8 +347,13 @@ class DraftStore:
             path = self._resolve(material_id)
             try:
                 filled[role] = (path, self._probe(path))
-            except (RuntimeError, OSError, ValueError, subprocess.TimeoutExpired) as exc:
-                raise DraftError("unprobeable", f"{path.name} could not be read: {exc}")
+            except (RuntimeError, OSError, ValueError, subprocess.TimeoutExpired):
+                # Not str(exc): ffprobe's own error text names the absolute
+                # staged path (ROOT/batch/tg-staging/...), and this message
+                # goes straight to the phone. path.name is what the user
+                # already sees in the slot; nothing else in the exception is
+                # theirs to see.
+                raise DraftError("unprobeable", f"{path.name} could not be read as media")
 
         with control.LOCK:
             d = self._load()
@@ -400,42 +424,75 @@ class DraftStore:
         The manifest is rendered under the lock and checked outside it; the
         verdict is recorded only if the draft did not change meanwhile.
         """
-        with control.LOCK:
-            d = self._load()
-            jobs = self._jobs(d)
-            if not jobs:
-                raise DraftError("nothing_to_validate", "no complete job to validate yet")
-            generation = d.generation
-            # A subdirectory: materials._in_use and runs.list_runs scan
-            # batch/*.yaml, and this file is never a run.
-            manifest = self.batch_dir / ".validate" / f"{self.owner}-{uuid.uuid4().hex}.yaml"
-            write_manifest(jobs, manifest, now=time.strftime("%Y-%m-%d %H:%M:%S"))
-        run = run or subprocess.run
+        # Acquired OUTSIDE control.LOCK and non-blocking, before anything else
+        # in this call: a second phone tapping validate while the first is
+        # still running must get an immediate "busy", not wait behind it
+        # holding (or waiting on) the lock every other mutation needs too.
+        if not _VALIDATE_SLOTS.acquire(blocking=False):
+            raise DraftError("busy", "a validation is already running — try again in a moment")
         try:
-            result = run(["make", "batch-validate", f"FILE={manifest}"], cwd=repo_root,
-                         capture_output=True, text=True, timeout=VALIDATE_TIMEOUT_SEC)
-            ok, output = result.returncode == 0, (result.stdout + result.stderr).strip()
-        except subprocess.TimeoutExpired:
-            ok, output = False, f"make batch-validate did not finish within {VALIDATE_TIMEOUT_SEC}s"
-        finally:
-            manifest.unlink(missing_ok=True)
-        # Staged files are named by absolute path in the validator's errors.
-        # DraftStore resolves staging_root (macOS's /var is a symlink to
-        # /private/var), so those paths are under repo_root.resolve() even
-        # when the caller passed repo_root unresolved — strip both forms.
-        output = output.replace(str(repo_root) + "/", "")
-        resolved_root = repo_root.resolve()
-        if resolved_root != repo_root:
-            output = output.replace(str(resolved_root) + "/", "")
-        output = output[-VALIDATE_OUTPUT_MAX_CHARS:]
+            with control.LOCK:
+                d = self._load()
+                jobs = self._jobs(d)
+                if not jobs:
+                    raise DraftError("nothing_to_validate", "no complete job to validate yet")
+                generation = d.generation
+                # A subdirectory: materials._in_use and runs.list_runs scan
+                # batch/*.yaml, and this file is never a run.
+                manifest = self.batch_dir / ".validate" / f"{self.owner}-{uuid.uuid4().hex}.yaml"
+                try:
+                    write_manifest(jobs, manifest, now=time.strftime("%Y-%m-%d %H:%M:%S"))
+                except Exception:
+                    # write_manifest is a plain path.write_text, not an
+                    # atomic rename, so a failure partway (disk full, OSError)
+                    # can leave a partial file sitting in batch/.validate/
+                    # forever — nothing else ever looks in there to clean it.
+                    manifest.unlink(missing_ok=True)
+                    raise
+            run = run or subprocess.run
+            try:
+                # Run the validator directly rather than through `make`:
+                # subprocess.run(timeout=) kills the process it started
+                # (`make`), which orphans the python3 child actually doing the
+                # work — the timeout stopped enforcing anything (measured
+                # 2026-09-21). This is exactly what the Makefile target runs
+                # (root Makefile: `python3 scripts/batch_run.py --file
+                # "$(FILE)" --validate-only`), so behaviour is unchanged.
+                result = run([sys.executable, "scripts/batch_run.py", "--file", str(manifest),
+                             "--validate-only"], cwd=repo_root, capture_output=True, text=True,
+                             timeout=VALIDATE_TIMEOUT_SEC)
+                ok, output = result.returncode == 0, (result.stdout + result.stderr).strip()
+            except subprocess.TimeoutExpired:
+                ok, output = False, f"make batch-validate did not finish within {VALIDATE_TIMEOUT_SEC}s"
+            finally:
+                manifest.unlink(missing_ok=True)
+            # Staged files are named by absolute path in the validator's errors.
+            # DraftStore resolves staging_root (macOS's /var is a symlink to
+            # /private/var), so those paths are under repo_root.resolve() even
+            # when the caller passed repo_root unresolved — strip both forms.
+            output = output.replace(str(repo_root) + "/", "")
+            resolved_root = repo_root.resolve()
+            if resolved_root != repo_root:
+                output = output.replace(str(resolved_root) + "/", "")
+            output = output[-VALIDATE_OUTPUT_MAX_CHARS:]
 
-        with control.LOCK:
-            d = self._load()
-            stale = d.generation != generation
-            if not stale:
-                d.validated = ok
-                self._save(d)          # a verdict is not a change: generation stays
-            view = self._view(d)
-        if not ok:
-            raise DraftError("invalid", output or "make batch-validate failed")
-        return {"valid": True, "stale": stale, "draft": view}
+            with control.LOCK:
+                d = self._load()
+                stale = d.generation != generation
+                if not stale:
+                    d.validated = ok
+                    self._save(d)          # a verdict is not a change: generation stays
+                view = self._view(d)
+            if stale:
+                # The draft this verdict is about no longer exists (edited or
+                # cleared mid-run), so a failure here is not the caller's
+                # failure to fix — it is stale information, not an error.
+                result = {"valid": ok, "stale": True, "draft": view}
+                if not ok:
+                    result["output"] = output
+                return result
+            if not ok:
+                raise DraftError("invalid", output or "make batch-validate failed")
+            return {"valid": True, "stale": False, "draft": view}
+        finally:
+            _VALIDATE_SLOTS.release()

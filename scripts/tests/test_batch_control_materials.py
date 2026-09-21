@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import control
 from control import materials
 import tgbot.run as run_mod
 
@@ -234,6 +235,43 @@ class TestDelete(MaterialsBase):
 
     def test_owner_is_stripped_before_the_app_check(self):
         materials.delete_material(self.staging, self.batch, " app ", "a.mp4")
+        self.assertFalse(self.a.exists())
+
+    def test_delete_waits_for_control_lock_held_by_another_thread(self):
+        # A PATCH /v1/draft can add this same file to the app's draft between
+        # _in_use's check and the unlink; holding control.LOCK across both is
+        # what closes that race. Simulate a holder (the draft mutation) and
+        # confirm the delete neither unlinks early nor deadlocks once the
+        # holder releases (RLock ownership is per-thread, so acquire/release
+        # both happen inside `holder`, not split across threads).
+        acquired, release = threading.Event(), threading.Event()
+
+        def holder():
+            control.LOCK.acquire()
+            acquired.set()
+            release.wait(5)
+            control.LOCK.release()
+
+        h = threading.Thread(target=holder)
+        h.start()
+        self.assertTrue(acquired.wait(5))
+
+        done = threading.Event()
+
+        def deleter():
+            materials.delete_material(self.staging, self.batch, "app", "a.mp4")
+            done.set()
+
+        d = threading.Thread(target=deleter)
+        d.start()
+        try:
+            self.assertFalse(done.wait(0.2))
+            self.assertTrue(self.a.exists())
+        finally:
+            release.set()
+        d.join(5)
+        h.join(5)
+        self.assertTrue(done.is_set())
         self.assertFalse(self.a.exists())
 
 
