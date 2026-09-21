@@ -6653,6 +6653,20 @@ BOT_COMMANDS = [
 ]
 
 
+def _api_enabled_for(args: argparse.Namespace) -> bool:
+    """Whether this invocation of main() should start the control API.
+
+    `--once` / `--dry-run` (`make bot-dry`) is a diagnostic round run on a box
+    where the real motion-bot may already be up and holding CONTROL_API_PORT.
+    Starting a second listener there doesn't just fail to bind — it fails
+    LOUD: _start_control_api's failure path sends a real "Phone API did not
+    start" Telegram message on every diagnostic run, which is noise at best
+    and alarming at worst. A one-off round has no phone client polling it
+    anyway, so skipping it costs nothing real.
+    """
+    return not (args.once or args.dry_run)
+
+
 def _start_control_api(tg: Tg, chat_id: int):
     """Start the phone app's HTTP API in a daemon thread, or explain why not.
 
@@ -6726,7 +6740,10 @@ def main() -> int:
                                           for c, d in BOT_COMMANDS])
     except TgError as exc:
         log(f"setMyCommands failed, continuing without the menu: {exc}")
-    _start_control_api(tg, allowed_user_id)
+    if _api_enabled_for(args):
+        _start_control_api(tg, allowed_user_id)
+    else:
+        log("control API skipped (--once/--dry-run diagnostic run)")
     log(f"started, api={base}, dry_run={args.dry_run}, pipeline={_DEFAULT_PIPELINE}")
     while True:
         try:
