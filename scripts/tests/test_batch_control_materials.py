@@ -66,15 +66,78 @@ class TestStageFile(unittest.TestCase):
 
 
 class TestPrune(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "app").mkdir()
+
+    def old(self, name, now):
+        path = self.root / "app" / name
+        path.write_bytes(b"o")
+        os.utime(path, (now - 8 * 86400, now - 8 * 86400))
+        return path
+
     def test_removes_only_old_files(self):
-        root = Path(tempfile.mkdtemp())
-        (root / "app").mkdir()
-        old, new = root / "app" / "old.mp4", root / "app" / "new.mp4"
-        old.write_bytes(b"o"); new.write_bytes(b"n")
         now = time.time()
-        os.utime(old, (now - 8 * 86400, now - 8 * 86400))
-        self.assertEqual(materials.prune_staged(root, 7, now), [old])
+        old = self.old("old.mp4", now)
+        new = self.root / "app" / "new.mp4"; new.write_bytes(b"n")
+        self.assertEqual(materials.prune_staged(self.root, 7, now), [old])
         self.assertTrue(new.exists())
+
+    def test_a_file_deleted_before_the_stat_does_not_abort_the_sweep(self):
+        # A DELETE (or /clear) between iterdir and stat used to raise
+        # FileNotFoundError out of the whole tick, skipping the upload and
+        # thumbnail sweeps for another 24 h.
+        now = time.time()
+        vanishing, other = self.old("a.mp4", now), self.old("b.mp4", now)
+        real_is_file = Path.is_file
+
+        def is_file(self):
+            result = real_is_file(self)
+            if self == vanishing:
+                os.unlink(self)                 # gone between the listing and the stat
+            return result
+
+        with mock.patch.object(Path, "is_file", is_file):
+            removed = materials.prune_staged(self.root, 7, now)
+        self.assertIn(other, removed)
+        self.assertFalse(other.exists())
+
+    def test_a_file_deleted_before_the_unlink_does_not_abort_the_sweep(self):
+        now = time.time()
+        vanishing, other = self.old("a.mp4", now), self.old("b.mp4", now)
+        real_unlink = Path.unlink
+
+        def unlink(self, missing_ok=False):
+            if self == vanishing:
+                os.unlink(self)                 # gone between the stat and the unlink
+            return real_unlink(self, missing_ok=missing_ok)
+
+        with mock.patch.object(Path, "unlink", unlink):
+            removed = materials.prune_staged(self.root, 7, now)
+        self.assertIn(other, removed)
+        self.assertFalse(other.exists())
+
+
+class TestTickPrunesIndependently(unittest.TestCase):
+    """One failing sweep must not skip the other two for another 24 h."""
+
+    def setUp(self):
+        import tgbot.bot as bot
+        self.bot = bot
+        bot._LAST_STAGING_PRUNE = 0.0
+        self.addCleanup(setattr, bot, "_LAST_STAGING_PRUNE", 0.0)
+
+    def test_a_failing_sweep_does_not_skip_the_others(self):
+        with mock.patch.object(self.bot, "_prune_old_staged_files",
+                               side_effect=OSError("disk hiccup")), \
+             mock.patch.object(self.bot.uploads, "prune_uploads", return_value=[]) as up, \
+             mock.patch.object(self.bot.materials, "prune_thumbs", return_value=[]) as th, \
+             mock.patch.object(self.bot, "log") as log:
+            self.bot._tick_staging_prune()
+        up.assert_called_once()
+        th.assert_called_once()
+        self.assertTrue(any("disk hiccup" in str(c) for c in log.call_args_list),
+                        log.call_args_list)
 
 
 def make_png(path: Path) -> Path:
@@ -205,6 +268,64 @@ class TestThumbAndIngest(MaterialsBase):
         with self.assertRaises(materials.MaterialError) as cm:
             materials.ingest(self.a)
         self.assertEqual(cm.exception.code, "unprobeable")
+
+
+class TestThumbConcurrency(unittest.TestCase):
+    """ffmpeg is capped and each run gets its own temp file (1 GB box)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.staging, self.thumbs = self.tmp / "tg-staging", self.tmp / "thumbs"
+        (self.staging / "app").mkdir(parents=True)
+        for n in range(4):
+            (self.staging / "app" / f"p{n}.png").write_bytes(b"i")
+
+    def test_temp_names_are_unique_and_removed(self):
+        seen = []
+
+        def fake_run(cmd, **kwargs):
+            seen.append(cmd[-1])
+            Path(cmd[-1]).write_bytes(b"\xff\xd8jpeg")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with mock.patch.object(materials.subprocess, "run", side_effect=fake_run):
+            materials.thumbnail(self.staging, self.thumbs, "app", "p0.png")
+            materials.thumbnail(self.staging, self.thumbs, "app", "p1.png")
+        self.assertEqual(len(set(seen)), 2)
+        self.assertEqual(list((self.thumbs / "app").glob("*.tmp*")), [])
+
+    def test_at_most_two_ffmpeg_runs_at_once(self):
+        inside, peak, lock = [], [0], threading.Lock()
+        two_inside, release = threading.Event(), threading.Event()
+
+        def fake_run(cmd, **kwargs):
+            with lock:
+                inside.append(1)
+                peak[0] = max(peak[0], len(inside))
+                if len(inside) == 2:
+                    two_inside.set()
+            release.wait(10)
+            with lock:
+                inside.pop()
+            Path(cmd[-1]).write_bytes(b"\xff\xd8jpeg")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with mock.patch.object(materials.subprocess, "run", side_effect=fake_run):
+            workers = [threading.Thread(
+                target=materials.thumbnail,
+                args=(self.staging, self.thumbs, "app", f"p{n}.png"), daemon=True)
+                for n in range(4)]
+            for w in workers:
+                w.start()
+            try:
+                self.assertTrue(two_inside.wait(5))
+                # All slots taken, so the other two threads cannot be running ffmpeg.
+                self.assertFalse(materials._FFMPEG_SLOTS.acquire(blocking=False))
+            finally:
+                release.set()
+                for w in workers:
+                    w.join(10)
+        self.assertEqual(peak[0], 2)
 
 
 class TestPruneThumbs(unittest.TestCase):

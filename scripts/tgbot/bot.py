@@ -378,16 +378,32 @@ def _tick_staging_prune() -> None:
     if now - _LAST_STAGING_PRUNE < _STAGING_PRUNE_INTERVAL_SEC:
         return
     _LAST_STAGING_PRUNE = now
-    removed = _prune_old_staged_files(now)
-    if removed:
-        log(f"pruned {len(removed)} staged file(s) older than "
-            f"{STAGING_MAX_AGE_DAYS}d: {', '.join(p.name for p in removed)}")
-    dropped = uploads.prune_uploads(ROOT / "batch" / "uploads", UPLOAD_MAX_AGE_SEC, now)
-    if dropped:
-        log(f"pruned {len(dropped)} abandoned upload(s) older than 24h")
-    thumbs = materials.prune_thumbs(ROOT / "batch" / "thumbs", ROOT / "batch" / STAGING_DIR_NAME)
-    if thumbs:
-        log(f"pruned {len(thumbs)} orphaned thumbnail(s)")
+
+    # Each sweep runs on its own: one raising (a file deleted from the app
+    # mid-sweep, a permission oddity) used to skip the two after it for another
+    # 24 h, and the uploads sweep is the one that frees GB.
+    def staged() -> None:
+        removed = _prune_old_staged_files(now)
+        if removed:
+            log(f"pruned {len(removed)} staged file(s) older than "
+                f"{STAGING_MAX_AGE_DAYS}d: {', '.join(p.name for p in removed)}")
+
+    def abandoned_uploads() -> None:
+        dropped = uploads.prune_uploads(ROOT / "batch" / "uploads", UPLOAD_MAX_AGE_SEC, now)
+        if dropped:
+            log(f"pruned {len(dropped)} abandoned upload(s) older than 24h")
+
+    def orphan_thumbs() -> None:
+        thumbs = materials.prune_thumbs(ROOT / "batch" / "thumbs",
+                                        ROOT / "batch" / STAGING_DIR_NAME)
+        if thumbs:
+            log(f"pruned {len(thumbs)} orphaned thumbnail(s)")
+
+    for sweep in (staged, abandoned_uploads, orphan_thumbs):
+        try:
+            sweep()
+        except Exception as exc:
+            log(f"prune sweep {sweep.__name__} failed, continuing: {exc!r}")
 
 
 # out/ is the one directory on the VPS that grows without bound (measured

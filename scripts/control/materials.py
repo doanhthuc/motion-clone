@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import threading
 import unicodedata
+import uuid
 from pathlib import Path
 
 from control.paths import safe_child
@@ -102,7 +103,7 @@ _STAGE_LOCK = threading.Lock()
 
 
 def stage_file(dest_dir: Path, src: Path, file_name: str | None, *,
-               move: bool = False) -> Path:
+               move: bool = False, reserve=None) -> Path:
     """Copy (or, with `move=True`, move) `src` into `dest_dir` and return that path.
 
     Copy, not reference, by default: the caller's own copy of the source is
@@ -113,6 +114,12 @@ def stage_file(dest_dir: Path, src: Path, file_name: str | None, *,
 
     Never overwrites: two files can share a name, and silently replacing the
     first would lose a file the user believes they sent.
+
+    `reserve`, if given, is called with the chosen destination while the name
+    is still held, just BEFORE the file claims it. It exists so a caller can
+    write down where the file is about to land — `uploads.complete` does, so a
+    crash between the move and its own bookkeeping cannot stage a second copy
+    on retry. It runs inside `_STAGE_LOCK`, so it must be a single cheap write.
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
     stem = safe_name(file_name or src.name)
@@ -149,6 +156,8 @@ def stage_file(dest_dir: Path, src: Path, file_name: str | None, *,
             # the first would lose a file the user believes they sent.
             dest = dest_dir / f"{Path(stem).stem}-{counter}{Path(stem).suffix}"
             counter += 1
+        if reserve is not None:
+            reserve(dest)
         if move:
             os.replace(src, dest)
         else:
@@ -162,6 +171,11 @@ def prune_staged(staging_root: Path, max_age_days: int, now: float) -> list[Path
     Age-based and blind to which owner or job a file belongs to — the
     directory carries no other record of that once a job is cleared or
     confirmed. Returns what it removed, so the caller can log it.
+
+    Tolerant of files that disappear mid-sweep (a DELETE from the app, a
+    /clear from Telegram): a bare `stat()`/`unlink()` raised FileNotFoundError
+    out of the whole daily tick, which then skipped the upload and thumbnail
+    sweeps for another 24 h.
     """
     cutoff = now - max_age_days * 86400
     removed: list[Path] = []
@@ -171,13 +185,19 @@ def prune_staged(staging_root: Path, max_age_days: int, now: float) -> list[Path
         if not owner_dir.is_dir():
             continue
         for path in owner_dir.iterdir():
-            if path.is_file() and path.stat().st_mtime < cutoff:
-                path.unlink()
-                removed.append(path)
+            try:
+                if not path.is_file() or path.stat().st_mtime >= cutoff:
+                    continue
+                path.unlink(missing_ok=True)
+            except FileNotFoundError:
+                continue
+            removed.append(path)
     return removed
 
 
 APP_OWNER = "app"
+# How many thumbnail ffmpeg processes may run at once — see thumbnail().
+_FFMPEG_SLOTS = threading.BoundedSemaphore(2)
 IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".heic", ".heif", ".bmp"})
 VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".m4v", ".webm", ".mkv"})
 THUMB_WIDTH = 320
@@ -274,15 +294,27 @@ def thumbnail(staging_root: Path, thumbs_root: Path, owner: str, name: str) -> P
     if dest.is_file() and dest.stat().st_mtime >= src.stat().st_mtime:
         return dest
     dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_suffix(".tmp.jpg")
+    # One temp file per call, not a fixed `<name>.tmp.jpg`: the app's grid asks
+    # for many thumbnails at once, and two calls for the same material (two
+    # screens, a retry) would otherwise write the same path and hand back a
+    # half-written JPEG. The name deliberately does NOT end in .jpg, so
+    # prune_thumbs' `*.jpg` sweep cannot delete a temp file mid-encode; `-f
+    # mjpeg` tells ffmpeg the format the extension no longer implies.
+    tmp = dest.with_name(f"{dest.name}.{uuid.uuid4().hex}.tmp")
     # -ss before -i seeks cheaply; 0.5 s skips the black first frame many phone
     # videos start with. For a still image ffmpeg ignores the seek.
     seek = ["-ss", "0.5"] if _kind(src) == "video" else []
     cmd = ["ffmpeg", "-v", "error", "-y", *seek, "-i", str(src), "-frames:v", "1",
-           "-vf", f"scale={THUMB_WIDTH}:-2", str(tmp)]
+           "-vf", f"scale={THUMB_WIDTH}:-2", "-f", "mjpeg", str(tmp)]
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        # Capped, not queued per request: the box has 1 GB of RAM and each
+        # ffmpeg measured 50–150 MB, so an app grid asking for a dozen previews
+        # at once could OOM-kill the bot itself. Two at a time still saturates
+        # the 2 vCPU droplet.
+        with _FFMPEG_SLOTS:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        tmp.unlink(missing_ok=True)
         raise MaterialError("unprobeable", f"no preview for {name}: {exc}") from exc
     if out.returncode != 0 or not tmp.is_file() or tmp.stat().st_size == 0:
         tmp.unlink(missing_ok=True)
