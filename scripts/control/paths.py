@@ -17,9 +17,17 @@ def safe_child(root: Path, name: str) -> Path | None:
     resolved (symlinks and any remaining "." collapsed) and re-checked with
     `is_relative_to` against the resolved root, a second, independent check
     after the first.
+
+    A bare "." is refused as well: it resolves to the root itself, which
+    `is_relative_to` accepts, so `safe_child(staging, ".")` handed back the
+    staging directory as if it were a material. A NUL byte is refused before
+    `resolve()` sees it — `Path("\\x00").resolve()` raises ValueError
+    ("embedded null byte"), which used to leave GET /v1/uploads/%00 as an
+    opaque 500 instead of a 404.
     """
     name = name.strip()
-    if not name or Path(name).is_absolute() or ".." in name or "/" in name or "\\" in name:
+    if (not name or name == "." or "\x00" in name or Path(name).is_absolute()
+            or ".." in name or "/" in name or "\\" in name):
         return None
     root_resolved = root.resolve()
     candidate = (root_resolved / name).resolve()

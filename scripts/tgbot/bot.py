@@ -23,7 +23,6 @@ import sys
 import tempfile
 import threading
 import time
-import unicodedata
 from dataclasses import asdict
 from pathlib import Path
 
@@ -51,6 +50,8 @@ import batch_clean
 # the path, which is what makes the absolute form work from either entry point.
 from tgbot.tgclient import Tg, TgError
 from httpapi.server import make_server, start_in_thread
+from control import materials, uploads
+from control.materials import fold_diacritics as _fold_diacritics, safe_name as _safe_name
 from control.paths import safe_child as _safe_child
 from tgbot import tiktok
 from tgbot.ingest import (Probe, describe, probe, quality_warning,
@@ -224,6 +225,10 @@ STAGING_DIR_NAME = "tg-staging"
 # normal "send material, confirm, run" session with margin.
 STAGING_MAX_AGE_DAYS = 7
 
+# An abandoned upload holds up to 2 GiB on a 25 GB disk, and a phone resuming
+# within a day is the realistic case.
+UPLOAD_MAX_AGE_SEC = 24 * 3600
+
 # Message kinds with no accept path at all: no width/height/bitrate ffprobe
 # can read from a sticker or a voice note, so there is nothing to warn about,
 # only refuse.
@@ -264,63 +269,6 @@ _RECOMPRESSION_COST = {
               "bitrate was halved (13,196 -> 6,603 kbps) and 49.8% of the "
               "bytes were gone"),
 }
-
-# Filenames are re-spelled into this alphabet before they are written or put
-# into a manifest. job.py's render_manifest emits `      <slot>: <path>` as a
-# PLAIN (unquoted) YAML scalar, so a space or a ": " anywhere in that line
-# would produce a manifest that parses wrong or not at all — and job.py is
-# protected by this branch's constraints, so quoting cannot be added there.
-#
-# What this actually guarantees is narrower than "the emitted line is always
-# valid plain YAML" (finding E, 2026-08-31). The line job.py emits is the whole
-# staged path — ROOT/batch/tg-staging/<chat_id>/<name> — and only the last
-# component passes through here. The rest is the checkout directory, an
-# unchecked assumption: clone this repo into "~/My Projects/motion clone" and
-# every manifest this bot writes breaks, with nothing in this file to catch it.
-# Sanitising only the filename is still the right split — ROOT is
-# developer-chosen and inspected once, the filename is user-chosen, arbitrary
-# and arrives at $0.99/hour — but the assumption is an assumption, not a proof.
-#
-# Restricting the alphabet also means a staged name can never contain a path
-# separator or "..", the same property _safe_child() checks for.
-_SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
-
-# `đ` (U+0111) is a distinct letter, not `d` plus a combining mark, so NFD
-# leaves it whole and the filter below would delete it. It is the only such
-# case in Vietnamese: ă â ê ô ơ ư and every tone mark do decompose, so this
-# one pair is the whole table rather than the start of one.
-_TRANSLIT = {"đ": "d", "Đ": "D", "ð": "d", "Ð": "D"}
-
-
-def _fold_diacritics(text: str) -> str:
-    """Drop accents while keeping the letter under them.
-
-    Without this, `_SAFE_NAME_RE` turned `áo dài.jpg` into `o_d_i.jpg`
-    (measured 2026-08-31) — the accented letters are outside `[A-Za-z0-9._-]`,
-    so they were deleted rather than folded. That matters beyond tidiness: the
-    manifest is what the user reads on a phone before confirming a $0.99/hour
-    render, and a file they cannot recognise is a file they cannot check is the
-    right one. Staging exists partly to make those names readable, and this is
-    what makes it true for the Vietnamese names this repo's material actually
-    uses.
-
-    NFD splits a base letter from its combining marks; dropping the marks keeps
-    the letter. `unicodedata` is stdlib, so this adds no dependency.
-
-    **NFD, never NFKD, and that is a security choice rather than a stylistic
-    one.** NFKD also applies compatibility mappings, which turn fullwidth forms
-    into their ASCII equivalents — measured 2026-08-31: `unicodedata.normalize
-    ("NFKD", "／")` is `"/"` and `("NFKD", "．")` is `"."`. Folding with NFKD
-    would therefore MANUFACTURE path separators and dots out of input that
-    contained none, upstream of `_SAFE_NAME_RE` and of every reason
-    `_safe_child()` gives for refusing them. Under NFD those characters are
-    left alone and the filter replaces them with "_", which is the whole point.
-    Do not "improve" this to NFKD for better folding.
-    """
-    text = "".join(_TRANSLIT.get(ch, ch) for ch in text)
-    return "".join(ch for ch in unicodedata.normalize("NFD", text)
-                   if not unicodedata.combining(ch))
-
 
 def log(msg: str) -> None:
     print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} bot: {msg}", flush=True)
@@ -368,26 +316,6 @@ def _identify(update: dict) -> tuple[int | None, int | None]:
     return None, None
 
 
-def _safe_name(name: str) -> str:
-    """A user-supplied filename, re-spelled into `_SAFE_NAME_RE`'s alphabet.
-
-    Stem and extension are re-spelled SEPARATELY (finding C, 2026-08-31).
-    Doing the whole basename in one pass and then stripping "._-" off the ends
-    destroyed the extension whenever the stem re-spelled to nothing:
-    `_safe_name('写真.heic')` returned `'heic'`, a name with no suffix at all,
-    so `to_png_if_heic` never fired and `probe` then rejected the file. This
-    user's material comes from a Vietnamese-language workflow, so a non-Latin
-    stem is the ordinary case; the extension is the part downstream code
-    actually dispatches on, so it is the part that must survive.
-    """
-    base = _fold_diacritics(Path(name).name)
-    stem = _SAFE_NAME_RE.sub("_", Path(base).stem).strip("._-")
-    # lstrip(".") first so the separating dot is re-added below rather than
-    # stripped away with the rest — ".heic" -> "heic" -> ".heic".
-    suffix = _SAFE_NAME_RE.sub("_", Path(base).suffix.lstrip(".")).strip("._-")
-    return f"{stem or 'file'}.{suffix}" if suffix else (stem or "file")
-
-
 def _stage_file(chat_id: int, src: Path, file_name: str | None) -> Path:
     """Copy an accepted upload under `batch/tg-staging/<chat_id>/` and return that path.
 
@@ -397,43 +325,9 @@ def _stage_file(chat_id: int, src: Path, file_name: str | None) -> Path:
     everything after it writes into the repo's own directory, which the bot
     owns and the container does not.
     """
-    dest_dir = ROOT / "batch" / STAGING_DIR_NAME / str(chat_id)
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    stem = _safe_name(file_name or src.name)
-
-    # HEIC/HEIF is converted the moment it lands, and ingest.to_png_if_heic
-    # writes `path.with_suffix(".png")` with no collision check of its own
-    # (ingest.py:145). So an incoming `photo.heic` claims TWO names, and both
-    # have to be reserved here (finding A, 2026-08-31). Reserving them in one
-    # place rather than giving to_png_if_heic its own counter is deliberate:
-    # this function already owns the staging directory and the never-overwrite
-    # rule, while ingest.py is written to know nothing about Telegram or
-    # staging (its module docstring) and returns a name the caller predicts.
-    # Two counters would be two owners of "which names are taken", which is
-    # how the hole opened in the first place.
-    #
-    # The hole it closes: send photo.png, answer "character", then send
-    # photo.heic. The .heic staged cleanly under its own name, converted, and
-    # overwrote the BYTES of the already-assigned photo.png. Job.slots and the
-    # manifest were unchanged and no message was sent, so the render used the
-    # wrong image inside a paid job. Created by staging itself — before it,
-    # conversion ran against Telegram's unique file_N.heic names.
-    derived_suffix = ".png" if Path(stem).suffix.lower() in (".heic", ".heif") else None
-
-    def taken(candidate: Path) -> bool:
-        if candidate.exists():
-            return True
-        return derived_suffix is not None and candidate.with_suffix(derived_suffix).exists()
-
-    dest = dest_dir / stem
-    counter = 1
-    while taken(dest):
-        # Never overwrite: two files can share a name, and silently replacing
-        # the first would lose a file the user believes they sent.
-        dest = dest_dir / f"{Path(stem).stem}-{counter}{Path(stem).suffix}"
-        counter += 1
     try:
-        shutil.copyfile(src, dest)
+        return materials.stage_file(ROOT / "batch" / STAGING_DIR_NAME / str(chat_id),
+                                    src, file_name)
     except OSError as exc:
         # Deliberately does NOT include `src` in the message: that string
         # contains the bot token (see STAGING_DIR_NAME), and this text goes
@@ -441,11 +335,11 @@ def _stage_file(chat_id: int, src: Path, file_name: str | None) -> Path:
         # directory") is the part that tells the operator what happened —
         # normally that the Bot API container's storage is not mounted at the
         # same path on the host (finding C2).
+        stem = _safe_name(file_name or src.name)
         raise RuntimeError(
             f"could not read the uploaded file for {stem}: {exc.strerror}. "
             f"On the VPS, check that telegram-bot-api.yml mounts "
             f"/var/lib/telegram-bot-api at the identical host path.") from exc
-    return dest
 
 
 def _prune_old_staged_files(now: float | None = None) -> list[Path]:
@@ -456,20 +350,8 @@ def _prune_old_staged_files(now: float | None = None) -> list[Path]:
     confirmed (job.py's Job only tracks the CURRENT assembly). Returns what
     it removed, so the caller can log it.
     """
-    now = time.time() if now is None else now
-    cutoff = now - STAGING_MAX_AGE_DAYS * 86400
-    staging_root = ROOT / "batch" / STAGING_DIR_NAME
-    removed: list[Path] = []
-    if not staging_root.is_dir():
-        return removed
-    for chat_dir in staging_root.iterdir():
-        if not chat_dir.is_dir():
-            continue
-        for path in chat_dir.iterdir():
-            if path.is_file() and path.stat().st_mtime < cutoff:
-                path.unlink()
-                removed.append(path)
-    return removed
+    return materials.prune_staged(ROOT / "batch" / STAGING_DIR_NAME, STAGING_MAX_AGE_DAYS,
+                                  time.time() if now is None else now)
 
 
 # How often main()'s poll loop actually runs the sweep above. Once a day
@@ -496,10 +378,32 @@ def _tick_staging_prune() -> None:
     if now - _LAST_STAGING_PRUNE < _STAGING_PRUNE_INTERVAL_SEC:
         return
     _LAST_STAGING_PRUNE = now
-    removed = _prune_old_staged_files(now)
-    if removed:
-        log(f"pruned {len(removed)} staged file(s) older than "
-            f"{STAGING_MAX_AGE_DAYS}d: {', '.join(p.name for p in removed)}")
+
+    # Each sweep runs on its own: one raising (a file deleted from the app
+    # mid-sweep, a permission oddity) used to skip the two after it for another
+    # 24 h, and the uploads sweep is the one that frees GB.
+    def staged() -> None:
+        removed = _prune_old_staged_files(now)
+        if removed:
+            log(f"pruned {len(removed)} staged file(s) older than "
+                f"{STAGING_MAX_AGE_DAYS}d: {', '.join(p.name for p in removed)}")
+
+    def abandoned_uploads() -> None:
+        dropped = uploads.prune_uploads(ROOT / "batch" / "uploads", UPLOAD_MAX_AGE_SEC, now)
+        if dropped:
+            log(f"pruned {len(dropped)} abandoned upload(s) older than 24h")
+
+    def orphan_thumbs() -> None:
+        thumbs = materials.prune_thumbs(ROOT / "batch" / "thumbs",
+                                        ROOT / "batch" / STAGING_DIR_NAME)
+        if thumbs:
+            log(f"pruned {len(thumbs)} orphaned thumbnail(s)")
+
+    for sweep in (staged, abandoned_uploads, orphan_thumbs):
+        try:
+            sweep()
+        except Exception as exc:
+            log(f"prune sweep {sweep.__name__} failed, continuing: {exc!r}")
 
 
 # out/ is the one directory on the VPS that grows without bound (measured

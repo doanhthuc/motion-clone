@@ -17,7 +17,8 @@ class TestSafeChild(unittest.TestCase):
         self.assertEqual(safe_child(self.root, "ok.mp4"), (self.root / "ok.mp4").resolve())
 
     def test_refuses_traversal_absolute_and_separators(self):
-        for bad in ("..", "../x", "a/b", "a\\b", "/etc/passwd", "", "   "):
+        for bad in ("..", "../x", "a/b", "a\\b", "/etc/passwd", "", "   ", ".",
+                    "x\x00.mp4", "\x00"):
             self.assertIsNone(safe_child(self.root, bad), bad)
 
     def test_refuses_a_symlink_that_escapes_the_root(self):

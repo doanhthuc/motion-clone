@@ -1,7 +1,9 @@
 import errno
 import http.client
 import json
+import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import time
@@ -13,6 +15,7 @@ from io import BytesIO
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batchlib_ext.lease import Lease
+from control import materials, uploads
 import control.runs as runs
 import tgbot.run as run_mod
 import httpapi.files as files_module
@@ -165,6 +168,32 @@ class TestErrors(HttpTestBase):
         self.assertTrue(any("boom" in line for line in self.logged))
         resp, _ = self.request("/v1/health")
         self.assertEqual(resp.status, 200)
+
+
+class TestSettleBody(unittest.TestCase):
+    def test_a_stalled_drain_closes_the_connection_instead_of_raising(self):
+        # _settle_body runs inside _handle's except clauses (via _error), so
+        # nothing upstream catches an exception raised here (reproduced by a
+        # GET that errors while the client holds back a promised body).
+        logged = []
+
+        class FakeServer:
+            log = staticmethod(logged.append)
+
+        class FakeRfile:
+            def read(self, n):
+                raise TimeoutError("timed out")
+
+        fake = types.SimpleNamespace(
+            headers={"Content-Length": "10"},
+            rfile=FakeRfile(),
+            close_connection=False,
+            _body_consumed=False,
+            server=FakeServer(),
+        )
+        _Handler._settle_body(fake)          # must not raise
+        self.assertTrue(fake.close_connection)
+        self.assertEqual(len(logged), 1)
 
 
 class TestHandlerTimeout(unittest.TestCase):
@@ -419,6 +448,223 @@ class TestBotStartsApi(unittest.TestCase):
         # start_in_thread failed, so the fix must close it on that path.
         with socket.socket() as s:
             s.bind(("127.0.0.1", port))
+
+
+class HttpWriteBase(HttpTestBase):
+    def send(self, method, path, body=b"", *, token=TOKEN, headers=None, json_body=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=10)
+        h = dict(headers or {})
+        if token is not None:
+            h["Authorization"] = f"Bearer {token}"
+        if json_body is not None:
+            body = json.dumps(json_body).encode()
+            h["Content-Type"] = "application/json"
+        conn.request(method, path, body=body, headers=h)
+        resp = conn.getresponse()
+        data = resp.read()
+        conn.close()
+        return resp, data
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(uploads, "CHUNK_SIZE", 4)
+        p.start(); self.addCleanup(p.stop)
+        p = mock.patch("shutil.disk_usage", return_value=mock.Mock(free=10 ** 13))
+        p.start(); self.addCleanup(p.stop)
+
+
+class TestWriteAuthAndErrors(HttpWriteBase):
+    def test_every_method_requires_the_token_and_answers_json(self):
+        for method in ("POST", "PUT", "DELETE"):
+            resp, body = self.send(method, "/v1/uploads", token=None)
+            self.assertEqual(resp.status, 401, method)
+            self.assertEqual(json.loads(body)["error"]["code"], "unauthorized")
+
+    def test_bad_json_is_400(self):
+        resp, body = self.send("POST", "/v1/uploads", b"{not json",
+                               headers={"Content-Type": "application/json"})
+        self.assertEqual(resp.status, 400)
+
+    def test_staging_dir_name_matches_the_bot(self):
+        import tgbot.bot as bot
+        self.assertEqual(self.server.staging_root.name, bot.STAGING_DIR_NAME)
+
+
+class TestUploadFlow(HttpWriteBase):
+    def test_chunked_upload_end_to_end(self):
+        resp, body = self.send("POST", "/v1/uploads", json_body={"file_name": "clip.bin", "size": 10})
+        self.assertEqual(resp.status, 201)
+        uid = json.loads(body)["upload_id"]
+        for n, data in ((2, b"89"), (0, b"0123"), (1, b"4567")):
+            resp, _ = self.send("PUT", f"/v1/uploads/{uid}/chunks/{n}", data)
+            self.assertEqual(resp.status, 200)
+        resp, body = self.send("GET", f"/v1/uploads/{uid}")
+        self.assertEqual(json.loads(body)["received"], [0, 1, 2])
+        with mock.patch.object(materials, "ingest",
+                               side_effect=lambda p: (p, {"kind": "video"})):
+            resp, body = self.send("POST", f"/v1/uploads/{uid}/complete")
+        self.assertEqual(resp.status, 201)
+        got = json.loads(body)
+        self.assertEqual(got["material"]["id"], "app/clip.bin")
+        self.assertEqual((self.batch / "tg-staging" / "app" / "clip.bin").read_bytes(), b"0123456789")
+
+    def test_wrong_chunk_length_is_400_and_closes(self):
+        uid = json.loads(self.send("POST", "/v1/uploads",
+                                   json_body={"file_name": "c.bin", "size": 10})[1])["upload_id"]
+        resp, _ = self.send("PUT", f"/v1/uploads/{uid}/chunks/0", b"abc")
+        self.assertEqual(resp.status, 400)
+        self.assertEqual(resp.getheader("Connection"), "close")
+
+    def test_complete_before_all_chunks_is_409(self):
+        uid = json.loads(self.send("POST", "/v1/uploads",
+                                   json_body={"file_name": "c.bin", "size": 10})[1])["upload_id"]
+        resp, body = self.send("POST", f"/v1/uploads/{uid}/complete")
+        self.assertEqual((resp.status, json.loads(body)["error"]["code"]), (409, "incomplete"))
+
+    def test_unprobeable_complete_is_422_and_leaves_nothing(self):
+        uid = json.loads(self.send("POST", "/v1/uploads",
+                                   json_body={"file_name": "junk.mp4", "size": 4})[1])["upload_id"]
+        self.send("PUT", f"/v1/uploads/{uid}/chunks/0", b"junk")
+        with mock.patch.object(materials, "ingest",
+                               side_effect=materials.MaterialError("unprobeable", "bad")):
+            resp, _ = self.send("POST", f"/v1/uploads/{uid}/complete")
+        self.assertEqual(resp.status, 422)
+        self.assertFalse((self.batch / "tg-staging" / "app" / "junk.mp4").exists())
+
+    def test_too_large_is_413(self):
+        resp, _ = self.send("POST", "/v1/uploads",
+                            json_body={"file_name": "x", "size": uploads.MAX_UPLOAD_BYTES + 1})
+        self.assertEqual(resp.status, 413)
+
+    def test_chunk_bigger_than_chunk_size_is_413_and_closes_with_no_tmp_left(self):
+        uid = json.loads(self.send("POST", "/v1/uploads",
+                                   json_body={"file_name": "big.bin", "size": 10})[1])["upload_id"]
+        resp, _ = self.send("PUT", f"/v1/uploads/{uid}/chunks/0", b"12345")   # CHUNK_SIZE patched to 4
+        self.assertEqual(resp.status, 413)
+        self.assertEqual(resp.getheader("Connection"), "close")
+        upload_dir = self.batch / "uploads" / uid
+        self.assertEqual(list(upload_dir.glob("*.tmp")), [])
+
+    def test_complete_twice_returns_the_same_material(self):
+        # A lost 201 (phone on a flaky link) must be retryable: the retry
+        # replays the stored response instead of 404-ing on a gone upload.
+        uid = json.loads(self.send("POST", "/v1/uploads",
+                                   json_body={"file_name": "twice.bin", "size": 4})[1])["upload_id"]
+        self.send("PUT", f"/v1/uploads/{uid}/chunks/0", b"data")
+        with mock.patch.object(materials, "ingest", side_effect=lambda p: (p, {"kind": "video"})):
+            first = self.send("POST", f"/v1/uploads/{uid}/complete")
+            second = self.send("POST", f"/v1/uploads/{uid}/complete")
+        self.assertEqual((first[0].status, second[0].status), (201, 201))
+        self.assertEqual(json.loads(first[1]), json.loads(second[1]))
+        self.assertEqual([p.name for p in (self.batch / "tg-staging" / "app").iterdir()],
+                         ["twice.bin"])
+        status = json.loads(self.send("GET", f"/v1/uploads/{uid}")[1])
+        self.assertEqual(status["material"], json.loads(first[1])["material"])
+
+    def test_a_chunk_during_assembly_is_409_conflict(self):
+        uid = json.loads(self.send("POST", "/v1/uploads",
+                                   json_body={"file_name": "busy.bin", "size": 4})[1])["upload_id"]
+        (self.batch / "uploads" / uid / uploads.ASSEMBLING).write_text(uploads._PROCESS_TOKEN)
+        resp, body = self.send("PUT", f"/v1/uploads/{uid}/chunks/0", b"data")
+        self.assertEqual((resp.status, json.loads(body)["error"]["code"]), (409, "conflict"))
+
+    def test_too_many_open_uploads_is_409(self):
+        for _ in range(uploads.MAX_OPEN_UPLOADS):
+            self.send("POST", "/v1/uploads", json_body={"file_name": "c.bin", "size": 10})
+        resp, body = self.send("POST", "/v1/uploads", json_body={"file_name": "c.bin", "size": 10})
+        self.assertEqual((resp.status, json.loads(body)["error"]["code"]), (409, "too_many"))
+
+    def test_a_nul_byte_in_an_upload_id_is_404_not_500(self):
+        resp, body = self.send("GET", "/v1/uploads/%00")
+        self.assertEqual((resp.status, json.loads(body)["error"]["code"]), (404, "not_found"))
+
+    def test_a_chunk_body_that_stalls_is_400_and_closes(self):
+        uid = json.loads(self.send("POST", "/v1/uploads",
+                                   json_body={"file_name": "stall.bin", "size": 4})[1])["upload_id"]
+        with mock.patch.object(_Handler, "timeout", 0.5):
+            conn = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=10)
+            conn.request("PUT", f"/v1/uploads/{uid}/chunks/0", body=b"da",
+                         headers={"Authorization": f"Bearer {TOKEN}", "Content-Length": "4"})
+            resp = conn.getresponse()
+            body = resp.read()
+            conn.close()
+        self.assertEqual((resp.status, json.loads(body)["error"]["code"]), (400, "bad_request"))
+        self.assertEqual(resp.getheader("Connection"), "close")
+
+    def test_complete_when_the_file_vanishes_meanwhile_is_404_not_500(self):
+        # A concurrent DELETE or prune between ingest() and the material_item()
+        # stat: the upload itself succeeded, so this must be a clean 404, not
+        # a StopIteration turned opaque 500.
+        uid = json.loads(self.send("POST", "/v1/uploads",
+                                   json_body={"file_name": "vanish.bin", "size": 4})[1])["upload_id"]
+        self.send("PUT", f"/v1/uploads/{uid}/chunks/0", b"data")
+
+        def ingest_then_delete(p):
+            p.unlink()
+            return p, {"kind": "video"}
+
+        with mock.patch.object(materials, "ingest", side_effect=ingest_then_delete):
+            resp, body = self.send("POST", f"/v1/uploads/{uid}/complete")
+        self.assertEqual((resp.status, json.loads(body)["error"]["code"]), (404, "not_found"))
+
+
+class TestKeepAlive(HttpWriteBase):
+    def test_a_body_no_route_read_does_not_desync_the_connection(self):
+        # DELETE and complete answer without reading the request body, so a
+        # client that sends `{}` left those two bytes in the socket and the
+        # next request on the same keep-alive connection was parsed as
+        # "{}GET / ..." → 501 Unsupported method (reproduced 2026-09-21).
+        d = self.batch / "tg-staging" / "app"
+        d.mkdir(parents=True)
+        (d / "a.mp4").write_bytes(b"v")
+        conn = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=10)
+        auth = {"Authorization": f"Bearer {TOKEN}"}
+        conn.request("DELETE", "/v1/materials/app/a.mp4", body=b"{}",
+                     headers={**auth, "Content-Type": "application/json"})
+        first = conn.getresponse()
+        first.read()
+        conn.request("GET", "/v1/health", headers=auth)
+        second = conn.getresponse()
+        body = second.read()
+        conn.close()
+        self.assertEqual((first.status, second.status), (204, 200))
+        self.assertEqual(json.loads(body), {"ok": True})
+
+
+class TestMaterialRoutes(HttpWriteBase):
+    def setUp(self):
+        super().setUp()
+        d = self.batch / "tg-staging" / "app"
+        d.mkdir(parents=True)
+        (d / "a.mp4").write_bytes(b"v")
+        (self.batch / "tg-staging" / "99").mkdir()
+        (self.batch / "tg-staging" / "99" / "t.png").write_bytes(b"i")
+
+    def test_list(self):
+        resp, body = self.send("GET", "/v1/materials")
+        self.assertEqual(sorted(m["id"] for m in json.loads(body)["materials"]),
+                         ["99/t.png", "app/a.mp4"])
+
+    def test_delete_app_material_is_204(self):
+        resp, body = self.send("DELETE", "/v1/materials/app/a.mp4")
+        self.assertEqual((resp.status, body), (204, b""))
+        self.assertFalse((self.batch / "tg-staging" / "app" / "a.mp4").exists())
+
+    def test_delete_telegram_material_is_403(self):
+        resp, _ = self.send("DELETE", "/v1/materials/99/t.png")
+        self.assertEqual(resp.status, 403)
+
+    def test_delete_traversal_is_404(self):
+        resp, _ = self.send("DELETE", "/v1/materials/app/..%2F99%2Ft.png")
+        self.assertEqual(resp.status, 404)
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg required")
+    def test_thumb_is_jpeg(self):
+        subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=blue:s=640x480",
+                        "-frames:v", "1", str(self.batch / "tg-staging" / "app" / "p.png")], check=True)
+        resp, body = self.send("GET", "/v1/materials/app/p.png/thumb")
+        self.assertEqual((resp.status, resp.getheader("Content-Type")), (200, "image/jpeg"))
+        self.assertTrue(body.startswith(b"\xff\xd8"))
 
 
 if __name__ == "__main__":
