@@ -1152,6 +1152,42 @@ class TestMigrate(_PodFixture):
         self.assertEqual(status, 202)
         self.start.assert_called_once()
 
+    def test_go_with_a_non_ascii_token_is_400_and_leaves_no_pending_record(self):
+        # hmac.compare_digest raises TypeError on a non-ASCII str. Refused
+        # before the idempotency record exists, so the key stays usable
+        # instead of answering `outcome_unknown` for a migration that never
+        # began.
+        token = self._token()
+        for bad in ("tok\u00e9n", "\ud800"):
+            status, body = self.pod.migrate({"to_dc": "EU-CZ-1",
+                                             "confirm_token": bad}, "m-bad")
+            self.assertEqual((status, body["error"]["code"]), (400, "bad_request"), bad)
+        self._nothing_started()
+        # The same key, now with the real token, is not stuck `pending`.
+        status, _ = self.pod.migrate({"to_dc": "EU-CZ-1", "confirm_token": token}, "m-bad")
+        self.assertEqual(status, 202)
+        self.start.assert_called_once()
+
+    def test_two_threads_racing_one_token_start_one_migration(self):
+        # Check-and-pop is one critical section under BOT_LOCK; a second
+        # caller with a different key must find the token already spent.
+        token = self._token()
+        results, barrier = [], threading.Barrier(2)
+
+        def go(key):
+            barrier.wait(5)
+            results.append(self.pod.migrate(
+                {"to_dc": "EU-CZ-1", "confirm_token": token}, key))
+
+        threads = [threading.Thread(target=go, args=(k,)) for k in ("r1", "r2")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        self.assertEqual(sorted(status for status, _ in results), [202, 409])
+        self.start.assert_called_once()
+        self.popen.assert_not_called()
+
 
 class TestBotLockedHelper(_PodFixture):
     def test_bot_locked_yields_none_when_it_gets_the_lock(self):

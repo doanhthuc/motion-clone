@@ -7418,7 +7418,7 @@ class AppPod:
         # no GPU to rent is a copy that buys nothing.
         offered = {entry.datacenter_id for entries in stock.values()
                    for entry in entries if entry.stock_status.lower() != "none"}
-        if to_dc not in offered - {home}:
+        if to_dc not in offered:
             return 409, _run_error("unknown_datacenter",
                                    "no GPU is currently offered in that datacenter")
         with _bot_locked() as busy_response:
@@ -7486,6 +7486,13 @@ class AppPod:
             return 400, _run_error("bad_request", "to_dc is required")
         if not isinstance(token, str) or not token:
             return 400, _run_error("bad_request", "confirm_token is required")
+        if not token.isascii():
+            # Checked before the idempotency record exists: `compare_digest`
+            # raises TypeError on a non-ASCII str, and by then the key would
+            # be stuck `pending` — a retry would answer `outcome_unknown`, the
+            # most alarming message on the route, for a migration that never
+            # began. Tokens are `token_urlsafe`, so ASCII is all a real one is.
+            return 400, _run_error("bad_request", "confirm_token is not valid")
         replay = self.idem.begin("migrate", key)
         if replay is not None:
             return replay
