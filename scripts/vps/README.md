@@ -919,3 +919,23 @@ Measured 2026-09-21 on the `s-1vcpu-1gb` droplet:
 | ETag through the tunnel | Arrives weakened to `W/"…"` (the compressed JSON response); echoing it in `If-None-Match` still gets `304` |
 | `Range` | `bytes=1000-1999` → `206`, `content-length: 1000` |
 | Full stream | 21,031,695 bytes in 3.4 s to the Mac |
+
+### Slice 2 (upload + materials), measured 2026-09-21
+
+End-to-end through the tunnel from the Mac, with a 36.1 MB driver (`out/2026-09-12-1408/_final/IMG6710-tiktok178922.mp4`) uploaded as 2 chunks, deliberately out of order (chunk 1 first):
+
+| | Measurement |
+|---|---|
+| Upload | 36.1 MB in 31.1 s end to end — 33.6 MB chunk in 28.6 s (~1.2 MB/s up from this connection), 2.5 MB chunk in 0.6 s |
+| `complete` | 1.2 s including assembly, HEIC check and ffprobe |
+| Replayed `complete` | Returns the identical 201 body from `done.json` — no duplicate staged |
+| Thumbnail | 0.9 s cold (ffmpeg), 0.3 s cached |
+| `motion-bot` RSS | 38,772 KB after the deploy → 39,420 KB after the upload, thumbnail and delete |
+| Disk | 7.8 GB of 24 GB used, 16 GB free |
+| Delete | `app`-owned → 204; a traversal id → 404 |
+
+**Cloudflare blocks some clients before the API sees them.** A `POST` sent with Python's default
+`urllib` user-agent came back as Cloudflare error **1010** (403) while the same request with an
+ordinary `User-Agent` header succeeded. Any client — the iPhone app included — must send its own
+user-agent; a bare scripted request may be refused at the edge, and that refusal looks nothing like
+the API's own JSON errors.
