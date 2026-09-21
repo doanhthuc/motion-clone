@@ -313,6 +313,16 @@ class DraftStore:
         with control.LOCK:
             return self._view(self._load())
 
+    def runnable(self) -> tuple[list[Job], bool | None, int]:
+        """What Phase A / confirm need from this draft: the jobs `view()` would
+        report, the last validate verdict, and the generation it belongs to —
+        read together under one lock acquisition so a concurrent edit cannot
+        change the jobs after the verdict was read but before the caller acts
+        on it."""
+        with control.LOCK:
+            d = self._load()
+            return self._jobs(d), d.validated, d.generation
+
     # -- mutations ---------------------------------------------------------
 
     def _resolve(self, material_id) -> Path:

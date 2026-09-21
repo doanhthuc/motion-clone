@@ -50,12 +50,13 @@ import batch_clean
 # the path, which is what makes the absolute form work from either entry point.
 from tgbot.tgclient import Tg, TgError
 from httpapi.server import make_server, start_in_thread
-from control import materials, uploads
+from control import BOT_LOCK, BOT_LOCK_TIMEOUT_SEC, materials, uploads
 import control.drafts as drafts
-from control.drafts import PROVIDER_LABELS
+from control.drafts import DraftStore, PROVIDER_LABELS
+from control.idempotency import IdempotencyStore
 from control.materials import fold_diacritics as _fold_diacritics, safe_name as _safe_name
 from control.paths import safe_child as _safe_child
-from control.runs import Outcome
+from control.runs import Outcome, status_for
 from tgbot import tiktok
 from tgbot.ingest import (Probe, describe, probe, quality_warning,
                          quality_warning_html,
@@ -384,7 +385,12 @@ def _tick_staging_prune() -> None:
         if thumbs:
             log(f"pruned {len(thumbs)} orphaned thumbnail(s)")
 
-    for sweep in (staged, abandoned_uploads, orphan_thumbs):
+    def stale_idempotency_records() -> None:
+        removed = IdempotencyStore(ROOT / "batch" / "idempotency").prune(now)
+        if removed:
+            log(f"pruned {removed} idempotency record(s) older than 24h")
+
+    for sweep in (staged, abandoned_uploads, orphan_thumbs, stale_idempotency_records):
         try:
             sweep()
         except Exception as exc:
@@ -6566,6 +6572,170 @@ BOT_COMMANDS = [
 ]
 
 
+def _run_error(code: str, message: str) -> dict:
+    """The `{"error": {...}}` body shape every route in httpapi/server.py
+    already sends (ApiError._error, DraftError), so a refusal from the app's
+    run routes looks the same on the wire as every other one."""
+    return {"error": {"code": code, "message": message}}
+
+
+class AppRuns:
+    """Phase A and confirm for the phone's draft, run through the one shared
+    slot (spec §5.8): the app's jobs go into the Telegram chat's own
+    manifest, `batch/tg-<chat>.yaml`, and through the bot's own
+    `_do_phase_a` / `_do_confirm` / `_do_resume` — the same functions and the
+    same refusals /confirm has always had, wrapped as the app's `_AppTg` so a
+    refusal answers the phone instead of the chat.
+
+    Every call is made under `BOT_LOCK`, so the check-then-start of a paid
+    drain here can never interleave with the bot loop's own `handle()` or
+    tick round (`_handle_locked`, `_run_ticks` below) — the race this whole
+    slice exists to close. Idempotency records are written `pending` by
+    `idem.begin` before anything runs, so a crash mid-call answers a replay
+    with `outcome_unknown` rather than risk a second rental; `bot_busy`
+    (the lock timed out) is the one outcome never recorded, so the same key
+    can just be retried once the lock frees up.
+    """
+
+    def __init__(self, tg: Tg, chat_id: int, drafts: DraftStore, idem: IdempotencyStore):
+        self.tg, self.chat_id, self.drafts, self.idem = tg, chat_id, drafts, idem
+
+    @property
+    def run_id(self) -> str:
+        return _job_manifest_path(self.chat_id).stem
+
+    def panel_token(self) -> str:
+        """`_run_token` alone only catches a rewritten manifest — it says
+        nothing about the app's OWN draft, which is what the app actually
+        reviewed on its rent panel. Joining the draft's generation closes
+        that: an edit to the draft (no manifest written yet) still stales the
+        token, the same way a Telegram edit stales `_run_token`."""
+        _, _, generation = self.drafts.runnable()
+        return f"{_run_token(self.chat_id)}.{generation}"
+
+    @contextlib.contextmanager
+    def _locked(self):
+        """`with self._locked() as busy:` — `busy` is `None` once `BOT_LOCK`
+        is held, or the ready-made 503 body when the wait timed out. The
+        caller's own job is to `idem.forget` in the timeout case (this method
+        does not know the scope/key) and return the 503 as-is, unrecorded."""
+        if BOT_LOCK.acquire(timeout=BOT_LOCK_TIMEOUT_SEC):
+            try:
+                yield None
+            finally:
+                BOT_LOCK.release()
+        else:
+            yield (503, _run_error("bot_busy", "the bot is busy — try again in a moment"))
+
+    def _draft_jobs(self) -> tuple[list[Job] | None, Outcome | None]:
+        """What Phase A and confirm's fresh-spend branch both need from the
+        app's draft: its jobs, or the refusal for why there are none to run."""
+        jobs, validated, _ = self.drafts.runnable()
+        if not jobs:
+            return None, Outcome(False, "nothing_to_run",
+                                 "no complete job in the app's draft yet")
+        if validated is not True:
+            return None, Outcome(False, "not_validated",
+                                 "validate the draft first (POST /v1/draft/validate)")
+        return jobs, None
+
+    def phase_a(self, key) -> tuple[int, dict]:
+        replay = self.idem.begin("phase-a", key)
+        if replay is not None:
+            return replay
+        with self._locked() as busy:
+            if busy is not None:
+                self.idem.forget("phase-a", key)
+                return busy
+            jobs, refusal = self._draft_jobs()
+            out = refusal if refusal is not None else _do_phase_a(
+                _AppTg(self.tg), self.chat_id, dry_run=False, jobs=jobs)
+        # Phase A is not a submission (same as the bot's own /confirm-less
+        # Run tap), so nothing above ever clears the app's draft.
+        response = ((202, {"run_id": self.run_id, "outcome": out.code}) if out
+                    else (status_for(out), _run_error(out.code, out.message)))
+        self.idem.finish("phase-a", key, *response)
+        return response
+
+    def confirm(self, run_id: str, body: dict, key) -> tuple[int, dict]:
+        # {id} must be the live slot's id (spec §5.8) — checked before the
+        # idempotency store ever sees this key, so a wrong id costs nothing.
+        if run_id != self.run_id:
+            return 404, _run_error("not_found", "no such run")
+        provider = body.get("provider")
+        if provider not in ("runpod", "vast"):
+            return 400, _run_error("bad_request",
+                                   'provider must be "runpod" or "vast"')
+        tryon = body.get("tryon")
+        if tryon not in (None, "reuse", "rerun"):
+            return 400, _run_error("bad_request",
+                                   'tryon must be "reuse", "rerun", or omitted')
+        replay = self.idem.begin("confirm", key)
+        if replay is not None:
+            return replay
+        with self._locked() as busy:
+            if busy is not None:
+                self.idem.forget("confirm", key)
+                return busy
+            if body.get("panel_token") != self.panel_token():
+                out = Outcome(False, "stale_panel",
+                              "the job changed since the panel was read — read it again")
+            elif _PHASE_A_OFFERED.get(self.chat_id) == _run_token(self.chat_id):
+                # The app's own chooser-less equivalent of the rent panel's
+                # spend button: Phase A already ran for this exact manifest,
+                # so this is a resume, never a fresh _do_confirm (see
+                # _do_resume's own docstring for why that is not a second
+                # money gate).
+                out = _do_resume(_AppTg(self.tg), self.chat_id,
+                                 _job_manifest_path(self.chat_id), dry_run=False,
+                                 gpu_provider=provider)
+                if out:
+                    _PHASE_A_OFFERED.pop(self.chat_id, None)
+                    self.drafts.clear()
+            else:
+                jobs, refusal = self._draft_jobs()
+                if refusal is not None:
+                    out = refusal
+                else:
+                    out = _do_confirm(_AppTg(self.tg), self.chat_id, dry_run=False,
+                                      jobs=jobs, gpu_provider=provider,
+                                      phase_a_choice=tryon)
+                    if out:
+                        self.drafts.clear()
+            if out:
+                response = (202, {"run_id": self.run_id, "outcome": out.code})
+            else:
+                response = (status_for(out), _run_error(out.code, out.message))
+                if out.code == "choice_required":
+                    # The app has no buttons to tap; it re-reads the panel
+                    # token here rather than a second round trip to get one.
+                    response[1]["panel_token"] = self.panel_token()
+        self.idem.finish("confirm", key, *response)
+        return response
+
+
+def _handle_locked(tg: Tg, update: dict, **kwargs) -> None:
+    """`handle()`, under `BOT_LOCK` — spec §5.8's other half of the guard
+    `AppRuns` takes on the HTTP side. No timeout here: this is the bot's own
+    loop, not a client that can be told to retry, and `get_updates` (the slow
+    part) already runs outside this call, in main()."""
+    with BOT_LOCK:
+        handle(tg, update, **kwargs)
+
+
+def _run_ticks(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
+    """The six tick calls main() makes every poll round, under `BOT_LOCK` as
+    one round — so an app confirm cannot land between, say, tick_phase_a
+    starting a resume and tick_progress reporting on it."""
+    with BOT_LOCK:
+        tick_progress(tg, chat_id)
+        tick_phase_a(tg, chat_id, dry_run=dry_run)
+        tick_migration_progress(tg, chat_id, dry_run=dry_run)
+        _tick_gpu_subs(tg, chat_id)
+        _tick_staging_prune()
+        _tick_out_prune(tg, chat_id)
+
+
 def _api_enabled_for(args: argparse.Namespace) -> bool:
     """Whether this invocation of main() should start the control API.
 
@@ -6691,20 +6861,17 @@ def main() -> int:
                     offset, timeout=(_POLL_ANIMATED_SEC if animating
                                      else _POLL_IDLE_SEC)):
                 offset = update["update_id"] + 1
-                handle(tg, update, allowed_user_id=allowed_user_id,
-                       dry_run=args.dry_run)
-            # After the updates, not instead of them.
+                _handle_locked(tg, update, allowed_user_id=allowed_user_id,
+                               dry_run=args.dry_run)
+            # After the updates, not instead of them — get_updates is the slow
+            # long-poll and must stay outside BOT_LOCK (spec §5.8), or an app
+            # confirm would wait out the whole poll timeout for no reason.
             # One chat, because the allowlist is one user (spec section 2).
             # tick_phase_a sits next to tick_progress for readability — the two
             # read the same _progress_path. Order is not what makes that safe:
             # the `phase` guard in each tick is, and they would be correct in
             # either order.
-            tick_progress(tg, allowed_user_id)
-            tick_phase_a(tg, allowed_user_id, dry_run=args.dry_run)
-            tick_migration_progress(tg, allowed_user_id, dry_run=args.dry_run)
-            _tick_gpu_subs(tg, allowed_user_id)
-            _tick_staging_prune()
-            _tick_out_prune(tg, allowed_user_id)
+            _run_ticks(tg, allowed_user_id, dry_run=args.dry_run)
         except TgError as exc:
             log(f"poll failed, continuing: {exc}")
             time.sleep(5)

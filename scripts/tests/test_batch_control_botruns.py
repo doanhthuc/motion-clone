@@ -5,17 +5,19 @@ Telegram chat's one run slot without touching the Telegram draft (spec §5.8).
 Everything here is free: start_drain / start_phase_a are patched, so no pod
 is rented and no try-on API is called.
 """
-import json, sys, tempfile, unittest
+import json, sys, tempfile, threading, time, unittest
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from batchlib.manifest import load_manifest
+from batchlib.manifest import load_manifest, state_path_for
 from batchlib_ext.handoff import mailbox_path
+import control.drafts as drafts
+from control.idempotency import IdempotencyStore
 from control.runs import Outcome
 import tgbot.bot as bot
 from tgbot.ingest import Probe
-from tgbot.job import Job
+from tgbot.job import Job, write_manifest
 
 ME = 12345
 
@@ -261,6 +263,204 @@ class TestRegen(_Fixture):
                                dry_run=False)
         self.assertEqual((out.ok, out.code), (False, "stale_panel"))
         self.assertEqual(self.tg.sent, [])
+
+
+class _AppRunsFixture(_Fixture):
+    """A real DraftStore and a real IdempotencyStore over the fixture's temp
+    `batch/`, wired into one AppRuns for chat ME — everything AppRuns itself
+    is built from, none of it faked."""
+
+    def setUp(self):
+        super().setUp()
+        staging = self.root / "batch" / "tg-staging"
+        staging.mkdir(parents=True, exist_ok=True)
+        self.store = drafts.DraftStore(self.root / "batch", staging, "app",
+                                       default_pipeline="motion-enhance",
+                                       default_provider="gemini")
+        self.idem = IdempotencyStore(self.root / "batch" / "idempotency")
+        self.runs = bot.AppRuns(self.tg, ME, self.store, self.idem)
+
+    def _seed_draft(self, *, validated: bool = True) -> Job:
+        # Straight into the store's own persistence rather than patch(): the
+        # app's job needs no staged material for these tests, only files
+        # DraftStore's completeness check (_missing) can stat.
+        job = self._job("app")
+        d = self.store._load()
+        d.job = job
+        d.validated = validated
+        self.store._save(d)
+        return job
+
+    def _seed_journal(self, job: Job) -> None:
+        """A live manifest plus a journal recording a batch id — the proof
+        _do_resume requires that this chat's manifest was already confirmed
+        once (see its own docstring), so AppRuns.confirm's resume branch has
+        something real to resume."""
+        write_manifest([job], self._live(), now=time.strftime("%Y-%m-%d %H:%M:%S"))
+        state_path_for(self._live()).write_text(
+            json.dumps({"batch": "2026-09-21-1200", "runs": {}}), encoding="utf-8")
+
+    def _body(self, provider: str = "runpod", tryon=None) -> dict:
+        return {"provider": provider, "tryon": tryon, "panel_token": self.runs.panel_token()}
+
+
+class TestAppRunsPhaseA(_AppRunsFixture):
+    def test_phase_a_requires_a_validated_draft(self):
+        self._seed_draft(validated=False)
+        status, body = self.runs.phase_a("k1")
+        self.assertEqual(status, 422)
+        self.assertEqual(body["error"]["code"], "not_validated")
+        self.patches["start_phase_a"].assert_not_called()
+
+    def test_phase_a_starts_and_replay_does_not_start_twice(self):
+        self._seed_draft(validated=True)
+        first = self.runs.phase_a("same-key")
+        second = self.runs.phase_a("same-key")
+        self.assertEqual(first[0], 202)
+        self.assertEqual(second, first)
+        self.patches["start_phase_a"].assert_called_once()
+
+
+class TestAppRunsConfirm(_AppRunsFixture):
+    def test_confirm_replayed_with_the_same_key_calls_start_drain_once(self):
+        self._seed_draft(validated=True)
+        body = self._body()
+        first = self.runs.confirm(self.runs.run_id, body, "same-key")
+        second = self.runs.confirm(self.runs.run_id, body, "same-key")
+        self.assertEqual(first[0], 202)
+        self.assertEqual(second, first)
+        self.patches["start_drain"].assert_called_once()
+
+    def test_confirm_with_a_stale_panel_token_is_409(self):
+        self._seed_draft(validated=True)
+        body = {"provider": "runpod", "tryon": None, "panel_token": "not-the-token"}
+        status, resp = self.runs.confirm(self.runs.run_id, body, "k")
+        self.assertEqual(status, 409)
+        self.assertEqual(resp["error"]["code"], "stale_panel")
+        self.patches["start_drain"].assert_not_called()
+
+    def test_two_concurrent_confirms_make_one_drain(self):
+        self._seed_draft(validated=True)
+        # Read once, before either thread starts — the phone would have read
+        # one panel and fired two retries of what it believes is one tap.
+        token = self.runs.panel_token()
+        results = {}
+
+        def call(key: str) -> None:
+            results[key] = self.runs.confirm(
+                self.runs.run_id,
+                {"provider": "runpod", "tryon": None, "panel_token": token}, key)
+
+        threads = [threading.Thread(target=call, args=(key,))
+                  for key in ("key-1", "key-2")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(5)
+        self.patches["start_drain"].assert_called_once()
+        self.assertEqual(sorted(status for status, _ in results.values()), [202, 409])
+        refused = next(body for status, body in results.values() if status == 409)
+        self.assertEqual(refused["error"]["code"], "stale_panel")
+
+    def test_confirm_after_phase_a_resumes(self):
+        job = self._seed_draft(validated=True)
+        self._seed_journal(job)
+        bot._PHASE_A_OFFERED[ME] = bot._run_token(ME)
+        status, _ = self.runs.confirm(self.runs.run_id, self._body(), "k")
+        self.assertEqual(status, 202)
+        self.patches["start_drain"].assert_called_once()
+        self.assertTrue(self.patches["start_drain"].call_args.kwargs.get("resume"))
+        self.assertNotIn(ME, bot._PHASE_A_OFFERED)
+        self.assertEqual(self.store.view()["jobs"], 0)
+
+    def test_confirm_clears_the_app_draft_only_on_success(self):
+        self._seed_draft(validated=True)
+        before = self.store.view()
+        self.patches["migration_running"].return_value = True
+        status, body = self.runs.confirm(self.runs.run_id, self._body(), "k")
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["code"], "migration")
+        self.patches["start_drain"].assert_not_called()
+        self.assertEqual(self.store.view(), before)
+
+    def test_crash_midway_leaves_the_key_pending(self):
+        self._seed_draft(validated=True)
+        body = self._body()
+        self.patches["start_drain"].side_effect = RuntimeError("boom")
+        with self.assertRaises(RuntimeError):
+            self.runs.confirm(self.runs.run_id, body, "k")
+        status, resp = self.runs.confirm(self.runs.run_id, body, "k")
+        self.assertEqual(status, 409)
+        self.assertEqual(resp["error"]["code"], "outcome_unknown")
+        self.patches["start_drain"].assert_called_once()
+
+    def test_bot_busy_is_503_and_retryable(self):
+        self._seed_draft(validated=True)
+        body = self._body()
+        held, release = threading.Event(), threading.Event()
+
+        def hold() -> None:
+            with bot.BOT_LOCK:
+                held.set()
+                release.wait(5)
+
+        t = threading.Thread(target=hold)
+        t.start()
+        try:
+            self.assertTrue(held.wait(5))
+            with mock.patch.object(bot, "BOT_LOCK_TIMEOUT_SEC", 0.2):
+                status, resp = self.runs.confirm(self.runs.run_id, body, "k")
+        finally:
+            release.set()
+            t.join(5)
+        self.assertEqual(status, 503)
+        self.assertEqual(resp["error"]["code"], "bot_busy")
+        # Not recorded — forgotten, so the exact same key may retry rather
+        # than read back an "outcome_unknown" for a call that never ran.
+        status, resp = self.runs.confirm(self.runs.run_id, body, "k")
+        self.assertEqual(status, 202)
+        self.patches["start_drain"].assert_called_once()
+
+    def test_confirm_wrong_run_id_is_404(self):
+        self._seed_draft(validated=True)
+        status, resp = self.runs.confirm("not-the-run-id", self._body(), "k")
+        self.assertEqual(status, 404)
+        self.assertEqual(resp["error"]["code"], "not_found")
+        self.patches["start_drain"].assert_not_called()
+
+    def test_confirm_bad_provider_is_400(self):
+        self._seed_draft(validated=True)
+        status, resp = self.runs.confirm(self.runs.run_id, {"provider": "nope"}, "k")
+        self.assertEqual(status, 400)
+        self.assertEqual(resp["error"]["code"], "bad_request")
+        self.patches["start_drain"].assert_not_called()
+
+
+class TestBotLoopLocking(_AppRunsFixture):
+    def test_handle_and_ticks_hold_the_bot_lock(self):
+        seen = []
+
+        def probe_from_another_thread(*_args, **_kwargs) -> None:
+            # RLock is per-thread reentrant, so the probe has to run on a
+            # different thread than the one holding BOT_LOCK — this thread
+            # could always re-acquire its own lock.
+            acquired = []
+
+            def worker() -> None:
+                got = bot.BOT_LOCK.acquire(blocking=False)
+                acquired.append(got)
+                if got:
+                    bot.BOT_LOCK.release()
+
+            t = threading.Thread(target=worker)
+            t.start(); t.join(5)
+            seen.append(acquired[0])
+
+        with mock.patch("tgbot.bot.handle", side_effect=probe_from_another_thread):
+            bot._handle_locked(self.tg, {"update_id": 1}, allowed_user_id=ME, dry_run=False)
+        with mock.patch("tgbot.bot.tick_progress", side_effect=probe_from_another_thread):
+            bot._run_ticks(self.tg, ME, dry_run=False)
+        self.assertEqual(seen, [False, False])
 
 
 if __name__ == "__main__":
