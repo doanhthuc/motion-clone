@@ -224,11 +224,19 @@ def resolve_material(staging_root: Path, owner: str, name: str) -> Path | None:
 
 def _in_use(batch_dir: Path, path: Path) -> bool:
     """A busy run's manifest names this file. Only busy runs block: a finished
-    manifest keeps naming its inputs forever, and would make nothing deletable."""
-    needle = str(path)
+    manifest keeps naming its inputs forever, and would make nothing deletable.
+
+    Matches the whole path, not a bare substring: `needle in text` would also
+    match `<path>.bak` or any other manifest value that merely starts with
+    this path, wrongly refusing a delete that nothing actually uses. The
+    lookahead requires the match to end at end-of-text or at a character that
+    cannot continue a path inside the manifest's YAML (whitespace, a quote,
+    or a flow-mapping delimiter).
+    """
+    pattern = re.compile(re.escape(str(path)) + r"(?=$|[\s'\",}\]])")
     for manifest in batch_dir.glob("*.yaml"):
         try:
-            if needle in manifest.read_text(encoding="utf-8", errors="replace") \
+            if pattern.search(manifest.read_text(encoding="utf-8", errors="replace")) \
                     and run_mod.busy(manifest):
                 return True
         except OSError:
@@ -237,6 +245,7 @@ def _in_use(batch_dir: Path, path: Path) -> bool:
 
 
 def delete_material(staging_root: Path, batch_dir: Path, owner: str, name: str) -> None:
+    owner, name = owner.strip(), name.strip()
     path = resolve_material(staging_root, owner, name)
     if path is None:
         raise MaterialError("not_found", "no such material")
@@ -250,6 +259,7 @@ def delete_material(staging_root: Path, batch_dir: Path, owner: str, name: str) 
 
 
 def thumbnail(staging_root: Path, thumbs_root: Path, owner: str, name: str) -> Path:
+    owner, name = owner.strip(), name.strip()
     src = resolve_material(staging_root, owner, name)
     if src is None:
         raise MaterialError("not_found", "no such material")

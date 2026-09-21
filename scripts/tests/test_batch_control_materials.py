@@ -143,6 +143,25 @@ class TestDelete(MaterialsBase):
         materials.delete_material(self.staging, self.batch, "app", "a.mp4")
         self.assertFalse(self.a.exists())
 
+    def test_in_use_ignores_a_path_that_merely_starts_with_it(self):
+        # A manifest naming "<path>.bak" must not refuse deleting "<path>" —
+        # `needle in text` would match here, a bare-substring bug this guards.
+        (self.batch / "r.yaml").write_text(f"driver: {self.a.resolve()}.bak\n")
+        with mock.patch.object(run_mod, "busy", return_value=True):
+            materials.delete_material(self.staging, self.batch, "app", "a.mp4")
+        self.assertFalse(self.a.exists())
+
+    def test_in_use_matches_the_exact_path_at_end_of_line(self):
+        (self.batch / "r.yaml").write_text(f"driver: {self.a.resolve()}\n")
+        with mock.patch.object(run_mod, "busy", return_value=True):
+            with self.assertRaises(materials.MaterialError) as cm:
+                materials.delete_material(self.staging, self.batch, "app", "a.mp4")
+        self.assertEqual(cm.exception.code, "in_use")
+
+    def test_owner_is_stripped_before_the_app_check(self):
+        materials.delete_material(self.staging, self.batch, " app ", "a.mp4")
+        self.assertFalse(self.a.exists())
+
 
 @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg required")
 class TestThumbAndIngest(MaterialsBase):
@@ -156,6 +175,11 @@ class TestThumbAndIngest(MaterialsBase):
         self.assertEqual(t2.stat().st_mtime, mtime)          # cached, not regenerated
         from tgbot import ingest
         self.assertEqual(ingest.probe(t1).width, 320)
+
+    def test_thumbnail_path_strips_whitespace_in_name(self):
+        make_png(self.staging / "app" / "p.png")
+        t = materials.thumbnail(self.staging, self.tmp / "thumbs", "app", " p.png ")
+        self.assertEqual(t, self.tmp / "thumbs" / "app" / "p.png.jpg")
 
     def test_thumbnail_of_garbage_is_unprobeable(self):
         with self.assertRaises(materials.MaterialError) as cm:
