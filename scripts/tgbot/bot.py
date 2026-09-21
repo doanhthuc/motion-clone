@@ -7577,8 +7577,12 @@ def _start_control_api(tg: Tg, chat_id: int):
         # built after make_server — and it must exist before the thread
         # starts, or the first phone request could see server.app_runs still
         # unset and get a spurious 503.
-        server.app_runs = AppRuns(tg, chat_id, server.drafts,
-                                  IdempotencyStore(ROOT / "batch" / "idempotency"))
+        idem = IdempotencyStore(ROOT / "batch" / "idempotency")
+        server.app_runs = AppRuns(tg, chat_id, server.drafts, idem)
+        # One AppPod for the life of the process, sharing AppRuns's store: the
+        # migrate confirm token is held on the instance, so building one per
+        # request would void every token before the phone could use it.
+        server.app_pod = AppPod(tg, chat_id, idem)
         start_in_thread(server)
     except (OSError, ValueError, RuntimeError) as exc:
         # RuntimeError: the OS refused to create the daemon thread (e.g. a
