@@ -7,6 +7,7 @@ memory beyond one READ_BLOCK, because the VPS has 1 GB of RAM.
 """
 from __future__ import annotations
 
+import errno
 import json
 import math
 import os
@@ -24,9 +25,10 @@ MAX_UPLOAD_BYTES = 2 * 1024 ** 3     # the local Telegram Bot API's own file lim
 DISK_HEADROOM = 1024 ** 3            # left free for the bot, out/ and the journals
 READ_BLOCK = 1024 * 1024
 
-# assemble() must not run twice for one upload at once (a phone retrying a
-# slow complete) — the second would find half-deleted chunks.
-_ASSEMBLE_LOCK = threading.Lock()
+# Guards assemble/write_chunk atomic operations and prune_uploads age checks
+# against concurrent rmtree, so a chunk re-sent during assembly or a prune
+# does not raise FileNotFoundError.
+_LOCK = threading.Lock()
 
 
 class UploadError(Exception):
@@ -80,20 +82,31 @@ def expected_chunk_length(meta: dict, n: int) -> int:
 
 def write_chunk(uploads_root: Path, upload_id: str, n: int, stream, length: int) -> None:
     d = _dir(uploads_root, upload_id)
-    if length != expected_chunk_length(_meta(d), n):
+    meta = _meta(d)
+    if length != expected_chunk_length(meta, n):
         raise UploadError("bad_request", f"chunk {n} must be exactly "
-                          f"{expected_chunk_length(_meta(d), n)} bytes")
+                          f"{expected_chunk_length(meta, n)} bytes")
     tmp = d / f"{n:05d}.part.{uuid.uuid4().hex}.tmp"
     remaining = length
     try:
-        with tmp.open("wb") as f:
-            while remaining > 0:
-                block = stream.read(min(READ_BLOCK, remaining))
-                if not block:
-                    raise UploadError("bad_request", f"chunk {n} ended early")
-                f.write(block)
-                remaining -= len(block)
-        os.replace(tmp, d / f"{n:05d}.part")
+        # Stream to .tmp OUTSIDE the lock so slow uploads don't block others.
+        # If the upload dir is removed (e.g. assemble's rmtree), catch OSError.
+        try:
+            with tmp.open("wb") as f:
+                while remaining > 0:
+                    block = stream.read(min(READ_BLOCK, remaining))
+                    if not block:
+                        raise UploadError("bad_request", f"chunk {n} ended early")
+                    f.write(block)
+                    remaining -= len(block)
+        except OSError as e:
+            # If the upload directory was removed, raise not_found instead of raw error.
+            raise UploadError("not_found", "no such upload")
+        # Atomic rename under lock: re-check meta.json exists, then replace.
+        with _LOCK:
+            if not (d / "meta.json").is_file():
+                raise UploadError("not_found", "no such upload")
+            os.replace(tmp, d / f"{n:05d}.part")
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -117,18 +130,25 @@ def upload_status(uploads_root: Path, upload_id: str) -> dict:
 
 
 def assemble(uploads_root: Path, upload_id: str, dest_dir: Path) -> Path:
-    with _ASSEMBLE_LOCK:
+    with _LOCK:
         d = _dir(uploads_root, upload_id)
         meta = _meta(d)
         total = math.ceil(meta["size"] / meta["chunk_size"])
         if len(_received(d, meta)) != total:
             raise UploadError("incomplete", "not every chunk has arrived; check GET /v1/uploads/{id}")
         combined = d / "assembled"
-        with combined.open("wb") as out:
-            for n in range(total):
-                with (d / f"{n:05d}.part").open("rb") as part:
-                    shutil.copyfileobj(part, out, READ_BLOCK)
-        staged = stage_file(dest_dir, combined, meta["file_name"], move=True)
+        try:
+            with combined.open("wb") as out:
+                for n in range(total):
+                    with (d / f"{n:05d}.part").open("rb") as part:
+                        shutil.copyfileobj(part, out, READ_BLOCK)
+            staged = stage_file(dest_dir, combined, meta["file_name"], move=True)
+        except OSError as e:
+            # Clean up the partial assembled file; chunks stay for retry.
+            (d / "assembled").unlink(missing_ok=True)
+            if e.errno == errno.ENOSPC:
+                raise UploadError("no_space", "server ran out of disk while assembling; free space and retry complete")
+            raise
         shutil.rmtree(d, ignore_errors=True)
         return staged
 
@@ -136,11 +156,18 @@ def assemble(uploads_root: Path, upload_id: str, dest_dir: Path) -> Path:
 def prune_uploads(uploads_root: Path, max_age_sec: float, now: float) -> list[str]:
     removed = []
     for d in uploads_root.iterdir() if uploads_root.is_dir() else []:
-        try:
-            created = _meta(d)["created_at"]
-        except (OSError, ValueError, KeyError):
-            created = d.stat().st_mtime            # unreadable meta: judge by the dir
-        if now - created > max_age_sec:
-            shutil.rmtree(d, ignore_errors=True)
-            removed.append(d.name)
+        # Skip non-directories (e.g. stray files under uploads_root).
+        if not d.is_dir():
+            continue
+        with _LOCK:
+            # Re-check that the directory still exists (may have been removed concurrently).
+            if not d.is_dir():
+                continue
+            try:
+                created = _meta(d)["created_at"]
+            except (OSError, ValueError, KeyError):
+                created = d.stat().st_mtime            # unreadable meta: judge by the dir
+            if now - created > max_age_sec:
+                shutil.rmtree(d, ignore_errors=True)
+                removed.append(d.name)
     return removed

@@ -1,3 +1,4 @@
+import errno
 import io
 import json
 import os
@@ -75,6 +76,19 @@ class TestChunks(UploadsBase):
                 uploads.upload_status(self.root, uid)
             self.assertEqual(cm.exception.code, "not_found")
 
+    def test_write_chunk_after_directory_removed(self):
+        uid = self.open()["upload_id"]
+        upload_dir = self.root / uid
+        # Simulate assemble removing the directory while write_chunk is called
+        import shutil as shutil_module
+        shutil_module.rmtree(upload_dir)
+        # write_chunk should raise not_found, not a raw FileNotFoundError
+        with self.assertRaises(uploads.UploadError) as cm:
+            self.put(uid, 0, b"0123")
+        self.assertEqual(cm.exception.code, "not_found")
+        # No stray tmp files should be left
+        self.assertEqual(list(self.root.glob("*/*.tmp")), [])
+
 
 class TestAssemble(UploadsBase):
     def test_incomplete_is_refused(self):
@@ -93,6 +107,21 @@ class TestAssemble(UploadsBase):
         self.assertEqual(staged.read_bytes(), b"0123456789")
         self.assertFalse((self.root / uid).exists())
 
+    def test_assemble_disk_full_cleanup_and_retry(self):
+        uid = self.open()["upload_id"]
+        for n, data in ((1, b"4567"), (0, b"0123"), (2, b"89")):
+            self.put(uid, n, data)
+        # Patch shutil.copyfileobj to raise OSError(ENOSPC)
+        with mock.patch("shutil.copyfileobj") as mock_copy:
+            mock_copy.side_effect = OSError(errno.ENOSPC, "No space left on device")
+            with self.assertRaises(uploads.UploadError) as cm:
+                uploads.assemble(self.root, uid, self.dest)
+            self.assertEqual(cm.exception.code, "no_space")
+        # Assembled file should be cleaned up
+        self.assertFalse((self.root / uid / "assembled").exists())
+        # Chunks should still be present for retry
+        self.assertEqual(uploads.upload_status(self.root, uid)["received"], [0, 1, 2])
+
 
 class TestPrune(UploadsBase):
     def test_removes_only_stale_uploads(self):
@@ -103,6 +132,21 @@ class TestPrune(UploadsBase):
         meta.write_text(json.dumps(m))
         self.assertEqual(uploads.prune_uploads(self.root, 24 * 3600, now), [old])
         self.assertTrue((self.root / new).exists())
+
+    def test_prune_skips_stray_regular_files(self):
+        uid = self.open()["upload_id"]
+        # Create a stray regular file in uploads_root (not a directory)
+        stray = self.root / "stray.txt"
+        stray.write_text("junk")
+        now = time.time()
+        # Prune should not crash and should not report the stray file
+        # Use a long max_age so the upload is not stale
+        result = uploads.prune_uploads(self.root, 24 * 3600, now)
+        self.assertEqual(result, [])
+        # Stray file should still exist (not deleted)
+        self.assertTrue(stray.exists())
+        # Upload should still exist (not stale)
+        self.assertTrue((self.root / uid).exists())
 
 
 if __name__ == "__main__":
