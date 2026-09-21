@@ -10,6 +10,7 @@ reason the API runs inside the bot process (spec §3, approach A).
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 from batchlib.manifest import load_state, state_path_for
@@ -95,3 +96,28 @@ def run_detail(batch_dir: Path, out_dir: Path, run_id: str) -> dict | None:
     }
     detail["outputs"] = final_names(out_dir, detail["batch"]) if detail["batch"] else []
     return detail
+
+
+@dataclass(frozen=True)
+class Outcome:
+    """What a run action did. Truthy when it started or queued something, so
+    callers that used to test a bool (`if _do_resume(...)`) keep working."""
+    ok: bool
+    code: str
+    message: str = ""
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+
+OUTCOME_STATUS = {
+    "not_found": 404,
+    "nothing_to_run": 422, "not_validated": 422, "invalid": 422, "manifest_error": 422,
+    "bot_busy": 503,
+}
+
+
+def status_for(outcome: Outcome) -> int:
+    if outcome.ok:
+        return 202
+    return OUTCOME_STATUS.get(outcome.code, 409)
