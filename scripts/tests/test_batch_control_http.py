@@ -519,6 +519,52 @@ class TestUploadFlow(HttpWriteBase):
         upload_dir = self.batch / "uploads" / uid
         self.assertEqual(list(upload_dir.glob("*.tmp")), [])
 
+    def test_complete_twice_returns_the_same_material(self):
+        # A lost 201 (phone on a flaky link) must be retryable: the retry
+        # replays the stored response instead of 404-ing on a gone upload.
+        uid = json.loads(self.send("POST", "/v1/uploads",
+                                   json_body={"file_name": "twice.bin", "size": 4})[1])["upload_id"]
+        self.send("PUT", f"/v1/uploads/{uid}/chunks/0", b"data")
+        with mock.patch.object(materials, "ingest", side_effect=lambda p: (p, {"kind": "video"})):
+            first = self.send("POST", f"/v1/uploads/{uid}/complete")
+            second = self.send("POST", f"/v1/uploads/{uid}/complete")
+        self.assertEqual((first[0].status, second[0].status), (201, 201))
+        self.assertEqual(json.loads(first[1]), json.loads(second[1]))
+        self.assertEqual([p.name for p in (self.batch / "tg-staging" / "app").iterdir()],
+                         ["twice.bin"])
+        status = json.loads(self.send("GET", f"/v1/uploads/{uid}")[1])
+        self.assertEqual(status["material"], json.loads(first[1])["material"])
+
+    def test_a_chunk_during_assembly_is_409_conflict(self):
+        uid = json.loads(self.send("POST", "/v1/uploads",
+                                   json_body={"file_name": "busy.bin", "size": 4})[1])["upload_id"]
+        (self.batch / "uploads" / uid / uploads.ASSEMBLING).write_text(uploads._PROCESS_TOKEN)
+        resp, body = self.send("PUT", f"/v1/uploads/{uid}/chunks/0", b"data")
+        self.assertEqual((resp.status, json.loads(body)["error"]["code"]), (409, "conflict"))
+
+    def test_too_many_open_uploads_is_409(self):
+        for _ in range(uploads.MAX_OPEN_UPLOADS):
+            self.send("POST", "/v1/uploads", json_body={"file_name": "c.bin", "size": 10})
+        resp, body = self.send("POST", "/v1/uploads", json_body={"file_name": "c.bin", "size": 10})
+        self.assertEqual((resp.status, json.loads(body)["error"]["code"]), (409, "too_many"))
+
+    def test_a_nul_byte_in_an_upload_id_is_404_not_500(self):
+        resp, body = self.send("GET", "/v1/uploads/%00")
+        self.assertEqual((resp.status, json.loads(body)["error"]["code"]), (404, "not_found"))
+
+    def test_a_chunk_body_that_stalls_is_400_and_closes(self):
+        uid = json.loads(self.send("POST", "/v1/uploads",
+                                   json_body={"file_name": "stall.bin", "size": 4})[1])["upload_id"]
+        with mock.patch.object(_Handler, "timeout", 0.5):
+            conn = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=10)
+            conn.request("PUT", f"/v1/uploads/{uid}/chunks/0", body=b"da",
+                         headers={"Authorization": f"Bearer {TOKEN}", "Content-Length": "4"})
+            resp = conn.getresponse()
+            body = resp.read()
+            conn.close()
+        self.assertEqual((resp.status, json.loads(body)["error"]["code"]), (400, "bad_request"))
+        self.assertEqual(resp.getheader("Connection"), "close")
+
     def test_complete_when_the_file_vanishes_meanwhile_is_404_not_500(self):
         # A concurrent DELETE or prune between ingest() and the material_item()
         # stat: the upload itself succeeded, so this must be a clean 404, not
@@ -534,6 +580,29 @@ class TestUploadFlow(HttpWriteBase):
         with mock.patch.object(materials, "ingest", side_effect=ingest_then_delete):
             resp, body = self.send("POST", f"/v1/uploads/{uid}/complete")
         self.assertEqual((resp.status, json.loads(body)["error"]["code"]), (404, "not_found"))
+
+
+class TestKeepAlive(HttpWriteBase):
+    def test_a_body_no_route_read_does_not_desync_the_connection(self):
+        # DELETE and complete answer without reading the request body, so a
+        # client that sends `{}` left those two bytes in the socket and the
+        # next request on the same keep-alive connection was parsed as
+        # "{}GET / ..." → 501 Unsupported method (reproduced 2026-09-21).
+        d = self.batch / "tg-staging" / "app"
+        d.mkdir(parents=True)
+        (d / "a.mp4").write_bytes(b"v")
+        conn = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=10)
+        auth = {"Authorization": f"Bearer {TOKEN}"}
+        conn.request("DELETE", "/v1/materials/app/a.mp4", body=b"{}",
+                     headers={**auth, "Content-Type": "application/json"})
+        first = conn.getresponse()
+        first.read()
+        conn.request("GET", "/v1/health", headers=auth)
+        second = conn.getresponse()
+        body = second.read()
+        conn.close()
+        self.assertEqual((first.status, second.status), (204, 200))
+        self.assertEqual(json.loads(body), {"ok": True})
 
 
 class TestMaterialRoutes(HttpWriteBase):

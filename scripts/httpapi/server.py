@@ -33,8 +33,13 @@ class ApiError(Exception):
 NOT_FOUND = ApiError(404, "not_found", "no such resource")
 
 _DOMAIN_STATUS = {"bad_request": 400, "forbidden": 403, "not_found": 404, "in_use": 409,
-                  "incomplete": 409, "too_large": 413, "unprobeable": 422, "no_space": 507}
+                  "incomplete": 409, "conflict": 409, "too_many": 409, "too_large": 413,
+                  "unprobeable": 422, "no_space": 507}
 MAX_JSON_BODY = 64 * 1024
+# A body this size or smaller is read and thrown away to keep the connection
+# usable; anything bigger is not worth reading, so the connection is closed
+# instead. Same limit as MAX_JSON_BODY: nothing this API accepts is larger.
+MAX_DRAIN_BODY = 64 * 1024
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -70,6 +75,13 @@ class _Handler(BaseHTTPRequestHandler):
         self._handle("DELETE")
 
     def _handle(self, method: str) -> None:
+        # Routes that answer without reading the body (DELETE /v1/materials/…,
+        # POST …/complete) left whatever the client sent in the socket, and the
+        # next request on the same keep-alive connection was parsed starting
+        # from those bytes: a DELETE with body `{}` followed by a GET answered
+        # 501 "Unsupported method ('{}GET')" (reproduced 2026-09-21). Every
+        # response path settles the body first — see _settle_body.
+        self._body_consumed = False
         try:
             self._authenticate()
             self._route(method)
@@ -83,11 +95,34 @@ class _Handler(BaseHTTPRequestHandler):
             self._error(500, "internal", "internal error")
 
     def _error(self, status: int, code: str, message: str) -> None:
-        # A request that carried a body may not have been read to the end; the
-        # leftover bytes would be parsed as the next request on this connection.
+        # A request that carried a body may not have been read to the end (and,
+        # for a chunk PUT, may have been read only halfway); the leftover bytes
+        # would be parsed as the next request on this connection.
         if self.command in ("POST", "PUT", "DELETE"):
             self.close_connection = True
         self._send_json(status, {"error": {"code": code, "message": message}})
+
+    def _settle_body(self) -> None:
+        """Make the connection safe to reuse before a response goes out."""
+        if self._body_consumed or self.close_connection:
+            return
+        self._body_consumed = True
+        raw = self.headers.get("Content-Length")
+        try:
+            n = int(raw) if raw else 0
+        except ValueError:
+            n = -1
+        if n <= 0:
+            self.close_connection = n < 0        # unparseable: don't guess where it ends
+            return
+        if n > MAX_DRAIN_BODY:
+            self.close_connection = True
+            return
+        # A client that promised more than it sent would block this read until
+        # the handler's own socket timeout, so assume the worst until it lands.
+        self.close_connection = True
+        self.rfile.read(n)
+        self.close_connection = False
 
     def _content_length(self) -> int:
         raw = self.headers.get("Content-Length")
@@ -105,8 +140,10 @@ class _Handler(BaseHTTPRequestHandler):
         n = self._content_length()
         if n > MAX_JSON_BODY:
             raise ApiError(413, "too_large", "JSON body too large")
+        raw = self.rfile.read(n)
+        self._body_consumed = True
         try:
-            data = json.loads(self.rfile.read(n) or b"{}")
+            data = json.loads(raw or b"{}")
         except ValueError:
             raise ApiError(400, "bad_request", "body is not valid JSON")
         if not isinstance(data, dict):
@@ -145,6 +182,7 @@ class _Handler(BaseHTTPRequestHandler):
                 if path is None:
                     raise NOT_FOUND
                 try:
+                    self._settle_body()
                     return send_file(self, path)
                 except FileNotFoundError:
                     raise NOT_FOUND
@@ -160,34 +198,25 @@ class _Handler(BaseHTTPRequestHandler):
             length = self._content_length()
             if length > uploads.CHUNK_SIZE:
                 raise ApiError(413, "too_large", "chunk larger than chunk_size")
+            # write_chunk reads exactly `length` bytes, so the body is settled
+            # either way: on success it is consumed, on failure _error closes.
+            self._body_consumed = True
             uploads.write_chunk(s.uploads_root, rest[1], n, self.rfile, length)
             return self._send_json(200, {"received": n})
         if method == "GET" and len(rest) == 2 and rest[0] == "uploads":
             return self._send_json(200, uploads.upload_status(s.uploads_root, rest[1]))
         if method == "POST" and len(rest) == 3 and rest[0] == "uploads" and rest[2] == "complete":
-            staged = uploads.assemble(s.uploads_root, rest[1], s.staging_root / materials.APP_OWNER)
-            try:
-                final, probe = materials.ingest(staged)
-            except materials.MaterialError:
-                # Unreadable material must not sit in the list looking usable.
-                # A HEIC may already have produced its PNG twin before probe failed.
-                staged.unlink(missing_ok=True)
-                if staged.suffix.lower() in (".heic", ".heif"):
-                    staged.with_suffix(".png").unlink(missing_ok=True)
-                raise
-            try:
-                item = materials.material_item(materials.APP_OWNER, final)
-            except FileNotFoundError:
-                # Vanished between ingest and here (a concurrent DELETE, a
-                # prune) — the upload itself succeeded, but there is nothing
-                # left to hand back as "the material".
-                raise NOT_FOUND
-            return self._send_json(201, {"material": item, "probe": probe})
+            # Assembly, ingest and the record of what was created all live in
+            # uploads.complete: it journals its own response (done.json), so a
+            # retry is answered from one place rather than re-derived here.
+            return self._send_json(201, uploads.complete(
+                s.uploads_root, rest[1], s.staging_root))
         if method == "GET" and rest == ["materials"]:
             return self._send_json(200, {"materials": materials.list_materials(s.staging_root)})
         if method == "GET" and len(rest) == 4 and rest[0] == "materials" and rest[3] == "thumb":
             thumb = materials.thumbnail(s.staging_root, s.thumbs_root, rest[1], rest[2])
             try:
+                self._settle_body()
                 return send_file(self, thumb)
             except FileNotFoundError:
                 raise NOT_FOUND
@@ -215,6 +244,7 @@ class _Handler(BaseHTTPRequestHandler):
         return False
 
     def _send_json(self, status: int, payload: dict) -> None:
+        self._settle_body()
         body = json.dumps(payload, ensure_ascii=False).encode()
         etag = '"' + hashlib.sha1(body).hexdigest() + '"'
         if status == 200 and self._etag_matches(etag):
@@ -235,8 +265,11 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _send_empty(self, status: int) -> None:
+        self._settle_body()
         self.send_response(status)
         self.send_header("Content-Length", "0")
+        if self.close_connection:
+            self.send_header("Connection", "close")
         self.end_headers()
 
 
