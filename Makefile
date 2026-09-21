@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: gpu-facelock batch-mcp-check batch-coverage check-comfy-nodes help setup dev down clean gpu-preflight gpu-provision gpu-wait gpu-bootstrap gpu-fe gpu-up gpu-down gpu-destroy gpu-db-dump gpu-db-check gpu-status gpu-logs batch-test batch-params check-batch-params check-vast-models batch-scan batch-validate batch batch-clean watchdog-dry drain bot-dry
+.PHONY: gpu-facelock batch-mcp-check batch-coverage check-comfy-nodes help setup dev down clean gpu-preflight gpu-provision gpu-wait gpu-bootstrap gpu-fe gpu-up gpu-down gpu-destroy gpu-db-dump gpu-db-check gpu-status gpu-logs batch-test batch-params check-batch-params check-vast-models batch-scan batch-validate batch batch-clean watchdog-dry drain bot-dry api-smoke
 
 help: ## Show this help
 	@echo "motion-clone — make targets:"
@@ -115,6 +115,9 @@ watchdog-dry: ## Report what the watchdog would destroy right now — destroys n
 
 bot-dry: ## One polling round against the local Bot API, invoking no jobs
 	@python3 scripts/tgbot/bot.py --once --dry-run
+
+api-smoke: ## Phone API through the tunnel: 403 without Access, 401 without bearer, 200 with both
+	@bash scripts/vps/api-smoke.sh
 
 drain: ## Rent a pod, run FILE, destroy it (dry run unless CONFIRM=yes; PROVIDER=vast|runpod overrides .env for this run; PHASE_A=1 stops before renting)
 	@test -n "$(FILE)" || { echo "usage: make drain FILE=batch/….yaml [CONFIRM=yes] [RESUME=1] [FORCE_LOCAL=1] [PHASE_A=1] [PROVIDER=vast|runpod]"; exit 1; }

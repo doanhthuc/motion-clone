@@ -50,6 +50,8 @@ import batch_clean
 # raises ImportError regardless of sys.path. The insert above puts scripts/ on
 # the path, which is what makes the absolute form work from either entry point.
 from tgbot.tgclient import Tg, TgError
+from httpapi.server import make_server, start_in_thread
+from control.paths import safe_child as _safe_child
 from tgbot import tiktok
 from tgbot.ingest import (Probe, describe, probe, quality_warning,
                          quality_warning_html,
@@ -364,30 +366,6 @@ def _identify(update: dict) -> tuple[int | None, int | None]:
         return ((query.get("from") or {}).get("id"),
                 (holder.get("chat") or {}).get("id"))
     return None, None
-
-
-def _safe_child(root: Path, name: str) -> Path | None:
-    """Resolve `name` as a single path component directly under `root`, or None.
-
-    The allowlist (`allowed()`) restricts WHO can message the bot, not WHAT
-    the one allowed user types or pastes — a mistyped or copy-pasted path is
-    enough to turn `/result`/`/tryon` into a probe for arbitrary files this
-    process can see. `name` is meant to be a bare filename or a bare batch
-    id, never a path, so an absolute argument, a literal ".." anywhere, or
-    any path separator at all is refused outright — three independent
-    reasons the same mistake would be caught. Then the joined path is
-    resolved (symlinks and any remaining "." collapsed) and re-checked with
-    `is_relative_to` against the resolved root, a second, independent check
-    after the first.
-    """
-    name = name.strip()
-    if not name or Path(name).is_absolute() or ".." in name or "/" in name or "\\" in name:
-        return None
-    root_resolved = root.resolve()
-    candidate = (root_resolved / name).resolve()
-    if not candidate.is_relative_to(root_resolved):
-        return None
-    return candidate
 
 
 def _safe_name(name: str) -> str:
@@ -6675,6 +6653,62 @@ BOT_COMMANDS = [
 ]
 
 
+def _api_enabled_for(args: argparse.Namespace) -> bool:
+    """Whether this invocation of main() should start the control API.
+
+    `--once` / `--dry-run` (`make bot-dry`) is a diagnostic round run on a box
+    where the real motion-bot may already be up and holding CONTROL_API_PORT.
+    Starting a second listener there doesn't just fail to bind — it fails
+    LOUD: _start_control_api's failure path sends a real "Phone API did not
+    start" Telegram message on every diagnostic run, which is noise at best
+    and alarming at worst. A one-off round has no phone client polling it
+    anyway, so skipping it costs nothing real.
+    """
+    return not (args.once or args.dry_run)
+
+
+def _start_control_api(tg: Tg, chat_id: int):
+    """Start the phone app's HTTP API in a daemon thread, or explain why not.
+
+    In this process on purpose (spec 2026-09-21 §3): the API must see the same
+    _RUNNING / _PHASE_A handles the bot does, or "is this run live" has two
+    answers. Opt-in via CONTROL_API_TOKEN so a VPS whose .env predates it keeps
+    a working bot. A failure to start never stops the bot — Telegram is still
+    the primary interface — but it is said out loud once, because the phone
+    app would otherwise just show a connection error with no reason.
+    """
+    token = env_get(ROOT / ".env", "CONTROL_API_TOKEN")
+    if not token:
+        log("control API disabled (CONTROL_API_TOKEN unset)")
+        return None
+    server = None
+    try:
+        port = int(env_get(ROOT / ".env", "CONTROL_API_PORT") or 8787)
+        server = make_server(token=token, batch_dir=ROOT / "batch", out_dir=ROOT / "out",
+                             port=port, log=log)
+        start_in_thread(server)
+    except (OSError, ValueError, RuntimeError) as exc:
+        # RuntimeError: the OS refused to create the daemon thread (e.g. a
+        # thread-count limit). This used to sit outside the try/except, so
+        # that exception escaped _start_control_api and, with systemd
+        # Restart=always, crash-looped the whole bot — the phone API failing
+        # must never take Telegram down with it (spec §4.2: "the bot keeps
+        # polling").
+        log(f"control API failed to start: {exc!r}")
+        if server is not None:
+            # start_in_thread can fail after make_server already bound the
+            # port; release it so a later retry or restart doesn't also fail
+            # with "address in use".
+            server.server_close()
+        try:
+            tg.send_message(chat_id, f"Phone API did not start: {exc}")
+        except TgError:
+            pass
+        return None
+    log(f"control API listening on 127.0.0.1:{port}")
+    return server
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--once", action="store_true")
@@ -6718,6 +6752,10 @@ def main() -> int:
                                           for c, d in BOT_COMMANDS])
     except TgError as exc:
         log(f"setMyCommands failed, continuing without the menu: {exc}")
+    if _api_enabled_for(args):
+        _start_control_api(tg, allowed_user_id)
+    else:
+        log("control API skipped (--once/--dry-run diagnostic run)")
     log(f"started, api={base}, dry_run={args.dry_run}, pipeline={_DEFAULT_PIPELINE}")
     while True:
         try:

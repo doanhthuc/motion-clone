@@ -875,3 +875,29 @@ shasum -a 256 out/<batch>/_final/job.mp4
 
 They must match. If they do not, `sendDocument` is not doing what this design claims and results are
 being re-encoded — which invalidates every quality measurement made from a delivered file.
+
+## Phone API (Cloudflare Tunnel + Access)
+
+`motion-bot` serves the phone app's API on `127.0.0.1:${CONTROL_API_PORT:-8787}` when
+`CONTROL_API_TOKEN` is set in `/opt/motion-clone/.env`
+(design: `docs/superpowers/specs/2026-09-21-vps-control-plane-api-design.md`). It never listens on
+a public interface; the tunnel is the only way in, and Access is checked at Cloudflare's edge
+before anything reaches the box.
+
+One-time setup:
+
+1. Zero Trust → Networks → Tunnels → create a tunnel (`motion-vps-api`), choose the Debian
+   connector, and run the `cloudflared service install <token>` command it prints **on the VPS**.
+   `systemctl status cloudflared` must be `active (running)`.
+2. In the tunnel, add a public hostname (e.g. `api-motion.<your domain>`) → `http://127.0.0.1:8787`
+   (the server binds IPv4 only; `cloudflared` can resolve `localhost` to `::1` and fail to connect).
+3. Zero Trust → Access → Service Auth → create a service token. Copy the Client ID and Secret —
+   the secret is shown once.
+4. Access → Applications → self-hosted app for that hostname, with one policy: action
+   **Service Auth**, include the service token from step 3.
+5. On the VPS: set `CONTROL_API_TOKEN` in `.env`, then `systemctl restart motion-bot`;
+   `journalctl -u motion-bot | grep "control API"` must show `listening on 127.0.0.1:8787`.
+6. On the Mac: put `CONTROL_API_URL`, `CF_ACCESS_CLIENT_ID`, `CF_ACCESS_CLIENT_SECRET` and the same
+   `CONTROL_API_TOKEN` in the root `.env`, then `make api-smoke` — all three lines must be `ok`.
+
+The same three secrets go into the iPhone app's Keychain. None of them is ever committed.

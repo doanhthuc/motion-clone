@@ -1,4 +1,4 @@
-import itertools, json, re, shutil, subprocess, sys, tempfile, time, unittest
+import argparse, itertools, json, re, shutil, subprocess, sys, tempfile, time, unittest
 from pathlib import Path
 from unittest import mock
 
@@ -8195,3 +8195,30 @@ class TestVastQueueGate(_FlowFixture):
         self.assertFalse(self.mailbox.exists(), "a refused job was left in the mailbox")
         self.assertTrue(any("Not queued" in m for m in self.tg.messages))
         self.assertIn(ME, bot._STATE)                                # the draft survives
+
+
+class TestApiEnabledForArgs(unittest.TestCase):
+    """_api_enabled_for gates _start_control_api out of a --once/--dry-run
+    diagnostic round.
+
+    2026-09-21 review finding: main() used to call _start_control_api
+    unconditionally, so `make bot-dry` (`bot.py --once --dry-run`) on a box
+    where the real motion-bot already holds CONTROL_API_PORT would fail to
+    bind and send a real, false "Phone API did not start" Telegram message on
+    every diagnostic run.
+    """
+
+    def enabled(self, *, once=False, dry_run=False):
+        return bot._api_enabled_for(argparse.Namespace(once=once, dry_run=dry_run))
+
+    def test_a_normal_run_is_enabled(self):
+        self.assertTrue(self.enabled())
+
+    def test_once_disables_it(self):
+        self.assertFalse(self.enabled(once=True))
+
+    def test_dry_run_disables_it(self):
+        self.assertFalse(self.enabled(dry_run=True))
+
+    def test_once_and_dry_run_disables_it(self):
+        self.assertFalse(self.enabled(once=True, dry_run=True))
