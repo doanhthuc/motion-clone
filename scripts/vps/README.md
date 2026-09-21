@@ -901,3 +901,21 @@ One-time setup:
    `CONTROL_API_TOKEN` in the root `.env`, then `make api-smoke` — all three lines must be `ok`.
 
 The same three secrets go into the iPhone app's Keychain. None of them is ever committed.
+
+Steps 1–4 can also be done through the Cloudflare API with the pod's `CF_API_TOKEN`. That is how
+it was done on 2026-09-21: the service token and the Access app were created first, then the tunnel
+`motion-vps-api`, and the DNS record last, so the hostname was behind Access from its first
+resolution. The token needs, besides Tunnel and DNS edit, **Access: Service Tokens · Edit** and
+**Access: Apps and Policies · Edit**; with read-only Access it fails with `1010 auth.forbidden`.
+Zero Trust itself must be enabled once in the dashboard; the API cannot do it.
+
+Measured 2026-09-21 on the `s-1vcpu-1gb` droplet:
+
+| | Measurement |
+|---|---|
+| `motion-bot` RSS | 38,428 KB with the API off → 39,108 KB with it on after a few loopback requests → 41,216 KB after streaming one 21 MB output through the tunnel |
+| `cloudflared` RSS | 44,108 KB, a new resident process |
+| Free RAM | 543 MB available before, 533 MB after |
+| ETag through the tunnel | Arrives weakened to `W/"…"` (the compressed JSON response); echoing it in `If-None-Match` still gets `304` |
+| `Range` | `bytes=1000-1999` → `206`, `content-length: 1000` |
+| Full stream | 21,031,695 bytes in 3.4 s to the Mac |
