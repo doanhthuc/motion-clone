@@ -32,9 +32,9 @@ VALIDATE_TIMEOUT_SEC = 90
 # error line batch_run.py prints, bounded so a runaway log stays small.
 VALIDATE_OUTPUT_MAX_CHARS = 4000
 # One validate at a time: `make batch-validate` peaks ~111 MB RSS for 0.38s
-# (measured 2026-09-21) on a 1 GB box already running Postgres-adjacent
-# processes, so a second one stacking on top of the first is a real risk, not
-# a theoretical one. Non-blocking: a second caller gets a fast "busy" instead
+# (measured 2026-09-21, mostly batch_run.py parsing linux.py with ast). The VPS
+# has 1 GB for the bot, cloudflared and a Phase A drain, and a phone retrying
+# while the box swaps would otherwise stack one of these per retry. Non-blocking: a second caller gets a fast "busy" instead
 # of queueing behind the first for up to VALIDATE_TIMEOUT_SEC.
 _VALIDATE_SLOTS = threading.BoundedSemaphore(1)
 
@@ -229,8 +229,8 @@ class DraftStore:
         except (ValueError, KeyError, TypeError, AttributeError):
             # AttributeError: a hand-edited draft can carry the right keys
             # with the wrong shape (e.g. "slots": [] instead of {}), and
-            # load_jobs's own `.items()` call raises that, not KeyError —
-            # measured 2026-09-21. Moved aside, never deleted: it is the only copy of what the
+            # load_jobs's own `.items()` call raises that, not KeyError.
+            # Moved aside, never deleted: it is the only copy of what the
             # user had composed (same rule as the bot's _load_draft). A
             # unique suffix, not a fixed ".bad", so a second corrupt file
             # never overwrites the first one moved aside.
@@ -463,7 +463,7 @@ class DraftStore:
                              timeout=VALIDATE_TIMEOUT_SEC)
                 ok, output = result.returncode == 0, (result.stdout + result.stderr).strip()
             except subprocess.TimeoutExpired:
-                ok, output = False, f"make batch-validate did not finish within {VALIDATE_TIMEOUT_SEC}s"
+                ok, output = False, f"validation did not finish within {VALIDATE_TIMEOUT_SEC}s"
             finally:
                 manifest.unlink(missing_ok=True)
             # Staged files are named by absolute path in the validator's errors.
