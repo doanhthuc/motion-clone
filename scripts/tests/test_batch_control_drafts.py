@@ -211,7 +211,7 @@ class TestPatch(StoreCase):
         # Closes the race between resolving/probing a path (outside
         # control.LOCK, since ffprobe can take up to 60s) and applying it
         # (under the lock): a delete landing in that gap must not leave the
-        # draft pointing at a file that no longer exists (fix round 1).
+        # draft pointing at a file that no longer exists.
         before = self.fill()
         orig = self.store._probe
 
@@ -275,7 +275,7 @@ class TestPatch(StoreCase):
         self.assertEqual(v["missing"], ["outfit"])
         # The current job is incomplete now (a required file vanished), so it
         # must drop out of `jobs`/`estimate_min` too — only the basket would
-        # count (fix round 1: jobs_for's own missing_slots() only checks
+        # count (jobs_for's own missing_slots() only checks
         # which roles have a dict entry, not whether the file still exists).
         self.assertEqual(v["jobs"], 0)
 

@@ -213,7 +213,7 @@ class DraftStore:
             # Moved aside, never deleted: it is the only copy of what the
             # user had composed (same rule as the bot's _load_draft). A
             # unique suffix, not a fixed ".bad", so a second corrupt file
-            # never overwrites the first one moved aside (fix round 1).
+            # never overwrites the first one moved aside.
             self.path.replace(self.path.with_name(f"{self.path.name}.{uuid.uuid4().hex}.bad"))
             return self._fresh()
 
@@ -250,11 +250,11 @@ class DraftStore:
 
         `jobs_for`'s own completeness check (`missing_slots`) only looks at
         which roles have a dict entry, not whether that entry's file still
-        exists on disk — so a vanished file (fix round 1: `_missing` counts
+        exists on disk — so a vanished file (`_missing` counts
         that as missing, `missing_slots` does not) left the current job
         counted as one of `jobs` while `missing` also listed it. Passing
         `None` here instead of the incomplete job is what `validate()`
-        (Task 3) needs too, hence the shared helper.
+        needs too, hence the shared helper.
         """
         current = d.job if not self._missing(d.job) else None
         return jobs_for(current, d.basket)
@@ -337,7 +337,7 @@ class DraftStore:
                 raise DraftError("not_applicable", f"{target} has no try-on stage to pick a provider for")
             # Re-checked under the lock, right before applying: ffprobe (above)
             # ran outside the lock, so a delete could land in the gap between
-            # resolving/probing a path and getting here (fix round 1).
+            # resolving/probing a path and getting here.
             for role, (path, probed) in filled.items():
                 if not path.is_file():
                     raise DraftError("not_found", f"no such material: {path.name}")

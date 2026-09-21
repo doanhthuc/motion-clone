@@ -263,7 +263,7 @@ def _in_use(batch_dir: Path, path: Path) -> str | None:
 
     Returns the reason (for the error message), or None when the file is
     free — not a bare bool, so the caller can tell a busy manifest apart from
-    the app's draft instead of printing one message for both (fix round 1).
+    the app's draft instead of printing one message for both.
     """
     pattern = re.compile(re.escape(str(path)) + r"(?=$|[\s'\",}\]])")
     for manifest in batch_dir.glob("*.yaml"):
