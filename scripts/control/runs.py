@@ -114,6 +114,11 @@ OUTCOME_STATUS = {
     "not_found": 404,
     "nothing_to_run": 422, "not_validated": 422, "invalid": 422, "manifest_error": 422,
     "bot_busy": 503,
+    # Slice 5: a refusal the caller can fix (a bad field) versus one nothing
+    # on this box can fix (runpodctl/vastai unreachable). Both would otherwise
+    # fall into the catch-all 409, which tells a phone client to retry the
+    # same body forever.
+    "upstream_unavailable": 502, "bad_request": 400,
 }
 
 

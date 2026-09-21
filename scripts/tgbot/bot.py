@@ -5138,7 +5138,7 @@ def _signal_drain_group(proc, sig: int) -> None:
         (proc.terminate if sig == signal.SIGTERM else proc.kill)()
 
 
-def _do_kill(tg: Tg, chat_id: int) -> None:
+def _do_kill(tg: Tg, chat_id: int) -> Outcome:
     """The emergency stop (2026-09-02): destroy the pod right now, on request.
 
     Two layers, because neither alone is trustworthy. Signalling the Popen's process group
@@ -5165,6 +5165,17 @@ def _do_kill(tg: Tg, chat_id: int) -> None:
     don't-trust-the-ask idiom _run_token encodes. That matters more here than
     usual: a phase can finish, or a drain can start, in the seconds a confirm
     button sits unanswered.
+
+    Returns an Outcome for the phone (slice 5, spec §5.9), but unlike
+    _do_confirm it keeps plain `tg.send_message` throughout: none of these
+    messages is a refusal, so none of them is what _AppTg/_refuse suppresses.
+    A destroy that could not be verified means a pod that may still be
+    billing, and that has to reach the Telegram chat whoever asked for it.
+
+    What this function does NOT have is an idle check: called with nothing
+    running it goes straight to the destroy branch and tears down whatever pod
+    .env happens to name. _ask_kill carries that check for Telegram; AppPod's
+    kill worker repeats it under BOT_LOCK for the phone.
     """
     manifest_path = _job_manifest_path(chat_id)
     if phase_a_running(manifest_path) and not drain_running(manifest_path):
@@ -5178,7 +5189,9 @@ def _do_kill(tg: Tg, chat_id: int) -> None:
             "🛑 Stopped the try-on phase. Nothing was rented, and Gemini calls "
             "already made are not refunded." if stopped else
             "the try-on phase had already finished — nothing to stop.")
-        return
+        return (Outcome(True, "phase_a_stopped", "stopped the try-on phase") if stopped
+                else Outcome(False, "phase_a_finished",
+                             "the try-on phase had already finished — nothing to stop"))
 
     proc = _RUNNING.get(manifest_path.resolve())
     if proc is not None and proc.poll() is None:
@@ -5214,11 +5227,18 @@ def _do_kill(tg: Tg, chat_id: int) -> None:
 
     if destroyed:
         tg.send_message(chat_id, "🛑 Killed. Pod destroyed and verified gone.")
-    else:
-        tg.send_message(chat_id,
-                        f"{ICON_WARN} <b>gpu-destroy may not have worked</b> — check "
-                        f"manually, it may still be billing.{detail}",
-                        parse_mode=PARSE_HTML)
+        return Outcome(True, "killed", "pod destroyed and verified gone")
+    tg.send_message(chat_id,
+                    f"{ICON_WARN} <b>gpu-destroy may not have worked</b> — check "
+                    f"manually, it may still be billing.{detail}",
+                    parse_mode=PARSE_HTML)
+    # The message carries the command's own tail; the Outcome deliberately
+    # does not. It ends up in GET /v1/pod's last_kill, which is polled, and
+    # an expandable blockquote of make output is not something a phone can
+    # show — the actionable half ("check it by hand") is.
+    return Outcome(False, "destroy_unverified",
+                   "gpu-destroy may not have worked — check the pod by hand, "
+                   "it may still be billing")
 
 
 def _ask_migrate(tg: Tg, chat_id: int, to_dc: str) -> None:
@@ -5245,17 +5265,22 @@ def _ask_migrate(tg: Tg, chat_id: int, to_dc: str) -> None:
                   ("Cancel", _CB_MIGRATE_NO)]])
 
 
-def _start_migration(tg: Tg, chat_id: int, to_dc: str) -> None:
+def _start_migration(tg: Tg, chat_id: int, to_dc: str) -> Outcome:
     """Launch scripts/volume_migrate.py, once.
 
     The marker is written BEFORE Popen and synchronously, not after: the whole
     point is to close the window between deciding to launch and
     volume_migrate.py writing its own lease minutes later. See
     _migrate_launch_marker for what a second migration in that window costs.
+
+    Both failures are refusals (slice 5, spec §5.9), so they go through
+    _refuse: a phone that asked for this gets the answer, and the Telegram
+    chat is not told about a request its user never made. The success message
+    stays a plain send — progress is reported in the chat, which owns it.
     """
     if migration_running():
-        tg.send_message(chat_id, "a volume migration is already in progress")
-        return
+        return _refuse(tg, chat_id, "migration",
+                       "a volume migration is already in progress")
 
     marker = _migrate_launch_marker()
     marker.parent.mkdir(parents=True, exist_ok=True)
@@ -5277,14 +5302,15 @@ def _start_migration(tg: Tg, chat_id: int, to_dc: str) -> None:
         # _MIGRATE_LAUNCH_GRACE_SEC for a migration that never started.
         marker.unlink(missing_ok=True)
         log(f"could not start volume_migrate.py: {exc!r}")
-        tg.send_message(chat_id, "could not start the migration — check the box. "
-                                 "Nothing was created.")
-        return
+        return _refuse(tg, chat_id, "launch_failed",
+                       "could not start the migration — check the box. "
+                       "Nothing was created.")
     _MIGRATE_PROC[_MIGRATE_PROC_KEY] = proc
 
     tg.send_message(chat_id, f"{ICON_DEPART_CE} Migration to {_esc(to_dc)} started — this will take "
                              f"{MIGRATE_DURATION_PLAIN}. I will report progress here.",
                     parse_mode=PARSE_HTML)
+    return Outcome(True, "started")
 
 
 def _again(tg: Tg, chat_id: int) -> None:
@@ -6585,6 +6611,27 @@ def _run_error(code: str, message: str) -> dict:
     return {"error": {"code": code, "message": message}}
 
 
+@contextlib.contextmanager
+def _bot_locked():
+    """`with _bot_locked() as busy:` — `busy` is `None` once `BOT_LOCK` is
+    held, or the ready-made 503 body when the wait timed out. The caller's own
+    job is to `idem.forget` in the timeout case (this helper does not know the
+    scope/key) and return the 503 as-is, unrecorded.
+
+    Module level rather than a method, because `AppRuns` and `AppPod` must
+    take the SAME lock object with the same timeout: two copies of this body
+    would be one rewording away from two different discipines on the one lock
+    that keeps a paid drain from interleaving with the bot's own loop.
+    """
+    if BOT_LOCK.acquire(timeout=BOT_LOCK_TIMEOUT_SEC):
+        try:
+            yield None
+        finally:
+            BOT_LOCK.release()
+    else:
+        yield (503, _run_error("bot_busy", "the bot is busy — try again in a moment"))
+
+
 def _rent_panel_data(chat_id: int, *, force: bool, manifest: Manifest | None) -> dict:
     """The `runpod`/`vast` numbers for the phone's rent panel — the same
     primitives `_offer_run_confirm` and `_offer_vast_panel` read, called
@@ -6672,19 +6719,11 @@ class AppRuns:
         _, _, generation = self.drafts.runnable()
         return f"{_run_token(self.chat_id)}.{generation}"
 
-    @contextlib.contextmanager
     def _locked(self):
-        """`with self._locked() as busy:` — `busy` is `None` once `BOT_LOCK`
-        is held, or the ready-made 503 body when the wait timed out. The
-        caller's own job is to `idem.forget` in the timeout case (this method
-        does not know the scope/key) and return the 503 as-is, unrecorded."""
-        if BOT_LOCK.acquire(timeout=BOT_LOCK_TIMEOUT_SEC):
-            try:
-                yield None
-            finally:
-                BOT_LOCK.release()
-        else:
-            yield (503, _run_error("bot_busy", "the bot is busy — try again in a moment"))
+        """`with self._locked() as busy:` — the module-level `_bot_locked()`,
+        kept under its old name so every call site in this class reads as it
+        did. `AppPod` uses the same helper directly."""
+        return _bot_locked()
 
     def _draft_jobs(self) -> tuple[list[Job] | None, Outcome | None]:
         """What Phase A and confirm's fresh-spend branch both need from the
@@ -6897,6 +6936,140 @@ class AppRuns:
             else:
                 response = (status_for(out), _run_error(out.code, out.message))
         self.idem.finish("regen", key, *response)
+        return response
+
+
+class AppPod:
+    """The pod-side calls the phone can make (spec §5.9): stop what is
+    running, and retry a rental that already failed once.
+
+    Same discipline as `AppRuns` — `BOT_LOCK` around every read or change of
+    bot state, an `IdempotencyStore` record written `pending` before anything
+    acts — and the same `_AppTg` wrapper, so a refusal answers the phone
+    while a real outcome still posts to the Telegram chat that owns the slot.
+    """
+
+    def __init__(self, tg: Tg, chat_id: int, idem: IdempotencyStore):
+        self.tg, self.chat_id, self.idem = tg, chat_id, idem
+        # The kill's answer, for GET /v1/pod to poll: the request itself only
+        # ever gets a 202 (see kill()).
+        self.last_kill: dict | None = None
+        self._kill_thread: threading.Thread | None = None
+
+    @property
+    def run_id(self) -> str:
+        return _job_manifest_path(self.chat_id).stem
+
+    def _something_live(self) -> bool:
+        """`_ask_kill`'s predicate, repeated for the app — the idle check
+        `_do_kill` itself does not have. Without it a kill with nothing
+        running destroys whatever pod .env happens to name.
+
+        Both halves resolve through `run_mod`, not the names imported at the
+        top of this file, for `_busy_reason`'s reason: that is how `busy()`
+        resolves them, so the two can never disagree about the same manifest.
+        """
+        manifest_path = _job_manifest_path(self.chat_id)
+        return (run_mod.drain_running(manifest_path)
+                or run_mod.phase_a_running(manifest_path))
+
+    def _kill_worker(self) -> None:
+        """`_do_kill` on its own thread, under `BOT_LOCK`.
+
+        A thread because `_do_kill` waits up to 30s for the drain to die and
+        up to 180s for `make gpu-destroy`, and Cloudflare closes a request at
+        ~100s — the phone would see a dead connection and have no idea
+        whether the pod was destroyed. The lock is held for the whole run,
+        exactly as the bot's own loop was blocked by it before; no timeout,
+        because this is not a client that can be told to retry.
+
+        The live check is repeated HERE, not only in `kill()`: a drain can
+        finish in the seconds between the request and this thread getting the
+        lock, and `_do_kill` would then destroy an unrelated pod.
+        """
+        try:
+            with BOT_LOCK:
+                if not self._something_live():
+                    self.last_kill = {
+                        "at": time.time(), "ok": False, "code": "nothing_running",
+                        "message": "nothing was running any more by the time the "
+                                   "kill got the lock — nothing was destroyed"}
+                    return
+                out = _do_kill(_AppTg(self.tg), self.chat_id)
+                self.last_kill = {"at": time.time(), "ok": bool(out.ok),
+                                  "code": out.code, "message": _plain(out.message)}
+        except Exception as exc:   # noqa: BLE001 - see below
+            # A worker thread's exception has nowhere to go: unrecorded, the
+            # phone polls last_kill forever and reads the previous kill's
+            # answer, or None, for a kill that actually crashed mid-destroy.
+            self.last_kill = {"at": time.time(), "ok": False, "code": "error",
+                              "message": _plain(f"the kill failed: {exc}")}
+            log(f"kill worker for chat {self.chat_id} failed: {exc!r}")
+
+    def kill(self, run_id: str, key) -> tuple[int, dict]:
+        if run_id != self.run_id:
+            return 404, _run_error("not_found", "no such run")
+        replay = self.idem.begin("kill", key)
+        if replay is not None:
+            return replay
+        with _bot_locked() as busy_response:
+            if busy_response is not None:
+                self.idem.forget("kill", key)
+                return busy_response
+            if self._kill_thread is not None and self._kill_thread.is_alive():
+                response = (409, _run_error("kill_in_progress",
+                                            "a kill is already running"))
+            elif not self._something_live():
+                response = (409, _run_error(
+                    "nothing_running",
+                    "nothing is running — there is no pod to kill"))
+            else:
+                self._kill_thread = threading.Thread(target=self._kill_worker,
+                                                     daemon=True)
+                self._kill_thread.start()
+                response = (202, {"run_id": self.run_id, "outcome": "kill_started"})
+        self.idem.finish("kill", key, *response)
+        return response
+
+    def resume(self, run_id: str, body: dict, key) -> tuple[int, dict]:
+        """Retry a rental that already failed — `_do_resume`, the same body
+        the recovery buttons reach.
+
+        Two gates the Telegram buttons get for free from being drawn only
+        under a failure card: an outstanding `provision-failed.json` (without
+        it, "resume" on a finished batch rents a pod to do nothing) and the
+        run's current token (the manifest must not have changed since the
+        phone read it). The app's draft is deliberately left alone — a resume
+        is about a manifest that was confirmed long ago.
+        """
+        if run_id != self.run_id:
+            return 404, _run_error("not_found", "no such run")
+        provider = body.get("provider")
+        if provider not in ("runpod", "vast"):
+            return 400, _run_error("bad_request",
+                                   'provider must be "runpod" or "vast"')
+        if not body.get("run_token"):
+            return 400, _run_error("bad_request", "run_token is required")
+        replay = self.idem.begin("resume", key)
+        if replay is not None:
+            return replay
+        manifest_path = _job_manifest_path(self.chat_id)
+        with _bot_locked() as busy_response:
+            if busy_response is not None:
+                self.idem.forget("resume", key)
+                return busy_response
+            if body.get("run_token") != _run_token(self.chat_id):
+                out = Outcome(False, "stale_run",
+                              "the run changed since it was read — read it again")
+            elif read_provision_failure(provision_failure_path(manifest_path)) is None:
+                out = Outcome(False, "no_failure",
+                              "no failed rental to retry for this run")
+            else:
+                out = _do_resume(_AppTg(self.tg), self.chat_id, manifest_path,
+                                 dry_run=False, gpu_provider=provider)
+            response = ((202, {"run_id": self.run_id, "outcome": out.code}) if out
+                        else (status_for(out), _run_error(out.code, out.message)))
+        self.idem.finish("resume", key, *response)
         return response
 
 
