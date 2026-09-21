@@ -1,13 +1,18 @@
+import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from control import materials
+import tgbot.run as run_mod
 
 
 class TestNaming(unittest.TestCase):
@@ -70,6 +75,102 @@ class TestPrune(unittest.TestCase):
         os.utime(old, (now - 8 * 86400, now - 8 * 86400))
         self.assertEqual(materials.prune_staged(root, 7, now), [old])
         self.assertTrue(new.exists())
+
+
+def make_png(path: Path) -> Path:
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=red:s=640x480",
+                    "-frames:v", "1", str(path)], check=True)
+    return path
+
+
+class MaterialsBase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.staging = self.tmp / "tg-staging"
+        self.batch = self.tmp
+        (self.staging / "app").mkdir(parents=True)
+        (self.staging / "12345").mkdir()
+        self.a = self.staging / "app" / "a.mp4"; self.a.write_bytes(b"v" * 10)
+        self.b = self.staging / "12345" / "b.png"; self.b.write_bytes(b"i")
+        os.utime(self.a, (1000, 1000)); os.utime(self.b, (2000, 2000))
+        p = mock.patch.object(run_mod, "busy", return_value=False)
+        p.start(); self.addCleanup(p.stop)
+
+
+class TestList(MaterialsBase):
+    def test_global_newest_first_with_kind(self):
+        got = materials.list_materials(self.staging)
+        self.assertEqual([m["id"] for m in got], ["12345/b.png", "app/a.mp4"])
+        self.assertEqual(got[1]["kind"], "video")
+        self.assertEqual(got[1]["bytes"], 10)
+        self.assertNotIn(str(self.tmp), json.dumps(got))
+
+    def test_symlinks_are_not_material(self):
+        os.symlink(self.a, self.staging / "app" / "link.mp4")
+        self.assertNotIn("app/link.mp4", [m["id"] for m in materials.list_materials(self.staging)])
+
+    def test_resolve_refuses_traversal(self):
+        self.assertEqual(materials.resolve_material(self.staging, "app", "a.mp4"), self.a.resolve())
+        for owner, name in (("..", "a.mp4"), ("app", "../12345/b.png"), ("app", "nope.mp4")):
+            self.assertIsNone(materials.resolve_material(self.staging, owner, name))
+
+
+class TestDelete(MaterialsBase):
+    def test_deletes_app_material(self):
+        materials.delete_material(self.staging, self.batch, "app", "a.mp4")
+        self.assertFalse(self.a.exists())
+
+    def test_telegram_material_is_forbidden(self):
+        with self.assertRaises(materials.MaterialError) as cm:
+            materials.delete_material(self.staging, self.batch, "12345", "b.png")
+        self.assertEqual(cm.exception.code, "forbidden")
+
+    def test_unknown_is_not_found(self):
+        with self.assertRaises(materials.MaterialError) as cm:
+            materials.delete_material(self.staging, self.batch, "app", "nope.mp4")
+        self.assertEqual(cm.exception.code, "not_found")
+
+    def test_in_use_by_a_busy_manifest(self):
+        (self.batch / "r.yaml").write_text(f"runs:\n  - inputs: {{driver: {self.a.resolve()}}}\n")
+        with mock.patch.object(run_mod, "busy", return_value=True):
+            with self.assertRaises(materials.MaterialError) as cm:
+                materials.delete_material(self.staging, self.batch, "app", "a.mp4")
+        self.assertEqual(cm.exception.code, "in_use")
+        self.assertTrue(self.a.exists())
+
+    def test_a_finished_manifest_does_not_block(self):
+        (self.batch / "r.yaml").write_text(f"runs:\n  - inputs: {{driver: {self.a.resolve()}}}\n")
+        materials.delete_material(self.staging, self.batch, "app", "a.mp4")
+        self.assertFalse(self.a.exists())
+
+
+@unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg required")
+class TestThumbAndIngest(MaterialsBase):
+    def test_thumbnail_is_cached_and_320_wide(self):
+        make_png(self.staging / "app" / "p.png")
+        thumbs = self.tmp / "thumbs"
+        t1 = materials.thumbnail(self.staging, thumbs, "app", "p.png")
+        self.assertEqual(t1, thumbs / "app" / "p.png.jpg")
+        mtime = t1.stat().st_mtime
+        t2 = materials.thumbnail(self.staging, thumbs, "app", "p.png")
+        self.assertEqual(t2.stat().st_mtime, mtime)          # cached, not regenerated
+        from tgbot import ingest
+        self.assertEqual(ingest.probe(t1).width, 320)
+
+    def test_thumbnail_of_garbage_is_unprobeable(self):
+        with self.assertRaises(materials.MaterialError) as cm:
+            materials.thumbnail(self.staging, self.tmp / "thumbs", "app", "a.mp4")
+        self.assertEqual(cm.exception.code, "unprobeable")
+
+    def test_ingest_probes_an_image(self):
+        path, info = materials.ingest(make_png(self.staging / "app" / "q.png"))
+        self.assertEqual((info["kind"], info["width"], info["height"]), ("image", 640, 480))
+        self.assertEqual(info["warning"], "")
+
+    def test_ingest_of_garbage_is_unprobeable(self):
+        with self.assertRaises(materials.MaterialError) as cm:
+            materials.ingest(self.a)
+        self.assertEqual(cm.exception.code, "unprobeable")
 
 
 if __name__ == "__main__":

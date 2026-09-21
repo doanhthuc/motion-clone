@@ -9,9 +9,14 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import subprocess
 import threading
 import unicodedata
 from pathlib import Path
+
+from control.paths import safe_child
+import tgbot.run as run_mod
+from tgbot import ingest as ingest_mod
 
 # Filenames are re-spelled into this alphabet before they are written or put
 # into a manifest. job.py's render_manifest emits `      <slot>: <path>` as a
@@ -170,3 +175,112 @@ def prune_staged(staging_root: Path, max_age_days: int, now: float) -> list[Path
                 path.unlink()
                 removed.append(path)
     return removed
+
+
+APP_OWNER = "app"
+IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".heic", ".heif", ".bmp"})
+VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".m4v", ".webm", ".mkv"})
+THUMB_WIDTH = 320
+
+
+class MaterialError(Exception):
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code, self.message = code, message
+
+
+def _kind(path: Path) -> str:
+    suffix = path.suffix.lower()
+    return "image" if suffix in IMAGE_SUFFIXES else "video" if suffix in VIDEO_SUFFIXES else "other"
+
+
+def list_materials(staging_root: Path) -> list[dict]:
+    found = []
+    for owner_dir in staging_root.iterdir() if staging_root.is_dir() else []:
+        if owner_dir.is_symlink() or not owner_dir.is_dir():
+            continue
+        for path in owner_dir.iterdir():
+            if path.is_symlink() or not path.is_file():
+                continue
+            try:
+                st = path.stat()
+            except FileNotFoundError:        # pruned or deleted mid-listing
+                continue
+            found.append({"id": f"{owner_dir.name}/{path.name}", "owner": owner_dir.name,
+                          "name": path.name, "bytes": st.st_size, "updated_at": st.st_mtime,
+                          "kind": _kind(path)})
+    return sorted(found, key=lambda m: m["updated_at"], reverse=True)
+
+
+def resolve_material(staging_root: Path, owner: str, name: str) -> Path | None:
+    owner_dir = safe_child(staging_root, owner)
+    if owner_dir is None or (staging_root / owner.strip()).is_symlink() or not owner_dir.is_dir():
+        return None
+    path = safe_child(owner_dir, name)
+    if path is None or (owner_dir / name.strip()).is_symlink() or not path.is_file():
+        return None
+    return path
+
+
+def _in_use(batch_dir: Path, path: Path) -> bool:
+    """A busy run's manifest names this file. Only busy runs block: a finished
+    manifest keeps naming its inputs forever, and would make nothing deletable."""
+    needle = str(path)
+    for manifest in batch_dir.glob("*.yaml"):
+        try:
+            if needle in manifest.read_text(encoding="utf-8", errors="replace") \
+                    and run_mod.busy(manifest):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def delete_material(staging_root: Path, batch_dir: Path, owner: str, name: str) -> None:
+    path = resolve_material(staging_root, owner, name)
+    if path is None:
+        raise MaterialError("not_found", "no such material")
+    if owner != APP_OWNER:
+        # Telegram's /clear and /wipe own the chat directories; deleting a file
+        # a Telegram draft points at would break that draft with no message.
+        raise MaterialError("forbidden", "only material uploaded from the app can be deleted here")
+    if _in_use(batch_dir, path):
+        raise MaterialError("in_use", "a running batch uses this file")
+    path.unlink(missing_ok=True)
+
+
+def thumbnail(staging_root: Path, thumbs_root: Path, owner: str, name: str) -> Path:
+    src = resolve_material(staging_root, owner, name)
+    if src is None:
+        raise MaterialError("not_found", "no such material")
+    dest = thumbs_root / owner / f"{name}.jpg"
+    if dest.is_file() and dest.stat().st_mtime >= src.stat().st_mtime:
+        return dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(".tmp.jpg")
+    # -ss before -i seeks cheaply; 0.5 s skips the black first frame many phone
+    # videos start with. For a still image ffmpeg ignores the seek.
+    seek = ["-ss", "0.5"] if _kind(src) == "video" else []
+    cmd = ["ffmpeg", "-v", "error", "-y", *seek, "-i", str(src), "-frames:v", "1",
+           "-vf", f"scale={THUMB_WIDTH}:-2", str(tmp)]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        raise MaterialError("unprobeable", f"no preview for {name}: {exc}") from exc
+    if out.returncode != 0 or not tmp.is_file() or tmp.stat().st_size == 0:
+        tmp.unlink(missing_ok=True)
+        raise MaterialError("unprobeable", f"no preview for {name}")
+    os.replace(tmp, dest)
+    return dest
+
+
+def ingest(path: Path) -> tuple[Path, dict]:
+    """HEIC→PNG, then measure — the same arrival gate the bot applies (ingest.py)."""
+    try:
+        path = ingest_mod.to_png_if_heic(path)
+        p = ingest_mod.probe(path)
+    except RuntimeError as exc:
+        raise MaterialError("unprobeable", str(exc)) from exc
+    return path, {"kind": p.kind, "width": p.width, "height": p.height,
+                  "duration_s": p.duration_s, "bitrate_kbps": p.bitrate_kbps,
+                  "size_bytes": p.size_bytes, "warning": ingest_mod.quality_warning(p)}
