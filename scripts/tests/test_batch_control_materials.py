@@ -207,5 +207,17 @@ class TestThumbAndIngest(MaterialsBase):
         self.assertEqual(cm.exception.code, "unprobeable")
 
 
+class TestPruneThumbs(unittest.TestCase):
+    def test_removes_thumbs_whose_source_is_gone(self):
+        tmp = Path(tempfile.mkdtemp())
+        staging, thumbs = tmp / "tg-staging", tmp / "thumbs"
+        (staging / "app").mkdir(parents=True); (thumbs / "app").mkdir(parents=True)
+        (staging / "app" / "keep.png").write_bytes(b"k")
+        keep, gone = thumbs / "app" / "keep.png.jpg", thumbs / "app" / "gone.png.jpg"
+        keep.write_bytes(b"j"); gone.write_bytes(b"j")
+        self.assertEqual(materials.prune_thumbs(thumbs, staging), [gone])
+        self.assertTrue(keep.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

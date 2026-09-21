@@ -301,3 +301,16 @@ def ingest(path: Path) -> tuple[Path, dict]:
     return path, {"kind": p.kind, "width": p.width, "height": p.height,
                   "duration_s": p.duration_s, "bitrate_kbps": p.bitrate_kbps,
                   "size_bytes": p.size_bytes, "warning": ingest_mod.quality_warning(p)}
+
+
+def prune_thumbs(thumbs_root: Path, staging_root: Path) -> list[Path]:
+    """Thumbnails whose material is gone (pruned, deleted, /clear'd)."""
+    removed = []
+    for owner_dir in thumbs_root.iterdir() if thumbs_root.is_dir() else []:
+        if not owner_dir.is_dir():
+            continue
+        for thumb in owner_dir.glob("*.jpg"):
+            if not (staging_root / owner_dir.name / thumb.name[: -len(".jpg")]).exists():
+                thumb.unlink(missing_ok=True)
+                removed.append(thumb)
+    return removed

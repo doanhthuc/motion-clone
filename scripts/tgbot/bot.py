@@ -50,7 +50,7 @@ import batch_clean
 # the path, which is what makes the absolute form work from either entry point.
 from tgbot.tgclient import Tg, TgError
 from httpapi.server import make_server, start_in_thread
-from control import materials
+from control import materials, uploads
 from control.materials import fold_diacritics as _fold_diacritics, safe_name as _safe_name
 from control.paths import safe_child as _safe_child
 from tgbot import tiktok
@@ -225,6 +225,10 @@ STAGING_DIR_NAME = "tg-staging"
 # normal "send material, confirm, run" session with margin.
 STAGING_MAX_AGE_DAYS = 7
 
+# An abandoned upload holds up to 2 GiB on a 25 GB disk, and a phone resuming
+# within a day is the realistic case.
+UPLOAD_MAX_AGE_SEC = 24 * 3600
+
 # Message kinds with no accept path at all: no width/height/bitrate ffprobe
 # can read from a sticker or a voice note, so there is nothing to warn about,
 # only refuse.
@@ -378,6 +382,12 @@ def _tick_staging_prune() -> None:
     if removed:
         log(f"pruned {len(removed)} staged file(s) older than "
             f"{STAGING_MAX_AGE_DAYS}d: {', '.join(p.name for p in removed)}")
+    dropped = uploads.prune_uploads(ROOT / "batch" / "uploads", UPLOAD_MAX_AGE_SEC, now)
+    if dropped:
+        log(f"pruned {len(dropped)} abandoned upload(s) older than 24h")
+    thumbs = materials.prune_thumbs(ROOT / "batch" / "thumbs", ROOT / "batch" / STAGING_DIR_NAME)
+    if thumbs:
+        log(f"pruned {len(thumbs)} orphaned thumbnail(s)")
 
 
 # out/ is the one directory on the VPS that grows without bound (measured
