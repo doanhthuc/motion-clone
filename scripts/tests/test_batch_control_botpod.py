@@ -876,6 +876,283 @@ class TestSetGpu(_PodFixture):
         self.assertEqual(self.env.read_text(encoding="utf-8"), self.ENV)
 
 
+class TestMigrate(_PodFixture):
+    """The two-step migration as the phone reaches it (spec §5.9).
+
+    The real `volume_migrate.py` DELETES the source Network Volume, so this
+    class patches both `_start_migration` and `subprocess.Popen`: the Popen
+    stub raises if anything ever reaches it, and every refusal test asserts
+    neither was called. A refusal proved against an unpatched launcher would
+    be worth nothing.
+    """
+
+    ENV = "POD_VOLUME_ID=vol-1\n"
+
+    def setUp(self):
+        super().setUp()
+        self.env = self.root / ".env"
+        self.env.write_text(self.ENV, encoding="utf-8")
+        # EU-CZ-1 (Low) and EUR-IS-1 / EU-NL-1 are offered; US-KS-2 is listed
+        # with stock "none"; EU-RO-1 is home.
+        self.patches["stock_at_cached"].return_value = _fake_stock()
+        patcher = mock.patch("tgbot.bot._start_migration",
+                             return_value=Outcome(True, "started"))
+        self.start = patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = mock.patch(
+            "tgbot.bot.subprocess.Popen",
+            side_effect=AssertionError("volume_migrate.py must never be launched"))
+        self.popen = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _ask(self, to_dc="EU-CZ-1"):
+        return self.pod.migrate_ask({"to_dc": to_dc})
+
+    def _token(self, to_dc="EU-CZ-1") -> str:
+        status, body = self._ask(to_dc)
+        self.assertEqual(status, 200)
+        return body["confirm_token"]
+
+    def _nothing_started(self):
+        self.start.assert_not_called()
+        self.popen.assert_not_called()
+
+    def _live_lease(self):
+        self.patches["read_lease"].return_value = Lease(
+            pod_id="p1", provisioned_at=1.0, manifest=str(self._live()),
+            abs_max_min=120, provider="runpod")
+
+    # ---- ask ----------------------------------------------------------
+
+    def test_ask_bad_to_dc_is_400_and_stores_nothing(self):
+        for bad in ({}, {"to_dc": None}, {"to_dc": ""}, {"to_dc": 5},
+                    {"to_dc": ["EU-CZ-1"]}, "not-a-dict"):
+            status, body = self.pod.migrate_ask(bad)
+            self.assertEqual((status, body["error"]["code"]), (400, "bad_request"), bad)
+            self.assertIsNone(self.pod._migrate_ask)
+        self._nothing_started()
+
+    def test_ask_refuses_while_a_migration_is_running(self):
+        self.patches["migration_running"].return_value = True
+        status, body = self._ask()
+        self.assertEqual((status, body["error"]["code"]), (409, "migration"))
+        self.assertIsNone(self.pod._migrate_ask)
+        self._nothing_started()
+
+    def test_ask_refuses_while_a_lease_is_live(self):
+        # Telegram lets a migration start under a live drain; the phone must
+        # not — the volume being copied is the one the pod is reading.
+        self._live_lease()
+        status, body = self._ask()
+        self.assertEqual((status, body["error"]["code"]), (409, "run_active"))
+        self.assertIsNone(self.pod._migrate_ask)
+        self._nothing_started()
+
+    def test_ask_refuses_while_the_chats_run_is_busy(self):
+        self.patches["busy"].return_value = True
+        status, body = self._ask()
+        self.assertEqual((status, body["error"]["code"]), (409, "run_active"))
+        self.assertIsNone(self.pod._migrate_ask)
+        self._nothing_started()
+
+    def test_ask_refuses_the_home_datacenter(self):
+        status, body = self._ask("EU-RO-1")
+        self.assertEqual((status, body["error"]["code"]), (409, "same_datacenter"))
+        self.assertIsNone(self.pod._migrate_ask)
+        self._nothing_started()
+
+    def test_ask_refuses_a_datacenter_the_stock_check_does_not_list(self):
+        for to_dc in ("XX-YY-1", "US-KS-2"):   # unknown, and listed as "none"
+            status, body = self._ask(to_dc)
+            self.assertEqual((status, body["error"]["code"]),
+                             (409, "unknown_datacenter"), to_dc)
+            self.assertIsNone(self.pod._migrate_ask)
+        self._nothing_started()
+
+    def test_ask_fails_closed_when_the_stock_check_is_down(self):
+        # Fail CLOSED: with no stock answer there is no evidence the
+        # destination exists, and this is the one operation that deletes data.
+        self.patches["stock_at_cached"].side_effect = RuntimeError("runpodctl down")
+        status, body = self._ask()
+        self.assertEqual((status, body["error"]["code"]), (502, "upstream_unavailable"))
+        self.assertIn("runpodctl down", body["error"]["message"])
+        self.assertIsNone(self.pod._migrate_ask)
+        self._nothing_started()
+
+    def test_ask_refuses_when_the_home_datacenter_is_unknown(self):
+        self.patches["volume_datacenter"].return_value = None
+        status, body = self._ask()
+        self.assertEqual((status, body["error"]["code"]), (409, "home_unknown"))
+        self.assertIsNone(self.pod._migrate_ask)
+        self._nothing_started()
+
+    def test_ask_returns_a_token_and_the_warning_without_html_or_paths(self):
+        status, body = self._ask()
+        self.assertEqual(status, 200)
+        self.assertEqual(body["to_dc"], "EU-CZ-1")
+        self.assertEqual(body["home_datacenter"], "EU-RO-1")
+        self.assertEqual(body["expires_in_sec"], 600)
+        self.assertTrue(body["confirm_token"])
+        warning = body["warning"]
+        self.assertIn("deletes the current volume", warning)
+        self.assertIn("Cannot be undone", warning)
+        self.assertIn("EU-CZ-1", warning)
+        self.assertIn(bot.MIGRATE_DURATION_PLAIN, warning)
+        self.assertNotIn("<", warning)
+        self.assertNotIn(str(self.root), json.dumps(body))
+        record = self.pod._migrate_ask
+        self.assertEqual((record["to_dc"], record["volume_id"], record["token"]),
+                         ("EU-CZ-1", "vol-1", body["confirm_token"]))
+        self._nothing_started()
+
+    def test_ask_network_runs_outside_the_bot_lock(self):
+        # A runpodctl round trip held under BOT_LOCK would stall every
+        # Telegram update for as long as it runs (_rent_panel_data's reason).
+        seen = []
+
+        def probing(*_args, **_kwargs):
+            seen.append(_lock_free_from_another_thread())
+            return _fake_stock()
+
+        def probing_home(*_args, **_kwargs):
+            seen.append(_lock_free_from_another_thread())
+            return "EU-RO-1"
+
+        self.patches["stock_at_cached"].side_effect = probing
+        self.patches["volume_datacenter"].side_effect = probing_home
+        status, _ = self._ask()
+        self.assertEqual((status, seen), (200, [True, True]))
+
+    def test_a_new_ask_replaces_the_old_token(self):
+        first = self._token()
+        second = self._token("EUR-IS-1")
+        self.assertNotEqual(first, second)
+        self.assertEqual(self.pod._migrate_ask["token"], second)
+        status, body = self.pod.migrate({"to_dc": "EU-CZ-1",
+                                         "confirm_token": first}, "m1")
+        self.assertEqual((status, body["error"]["code"]), (409, "bad_confirm_token"))
+        self._nothing_started()
+
+    # ---- go -----------------------------------------------------------
+
+    def test_go_bad_body_is_400(self):
+        self._token()
+        for bad in ({}, {"to_dc": "EU-CZ-1"}, {"confirm_token": "x"},
+                    {"to_dc": 5, "confirm_token": "x"},
+                    {"to_dc": "EU-CZ-1", "confirm_token": 5}):
+            status, body = self.pod.migrate(bad, "m-bad")
+            self.assertEqual((status, body["error"]["code"]), (400, "bad_request"), bad)
+        self._nothing_started()
+
+    def test_go_without_a_prior_ask_is_bad_confirm_token(self):
+        status, body = self.pod.migrate({"to_dc": "EU-CZ-1",
+                                         "confirm_token": "made-up"}, "m1")
+        self.assertEqual((status, body["error"]["code"]), (409, "bad_confirm_token"))
+        self._nothing_started()
+
+    def test_go_with_the_wrong_token_or_the_wrong_datacenter_is_refused(self):
+        token = self._token()
+        for body_in, key in (({"to_dc": "EU-CZ-1", "confirm_token": token + "x"}, "m1"),
+                             ({"to_dc": "EUR-IS-1", "confirm_token": token}, "m2")):
+            status, body = self.pod.migrate(body_in, key)
+            self.assertEqual((status, body["error"]["code"]),
+                             (409, "bad_confirm_token"), body_in)
+        # Still stored: a wrong guess must not burn the real confirmation.
+        self.assertIsNotNone(self.pod._migrate_ask)
+        self._nothing_started()
+
+    def test_go_with_an_expired_token_is_refused(self):
+        token = self._token()
+        later = time.monotonic() + 601
+        with mock.patch("tgbot.bot.time.monotonic", return_value=later):
+            status, body = self.pod.migrate({"to_dc": "EU-CZ-1",
+                                             "confirm_token": token}, "m1")
+        self.assertEqual((status, body["error"]["code"]), (409, "bad_confirm_token"))
+        self._nothing_started()
+
+    def test_go_after_the_volume_id_changed_is_refused(self):
+        # The token is bound to the volume it was shown for. If .env now names
+        # a different volume, the ask's warning described a different deletion.
+        token = self._token()
+        self.env.write_text("POD_VOLUME_ID=vol-2\n", encoding="utf-8")
+        status, body = self.pod.migrate({"to_dc": "EU-CZ-1",
+                                         "confirm_token": token}, "m1")
+        self.assertEqual((status, body["error"]["code"]), (409, "bad_confirm_token"))
+        self._nothing_started()
+
+    def test_go_after_a_migration_started_is_refused(self):
+        token = self._token()
+        self.patches["migration_running"].return_value = True
+        status, body = self.pod.migrate({"to_dc": "EU-CZ-1",
+                                         "confirm_token": token}, "m1")
+        self.assertEqual((status, body["error"]["code"]), (409, "migration"))
+        self._nothing_started()
+
+    def test_go_after_a_drain_went_live_is_refused(self):
+        token = self._token()
+        self._live_lease()
+        status, body = self.pod.migrate({"to_dc": "EU-CZ-1",
+                                         "confirm_token": token}, "m1")
+        self.assertEqual((status, body["error"]["code"]), (409, "run_active"))
+        self._nothing_started()
+
+    def test_go_makes_no_network_call(self):
+        # Every re-check under the lock reads files, .env or memory. A
+        # runpodctl round trip here would hold BOT_LOCK for its duration.
+        token = self._token()
+        self.patches["stock_at_cached"].side_effect = AssertionError("stock from migrate()")
+        self.patches["volume_datacenter"].side_effect = AssertionError("home from migrate()")
+        status, _ = self.pod.migrate({"to_dc": "EU-CZ-1", "confirm_token": token}, "m1")
+        self.assertEqual(status, 202)
+
+    def test_go_consumes_the_token_and_starts_exactly_once(self):
+        token = self._token()
+        first = self.pod.migrate({"to_dc": "EU-CZ-1", "confirm_token": token}, "m1")
+        self.assertEqual(first, (202, {"outcome": "started", "to_dc": "EU-CZ-1"}))
+        self.start.assert_called_once()
+        tg_arg, chat_arg, dc_arg = self.start.call_args.args
+        self.assertIsInstance(tg_arg, bot._AppTg)
+        self.assertIs(tg_arg._tg, self.tg)
+        self.assertEqual((chat_arg, dc_arg), (ME, "EU-CZ-1"))
+        # Popped before the launch, so a crash inside _start_migration cannot
+        # leave a token that would start a second, concurrent migration.
+        self.assertIsNone(self.pod._migrate_ask)
+
+        # A retry of the same request replays; a fresh key does not get a
+        # second migration out of the same single-use token.
+        self.assertEqual(
+            self.pod.migrate({"to_dc": "EU-CZ-1", "confirm_token": token}, "m1"), first)
+        status, body = self.pod.migrate({"to_dc": "EU-CZ-1",
+                                         "confirm_token": token}, "m2")
+        self.assertEqual((status, body["error"]["code"]), (409, "bad_confirm_token"))
+        self.start.assert_called_once()
+        self.popen.assert_not_called()
+
+    def test_go_refusal_from_start_migration_is_returned_not_sent(self):
+        token = self._token()
+        self.start.return_value = Outcome(False, "launch_failed",
+                                          MIGRATE_LAUNCH_FAILED)
+        status, body = self.pod.migrate({"to_dc": "EU-CZ-1",
+                                         "confirm_token": token}, "m1")
+        self.assertEqual((status, body["error"]["code"]), (409, "launch_failed"))
+        self.assertEqual(body["error"]["message"], MIGRATE_LAUNCH_FAILED)
+        self.assertEqual(self.tg.sent, [])
+
+    def test_go_bot_busy_is_503_and_forgets_the_key(self):
+        token = self._token()
+        with _bot_lock_held_elsewhere(), \
+             mock.patch.object(bot, "BOT_LOCK_TIMEOUT_SEC", 0.05):
+            status, body = self.pod.migrate({"to_dc": "EU-CZ-1",
+                                             "confirm_token": token}, "m1")
+        self.assertEqual((status, body["error"]["code"]), (503, "bot_busy"))
+        self._nothing_started()
+        # Forgotten, not recorded: the same key may simply be retried.
+        status, _ = self.pod.migrate({"to_dc": "EU-CZ-1",
+                                      "confirm_token": token}, "m1")
+        self.assertEqual(status, 202)
+        self.start.assert_called_once()
+
+
 class TestBotLockedHelper(_PodFixture):
     def test_bot_locked_yields_none_when_it_gets_the_lock(self):
         with bot._bot_locked() as busy:

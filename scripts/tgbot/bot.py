@@ -12,10 +12,12 @@ from __future__ import annotations
 import argparse
 import contextlib
 import hashlib
+import hmac
 import html
 import json
 import os
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -5358,6 +5360,32 @@ def _ask_migrate(tg: Tg, chat_id: int, to_dc: str) -> None:
                   ("Cancel", _CB_MIGRATE_NO)]])
 
 
+# How long the phone's migration confirmation stays valid. Long enough to
+# read the warning and think about it, short enough that a token left in a
+# backgrounded app cannot start a copy against state that has since moved —
+# and every guard is re-checked at spend time anyway, so this is the outer
+# bound, not the protection.
+_MIGRATE_CONFIRM_TTL_SEC = 600
+
+
+def _migrate_warning(to_dc: str) -> str:
+    """`_ask_migrate`'s confirm text as plain prose, for the phone's own
+    confirm screen (spec §5.9).
+
+    A twin of the message above rather than a caller of it: `_ask_migrate`
+    sends a Telegram message and builds HTML buttons, and this only ever
+    returns a string. Kept next to it so the two are edited together — what
+    the user is warned about before the source volume is deleted must not
+    depend on which client asked. `_plain` on the way out for the promise the
+    whole JSON surface makes (no tags, no absolute paths).
+    """
+    return _plain(
+        f"This copies your Network Volume to {to_dc}: ~2 temporary CPU pods "
+        f"for the duration, then deletes the current volume once the copy is "
+        f"verified byte-for-byte. {MIGRATE_DURATION_TEXT}. "
+        f"Cannot be undone once the old volume is deleted.")
+
+
 def _start_migration(tg: Tg, chat_id: int, to_dc: str) -> Outcome:
     """Launch scripts/volume_migrate.py, once.
 
@@ -7071,6 +7099,10 @@ class AppPod:
         # ever gets a 202 (see kill()).
         self.last_kill: dict | None = None
         self._kill_thread: threading.Thread | None = None
+        # The outstanding migration confirmation, or None. In memory on
+        # purpose (spec §5.9): a bot restart voids it and the user asks again,
+        # which is the right default for the one call that deletes data.
+        self._migrate_ask: dict | None = None
 
     @property
     def run_id(self) -> str:
@@ -7190,7 +7222,6 @@ class AppPod:
         self.idem.finish("resume", key, *response)
         return response
 
-
     def _migration_state(self) -> dict:
         """The migration block of `GET /v1/pod`, from files only.
 
@@ -7238,10 +7269,14 @@ class AppPod:
         """`GET /v1/pod`: the lease, the selected GPU, the migration and the
         last kill — files and memory only, so it is cheap to poll (spec 5.4).
 
-        No network call (a test proves it) and no field derived from the
-        current time (a test proves that too): the body is hashed into an
-        ETag, and one that moves with the clock never gets a 304. The phone
-        computes elapsed from `lease.provisioned_at` itself.
+        No network call (a test proves it) and no field that changes with each
+        poll (a test proves that too): the body is hashed into an ETag, and
+        one that moves with the clock never gets a 304. The phone computes
+        elapsed from `lease.provisioned_at` itself. The one clock comparison
+        underneath is the pre-existing launch-marker grace inside
+        `migration_running()`, which after `_MIGRATE_LAUNCH_GRACE_SEC` flips
+        `migration.running` to False — and unlinks the stale marker as it
+        does. That is a state change, not a per-poll one: it happens once.
 
         Takes NO `BOT_LOCK`, on purpose. The kill worker holds that lock for
         the whole destroy (up to ~210 s), and this is the route the phone
@@ -7320,6 +7355,155 @@ class AppPod:
                 return busy_response
             env_set(ROOT / ".env", "GPU", gpu)
         return 200, {"gpu": gpu, "name": _GPU_DISPLAY_SHORT.get(gpu, gpu)}
+
+    def _migrate_blocked(self) -> tuple[int, dict] | None:
+        """The live-state guards both halves of the migration share, read
+        under `BOT_LOCK` from files and memory only — no network, so holding
+        the lock across them costs microseconds.
+
+        Stricter than Telegram's `_ask_migrate`, which only checks
+        `migration_running()` (spec §5.9). A migration copies the volume the
+        pod is reading from and then deletes the original, so a live lease or
+        a busy run is a refusal here even though a Telegram user can tap
+        through it — the phone has no chat in front of it explaining what is
+        running.
+        """
+        if migration_running():
+            return 409, _run_error("migration",
+                                   "a volume migration is already in progress")
+        if read_lease(LEASE_PATH) is not None:
+            return 409, _run_error("run_active",
+                                   "a pod is live — stop it before moving the volume")
+        if busy(_job_manifest_path(self.chat_id)):
+            return 409, _run_error("run_active",
+                                   "this run is busy — wait for it before moving the volume")
+        return None
+
+    def migrate_ask(self, body: dict) -> tuple[int, dict]:
+        """`POST /v1/pod/migrate/ask`: the first half of the two-step.
+
+        Returns the warning the phone must show and a single-use
+        `confirm_token` bound to `to_dc` AND to the volume id the warning was
+        written about. No `Idempotency-Key`: nothing here acts, and a repeat
+        ask simply replaces the token.
+
+        The two network reads (`volume_datacenter`, `stock_at_cached`) run
+        OUTSIDE `BOT_LOCK` — a runpodctl round trip held under it would stall
+        every Telegram update for as long as it runs (`_rent_panel_data`'s
+        reasoning) — and the destination is then checked against what the
+        stock call actually listed. That check FAILS CLOSED: unlike
+        `_offer_run_confirm`, which degrades to "no evidence of stock", a dead
+        runpodctl here would mean starting an irreversible copy toward a
+        datacenter nothing has confirmed exists.
+        """
+        to_dc = body.get("to_dc") if isinstance(body, dict) else None
+        if not isinstance(to_dc, str) or not to_dc:
+            return 400, _run_error("bad_request", "to_dc is required")
+        volume_id = env_get(ROOT / ".env", "POD_VOLUME_ID") or ""
+        home = volume_datacenter(volume_id)
+        if not home:
+            return 409, _run_error("home_unknown",
+                                   "cannot tell which datacenter the volume is in — "
+                                   "nothing was started")
+        if to_dc == home:
+            return 409, _run_error("same_datacenter",
+                                   f"the volume is already in {_plain(to_dc)}")
+        try:
+            stock = stock_at_cached([_PRIMARY_GPU_ID, *_FALLBACK_GPU_IDS])
+        except RuntimeError as exc:
+            return 502, _run_error("upstream_unavailable",
+                                   _plain(f"couldn't reach runpodctl: {exc}"))
+        # The same set `_migrate_options` offers buttons for: every datacenter
+        # one of the wanted GPUs is stocked at, minus home. A destination with
+        # no GPU to rent is a copy that buys nothing.
+        offered = {entry.datacenter_id for entries in stock.values()
+                   for entry in entries if entry.stock_status.lower() != "none"}
+        if to_dc not in offered - {home}:
+            return 409, _run_error("unknown_datacenter",
+                                   "no GPU is currently offered in that datacenter")
+        with _bot_locked() as busy_response:
+            if busy_response is not None:
+                return busy_response
+            blocked = self._migrate_blocked()
+            if blocked is not None:
+                return blocked
+            token = secrets.token_urlsafe(16)
+            self._migrate_ask = {"token": token, "to_dc": to_dc,
+                                 "volume_id": volume_id,
+                                 # monotonic, not time.time(): an NTP step
+                                 # must not extend or void a confirmation.
+                                 "expires": time.monotonic() + _MIGRATE_CONFIRM_TTL_SEC}
+        return 200, {"to_dc": to_dc, "home_datacenter": home,
+                     "confirm_token": token,
+                     "expires_in_sec": _MIGRATE_CONFIRM_TTL_SEC,
+                     "warning": _migrate_warning(to_dc)}
+
+    def _migrate_token_stale(self, to_dc: str, token: str) -> tuple[int, dict] | None:
+        """Whether the confirmation is still the one `migrate_ask` issued.
+
+        One refusal code for every way of failing, on purpose: which of them
+        it was is not something a client can act on differently (ask again),
+        and saying "the token was right but expired" tells a guesser it was
+        right. `hmac.compare_digest` for the same reason — the comparison
+        runs on a value the caller chose.
+
+        Files and `.env` only, no network: this runs under `BOT_LOCK`.
+        """
+        record = self._migrate_ask
+        stale = (409, _run_error("bad_confirm_token",
+                                 "that confirmation is no longer valid — ask again"))
+        if record is None or not hmac.compare_digest(record["token"], token):
+            return stale
+        if record["to_dc"] != to_dc or time.monotonic() > record["expires"]:
+            return stale
+        # The volume the warning was written about. `.env` can be rewritten
+        # between the two calls (a finished migration does exactly that), and
+        # deleting a volume the user was never warned about is the one mistake
+        # this whole two-step exists to prevent.
+        if (env_get(ROOT / ".env", "POD_VOLUME_ID") or "") != record["volume_id"]:
+            return stale
+        return None
+
+    def migrate(self, body: dict, key) -> tuple[int, dict]:
+        """`POST /v1/pod/migrate`: the second half — `_start_migration` itself.
+
+        This is the most destructive call in the API: `volume_migrate.py`
+        copies the Network Volume and then DELETES the source, which holds the
+        models, Postgres and MinIO. So every guard `migrate_ask` checked is
+        checked AGAIN here, under `BOT_LOCK`, from files and memory only — a
+        drain can start, or a migration can be launched from Telegram, in the
+        minutes between the two calls.
+
+        The token is popped BEFORE `_start_migration` runs. If that call
+        crashed after launching the subprocess, a token still in memory would
+        let a second migration start against a volume already being deleted.
+        The "Migration started" Telegram message is `_start_migration`'s own,
+        as it is for the Telegram button — progress lives in the chat.
+        """
+        to_dc = body.get("to_dc") if isinstance(body, dict) else None
+        token = body.get("confirm_token") if isinstance(body, dict) else None
+        if not isinstance(to_dc, str) or not to_dc:
+            return 400, _run_error("bad_request", "to_dc is required")
+        if not isinstance(token, str) or not token:
+            return 400, _run_error("bad_request", "confirm_token is required")
+        replay = self.idem.begin("migrate", key)
+        if replay is not None:
+            return replay
+        with _bot_locked() as busy_response:
+            if busy_response is not None:
+                self.idem.forget("migrate", key)
+                return busy_response
+            refusal = (self._migrate_blocked()
+                       or self._migrate_token_stale(to_dc, token))
+            if refusal is not None:
+                response = refusal
+            else:
+                self._migrate_ask = None
+                out = _start_migration(_AppTg(self.tg), self.chat_id, to_dc)
+                response = ((202, {"outcome": out.code, "to_dc": to_dc}) if out
+                            else (status_for(out), _run_error(out.code, out.message)))
+        self.idem.finish("migrate", key, *response)
+        return response
 
 
 def _handle_locked(tg: Tg, update: dict, **kwargs) -> None:
