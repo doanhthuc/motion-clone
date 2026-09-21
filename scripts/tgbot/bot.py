@@ -50,6 +50,7 @@ import batch_clean
 # raises ImportError regardless of sys.path. The insert above puts scripts/ on
 # the path, which is what makes the absolute form work from either entry point.
 from tgbot.tgclient import Tg, TgError
+from httpapi.server import make_server, start_in_thread
 from control.paths import safe_child as _safe_child
 from tgbot import tiktok
 from tgbot.ingest import (Probe, describe, probe, quality_warning,
@@ -6652,6 +6653,36 @@ BOT_COMMANDS = [
 ]
 
 
+def _start_control_api(tg: Tg, chat_id: int):
+    """Start the phone app's HTTP API in a daemon thread, or explain why not.
+
+    In this process on purpose (spec 2026-09-21 §3): the API must see the same
+    _RUNNING / _PHASE_A handles the bot does, or "is this run live" has two
+    answers. Opt-in via CONTROL_API_TOKEN so a VPS whose .env predates it keeps
+    a working bot. A failure to start never stops the bot — Telegram is still
+    the primary interface — but it is said out loud once, because the phone
+    app would otherwise just show a connection error with no reason.
+    """
+    token = env_get(ROOT / ".env", "CONTROL_API_TOKEN")
+    if not token:
+        log("control API disabled (CONTROL_API_TOKEN unset)")
+        return None
+    try:
+        port = int(env_get(ROOT / ".env", "CONTROL_API_PORT") or 8787)
+        server = make_server(token=token, batch_dir=ROOT / "batch", out_dir=ROOT / "out",
+                             port=port, log=log)
+    except (OSError, ValueError) as exc:
+        log(f"control API failed to start: {exc!r}")
+        try:
+            tg.send_message(chat_id, f"Phone API did not start: {exc}")
+        except TgError:
+            pass
+        return None
+    start_in_thread(server)
+    log(f"control API listening on 127.0.0.1:{port}")
+    return server
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--once", action="store_true")
@@ -6695,6 +6726,7 @@ def main() -> int:
                                           for c, d in BOT_COMMANDS])
     except TgError as exc:
         log(f"setMyCommands failed, continuing without the menu: {exc}")
+    _start_control_api(tg, allowed_user_id)
     log(f"started, api={base}, dry_run={args.dry_run}, pipeline={_DEFAULT_PIPELINE}")
     while True:
         try:

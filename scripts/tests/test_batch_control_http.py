@@ -1,5 +1,6 @@
 import http.client
 import json
+import socket
 import sys
 import tempfile
 import types
@@ -260,6 +261,38 @@ class TestFileStreaming(HttpTestBase):
                            f"Wrote {handler.wfile.written_bytes} bytes but file was 500")
         finally:
             test_file.unlink()
+
+
+class TestBotStartsApi(unittest.TestCase):
+    def setUp(self):
+        import tgbot.bot as bot
+        self.bot = bot
+        self.tg = mock.Mock()
+
+    def env(self, **values):
+        return mock.patch.object(self.bot, "env_get",
+                                 side_effect=lambda _path, key: values.get(key))
+
+    def test_no_token_means_disabled_and_silent(self):
+        with self.env():
+            self.assertIsNone(self.bot._start_control_api(self.tg, 1))
+        self.tg.send_message.assert_not_called()
+
+    def test_starts_on_the_configured_port(self):
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]
+        with self.env(CONTROL_API_TOKEN="x", CONTROL_API_PORT=str(port)):
+            server = self.bot._start_control_api(self.tg, 1)
+        self.addCleanup(server.server_close); self.addCleanup(server.shutdown)
+        self.assertEqual(server.server_address, ("127.0.0.1", port))
+
+    def test_port_in_use_reports_and_keeps_the_bot_alive(self):
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0)); s.listen(); port = s.getsockname()[1]
+            with self.env(CONTROL_API_TOKEN="x", CONTROL_API_PORT=str(port)):
+                self.assertIsNone(self.bot._start_control_api(self.tg, 1))
+        self.tg.send_message.assert_called_once()
+        self.assertIn("API", self.tg.send_message.call_args.args[1])
 
 
 if __name__ == "__main__":
