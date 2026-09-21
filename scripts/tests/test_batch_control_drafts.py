@@ -128,6 +128,23 @@ class StoreCase(unittest.TestCase):
         self.assertEqual(cm.exception.code, code)
 
 
+class TestRunnable(StoreCase):
+    def test_runnable(self):
+        self.assertEqual(self.store.runnable(), ([], None, 0))
+        v = self.fill()
+        jobs, validated, generation = self.store.runnable()
+        self.assertEqual(len(jobs), 1)
+        self.assertIsNone(validated)
+        self.assertEqual(generation, v["generation"])
+        d = self.store._load()
+        d.validated = True
+        self.store._save(d)
+        jobs, validated, generation = self.store.runnable()
+        self.assertEqual(len(jobs), 1)
+        self.assertTrue(validated)
+        self.assertEqual(generation, v["generation"])
+
+
 class TestView(StoreCase):
     def test_fresh_draft_uses_defaults_and_writes_nothing(self):
         v = self.store.view()

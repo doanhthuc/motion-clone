@@ -50,11 +50,13 @@ import batch_clean
 # the path, which is what makes the absolute form work from either entry point.
 from tgbot.tgclient import Tg, TgError
 from httpapi.server import make_server, start_in_thread
-from control import materials, uploads
+from control import BOT_LOCK, BOT_LOCK_TIMEOUT_SEC, materials, uploads
 import control.drafts as drafts
-from control.drafts import PROVIDER_LABELS
+from control.drafts import DraftStore, PROVIDER_LABELS
+from control.idempotency import IdempotencyStore
 from control.materials import fold_diacritics as _fold_diacritics, safe_name as _safe_name
 from control.paths import safe_child as _safe_child
+from control.runs import Outcome, status_for
 from tgbot import tiktok
 from tgbot.ingest import (Probe, describe, probe, quality_warning,
                          quality_warning_html,
@@ -383,7 +385,12 @@ def _tick_staging_prune() -> None:
         if thumbs:
             log(f"pruned {len(thumbs)} orphaned thumbnail(s)")
 
-    for sweep in (staged, abandoned_uploads, orphan_thumbs):
+    def stale_idempotency_records() -> None:
+        removed = IdempotencyStore(ROOT / "batch" / "idempotency").prune(now)
+        if removed:
+            log(f"pruned {removed} idempotency record(s) older than 24h")
+
+    for sweep in (staged, abandoned_uploads, orphan_thumbs, stale_idempotency_records):
         try:
             sweep()
         except Exception as exc:
@@ -3021,8 +3028,50 @@ def _tryon_versions(image: Path) -> list[Path]:
     return [path for _, path in sorted(found)]
 
 
+class _AppTg:
+    """The Tg a call made for the phone app passes into the run functions.
+
+    Everything is forwarded to the real client, so a success (Started,
+    progress, try-on previews) still posts to the Telegram chat, which owns
+    the one shared run slot (spec §5.8). The only difference is the marker
+    `_refuse` reads: a refusal belongs to the phone that asked, and posting it
+    into the chat as well would tell the Telegram user about a request they
+    never made.
+    """
+    app_origin = True
+
+    def __init__(self, tg: Tg):
+        self._tg = tg
+
+    def __getattr__(self, name):
+        return getattr(self._tg, name)
+
+
+_TAG = re.compile(r"<[^>]+>")
+
+
+def _plain(text: str) -> str:
+    """A refusal's Telegram HTML as plain text for the phone. Tags go but their
+    inner text stays, so a `<tg-emoji>` keeps its fallback emoji.
+
+    The repo root is stripped as well: a few refusals format an exception
+    (`could not regenerate — {exc}`) whose ManifestError text starts with the
+    absolute manifest path, and the API never exposes absolute paths.
+    """
+    plain = html.unescape(_TAG.sub("", text)).strip()
+    return plain.replace(str(ROOT) + "/", "").replace(str(ROOT), "")
+
+
+def _refuse(tg: Tg, chat_id: int, code: str, text: str, **send_kwargs) -> Outcome:
+    """Send a run function's refusal exactly as before, unless the call came
+    from the app — then only return it."""
+    if not getattr(tg, "app_origin", False):
+        tg.send_message(chat_id, text, **send_kwargs)
+    return Outcome(False, code, _plain(text))
+
+
 def _regen_tryon(tg: Tg, chat_id: int, index: str, token: str, *,
-                 dry_run: bool) -> None:
+                 dry_run: bool) -> Outcome:
     """Redo ONE run's try-on image, leaving every other run's untouched.
 
     Reached from the 🔄 button under a Phase A preview. The mechanism is the
@@ -3043,38 +3092,37 @@ def _regen_tryon(tg: Tg, chat_id: int, index: str, token: str, *,
     """
     manifest_path = _job_manifest_path(chat_id)
     if token != _run_token(chat_id):
-        tg.send_message(chat_id, "the job changed since that image was sent, so "
-                                 "nothing was regenerated.")
-        return
+        return _refuse(tg, chat_id, "stale_panel",
+                       "the job changed since that image was sent, so "
+                       "nothing was regenerated.")
     if dry_run:
-        tg.send_message(chat_id, "dry run — regenerating would spend API quota, "
-                                 "so nothing ran")
-        return
+        return _refuse(tg, chat_id, "dry_run",
+                       "dry run — regenerating would spend API quota, "
+                       "so nothing ran")
     if drain_running(manifest_path):
-        tg.send_message(chat_id, "too late to regenerate — the GPU run has "
-                                 "started and uses this image. /status shows it.")
-        return
+        return _refuse(tg, chat_id, "too_late",
+                       "too late to regenerate — the GPU run has "
+                       "started and uses this image. /status shows it.")
     if phase_a_running(manifest_path):
-        tg.send_message(chat_id, "the try-on phase is still running — wait for "
-                                 "the \"rent a GPU?\" panel, then tap Regenerate "
-                                 "again.")
-        return
+        return _refuse(tg, chat_id, "phase_a_running",
+                       "the try-on phase is still running — wait for "
+                       "the \"rent a GPU?\" panel, then tap Regenerate "
+                       "again.")
     try:
         manifest = load_manifest(manifest_path)
     except ManifestError as exc:
-        tg.send_message(chat_id, f"could not regenerate — {exc}")
-        return
+        return _refuse(tg, chat_id, "manifest_error", f"could not regenerate — {exc}")
     if not index.isdigit() or int(index) >= len(manifest.runs):
-        tg.send_message(chat_id, "that button is from an older version of the "
-                                 "bot; send /start for the commands")
-        return
+        return _refuse(tg, chat_id, "not_found",
+                       "that button is from an older version of the "
+                       "bot; send /start for the commands")
     run = manifest.runs[int(index)]
     stage_name = _local_tryon_stage(run)
     if stage_name is None:
-        tg.send_message(chat_id, f"{run.id}'s try-on no longer runs over the API "
-                                 "(its provider changed), so there is nothing to "
-                                 "regenerate here.")
-        return
+        return _refuse(tg, chat_id, "not_local",
+                       f"{run.id}'s try-on no longer runs over the API "
+                       "(its provider changed), so there is nothing to "
+                       "regenerate here.")
 
     state_file = state_path_for(manifest_path)
     state = load_state(state_file)
@@ -3084,14 +3132,14 @@ def _regen_tryon(tg: Tg, chat_id: int, index: str, token: str, *,
     recorded = stages.get(stage_name) or {}
     pipeline = PIPELINES[run.pipeline]
     if any(stages.get(later) for later in pipeline[pipeline.index(stage_name) + 1:]):
-        tg.send_message(chat_id, f"too late to regenerate — {run.id} has already "
-                                 "gone past try-on on the pod, so a new image "
-                                 "would not be used.")
-        return
+        return _refuse(tg, chat_id, "too_late",
+                       f"too late to regenerate — {run.id} has already "
+                       "gone past try-on on the pod, so a new image "
+                       "would not be used.")
     if not batch_id or recorded.get("status") not in ("done", "error"):
-        tg.send_message(chat_id, f"{run.id}'s try-on has not run yet — nothing "
-                                 "to regenerate.")
-        return
+        return _refuse(tg, chat_id, "not_ready",
+                       f"{run.id}'s try-on has not run yet — nothing "
+                       "to regenerate.")
 
     dest = stage_dest(run, ROOT / "out" / batch_id / "runs" / run.id, stage_name)
     backup = None
@@ -3137,6 +3185,7 @@ def _regen_tryon(tg: Tg, chat_id: int, index: str, token: str, *,
                 all_stages.append(stage)
     _start_progress(tg, chat_id, manifest_path, all_stages, phase="local",
                     sent_tryon=seed, regen=regen)
+    return Outcome(True, "started")
 
 
 _RETRY_PROVIDERS = {"gemini": "Gemini", "qwen-max": "Qwen"}
@@ -5296,7 +5345,7 @@ def _again(tg: Tg, chat_id: int) -> None:
 
 
 def _do_resume(tg: Tg, chat_id: int, manifest_path: Path, *, dry_run: bool,
-               gpu_provider: str | None = None) -> bool:
+               gpu_provider: str | None = None) -> Outcome:
     """Continue a batch whose pod rental already failed once — reached only
     from the recovery buttons _deliver_provision_failure offers, after the
     user picked a different GPU (_CB_RECOVER_SWITCH) or asked to retry the
@@ -5319,14 +5368,14 @@ def _do_resume(tg: Tg, chat_id: int, manifest_path: Path, *, dry_run: bool,
     `gpu_provider` is "vast" when the user picked Vast on the panel, None for everything else
     (drain then uses .env's provider, as it always did). A Vast rental has no Network Volume, so
     the migration guard does not apply to it, and it must pass _vast_refusal — the same checks the
-    panel's hidden spend button shows — before anything is started. Returns True only when a drain
-    was started, so a caller can tell a refusal from a launch.
+    panel's hidden spend button shows — before anything is started. Returns a truthy Outcome only
+    when a drain was started, so a caller can tell a refusal from a launch.
     """
     if gpu_provider != "vast" and migration_running():
-        tg.send_message(chat_id, "a volume migration is in progress for this "
-                                 "pod's datacenter — wait for it to finish "
-                                 "before retrying")
-        return False
+        return _refuse(tg, chat_id, "migration",
+                       "a volume migration is in progress for this "
+                       "pod's datacenter — wait for it to finish "
+                       "before retrying")
     # busy(), not drain_running(): this is about to hand the manifest to
     # drain.py, which READS it — the predicate run.busy's own docstring names
     # for exactly that. A live Phase A holds no lease and registers no _RUNNING
@@ -5337,23 +5386,20 @@ def _do_resume(tg: Tg, chat_id: int, manifest_path: Path, *, dry_run: bool,
     # a Phase A too, and unlike /clear's and /wipe's strings it never claimed
     # the thing running was a drain.
     if busy(manifest_path):
-        tg.send_message(chat_id, "already running — nothing to resume")
-        return False
+        return _refuse(tg, chat_id, "already_running", "already running — nothing to resume")
     state = load_state(state_path_for(manifest_path))
     if not state.get("batch"):
-        tg.send_message(chat_id, f"nothing to resume for {_esc(manifest_path.stem)} "
-                                 "— that batch never started")
-        return False
+        return _refuse(tg, chat_id, "nothing_to_resume",
+                       f"nothing to resume for {_esc(manifest_path.stem)} "
+                       "— that batch never started")
     try:
         manifest = load_manifest(manifest_path)
     except ManifestError as exc:
-        tg.send_message(chat_id, f"could not resume — {_esc(str(exc))}")
-        return False
+        return _refuse(tg, chat_id, "manifest_error", f"could not resume — {_esc(str(exc))}")
     if gpu_provider == "vast":
         refusal = _vast_refusal(manifest)
         if refusal is not None:
-            tg.send_message(chat_id, refusal, parse_mode=PARSE_HTML)
-            return False
+            return _refuse(tg, chat_id, "vast_refused", refusal, parse_mode=PARSE_HTML)
     clear_provision_failure(provision_failure_path(manifest_path))
     stages: list[str] = []
     for run in manifest.runs:
@@ -5370,7 +5416,7 @@ def _do_resume(tg: Tg, chat_id: int, manifest_path: Path, *, dry_run: bool,
     provider_kwargs = {} if gpu_provider is None else {"gpu_provider": gpu_provider}
     start_drain(manifest_path, dry_run=dry_run, resume=True, **provider_kwargs)
     _start_progress(tg, chat_id, manifest_path, stages, **provider_kwargs)
-    return True
+    return Outcome(True, "started")
 
 
 def _manifest_write_ok(chat_id: int) -> bool:
@@ -5442,12 +5488,15 @@ def _job_has_local_tryon(chat_id: int) -> bool:
     return manifest is not None and has_local_tryon(manifest)
 
 
-def _draft_manifest(chat_id: int) -> Manifest | None:
+def _draft_manifest(chat_id: int, jobs: list[Job] | None = None) -> Manifest | None:
     """The manifest this chat's drafted jobs WOULD write, loaded back from a throwaway file — or
     None when there is no job or it will not render. The one place that answers "what is about to
     be submitted" without touching the live manifest file, whose mtime is the run token that every
-    button in the chat is checked against."""
-    queued = _jobs_for(chat_id)
+    button in the chat is checked against.
+
+    `jobs`, when given, are the phone app's jobs, checked in place of the Telegram draft: the app
+    runs through this chat's slot but brings its own draft (spec §5.8)."""
+    queued = jobs if jobs is not None else _jobs_for(chat_id)
     if not queued:
         return None
     try:
@@ -5475,7 +5524,8 @@ _QUOTE_MAX_AGE_S = 600.0
 _QUOTE_GB_TOLERANCE = 0.15
 
 
-def _vast_queue_refusal(chat_id: int, live_path: Path) -> str | None:
+def _vast_queue_refusal(chat_id: int, live_path: Path,
+                        jobs: list[Job] | None = None) -> str | None:
     """Why the job being assembled must NOT be queued onto the drain running now; None means it
     may. Only a Vast pod needs this.
 
@@ -5486,11 +5536,14 @@ def _vast_queue_refusal(chat_id: int, live_path: Path) -> str | None:
     the pod lacks, would run on a billing box and fail — or sit queued — at the worker. RunPod's pod
     mounts the whole model volume, so it is exempt. The lease says which cloud the drain is on;
     lease_for misses a chained link (its lease points at the claimed manifest), so it falls back to
-    the global lease file exactly as _do_kill does."""
+    the global lease file exactly as _do_kill does.
+
+    `jobs` is the app's job list when the phone is queuing; the check has to be about the job that
+    is actually going into the mailbox, not whatever the Telegram draft holds."""
     lease = lease_for(live_path) or read_lease(LEASE_PATH)
     if lease is None or lease.provider != "vast":
         return None
-    draft = _draft_manifest(chat_id)
+    draft = _draft_manifest(chat_id, jobs)
     if draft is None:
         return None
     reasons = static_blockers(draft, _vast_enabled())
@@ -5603,7 +5656,8 @@ def _start_phase_a_and_report(tg: Tg, chat_id: int, manifest_path: Path,
     _start_progress(tg, chat_id, manifest_path, stages, phase="local")
 
 
-def _do_phase_a(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
+def _do_phase_a(tg: Tg, chat_id: int, *, dry_run: bool,
+                jobs: list[Job] | None = None) -> Outcome:
     """The pre-spend half of _do_confirm: same guards, same manifest write,
     no pod and no confirm flag.
 
@@ -5625,27 +5679,31 @@ def _do_phase_a(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
     is the only question --dry-run asks. Keeping the parameter also lets
     _CB_RUN_GO thread it to both branches identically instead of remembering
     which of the two takes it.
+
+    `jobs`, when given, are the phone app's jobs, run through this chat's
+    manifest in place of the Telegram draft. The phone's draft is not the
+    Telegram draft (spec §5.8): the unassigned-file queue belongs to the chat,
+    so it is not consulted for them.
     """
     if dry_run:
-        tg.send_message(chat_id, "dry run — Phase A would spend Gemini quota, "
-                                 "so nothing ran")
-        return
+        return _refuse(tg, chat_id, "dry_run",
+                       "dry run — Phase A would spend Gemini quota, "
+                       "so nothing ran")
     if migration_running():
-        tg.send_message(chat_id, "a volume migration is in progress for this pod's "
-                                 "datacenter — wait for it to finish before renting")
-        return
-    queued = _jobs_for(chat_id)
+        return _refuse(tg, chat_id, "migration",
+                       "a volume migration is in progress for this pod's "
+                       "datacenter — wait for it to finish before renting")
+    queued = jobs if jobs is not None else _jobs_for(chat_id)
     if not queued:
-        tg.send_message(chat_id, "no complete job yet — send the required files first")
-        return
-    pending = _PENDING.get(chat_id) or []
+        return _refuse(tg, chat_id, "nothing_to_run",
+                       "no complete job yet — send the required files first")
+    pending = (_PENDING.get(chat_id) or []) if jobs is None else []
     if pending and chat_id not in _CONFIRM_WARNED:
         _CONFIRM_WARNED.add(chat_id)
-        tg.send_message(chat_id,
-                        f"{ICON_FLAG_CE} {len(pending)} file(s) still unassigned — answer "
-                        f"them, or send /confirm again to run without them",
-                        parse_mode=PARSE_HTML)
-        return
+        return _refuse(tg, chat_id, "unassigned_files",
+                       f"{ICON_FLAG_CE} {len(pending)} file(s) still unassigned — answer "
+                       f"them, or send /confirm again to run without them",
+                       parse_mode=PARSE_HTML)
     if not _manifest_write_ok(chat_id):
         # Which half of busy() is holding it decides the way OUT, not just the
         # wording, so this branches rather than naming /confirm unconditionally.
@@ -5664,14 +5722,14 @@ def _do_phase_a(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
         # bug, so this one offers the same two real exits that one does.
         reason = _busy_reason(chat_id)
         if reason == _REASON_DRAIN:
-            tg.send_message(chat_id, f"{reason} for this job — /status shows "
-                                     "it. Run cannot queue behind it, but "
-                                     "/confirm still can.")
-        else:
-            tg.send_message(chat_id, f"{reason} for this job — /status shows "
-                                     "it. Wait for it to finish, or /kill to "
-                                     "stop it, then tap Run again.")
-        return
+            return _refuse(tg, chat_id, "drain_running",
+                           f"{reason} for this job — /status shows "
+                           "it. Run cannot queue behind it, but "
+                           "/confirm still can.")
+        return _refuse(tg, chat_id, "phase_a_running",
+                       f"{reason} for this job — /status shows "
+                       "it. Wait for it to finish, or /kill to "
+                       "stop it, then tap Run again.")
     live_path = _job_manifest_path(chat_id)
     write_manifest(queued, live_path, now=time.strftime("%Y-%m-%d %H:%M:%S"))
     stages: list[str] = []
@@ -5681,11 +5739,13 @@ def _do_phase_a(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
                 stages.append(stage)
     _PHASE_A_OFFERED.pop(chat_id, None)
     _start_phase_a_and_report(tg, chat_id, live_path, stages)
+    return Outcome(True, "started")
 
 
 def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool,
                 phase_a_choice: str | None = None,
-                gpu_provider: str | None = None) -> None:
+                gpu_provider: str | None = None,
+                jobs: list[Job] | None = None) -> Outcome:
     """THE money gate for a FRESH spend decision. The only OTHER function
     that may call start_drain is _do_resume, which continues a manifest
     already confirmed here once — see its own docstring for why that is not
@@ -5715,14 +5775,22 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool,
     (not a job queued onto a pod already running) must pass _vast_refusal, evaluated BEFORE the
     manifest is rewritten — that rewrite changes its mtime, which is the run token, and would kill
     the very panel the user is about to tap again after a refusal.
+
+    `jobs`, when given, are the phone app's jobs, written into this chat's
+    manifest in place of the Telegram draft. The phone's draft is not the
+    Telegram draft (spec §5.8), so everything below that is about the chat's
+    draft is skipped for them: the unassigned-file queue, the cached validate
+    verdict (the app checks its own draft before calling), the panel freeze
+    and the clear of the chat's in-memory draft. The world-state gates —
+    migration, Phase A, the mailbox, Vast — apply to both alike.
     """
     # Checked before anything else, including completeness — a migration mid-
     # copy is moving the Network Volume this pod would mount, so renting must
     # not be allowed to race it regardless of how complete the job is.
     if gpu_provider != "vast" and migration_running():
-        tg.send_message(chat_id, "a volume migration is in progress for this pod's "
-                                 "datacenter — wait for it to finish before renting")
-        return
+        return _refuse(tg, chat_id, "migration",
+                       "a volume migration is in progress for this pod's "
+                       "datacenter — wait for it to finish before renting")
     # Second, ahead of completeness for the same reason the migration check is:
     # this is about the world, not about the job, and the job being perfect
     # does not make renting safe.
@@ -5744,22 +5812,21 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool,
     # all, uses busy() for the same underlying reason.
     live_path = _job_manifest_path(chat_id)
     if phase_a_running(live_path):
-        tg.send_message(chat_id,
-                        "the try-on phase is still running for this job — wait "
-                        "for it to finish, or /kill to stop it, then /confirm "
-                        "again")
-        return
+        return _refuse(tg, chat_id, "phase_a_running",
+                       "the try-on phase is still running for this job — wait "
+                       "for it to finish, or /kill to stop it, then /confirm "
+                       "again")
     # `dry_run` is threaded from the caller (main()'s --dry-run; False for real
     # usage and for every call in this file's own tests) all the way to the one
     # start_drain below. The CLI flag has to actually reach that line, or
     # "--dry-run: never invokes drain" in this module's docstring would be
     # false — and the button path has to thread it just as far as the typed one.
     job = _STATE.get(chat_id)
-    queued = _jobs_for(chat_id)
+    queued = jobs if jobs is not None else _jobs_for(chat_id)
     if not queued:
-        tg.send_message(chat_id, "no complete job yet — send the required files first")
-        return
-    pending = _PENDING.get(chat_id) or []
+        return _refuse(tg, chat_id, "nothing_to_run",
+                       "no complete job yet — send the required files first")
+    pending = (_PENDING.get(chat_id) or []) if jobs is None else []
     if pending and chat_id not in _CONFIRM_WARNED:
         # /confirm used to succeed with files still queued and unanswered,
         # then drop them silently on the state clear below (finding I6,
@@ -5768,15 +5835,17 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool,
         # skipped" is a legitimate intent and there is no other way to
         # express it.
         _CONFIRM_WARNED.add(chat_id)
-        tg.send_message(chat_id,
-                        f"{ICON_FLAG_CE} {len(pending)} file(s) still unassigned — answer "
-                        f"them, or send /confirm again to run without them",
-                        parse_mode=PARSE_HTML)
-        return
+        return _refuse(tg, chat_id, "unassigned_files",
+                       f"{ICON_FLAG_CE} {len(pending)} file(s) still unassigned — answer "
+                       f"them, or send /confirm again to run without them",
+                       parse_mode=PARSE_HTML)
 
     # Ordered AFTER the pending check on purpose: the render below writes
     # the manifest, and writing one we are about to refuse to run is noise.
-    validated = _LAST_VALIDATE.get(chat_id)
+    # True for the app's jobs, so neither branch below runs for them: the
+    # cache is about the Telegram draft, and _render_and_validate would write
+    # that draft into the manifest.
+    validated = _LAST_VALIDATE.get(chat_id) if jobs is None else True
     if validated is None:
         # Never attempted — the only way to get here is the write guard in
         # _render_and_validate having refused while a drain was live
@@ -5792,7 +5861,7 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool,
         if not _render_and_validate(tg, chat_id):
             # It already sent the specific reason; a second, vaguer line
             # would only bury it.
-            return
+            return Outcome(False, "invalid", "")
         # The confirmation screen was never shown for this job, so send
         # the manifest now: nothing may spend $0.99/hour without the exact
         # inputs it spent on being in the transcript.
@@ -5805,11 +5874,10 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool,
         # bot, so this guard cannot rely on it (Task 7 fix round 1,
         # Finding 2). Retrying the validate here would be pointless — the
         # job has not changed since it failed.
-        tg.send_message(chat_id,
-                        "this manifest did not pass `make batch-validate`, and "
-                        "its output was sent above — nothing will run. Fix what "
-                        "it named and send the file(s) again.")
-        return
+        return _refuse(tg, chat_id, "invalid",
+                       "this manifest did not pass `make batch-validate`, and "
+                       "its output was sent above — nothing will run. Fix what "
+                       "it named and send the file(s) again.")
 
     # A drain already running for this chat is no longer a refusal
     # (2026-09-02): it means THIS job goes into the mailbox instead of being
@@ -5823,20 +5891,28 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool,
     # here is what it used to be, and re-deriving a path a guard already acted
     # on is how the two can quietly stop being the same file.
     running = drain_running(live_path)
+    # The queue-depth-1 guard for the app's jobs. A Telegram job met it inside
+    # _render_and_validate, which the app's jobs skip above; without it they
+    # would overwrite a job already waiting in the mailbox — and the Vast
+    # check below would delete that job on a refusal. Same reply as there.
+    if (jobs is not None and running and phase_a_choice is None
+            and mailbox_path(live_path).exists()):
+        return _refuse(tg, chat_id, "queue_full",
+                       "a job is already queued next for this chat — wait for "
+                       "it to start before queuing another. Your files are "
+                       "kept; send /status for progress.")
     if running and phase_a_choice is None:
         # _render_and_validate already checked the draft before it wrote the mailbox; the pod or
         # the enabled list may have changed since, so check again — and take the job back OUT of
         # the mailbox on a refusal, because a file left there would still be claimed.
-        refusal = _vast_queue_refusal(chat_id, live_path)
+        refusal = _vast_queue_refusal(chat_id, live_path, jobs)
         if refusal is not None:
             mailbox_path(live_path).unlink(missing_ok=True)
-            tg.send_message(chat_id, refusal, parse_mode=PARSE_HTML)
-            return
+            return _refuse(tg, chat_id, "vast_refused", refusal, parse_mode=PARSE_HTML)
     if gpu_provider == "vast" and not running:
-        refusal = _vast_refusal(_draft_manifest(chat_id))
+        refusal = _vast_refusal(_draft_manifest(chat_id, jobs))
         if refusal is not None:
-            tg.send_message(chat_id, refusal, parse_mode=PARSE_HTML)
-            return
+            return _refuse(tg, chat_id, "vast_refused", refusal, parse_mode=PARSE_HTML)
     manifest_path = mailbox_path(live_path) if running else live_path
     # Re-written on the FIRST entry, even when `validated` was cached True: the
     # cache only remembers that the JOB CONTENT was valid, not which file it
@@ -5874,6 +5950,13 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool,
     if not running and phase_a_choice is None:
         reusable, total = _preserved_tryon(manifest_path)
         if reusable:
+            if getattr(tg, "app_origin", False):
+                # The phone has no buttons to tap; it answers by calling again
+                # with the choice, which is the same second entry a tap makes.
+                return Outcome(False, "choice_required",
+                               f"try-on already ran for {reusable} of {total} job(s) — "
+                               "confirm again with tryon=reuse to keep it, or "
+                               "tryon=rerun to redo it")
             token = _run_token(chat_id)
             # Carries whatever provider _CB_RUN_GO's tap already named (now always explicit for a
             # newly minted RunPod button too, see _RUNPOD_SUFFIX) forward onto the chooser buttons
@@ -5890,11 +5973,13 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool,
                            _ce_id(ICON_OK_CE)),
                           ("Re-run try-on", _CB_PHASE_A_RERUN + token + suffix,
                            _ce_id(ICON_ROCKET_CE))]])
-            return
+            return Outcome(False, "choice_offered")
     # BEFORE start_drain and before the state clear: this is the last instant
     # the submitted job exists in memory, and freezing the panel here is what
-    # leaves the exact inputs permanently in the transcript.
-    _freeze_panel(tg, chat_id, f"submitted {time.strftime('%H:%M')}")
+    # leaves the exact inputs permanently in the transcript. Not for the app's
+    # jobs: the panel shows the Telegram draft, which they did not submit.
+    if jobs is None:
+        _freeze_panel(tg, chat_id, f"submitted {time.strftime('%H:%M')}")
     if not running:
         # THE money gate (see docstring) — the only line that may rent a pod.
         # Queuing (the `running` branch below) never reaches this: the
@@ -5929,9 +6014,12 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool,
     # Clear in-memory state so the next file starts a fresh job rather
     # than mutating one already handed to a running drain. The manifest
     # itself, and the drain's own journal, stay on disk regardless.
-    dropped = len(_PENDING.pop(chat_id, []) or [])
+    # The app's jobs leave all of it alone: the Telegram draft was not what
+    # ran, so clearing it would lose a job the chat is still assembling.
+    dropped = len(_PENDING.pop(chat_id, []) or []) if jobs is None else 0
     submitted_count = len(queued)
-    _BASKET.pop(chat_id, None)
+    if jobs is None:
+        _BASKET.pop(chat_id, None)
     # Copied to `.last.json` BEFORE the clear, so /again can rebuild it.
     # Deliberately not left in `.draft.json`: _load_draft reads that file, so a
     # restart would resurrect a job already handed to a running drain.
@@ -5940,12 +6028,13 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool,
     # quietly discard the other three.
     _last_path(chat_id).write_text(json.dumps(
         {"jobs": _dump_jobs(queued)}, indent=2), encoding="utf-8")
-    _STATE.pop(chat_id, None)
-    _LAST_VALIDATE.pop(chat_id, None)
-    _CONFIRM_WARNED.discard(chat_id)
-    _ALBUM_KEY.pop(chat_id, None)
-    _FIDELITY.pop(chat_id, None)
-    _STRIP.pop(chat_id, None)
+    if jobs is None:
+        _STATE.pop(chat_id, None)
+        _LAST_VALIDATE.pop(chat_id, None)
+        _CONFIRM_WARNED.discard(chat_id)
+        _ALBUM_KEY.pop(chat_id, None)
+        _FIDELITY.pop(chat_id, None)
+        _STRIP.pop(chat_id, None)
     if dropped:
         tg.send_message(chat_id, f"running without {dropped} unassigned file(s)")
     if running and phase_a_choice is None:
@@ -6019,7 +6108,9 @@ def _do_confirm(tg: Tg, chat_id: int, *, dry_run: bool,
                         parse_mode=PARSE_HTML)
         _start_progress(tg, chat_id, manifest_path, stages,
                         **({} if gpu_provider is None else {"gpu_provider": gpu_provider}))
-    return
+    if not running:
+        return Outcome(True, "started")
+    return Outcome(True, "queued" if phase_a_choice is None else "already_running")
 
 
 def _handle(tg: Tg, update: dict, *, allowed_user_id: int,
@@ -6487,6 +6578,350 @@ BOT_COMMANDS = [
 ]
 
 
+def _run_error(code: str, message: str) -> dict:
+    """The `{"error": {...}}` body shape every route in httpapi/server.py
+    already sends (ApiError._error, DraftError), so a refusal from the app's
+    run routes looks the same on the wire as every other one."""
+    return {"error": {"code": code, "message": message}}
+
+
+def _rent_panel_data(chat_id: int, *, force: bool, manifest: Manifest | None) -> dict:
+    """The `runpod`/`vast` numbers for the phone's rent panel — the same
+    primitives `_offer_run_confirm` and `_offer_vast_panel` read, called
+    fresh here instead of through either of them: both those functions also
+    send or edit a Telegram message, and this only ever returns JSON.
+
+    Takes no lock. `stock_at`/`stock_at_cached` is a runpodctl round trip and
+    `vast_fetch_quote` can take up to 120s (spec §5.8) — either one held
+    under `BOT_LOCK` would stall every Telegram update for as long as the
+    network call runs. `AppRuns.rent_panel` reads everything that needs the
+    lock (the token, `after_phase_a`, the app's jobs) before calling this.
+    """
+    configured = env_get(ROOT / ".env", "GPU") or _PRIMARY_GPU_ID
+    volume_id = env_get(ROOT / ".env", "POD_VOLUME_ID")
+    home_dc = volume_datacenter(volume_id)
+    wanted = [_PRIMARY_GPU_ID, *_FALLBACK_GPU_IDS]
+    try:
+        stock = ((stock_at(wanted) if force else stock_at_cached(wanted))
+                 if home_dc else {})
+    except RuntimeError:
+        # Fails open exactly like _offer_run_confirm: a dead runpodctl must
+        # never turn this into a 500, only into the honest "no evidence of
+        # stock" answer below (home is None -> sold_out).
+        stock = {}
+    price = _gpu_price(configured, stock)
+    home = next((e for e in (stock.get(configured) or [])
+                if e.datacenter_id == home_dc), None)
+    sold_out = home is None or home.stock_status.lower() == "none"
+    runpod = {"gpu": configured, "datacenter": home_dc,
+             "stock": home.stock_status if home is not None else None,
+             "usd_per_hr": price, "sold_out": sold_out}
+
+    enabled = _vast_enabled()
+    if manifest is None:
+        # No job to quote a session for — same message _offer_vast_panel
+        # shows when _panel_manifest comes back empty.
+        vast = {"enabled": bool(enabled), "usd_per_hr": None, "session_usd": None,
+               "blockers": [_plain("no complete job yet — send the required files first")],
+               "can_spend": False}
+    else:
+        gb = vast_download_gb(manifest)
+        view = vast_build_view(
+            manifest, gb=gb, enabled=enabled,
+            quote_fn=lambda: vast_fetch_quote(gb, force=force, repo_root=_REPO_ROOT),
+            credit_fn=vast_credit)
+        vast = {"enabled": bool(enabled),
+               "usd_per_hr": view.quote.dph if view.quote else None,
+               "session_usd": view.session_usd,
+               "blockers": [_plain(b) for b in view.blockers],
+               "can_spend": view.can_spend}
+    return {"runpod": runpod, "vast": vast}
+
+
+class AppRuns:
+    """Phase A and confirm for the phone's draft, run through the one shared
+    slot (spec §5.8): the app's jobs go into the Telegram chat's own
+    manifest, `batch/tg-<chat>.yaml`, and through the bot's own
+    `_do_phase_a` / `_do_confirm` / `_do_resume` — the same functions and the
+    same refusals /confirm has always had, wrapped as the app's `_AppTg` so a
+    refusal answers the phone instead of the chat.
+
+    Every call is made under `BOT_LOCK`, so the check-then-start of a paid
+    drain here can never interleave with the bot loop's own `handle()` or
+    tick round (`_handle_locked`, `_run_ticks` below) — the race this whole
+    slice exists to close. Idempotency records are written `pending` by
+    `idem.begin` before anything runs, so a crash mid-call answers a replay
+    with `outcome_unknown` rather than risk a second rental; `bot_busy`
+    (the lock timed out) is the one outcome never recorded, so the same key
+    can just be retried once the lock frees up.
+    """
+
+    def __init__(self, tg: Tg, chat_id: int, drafts: DraftStore, idem: IdempotencyStore):
+        self.tg, self.chat_id, self.drafts, self.idem = tg, chat_id, drafts, idem
+
+    @property
+    def run_id(self) -> str:
+        return _job_manifest_path(self.chat_id).stem
+
+    def panel_token(self) -> str:
+        """`_run_token` alone only catches a rewritten manifest — it says
+        nothing about the app's OWN draft, which is what the app actually
+        reviewed on its rent panel. Joining the draft's generation closes
+        that: an edit to the draft (no manifest written yet) still stales the
+        token, the same way a Telegram edit stales `_run_token`."""
+        _, _, generation = self.drafts.runnable()
+        return f"{_run_token(self.chat_id)}.{generation}"
+
+    @contextlib.contextmanager
+    def _locked(self):
+        """`with self._locked() as busy:` — `busy` is `None` once `BOT_LOCK`
+        is held, or the ready-made 503 body when the wait timed out. The
+        caller's own job is to `idem.forget` in the timeout case (this method
+        does not know the scope/key) and return the 503 as-is, unrecorded."""
+        if BOT_LOCK.acquire(timeout=BOT_LOCK_TIMEOUT_SEC):
+            try:
+                yield None
+            finally:
+                BOT_LOCK.release()
+        else:
+            yield (503, _run_error("bot_busy", "the bot is busy — try again in a moment"))
+
+    def _draft_jobs(self) -> tuple[list[Job] | None, Outcome | None]:
+        """What Phase A and confirm's fresh-spend branch both need from the
+        app's draft: its jobs, or the refusal for why there are none to run."""
+        jobs, validated, _ = self.drafts.runnable()
+        if not jobs:
+            return None, Outcome(False, "nothing_to_run",
+                                 "no complete job in the app's draft yet")
+        if validated is not True:
+            return None, Outcome(False, "not_validated",
+                                 "validate the draft first (POST /v1/draft/validate)")
+        return jobs, None
+
+    def phase_a(self, key) -> tuple[int, dict]:
+        replay = self.idem.begin("phase-a", key)
+        if replay is not None:
+            return replay
+        with self._locked() as busy:
+            if busy is not None:
+                self.idem.forget("phase-a", key)
+                return busy
+            jobs, refusal = self._draft_jobs()
+            out = refusal if refusal is not None else _do_phase_a(
+                _AppTg(self.tg), self.chat_id, dry_run=False, jobs=jobs)
+        # Phase A is not a submission (same as the bot's own /confirm-less
+        # Run tap), so nothing above ever clears the app's draft.
+        response = ((202, {"run_id": self.run_id, "outcome": out.code}) if out
+                    else (status_for(out), _run_error(out.code, out.message)))
+        self.idem.finish("phase-a", key, *response)
+        return response
+
+    def confirm(self, run_id: str, body: dict, key) -> tuple[int, dict]:
+        # {id} must be the live slot's id (spec §5.8) — checked before the
+        # idempotency store ever sees this key, so a wrong id costs nothing.
+        if run_id != self.run_id:
+            return 404, _run_error("not_found", "no such run")
+        provider = body.get("provider")
+        if provider not in ("runpod", "vast"):
+            return 400, _run_error("bad_request",
+                                   'provider must be "runpod" or "vast"')
+        tryon = body.get("tryon")
+        if tryon not in (None, "reuse", "rerun"):
+            return 400, _run_error("bad_request",
+                                   'tryon must be "reuse", "rerun", or omitted')
+        replay = self.idem.begin("confirm", key)
+        if replay is not None:
+            return replay
+        with self._locked() as busy:
+            if busy is not None:
+                self.idem.forget("confirm", key)
+                return busy
+            if body.get("panel_token") != self.panel_token():
+                out = Outcome(False, "stale_panel",
+                              "the job changed since the panel was read — read it again")
+            elif _PHASE_A_OFFERED.get(self.chat_id) == _run_token(self.chat_id):
+                # The app's own chooser-less equivalent of the rent panel's
+                # spend button: Phase A already ran for this exact manifest,
+                # so this is a resume, never a fresh _do_confirm (see
+                # _do_resume's own docstring for why that is not a second
+                # money gate).
+                out = _do_resume(_AppTg(self.tg), self.chat_id,
+                                 _job_manifest_path(self.chat_id), dry_run=False,
+                                 gpu_provider=provider)
+                if out:
+                    _PHASE_A_OFFERED.pop(self.chat_id, None)
+                    self.drafts.clear()
+            else:
+                jobs, refusal = self._draft_jobs()
+                if refusal is not None:
+                    out = refusal
+                else:
+                    out = _do_confirm(_AppTg(self.tg), self.chat_id, dry_run=False,
+                                      jobs=jobs, gpu_provider=provider,
+                                      phase_a_choice=tryon)
+                    if out:
+                        self.drafts.clear()
+            if out:
+                response = (202, {"run_id": self.run_id, "outcome": out.code})
+            else:
+                response = (status_for(out), _run_error(out.code, out.message))
+                if out.code == "choice_required":
+                    # The app has no buttons to tap; it re-reads the panel
+                    # token here rather than a second round trip to get one.
+                    response[1]["panel_token"] = self.panel_token()
+        self.idem.finish("confirm", key, *response)
+        return response
+
+    def rent_panel(self, run_id: str, *, force: bool) -> tuple[int, dict]:
+        """The phone's rent panel: RunPod stock/price plus the Vast tab, for
+        the manifest the app is about to spend on. Mirrors
+        `_offer_run_confirm`/`_offer_vast_panel` (do not change either) —
+        see `_rent_panel_data` for why the network calls happen outside this
+        method's own lock."""
+        if run_id != self.run_id:
+            return 404, _run_error("not_found", "no such run")
+        with self._locked() as busy:
+            if busy is not None:
+                return busy
+            token = self.panel_token()
+            after_phase_a = _PHASE_A_OFFERED.get(self.chat_id) == _run_token(self.chat_id)
+            if after_phase_a:
+                try:
+                    manifest = load_manifest(_job_manifest_path(self.chat_id))
+                except (ManifestError, OSError):
+                    manifest = None
+                runs = manifest.runs if manifest is not None else []
+                jobs, estimate_min = len(runs), sum(estimate_minutes(r) for r in runs)
+            else:
+                # None, never [] — _draft_jobs() only ever returns a
+                # non-empty list or None (nothing to run / not validated).
+                app_jobs, _refusal = self._draft_jobs()
+                # jobs=None here would make _draft_manifest fall back to the
+                # TELEGRAM chat's own queued jobs (its own default), leaking
+                # the Telegram user's draft into the app's rent panel — so
+                # the manifest is only built from a real, non-empty list.
+                manifest = _draft_manifest(self.chat_id, jobs=app_jobs) if app_jobs else None
+                jobs = len(app_jobs) if app_jobs else 0
+                estimate_min = sum(estimate_minutes(j) for j in app_jobs) if app_jobs else 0
+        data = _rent_panel_data(self.chat_id, force=force, manifest=manifest)
+        data.update(run_id=self.run_id, panel_token=token, after_phase_a=after_phase_a,
+                    jobs=jobs, estimate_min=estimate_min)
+        return 200, data
+
+    def _tryon_entries(self) -> list[tuple[str, "Run", str, dict]]:
+        """(index, run, stage_name, journal entry) for every run in this
+        chat's manifest whose try-on Phase A can do locally, in the order
+        `_deliver_tryon_previews` walks them. `index` is the run's own
+        position in `manifest.runs`, as a string — the same index
+        `_regen_tryon` takes — not a position in this filtered list, so a
+        button minted from one previews list still resolves against the
+        manifest `_regen_tryon` reads.
+        """
+        manifest_path = _job_manifest_path(self.chat_id)
+        try:
+            manifest = load_manifest(manifest_path)
+        except (ManifestError, OSError):
+            return []
+        runs_state = load_state(state_path_for(manifest_path)).get("runs") or {}
+        found = []
+        for index, run in enumerate(manifest.runs):
+            stage_name = _local_tryon_stage(run)
+            if stage_name is None:
+                continue
+            entry = ((runs_state.get(run.id) or {}).get("stages") or {}).get(stage_name) or {}
+            found.append((str(index), run, stage_name, entry))
+        return found
+
+    def tryon(self, run_id: str) -> tuple[int, dict]:
+        """The phone's try-on previews for this chat's manifest — the same
+        journal `_deliver_tryon_previews` reads, without the Telegram send:
+        the app fetches the image itself, over `tryon_image`."""
+        if run_id != self.run_id:
+            return 404, _run_error("not_found", "no such run")
+        with self._locked() as busy:
+            if busy is not None:
+                return busy
+            previews = []
+            for index, run, _stage, entry in self._tryon_entries():
+                status = entry.get("status") or "pending"
+                has_image = status == "done" and Path(entry.get("file") or "").is_file()
+                previews.append({"index": index, "run": run.id, "status": status,
+                                 "has_image": has_image})
+            response = (200, {"run_id": self.run_id, "run_token": _run_token(self.chat_id),
+                              "phase_a_running": phase_a_running(
+                                  _job_manifest_path(self.chat_id)),
+                              "previews": previews})
+        return response
+
+    def tryon_image(self, run_id: str, index: str) -> Path | None:
+        """The try-on image `tryon()`'s preview at `index` points to, or
+        `None` — including when the journal's own `file` field, for any
+        reason, resolves outside `ROOT / "out"`: this is served to the
+        phone over HTTP, so a path that escapes `out/` must never reach the
+        caller that opens it."""
+        if run_id != self.run_id:
+            return None
+        with self._locked() as busy:
+            if busy is not None:
+                return None
+            entry = next((e for i, _r, _s, e in self._tryon_entries() if i == index), None)
+        if entry is None:
+            return None
+        try:
+            image = Path(entry.get("file") or "").resolve()
+        except OSError:
+            return None
+        out_root = (ROOT / "out").resolve()
+        if not image.is_relative_to(out_root) or not image.is_file():
+            return None
+        return image
+
+    def regen(self, run_id: str, index: str, body: dict, key) -> tuple[int, dict]:
+        """Regenerate one run's try-on image — `_regen_tryon` itself,
+        wrapped the same way `confirm` wraps `_do_confirm`/`_do_resume`."""
+        if run_id != self.run_id:
+            return 404, _run_error("not_found", "no such run")
+        token = body.get("run_token")
+        if not token:
+            return 400, _run_error("bad_request", "run_token is required")
+        replay = self.idem.begin("regen", key)
+        if replay is not None:
+            return replay
+        with self._locked() as busy:
+            if busy is not None:
+                self.idem.forget("regen", key)
+                return busy
+            out = _regen_tryon(_AppTg(self.tg), self.chat_id, index, token, dry_run=False)
+            if out:
+                response = (202, {"run_id": self.run_id, "outcome": out.code})
+            else:
+                response = (status_for(out), _run_error(out.code, out.message))
+        self.idem.finish("regen", key, *response)
+        return response
+
+
+def _handle_locked(tg: Tg, update: dict, **kwargs) -> None:
+    """`handle()`, under `BOT_LOCK` — spec §5.8's other half of the guard
+    `AppRuns` takes on the HTTP side. No timeout here: this is the bot's own
+    loop, not a client that can be told to retry, and `get_updates` (the slow
+    part) already runs outside this call, in main()."""
+    with BOT_LOCK:
+        handle(tg, update, **kwargs)
+
+
+def _run_ticks(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
+    """The six tick calls main() makes every poll round, under `BOT_LOCK` as
+    one round — so an app confirm cannot land between, say, tick_phase_a
+    starting a resume and tick_progress reporting on it."""
+    with BOT_LOCK:
+        tick_progress(tg, chat_id)
+        tick_phase_a(tg, chat_id, dry_run=dry_run)
+        tick_migration_progress(tg, chat_id, dry_run=dry_run)
+        _tick_gpu_subs(tg, chat_id)
+        _tick_staging_prune()
+        _tick_out_prune(tg, chat_id)
+
+
 def _api_enabled_for(args: argparse.Namespace) -> bool:
     """Whether this invocation of main() should start the control API.
 
@@ -6525,6 +6960,12 @@ def _start_control_api(tg: Tg, chat_id: int):
         server = make_server(token=token, batch_dir=ROOT / "batch", out_dir=ROOT / "out",
                              port=port, log=log,
                              default_pipeline=_DEFAULT_PIPELINE, default_provider=_DEFAULT_PROVIDER)
+        # AppRuns needs this server's own `drafts` store, so it can only be
+        # built after make_server — and it must exist before the thread
+        # starts, or the first phone request could see server.app_runs still
+        # unset and get a spurious 503.
+        server.app_runs = AppRuns(tg, chat_id, server.drafts,
+                                  IdempotencyStore(ROOT / "batch" / "idempotency"))
         start_in_thread(server)
     except (OSError, ValueError, RuntimeError) as exc:
         # RuntimeError: the OS refused to create the daemon thread (e.g. a
@@ -6612,20 +7053,17 @@ def main() -> int:
                     offset, timeout=(_POLL_ANIMATED_SEC if animating
                                      else _POLL_IDLE_SEC)):
                 offset = update["update_id"] + 1
-                handle(tg, update, allowed_user_id=allowed_user_id,
-                       dry_run=args.dry_run)
-            # After the updates, not instead of them.
+                _handle_locked(tg, update, allowed_user_id=allowed_user_id,
+                               dry_run=args.dry_run)
+            # After the updates, not instead of them — get_updates is the slow
+            # long-poll and must stay outside BOT_LOCK (spec §5.8), or an app
+            # confirm would wait out the whole poll timeout for no reason.
             # One chat, because the allowlist is one user (spec section 2).
             # tick_phase_a sits next to tick_progress for readability — the two
             # read the same _progress_path. Order is not what makes that safe:
             # the `phase` guard in each tick is, and they would be correct in
             # either order.
-            tick_progress(tg, allowed_user_id)
-            tick_phase_a(tg, allowed_user_id, dry_run=args.dry_run)
-            tick_migration_progress(tg, allowed_user_id, dry_run=args.dry_run)
-            _tick_gpu_subs(tg, allowed_user_id)
-            _tick_staging_prune()
-            _tick_out_prune(tg, allowed_user_id)
+            _run_ticks(tg, allowed_user_id, dry_run=args.dry_run)
         except TgError as exc:
             log(f"poll failed, continuing: {exc}")
             time.sleep(5)

@@ -141,5 +141,21 @@ class TestDetail(RunsTestBase):
         self.assertEqual(runs.run_detail(self.batch, self.out, "r")["outputs"], ["a.mp4"])
 
 
+class TestOutcome(unittest.TestCase):
+    def test_truthiness_and_status(self):
+        import control
+        from control.runs import Outcome, status_for
+        self.assertTrue(Outcome(True, "started"))
+        self.assertFalse(Outcome(False, "migration", "wait"))
+        self.assertEqual(status_for(Outcome(True, "queued")), 202)
+        self.assertEqual(status_for(Outcome(False, "not_validated")), 422)
+        self.assertEqual(status_for(Outcome(False, "no_such_code")), 409)
+        self.assertEqual(status_for(Outcome(False, "not_found")), 404)
+        with control.BOT_LOCK:
+            with control.BOT_LOCK:
+                pass
+        self.assertEqual(control.BOT_LOCK_TIMEOUT_SEC, 60)
+
+
 if __name__ == "__main__":
     unittest.main()
