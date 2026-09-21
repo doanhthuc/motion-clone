@@ -4216,7 +4216,9 @@ def _gpu_stock_data(*, force: bool) -> dict:
                                   "datacenter": _plain(e.datacenter_id),
                                   "stock": _plain(e.stock_status),
                                   "usd_per_hr": e.price_per_hr or None})
-    return {"selected": env_get(ROOT / ".env", "GPU") or None,
+    # The primary when .env has no GPU=, the same fallback GET /v1/pod and
+    # _gpu_mismatch use — two screens must not show two answers for one value.
+    return {"selected": env_get(ROOT / ".env", "GPU") or _PRIMARY_GPU_ID,
             "home_datacenter": home_dc, "gpus": gpus, "other_regions": other_regions}
 
 
@@ -5403,6 +5405,14 @@ def _start_migration(tg: Tg, chat_id: int, to_dc: str) -> Outcome:
         return _refuse(tg, chat_id, "migration",
                        "a volume migration is already in progress")
 
+    # Any handle still here belongs to a migration that is over: migration_running()
+    # just said no, and a live one holds either its lease or this marker. It is
+    # dropped BEFORE the marker is written because _migration_launching() unlinks
+    # the marker of a finished handle — and GET /v1/pod (slice 5) reads
+    # migration_running() without BOT_LOCK, so it can land between the write below
+    # and the assignment after Popen. Left in place, that read deletes the marker
+    # this launch just wrote and reopens the window the marker exists to close.
+    _MIGRATE_PROC.pop(_MIGRATE_PROC_KEY, None)
     marker = _migrate_launch_marker()
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text(json.dumps({"at": time.time(), "to_dc": to_dc}),

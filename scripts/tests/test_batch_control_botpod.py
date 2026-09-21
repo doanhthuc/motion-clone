@@ -189,6 +189,28 @@ class TestStartMigrationOutcomes(_PodFixture):
         self.assertTrue(any("Migration to EU-CZ-1 started" in text
                             for text in self._texts()))
 
+    def test_a_lock_free_reader_cannot_delete_the_marker_this_launch_wrote(self):
+        # A finished migration's Popen handle can outlive it in _MIGRATE_PROC
+        # (nothing pops it if the tick never saw done/failed). While Popen runs,
+        # GET /v1/pod reads migration_running() without BOT_LOCK; with the stale
+        # handle still in place that read used to unlink the fresh marker.
+        finished = mock.Mock()
+        finished.poll.return_value = 0
+        bot._MIGRATE_PROC[bot._MIGRATE_PROC_KEY] = finished
+        self.addCleanup(bot._MIGRATE_PROC.clear)
+        seen = {}
+
+        def popen(*_args, **_kwargs):
+            seen["launching"] = bot._migration_launching()
+            seen["marker"] = bot._migrate_launch_marker().exists()
+            return mock.Mock(pid=1234)
+
+        with mock.patch("tgbot.bot.subprocess.Popen", side_effect=popen):
+            out = bot._start_migration(self.tg, ME, "EU-CZ-1")
+        self.assertEqual(out, Outcome(True, "started"))
+        self.assertTrue(seen["launching"])
+        self.assertTrue(seen["marker"])
+
     def test_app_call_keeps_the_refusal_off_telegram(self):
         self.patches["migration_running"].return_value = True
         out = bot._start_migration(bot._AppTg(self.tg), ME, "EU-CZ-1")
@@ -540,6 +562,14 @@ class TestGpuStock(_PodFixture):
         super().setUp()
         (self.root / ".env").write_text(
             f"GPU={P4090}\nPOD_VOLUME_ID=vol-1\n", encoding="utf-8")
+
+    def test_selected_falls_back_to_the_primary_like_pod_does(self):
+        # No GPU= in .env: GET /v1/pod, _gpu_mismatch and this route must all
+        # name the same GPU, or two phone screens disagree about one value.
+        (self.root / ".env").write_text("POD_VOLUME_ID=vol-1\n", encoding="utf-8")
+        self.patches["stock_at_cached"].return_value = _fake_stock()
+        self.assertEqual(bot._gpu_stock_data(force=False)["selected"], bot._PRIMARY_GPU_ID)
+        self.assertEqual(self.pod.pod()[1]["gpu"], bot._PRIMARY_GPU_ID)
 
     def test_gpu_stock_data_matches_report_gpu_stock(self):
         """The JSON is a twin of _report_gpu_stock, not a caller of it, so this

@@ -1068,8 +1068,13 @@ to a pod. Nothing here rents a pod except `resume`; `kill` and `migrate` destroy
   destroy and waiting on it has no timeout, so every other call that needs the lock — including a
   second `kill` — answers `503 bot_busy` (a double-tap on kill normally gets exactly that; a second
   kill that does get in is `409 kill_in_progress`). If `kill_running` stays `true` for a long time the
-  destroy is hung: look at the pod in the RunPod console and in `runpodctl`, not at the phone.
-  `GET /v1/pod` deliberately takes no lock, so it keeps answering while this happens.
+  destroy is hung: look at the pod in the RunPod console and in `runpodctl`, not at the phone, and
+  destroy it by hand if it is still there. `GET /v1/pod` deliberately takes no lock, so it keeps
+  answering while this happens.
+- **A bot restart forgets a kill.** `last_kill` and the worker are in memory: after a restart
+  `GET /v1/pod` says `kill_running: false, last_kill: null` whether the kill finished or was cut
+  off, and the same `Idempotency-Key` replays the old `202`. If a pod may still be up, send `kill`
+  again with a **new** key (it destroys only if a drain or Phase A is live, from the lease file).
 - **`resume` needs an outstanding failed rental and the run's current token.** `GET /v1/pod`'s
   `failed_rental` is non-null exactly when Telegram would draw its recovery buttons; without one,
   `resume` is `409 no_failure` (resuming a finished batch would rent a pod to do nothing). `run_token`
@@ -1094,14 +1099,16 @@ to a pod. Nothing here rents a pod except `resume`; `kill` and `migrate` destroy
   - The phone is refused (`409`) while a migration is running (`migration`), while a lease is live
     or the run is busy (`run_active`), when `to_dc` is the volume's current datacenter
     (`same_datacenter`), or when `to_dc` is not a datacenter the stock check currently lists
-    (`unknown_datacenter`). This is stricter than Telegram, which lets a migration start under a live
+    (`unknown_datacenter`), or when the volume's datacenter cannot be determined (`home_unknown` —
+    including when `runpodctl` is down, which is why that case is this `409` and not a `502`). This
+    is stricter than Telegram, which lets a migration start under a live
     drain. `migrate` re-checks every one of these under the lock, because a drain can start in the
     minutes between the two calls.
   - Progress is not streamed: read `GET /v1/pod`'s `migration` (`running`, `phase`, `to_dc`,
     `started_at`, `bytes_copied`, `total_bytes`), and expect the same progress messages in Telegram.
 - **`502 upstream_unavailable`**: a `runpodctl` call the endpoint cannot do without failed —
-  `GET /v1/gpu/stock`, and `migrate/ask` (which fails closed: it will not start an irreversible copy
-  toward a datacenter nothing confirmed). `GET /v1/balance` does not use it; it degrades to `null`
+  `GET /v1/gpu/stock`, and `migrate/ask` once the volume's datacenter is known (it fails closed: it
+  will not start an irreversible copy toward a datacenter nothing confirmed). `GET /v1/balance` does not use it; it degrades to `null`
   plus `errors`.
 - **`503 pod_unavailable`**: the bot built no `AppPod` (the phone API is not fully wired) — every
   route above answers it, never a `500`.
