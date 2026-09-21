@@ -209,6 +209,7 @@ class TestDelete(MaterialsBase):
             with self.assertRaises(materials.MaterialError) as cm:
                 materials.delete_material(self.staging, self.batch, "app", "a.mp4")
         self.assertEqual(cm.exception.code, "in_use")
+        self.assertEqual(cm.exception.message, "a running batch uses this file")
         self.assertTrue(self.a.exists())
 
     def test_a_finished_manifest_does_not_block(self):
@@ -344,6 +345,7 @@ class TestDeleteVsAppDraft(unittest.TestCase):
         with self.assertRaises(materials.MaterialError) as cm:
             materials.delete_material(staging, batch, "app", "a.png")
         self.assertEqual(cm.exception.code, "in_use")
+        self.assertEqual(cm.exception.message, "the app's draft uses this file")
         materials.delete_material(staging, batch, "app", "a.png.bak")   # whole-path match only
         self.assertFalse(free.exists())
 

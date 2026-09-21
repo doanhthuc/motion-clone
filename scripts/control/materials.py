@@ -249,7 +249,7 @@ def resolve_material(staging_root: Path, owner: str, name: str) -> Path | None:
     return path
 
 
-def _in_use(batch_dir: Path, path: Path) -> bool:
+def _in_use(batch_dir: Path, path: Path) -> str | None:
     """A busy run's manifest, or the app's draft, names this file. Only busy
     runs block: a finished manifest keeps naming its inputs forever, and would
     make nothing deletable.
@@ -260,13 +260,17 @@ def _in_use(batch_dir: Path, path: Path) -> bool:
     lookahead requires the match to end at end-of-text or at a character that
     cannot continue a path inside the manifest's YAML (whitespace, a quote,
     or a flow-mapping delimiter).
+
+    Returns the reason (for the error message), or None when the file is
+    free — not a bare bool, so the caller can tell a busy manifest apart from
+    the app's draft instead of printing one message for both (fix round 1).
     """
     pattern = re.compile(re.escape(str(path)) + r"(?=$|[\s'\",}\]])")
     for manifest in batch_dir.glob("*.yaml"):
         try:
             if pattern.search(manifest.read_text(encoding="utf-8", errors="replace")) \
                     and run_mod.busy(manifest):
-                return True
+                return "a running batch uses this file"
         except OSError:
             continue
     # The phone's draft (control/drafts.py) names files it has not run yet;
@@ -275,10 +279,10 @@ def _in_use(batch_dir: Path, path: Path) -> bool:
     draft = batch_dir / f"{APP_OWNER}.draft.json"
     try:
         if pattern.search(draft.read_text(encoding="utf-8", errors="replace")):
-            return True
+            return "the app's draft uses this file"
     except OSError:
         pass
-    return False
+    return None
 
 
 def delete_material(staging_root: Path, batch_dir: Path, owner: str, name: str) -> None:
@@ -290,8 +294,9 @@ def delete_material(staging_root: Path, batch_dir: Path, owner: str, name: str) 
         # Telegram's /clear and /wipe own the chat directories; deleting a file
         # a Telegram draft points at would break that draft with no message.
         raise MaterialError("forbidden", "only material uploaded from the app can be deleted here")
-    if _in_use(batch_dir, path):
-        raise MaterialError("in_use", "a running batch uses this file")
+    reason = _in_use(batch_dir, path)
+    if reason is not None:
+        raise MaterialError("in_use", reason)
     path.unlink(missing_ok=True)
 
 

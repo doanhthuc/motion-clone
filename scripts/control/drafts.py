@@ -211,8 +211,10 @@ class DraftStore:
                           validated=payload["validated"], generation=int(payload["generation"]))
         except (ValueError, KeyError, TypeError):
             # Moved aside, never deleted: it is the only copy of what the
-            # user had composed (same rule as the bot's _load_draft).
-            self.path.replace(self.path.with_name(self.path.name + ".bad"))
+            # user had composed (same rule as the bot's _load_draft). A
+            # unique suffix, not a fixed ".bad", so a second corrupt file
+            # never overwrites the first one moved aside (fix round 1).
+            self.path.replace(self.path.with_name(f"{self.path.name}.{uuid.uuid4().hex}.bad"))
             return self._fresh()
 
     def _save(self, d: _Draft) -> None:
@@ -242,9 +244,24 @@ class DraftStore:
         present = {r for r, p in job.slots.items() if p.is_file()}
         return sorted(required_roles(job.pipeline) - present)
 
+    def _jobs(self, d: _Draft) -> list[Job]:
+        """What Run would submit right now: the basket, plus the job being
+        edited only when it is actually complete.
+
+        `jobs_for`'s own completeness check (`missing_slots`) only looks at
+        which roles have a dict entry, not whether that entry's file still
+        exists on disk — so a vanished file (fix round 1: `_missing` counts
+        that as missing, `missing_slots` does not) left the current job
+        counted as one of `jobs` while `missing` also listed it. Passing
+        `None` here instead of the incomplete job is what `validate()`
+        (Task 3) needs too, hence the shared helper.
+        """
+        current = d.job if not self._missing(d.job) else None
+        return jobs_for(current, d.basket)
+
     def _view(self, d: _Draft) -> dict:
         job = d.job
-        jobs = jobs_for(job, d.basket)
+        jobs = self._jobs(d)
         return {
             "owner": self.owner, "pipeline": job.pipeline, "provider": job.provider,
             "generation": d.generation,
@@ -318,6 +335,12 @@ class DraftStore:
                                      f"{role} must be {role_kind(role)}, {path.name} is {probed.kind}")
             if provider is not None and _tryon_stage(target) is None:
                 raise DraftError("not_applicable", f"{target} has no try-on stage to pick a provider for")
+            # Re-checked under the lock, right before applying: ffprobe (above)
+            # ran outside the lock, so a delete could land in the gap between
+            # resolving/probing a path and getting here (fix round 1).
+            for role, (path, probed) in filled.items():
+                if not path.is_file():
+                    raise DraftError("not_found", f"no such material: {path.name}")
             # Every check passed: apply. Nothing above wrote anything.
             dropped = drop_unusable(d.job, target) if pipeline is not None else []
             if provider is not None:

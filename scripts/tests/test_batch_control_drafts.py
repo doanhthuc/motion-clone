@@ -146,7 +146,15 @@ class TestView(StoreCase):
         self.store.path.write_text("{not json")
         v = self.store.view()
         self.assertEqual(v["slots"], {})
-        self.assertTrue(self.store.path.with_name("app.draft.json.bad").exists())
+        self.assertEqual(len(list(self.store.path.parent.glob("app.draft.json.*bad"))), 1)
+
+    def test_a_second_corrupt_file_does_not_clobber_the_first_bad(self):
+        self.store.path.parent.mkdir(parents=True, exist_ok=True)
+        self.store.path.write_text("{not json")
+        self.store.view()
+        self.store.path.write_text("{still not json")
+        self.store.view()
+        self.assertEqual(len(list(self.store.path.parent.glob("app.draft.json.*bad"))), 2)
 
 
 class TestPatch(StoreCase):
@@ -199,6 +207,25 @@ class TestPatch(StoreCase):
         (self.staging / "app" / "broken.png").write_bytes(b"x")
         self.assertRefused("unprobeable", self.store.patch, {"slots": {"character": "app/broken.png"}})
 
+    def test_file_deleted_between_resolve_and_apply_is_not_found(self):
+        # Closes the race between resolving/probing a path (outside
+        # control.LOCK, since ffprobe can take up to 60s) and applying it
+        # (under the lock): a delete landing in that gap must not leave the
+        # draft pointing at a file that no longer exists (fix round 1).
+        before = self.fill()
+        orig = self.store._probe
+
+        def vanish(path):
+            result = orig(path)
+            path.unlink()
+            return result
+
+        self.store._probe = vanish
+        self.assertRefused("not_found", self.store.patch, {"slots": {"background": "app/bg.png"}})
+        after = self.store.view()
+        self.assertEqual(after["generation"], before["generation"])
+        self.assertNotIn("background", after["slots"])
+
     def test_a_refused_patch_changes_nothing(self):
         before = self.fill()
         self.assertRefused("wrong_kind", self.store.patch,
@@ -246,6 +273,11 @@ class TestPatch(StoreCase):
         v = self.store.view()
         self.assertFalse(v["slots"]["outfit"]["exists"])
         self.assertEqual(v["missing"], ["outfit"])
+        # The current job is incomplete now (a required file vanished), so it
+        # must drop out of `jobs`/`estimate_min` too — only the basket would
+        # count (fix round 1: jobs_for's own missing_slots() only checks
+        # which roles have a dict entry, not whether the file still exists).
+        self.assertEqual(v["jobs"], 0)
 
 
 class TestBatch(StoreCase):
