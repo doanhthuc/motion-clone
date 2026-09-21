@@ -2,6 +2,7 @@ import http.client
 import json
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -15,6 +16,25 @@ from httpapi.files import parse_range
 from httpapi.server import make_server, start_in_thread
 
 TOKEN = "t-123"
+
+
+class FakeHandler:
+    """Minimal fake HTTP handler for testing file streaming."""
+    def __init__(self):
+        self.close_connection = False
+        self.headers = {}
+        self.headers_sent = {}
+        self.response_status = None
+        self.wfile = BytesIO()
+
+    def send_response(self, status):
+        self.response_status = status
+
+    def send_header(self, name, value):
+        self.headers_sent[name] = value
+
+    def end_headers(self):
+        pass
 
 
 class HttpTestBase(unittest.TestCase):
@@ -160,26 +180,6 @@ class TestFileStreaming(HttpTestBase):
 
     def test_disconnect_during_stream(self):
         # Verify that client disconnect (BrokenPipeError) is handled gracefully
-        from http.server import BaseHTTPRequestHandler
-
-        # Create a minimal fake handler that raises BrokenPipeError on write
-        class FakeHandler(BaseHTTPRequestHandler):
-            def __init__(self):
-                self.response_status = None
-                self.headers_sent = {}
-                self.close_connection = False
-                self.headers = {}
-
-            def send_response(self, status):
-                self.response_status = status
-
-            def send_header(self, name, value):
-                self.headers_sent[name] = value
-
-            def end_headers(self):
-                pass
-
-        # Create wfile that raises BrokenPipeError on any write
         class FailingWFile:
             def write(self, data):
                 raise BrokenPipeError("client disconnected")
@@ -187,12 +187,10 @@ class TestFileStreaming(HttpTestBase):
         handler = FakeHandler()
         handler.wfile = FailingWFile()
 
-        # send_file should handle the disconnect gracefully
         test_file = Path(tempfile.mktemp(suffix=".bin"))
         test_file.write_bytes(b"x" * 1000)
         try:
             files_module.send_file(handler, test_file)
-            # Should not raise, and should mark connection for close
             self.assertTrue(handler.close_connection)
         finally:
             test_file.unlink()
@@ -215,39 +213,51 @@ class TestFileStreaming(HttpTestBase):
             self.assertEqual(json.loads(body)["error"]["code"], "not_found")
 
     def test_disconnect_during_headers(self):
-        # Verify that disconnect during end_headers (header flush to socket)
-        # is caught and handled gracefully, not propagated
-        from http.server import BaseHTTPRequestHandler
-
-        class FakeHandler(BaseHTTPRequestHandler):
-            def __init__(self):
-                self.response_status = None
-                self.headers_sent = {}
-                self.close_connection = False
-                self.headers = {}
-
-            def send_response(self, status):
-                self.response_status = status
-
-            def send_header(self, name, value):
-                self.headers_sent[name] = value
-
+        # Verify that disconnect during end_headers (header flush) is caught
+        class HeaderFailingHandler(FakeHandler):
             def end_headers(self):
-                # Simulate disconnect during header flush
                 raise BrokenPipeError("client disconnected during headers")
 
-        handler = FakeHandler()
-        handler.wfile = BytesIO()
-
+        handler = HeaderFailingHandler()
         test_file = Path(tempfile.mktemp(suffix=".bin"))
         test_file.write_bytes(b"x" * 1000)
 
         try:
-            # send_file should catch the BrokenPipeError during end_headers
             files_module.send_file(handler, test_file)
+            self.assertTrue(handler.close_connection)
+        finally:
+            test_file.unlink()
+
+    def test_short_file_sets_close_connection(self):
+        # Verify that when file ends before promised Content-Length (because
+        # fstat reported larger size than real file), close_connection is set.
+        class CountingWFile:
+            def __init__(self):
+                self.written_bytes = 0
+
+            def write(self, data):
+                self.written_bytes += len(data)
+
+        handler = FakeHandler()
+        handler.wfile = CountingWFile()
+
+        test_file = Path(tempfile.mktemp(suffix=".bin"))
+        test_file.write_bytes(b"x" * 500)
+
+        try:
+            # Patch os.fstat to report larger size (1000) than real file (500)
+            fake_stat = types.SimpleNamespace(st_size=1000)
+            with mock.patch.object(files_module.os, "fstat", return_value=fake_stat):
+                files_module.send_file(handler, test_file)
+
             # Should not raise, close_connection should be True
             self.assertTrue(handler.close_connection,
-                          "close_connection not set on disconnect during headers")
+                          "close_connection not set when file ends early")
+            # Content-Length should be 1000 (from fstat)
+            self.assertEqual(handler.headers_sent.get("Content-Length"), "1000")
+            # But only 500 bytes written (real file size)
+            self.assertEqual(handler.wfile.written_bytes, 500,
+                           f"Wrote {handler.wfile.written_bytes} bytes but file was 500")
         finally:
             test_file.unlink()
 
