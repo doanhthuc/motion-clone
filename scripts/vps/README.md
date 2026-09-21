@@ -1016,3 +1016,18 @@ in); any other id is `404`.
 - **`503 bot_busy`**: the bot's own lock (`BOT_LOCK`) is held by something else — a Telegram update
   or a tick round — and the wait for it timed out. Nothing was recorded against the Idempotency-Key
   in that case, so the same call can just be retried once the lock frees up.
+
+Measured 2026-09-21 through the tunnel from the Mac, on the shared run slot (`tg-<chat>`) that already
+had two done try-on runs from a prior session — nothing here rents anything:
+
+| | Measurement |
+|---|---|
+| `GET .../rent-panel` | 200, 2.1 s (a live `runpodctl gpu list` + a Vast credit check); `sold_out: true` — the 5090 was genuinely out of stock at the home datacenter, not a bug |
+| `POST .../confirm` with a deliberately stale `panel_token` | `409 stale_panel`, 0.2 s; `runpodctl pod list` afterwards: no pod created |
+| `POST /v1/runs/phase-a` with no `Idempotency-Key` | `400 bad_request`, before anything ran |
+| `GET .../tryon` | 200, both prior try-on runs listed with `has_image: true` |
+| Absolute paths in any body | none |
+| Telegram's draft (`tg-<chat>.draft.json`) | sha256 identical before and after |
+| `motion-bot` RSS | 38,520 KB before the deploy → 39,868 KB after this run |
+
+No real `confirm` was sent — that needs the user's explicit go, since it rents a pod at ~$1/hour.
