@@ -38,6 +38,7 @@ def send_file(handler: BaseHTTPRequestHandler, path: Path) -> None:
         size = os.fstat(f.fileno()).st_size
         rng = parse_range(handler.headers.get("Range"), size)
 
+        headers_sent = False
         try:
             if rng == "unsatisfiable":
                 handler.send_response(416)
@@ -55,6 +56,7 @@ def send_file(handler: BaseHTTPRequestHandler, path: Path) -> None:
             if rng:
                 handler.send_header("Content-Range", f"bytes {start}-{end}/{size}")
             handler.end_headers()
+            headers_sent = True
 
             f.seek(start)
             remaining = length
@@ -70,3 +72,14 @@ def send_file(handler: BaseHTTPRequestHandler, path: Path) -> None:
             # Client disconnected (seek, timeout, network issue, headers flush) — normal.
             # Catch BrokenPipeError, ConnectionResetError, etc. Do not propagate.
             handler.close_connection = True
+        except OSError as exc:
+            if not headers_sent:
+                raise   # e.g. before send_response — do_GET's normal error path handles it
+            # A 200/206 is already on the wire, so do_GET must not also write
+            # a second (500) response on top of it — that would corrupt the
+            # stream. Best available response to a mid-read failure (e.g. EIO
+            # from a flaky disk) is to close the connection and log it.
+            handler.close_connection = True
+            log = getattr(handler.server, "log", None)
+            if log is not None:
+                log(f"httpapi: send_file failed after headers were sent: {exc!r}")

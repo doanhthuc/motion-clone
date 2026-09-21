@@ -34,8 +34,21 @@ NOT_FOUND = ApiError(404, "not_found", "no such resource")
 class _Handler(BaseHTTPRequestHandler):
     server: "_Server"
     protocol_version = "HTTP/1.1"
+    # socketserver's per-request socket timeout. Without it, a keep-alive
+    # connection that goes idle (or a client that stops reading mid-response)
+    # holds a ThreadingHTTPServer worker thread forever.
+    timeout = 60
 
     def log_message(self, fmt, *args):          # route stdlib access logs to our logger
+        # AVPlayer issues many Range requests per playback (one per seek/
+        # chunk); logging every 200/206 on /v1/outputs/<batch>/<file> would
+        # flood the journal with routine seek traffic. log_request's default
+        # call is log_message('"%s" %s %s', requestline, code, size), so
+        # args[1] is the status code.
+        if len(args) >= 2 and args[1] in ("200", "206"):
+            parts = urlsplit(self.path).path.split("/")
+            if len(parts) == 5 and parts[1] == "v1" and parts[2] == "outputs":
+                return
         self.server.log("api: " + fmt % args)
 
     def do_GET(self):
@@ -85,10 +98,28 @@ class _Handler(BaseHTTPRequestHandler):
                 raise NOT_FOUND
         raise NOT_FOUND
 
+    def _etag_matches(self, etag: str) -> bool:
+        # Cloudflare (and other proxies) can rewrite a strong ETag to a weak
+        # one (`W/"..."`) when compressing the response, and a client may
+        # send several candidates comma-separated. RFC 7232's weak comparison
+        # only requires the opaque tag to match, so without stripping the
+        # W/ prefix here, 304 would never fire once any such proxy sits in
+        # front of this server.
+        header = self.headers.get("If-None-Match")
+        if not header:
+            return False
+        for candidate in header.split(","):
+            candidate = candidate.strip()
+            if candidate.startswith("W/"):
+                candidate = candidate[2:].strip()
+            if candidate == "*" or candidate == etag:
+                return True
+        return False
+
     def _send_json(self, status: int, payload: dict) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode()
         etag = '"' + hashlib.sha1(body).hexdigest() + '"'
-        if status == 200 and self.headers.get("If-None-Match") == etag:
+        if status == 200 and self._etag_matches(etag):
             self.send_response(304)
             self.send_header("ETag", etag)
             self.send_header("Content-Length", "0")

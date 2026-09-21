@@ -1,8 +1,10 @@
+import errno
 import http.client
 import json
 import socket
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -10,11 +12,12 @@ from unittest import mock
 from io import BytesIO
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from batchlib_ext.lease import Lease
 import control.runs as runs
 import tgbot.run as run_mod
 import httpapi.files as files_module
 from httpapi.files import parse_range
-from httpapi.server import make_server, start_in_thread
+from httpapi.server import _Handler, make_server, start_in_thread
 
 TOKEN = "t-123"
 
@@ -27,6 +30,7 @@ class FakeHandler:
         self.headers_sent = {}
         self.response_status = None
         self.wfile = BytesIO()
+        self.server = None   # real BaseHTTPRequestHandler always has one
 
     def send_response(self, status):
         self.response_status = status
@@ -118,6 +122,38 @@ class TestEtag(HttpTestBase):
         resp, body = self.request("/v1/runs/r1", headers={"If-None-Match": etag})
         self.assertEqual((resp.status, body), (304, b""))
 
+    def test_etag_is_stable_across_requests_with_a_live_lease(self):
+        # elapsed_sec (derived from time.time()) used to sit in the body, so
+        # the ETag (a hash of the body) changed every second and 304 could
+        # never fire while a pod was live (review finding 2a). provisioned_at
+        # is a fixed number from the lease, so it must not do that.
+        lease = Lease(pod_id="p1", provisioned_at=time.time() - 30,
+                      manifest=str(self.batch / "r1.yaml"), abs_max_min=120, provider="vast")
+        with mock.patch.object(run_mod, "lease_for", return_value=lease):
+            resp1, _ = self.request("/v1/runs/r1")
+            resp2, _ = self.request("/v1/runs/r1")
+            etag = resp1.getheader("ETag")
+            self.assertTrue(etag)
+            self.assertEqual(etag, resp2.getheader("ETag"))
+            resp3, body3 = self.request("/v1/runs/r1", headers={"If-None-Match": etag})
+        self.assertEqual((resp3.status, body3), (304, b""))
+
+    def test_weak_etag_matches(self):
+        # Cloudflare can rewrite a strong ETag to a weak one (W/"...") when
+        # compressing the response; RFC 7232 weak comparison only needs the
+        # opaque tag to match, so this must still 304.
+        resp, _ = self.request("/v1/runs/r1")
+        etag = resp.getheader("ETag")
+        resp, body = self.request("/v1/runs/r1", headers={"If-None-Match": f"W/{etag}"})
+        self.assertEqual((resp.status, body), (304, b""))
+
+    def test_weak_etag_in_a_list_matches(self):
+        resp, _ = self.request("/v1/runs/r1")
+        etag = resp.getheader("ETag")
+        resp, body = self.request(
+            "/v1/runs/r1", headers={"If-None-Match": f'"other", W/{etag}'})
+        self.assertEqual((resp.status, body), (304, b""))
+
 
 class TestErrors(HttpTestBase):
     def test_an_exception_is_a_logged_500_and_the_server_survives(self):
@@ -129,6 +165,36 @@ class TestErrors(HttpTestBase):
         self.assertTrue(any("boom" in line for line in self.logged))
         resp, _ = self.request("/v1/health")
         self.assertEqual(resp.status, 200)
+
+
+class TestHandlerTimeout(unittest.TestCase):
+    def test_handler_has_a_finite_idle_timeout(self):
+        # Without this, a keep-alive connection that goes idle (or a client
+        # that stops reading mid-response) holds a ThreadingHTTPServer worker
+        # thread forever.
+        self.assertEqual(_Handler.timeout, 60)
+
+
+class TestAccessLogSuppression(HttpTestBase):
+    def test_successful_output_requests_are_not_logged(self):
+        # AVPlayer issues many Range requests per playback; logging every
+        # 200/206 on /v1/outputs/... would flood the journal with routine
+        # seek traffic.
+        self.logged.clear()
+        resp, _ = self.request("/v1/outputs/b1/a.mp4")
+        self.assertEqual(resp.status, 200)
+        self.assertFalse(any("outputs" in line for line in self.logged), self.logged)
+
+    def test_a_404_on_outputs_is_still_logged(self):
+        self.logged.clear()
+        resp, _ = self.request("/v1/outputs/b1/missing.mp4")
+        self.assertEqual(resp.status, 404)
+        self.assertTrue(any("outputs" in line for line in self.logged), self.logged)
+
+    def test_other_routes_are_still_logged(self):
+        self.logged.clear()
+        self.request("/v1/health")
+        self.assertTrue(any("health" in line for line in self.logged), self.logged)
 
 
 class TestParseRange(unittest.TestCase):
@@ -213,6 +279,47 @@ class TestFileStreaming(HttpTestBase):
             self.assertEqual(resp.status, 404)
             self.assertEqual(json.loads(body)["error"]["code"], "not_found")
 
+    def test_os_error_after_headers_sent_does_not_propagate(self):
+        # A non-ConnectionError OSError (e.g. EIO from a flaky disk) reading
+        # the file after the 200/206 headers are already on the wire must
+        # not escape send_file: do_GET's except would otherwise write a
+        # second (500) response on top of the first, corrupting the stream.
+        class EIOFile:
+            def __init__(self, real):
+                self._real = real
+
+            def fileno(self):
+                return self._real.fileno()
+
+            def seek(self, pos):
+                return self._real.seek(pos)
+
+            def read(self, n=-1):
+                raise OSError(errno.EIO, "Input/output error")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                self._real.close()
+                return False
+
+        logged = []
+        handler = FakeHandler()
+        handler.server = types.SimpleNamespace(log=logged.append)
+
+        test_file = Path(tempfile.mktemp(suffix=".bin"))
+        test_file.write_bytes(b"x" * 1000)
+        real = test_file.open("rb")
+        try:
+            with mock.patch.object(Path, "open", return_value=EIOFile(real)):
+                files_module.send_file(handler, test_file)   # must not raise
+            self.assertTrue(handler.close_connection)
+            self.assertEqual(handler.response_status, 200)   # not overwritten to 500
+            self.assertTrue(any("EIO" in m or "Input/output" in m for m in logged), logged)
+        finally:
+            test_file.unlink()
+
     def test_disconnect_during_headers(self):
         # Verify that disconnect during end_headers (header flush) is caught
         class HeaderFailingHandler(FakeHandler):
@@ -293,6 +400,25 @@ class TestBotStartsApi(unittest.TestCase):
                 self.assertIsNone(self.bot._start_control_api(self.tg, 1))
         self.tg.send_message.assert_called_once()
         self.assertIn("API", self.tg.send_message.call_args.args[1])
+
+    def test_thread_start_failure_reports_and_frees_the_port(self):
+        # If the OS refuses to create the daemon thread (RuntimeError: can't
+        # start new thread), that used to escape _start_control_api and, with
+        # systemd Restart=always, crash-loop the whole bot (spec §4.2: the
+        # bot must keep polling even if the phone API can't start).
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]
+        with self.env(CONTROL_API_TOKEN="x", CONTROL_API_PORT=str(port)), \
+             mock.patch.object(self.bot, "start_in_thread",
+                               side_effect=RuntimeError("can't start new thread")):
+            result = self.bot._start_control_api(self.tg, 1)
+        self.assertIsNone(result)
+        self.tg.send_message.assert_called_once()
+        self.assertIn("API", self.tg.send_message.call_args.args[1])
+        # The port must be free again — make_server already bound it before
+        # start_in_thread failed, so the fix must close it on that path.
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", port))
 
 
 if __name__ == "__main__":
