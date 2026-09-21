@@ -5,10 +5,12 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+from io import BytesIO
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import control.runs as runs
 import tgbot.run as run_mod
+import httpapi.files as files_module
 from httpapi.files import parse_range
 from httpapi.server import make_server, start_in_thread
 
@@ -143,6 +145,77 @@ class TestFileStreaming(HttpTestBase):
                                headers={"Range": f"bytes={len(self.video)}-"})
         self.assertEqual(resp.status, 416)
         self.assertEqual(resp.getheader("Content-Range"), f"bytes */{len(self.video)}")
+
+    def test_multi_chunk_stream(self):
+        # Verify that streaming works correctly when file is read in small chunks
+        with mock.patch.object(files_module, "_CHUNK", 1000):
+            # Full file request should return all bytes
+            resp, body = self.request("/v1/outputs/b1/a.mp4")
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(body, self.video)
+            # Range request should return exact slice
+            resp, body = self.request("/v1/outputs/b1/a.mp4", headers={"Range": "bytes=100-199"})
+            self.assertEqual(resp.status, 206)
+            self.assertEqual(body, self.video[100:200])
+
+    def test_disconnect_during_stream(self):
+        # Verify that client disconnect (BrokenPipeError) is handled gracefully
+        from http.server import BaseHTTPRequestHandler
+
+        # Create a minimal fake handler that raises BrokenPipeError on write
+        class FakeHandler(BaseHTTPRequestHandler):
+            def __init__(self):
+                self.response_status = None
+                self.headers_sent = {}
+                self.close_connection = False
+                self.headers = {}
+
+            def send_response(self, status):
+                self.response_status = status
+
+            def send_header(self, name, value):
+                self.headers_sent[name] = value
+
+            def end_headers(self):
+                pass
+
+        # Create wfile that raises BrokenPipeError on any write
+        class FailingWFile:
+            def write(self, data):
+                raise BrokenPipeError("client disconnected")
+
+        handler = FakeHandler()
+        handler.wfile = FailingWFile()
+
+        # send_file should handle the disconnect gracefully
+        test_file = Path(tempfile.mktemp(suffix=".bin"))
+        test_file.write_bytes(b"x" * 1000)
+        try:
+            files_module.send_file(handler, test_file)
+            # Should not raise, and should mark connection for close
+            self.assertTrue(handler.close_connection)
+        finally:
+            test_file.unlink()
+
+    def test_file_vanishes_between_resolve_and_send(self):
+        # Verify that file vanishing becomes a 404, not a 500
+        resp, body = self.request("/v1/outputs/b1/a.mp4")
+        # Delete the file after it was resolved but before response is complete
+        # We do this by patching resolve_output to delete the file after returning it
+        from pathlib import Path
+        import control.outputs as outputs_mod
+
+        original_resolve = outputs_mod.resolve_output
+        def resolve_and_delete(out_dir, batch, name):
+            path = original_resolve(out_dir, batch, name)
+            if path and path.exists():
+                path.unlink()  # Delete immediately
+            return path
+
+        with mock.patch.object(outputs_mod, "resolve_output", side_effect=resolve_and_delete):
+            resp, body = self.request("/v1/outputs/b1/a.mp4")
+            self.assertEqual(resp.status, 404)
+            self.assertEqual(json.loads(body)["error"]["code"], "not_found")
 
 
 if __name__ == "__main__":

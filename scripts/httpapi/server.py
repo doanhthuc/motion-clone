@@ -79,7 +79,10 @@ class _Handler(BaseHTTPRequestHandler):
             path = outputs.resolve_output(s.out_dir, rest[1], rest[2])
             if path is None:
                 raise NOT_FOUND
-            return send_file(self, path)
+            try:
+                return send_file(self, path)
+            except FileNotFoundError:
+                raise NOT_FOUND
         raise NOT_FOUND
 
     def _send_json(self, status: int, payload: dict) -> None:
