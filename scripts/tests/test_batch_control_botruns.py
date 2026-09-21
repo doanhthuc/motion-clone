@@ -531,6 +531,24 @@ class TestRentPanel(_AppRunsFixture):
         self.assertTrue(body["runpod"]["sold_out"])
         self.assertIsNone(body["runpod"]["stock"])
 
+    def test_rent_panel_never_prices_the_telegram_draft(self):
+        # _draft_manifest(chat_id) with no jobs falls back to _jobs_for(chat_id),
+        # i.e. the TELEGRAM chat's own draft. With the app's draft empty (or
+        # unvalidated) and a Telegram draft sitting in _STATE, the panel must
+        # describe nothing rather than price the Telegram user's job.
+        telegram = self._job("telegram")
+        bot._STATE[ME] = telegram
+        bot._LAST_VALIDATE[ME] = True
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()), \
+             mock.patch("tgbot.bot.vast_fetch_quote", side_effect=RuntimeError("no vastai")), \
+             mock.patch("tgbot.bot.vast_credit", return_value=25.0), \
+             mock.patch("tgbot.bot._draft_manifest") as draft_manifest:
+            status, body = self.runs.rent_panel(self.runs.run_id, force=False)
+        self.assertEqual(status, 200)
+        self.assertEqual((body["jobs"], body["estimate_min"]), (0, 0))
+        draft_manifest.assert_not_called()
+
     def test_rent_panel_token_matches_what_confirm_accepts(self):
         self._seed_draft(validated=True)
         with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
