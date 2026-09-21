@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import control
 from control import materials
 import tgbot.run as run_mod
 
@@ -209,6 +210,7 @@ class TestDelete(MaterialsBase):
             with self.assertRaises(materials.MaterialError) as cm:
                 materials.delete_material(self.staging, self.batch, "app", "a.mp4")
         self.assertEqual(cm.exception.code, "in_use")
+        self.assertEqual(cm.exception.message, "a running batch uses this file")
         self.assertTrue(self.a.exists())
 
     def test_a_finished_manifest_does_not_block(self):
@@ -233,6 +235,43 @@ class TestDelete(MaterialsBase):
 
     def test_owner_is_stripped_before_the_app_check(self):
         materials.delete_material(self.staging, self.batch, " app ", "a.mp4")
+        self.assertFalse(self.a.exists())
+
+    def test_delete_waits_for_control_lock_held_by_another_thread(self):
+        # A PATCH /v1/draft can add this same file to the app's draft between
+        # _in_use's check and the unlink; holding control.LOCK across both is
+        # what closes that race. Simulate a holder (the draft mutation) and
+        # confirm the delete neither unlinks early nor deadlocks once the
+        # holder releases (RLock ownership is per-thread, so acquire/release
+        # both happen inside `holder`, not split across threads).
+        acquired, release = threading.Event(), threading.Event()
+
+        def holder():
+            control.LOCK.acquire()
+            acquired.set()
+            release.wait(5)
+            control.LOCK.release()
+
+        h = threading.Thread(target=holder)
+        h.start()
+        self.assertTrue(acquired.wait(5))
+
+        done = threading.Event()
+
+        def deleter():
+            materials.delete_material(self.staging, self.batch, "app", "a.mp4")
+            done.set()
+
+        d = threading.Thread(target=deleter)
+        d.start()
+        try:
+            self.assertFalse(done.wait(0.2))
+            self.assertTrue(self.a.exists())
+        finally:
+            release.set()
+        d.join(5)
+        h.join(5)
+        self.assertTrue(done.is_set())
         self.assertFalse(self.a.exists())
 
 
@@ -326,6 +365,27 @@ class TestThumbConcurrency(unittest.TestCase):
                 for w in workers:
                     w.join(10)
         self.assertEqual(peak[0], 2)
+
+
+class TestDeleteVsAppDraft(unittest.TestCase):
+    def test_delete_refuses_material_the_app_draft_uses(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        batch, staging = tmp / "batch", tmp / "batch" / "tg-staging"
+        (staging / "app").mkdir(parents=True)
+        used, free = staging / "app" / "a.png", staging / "app" / "a.png.bak"
+        used.write_bytes(b"x"); free.write_bytes(b"x")
+        # .resolve(): the store always saves a resolved path (dump_jobs, fed
+        # by materials.resolve_material -> control.paths.safe_child), same
+        # reason the manifest tests above compare against self.a.resolve().
+        (batch / "app.draft.json").write_text(
+            json.dumps({"slots": {"character": str(used.resolve())}}, indent=2))
+        with self.assertRaises(materials.MaterialError) as cm:
+            materials.delete_material(staging, batch, "app", "a.png")
+        self.assertEqual(cm.exception.code, "in_use")
+        self.assertEqual(cm.exception.message, "the app's draft uses this file")
+        materials.delete_material(staging, batch, "app", "a.png.bak")   # whole-path match only
+        self.assertFalse(free.exists())
 
 
 class TestPruneThumbs(unittest.TestCase):

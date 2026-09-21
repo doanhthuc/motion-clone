@@ -63,6 +63,15 @@ batch/*.last.json
 batch/*.progress.json
 # draft không đọc được, dọn sang một bên để còn dựng lại tay
 batch/*.json.bad
+# DraftStore's own corrupt/atomic-write files are named
+# `<owner>.draft.json.<hex>.bad` / `.tmp` (control/drafts.py _load/_save) — the
+# hex suffix means they don't end in ".json.bad", so the glob above misses
+# them; these two catch the actual on-disk names.
+batch/*.bad
+batch/*.tmp
+# make batch-validate's throwaway manifests (control/drafts.py validate()) —
+# never a run, never referenced once the request answers.
+batch/.validate/
 # /wipe's per-chat message-id ledger — tracks the user's own chat history
 batch/*.ledger.json
 

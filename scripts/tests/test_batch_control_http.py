@@ -21,6 +21,7 @@ import tgbot.run as run_mod
 import httpapi.files as files_module
 from httpapi.files import parse_range
 from httpapi.server import _Handler, make_server, start_in_thread
+from tgbot.ingest import Probe
 
 TOKEN = "t-123"
 
@@ -63,10 +64,15 @@ class HttpTestBase(unittest.TestCase):
         p.start(); self.addCleanup(p.stop)
         self.logged = []
         self.server = make_server(token=TOKEN, batch_dir=self.batch, out_dir=self.out,
-                                  port=0, log=self.logged.append)
+                                  port=0, log=self.logged.append, **self.server_kwargs())
         start_in_thread(self.server)
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
+
+    def server_kwargs(self) -> dict:
+        """Extra make_server keywords, for subclasses that need a non-default
+        pipeline/provider/probe (e.g. the draft routes)."""
+        return {}
 
     def request(self, path, *, token=TOKEN, headers=None):
         conn = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=5)
@@ -665,6 +671,99 @@ class TestMaterialRoutes(HttpWriteBase):
         resp, body = self.send("GET", "/v1/materials/app/p.png/thumb")
         self.assertEqual((resp.status, resp.getheader("Content-Type")), (200, "image/jpeg"))
         self.assertTrue(body.startswith(b"\xff\xd8"))
+
+
+def _fake_probe(path: Path) -> Probe:
+    """A stand-in for ingest.probe: kind from the extension, no ffprobe call —
+    these tests run offline and don't care about real dimensions/bitrate."""
+    if path.suffix == ".mp4":
+        return Probe(kind="video", width=1080, height=1920, duration_s=5.0,
+                     bitrate_kbps=4000, size_bytes=path.stat().st_size)
+    return Probe(kind="image", width=1024, height=1024, duration_s=0.0,
+                 bitrate_kbps=0, size_bytes=path.stat().st_size)
+
+
+class TestDraftRoutes(HttpWriteBase):
+    def setUp(self):
+        super().setUp()
+        d = self.batch / "tg-staging" / "app"
+        d.mkdir(parents=True)
+        (d / "me.png").write_bytes(b"i")
+        (d / "dress.png").write_bytes(b"i")
+        (d / "dance.mp4").write_bytes(b"v")
+
+    def server_kwargs(self) -> dict:
+        return {"default_pipeline": "tryon-motion-enhance", "default_provider": "gemini",
+                "probe": _fake_probe}
+
+    def request(self, method, path, body=None):
+        resp, data = self.send(method, path, json_body=body) if body is not None \
+            else self.send(method, path)
+        return resp.status, (json.loads(data) if data else None)
+
+    def test_pipelines(self):
+        status, body = self.request("GET", "/v1/pipelines")
+        self.assertEqual(status, 200)
+        self.assertIn("tryon-motion-enhance", [p["id"] for p in body["pipelines"]])
+
+    def test_compose_batch_and_clear(self):
+        status, body = self.request("GET", "/v1/draft")
+        self.assertEqual((status, body["pipeline"], body["provider"]),
+                         (200, "tryon-motion-enhance", "gemini"))
+        status, body = self.request("PATCH", "/v1/draft", {"slots": {
+            "character": "app/me.png", "outfit": "app/dress.png", "driver": "app/dance.mp4"}})
+        self.assertEqual((status, body["missing"]), (200, []))
+        status, body = self.request("POST", "/v1/draft/add-to-batch")
+        self.assertEqual((status, len(body["batch"])), (200, 1))
+        digest = body["batch"][0]["digest"]
+        status, body = self.request("DELETE", f"/v1/draft/batch/{digest}")
+        self.assertEqual((status, body["batch"]), (200, []))
+        status, body = self.request("POST", "/v1/draft/clear")
+        self.assertEqual((status, body["slots"]), (200, {}))
+
+    def test_refusal_statuses(self):
+        cases = [
+            ("PATCH", "/v1/draft", {"pipeline": "nope"}, 422, "unknown_pipeline"),
+            ("PATCH", "/v1/draft", {"slots": {"driver": "app/me.png"}}, 422, "wrong_kind"),
+            ("PATCH", "/v1/draft", {"slots": {"character": "app/none.png"}}, 404, "not_found"),
+            ("PATCH", "/v1/draft", {"hat": 1}, 400, "bad_request"),
+            ("POST", "/v1/draft/add-to-batch", None, 422, "missing_slots"),
+            ("DELETE", "/v1/draft/batch/0000000000", None, 404, "not_found"),
+            ("POST", "/v1/draft/validate", None, 422, "nothing_to_validate"),
+        ]
+        for method, path, body, want_status, want_code in cases:
+            with self.subTest(method=method, path=path, body=body):
+                status, got = self.request(method, path, body)
+                self.assertEqual((status, got["error"]["code"]), (want_status, want_code))
+
+    def test_draft_etag_is_stable_between_polls(self):
+        resp, _ = self.send("GET", "/v1/draft")
+        etag = resp.getheader("ETag")
+        self.assertTrue(etag)
+        resp, body = self.send("GET", "/v1/draft", headers={"If-None-Match": etag})
+        self.assertEqual((resp.status, body), (304, b""))
+
+    def test_deleting_material_the_draft_uses_is_409(self):
+        self.request("PATCH", "/v1/draft", {"slots": {"character": "app/me.png"}})
+        status, body = self.request("DELETE", "/v1/materials/app/me.png")
+        self.assertEqual((status, body["error"]["code"]), (409, "in_use"))
+
+    def test_patch_error_closes_the_connection(self):
+        # Same technique as the existing keep-alive tests for DELETE/POST
+        # errors: a body-bearing method that errors must not leave the
+        # connection open for a client that expects it closed.
+        resp, _ = self.send("PATCH", "/v1/draft", json_body={"pipeline": "nope"})
+        self.assertEqual(resp.status, 422)
+        self.assertEqual(resp.getheader("Connection"), "close")
+
+    def test_validate_route_passes_repo_root(self):
+        self.request("PATCH", "/v1/draft", {"slots": {
+            "character": "app/me.png", "outfit": "app/dress.png", "driver": "app/dance.mp4"}})
+        with mock.patch("control.drafts.subprocess.run",
+                        return_value=mock.Mock(returncode=0, stdout="ok", stderr="")) as run:
+            status, body = self.request("POST", "/v1/draft/validate")
+        self.assertEqual((status, body["valid"]), (200, True))
+        self.assertEqual(run.call_args.kwargs["cwd"], self.batch.parent)
 
 
 if __name__ == "__main__":

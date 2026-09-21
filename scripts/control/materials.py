@@ -15,6 +15,7 @@ import unicodedata
 import uuid
 from pathlib import Path
 
+import control
 from control.paths import safe_child
 import tgbot.run as run_mod
 from tgbot import ingest as ingest_mod
@@ -249,9 +250,10 @@ def resolve_material(staging_root: Path, owner: str, name: str) -> Path | None:
     return path
 
 
-def _in_use(batch_dir: Path, path: Path) -> bool:
-    """A busy run's manifest names this file. Only busy runs block: a finished
-    manifest keeps naming its inputs forever, and would make nothing deletable.
+def _in_use(batch_dir: Path, path: Path) -> str | None:
+    """A busy run's manifest, or the app's draft, names this file. Only busy
+    runs block: a finished manifest keeps naming its inputs forever, and would
+    make nothing deletable.
 
     Matches the whole path, not a bare substring: `needle in text` would also
     match `<path>.bak` or any other manifest value that merely starts with
@@ -259,16 +261,29 @@ def _in_use(batch_dir: Path, path: Path) -> bool:
     lookahead requires the match to end at end-of-text or at a character that
     cannot continue a path inside the manifest's YAML (whitespace, a quote,
     or a flow-mapping delimiter).
+
+    Returns the reason (for the error message), or None when the file is
+    free — not a bare bool, so the caller can tell a busy manifest apart from
+    the app's draft instead of printing one message for both.
     """
     pattern = re.compile(re.escape(str(path)) + r"(?=$|[\s'\",}\]])")
     for manifest in batch_dir.glob("*.yaml"):
         try:
             if pattern.search(manifest.read_text(encoding="utf-8", errors="replace")) \
                     and run_mod.busy(manifest):
-                return True
+                return "a running batch uses this file"
         except OSError:
             continue
-    return False
+    # The phone's draft (control/drafts.py) names files it has not run yet;
+    # deleting one would leave the draft pointing at nothing. Not a manifest,
+    # so not gated on busy(): a draft is always "in use".
+    draft = batch_dir / f"{APP_OWNER}.draft.json"
+    try:
+        if pattern.search(draft.read_text(encoding="utf-8", errors="replace")):
+            return "the app's draft uses this file"
+    except OSError:
+        pass
+    return None
 
 
 def delete_material(staging_root: Path, batch_dir: Path, owner: str, name: str) -> None:
@@ -280,9 +295,18 @@ def delete_material(staging_root: Path, batch_dir: Path, owner: str, name: str) 
         # Telegram's /clear and /wipe own the chat directories; deleting a file
         # a Telegram draft points at would break that draft with no message.
         raise MaterialError("forbidden", "only material uploaded from the app can be deleted here")
-    if _in_use(batch_dir, path):
-        raise MaterialError("in_use", "a running batch uses this file")
-    path.unlink(missing_ok=True)
+    # DraftStore.patch can add this same file to the app's draft between the
+    # _in_use check and the unlink below (its own ffprobe runs outside
+    # control.LOCK, same shape race as its "file deleted between resolve and
+    # apply" guard) — wrapping both steps in control.LOCK closes it from this
+    # side too. Verified no lock-ordering risk: nothing here takes
+    # control.LOCK while holding _STAGE_LOCK (stage_file) or uploads._LOCK,
+    # and drafts.py never takes those while holding control.LOCK.
+    with control.LOCK:
+        reason = _in_use(batch_dir, path)
+        if reason is not None:
+            raise MaterialError("in_use", reason)
+        path.unlink(missing_ok=True)
 
 
 def thumbnail(staging_root: Path, thumbs_root: Path, owner: str, name: str) -> Path:

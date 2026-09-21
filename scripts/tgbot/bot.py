@@ -51,6 +51,8 @@ import batch_clean
 from tgbot.tgclient import Tg, TgError
 from httpapi.server import make_server, start_in_thread
 from control import materials, uploads
+import control.drafts as drafts
+from control.drafts import PROVIDER_LABELS
 from control.materials import fold_diacritics as _fold_diacritics, safe_name as _safe_name
 from control.paths import safe_child as _safe_child
 from tgbot import tiktok
@@ -121,25 +123,7 @@ JOB_PIPELINE = "tryon-motion-enhance"
 # one silently switches pipelines under them).
 _DEFAULT_PIPELINE = JOB_PIPELINE
 
-# Try-on providers offered from the bot. gemini/qwen-max run directly from
-# THIS process (batchlib/runner.py's run_local_phase, invoked by drain.py's
-# Phase A) before a pod is ever rented — the self-host default still needs the
-# pod, same as every pipeline's motion/character-swap/enhance stage always has.
-#
-# "qwen-max" here is what the user calls "Qwen Image 3.0 Pro" — the DashScope
-# Qwen-Image API (batchlib/local_tryon.py:394-398). Needs DASHSCOPE_API_KEY
-# AND QWEN_IMAGE_WORKSPACE (or QWEN_IMAGE_BASE) in the VPS's .env; missing
-# either raises a ConfigError from run_local_phase, same as a missing
-# GEMINI_API_KEY does for gemini. The model actually called is
-# QWEN_IMAGE_MODEL (defaults to "qwen-image-edit-plus", GA) — "qwen-image-3.0-
-# pro" specifically was limited preview at local_tryon.py:395-397 and only
-# runs once that env var is set to it; the button does not promise 3.0 by name.
-PROVIDER_LABELS = {"qwen": "🖥 Self-host (qwen) — needs the GPU pod",
-                  "gemini": "☁️ Gemini API — runs here, no pod wait; "
-                            "may crop product photos less precisely than "
-                            "the pod path",
-                  "qwen-max": "☁️ Qwen-Image API (DashScope) — runs here, "
-                              "no pod wait; same crop caveat as Gemini"}
+# PROVIDER_LABELS lives in control/drafts.py (shared with the phone API).
 
 # The value a NEW job starts on — same role for provider as JOB_PIPELINE/
 # _DEFAULT_PIPELINE above has for pipeline, including the TG_PROVIDER env
@@ -733,12 +717,7 @@ def _switch_pipeline(chat_id: int, name: str) -> tuple[Job, list[str]]:
     would produce a run that ignores a file the user deliberately labelled.
     """
     job = _job_for(chat_id)
-    usable = required_roles(name) | optional_roles(name)
-    dropped = sorted(set(job.slots) - usable)
-    for role in dropped:
-        job.slots.pop(role, None)
-        job.probes.pop(role, None)
-    job.pipeline = name
+    dropped = drafts.drop_unusable(job, name)
     # The cached verdict belongs to the manifest of the OLD pipeline. Leaving
     # it set would let a later /confirm act on a validation that never ran
     # against what is about to be submitted.
@@ -2480,40 +2459,11 @@ _FIDELITY: dict[int, dict[str, str]] = {}
 _BASKET: dict[int, list[Job]] = {}
 
 
-def _copy_job(job: Job) -> Job:
-    """A detached copy. The basket must not alias the job still being edited.
-
-    Job holds plain dicts, so appending the live object and carrying on editing
-    it would silently rewrite an entry the user already committed to the batch.
-    """
-    return Job(pipeline=job.pipeline, slots=dict(job.slots),
-               probes=dict(job.probes), provider=job.provider)
-
-
-def _signature(job: Job) -> tuple:
-    """What makes two runs the same run — pipeline, material, and provider.
-
-    Provider is part of the identity, not just a cosmetic setting: same
-    material through gemini vs qwen is two different runs (different API,
-    different cost, possibly different output) — collapsing them into "the
-    same job" would make _job_digest collide and an edit/drop tap on one
-    basket row silently act on the other.
-    """
-    return (job.pipeline, job.provider,
-            tuple(sorted((r, str(p)) for r, p in job.slots.items())))
-
-
-def _job_digest(job: Job) -> str:
-    """A short, stable handle for one queued job, for callback_data.
-
-    Keyed on the job's own material rather than its position in the basket. An
-    index would be a stale-button hazard: the keyboard on an older panel still
-    works — Telegram never expires one — so `bj:d:2` tapped after the batch has
-    changed would delete whatever is second NOW. A digest simply fails to match
-    and says so, which is the same reasoning as _run_token's staleness guard on
-    the money button.
-    """
-    return hashlib.sha256(repr(_signature(job)).encode()).hexdigest()[:10]
+# _copy_job / _signature / _job_digest live in control/drafts.py (shared with
+# the phone API).
+_copy_job = drafts.copy_job
+_signature = drafts.signature
+_job_digest = drafts.job_digest
 
 
 def _find_in_batch(chat_id: int, digest: str) -> int | None:
@@ -2610,13 +2560,7 @@ def _jobs_for(chat_id: int) -> list[Job]:
     they want changed — which means it is briefly an exact duplicate. Running it
     would pay twice for one video.
     """
-    jobs = list(_BASKET.get(chat_id) or [])
-    current = _STATE.get(chat_id)
-    if current is None or missing_slots(current):
-        return jobs
-    if any(_signature(current) == _signature(other) for other in jobs):
-        return jobs
-    return jobs + [current]
+    return drafts.jobs_for(_STATE.get(chat_id), _BASKET.get(chat_id) or [])
 
 
 # Panels that are a PHOTO rather than a text message. A ready job becomes one
@@ -3807,24 +3751,10 @@ def tick_migration_progress(tg: Tg, chat_id: int, *, dry_run: bool = False) -> N
 _LAST_SUFFIX = ".last.json"
 
 
-def _dump_jobs(jobs: list[Job]) -> list[dict]:
-    return [{"pipeline": j.pipeline,
-             "provider": j.provider,
-             "slots": {r: str(v) for r, v in j.slots.items()},
-             "probes": {r: asdict(pr) for r, pr in j.probes.items()}}
-            for j in jobs]
-
-
-def _load_jobs(payload: list) -> list[Job]:
-    return [Job(pipeline=entry["pipeline"],
-                # .get, not entry["provider"]: a basket dumped by a previous
-                # version of this bot has no such key, and refusing to load an
-                # otherwise good job over a missing cosmetic field is exactly
-                # the failure _load_draft's own docstring warns against.
-                provider=entry.get("provider", DEFAULT_PROVIDER),
-                slots={r: Path(v) for r, v in entry["slots"].items()},
-                probes={r: Probe(**d) for r, d in entry["probes"].items()})
-            for entry in payload]
+# _dump_jobs / _load_jobs live in control/drafts.py (shared with the phone
+# API).
+_dump_jobs = drafts.dump_jobs
+_load_jobs = drafts.load_jobs
 
 
 def _last_path(chat_id: int) -> Path:
@@ -6588,8 +6518,13 @@ def _start_control_api(tg: Tg, chat_id: int):
     server = None
     try:
         port = int(env_get(ROOT / ".env", "CONTROL_API_PORT") or 8787)
+        # main() has already applied TG_PIPELINE/TG_PROVIDER to these globals by
+        # the time this runs, so the phone's brand-new draft starts on the same
+        # pipeline/provider Telegram's own drafts do, rather than the server's
+        # hardcoded fallback.
         server = make_server(token=token, batch_dir=ROOT / "batch", out_dir=ROOT / "out",
-                             port=port, log=log)
+                             port=port, log=log,
+                             default_pipeline=_DEFAULT_PIPELINE, default_provider=_DEFAULT_PROVIDER)
         start_in_thread(server)
     except (OSError, ValueError, RuntimeError) as exc:
         # RuntimeError: the OS refused to create the daemon thread (e.g. a
