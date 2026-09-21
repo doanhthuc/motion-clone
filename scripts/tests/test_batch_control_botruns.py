@@ -11,6 +11,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batchlib.manifest import load_manifest, state_path_for
+from batchlib_ext.gpu_stock import Stock
 from batchlib_ext.handoff import mailbox_path
 import control.drafts as drafts
 from control.idempotency import IdempotencyStore
@@ -303,6 +304,36 @@ class _AppRunsFixture(_Fixture):
     def _body(self, provider: str = "runpod", tryon=None) -> dict:
         return {"provider": provider, "tryon": tryon, "panel_token": self.runs.panel_token()}
 
+    def _tryon_job(self, tag: str = "tryon") -> Job:
+        """A job whose pipeline has a LOCAL try-on stage. `motion-enhance`
+        (every other job in this file) has none — `tryon-motion-enhance`
+        does, and needs `provider="gemini"` explicit: the Job dataclass
+        default (`qwen`, self-host) is not in LOCAL_PROVIDERS."""
+        character = self.root / f"{tag}-character.png"
+        driver = self.root / f"{tag}-driver.mp4"
+        outfit = self.root / f"{tag}-outfit.png"
+        for path, data in ((character, b"c"), (driver, b"d"), (outfit, b"o")):
+            path.write_bytes(data)
+        return Job(
+            slots={"character": character, "driver": driver, "outfit": outfit},
+            probes={"character": Probe(kind="image", width=1024, height=1024,
+                                       duration_s=0.0, bitrate_kbps=0, size_bytes=800_000),
+                    "driver": Probe(kind="video", width=1080, height=1920,
+                                    duration_s=5.0, bitrate_kbps=3000, size_bytes=1_500_000),
+                    "outfit": Probe(kind="image", width=1024, height=1024,
+                                    duration_s=0.0, bitrate_kbps=0, size_bytes=800_000)},
+            pipeline="tryon-motion-enhance", provider="gemini")
+
+    def _write_live_manifest(self, job: Job):
+        write_manifest([job], self._live(), now=time.strftime("%Y-%m-%d %H:%M:%S"))
+        return load_manifest(self._live())
+
+    def _write_journal(self, run_id: str, *, batch: str = "batch1", **stages) -> None:
+        state_path_for(self._live()).write_text(
+            json.dumps({"batch": batch, "runs": {run_id: {"status": "running",
+                                                           "stages": stages}}}),
+            encoding="utf-8")
+
 
 class TestAppRunsPhaseA(_AppRunsFixture):
     def test_phase_a_requires_a_validated_draft(self):
@@ -461,6 +492,204 @@ class TestBotLoopLocking(_AppRunsFixture):
         with mock.patch("tgbot.bot.tick_progress", side_effect=probe_from_another_thread):
             bot._run_ticks(self.tg, ME, dry_run=False)
         self.assertEqual(seen, [False, False])
+
+
+class TestRentPanel(_AppRunsFixture):
+    """`AppRuns.rent_panel` — the same runpodctl/Vast primitives
+    `_offer_run_confirm`/`_offer_vast_panel` read, minus the Telegram send."""
+
+    def _stock(self, status: str = "High", price: float = 0.99) -> dict:
+        return {"NVIDIA GeForce RTX 5090": [
+            Stock(gpu_id="NVIDIA GeForce RTX 5090", display_name="RTX 5090",
+                  datacenter_id="EU-RO-1", stock_status=status, price_per_hr=price)]}
+
+    def test_rent_panel_in_stock(self):
+        self._seed_draft(validated=True)
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()), \
+             mock.patch("tgbot.bot.vast_fetch_quote", side_effect=RuntimeError("no vastai")), \
+             mock.patch("tgbot.bot.vast_credit", return_value=25.0):
+            status, body = self.runs.rent_panel(self.runs.run_id, force=False)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["runpod"], {
+            "gpu": "NVIDIA GeForce RTX 5090", "datacenter": "EU-RO-1",
+            "stock": "High", "usd_per_hr": 0.99, "sold_out": False})
+        self.assertFalse(body["after_phase_a"])
+        self.assertEqual(body["jobs"], 1)
+        self.assertGreater(body["estimate_min"], 0)
+        self.assertEqual(body["run_id"], self.runs.run_id)
+        self.assertEqual(body["panel_token"], self.runs.panel_token())
+
+    def test_rent_panel_sold_out_and_runpodctl_failure_fail_open(self):
+        self._seed_draft(validated=True)
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", side_effect=RuntimeError("runpodctl down")), \
+             mock.patch("tgbot.bot.vast_fetch_quote", side_effect=RuntimeError("no vastai")), \
+             mock.patch("tgbot.bot.vast_credit", return_value=25.0):
+            status, body = self.runs.rent_panel(self.runs.run_id, force=False)
+        self.assertEqual(status, 200)
+        self.assertTrue(body["runpod"]["sold_out"])
+        self.assertIsNone(body["runpod"]["stock"])
+
+    def test_rent_panel_token_matches_what_confirm_accepts(self):
+        self._seed_draft(validated=True)
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()), \
+             mock.patch("tgbot.bot.vast_fetch_quote", side_effect=RuntimeError("no vastai")), \
+             mock.patch("tgbot.bot.vast_credit", return_value=25.0):
+            _, body = self.runs.rent_panel(self.runs.run_id, force=False)
+        confirm_body = {"provider": "runpod", "tryon": None, "panel_token": body["panel_token"]}
+        status, resp = self.runs.confirm(self.runs.run_id, confirm_body, "k")
+        self.assertEqual(status, 202)
+        self.patches["start_drain"].assert_called_once()
+
+    def test_rent_panel_network_runs_outside_the_bot_lock(self):
+        self._seed_draft(validated=True)
+        seen = []
+
+        def probing_stock(*_args, **_kwargs):
+            # A second thread, same reasoning as TestBotLoopLocking: BOT_LOCK
+            # is an RLock, so this thread re-acquiring its own hold would
+            # always succeed and prove nothing.
+            acquired = []
+
+            def worker() -> None:
+                got = bot.BOT_LOCK.acquire(blocking=False)
+                acquired.append(got)
+                if got:
+                    bot.BOT_LOCK.release()
+
+            t = threading.Thread(target=worker)
+            t.start(); t.join(5)
+            seen.append(acquired[0])
+            return self._stock()
+
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", side_effect=probing_stock), \
+             mock.patch("tgbot.bot.vast_fetch_quote", side_effect=RuntimeError("no vastai")), \
+             mock.patch("tgbot.bot.vast_credit", return_value=25.0):
+            status, _ = self.runs.rent_panel(self.runs.run_id, force=False)
+        self.assertEqual(status, 200)
+        self.assertEqual(seen, [True])
+
+    def test_rent_panel_vast_blockers_are_plain_text(self):
+        self._seed_draft(validated=True)   # motion-enhance, no VAST_ENABLED_PIPELINES set
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()), \
+             mock.patch("tgbot.bot.vast_fetch_quote", side_effect=RuntimeError("no vastai")), \
+             mock.patch("tgbot.bot.vast_credit", return_value=25.0):
+            _, body = self.runs.rent_panel(self.runs.run_id, force=False)
+        self.assertTrue(body["vast"]["blockers"])
+        for reason in body["vast"]["blockers"]:
+            self.assertIsInstance(reason, str)
+            self.assertNotIn("<", reason)
+        self.assertFalse(body["vast"]["can_spend"])
+
+
+class TestTryonPreviews(_AppRunsFixture):
+    """`AppRuns.tryon`/`tryon_image` — the journal `_deliver_tryon_previews`
+    itself reads, without the Telegram send."""
+
+    def test_tryon_lists_previews_and_image_path_stays_in_out(self):
+        job = self._tryon_job()
+        manifest = self._write_live_manifest(job)
+        run_id = manifest.runs[0].id
+        image = self.root / "out" / "batch1" / "runs" / run_id / "01-tryon.png"
+        image.parent.mkdir(parents=True, exist_ok=True)
+        image.write_bytes(b"img")
+        self._write_journal(run_id, tryon={"status": "done", "file": str(image)})
+
+        status, body = self.runs.tryon(self.runs.run_id)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["run_token"], bot._run_token(ME))
+        self.assertFalse(body["phase_a_running"])
+        self.assertEqual(body["previews"],
+                         [{"index": "0", "run": run_id, "status": "done", "has_image": True}])
+
+        got = self.runs.tryon_image(self.runs.run_id, "0")
+        self.assertEqual(got, image.resolve())
+
+        # The same slot, now pointing outside out/ — tryon_image refuses it
+        # even though the journal calls it "done".
+        outside = Path(tempfile.mkdtemp()) / "elsewhere.png"
+        outside.write_bytes(b"img")
+        self._write_journal(run_id, tryon={"status": "done", "file": str(outside)})
+        self.assertIsNone(self.runs.tryon_image(self.runs.run_id, "0"))
+
+    def test_tryon_wrong_run_id_is_404(self):
+        status, body = self.runs.tryon("not-the-run-id")
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"]["code"], "not_found")
+
+    def test_tryon_image_wrong_run_id_is_none(self):
+        self.assertIsNone(self.runs.tryon_image("not-the-run-id", "0"))
+
+
+class TestRegenViaAppRuns(_AppRunsFixture):
+    """`AppRuns.regen` — `_regen_tryon` itself, wrapped in the idempotency
+    and the run-id check every other AppRuns method already has."""
+
+    def _seed_tryon_run(self) -> str:
+        job = self._tryon_job()
+        manifest = self._write_live_manifest(job)
+        run_id = manifest.runs[0].id
+        image = self.root / "out" / "batch1" / "runs" / run_id / "01-tryon.png"
+        image.parent.mkdir(parents=True, exist_ok=True)
+        image.write_bytes(b"img")
+        self._write_journal(run_id, tryon={"status": "done", "file": str(image)})
+        return run_id
+
+    def test_regen_starts_once_per_key_and_refuses_a_stale_run_token(self):
+        self._seed_tryon_run()
+        token = bot._run_token(ME)
+        body = {"run_token": token}
+        first = self.runs.regen(self.runs.run_id, "0", body, "same-key")
+        second = self.runs.regen(self.runs.run_id, "0", body, "same-key")
+        self.assertEqual(first[0], 202)
+        self.assertEqual(second, first)
+        self.patches["start_phase_a"].assert_called_once()
+
+        stale = self.runs.regen(self.runs.run_id, "0", {"run_token": "not-the-token"}, "key-2")
+        self.assertEqual(stale[0], 409)
+        self.assertEqual(stale[1]["error"]["code"], "stale_panel")
+
+    def test_regen_requires_a_run_token(self):
+        self._seed_tryon_run()
+        status, body = self.runs.regen(self.runs.run_id, "0", {}, "k")
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "bad_request")
+        self.patches["start_phase_a"].assert_not_called()
+
+    def test_regen_wrong_run_id_is_404(self):
+        self._seed_tryon_run()
+        status, body = self.runs.regen("not-the-run-id", "0", {"run_token": "x"}, "k")
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"]["code"], "not_found")
+
+
+class TestNoAbsolutePaths(_AppRunsFixture):
+    def test_no_absolute_paths_in_any_body(self):
+        self._seed_draft(validated=True)
+        job = self._tryon_job()
+        manifest = self._write_live_manifest(job)
+        run_id = manifest.runs[0].id
+        image = self.root / "out" / "batch1" / "runs" / run_id / "01-tryon.png"
+        image.parent.mkdir(parents=True, exist_ok=True)
+        image.write_bytes(b"img")
+        self._write_journal(run_id, tryon={"status": "done", "file": str(image)})
+
+        bodies = []
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value={}), \
+             mock.patch("tgbot.bot.vast_fetch_quote", side_effect=RuntimeError("no vastai")), \
+             mock.patch("tgbot.bot.vast_credit", return_value=25.0):
+            bodies.append(self.runs.rent_panel(self.runs.run_id, force=False)[1])
+        bodies.append(self.runs.tryon(self.runs.run_id)[1])
+        bodies.append(self.runs.regen(self.runs.run_id, "0",
+                                      {"run_token": bot._run_token(ME)}, "k")[1])
+        root = str(self.root)
+        for body in bodies:
+            self.assertNotIn(root, json.dumps(body))
 
 
 if __name__ == "__main__":

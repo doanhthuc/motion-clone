@@ -6579,6 +6579,59 @@ def _run_error(code: str, message: str) -> dict:
     return {"error": {"code": code, "message": message}}
 
 
+def _rent_panel_data(chat_id: int, *, force: bool, manifest: Manifest | None) -> dict:
+    """The `runpod`/`vast` numbers for the phone's rent panel — the same
+    primitives `_offer_run_confirm` and `_offer_vast_panel` read, called
+    fresh here instead of through either of them: both those functions also
+    send or edit a Telegram message, and this only ever returns JSON.
+
+    Takes no lock. `stock_at`/`stock_at_cached` is a runpodctl round trip and
+    `vast_fetch_quote` can take up to 120s (spec §5.8) — either one held
+    under `BOT_LOCK` would stall every Telegram update for as long as the
+    network call runs. `AppRuns.rent_panel` reads everything that needs the
+    lock (the token, `after_phase_a`, the app's jobs) before calling this.
+    """
+    configured = env_get(ROOT / ".env", "GPU") or _PRIMARY_GPU_ID
+    volume_id = env_get(ROOT / ".env", "POD_VOLUME_ID")
+    home_dc = volume_datacenter(volume_id)
+    wanted = [_PRIMARY_GPU_ID, *_FALLBACK_GPU_IDS]
+    try:
+        stock = ((stock_at(wanted) if force else stock_at_cached(wanted))
+                 if home_dc else {})
+    except RuntimeError:
+        # Fails open exactly like _offer_run_confirm: a dead runpodctl must
+        # never turn this into a 500, only into the honest "no evidence of
+        # stock" answer below (home is None -> sold_out).
+        stock = {}
+    price = _gpu_price(configured, stock)
+    home = next((e for e in (stock.get(configured) or [])
+                if e.datacenter_id == home_dc), None)
+    sold_out = home is None or home.stock_status.lower() == "none"
+    runpod = {"gpu": configured, "datacenter": home_dc,
+             "stock": home.stock_status if home is not None else None,
+             "usd_per_hr": price, "sold_out": sold_out}
+
+    enabled = _vast_enabled()
+    if manifest is None:
+        # No job to quote a session for — same message _offer_vast_panel
+        # shows when _panel_manifest comes back empty.
+        vast = {"enabled": bool(enabled), "usd_per_hr": None, "session_usd": None,
+               "blockers": [_plain("no complete job yet — send the required files first")],
+               "can_spend": False}
+    else:
+        gb = vast_download_gb(manifest)
+        view = vast_build_view(
+            manifest, gb=gb, enabled=enabled,
+            quote_fn=lambda: vast_fetch_quote(gb, force=force, repo_root=_REPO_ROOT),
+            credit_fn=vast_credit)
+        vast = {"enabled": bool(enabled),
+               "usd_per_hr": view.quote.dph if view.quote else None,
+               "session_usd": view.session_usd,
+               "blockers": [_plain(b) for b in view.blockers],
+               "can_spend": view.can_spend}
+    return {"runpod": runpod, "vast": vast}
+
+
 class AppRuns:
     """Phase A and confirm for the phone's draft, run through the one shared
     slot (spec §5.8): the app's jobs go into the Telegram chat's own
@@ -6711,6 +6764,133 @@ class AppRuns:
                     # token here rather than a second round trip to get one.
                     response[1]["panel_token"] = self.panel_token()
         self.idem.finish("confirm", key, *response)
+        return response
+
+    def rent_panel(self, run_id: str, *, force: bool) -> tuple[int, dict]:
+        """The phone's rent panel: RunPod stock/price plus the Vast tab, for
+        the manifest the app is about to spend on. Mirrors
+        `_offer_run_confirm`/`_offer_vast_panel` (do not change either) —
+        see `_rent_panel_data` for why the network calls happen outside this
+        method's own lock."""
+        if run_id != self.run_id:
+            return 404, _run_error("not_found", "no such run")
+        with self._locked() as busy:
+            if busy is not None:
+                return busy
+            token = self.panel_token()
+            after_phase_a = _PHASE_A_OFFERED.get(self.chat_id) == _run_token(self.chat_id)
+            if after_phase_a:
+                try:
+                    manifest = load_manifest(_job_manifest_path(self.chat_id))
+                except (ManifestError, OSError):
+                    manifest = None
+                runs = manifest.runs if manifest is not None else []
+                jobs, estimate_min = len(runs), sum(estimate_minutes(r) for r in runs)
+            else:
+                # None, never [] — _draft_jobs() only ever returns a
+                # non-empty list or None (nothing to run / not validated).
+                app_jobs, _refusal = self._draft_jobs()
+                # jobs=None here would make _draft_manifest fall back to the
+                # TELEGRAM chat's own queued jobs (its own default), leaking
+                # the Telegram user's draft into the app's rent panel — so
+                # the manifest is only built from a real, non-empty list.
+                manifest = _draft_manifest(self.chat_id, jobs=app_jobs) if app_jobs else None
+                jobs = len(app_jobs) if app_jobs else 0
+                estimate_min = sum(estimate_minutes(j) for j in app_jobs) if app_jobs else 0
+        data = _rent_panel_data(self.chat_id, force=force, manifest=manifest)
+        data.update(run_id=self.run_id, panel_token=token, after_phase_a=after_phase_a,
+                    jobs=jobs, estimate_min=estimate_min)
+        return 200, data
+
+    def _tryon_entries(self) -> list[tuple[str, "Run", str, dict]]:
+        """(index, run, stage_name, journal entry) for every run in this
+        chat's manifest whose try-on Phase A can do locally, in the order
+        `_deliver_tryon_previews` walks them. `index` is the run's own
+        position in `manifest.runs`, as a string — the same index
+        `_regen_tryon` takes — not a position in this filtered list, so a
+        button minted from one previews list still resolves against the
+        manifest `_regen_tryon` reads.
+        """
+        manifest_path = _job_manifest_path(self.chat_id)
+        try:
+            manifest = load_manifest(manifest_path)
+        except (ManifestError, OSError):
+            return []
+        runs_state = load_state(state_path_for(manifest_path)).get("runs") or {}
+        found = []
+        for index, run in enumerate(manifest.runs):
+            stage_name = _local_tryon_stage(run)
+            if stage_name is None:
+                continue
+            entry = ((runs_state.get(run.id) or {}).get("stages") or {}).get(stage_name) or {}
+            found.append((str(index), run, stage_name, entry))
+        return found
+
+    def tryon(self, run_id: str) -> tuple[int, dict]:
+        """The phone's try-on previews for this chat's manifest — the same
+        journal `_deliver_tryon_previews` reads, without the Telegram send:
+        the app fetches the image itself, over `tryon_image`."""
+        if run_id != self.run_id:
+            return 404, _run_error("not_found", "no such run")
+        with self._locked() as busy:
+            if busy is not None:
+                return busy
+            previews = []
+            for index, run, _stage, entry in self._tryon_entries():
+                status = entry.get("status") or "pending"
+                has_image = status == "done" and Path(entry.get("file") or "").is_file()
+                previews.append({"index": index, "run": run.id, "status": status,
+                                 "has_image": has_image})
+            response = (200, {"run_id": self.run_id, "run_token": _run_token(self.chat_id),
+                              "phase_a_running": phase_a_running(
+                                  _job_manifest_path(self.chat_id)),
+                              "previews": previews})
+        return response
+
+    def tryon_image(self, run_id: str, index: str) -> Path | None:
+        """The try-on image `tryon()`'s preview at `index` points to, or
+        `None` — including when the journal's own `file` field, for any
+        reason, resolves outside `ROOT / "out"`: this is served to the
+        phone over HTTP, so a path that escapes `out/` must never reach the
+        caller that opens it."""
+        if run_id != self.run_id:
+            return None
+        with self._locked() as busy:
+            if busy is not None:
+                return None
+            entry = next((e for i, _r, _s, e in self._tryon_entries() if i == index), None)
+        if entry is None:
+            return None
+        try:
+            image = Path(entry.get("file") or "").resolve()
+        except OSError:
+            return None
+        out_root = (ROOT / "out").resolve()
+        if not image.is_relative_to(out_root) or not image.is_file():
+            return None
+        return image
+
+    def regen(self, run_id: str, index: str, body: dict, key) -> tuple[int, dict]:
+        """Regenerate one run's try-on image — `_regen_tryon` itself,
+        wrapped the same way `confirm` wraps `_do_confirm`/`_do_resume`."""
+        if run_id != self.run_id:
+            return 404, _run_error("not_found", "no such run")
+        token = body.get("run_token")
+        if not token:
+            return 400, _run_error("bad_request", "run_token is required")
+        replay = self.idem.begin("regen", key)
+        if replay is not None:
+            return replay
+        with self._locked() as busy:
+            if busy is not None:
+                self.idem.forget("regen", key)
+                return busy
+            out = _regen_tryon(_AppTg(self.tg), self.chat_id, index, token, dry_run=False)
+            if out:
+                response = (202, {"run_id": self.run_id, "outcome": out.code})
+            else:
+                response = (status_for(out), _run_error(out.code, out.message))
+        self.idem.finish("regen", key, *response)
         return response
 
 
