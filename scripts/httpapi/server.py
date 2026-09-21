@@ -121,7 +121,18 @@ class _Handler(BaseHTTPRequestHandler):
         # A client that promised more than it sent would block this read until
         # the handler's own socket timeout, so assume the worst until it lands.
         self.close_connection = True
-        self.rfile.read(n)
+        try:
+            self.rfile.read(n)
+        except OSError:
+            # This runs from inside _handle's except clauses (via _error), so
+            # nothing upstream catches an exception raised here — it would
+            # escape to socketserver's default handler and print a raw
+            # traceback instead of going through self.server.log. A stalled
+            # client (TimeoutError/socket.timeout) or a dropped one
+            # (ConnectionError) is exactly a connection we must not reuse, so
+            # log it and return with close_connection already True.
+            self.server.log("api: settle body failed, closing connection\n" + traceback.format_exc())
+            return
         self.close_connection = False
 
     def _content_length(self) -> int:

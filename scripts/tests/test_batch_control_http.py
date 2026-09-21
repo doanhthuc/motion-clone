@@ -170,6 +170,32 @@ class TestErrors(HttpTestBase):
         self.assertEqual(resp.status, 200)
 
 
+class TestSettleBody(unittest.TestCase):
+    def test_a_stalled_drain_closes_the_connection_instead_of_raising(self):
+        # _settle_body runs inside _handle's except clauses (via _error), so
+        # nothing upstream catches an exception raised here (reproduced by a
+        # GET that errors while the client holds back a promised body).
+        logged = []
+
+        class FakeServer:
+            log = staticmethod(logged.append)
+
+        class FakeRfile:
+            def read(self, n):
+                raise TimeoutError("timed out")
+
+        fake = types.SimpleNamespace(
+            headers={"Content-Length": "10"},
+            rfile=FakeRfile(),
+            close_connection=False,
+            _body_consumed=False,
+            server=FakeServer(),
+        )
+        _Handler._settle_body(fake)          # must not raise
+        self.assertTrue(fake.close_connection)
+        self.assertEqual(len(logged), 1)
+
+
 class TestHandlerTimeout(unittest.TestCase):
     def test_handler_has_a_finite_idle_timeout(self):
         # Without this, a keep-alive connection that goes idle (or a client
