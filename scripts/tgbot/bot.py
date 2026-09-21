@@ -3052,8 +3052,14 @@ _TAG = re.compile(r"<[^>]+>")
 
 def _plain(text: str) -> str:
     """A refusal's Telegram HTML as plain text for the phone. Tags go but their
-    inner text stays, so a `<tg-emoji>` keeps its fallback emoji."""
-    return html.unescape(_TAG.sub("", text)).strip()
+    inner text stays, so a `<tg-emoji>` keeps its fallback emoji.
+
+    The repo root is stripped as well: a few refusals format an exception
+    (`could not regenerate — {exc}`) whose ManifestError text starts with the
+    absolute manifest path, and the API never exposes absolute paths.
+    """
+    plain = html.unescape(_TAG.sub("", text)).strip()
+    return plain.replace(str(ROOT) + "/", "").replace(str(ROOT), "")
 
 
 def _refuse(tg: Tg, chat_id: int, code: str, text: str, **send_kwargs) -> Outcome:

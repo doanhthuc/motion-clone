@@ -120,6 +120,23 @@ class TestRefusals(_Fixture):
                        '<tg-emoji emoji-id="1">🚀</tg-emoji>'),
             "⚠️ Not queued — a & b 🚀")
 
+    def test_plain_strips_the_repo_root(self):
+        # A few refusals format an exception whose text starts with the
+        # absolute manifest path (ManifestError does), and that text is what
+        # the phone is handed.
+        self.assertEqual(bot._plain(f"could not regenerate — {self.root}/batch/tg-1.yaml: broken"),
+                         "could not regenerate — batch/tg-1.yaml: broken")
+
+    def test_a_broken_manifest_refusal_names_no_absolute_path(self):
+        self._telegram_draft()
+        broken = f"{self.root}/batch/tg-{ME}.yaml: YAML hỏng"
+        with mock.patch("tgbot.bot.load_manifest", side_effect=bot.ManifestError(broken)):
+            out = bot._regen_tryon(bot._AppTg(self.tg), ME, "0", bot._run_token(ME),
+                                   dry_run=False)
+        self.assertEqual(out.code, "manifest_error")
+        self.assertNotIn(str(self.root), out.message)
+        self.assertIn("YAML hỏng", out.message)
+
     def test_app_tg_forwards_and_is_marked(self):
         app = bot._AppTg(self.tg)
         self.assertTrue(app.app_origin)
