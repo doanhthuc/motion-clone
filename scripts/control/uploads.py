@@ -90,7 +90,8 @@ def write_chunk(uploads_root: Path, upload_id: str, n: int, stream, length: int)
     remaining = length
     try:
         # Stream to .tmp OUTSIDE the lock so slow uploads don't block others.
-        # If the upload dir is removed (e.g. assemble's rmtree), catch OSError.
+        # If the upload dir is removed (e.g. assemble's rmtree) or disk fills up,
+        # catch OSError and distinguish the cause.
         try:
             with tmp.open("wb") as f:
                 while remaining > 0:
@@ -100,8 +101,14 @@ def write_chunk(uploads_root: Path, upload_id: str, n: int, stream, length: int)
                     f.write(block)
                     remaining -= len(block)
         except OSError as e:
-            # If the upload directory was removed, raise not_found instead of raw error.
-            raise UploadError("not_found", "no such upload")
+            if e.errno == errno.ENOSPC:
+                # Disk full: tell the phone to free space and retry this chunk
+                raise UploadError("no_space", "server ran out of disk while receiving this chunk; free space and retry it") from e
+            # Check if the upload directory (or its meta.json) no longer exists
+            if not d.is_dir() or not (d / "meta.json").is_file():
+                raise UploadError("not_found", "no such upload") from e
+            # Other OSError: re-raise to propagate upward
+            raise
         # Atomic rename under lock: re-check meta.json exists, then replace.
         with _LOCK:
             if not (d / "meta.json").is_file():

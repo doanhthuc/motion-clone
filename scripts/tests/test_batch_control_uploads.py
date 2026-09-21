@@ -89,6 +89,56 @@ class TestChunks(UploadsBase):
         # No stray tmp files should be left
         self.assertEqual(list(self.root.glob("*/*.tmp")), [])
 
+    def test_write_chunk_disk_full_during_stream(self):
+        uid = self.open()["upload_id"]
+        # Create a stream that raises ENOSPC during read
+        class EOSPCStream:
+            def __init__(self):
+                self.calls = 0
+            def read(self, size):
+                self.calls += 1
+                if self.calls == 2:
+                    # Raise ENOSPC on the second read call
+                    raise OSError(errno.ENOSPC, "No space left on device")
+                # First read returns partial data to force a second read
+                return b"01" if self.calls == 1 else b""
+
+        stream = EOSPCStream()
+        # Use a larger chunk to force multiple read calls
+        with self.assertRaises(uploads.UploadError) as cm:
+            uploads.write_chunk(self.root, uid, 1, stream, 4)
+        self.assertEqual(cm.exception.code, "no_space")
+        # No stray tmp files should be left
+        self.assertEqual(list(self.root.glob(f"{uid}/*.tmp")), [])
+        # Upload should still exist for retry
+        self.assertTrue((self.root / uid / "meta.json").is_file())
+
+    def test_write_chunk_directory_removed_during_stream(self):
+        uid = self.open()["upload_id"]
+        upload_dir = self.root / uid
+        # Create a stream that removes the upload directory during streaming
+        class RemoveOnReadStream:
+            def __init__(self):
+                self.calls = 0
+                self.upload_dir = upload_dir
+            def read(self, size):
+                self.calls += 1
+                if self.calls == 2:
+                    # Remove the directory on the second read
+                    import shutil as shutil_module
+                    shutil_module.rmtree(self.upload_dir)
+                # Return data to force multiple reads; second read will fail to write
+                if self.calls == 1:
+                    return b"01"
+                raise OSError(2, "No such file or directory")  # Simulate write failure after dir removal
+
+        stream = RemoveOnReadStream()
+        with self.assertRaises(uploads.UploadError) as cm:
+            uploads.write_chunk(self.root, uid, 1, stream, 4)
+        self.assertEqual(cm.exception.code, "not_found")
+        # Nothing stray should remain under uploads_root
+        self.assertEqual(list(self.root.glob("*/*.tmp")), [])
+
 
 class TestAssemble(UploadsBase):
     def test_incomplete_is_refused(self):
