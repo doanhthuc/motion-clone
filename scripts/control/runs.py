@@ -10,7 +10,6 @@ reason the API runs inside the bot process (spec §3, approach A).
 """
 from __future__ import annotations
 
-import time
 from pathlib import Path
 
 from batchlib.manifest import load_state, state_path_for
@@ -52,7 +51,13 @@ def list_runs(batch_dir: Path, out_dir: Path) -> list[dict]:
     for state_file in batch_dir.glob("*.state.json"):
         manifest = batch_dir / (state_file.name[: -len(".state.json")] + ".yaml")
         if manifest.is_file():
-            found.append(_summary(manifest, state_file))
+            try:
+                found.append(_summary(manifest, state_file))
+            except FileNotFoundError:
+                # /clear or batch-clean can delete a state file after glob()
+                # found it but before _summary()'s stat() runs. One vanished
+                # run should not 500 the whole list — skip it.
+                continue
     return sorted(found, key=lambda r: r["updated_at"], reverse=True)
 
 
@@ -77,9 +82,15 @@ def run_detail(batch_dir: Path, out_dir: Path, run_id: str) -> dict | None:
         for job_id, job in jobs.items() if isinstance(job, dict)
     ]
     lease = run_mod.lease_for(manifest)
+    # provisioned_at, not a derived elapsed_sec: elapsed_sec changed every
+    # second, so the ETag (a hash of the whole JSON body, server.py
+    # _send_json) could never repeat while a pod was live and If-None-Match
+    # never got a 304 (review finding 2a, 2026-09-21). provisioned_at is a
+    # fixed number straight from the lease; the phone can compute elapsed
+    # itself from it.
     detail["lease"] = None if lease is None else {
         "provider": lease.provider,
-        "elapsed_sec": int(time.time() - lease.provisioned_at),
+        "provisioned_at": lease.provisioned_at,
         "abs_max_min": lease.abs_max_min,
     }
     detail["outputs"] = final_names(out_dir, detail["batch"]) if detail["batch"] else []

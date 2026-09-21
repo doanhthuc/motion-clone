@@ -18,6 +18,14 @@ def _final_dir(out_dir: Path, batch: str) -> Path | None:
     batch_dir = safe_child(out_dir, batch)
     if batch_dir is None:
         return None
+    # safe_child resolves symlinks while validating the target stays inside
+    # out_dir, so by this point batch_dir already points PAST a symlink like
+    # out/latest (runner.py ~371-374 keeps that one pointed at the newest
+    # batch). Check the un-resolved entry directly: a symlinked batch dir is
+    # excluded outright, not just de-duplicated, so a batch never gets served
+    # under two different names.
+    if (out_dir / batch.strip()).is_symlink():
+        return None
     final = batch_dir / "_final"
     return final if final.is_dir() else None
 
@@ -35,6 +43,11 @@ def final_names(out_dir: Path, batch: str) -> list[str]:
 def list_outputs(out_dir: Path) -> list[dict]:
     listed = []
     for batch_dir in out_dir.iterdir() if out_dir.is_dir() else []:
+        if batch_dir.is_symlink():
+            # out/latest -> newest batch dir (runner.py ~371-374). is_dir()
+            # below follows symlinks, so without this check "latest" was
+            # listed as a second, duplicate entry for the newest batch.
+            continue
         final = batch_dir / "_final"
         if not batch_dir.is_dir() or not final.is_dir():
             continue

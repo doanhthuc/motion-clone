@@ -57,6 +57,23 @@ class TestListRuns(RunsTestBase):
         self.assertEqual((summary["jobs_total"], summary["jobs_done"]), (2, 1))
         self.assertEqual(summary["batch"], "2026-09-20-1000")
 
+    def test_state_file_deleted_between_glob_and_stat_is_skipped(self):
+        # /clear or batch-clean can delete a state file after glob() found it
+        # but before _summary() stats it. That race used to raise out of
+        # list_runs and turn the whole list into a 500 for one vanished run.
+        write_run(self.batch, "gone", STATE)
+        write_run(self.batch, "keep", STATE)
+        real_stat = Path.stat
+
+        def flaky_stat(path_self, *args, **kwargs):
+            if path_self.name == "gone.state.json":
+                raise FileNotFoundError(path_self)
+            return real_stat(path_self, *args, **kwargs)
+
+        with mock.patch.object(Path, "stat", flaky_stat):
+            result = runs.list_runs(self.batch, self.out)
+        self.assertEqual([r["id"] for r in result], ["keep"])
+
 
 class TestStatus(RunsTestBase):
     def test_error_when_any_job_errored_and_nothing_runs(self):
@@ -102,13 +119,18 @@ class TestDetail(RunsTestBase):
 
     def test_lease_is_summarised(self):
         write_run(self.batch, "r", STATE)
-        lease = Lease(pod_id="p1", provisioned_at=time.time() - 65,
+        provisioned_at = time.time() - 65
+        lease = Lease(pod_id="p1", provisioned_at=provisioned_at,
                       manifest=str(self.batch / "r.yaml"), abs_max_min=120, provider="vast")
         with mock.patch.object(run_mod, "lease_for", return_value=lease):
             got = runs.run_detail(self.batch, self.out, "r")["lease"]
         self.assertEqual(got["provider"], "vast")
         self.assertEqual(got["abs_max_min"], 120)
-        self.assertGreaterEqual(got["elapsed_sec"], 65)
+        # provisioned_at, not a derived elapsed_sec: elapsed_sec changed every
+        # second, which meant the ETag (a hash of the whole body) could never
+        # repeat while a pod was live, so 304 never fired (review finding 2a).
+        self.assertEqual(got["provisioned_at"], provisioned_at)
+        self.assertNotIn("elapsed_sec", got)
 
     def test_outputs_list_final_files_only(self):
         write_run(self.batch, "r", STATE)

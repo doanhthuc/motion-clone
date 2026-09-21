@@ -43,6 +43,17 @@ class TestOutputs(unittest.TestCase):
         self.assertIsNone(resolve_output(self.out, "b-new", "../runs/r/01-motion.mp4"))
         self.assertIsNone(resolve_output(self.out, "b-new", "missing.mp4"))
 
+    def test_symlinked_batch_dir_is_excluded(self):
+        # runner.py maintains out/latest -> newest batch dir (runner.py
+        # ~371-374). Without this, list_outputs's is_dir() follows the
+        # symlink and lists "latest" as a second copy of "b-new", and
+        # resolve_output would happily serve it too.
+        (self.out / "latest").symlink_to("b-new")
+        listed = list_outputs(self.out)
+        self.assertEqual([b["batch"] for b in listed], ["b-new", "b-old"])
+        self.assertIsNone(resolve_output(self.out, "latest", "x.mp4"))
+        self.assertEqual(final_names(self.out, "latest"), [])
+
 
 if __name__ == "__main__":
     unittest.main()
