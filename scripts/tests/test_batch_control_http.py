@@ -9,6 +9,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import control.runs as runs
 import tgbot.run as run_mod
+from httpapi.files import parse_range
 from httpapi.server import make_server, start_in_thread
 
 TOKEN = "t-123"
@@ -105,6 +106,43 @@ class TestErrors(HttpTestBase):
         self.assertTrue(any("boom" in line for line in self.logged))
         resp, _ = self.request("/v1/health")
         self.assertEqual(resp.status, 200)
+
+
+class TestParseRange(unittest.TestCase):
+    def test_forms(self):
+        self.assertEqual(parse_range("bytes=0-1", 100), (0, 1))
+        self.assertEqual(parse_range("bytes=10-", 100), (10, 99))
+        self.assertEqual(parse_range("bytes=-10", 100), (90, 99))
+        self.assertEqual(parse_range("bytes=90-500", 100), (90, 99))   # end clamped
+
+    def test_whole_file_cases(self):
+        for header in (None, "", "items=0-1", "bytes=0-1,5-6", "bytes=abc"):
+            self.assertIsNone(parse_range(header, 100), header)
+
+    def test_unsatisfiable(self):
+        for header in ("bytes=100-", "bytes=5-2", "bytes=-0"):
+            self.assertEqual(parse_range(header, 100), "unsatisfiable", header)
+
+
+class TestFileStreaming(HttpTestBase):
+    def test_full_file(self):
+        resp, body = self.request("/v1/outputs/b1/a.mp4")
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(body, self.video)
+        self.assertEqual(resp.getheader("Accept-Ranges"), "bytes")
+        self.assertEqual(resp.getheader("Content-Type"), "video/mp4")
+
+    def test_range(self):
+        resp, body = self.request("/v1/outputs/b1/a.mp4", headers={"Range": "bytes=100-199"})
+        self.assertEqual(resp.status, 206)
+        self.assertEqual(body, self.video[100:200])
+        self.assertEqual(resp.getheader("Content-Range"), f"bytes 100-199/{len(self.video)}")
+
+    def test_unsatisfiable_range_is_416(self):
+        resp, _ = self.request("/v1/outputs/b1/a.mp4",
+                               headers={"Range": f"bytes={len(self.video)}-"})
+        self.assertEqual(resp.status, 416)
+        self.assertEqual(resp.getheader("Content-Range"), f"bytes */{len(self.video)}")
 
 
 if __name__ == "__main__":

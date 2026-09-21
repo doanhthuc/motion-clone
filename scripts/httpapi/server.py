@@ -19,6 +19,7 @@ from urllib.parse import unquote, urlsplit
 
 import control.outputs as outputs
 import control.runs as runs
+from httpapi.files import send_file
 
 
 class ApiError(Exception):
@@ -78,7 +79,7 @@ class _Handler(BaseHTTPRequestHandler):
             path = outputs.resolve_output(s.out_dir, rest[1], rest[2])
             if path is None:
                 raise NOT_FOUND
-            raise ApiError(501, "not_implemented", "file streaming arrives in Task 5")
+            return send_file(self, path)
         raise NOT_FOUND
 
     def _send_json(self, status: int, payload: dict) -> None:
