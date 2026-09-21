@@ -207,9 +207,12 @@ A mobile client retries. A duplicated `confirm` must never become a second pod.
   `_run_token`. A stale token is `409 stale_panel`; the app re-reads the panel.
 - `confirm` requires an `Idempotency-Key` header. The server records `(key → response)` for 24 h on
   disk; a replay returns the stored response and calls nothing.
-- `confirm` runs **the same `_do_confirm` body** the bot uses, moved to `control/runs.py`. There is
-  no second gate. The grep invariant becomes: `start_drain` has exactly two call sites in
-  `scripts/control/runs.py` (confirm and resume) and none anywhere else.
+- `confirm` runs **the same `_do_confirm` / `_do_resume` bodies** the bot uses. There is no second
+  gate. *Amended 2026-09-21 (slice 4):* the bodies stay in `bot.py` rather than moving to
+  `control/runs.py` — 58 tests patch `tgbot.bot.start_drain` and 120 patch `tgbot.bot.drain_running`,
+  and a moved body would silently escape those patches. The grep invariant is therefore:
+  `start_drain` has exactly two call sites, both in `scripts/tgbot/bot.py` (`_do_confirm`,
+  `_do_resume`), and none in `scripts/control/` or `scripts/httpapi/`. See §5.8.
 - `phase-a` and `regen` spend Gemini/Qwen quota, so they take an `Idempotency-Key` too.
 
 ### 5.6 Status codes
@@ -228,6 +231,33 @@ The app polls `GET /v1/runs/{id}` every 5 s while in the foreground, using `ETag
 drops idle connections after ~100 s, and the app cannot hold a connection in the background without
 push anyway. When the app is closed, Telegram reports.
 
+### 5.8 One run slot (slice 4, decided 2026-09-21)
+
+Mapping the code for slice 4 showed that a separate app run (`batch/app.yaml`) is unsafe:
+`drain_running` is per manifest, so an app confirm during a Telegram drain would neither refuse nor
+queue — it would provision a **second pod**, while the lease file, `.env`'s `GPU_INSTANCE_ID` and
+`gpu-destroy` can each hold only one. The user chose **one run slot, shared**:
+
+- Drafts stay separate (slice 3). **Runs are one slot:** Phase A and confirm from the app write the
+  app draft's jobs into the Telegram chat's manifest, `batch/tg-<TG_ALLOWED_USER_ID>.yaml`, and go
+  through the bot's own `_do_phase_a` / `_do_confirm` / `_do_resume` / `_regen_tryon`. Progress,
+  try-on previews, the rent panel, `/kill` and `/status` in Telegram therefore work unchanged for a
+  run started from the phone, and a confirm while a drain is live queues onto that same pod through
+  the existing mailbox.
+- Those functions return an outcome instead of `None`: a refusal carries a code and the same text the
+  bot sends. A call made for the app does not send its refusal to Telegram (the phone shows it);
+  successes (`Started`, progress) still post to Telegram. The Telegram draft (`_STATE`) is untouched
+  by an app call; the app draft is cleared when its jobs start or queue.
+- A `BOT_LOCK` (re-entrant) is held by the bot loop around each `handle()` and each tick round —
+  never across `getUpdates` — and by the HTTP thread around every call into these functions. The
+  HTTP side waits at most 60 s for it and then answers `503 bot_busy`.
+- `{id}` in the run routes must be the live slot's id, `tg-<chat>`. The `panel_token` is the
+  manifest's mtime (the bot's `_run_token`) joined with the app draft's generation.
+- Idempotency records are written as `pending` **before** the call; a replay of a key whose call
+  crashed answers `409 outcome_unknown` rather than risk a second rental.
+- Not in slice 4: choosing the RunPod GPU type (`.env`'s `GPU`, global — slice 5), and retrying a
+  try-on with a different provider.
+
 ## 6. Delivery in slices
 
 Each slice deploys on its own; `scripts/tests/test_batch_bot.py` stays green after every slice.
@@ -237,7 +267,7 @@ Each slice deploys on its own; `scripts/tests/test_batch_bot.py` stays green aft
 | 1 | Skeleton: HTTP thread, auth, `cloudflared` + Access, `/v1/health`, `GET /v1/runs[/{id}]`, `/v1/outputs` with Range | Almost nothing — reads from disk | Watch progress, play and save outputs |
 | 2 | Chunked upload + materials | `_stage_file`, `_prune_old_staged_files` | Manage material |
 | 3 | Drafts keyed by owner | `_STATE`, `_job_for`, `_switch_*`, `_fill_slot`, batch and draft functions | Compose jobs |
-| 4 | Phase A, regenerate, rent panel, **confirm** | `_do_phase_a`, `_do_confirm`, data half of `_offer_run_confirm`, `_regen_tryon`, `_retry_tryon` | Run jobs |
+| 4 | Phase A, regenerate, rent panel, **confirm** — one shared run slot (§5.8) | nothing moves; `_do_phase_a`, `_do_confirm`, `_do_resume`, `_regen_tryon` return outcomes; data half of the rent panel | Run jobs |
 | 5 | Pod: kill, resume, GPU stock, balance, migrate | `_do_kill`, `_do_resume`, `_report_gpu_stock`, `_report_balance`, `_start_migration` | Pod / cost |
 
 The SwiftUI app (sub-project 2) can start against slice 1.
