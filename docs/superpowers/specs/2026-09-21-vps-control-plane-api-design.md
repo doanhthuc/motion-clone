@@ -178,7 +178,7 @@ uploads directory (it currently only ages out staged files after `STAGING_MAX_AG
 | `GET /v1/runs/{id}/rent-panel` | Per-GPU stock and price at the home datacenter, RunPod and Vast, Vast refusals, and a `panel_token` |
 | `POST /v1/runs/{id}/confirm` `{gpu, provider, panel_token}` | **The money gate** (§5.5) |
 | `GET /v1/runs` | Runs, newest first, from the on-disk journals |
-| `GET /v1/runs/{id}` | Stages, per-job state, elapsed, cost estimate. Read from `state.json` (`progress_text`'s source), so it stays true after the pod is gone. Supports `ETag` / `If-None-Match` |
+| `GET /v1/runs/{id}` | Stages, per-job state, the lease's `provisioned_at` (epoch; the client computes elapsed), cost estimate (slice 5). Read from `state.json` (`progress_text`'s source), so it stays true after the pod is gone. Supports `ETag` / `If-None-Match`, compared weakly because Cloudflare turns ETags into `W/"…"` when it compresses. The body must hold no field derived from the current time, or the ETag changes on every poll |
 | `POST /v1/runs/{id}/kill` | `_do_kill` |
 | `POST /v1/runs/{id}/resume` | `_do_resume` |
 
@@ -196,6 +196,8 @@ A run's `id` is the manifest stem (`batch/<id>.yaml`).
 
 Every path parameter that names a file goes through `_safe_child`; `..`, absolute paths and symlinks
 out of the root are `404`.
+Symlinked batch directories under `out/` (the runner's `out/latest`) are not batches: they are left out of
+`GET /v1/outputs` and refused by the file route, so the newest batch never appears twice.
 
 ### 5.5 Protecting money
 
