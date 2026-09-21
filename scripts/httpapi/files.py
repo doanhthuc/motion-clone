@@ -37,25 +37,27 @@ def send_file(handler: BaseHTTPRequestHandler, path: Path) -> None:
     with path.open("rb") as f:
         size = os.fstat(f.fileno()).st_size
         rng = parse_range(handler.headers.get("Range"), size)
-        if rng == "unsatisfiable":
-            handler.send_response(416)
-            handler.send_header("Content-Range", f"bytes */{size}")
-            handler.send_header("Content-Length", "0")
-            handler.end_headers()
-            return
-        start, end = rng if rng else (0, size - 1)
-        length = end - start + 1 if size else 0
-        handler.send_response(206 if rng else 200)
-        handler.send_header("Content-Type", kind)
-        handler.send_header("Accept-Ranges", "bytes")
-        handler.send_header("Content-Length", str(length))
-        if rng:
-            handler.send_header("Content-Range", f"bytes {start}-{end}/{size}")
-        handler.end_headers()
 
-        f.seek(start)
-        remaining = length
         try:
+            if rng == "unsatisfiable":
+                handler.send_response(416)
+                handler.send_header("Content-Range", f"bytes */{size}")
+                handler.send_header("Content-Length", "0")
+                handler.end_headers()
+                return
+
+            start, end = rng if rng else (0, size - 1)
+            length = end - start + 1 if size else 0
+            handler.send_response(206 if rng else 200)
+            handler.send_header("Content-Type", kind)
+            handler.send_header("Accept-Ranges", "bytes")
+            handler.send_header("Content-Length", str(length))
+            if rng:
+                handler.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            handler.end_headers()
+
+            f.seek(start)
+            remaining = length
             while remaining > 0:
                 chunk = f.read(min(_CHUNK, remaining))
                 if not chunk:
@@ -65,6 +67,6 @@ def send_file(handler: BaseHTTPRequestHandler, path: Path) -> None:
                 handler.wfile.write(chunk)
                 remaining -= len(chunk)
         except ConnectionError:
-            # Client disconnected (seek, timeout, network issue) — this is normal.
+            # Client disconnected (seek, timeout, network issue, headers flush) — normal.
             # Catch BrokenPipeError, ConnectionResetError, etc. Do not propagate.
             handler.close_connection = True

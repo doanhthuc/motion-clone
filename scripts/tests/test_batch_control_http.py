@@ -199,9 +199,6 @@ class TestFileStreaming(HttpTestBase):
 
     def test_file_vanishes_between_resolve_and_send(self):
         # Verify that file vanishing becomes a 404, not a 500
-        resp, body = self.request("/v1/outputs/b1/a.mp4")
-        # Delete the file after it was resolved but before response is complete
-        # We do this by patching resolve_output to delete the file after returning it
         from pathlib import Path
         import control.outputs as outputs_mod
 
@@ -216,6 +213,43 @@ class TestFileStreaming(HttpTestBase):
             resp, body = self.request("/v1/outputs/b1/a.mp4")
             self.assertEqual(resp.status, 404)
             self.assertEqual(json.loads(body)["error"]["code"], "not_found")
+
+    def test_disconnect_during_headers(self):
+        # Verify that disconnect during end_headers (header flush to socket)
+        # is caught and handled gracefully, not propagated
+        from http.server import BaseHTTPRequestHandler
+
+        class FakeHandler(BaseHTTPRequestHandler):
+            def __init__(self):
+                self.response_status = None
+                self.headers_sent = {}
+                self.close_connection = False
+                self.headers = {}
+
+            def send_response(self, status):
+                self.response_status = status
+
+            def send_header(self, name, value):
+                self.headers_sent[name] = value
+
+            def end_headers(self):
+                # Simulate disconnect during header flush
+                raise BrokenPipeError("client disconnected during headers")
+
+        handler = FakeHandler()
+        handler.wfile = BytesIO()
+
+        test_file = Path(tempfile.mktemp(suffix=".bin"))
+        test_file.write_bytes(b"x" * 1000)
+
+        try:
+            # send_file should catch the BrokenPipeError during end_headers
+            files_module.send_file(handler, test_file)
+            # Should not raise, close_connection should be True
+            self.assertTrue(handler.close_connection,
+                          "close_connection not set on disconnect during headers")
+        finally:
+            test_file.unlink()
 
 
 if __name__ == "__main__":
