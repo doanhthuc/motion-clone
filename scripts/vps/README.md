@@ -957,3 +957,24 @@ Composing a job from the phone, without touching Telegram:
 The app's draft lives at `batch/app.draft.json`, separate from Telegram's own
 `batch/tg-<chat>.draft.json` — deleting or clearing it resets the phone's draft only, and Telegram's
 in-progress job is untouched.
+
+Measured 2026-09-21 through the tunnel from the Mac, composing from material already on the VPS
+(3 images, 2 videos) on the VPS's default pipeline (`tryon-character-swap-enhance`, from `TG_PIPELINE`):
+
+| | Measurement |
+|---|---|
+| `GET /v1/pipelines` | 200, 6 pipelines, 2.4 KB, 0.9-1.2 s |
+| `PATCH /v1/draft` (3 slots, 3 ffprobes) | 0.66 s |
+| `POST /v1/draft/add-to-batch` | 2.45 s (one sample; every other draft call was under 1 s) |
+| `POST /v1/draft/validate` | 2.34 s end to end, valid, estimate 68 min |
+| Refusals | driver = an image → 422 `wrong_kind`; same job twice → 422 `duplicate` |
+| Absolute paths | none in any response body |
+| Telegram's draft | `tg-<chat>.draft.json` sha256 identical before and after |
+| `batch/.validate/` | empty afterwards |
+| `motion-bot` RSS | 38,656 KB before the deploy → 38,812 KB after the run |
+
+**One hang, not reproduced:** the very first `GET /v1/pipelines`, 35 s after the deploy restarted
+`motion-bot`, never reached the client, although the server logged `200` for it. Its keep-alive socket
+timed out 60 s later. The same route answered in 2 ms on the VPS itself, and from the Mac through the
+tunnel both curl and the same script worked on every retry. If the phone sees this, a client timeout
+and one retry are enough; nothing on the server needs to change.
