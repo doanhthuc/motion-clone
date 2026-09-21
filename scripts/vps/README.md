@@ -939,3 +939,21 @@ End-to-end through the tunnel from the Mac, with a 36.1 MB driver (`out/2026-09-
 ordinary `User-Agent` header succeeded. Any client — the iPhone app included — must send its own
 user-agent; a bare scripted request may be refused at the edge, and that refusal looks nothing like
 the API's own JSON errors.
+
+### Slice 3 (pipelines + draft)
+
+Composing a job from the phone, without touching Telegram:
+
+| Method + path | Does |
+|---|---|
+| `GET /v1/pipelines` | every pipeline the phone can offer, with its roles and providers |
+| `GET /v1/draft` | the app's current draft |
+| `PATCH /v1/draft` | change pipeline/provider/slots |
+| `POST /v1/draft/add-to-batch` | commit the current draft as a batch entry, start editing a fresh copy |
+| `DELETE /v1/draft/batch/<digest>` | drop one batch entry (its digest, from `GET /v1/draft`'s `batch` list) |
+| `POST /v1/draft/clear` | reset to an empty draft on the default pipeline/provider |
+| `POST /v1/draft/validate` | `make batch-validate` on what `add-to-batch` would submit — free, no pod |
+
+The app's draft lives at `batch/app.draft.json`, separate from Telegram's own
+`batch/tg-<chat>.draft.json` — deleting or clearing it resets the phone's draft only, and Telegram's
+in-progress job is untouched.

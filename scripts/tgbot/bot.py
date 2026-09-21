@@ -6518,8 +6518,13 @@ def _start_control_api(tg: Tg, chat_id: int):
     server = None
     try:
         port = int(env_get(ROOT / ".env", "CONTROL_API_PORT") or 8787)
+        # main() has already applied TG_PIPELINE/TG_PROVIDER to these globals by
+        # the time this runs, so the phone's brand-new draft starts on the same
+        # pipeline/provider Telegram's own drafts do, rather than the server's
+        # hardcoded fallback.
         server = make_server(token=token, batch_dir=ROOT / "batch", out_dir=ROOT / "out",
-                             port=port, log=log)
+                             port=port, log=log,
+                             default_pipeline=_DEFAULT_PIPELINE, default_provider=_DEFAULT_PROVIDER)
         start_in_thread(server)
     except (OSError, ValueError, RuntimeError) as exc:
         # RuntimeError: the OS refused to create the daemon thread (e.g. a

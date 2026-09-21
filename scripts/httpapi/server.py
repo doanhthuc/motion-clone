@@ -17,6 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+import control.drafts as drafts
 import control.materials as materials
 import control.outputs as outputs
 import control.runs as runs
@@ -34,7 +35,10 @@ NOT_FOUND = ApiError(404, "not_found", "no such resource")
 
 _DOMAIN_STATUS = {"bad_request": 400, "forbidden": 403, "not_found": 404, "in_use": 409,
                   "incomplete": 409, "conflict": 409, "too_many": 409, "too_large": 413,
-                  "unprobeable": 422, "no_space": 507}
+                  "unprobeable": 422, "no_space": 507,
+                  "unknown_pipeline": 422, "unknown_provider": 422, "unknown_role": 422,
+                  "wrong_kind": 422, "not_applicable": 422, "missing_slots": 422,
+                  "duplicate": 422, "nothing_to_validate": 422, "invalid": 422}
 MAX_JSON_BODY = 64 * 1024
 # A body this size or smaller is read and thrown away to keep the connection
 # usable; anything bigger is not worth reading, so the connection is closed
@@ -74,6 +78,9 @@ class _Handler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         self._handle("DELETE")
 
+    def do_PATCH(self):
+        self._handle("PATCH")
+
     def _handle(self, method: str) -> None:
         # Routes that answer without reading the body (DELETE /v1/materials/…,
         # POST …/complete) left whatever the client sent in the socket, and the
@@ -87,7 +94,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._route(method)
         except ApiError as exc:
             self._error(exc.status, exc.code, exc.message)
-        except (uploads.UploadError, materials.MaterialError) as exc:
+        except (uploads.UploadError, materials.MaterialError, drafts.DraftError) as exc:
             self._error(_DOMAIN_STATUS.get(exc.code, 400), exc.code, exc.message)
         except Exception:
             # Logged in full, returned opaque: the client gets no internals.
@@ -98,7 +105,7 @@ class _Handler(BaseHTTPRequestHandler):
         # A request that carried a body may not have been read to the end (and,
         # for a chunk PUT, may have been read only halfway); the leftover bytes
         # would be parsed as the next request on this connection.
-        if self.command in ("POST", "PUT", "DELETE"):
+        if self.command in ("POST", "PUT", "PATCH", "DELETE"):
             self.close_connection = True
         self._send_json(status, {"error": {"code": code, "message": message}})
 
@@ -234,6 +241,26 @@ class _Handler(BaseHTTPRequestHandler):
         if method == "DELETE" and len(rest) == 3 and rest[0] == "materials":
             materials.delete_material(s.staging_root, s.batch_dir, rest[1], rest[2])
             return self._send_empty(204)
+        if method == "GET" and rest == ["pipelines"]:
+            return self._send_json(200, {"pipelines": drafts.pipeline_catalog()})
+        if rest[:1] == ["draft"]:
+            return self._route_draft(method, rest[1:])
+        raise NOT_FOUND
+
+    def _route_draft(self, method: str, rest: list[str]) -> None:
+        store = self.server.drafts
+        if method == "GET" and rest == []:
+            return self._send_json(200, store.view())
+        if method == "PATCH" and rest == []:
+            return self._send_json(200, store.patch(self._read_json()))
+        if method == "POST" and rest == ["add-to-batch"]:
+            return self._send_json(200, store.add_to_batch())
+        if method == "POST" and rest == ["clear"]:
+            return self._send_json(200, store.clear())
+        if method == "POST" and rest == ["validate"]:
+            return self._send_json(200, store.validate(repo_root=self.server.repo_root))
+        if method == "DELETE" and len(rest) == 2 and rest[0] == "batch":
+            return self._send_json(200, store.drop_from_batch(rest[1]))
         raise NOT_FOUND
 
     def _etag_matches(self, etag: str) -> bool:
@@ -289,7 +316,9 @@ class _Server(ThreadingHTTPServer):
 
 
 def make_server(*, token: str, batch_dir: Path, out_dir: Path,
-                host: str = "127.0.0.1", port: int = 0, log=print) -> _Server:
+                host: str = "127.0.0.1", port: int = 0, log=print,
+                default_pipeline: str = "tryon-motion-enhance",
+                default_provider: str = "gemini", probe=None) -> _Server:
     if not token:
         raise ValueError("an empty token would authenticate nothing")
     server = _Server((host, port), _Handler)
@@ -297,6 +326,11 @@ def make_server(*, token: str, batch_dir: Path, out_dir: Path,
     server.staging_root = batch_dir / "tg-staging"
     server.uploads_root = batch_dir / "uploads"
     server.thumbs_root = batch_dir / "thumbs"
+    server.repo_root = batch_dir.parent
+    server.drafts = drafts.DraftStore(
+        batch_dir, server.staging_root, materials.APP_OWNER,
+        default_pipeline=default_pipeline, default_provider=default_provider,
+        **({"probe": probe} if probe is not None else {}))
     return server
 
 
