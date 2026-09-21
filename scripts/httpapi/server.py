@@ -175,8 +175,13 @@ class _Handler(BaseHTTPRequestHandler):
                 if staged.suffix.lower() in (".heic", ".heif"):
                     staged.with_suffix(".png").unlink(missing_ok=True)
                 raise
-            item = next(m for m in materials.list_materials(s.staging_root)
-                        if m["id"] == f"{materials.APP_OWNER}/{final.name}")
+            try:
+                item = materials.material_item(materials.APP_OWNER, final)
+            except FileNotFoundError:
+                # Vanished between ingest and here (a concurrent DELETE, a
+                # prune) — the upload itself succeeded, but there is nothing
+                # left to hand back as "the material".
+                raise NOT_FOUND
             return self._send_json(201, {"material": item, "probe": probe})
         if method == "GET" and rest == ["materials"]:
             return self._send_json(200, {"materials": materials.list_materials(s.staging_root)})

@@ -194,6 +194,16 @@ def _kind(path: Path) -> str:
     return "image" if suffix in IMAGE_SUFFIXES else "video" if suffix in VIDEO_SUFFIXES else "other"
 
 
+def material_item(owner: str, path: Path) -> dict:
+    """The list_materials entry for one file. Raises FileNotFoundError if it's gone —
+    callers that stat a single, just-produced file (e.g. the HTTP complete route)
+    want that distinguished from "never existed", not silently swallowed.
+    """
+    st = path.stat()
+    return {"id": f"{owner}/{path.name}", "owner": owner, "name": path.name,
+            "bytes": st.st_size, "updated_at": st.st_mtime, "kind": _kind(path)}
+
+
 def list_materials(staging_root: Path) -> list[dict]:
     found = []
     for owner_dir in staging_root.iterdir() if staging_root.is_dir() else []:
@@ -203,12 +213,9 @@ def list_materials(staging_root: Path) -> list[dict]:
             if path.is_symlink() or not path.is_file():
                 continue
             try:
-                st = path.stat()
+                found.append(material_item(owner_dir.name, path))
             except FileNotFoundError:        # pruned or deleted mid-listing
                 continue
-            found.append({"id": f"{owner_dir.name}/{path.name}", "owner": owner_dir.name,
-                          "name": path.name, "bytes": st.st_size, "updated_at": st.st_mtime,
-                          "kind": _kind(path)})
     return sorted(found, key=lambda m: m["updated_at"], reverse=True)
 
 

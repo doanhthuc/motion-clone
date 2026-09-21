@@ -510,6 +510,31 @@ class TestUploadFlow(HttpWriteBase):
                             json_body={"file_name": "x", "size": uploads.MAX_UPLOAD_BYTES + 1})
         self.assertEqual(resp.status, 413)
 
+    def test_chunk_bigger_than_chunk_size_is_413_and_closes_with_no_tmp_left(self):
+        uid = json.loads(self.send("POST", "/v1/uploads",
+                                   json_body={"file_name": "big.bin", "size": 10})[1])["upload_id"]
+        resp, _ = self.send("PUT", f"/v1/uploads/{uid}/chunks/0", b"12345")   # CHUNK_SIZE patched to 4
+        self.assertEqual(resp.status, 413)
+        self.assertEqual(resp.getheader("Connection"), "close")
+        upload_dir = self.batch / "uploads" / uid
+        self.assertEqual(list(upload_dir.glob("*.tmp")), [])
+
+    def test_complete_when_the_file_vanishes_meanwhile_is_404_not_500(self):
+        # A concurrent DELETE or prune between ingest() and the material_item()
+        # stat: the upload itself succeeded, so this must be a clean 404, not
+        # a StopIteration turned opaque 500.
+        uid = json.loads(self.send("POST", "/v1/uploads",
+                                   json_body={"file_name": "vanish.bin", "size": 4})[1])["upload_id"]
+        self.send("PUT", f"/v1/uploads/{uid}/chunks/0", b"data")
+
+        def ingest_then_delete(p):
+            p.unlink()
+            return p, {"kind": "video"}
+
+        with mock.patch.object(materials, "ingest", side_effect=ingest_then_delete):
+            resp, body = self.send("POST", f"/v1/uploads/{uid}/complete")
+        self.assertEqual((resp.status, json.loads(body)["error"]["code"]), (404, "not_found"))
+
 
 class TestMaterialRoutes(HttpWriteBase):
     def setUp(self):

@@ -105,6 +105,16 @@ class TestList(MaterialsBase):
         self.assertEqual(got[1]["bytes"], 10)
         self.assertNotIn(str(self.tmp), json.dumps(got))
 
+    def test_material_item_matches_the_list_entry(self):
+        got = materials.list_materials(self.staging)
+        listed = next(m for m in got if m["id"] == "app/a.mp4")
+        self.assertEqual(materials.material_item("app", self.a), listed)
+
+    def test_material_item_of_a_vanished_file_is_file_not_found(self):
+        missing = self.staging / "app" / "gone.mp4"
+        with self.assertRaises(FileNotFoundError):
+            materials.material_item("app", missing)
+
     def test_symlinks_are_not_material(self):
         os.symlink(self.a, self.staging / "app" / "link.mp4")
         self.assertNotIn("app/link.mp4", [m["id"] for m in materials.list_materials(self.staging)])
