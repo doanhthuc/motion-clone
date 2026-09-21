@@ -6954,6 +6954,12 @@ def _start_control_api(tg: Tg, chat_id: int):
         server = make_server(token=token, batch_dir=ROOT / "batch", out_dir=ROOT / "out",
                              port=port, log=log,
                              default_pipeline=_DEFAULT_PIPELINE, default_provider=_DEFAULT_PROVIDER)
+        # AppRuns needs this server's own `drafts` store, so it can only be
+        # built after make_server — and it must exist before the thread
+        # starts, or the first phone request could see server.app_runs still
+        # unset and get a spurious 503.
+        server.app_runs = AppRuns(tg, chat_id, server.drafts,
+                                  IdempotencyStore(ROOT / "batch" / "idempotency"))
         start_in_thread(server)
     except (OSError, ValueError, RuntimeError) as exc:
         # RuntimeError: the OS refused to create the daemon thread (e.g. a

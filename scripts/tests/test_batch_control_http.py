@@ -766,5 +766,157 @@ class TestDraftRoutes(HttpWriteBase):
         self.assertEqual(run.call_args.kwargs["cwd"], self.batch.parent)
 
 
+class FakeAppRuns:
+    """Records every call `_route` makes into it and answers with whatever
+    the test set up beforehand — the real `AppRuns` (bot.py) already has its
+    own unit tests; these HTTP tests only need to prove the routing, the
+    Idempotency-Key gate and the 503 wiring, not `AppRuns`'s own logic."""
+
+    def __init__(self):
+        self.calls = []
+        self.phase_a_response = (202, {"run_id": "tg-1", "outcome": "started"})
+        self.confirm_response = (202, {"run_id": "tg-1", "outcome": "started"})
+        self.rent_panel_response = (200, {"run_id": "tg-1", "panel_token": "p1"})
+        self.tryon_response = (200, {"run_id": "tg-1", "previews": []})
+        self.regen_response = (202, {"run_id": "tg-1", "outcome": "started"})
+        self.tryon_image_path = None
+
+    def phase_a(self, key):
+        self.calls.append(("phase_a", key))
+        return self.phase_a_response
+
+    def confirm(self, run_id, body, key):
+        self.calls.append(("confirm", run_id, body, key))
+        return self.confirm_response
+
+    def rent_panel(self, run_id, *, force):
+        self.calls.append(("rent_panel", run_id, force))
+        return self.rent_panel_response
+
+    def tryon(self, run_id):
+        self.calls.append(("tryon", run_id))
+        return self.tryon_response
+
+    def tryon_image(self, run_id, index):
+        self.calls.append(("tryon_image", run_id, index))
+        return self.tryon_image_path
+
+    def regen(self, run_id, index, body, key):
+        self.calls.append(("regen", run_id, index, body, key))
+        return self.regen_response
+
+
+class TestAppRunRoutes(HttpWriteBase):
+    def setUp(self):
+        self.fake = FakeAppRuns()
+        super().setUp()
+        self.server.app_runs = self.fake
+
+    def test_phase_a_reaches_app_runs_with_the_key(self):
+        resp, body = self.send("POST", "/v1/runs/phase-a", headers={"Idempotency-Key": "k1"})
+        self.assertEqual((resp.status, json.loads(body)), self.fake.phase_a_response)
+        self.assertEqual(self.fake.calls, [("phase_a", "k1")])
+
+    def test_phase_a_missing_key_is_400_and_never_reaches_app_runs(self):
+        resp, body = self.send("POST", "/v1/runs/phase-a")
+        self.assertEqual(resp.status, 400)
+        self.assertEqual(json.loads(body)["error"]["code"], "bad_request")
+        self.assertEqual(self.fake.calls, [])
+
+    def test_rent_panel_reaches_app_runs_and_parses_force(self):
+        resp, body = self.send("GET", "/v1/runs/tg-1/rent-panel?force=1")
+        self.assertEqual((resp.status, json.loads(body)), self.fake.rent_panel_response)
+        self.assertEqual(self.fake.calls, [("rent_panel", "tg-1", True)])
+
+    def test_rent_panel_defaults_force_to_false(self):
+        self.send("GET", "/v1/runs/tg-1/rent-panel")
+        self.assertEqual(self.fake.calls, [("rent_panel", "tg-1", False)])
+
+    def test_confirm_reaches_app_runs_with_body_and_key(self):
+        payload = {"provider": "runpod", "panel_token": "p1", "tryon": "reuse"}
+        resp, body = self.send("POST", "/v1/runs/tg-1/confirm", json_body=payload,
+                               headers={"Idempotency-Key": "k2"})
+        self.assertEqual((resp.status, json.loads(body)), self.fake.confirm_response)
+        self.assertEqual(self.fake.calls, [("confirm", "tg-1", payload, "k2")])
+
+    def test_confirm_missing_key_is_400_and_never_reaches_app_runs(self):
+        resp, body = self.send("POST", "/v1/runs/tg-1/confirm",
+                               json_body={"provider": "runpod", "panel_token": "p1"})
+        self.assertEqual(resp.status, 400)
+        self.assertEqual(json.loads(body)["error"]["code"], "bad_request")
+        self.assertEqual(self.fake.calls, [])
+
+    def test_a_202_from_app_runs_passes_through(self):
+        self.fake.confirm_response = (202, {"run_id": "tg-1", "outcome": "resumed"})
+        resp, body = self.send("POST", "/v1/runs/tg-1/confirm",
+                               json_body={"provider": "vast", "panel_token": "p1"},
+                               headers={"Idempotency-Key": "k3"})
+        self.assertEqual((resp.status, json.loads(body)), (202, {"run_id": "tg-1",
+                                                                 "outcome": "resumed"}))
+
+    def test_tryon_reaches_app_runs(self):
+        resp, body = self.send("GET", "/v1/runs/tg-1/tryon")
+        self.assertEqual((resp.status, json.loads(body)), self.fake.tryon_response)
+        self.assertEqual(self.fake.calls, [("tryon", "tg-1")])
+
+    def test_tryon_image_streams_a_file(self):
+        image = Path(tempfile.mktemp(suffix=".jpg"))
+        image.write_bytes(b"\xff\xd8fake-jpeg")
+        self.addCleanup(image.unlink)
+        self.fake.tryon_image_path = image
+        resp, body = self.send("GET", "/v1/runs/tg-1/tryon/0")
+        self.assertEqual((resp.status, body), (200, image.read_bytes()))
+        self.assertEqual(self.fake.calls, [("tryon_image", "tg-1", "0")])
+
+    def test_tryon_image_404s_on_none(self):
+        resp, body = self.send("GET", "/v1/runs/tg-1/tryon/0")
+        self.assertEqual(resp.status, 404)
+        self.assertEqual(json.loads(body)["error"]["code"], "not_found")
+
+    def test_regen_reaches_app_runs_with_body_and_key(self):
+        resp, body = self.send("POST", "/v1/runs/tg-1/tryon/2/regen",
+                               json_body={"run_token": "rt1"},
+                               headers={"Idempotency-Key": "k4"})
+        self.assertEqual((resp.status, json.loads(body)), self.fake.regen_response)
+        self.assertEqual(self.fake.calls, [("regen", "tg-1", "2", {"run_token": "rt1"}, "k4")])
+
+    def test_regen_missing_key_is_400_and_never_reaches_app_runs(self):
+        resp, body = self.send("POST", "/v1/runs/tg-1/tryon/2/regen",
+                               json_body={"run_token": "rt1"})
+        self.assertEqual(resp.status, 400)
+        self.assertEqual(self.fake.calls, [])
+
+    def test_existing_run_routes_are_unaffected_by_app_runs_being_set(self):
+        resp, body = self.send("GET", "/v1/runs")
+        self.assertEqual(resp.status, 200)
+        self.assertEqual([r["id"] for r in json.loads(body)["runs"]], ["r1"])
+        resp, body = self.send("GET", "/v1/runs/r1")
+        self.assertEqual(json.loads(body)["status"], "done")
+
+    def test_a_post_error_on_a_new_route_closes_the_connection(self):
+        resp, _ = self.send("POST", "/v1/runs/phase-a")
+        self.assertEqual(resp.status, 400)
+        self.assertEqual(resp.getheader("Connection"), "close")
+
+
+class TestAppRunRoutesUnavailable(HttpWriteBase):
+    def test_every_new_route_is_503_when_app_runs_is_unset(self):
+        cases = [
+            ("POST", "/v1/runs/phase-a", {"Idempotency-Key": "k1"}, None),
+            ("GET", "/v1/runs/tg-1/rent-panel", {}, None),
+            ("POST", "/v1/runs/tg-1/confirm", {"Idempotency-Key": "k2"},
+             {"provider": "runpod", "panel_token": "p1"}),
+            ("GET", "/v1/runs/tg-1/tryon", {}, None),
+            ("GET", "/v1/runs/tg-1/tryon/0", {}, None),
+            ("POST", "/v1/runs/tg-1/tryon/0/regen", {"Idempotency-Key": "k3"},
+             {"run_token": "rt1"}),
+        ]
+        for method, path, headers, payload in cases:
+            with self.subTest(method=method, path=path):
+                resp, body = self.send(method, path, headers=headers, json_body=payload)
+                self.assertEqual(resp.status, 503, path)
+                self.assertEqual(json.loads(body)["error"]["code"], "runs_unavailable", path)
+
+
 if __name__ == "__main__":
     unittest.main()

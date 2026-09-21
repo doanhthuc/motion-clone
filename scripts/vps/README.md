@@ -978,3 +978,41 @@ Measured 2026-09-21 through the tunnel from the Mac, composing from material alr
 timed out 60 s later. The same route answered in 2 ms on the VPS itself, and from the Mac through the
 tunnel both curl and the same script worked on every retry. If the phone sees this, a client timeout
 and one retry are enough; nothing on the server needs to change.
+
+### Slice 4 (phase A, try-on, rent panel, confirm)
+
+Running the phone's draft, through the **one shared run slot** (spec §5.8): the app has no manifest
+of its own — its jobs run as the Telegram chat's own manifest (`batch/tg-<chat>.yaml`), through the
+bot's own `_do_phase_a`/`_do_confirm`/`_do_resume`/`_regen_tryon`. The phone's run *is* the Telegram
+chat's run: Telegram keeps showing progress on it exactly as if `/confirm` had been typed there, and
+a job started from the phone can be watched, or finished, from Telegram and vice versa. There is
+still only one GPU and one slot; the phone does not get a second one.
+
+| Method + path | Does |
+|---|---|
+| `POST /v1/runs/phase-a` | run the app's draft's try-on preview locally (no pod) — the app's equivalent of Telegram's implicit Phase A |
+| `GET /v1/runs/<id>/rent-panel[?force=1]` | RunPod stock/price and the Vast tab for the run that `/confirm` would start; `force=1` bypasses the stock cache |
+| `POST /v1/runs/<id>/confirm` `{provider, panel_token, tryon?}` | spend money: rent a pod and start the run (or resume one Phase A already offered) |
+| `GET /v1/runs/<id>/tryon` | this run's try-on previews (status per job, no image bytes) |
+| `GET /v1/runs/<id>/tryon/<index>` | one try-on preview image, streamed; `404` if it isn't ready |
+| `POST /v1/runs/<id>/tryon/<index>/regen` `{run_token}` | regenerate one try-on preview |
+
+`<id>` must be the live slot's own run id (`GET /v1/runs` — the same list Telegram's run shows up
+in); any other id is `404`.
+
+- **`Idempotency-Key` header** (required on `phase-a`, `confirm`, `regen` — the routes that spend
+  money or GPU time): a client-chosen string, replayed on retry. The first call with a key runs the
+  action and stores the answer; a retry with the same key gets that stored answer back instead of
+  running the action twice. A missing key is `400 bad_request` before anything runs. A key reused
+  while the first call is still in flight is `409 outcome_unknown` — read the run's status before
+  retrying, don't just resend.
+- **`panel_token`**, from `GET .../rent-panel`: proves `POST .../confirm` is spending on the exact
+  draft the panel showed. Any edit to the draft (or a fresh Telegram message rewriting the same
+  manifest) changes the token; `confirm` with a stale one is `409 stale_panel` — read the panel again
+  before retrying, don't just resend the old token.
+- **`tryon: "reuse" | "rerun"` on confirm**: which try-on result the drain should use when Phase A
+  already produced one — `reuse` keeps it, `rerun` throws it away and does try-on again as part of
+  the paid run. Omit it when there is no Phase A result to choose between.
+- **`503 bot_busy`**: the bot's own lock (`BOT_LOCK`) is held by something else — a Telegram update
+  or a tick round — and the wait for it timed out. Nothing was recorded against the Idempotency-Key
+  in that case, so the same call can just be retried once the lock frees up.

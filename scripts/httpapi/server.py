@@ -15,13 +15,14 @@ import threading
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import control.drafts as drafts
 import control.materials as materials
 import control.outputs as outputs
 import control.runs as runs
 import control.uploads as uploads
+from control.idempotency import IdempotencyError
 from httpapi.files import send_file
 
 
@@ -94,7 +95,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._route(method)
         except ApiError as exc:
             self._error(exc.status, exc.code, exc.message)
-        except (uploads.UploadError, materials.MaterialError, drafts.DraftError) as exc:
+        except (uploads.UploadError, materials.MaterialError, drafts.DraftError,
+                IdempotencyError) as exc:
             self._error(_DOMAIN_STATUS.get(exc.code, 400), exc.code, exc.message)
         except Exception:
             # Logged in full, returned opaque: the client gets no internals.
@@ -168,6 +170,25 @@ class _Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "bad_request", "body must be a JSON object")
         return data
 
+    def _app_runs(self):
+        """The `AppRuns` instance the bot builds in `_start_control_api`, or
+        the 503 every route in this section answers when the bot started
+        before the idempotency store existed (or the phone API is otherwise
+        not wired up) — never an AttributeError that would 500 instead."""
+        app_runs = self.server.app_runs
+        if app_runs is None:
+            raise ApiError(503, "runs_unavailable", "the app's run routes are not available")
+        return app_runs
+
+    def _idempotency_key(self) -> str:
+        # Checked here, before any AppRuns method runs, so a missing key
+        # never reaches — and never spends — anything: the shape check on a
+        # key that IS present still happens inside IdempotencyStore.begin.
+        key = self.headers.get("Idempotency-Key")
+        if not key:
+            raise ApiError(400, "bad_request", "Idempotency-Key is required")
+        return key
+
     def _authenticate(self) -> None:
         header = self.headers.get("Authorization", "")
         given = header[len("Bearer "):] if header.startswith("Bearer ") else ""
@@ -204,6 +225,40 @@ class _Handler(BaseHTTPRequestHandler):
                     return send_file(self, path)
                 except FileNotFoundError:
                     raise NOT_FOUND
+        if method == "POST" and rest == ["runs", "phase-a"]:
+            app_runs = self._app_runs()
+            key = self._idempotency_key()
+            status, body = app_runs.phase_a(key)
+            return self._send_json(status, body)
+        if method == "GET" and len(rest) == 3 and rest[0] == "runs" and rest[2] == "rent-panel":
+            force = parse_qs(urlsplit(self.path).query).get("force", ["0"])[0] == "1"
+            status, body = self._app_runs().rent_panel(rest[1], force=force)
+            return self._send_json(status, body)
+        if method == "POST" and len(rest) == 3 and rest[0] == "runs" and rest[2] == "confirm":
+            app_runs = self._app_runs()
+            key = self._idempotency_key()
+            payload = self._read_json()
+            status, body = app_runs.confirm(rest[1], payload, key)
+            return self._send_json(status, body)
+        if method == "GET" and len(rest) == 3 and rest[0] == "runs" and rest[2] == "tryon":
+            status, body = self._app_runs().tryon(rest[1])
+            return self._send_json(status, body)
+        if method == "GET" and len(rest) == 4 and rest[0] == "runs" and rest[2] == "tryon":
+            image = self._app_runs().tryon_image(rest[1], rest[3])
+            if image is None:
+                raise NOT_FOUND
+            try:
+                self._settle_body()
+                return send_file(self, image)
+            except FileNotFoundError:
+                raise NOT_FOUND
+        if (method == "POST" and len(rest) == 5 and rest[0] == "runs" and rest[2] == "tryon"
+                and rest[4] == "regen"):
+            app_runs = self._app_runs()
+            key = self._idempotency_key()
+            payload = self._read_json()
+            status, body = app_runs.regen(rest[1], rest[3], payload, key)
+            return self._send_json(status, body)
         if method == "POST" and rest == ["uploads"]:
             body = self._read_json()
             return self._send_json(201, uploads.open_upload(
@@ -318,7 +373,7 @@ class _Server(ThreadingHTTPServer):
 def make_server(*, token: str, batch_dir: Path, out_dir: Path,
                 host: str = "127.0.0.1", port: int = 0, log=print,
                 default_pipeline: str = "tryon-motion-enhance",
-                default_provider: str = "gemini", probe=None) -> _Server:
+                default_provider: str = "gemini", probe=None, app_runs=None) -> _Server:
     if not token:
         raise ValueError("an empty token would authenticate nothing")
     server = _Server((host, port), _Handler)
@@ -331,6 +386,11 @@ def make_server(*, token: str, batch_dir: Path, out_dir: Path,
         batch_dir, server.staging_root, materials.APP_OWNER,
         default_pipeline=default_pipeline, default_provider=default_provider,
         **({"probe": probe} if probe is not None else {}))
+    # Set by the caller (bot._start_control_api) once its own AppRuns exists
+    # — a chicken-and-egg the constructor can't resolve itself, since AppRuns
+    # needs this server's own `drafts` store. None until then, and every
+    # /v1/runs/... route in this section answers 503 rather than AttributeError.
+    server.app_runs = app_runs
     return server
 
 
