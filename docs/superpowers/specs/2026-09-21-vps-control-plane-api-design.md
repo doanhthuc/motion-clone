@@ -179,8 +179,8 @@ uploads directory (it currently only ages out staged files after `STAGING_MAX_AG
 | `POST /v1/runs/{id}/confirm` `{gpu, provider, panel_token}` | **The money gate** (§5.5) |
 | `GET /v1/runs` | Runs, newest first, from the on-disk journals |
 | `GET /v1/runs/{id}` | Stages, per-job state, the lease's `provisioned_at` (epoch; the client computes elapsed), cost estimate (slice 5). Read from `state.json` (`progress_text`'s source), so it stays true after the pod is gone. Supports `ETag` / `If-None-Match`, compared weakly because Cloudflare turns ETags into `W/"…"` when it compresses. The body must hold no field derived from the current time, or the ETag changes on every poll |
-| `POST /v1/runs/{id}/kill` | `_do_kill` |
-| `POST /v1/runs/{id}/resume` | `_do_resume` |
+| `POST /v1/runs/{id}/kill` | `_do_kill`, run on a worker thread; `202` at once (§5.9) |
+| `POST /v1/runs/{id}/resume` `{provider, run_token, gpu?}` | `_do_resume`, only for a run whose pod rental failed (§5.9) |
 
 A run's `id` is the manifest stem (`batch/<id>.yaml`).
 
@@ -188,9 +188,12 @@ A run's `id` is the manifest stem (`batch/<id>.yaml`).
 
 | Method + path | Behaviour |
 |---|---|
-| `GET /v1/pod` | Lease (provider, GPU, since, quoted $/h), migration state, balance |
-| `GET /v1/gpu/stock` | `_report_gpu_stock`'s data |
-| `POST /v1/pod/migrate` `{to_dc, confirm_token}` | `_start_migration`, behind a two-step confirm as in the bot |
+| `GET /v1/pod` | Lease (provider, GPU, since, quoted $/h), the selected GPU, migration state, the last kill. Files and memory only — no network, so it is cheap to poll |
+| `GET /v1/gpu/stock[?force=1]` | `_report_gpu_stock`'s data: per-GPU stock and price at the home datacenter, and other regions |
+| `GET /v1/balance[?vast=1]` | RunPod prepaid balance and runway hours; the Vast credit only when asked (§5.9) |
+| `PUT /v1/pod/gpu` `{gpu}` | Sets `.env`'s `GPU` to one of the bot's five |
+| `POST /v1/pod/migrate/ask` `{to_dc}` | Step one of the two-step confirm: checks, then returns a single-use `confirm_token` |
+| `POST /v1/pod/migrate` `{to_dc, confirm_token}` | Step two: `_start_migration`. **Deletes the source volume once the copy verifies** |
 | `GET /v1/outputs` | Batches in `out/*/_final` with their files |
 | `GET /v1/outputs/{batch}/{file}` | Streams the file with HTTP `Range` support so `AVPlayer` plays without a full download |
 
@@ -222,6 +225,7 @@ A mobile client retries. A duplicated `confirm` must never become a second pod.
 | `401` | Missing or wrong bearer token |
 | `404` | Unknown id, or a path outside its root |
 | `409` | World-state refusal: migration in progress, a run already live, Phase A still running, stale `panel_token`, material in use |
+| `502` | `runpodctl` (or another upstream) could not answer a read the app asked for — never for a spend or a kill |
 | `422` | Draft refusal: missing slots, validation failed, unanswered files |
 | `500` | Unexpected exception — logged, and **never** propagated into the bot's poll loop |
 
@@ -258,6 +262,49 @@ queue — it would provision a **second pod**, while the lease file, `.env`'s `G
 - Not in slice 4: choosing the RunPod GPU type (`.env`'s `GPU`, global — slice 5), and retrying a
   try-on with a different provider.
 
+### 5.9 Pod, kill and migrate (slice 5, decided 2026-09-22)
+
+Nothing here spends new money except `resume`, which is `_do_resume` — the same body `confirm` reaches
+after Phase A — and `migrate`, which rents two temporary CPU pods and then **deletes the volume that
+holds the models, Postgres and MinIO**. Both sit behind the slice-4 machinery (`BOT_LOCK`,
+`Idempotency-Key`, a token that goes stale).
+
+- **`kill` never runs `make gpu-destroy` unless something is live.** `_do_kill` itself does not check:
+  Telegram's `_ask_kill` does, one step earlier. Called with nothing running, `_do_kill` would destroy
+  whatever pod `.env` happens to name. The app path repeats `_ask_kill`'s predicate (`drain_running` or
+  `phase_a_running`) **inside** the worker, under `BOT_LOCK`, immediately before calling `_do_kill` —
+  a drain can finish in the seconds between the request and the worker getting the lock.
+- **`kill` answers `202` and works on a thread.** `_do_kill` waits up to 30 s for the drain to die and
+  up to 180 s for `make gpu-destroy`; Cloudflare closes a request at ~100 s. The thread holds `BOT_LOCK`
+  for the duration, exactly as the bot's own loop was blocked by it before. One kill at a time
+  (`409 kill_in_progress`). The result is `GET /v1/pod`'s `last_kill`; a destroy that could not be
+  verified is `ok: false, code: destroy_unverified` and is also posted to Telegram, because a pod may
+  still be billing.
+- **`resume` is for a failed rental only.** It requires an outstanding `provision-failed.json` for the
+  run (the condition Telegram's recovery buttons are drawn under) and the run's current `run_token`;
+  without the first, resuming a finished batch would rent a pod to do nothing. `provider` is required,
+  as on `confirm`. `gpu`, when sent, must equal `.env`'s `GPU` or the answer is `409 stale_panel`; the
+  same optional `gpu` is now checked on `confirm` — the price the app showed was for one GPU.
+- **`GET /v1/balance` keeps the Vast credit opt-in.** `vast_credit()` is a ~30 s subprocess; the RunPod
+  balance is one `runpodctl` call. `GET /v1/pod` is therefore free of both.
+- **Migration is guarded more tightly than Telegram.** `ask` refuses (`409`) while a migration is
+  running, a lease is live, or the chat's run is busy (Telegram lets a migration start under a live
+  drain), when `to_dc` is the home datacenter, or when `to_dc` is not a datacenter the stock check
+  currently lists (`502` if the stock check itself fails: the check fails closed). It returns a
+  `confirm_token` bound to `to_dc` and the volume id, valid for 10 minutes, single use, held in memory
+  (a bot restart voids it — the user asks again). `migrate` consumes the token and re-checks every guard
+  under `BOT_LOCK` before `_start_migration`. Progress stays in Telegram (`tick_migration_progress`);
+  the phone reads the same progress file through `GET /v1/pod`'s `migration`.
+- **No test and no live check ever calls the real `volume_migrate.py` or `make gpu-destroy`.** The
+  invariant test greps `scripts/control/` and `scripts/httpapi/` for both.
+- Cost: `GET /v1/runs/{id}`'s `lease` gains `quoted_usd_per_hr` — the flat $0.99 the bot's own `/kill`
+  text uses for RunPod, `null` for Vast (its lease does not carry the offer's price). A quote, not the
+  invoice; it is a constant, so the ETag rule of §5.3 still holds and the client computes
+  `elapsed × rate` itself.
+- Not in slice 5: switching the *provider* on a resume from the phone (only RunPod's recovery button
+  and the panel's Vast tab exist in Telegram; `provider` on `resume` picks between them), `/subscribe`
+  stock watches, and cancelling a running migration.
+
 ## 6. Delivery in slices
 
 Each slice deploys on its own; `scripts/tests/test_batch_bot.py` stays green after every slice.
@@ -268,7 +315,7 @@ Each slice deploys on its own; `scripts/tests/test_batch_bot.py` stays green aft
 | 2 | Chunked upload + materials | `_stage_file`, `_prune_old_staged_files` | Manage material |
 | 3 | Drafts keyed by owner | `_STATE`, `_job_for`, `_switch_*`, `_fill_slot`, batch and draft functions | Compose jobs |
 | 4 | Phase A, regenerate, rent panel, **confirm** — one shared run slot (§5.8) | nothing moves; `_do_phase_a`, `_do_confirm`, `_do_resume`, `_regen_tryon` return outcomes; data half of the rent panel | Run jobs |
-| 5 | Pod: kill, resume, GPU stock, balance, migrate | `_do_kill`, `_do_resume`, `_report_gpu_stock`, `_report_balance`, `_start_migration` | Pod / cost |
+| 5 | Pod: kill, resume, GPU stock and choice, balance, migrate — §5.9 | nothing moves; `_do_kill` and `_start_migration` return outcomes; data halves of `_report_gpu_stock` and `_report_balance` | Pod / cost |
 
 The SwiftUI app (sub-project 2) can start against slice 1.
 
