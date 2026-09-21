@@ -387,6 +387,27 @@ class TestAppRunsConfirm(_AppRunsFixture):
         self.assertEqual(resp["error"]["code"], "stale_panel")
         self.patches["start_drain"].assert_not_called()
 
+    def test_confirm_with_a_different_gpu_is_stale_panel_and_spends_nothing(self):
+        # The price the phone showed was for one GPU (spec 5.9); .env's GPU
+        # can have moved since (PUT /v1/pod/gpu, or Telegram's own switch).
+        (self.root / ".env").write_text("GPU=NVIDIA GeForce RTX 4090\n", encoding="utf-8")
+        self._seed_draft(validated=True)
+        body = dict(self._body(), gpu="NVIDIA GeForce RTX 5090")
+        status, resp = self.runs.confirm(self.runs.run_id, body, "k-mismatch")
+        self.assertEqual((status, resp["error"]["code"]), (409, "stale_panel"))
+        self.patches["start_drain"].assert_not_called()
+
+        # A matching gpu proceeds, as does an omitted one (an older client).
+        body = dict(self._body(), gpu="NVIDIA GeForce RTX 4090")
+        status, _ = self.runs.confirm(self.runs.run_id, body, "k-match")
+        self.assertEqual(status, 202)
+        self.assertEqual(self.patches["start_drain"].call_count, 1)
+
+        self._seed_draft(validated=True)
+        status, _ = self.runs.confirm(self.runs.run_id, self._body(), "k-omitted")
+        self.assertEqual(status, 202)
+        self.assertEqual(self.patches["start_drain"].call_count, 2)
+
     def test_two_concurrent_confirms_make_one_drain(self):
         self._seed_draft(validated=True)
         # Read once, before either thread starts — the phone would have read

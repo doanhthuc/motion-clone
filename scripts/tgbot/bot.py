@@ -56,7 +56,7 @@ from control.drafts import DraftStore, PROVIDER_LABELS
 from control.idempotency import IdempotencyStore
 from control.materials import fold_diacritics as _fold_diacritics, safe_name as _safe_name
 from control.paths import safe_child as _safe_child
-from control.runs import Outcome, status_for
+from control.runs import Outcome, quoted_usd_per_hr, status_for
 from tgbot import tiktok
 from tgbot.ingest import (Probe, describe, probe, quality_warning,
                          quality_warning_html,
@@ -4165,6 +4165,59 @@ def _report_gpu_stock(tg: Tg, chat_id: int, *, message_id: int | None = None,
                  [[("Refresh", _CB_GPU_REFRESH, _ce_id(ICON_REFRESH_CE))]], parse_mode=PARSE_HTML)
 
 
+def _gpu_stock_data(*, force: bool) -> dict:
+    """`_report_gpu_stock`'s numbers as JSON for the phone (`GET /v1/gpu/stock`).
+
+    A twin, not a caller: `_report_gpu_stock` also sends or edits a Telegram
+    message, and this only returns data. The selection logic below is
+    therefore copied from it on purpose — `entries[0]` for name and price,
+    `home` = the entry at the volume's datacenter, `elsewhere` = the non-home
+    entries with any stock, best first, two per GPU — and a test builds one
+    stock dict and checks both agree, so an edit to one that forgets the
+    other turns red instead of drifting.
+
+    Takes no lock and must not be called under one: `stock_at` is a
+    runpodctl round trip (~30s worst case, its own timeout). Raises
+    RuntimeError when the stock check does; `AppPod.gpu_stock` maps that to
+    502, where the Telegram report says "couldn't reach runpodctl".
+    """
+    volume_id = env_get(ROOT / ".env", "POD_VOLUME_ID")
+    home_dc = volume_datacenter(volume_id)
+    wanted = [_PRIMARY_GPU_ID, *_FALLBACK_GPU_IDS]
+    stock = stock_at(wanted) if force else stock_at_cached(wanted)
+
+    gpus, other_regions = [], []
+    for wanted_id in wanted:
+        entries = stock.get(wanted_id)
+        if not entries:
+            gpus.append({"gpu": wanted_id,
+                         "name": _GPU_DISPLAY_SHORT.get(wanted_id, wanted_id),
+                         "usd_per_hr": None, "home": None,
+                         "sold_out_everywhere": True})
+            continue
+        name = _plain(entries[0].display_name)
+        # A price of 0/None is "?" in the Telegram text; null here, never 0.
+        price = entries[0].price_per_hr or None
+        # None when home_dc itself is unknown: same "no basis for a claim"
+        # reasoning as the report's own comment on this line.
+        home = next((e for e in entries if home_dc and e.datacenter_id == home_dc),
+                    None)
+        gpus.append({"gpu": wanted_id, "name": name, "usd_per_hr": price,
+                     "home": ({"stock": _plain(home.stock_status)}
+                              if home is not None else None),
+                     "sold_out_everywhere": False})
+        elsewhere = sorted(
+            (e for e in entries if e is not home and e.stock_status.lower() != "none"),
+            key=lambda e: _STOCK_RANK.get(e.stock_status.lower(), 9))
+        for e in elsewhere[:2]:
+            other_regions.append({"gpu": wanted_id, "name": _plain(e.display_name),
+                                  "datacenter": _plain(e.datacenter_id),
+                                  "stock": _plain(e.stock_status),
+                                  "usd_per_hr": e.price_per_hr or None})
+    return {"selected": env_get(ROOT / ".env", "GPU") or None,
+            "home_datacenter": home_dc, "gpus": gpus, "other_regions": other_regions}
+
+
 # Below this many hours of runway, /balance warns before a rent is attempted:
 # one motion job runs ~40 minutes on the 5090, plus pod setup, so under an
 # hour a single job may not finish before the balance runs dry.
@@ -4196,6 +4249,46 @@ def _report_balance(tg: Tg, chat_id: int, *, message_id: int | None = None) -> N
         lines.append(f"{ICON_WARN} Under {_LOW_RUNWAY_HOURS:g}h — top up before renting, "
                      "one motion job may not finish.")
     _edit_or_send(tg, chat_id, message_id, "\n".join(lines), buttons, parse_mode=PARSE_HTML)
+
+
+def _balance_data(*, vast: bool) -> dict:
+    """`_report_balance`'s numbers as JSON (`GET /v1/balance`), plus the Vast
+    credit when `vast` is set.
+
+    Same price as the report (`_panel_price`, i.e. what the [Run] button
+    quotes), so the phone and Telegram never give two runways for one
+    balance. Fails soft where the report does: a dead runpodctl is
+    `runpod: None` and a reason in `errors`, not an exception — a balance
+    screen that 500s says less than one that says "could not read it".
+
+    `vast` is opt-in because `vast_credit()` is its own ~30s subprocess
+    (spec 5.9). Absent from the body when not asked; `{"usd": None}` plus an
+    error when asked and unreadable, never `0`: an unreadable account must not
+    read as an empty one (vast_account's own contract).
+
+    Takes no lock; every call here is a network round trip.
+    """
+    errors: list[str] = []
+    runpod = None
+    try:
+        balance = account_balance()
+    except RuntimeError as exc:
+        errors.append(_plain(f"couldn't reach runpodctl: {exc}"))
+    else:
+        price = _panel_price()
+        hours = balance / price if price > 0 else 0.0
+        runpod = {"usd": balance, "usd_per_hr": price,
+                  "runway_hours": round(hours, 2),
+                  "low_runway": hours < _LOW_RUNWAY_HOURS}
+    data: dict = {"runpod": runpod}
+    if vast:
+        try:
+            data["vast"] = {"usd": vast_credit()}
+        except RuntimeError as exc:
+            data["vast"] = {"usd": None}
+            errors.append(_plain(f"couldn't read the Vast credit: {exc}"))
+    data["errors"] = errors
+    return data
 
 
 # One-shot GPU-stock watches: (gpu_id, datacenter_id) pairs a chat asked to
@@ -6632,6 +6725,27 @@ def _bot_locked():
         yield (503, _run_error("bot_busy", "the bot is busy — try again in a moment"))
 
 
+def _gpu_mismatch(body: dict) -> Outcome | None:
+    """The optional `gpu` on `confirm` and `resume` (spec 5.9): the GPU the
+    phone priced its panel for. `.env`'s GPU can move under it — the phone's
+    own `PUT /v1/pod/gpu`, or Telegram's switch — and spending at a different
+    card than the one shown is a different price. A refusal, decided before
+    anything is rented.
+
+    Omitted `gpu` is no check (an older client). The comparison is against
+    the same `.env` GPU (falling back to the primary) that `_do_confirm` and
+    the rent panel read, so "what the app was shown" and "what would be
+    rented" are the one value.
+    """
+    if "gpu" not in body or body["gpu"] is None:
+        return None
+    current = env_get(ROOT / ".env", "GPU") or _PRIMARY_GPU_ID
+    if body["gpu"] == current:
+        return None
+    return Outcome(False, "stale_panel",
+                   "the selected GPU changed since the panel was read — read it again")
+
+
 def _rent_panel_data(chat_id: int, *, force: bool, manifest: Manifest | None) -> dict:
     """The `runpod`/`vast` numbers for the phone's rent panel — the same
     primitives `_offer_run_confirm` and `_offer_vast_panel` read, called
@@ -6778,6 +6892,8 @@ class AppRuns:
             if body.get("panel_token") != self.panel_token():
                 out = Outcome(False, "stale_panel",
                               "the job changed since the panel was read — read it again")
+            elif (mismatch := _gpu_mismatch(body)) is not None:
+                out = mismatch
             elif _PHASE_A_OFFERED.get(self.chat_id) == _run_token(self.chat_id):
                 # The app's own chooser-less equivalent of the rent panel's
                 # spend button: Phase A already ran for this exact manifest,
@@ -7064,6 +7180,8 @@ class AppPod:
             elif read_provision_failure(provision_failure_path(manifest_path)) is None:
                 out = Outcome(False, "no_failure",
                               "no failed rental to retry for this run")
+            elif (mismatch := _gpu_mismatch(body)) is not None:
+                out = mismatch
             else:
                 out = _do_resume(_AppTg(self.tg), self.chat_id, manifest_path,
                                  dry_run=False, gpu_provider=provider)
@@ -7071,6 +7189,132 @@ class AppPod:
                         else (status_for(out), _run_error(out.code, out.message)))
         self.idem.finish("resume", key, *response)
         return response
+
+
+    def _migration_state(self) -> dict:
+        """The migration block of `GET /v1/pod`, from files only.
+
+        `running` is `migration_running()` (lease or launch marker);
+        everything else is read back from the files volume_migrate.py and
+        `_start_migration` write, the same ones `tick_migration_progress`
+        renders. Nothing here is derived from the clock — `started_at` is the
+        stored timestamp and the phone computes elapsed itself — so an idle
+        or unchanged migration gives a byte-identical body (the ETag rule).
+
+        `to_dc` has three homes because the progress file only carries it in
+        its first ("create") phase: the lease is the durable one, the launch
+        marker covers the window before the lease exists.
+        """
+        progress: dict = {}
+        try:
+            raw = json.loads(_migrate_progress_path().read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                progress = raw
+        except (OSError, ValueError):
+            pass
+        lease = read_migrate_lease(_migrate_lease_path())
+        marker: dict = {}
+        try:
+            raw = json.loads(_migrate_launch_marker().read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                marker = raw
+        except (OSError, ValueError):
+            pass
+
+        def number(value):
+            return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+        phase = progress.get("phase")
+        to_dc = progress.get("to_dc") or (lease.to_dc if lease else None) or marker.get("to_dc")
+        return {"running": bool(migration_running()),
+                "phase": _plain(str(phase)) if phase else None,
+                "to_dc": _plain(str(to_dc)) if to_dc else None,
+                "started_at": number(progress.get("started_at"))
+                              or (lease.started_at if lease else None),
+                "bytes_copied": number(progress.get("bytes_copied")),
+                "total_bytes": number(progress.get("total_bytes"))}
+
+    def pod(self) -> tuple[int, dict]:
+        """`GET /v1/pod`: the lease, the selected GPU, the migration and the
+        last kill — files and memory only, so it is cheap to poll (spec 5.4).
+
+        No network call (a test proves it) and no field derived from the
+        current time (a test proves that too): the body is hashed into an
+        ETag, and one that moves with the clock never gets a 304. The phone
+        computes elapsed from `lease.provisioned_at` itself.
+
+        Takes `BOT_LOCK` like every read of bot state, which means a kill in
+        progress answers this with 503 bot_busy until the worker lets go: the
+        worker holds the lock for the whole destroy.
+        """
+        with _bot_locked() as busy_response:
+            if busy_response is not None:
+                return busy_response
+            manifest_path = _job_manifest_path(self.chat_id)
+            lease = lease_for(manifest_path) or read_lease(LEASE_PATH)
+            failure = read_provision_failure(provision_failure_path(manifest_path))
+            body = {
+                "run_id": self.run_id,
+                "gpu": env_get(ROOT / ".env", "GPU") or _PRIMARY_GPU_ID,
+                "lease": None if lease is None else {
+                    "provider": lease.provider,
+                    "provisioned_at": lease.provisioned_at,
+                    "abs_max_min": lease.abs_max_min,
+                    "quoted_usd_per_hr": quoted_usd_per_hr(lease.provider),
+                    # The stem only: the lease's manifest is an absolute path.
+                    "run_id": Path(lease.manifest).stem or None,
+                },
+                "migration": self._migration_state(),
+                # Plain again on the way out: the worker already stripped it,
+                # but this body is where "no absolute path, no HTML" is
+                # promised, so it does not rest on a writer elsewhere.
+                "last_kill": ({**self.last_kill,
+                               "message": _plain(str(self.last_kill.get("message", "")))}
+                              if self.last_kill else None),
+                "failed_rental": None if failure is None else {
+                    "gpu": _plain(failure.gpu),
+                    "datacenter": _plain(failure.datacenter) if failure.datacenter else None,
+                    "stock_out": failure.stock_out,
+                    "detail": _plain(failure.detail)},
+            }
+        return 200, body
+
+    def gpu_stock(self, force: bool) -> tuple[int, dict]:
+        """`GET /v1/gpu/stock[?force=1]`. Takes no lock: nothing it reads is
+        bot state, and a runpodctl round trip held under `BOT_LOCK` would stall
+        every Telegram update for as long as it runs (`_rent_panel_data`'s
+        reasoning). A dead runpodctl is 502 here, where the rent panel fails
+        open — this endpoint's only job is the stock, so "no data" is the
+        honest answer, not an empty list that reads as "sold out"."""
+        try:
+            return 200, _gpu_stock_data(force=bool(force))
+        except RuntimeError as exc:
+            return 502, _run_error("upstream_unavailable",
+                                   _plain(f"couldn't reach runpodctl: {exc}"))
+
+    def balance(self, vast: bool) -> tuple[int, dict]:
+        """`GET /v1/balance[?vast=1]`. No lock, for `gpu_stock`'s reason; the
+        soft-failure shape is `_balance_data`'s."""
+        return 200, _balance_data(vast=bool(vast))
+
+    def set_gpu(self, body: dict) -> tuple[int, dict]:
+        """`PUT /v1/pod/gpu`: `.env`'s GPU, one of the bot's five.
+
+        No run or drain guard, by design: Telegram's own switch button
+        (`_CB_RUN_SWITCH`) has none either, and a rental already in flight
+        read its GPU when it started. Only catalog membership is checked, by
+        full id — the ids `GET /v1/gpu/stock` hands out. The lock is for the
+        `.env` rewrite (`env_set`), not for anything the check reads.
+        """
+        gpu = body.get("gpu") if isinstance(body, dict) else None
+        if not isinstance(gpu, str) or gpu not in _GPU_CATALOG:
+            return 400, _run_error("bad_request", "gpu must be one of the catalog ids "
+                                                  "from GET /v1/gpu/stock")
+        with _bot_locked() as busy_response:
+            if busy_response is not None:
+                return busy_response
+            env_set(ROOT / ".env", "GPU", gpu)
+        return 200, {"gpu": gpu, "name": _GPU_DISPLAY_SHORT.get(gpu, gpu)}
 
 
 def _handle_locked(tg: Tg, update: dict, **kwargs) -> None:

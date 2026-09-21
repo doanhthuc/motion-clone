@@ -7,7 +7,7 @@ readers are patched by name in `tgbot.bot`, so no test can reach `make
 gpu-destroy`, `volume_migrate.py`, `runpodctl` or `vastai`. A test that could
 reach one unpatched is a defect, not a slow test.
 """
-import json, subprocess, sys, threading, time, unittest
+import contextlib, itertools, json, subprocess, sys, threading, time, unittest
 from pathlib import Path
 from unittest import mock
 
@@ -18,11 +18,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from batchlib.manifest import state_path_for
+from batchlib.config import env_get
+from batchlib_ext.gpu_stock import Stock
+from batchlib_ext.lease import Lease, read_lease, write_lease
+from batchlib_ext.migrate_lease import MigrateLease, write_migrate_lease
 from batchlib_ext.provision_failure import (ProvisionFailure, provision_failure_path,
                                             write_provision_failure)
 from control.idempotency import IdempotencyStore
 from control.runs import Outcome
 import tgbot.bot as bot
+import tgbot.run as run_mod
 from tgbot.job import write_manifest
 
 from test_batch_control_botruns import ME, _Fixture
@@ -107,6 +112,11 @@ class TestDoKillOutcomes(_PodFixture):
         out = bot._do_kill(self.tg, ME)
         self.assertEqual((out.ok, out.code), (False, "destroy_unverified"))
         self.assertTrue(any("may not have worked" in text for text in self._texts()))
+        # This message is what GET /v1/pod's last_kill hands the phone. It is
+        # the one outcome where a pod may still be billing, so an empty or
+        # vague message would hide the only thing the user has to act on.
+        self.assertTrue(out.message)
+        self.assertIn("billing", out.message)
 
     def test_do_kill_destroy_timeout_is_not_ok(self):
         self.patches["drain_running"].return_value = True
@@ -397,6 +407,25 @@ class TestAppPodResume(_PodFixture):
         self.assertEqual(second, first)
         self.patches["start_drain"].assert_called_once()
 
+    def test_resume_with_a_different_gpu_is_stale_panel_and_spends_nothing(self):
+        (self.root / ".env").write_text("GPU=NVIDIA GeForce RTX 4090\n", encoding="utf-8")
+        failure = self._seed_failure()
+        status, body = self.pod.resume(
+            self.pod.run_id, self._body(gpu="NVIDIA GeForce RTX 5090"), "k-mismatch")
+        self.assertEqual((status, body["error"]["code"]), (409, "stale_panel"))
+        self.patches["start_drain"].assert_not_called()
+        self.assertTrue(failure.exists())
+
+        # A matching gpu and an omitted one both go through as before.
+        status, _ = self.pod.resume(
+            self.pod.run_id, self._body(gpu="NVIDIA GeForce RTX 4090"), "k-match")
+        self.assertEqual(status, 202)
+        self.assertEqual(self.patches["start_drain"].call_count, 1)
+        self._seed_failure()
+        status, _ = self.pod.resume(self.pod.run_id, self._body(), "k-omitted")
+        self.assertEqual(status, 202)
+        self.assertEqual(self.patches["start_drain"].call_count, 2)
+
     def test_resume_refusal_is_returned_not_sent_to_telegram(self):
         self._seed_failure()
         self.patches["migration_running"].return_value = True
@@ -429,6 +458,402 @@ class TestAppPodResume(_PodFixture):
         # Forgotten, not recorded: the same key may simply be retried.
         status, _body = self.pod.resume(self.pod.run_id, self._body(), "k1")
         self.assertEqual(status, 202)
+
+
+P5090 = "NVIDIA GeForce RTX 5090"
+P4090 = "NVIDIA GeForce RTX 4090"
+PL40S = "NVIDIA L40S"
+
+
+def _fake_stock() -> dict:
+    """One stock answer, shared by the JSON data function and the Telegram
+    report, so the parity test compares the two on identical input. The 5090
+    is at home (Medium) and in four other regions; the L40S is only elsewhere
+    and has no price; every other card is absent (sold out everywhere)."""
+    def s(gpu, name, price, dc, status):
+        return Stock(gpu_id=gpu, display_name=name, price_per_hr=price,
+                     datacenter_id=dc, stock_status=status)
+    return {
+        P5090: [s(P5090, "RTX 5090", 0.99, "EU-RO-1", "Medium"),
+                s(P5090, "RTX 5090", 0.99, "EU-CZ-1", "Low"),
+                s(P5090, "RTX 5090", 1.05, "EUR-IS-1", "High"),
+                s(P5090, "RTX 5090", 0.99, "US-KS-2", "none"),
+                s(P5090, "RTX 5090", 0.99, "EU-NL-1", "Medium")],
+        PL40S: [s(PL40S, "L40S", None, "EU-CZ-1", "Medium")],
+    }
+
+
+@contextlib.contextmanager
+def _bot_lock_held_elsewhere():
+    """BOT_LOCK is an RLock, so this thread taking it would always succeed:
+    the holder has to be another thread for a test to prove anything."""
+    held, release = threading.Event(), threading.Event()
+
+    def hold():
+        with bot.BOT_LOCK:
+            held.set()
+            release.wait(10)
+
+    t = threading.Thread(target=hold)
+    t.start()
+    try:
+        assert held.wait(5)
+        yield
+    finally:
+        release.set()
+        t.join(5)
+
+
+def _lock_free_from_another_thread() -> bool:
+    got = []
+
+    def probe():
+        ok = bot.BOT_LOCK.acquire(blocking=False)
+        got.append(ok)
+        if ok:
+            bot.BOT_LOCK.release()
+
+    t = threading.Thread(target=probe)
+    t.start()
+    t.join(5)
+    return got[0]
+
+
+class TestGpuStock(_PodFixture):
+    def setUp(self):
+        super().setUp()
+        (self.root / ".env").write_text(
+            f"GPU={P4090}\nPOD_VOLUME_ID=vol-1\n", encoding="utf-8")
+
+    def test_gpu_stock_data_matches_report_gpu_stock(self):
+        """The JSON is a twin of _report_gpu_stock, not a caller of it, so this
+        is the only thing that stops the two drifting apart."""
+        stock = _fake_stock()
+        self.patches["stock_at_cached"].return_value = stock
+        data = bot._gpu_stock_data(force=False)
+        bot._report_gpu_stock(self.tg, ME)
+        [(html, _)] = self.tg.sent
+        lines = [line.strip() for line in bot._plain(html).splitlines()]
+
+        self.assertEqual(data["selected"], P4090)
+        self.assertEqual(data["home_datacenter"], "EU-RO-1")
+        self.assertIn(f"Currently selected: {P4090}", " ".join(lines))
+        self.assertTrue(any("EU-RO-1" in line and "your volume" in line for line in lines))
+
+        def price_text(price):
+            return f"${price:.2f}/h" if price else "?"
+
+        self.assertEqual([g["gpu"] for g in data["gpus"]],
+                         [bot._PRIMARY_GPU_ID, *bot._FALLBACK_GPU_IDS])
+        for gpu in data["gpus"]:
+            entries = stock.get(gpu["gpu"])
+            if not entries:
+                self.assertTrue(gpu["sold_out_everywhere"])
+                self.assertIsNone(gpu["home"])
+                self.assertIsNone(gpu["usd_per_hr"])
+                self.assertIn(f"{gpu['name']}: 🔴 sold out everywhere", lines)
+                continue
+            self.assertFalse(gpu["sold_out_everywhere"])
+            self.assertEqual(gpu["name"], entries[0].display_name)
+            self.assertEqual(gpu["usd_per_hr"], entries[0].price_per_hr or None)
+            [row] = [l for l in lines if l.startswith(gpu["name"] + ":")
+                     or l.startswith(gpu["name"] + " ·")]
+            self.assertTrue(row.endswith(price_text(entries[0].price_per_hr)), row)
+            home = next((e for e in entries if e.datacenter_id == "EU-RO-1"), None)
+            if home is None:
+                self.assertIsNone(gpu["home"])
+            else:
+                self.assertEqual(gpu["home"], {"stock": home.stock_status})
+                self.assertIn(home.stock_status, row)
+
+        # Other regions: same entries, same order, same two-per-GPU cut.
+        start = next(i for i, l in enumerate(lines) if l.startswith("Other regions"))
+        rows = [l for l in lines[start + 1:] if l]
+        self.assertEqual(len(rows), len(data["other_regions"]))
+        for row, other in zip(rows, data["other_regions"]):
+            self.assertTrue(row.startswith(f"{other['name']} — {other['datacenter']}:"), row)
+            self.assertIn(other["stock"], row)
+            self.assertTrue(row.endswith(price_text(other["usd_per_hr"])), row)
+        # Two per GPU, best stock first: High before Medium, Low cut.
+        self.assertEqual(
+            [(o["gpu"], o["datacenter"], o["stock"]) for o in data["other_regions"]],
+            [(P5090, "EUR-IS-1", "High"), (P5090, "EU-NL-1", "Medium"),
+             (PL40S, "EU-CZ-1", "Medium")])
+        self.assertIsNone(data["other_regions"][2]["usd_per_hr"])
+
+    def test_gpu_stock_answers_200_with_the_data(self):
+        self.patches["stock_at_cached"].return_value = _fake_stock()
+        status, body = self.pod.gpu_stock(False)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, bot._gpu_stock_data(force=False))
+        self.assertNotIn("<", json.dumps(body))
+
+    def test_gpu_stock_runpodctl_failure_is_502_upstream_unavailable(self):
+        self.patches["stock_at_cached"].side_effect = RuntimeError("runpodctl down")
+        status, body = self.pod.gpu_stock(False)
+        self.assertEqual(status, 502)
+        self.assertEqual(body["error"]["code"], "upstream_unavailable")
+        self.assertIn("runpodctl down", body["error"]["message"])
+
+    def test_gpu_stock_force_uses_live_check(self):
+        with mock.patch("tgbot.bot.stock_at", return_value=_fake_stock()) as live:
+            self.pod.gpu_stock(True)
+            live.assert_called_once()
+            self.patches["stock_at_cached"].assert_not_called()
+        with mock.patch("tgbot.bot.stock_at", return_value=_fake_stock()) as live:
+            self.pod.gpu_stock(False)
+            live.assert_not_called()
+            self.patches["stock_at_cached"].assert_called_once()
+
+    def test_gpu_stock_runs_outside_the_bot_lock(self):
+        seen = []
+
+        def probing_stock(*_args, **_kwargs):
+            seen.append(_lock_free_from_another_thread())
+            return _fake_stock()
+
+        self.patches["stock_at_cached"].side_effect = probing_stock
+        status, _ = self.pod.gpu_stock(False)
+        self.assertEqual((status, seen), (200, [True]))
+
+    def test_gpu_stock_does_not_take_the_lock_at_all(self):
+        # A kill worker holds BOT_LOCK for minutes; the stock read is not bot
+        # state and must not queue behind it.
+        self.patches["stock_at_cached"].return_value = _fake_stock()
+        with _bot_lock_held_elsewhere(), \
+             mock.patch.object(bot, "BOT_LOCK_TIMEOUT_SEC", 0.05):
+            status, _ = self.pod.gpu_stock(False)
+        self.assertEqual(status, 200)
+
+
+class TestBalance(_PodFixture):
+    def _balance(self, usd: float, *, vast: bool = False, vast_credit=25.0):
+        with mock.patch("tgbot.bot.account_balance", return_value=usd), \
+             mock.patch("tgbot.bot.vast_credit", return_value=vast_credit) as credit:
+            result = self.pod.balance(vast)
+        return result, credit
+
+    def test_balance_runway_and_low_flag(self):
+        # The fixture's stock check answers {}, so the price is _gpu_price's
+        # own 0.99 fallback, the same number the [Run] button quotes.
+        (status, body), _ = self._balance(40.0)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["runpod"]["usd"], 40.0)
+        self.assertEqual(body["runpod"]["usd_per_hr"], 0.99)
+        self.assertAlmostEqual(body["runpod"]["runway_hours"], 40.0 / 0.99, places=2)
+        self.assertFalse(body["runpod"]["low_runway"])
+        self.assertEqual(body["errors"], [])
+
+        (status, body), _ = self._balance(0.50)
+        self.assertTrue(body["runpod"]["low_runway"])
+
+    def test_balance_low_flag_agrees_with_the_telegram_report(self):
+        for usd in (0.50, 40.0):
+            self.tg.sent.clear()
+            with mock.patch("tgbot.bot.account_balance", return_value=usd):
+                bot._report_balance(self.tg, ME)
+                _, body = self.pod.balance(False)
+            [(html, _)] = self.tg.sent
+            self.assertEqual("Under 1h" in bot._plain(html), body["runpod"]["low_runway"])
+
+    def test_balance_vast_only_when_asked(self):
+        (_, body), credit = self._balance(40.0)
+        credit.assert_not_called()
+        self.assertNotIn("vast", body)
+        (_, body), credit = self._balance(40.0, vast=True)
+        credit.assert_called_once()
+        self.assertEqual(body["vast"], {"usd": 25.0})
+
+    def test_balance_vast_failure_is_soft(self):
+        with mock.patch("tgbot.bot.account_balance", return_value=40.0), \
+             mock.patch("tgbot.bot.vast_credit", side_effect=RuntimeError("vastai down")):
+            status, body = self.pod.balance(True)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["vast"], {"usd": None})
+        self.assertEqual(body["runpod"]["usd"], 40.0)
+        self.assertTrue(any("vastai down" in e for e in body["errors"]))
+
+    def test_balance_runpodctl_failure_is_200_with_error_not_500(self):
+        with mock.patch("tgbot.bot.account_balance",
+                        side_effect=RuntimeError("could not run <b>runpodctl</b>")):
+            status, body = self.pod.balance(False)
+        self.assertEqual(status, 200)
+        self.assertIsNone(body["runpod"])
+        [error] = body["errors"]
+        self.assertIn("runpodctl", error)
+        self.assertNotIn("<", error)
+
+    def test_balance_network_runs_outside_the_lock_and_never_takes_it(self):
+        seen = []
+
+        def probing_balance():
+            seen.append(_lock_free_from_another_thread())
+            return 40.0
+
+        with mock.patch("tgbot.bot.account_balance", side_effect=probing_balance):
+            self.assertEqual(self.pod.balance(False)[0], 200)
+        self.assertEqual(seen, [True])
+        with _bot_lock_held_elsewhere(), \
+             mock.patch.object(bot, "BOT_LOCK_TIMEOUT_SEC", 0.05), \
+             mock.patch("tgbot.bot.account_balance", return_value=40.0):
+            self.assertEqual(self.pod.balance(False)[0], 200)
+
+
+class TestPodState(_PodFixture):
+    IDLE_MIGRATION = {"running": False, "phase": None, "to_dc": None,
+                      "started_at": None, "bytes_copied": None, "total_bytes": None}
+
+    def _real_leases(self) -> Path:
+        """Undo the fixture's lease stubs so the lease files on disk are what
+        is read, with both lease paths pointed at the temp root."""
+        path = self.root / "batch" / "pod-lease.json"
+        for target, value in (("tgbot.run.LEASE_PATH", path), ("tgbot.bot.LEASE_PATH", path)):
+            patcher = mock.patch(target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.patches["lease_for"].side_effect = run_mod.lease_for
+        self.patches["read_lease"].side_effect = read_lease
+        return path
+
+    def test_pod_reports_idle(self):
+        status, body = self.pod.pod()
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {
+            "run_id": f"tg-{ME}", "gpu": bot._PRIMARY_GPU_ID, "lease": None,
+            "migration": self.IDLE_MIGRATION, "last_kill": None,
+            "failed_rental": None})
+
+    def test_pod_gpu_is_the_env_gpu(self):
+        (self.root / ".env").write_text(f"GPU={P4090}\n", encoding="utf-8")
+        self.assertEqual(self.pod.pod()[1]["gpu"], P4090)
+
+    def test_pod_reports_lease_migration_failed_rental_last_kill(self):
+        lease_path = self._real_leases()
+        write_lease(lease_path, Lease(pod_id="p1", provisioned_at=1_800_000_000.0,
+                                      manifest=str(self._live()), abs_max_min=120,
+                                      provider="runpod"))
+        write_migrate_lease(self.root / "batch" / "volume-migrate-lease.json",
+                            MigrateLease(pod_a_id="a", pod_b_id="b",
+                                         started_at=1_800_000_500.0, to_dc="EU-CZ-1"))
+        (self.root / "batch" / "volume-migrate.progress.json").write_text(json.dumps({
+            "phase": "sync", "at": 1_800_000_900.0, "started_at": 1_800_000_600.0,
+            "total_bytes": 100, "bytes_copied": 40}), encoding="utf-8")
+        self.patches["migration_running"].return_value = True
+        write_provision_failure(provision_failure_path(self._live()), ProvisionFailure(
+            gpu=P5090, datacenter="EU-RO-1", stock_out=True, detail="no instances"))
+        self.pod.last_kill = {"at": 1.0, "ok": True, "code": "killed", "message": "done"}
+
+        status, body = self.pod.pod()
+        self.assertEqual(status, 200)
+        self.assertEqual(body["lease"], {
+            "provider": "runpod", "provisioned_at": 1_800_000_000.0, "abs_max_min": 120,
+            "quoted_usd_per_hr": 0.99, "run_id": f"tg-{ME}"})
+        self.assertEqual(body["migration"], {
+            "running": True, "phase": "sync", "to_dc": "EU-CZ-1",
+            "started_at": 1_800_000_600.0, "bytes_copied": 40, "total_bytes": 100})
+        self.assertEqual(body["failed_rental"], {
+            "gpu": P5090, "datacenter": "EU-RO-1", "stock_out": True,
+            "detail": "no instances"})
+        self.assertEqual(body["last_kill"],
+                         {"at": 1.0, "ok": True, "code": "killed", "message": "done"})
+
+    def test_pod_lease_falls_back_to_the_global_file_for_a_chained_link(self):
+        # drain.py rewrites lease.manifest to the claimed link, so
+        # lease_for(this manifest) is None while a pod is still live.
+        lease_path = self._real_leases()
+        write_lease(lease_path, Lease(pod_id="p1", provisioned_at=5.0,
+                                      manifest=str(self.root / "batch" / "other.yaml"),
+                                      abs_max_min=90, provider="vast"))
+        lease = self.pod.pod()[1]["lease"]
+        self.assertEqual((lease["provider"], lease["run_id"], lease["quoted_usd_per_hr"]),
+                         ("vast", "other", None))
+
+    def test_pod_migration_phase_survives_when_no_lease_exists_yet(self):
+        # The window between the launch marker and volume_migrate.py's own
+        # lease: the destination comes from the marker.
+        self.patches["migration_running"].return_value = True
+        (self.root / "batch" / "volume-migrate.launching.json").write_text(
+            json.dumps({"at": 1.0, "to_dc": "EUR-IS-1"}), encoding="utf-8")
+        migration = self.pod.pod()[1]["migration"]
+        self.assertEqual((migration["running"], migration["phase"], migration["to_dc"]),
+                         (True, None, "EUR-IS-1"))
+
+    def test_pod_makes_no_network_call(self):
+        def boom(name):
+            return mock.patch(f"tgbot.bot.{name}",
+                              side_effect=AssertionError(f"{name} called from pod()"))
+
+        with boom("stock_at"), boom("stock_at_cached"), boom("volume_datacenter"), \
+             boom("account_balance"), boom("vast_credit"), \
+             mock.patch("tgbot.bot.subprocess.Popen",
+                        side_effect=AssertionError("Popen called from pod()")):
+            self.run.side_effect = AssertionError("subprocess.run called from pod()")
+            status, _ = self.pod.pod()
+        self.assertEqual(status, 200)
+
+    def test_pod_body_is_stable_between_calls(self):
+        # The ETag-safety property (spec 5.3): with a lease, a migration and a
+        # failed rental all present, nothing in the body may move with the
+        # clock, or If-None-Match never gets a 304.
+        lease_path = self._real_leases()
+        write_lease(lease_path, Lease(pod_id="p1", provisioned_at=1_800_000_000.0,
+                                      manifest=str(self._live()), abs_max_min=120))
+        (self.root / "batch" / "volume-migrate.progress.json").write_text(
+            json.dumps({"phase": "sync", "started_at": 1.0}), encoding="utf-8")
+        self.patches["migration_running"].return_value = True
+        write_provision_failure(provision_failure_path(self._live()), ProvisionFailure(
+            gpu=P5090, datacenter=None, stock_out=False, detail="x"))
+        ticking = itertools.count(1_900_000_000.0, 7.0)
+        with mock.patch("tgbot.bot.time.time", side_effect=lambda: next(ticking)):
+            first = self.pod.pod()
+            second = self.pod.pod()
+        self.assertEqual(first, second)
+
+    def test_pod_names_no_absolute_path(self):
+        lease_path = self._real_leases()
+        write_lease(lease_path, Lease(pod_id="p1", provisioned_at=1.0,
+                                      manifest=str(self._live()), abs_max_min=60))
+        write_provision_failure(provision_failure_path(self._live()), ProvisionFailure(
+            gpu=P5090, datacenter="EU-RO-1", stock_out=False,
+            detail=f"failed in {self.root}/batch/tg.yaml <b>badly</b>"))
+        self.pod.last_kill = {"at": 1.0, "ok": False, "code": "error",
+                              "message": f"see {self.root}/x"}
+        text = json.dumps(self.pod.pod()[1])
+        self.assertNotIn(str(self.root), text)
+        self.assertNotIn("<b>", text)
+
+    def test_pod_is_503_while_the_bot_lock_is_held(self):
+        with _bot_lock_held_elsewhere(), mock.patch.object(bot, "BOT_LOCK_TIMEOUT_SEC", 0.05):
+            status, body = self.pod.pod()
+        self.assertEqual((status, body["error"]["code"]), (503, "bot_busy"))
+
+
+class TestSetGpu(_PodFixture):
+    ENV = f"OTHER=1\nGPU={P5090}\n"
+
+    def setUp(self):
+        super().setUp()
+        self.env = self.root / ".env"
+        self.env.write_text(self.ENV, encoding="utf-8")
+
+    def test_set_gpu_writes_env_and_rejects_unknown(self):
+        for bad in ({"gpu": "NVIDIA H100"}, {"gpu": "5090"}, {"gpu": None}, {},
+                    {"gpu": ["x"]}, {"gpu": 5}):
+            status, body = self.pod.set_gpu(bad)
+            self.assertEqual((status, body["error"]["code"]), (400, "bad_request"), bad)
+            self.assertEqual(self.env.read_text(encoding="utf-8"), self.ENV)
+
+        status, body = self.pod.set_gpu({"gpu": P4090})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["gpu"], P4090)
+        self.assertEqual(env_get(self.env, "GPU"), P4090)
+        self.assertEqual(env_get(self.env, "OTHER"), "1")
+
+    def test_set_gpu_takes_the_bot_lock(self):
+        with _bot_lock_held_elsewhere(), mock.patch.object(bot, "BOT_LOCK_TIMEOUT_SEC", 0.05):
+            status, body = self.pod.set_gpu({"gpu": P4090})
+        self.assertEqual((status, body["error"]["code"]), (503, "bot_busy"))
+        self.assertEqual(self.env.read_text(encoding="utf-8"), self.ENV)
 
 
 class TestBotLockedHelper(_PodFixture):
