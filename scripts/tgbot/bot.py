@@ -3072,8 +3072,12 @@ def _refuse(tg: Tg, chat_id: int, code: str, text: str, **send_kwargs) -> Outcom
     return Outcome(False, code, _plain(text))
 
 
+_GUIDANCE_FLAGS = {"keep_face": "keepFace", "tighter_crop": "tighterCrop",
+                   "match_lighting": "matchLighting"}
+
+
 def _regen_tryon(tg: Tg, chat_id: int, index: str, token: str, *,
-                 dry_run: bool) -> Outcome:
+                 dry_run: bool, guidance: list[str] | None = None) -> Outcome:
     """Redo ONE run's try-on image, leaving every other run's untouched.
 
     Reached from the 🔄 button under a Phase A preview. The mechanism is the
@@ -3125,6 +3129,14 @@ def _regen_tryon(tg: Tg, chat_id: int, index: str, token: str, *,
                        f"{run.id}'s try-on no longer runs over the API "
                        "(its provider changed), so there is nothing to "
                        "regenerate here.")
+    if guidance:
+        unknown = [g for g in guidance if g not in _GUIDANCE_FLAGS]
+        if unknown:
+            return _refuse(tg, chat_id, "bad_request",
+                           f"unknown guidance value(s): {', '.join(unknown)} — only "
+                           f"{', '.join(sorted(_GUIDANCE_FLAGS))} are accepted")
+        run.stage_params.setdefault(stage_name, {}).update(
+            {_GUIDANCE_FLAGS[g]: "1" for g in guidance})
 
     state_file = state_path_for(manifest_path)
     state = load_state(state_file)
@@ -7101,6 +7113,21 @@ class AppRuns:
             return None
         return image
 
+    def tryon_version_image(self, index: str, n: str) -> Path | None:
+        """An earlier version of the try-on image at `index`, oldest = "1"
+        (§5.10, slice 6). Same shape as tryon_image: `None` covers both "no
+        such preview" and "n out of range", never an exception."""
+        if not n.isdigit() or int(n) < 1:
+            return None
+        image = self.tryon_image(self.run_id, index)
+        if image is None:
+            return None
+        versions = _tryon_versions(image)
+        position = int(n) - 1
+        if position >= len(versions):
+            return None
+        return versions[position]
+
     def tryon_save_info(self, index: str) -> tuple[Path, dict, str] | None:
         """(image_path, material_ids, provider) for the current try-on
         preview at `index`, for the try-on library to save — or `None` when
@@ -7135,6 +7162,14 @@ class AppRuns:
         token = body.get("run_token")
         if not token:
             return 400, _run_error("bad_request", "run_token is required")
+        guidance = body.get("guidance")
+        if guidance is not None:
+            if not isinstance(guidance, list) or not all(isinstance(g, str) for g in guidance):
+                return 400, _run_error("bad_request", "guidance must be a list of strings")
+            unknown = [g for g in guidance if g not in _GUIDANCE_FLAGS]
+            if unknown:
+                return 400, _run_error("bad_request",
+                                       f"unknown guidance value(s): {', '.join(unknown)}")
         replay = self.idem.begin("regen", key)
         if replay is not None:
             return replay
@@ -7142,7 +7177,8 @@ class AppRuns:
             if busy is not None:
                 self.idem.forget("regen", key)
                 return busy
-            out = _regen_tryon(_AppTg(self.tg), self.chat_id, index, token, dry_run=False)
+            out = _regen_tryon(_AppTg(self.tg), self.chat_id, index, token, dry_run=False,
+                               guidance=guidance)
             if out:
                 response = (202, {"run_id": self.run_id, "outcome": out.code})
             else:

@@ -230,6 +230,18 @@ _TRYON_NAILS_NEG = ("painted nails, nail polish, colored nails, manicure, artifi
 _TRYON_WRIST_POS = "Do not show a watch or bracelet on either wrist."
 _TRYON_WRIST_NEG = "watch, wristwatch, bracelet, wrist jewelry"
 
+# Guidance chips from the phone's Regenerate screen (§5.10, slice 6) — a
+# closed vocabulary of exactly three flags, appended the same way the hands
+# clauses above are. "Keep face" reinforces a guard gemini_tryon_prompt
+# already applies unconditionally (the CRITICAL face-lock sentence); the
+# other two are new instructions.
+_TRYON_KEEP_FACE_POS = ("Preserve the person's exact facial identity, expression and skin tone with "
+                        "no changes.")
+_TRYON_TIGHTER_CROP_POS = ("Frame the result as a tighter, closer crop on the person and garment, "
+                           "cropping in from the current framing.")
+_TRYON_MATCH_LIGHTING_POS = ("Match the lighting, color temperature and shadow direction of the "
+                             "garment to the lighting already present on the person in image 1.")
+
 
 def _flag(params: dict, *keys: str) -> bool:
     for key in keys:
@@ -250,6 +262,22 @@ def tryon_hands_prompts(params: dict) -> tuple[str, str]:
     if _flag(params, "remove_wrist_accessories", "removeWristAccessories"):
         pos.append(_TRYON_WRIST_POS); neg.append(_TRYON_WRIST_NEG)
     return " ".join(pos), ", ".join(neg)
+
+
+def tryon_guidance_prompts(params: dict) -> tuple[str, str]:
+    """(positive, negative) guidance clauses for a regenerate's guidance chips;
+    ("", "") when none are on. Same shape as tryon_hands_prompts, a sibling
+    function rather than a rewrite of it, since the two flag families are
+    independent (hands come from the draft's job params, guidance from one
+    regenerate call)."""
+    pos = []
+    if _flag(params, "keepFace"):
+        pos.append(_TRYON_KEEP_FACE_POS)
+    if _flag(params, "tighterCrop"):
+        pos.append(_TRYON_TIGHTER_CROP_POS)
+    if _flag(params, "matchLighting"):
+        pos.append(_TRYON_MATCH_LIGHTING_POS)
+    return " ".join(pos), ""
 
 
 def gemini_tryon_prompt(gt: str, extra: str = "", hands: tuple[str, str] = ("", "")) -> str:
@@ -762,7 +790,10 @@ def run_local_tryon(run: Run, params: dict, settings: Settings, out_path: Path) 
     # GEMINI_API_BASE (mock.patch.object(lt, "GEMINI_API_BASE", ...)) sẽ không có tác
     # dụng và code gọi thẳng ra Google thật thay vì fake HTTP server của test.
     extra_en = translate_vn_to_en(extra_raw, gem_key, base_url=GEMINI_API_BASE) if extra_raw else ""
-    hands = tryon_hands_prompts(params)
+    hands_pos, hands_neg = tryon_hands_prompts(params)
+    guide_pos, guide_neg = tryon_guidance_prompts(params)
+    hands = (" ".join(x for x in (hands_pos, guide_pos) if x),
+             ", ".join(x for x in (hands_neg, guide_neg) if x))
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp_dir = Path(tmp)

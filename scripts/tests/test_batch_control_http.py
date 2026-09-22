@@ -816,6 +816,7 @@ class FakeAppRuns:
         self.regen_response = (202, {"run_id": "tg-1", "outcome": "started"})
         self.tryon_image_path = None
         self.tryon_image_error = None
+        self.tryon_version_image_path = None
         self.tryon_save_info_result = None
 
     def phase_a(self, key):
@@ -843,6 +844,10 @@ class FakeAppRuns:
     def regen(self, run_id, index, body, key):
         self.calls.append(("regen", run_id, index, body, key))
         return self.regen_response
+
+    def tryon_version_image(self, index, n):
+        self.calls.append(("tryon_version_image", index, n))
+        return self.tryon_version_image_path
 
     def tryon_save_info(self, index):
         self.calls.append(("tryon_save_info", index))
@@ -925,6 +930,21 @@ class TestAppRunRoutes(HttpWriteBase):
         resp, body = self.send("GET", "/v1/runs/tg-1/tryon/0")
         self.assertEqual(resp.status, 503)
         self.assertEqual(json.loads(body)["error"]["code"], "bot_busy")
+
+    def test_tryon_version_image_streams_a_file(self):
+        image = Path(tempfile.mktemp(suffix=".jpg"))
+        image.write_bytes(b"\xff\xd8fake-jpeg-version")
+        self.addCleanup(image.unlink)
+        self.fake.tryon_version_image_path = image
+        resp, body = self.send("GET", "/v1/runs/tg-1/tryon/0/versions/1")
+        self.assertEqual((resp.status, body), (200, image.read_bytes()))
+        self.assertEqual(self.fake.calls, [("tryon_version_image", "0", "1")])
+
+    def test_tryon_version_route_404s_for_an_unknown_version(self):
+        self.fake.tryon_version_image_path = None
+        resp, body = self.send("GET", "/v1/runs/tg-1/tryon/0/versions/99")
+        self.assertEqual(resp.status, 404)
+        self.assertEqual(json.loads(body)["error"]["code"], "not_found")
 
     def test_regen_reaches_app_runs_with_body_and_key(self):
         resp, body = self.send("POST", "/v1/runs/tg-1/tryon/2/regen",

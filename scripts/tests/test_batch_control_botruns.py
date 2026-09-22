@@ -855,6 +855,53 @@ class TestRegenViaAppRuns(_AppRunsFixture):
         self.assertEqual(status, 404)
         self.assertEqual(body["error"]["code"], "not_found")
 
+    def test_regen_with_unknown_guidance_is_400_and_calls_nothing(self):
+        with mock.patch("tgbot.bot._regen_tryon") as fake_regen:
+            status, body = self.runs.regen(
+                self.runs.run_id, "0",
+                {"run_token": "whatever", "guidance": ["not_a_real_flag"]}, "k1")
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "bad_request")
+        fake_regen.assert_not_called()
+
+    def test_regen_with_valid_guidance_reaches_regen_tryon(self):
+        with mock.patch("tgbot.bot._regen_tryon") as fake_regen:
+            fake_regen.return_value = Outcome(True, "regenerated")
+            self.runs.regen(self.runs.run_id, "0",
+                            {"run_token": "whatever",
+                             "guidance": ["keep_face", "tighter_crop"]}, "k2")
+        _args, kwargs = fake_regen.call_args
+        self.assertEqual(kwargs.get("guidance"), ["keep_face", "tighter_crop"])
+
+
+class TestTryonVersionImage(_AppRunsFixture):
+    """AppRuns.tryon_version_image — the version history `_regen_tryon`
+    already keeps on disk (_tryon_versions), served over HTTP (§5.10, slice 6)."""
+
+    def _seed_tryon_run_with_version(self) -> tuple[str, Path]:
+        job = self._tryon_job()
+        manifest = self._write_live_manifest(job)
+        run_id = manifest.runs[0].id
+        image = self.root / "out" / "batch1" / "runs" / run_id / "01-tryon.png"
+        image.parent.mkdir(parents=True, exist_ok=True)
+        image.write_bytes(b"img")
+        version = image.with_name("01-tryon.v1.png")
+        version.write_bytes(b"old img")
+        self._write_journal(run_id, tryon={"status": "done", "file": str(image)})
+        return run_id, version
+
+    def test_version_image_returns_an_older_version(self):
+        _run_id, version = self._seed_tryon_run_with_version()
+        path = self.runs.tryon_version_image("0", "1")
+        self.assertEqual(path, version.resolve())
+
+    def test_version_image_out_of_range_is_none(self):
+        self._seed_tryon_run_with_version()
+        self.assertIsNone(self.runs.tryon_version_image("0", "99"))
+
+    def test_version_image_no_such_preview_is_none(self):
+        self.assertIsNone(self.runs.tryon_version_image("0", "1"))
+
 
 class TestNoAbsolutePaths(_AppRunsFixture):
     def test_no_absolute_paths_in_any_body(self):

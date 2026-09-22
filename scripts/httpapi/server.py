@@ -263,6 +263,16 @@ class _Handler(BaseHTTPRequestHandler):
                 return send_file(self, image)
             except FileNotFoundError:
                 raise NOT_FOUND
+        if (method == "GET" and len(rest) == 6 and rest[0] == "runs" and rest[2] == "tryon"
+                and rest[4] == "versions"):
+            image = self._app_runs().tryon_version_image(rest[3], rest[5])
+            if image is None:
+                raise NOT_FOUND
+            try:
+                self._settle_body()
+                return send_file(self, image)
+            except FileNotFoundError:
+                raise NOT_FOUND
         if (method == "POST" and len(rest) == 5 and rest[0] == "runs" and rest[2] == "tryon"
                 and rest[4] == "regen"):
             app_runs = self._app_runs()
