@@ -126,8 +126,12 @@ public final class DraftStore {
             if response.stale {
                 message = "The draft changed during validation. Validate it again."
             }
-        } catch let api {
-            error = api
+        } catch {
+            let api = apiError(error)
+            if api.isOffline {
+                await refreshAfterAmbiguousWrite()
+            }
+            self.error = api
             message = api.userMessage
         }
     }

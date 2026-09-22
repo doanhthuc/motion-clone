@@ -166,6 +166,27 @@ extension URLProtocolTests {
         #expect(store.message == "Assign driver before validating.")
     }
 
+    @Test func transportFailureReconcilesBeforeValidationCompletes() async {
+        TransportDuringWriteProtocol.install(failingMethod: "POST")
+        let store = DraftStore(client: TransportDuringWriteProtocol.client())
+        await store.load()
+
+        let validation = Task { await store.validate() }
+        for _ in 0..<1_000 {
+            if TransportDuringWriteProtocol.requests.count == 4 { break }
+            await Task.yield()
+        }
+
+        #expect(TransportDuringWriteProtocol.requests.map(\.httpMethod) == ["GET", "GET", "POST", "GET"])
+        #expect(store.isValidating)
+        TransportDuringWriteProtocol.releaseRefresh()
+        await validation.value
+        #expect(!store.isValidating)
+        #expect(store.draft?.generation == 6)
+        #expect(store.error?.isOffline == true)
+        #expect(store.message == store.error?.userMessage)
+    }
+
     @Test func failedRefreshKeepsTheLastDraftAndMarksItStale() async {
         StubURLProtocol.install { request in
             request.url?.path == "/v1/pipelines"
@@ -186,19 +207,19 @@ extension URLProtocolTests {
     }
 
     @Test func transportFailureRefreshesBeforeTheMutationCompletes() async {
-        TransportDuringPatchProtocol.install()
-        let store = DraftStore(client: TransportDuringPatchProtocol.client())
+        TransportDuringWriteProtocol.install(failingMethod: "PATCH")
+        let store = DraftStore(client: TransportDuringWriteProtocol.client())
         await store.load()
 
         let mutation = Task { await store.selectProvider("qwen-max") }
         for _ in 0..<1_000 {
-            if TransportDuringPatchProtocol.requests.count == 4 { break }
+            if TransportDuringWriteProtocol.requests.count == 4 { break }
             await Task.yield()
         }
 
-        #expect(TransportDuringPatchProtocol.requests.map(\.httpMethod) == ["GET", "GET", "PATCH", "GET"])
+        #expect(TransportDuringWriteProtocol.requests.map(\.httpMethod) == ["GET", "GET", "PATCH", "GET"])
         #expect(store.isMutating)
-        TransportDuringPatchProtocol.releaseRefresh()
+        TransportDuringWriteProtocol.releaseRefresh()
         await mutation.value
         #expect(!store.isMutating)
         #expect(store.draft?.generation == 6)
@@ -263,16 +284,16 @@ private func draftResponse(generation: Int, dropped: [String] = []) -> String {
     return result
 }
 
-private final class TransportDuringPatchProtocol: URLProtocol, @unchecked Sendable {
+private final class TransportDuringWriteProtocol: URLProtocol, @unchecked Sendable {
     private static let lock = NSLock()
     private static let refreshRelease = DispatchSemaphore(value: 0)
     nonisolated(unsafe) private static var recorded: [URLRequest] = []
-    nonisolated(unsafe) private static var patchFailed = false
+    nonisolated(unsafe) private static var failedMethod: String?
 
-    static func install() {
+    static func install(failingMethod: String) {
         lock.withLock {
             recorded = []
-            patchFailed = false
+            self.failedMethod = failingMethod
         }
     }
 
@@ -284,7 +305,7 @@ private final class TransportDuringPatchProtocol: URLProtocol, @unchecked Sendab
 
     static func client() -> APIClient {
         let configuration = URLSessionConfiguration.ephemeral
-        configuration.protocolClasses = [TransportDuringPatchProtocol.self]
+        configuration.protocolClasses = [TransportDuringWriteProtocol.self]
         return APIClient(credentials: TestSupport.credentials, session: URLSession(configuration: configuration))
     }
 
@@ -294,13 +315,13 @@ private final class TransportDuringPatchProtocol: URLProtocol, @unchecked Sendab
     override func startLoading() {
         let state = Self.lock.withLock {
             Self.recorded.append(request)
-            let didFailPatch = Self.patchFailed
+            let didFailWrite = Self.failedMethod == nil
             return (
-                shouldBlockRefresh: didFailPatch && request.httpMethod == "GET" && request.url?.path == "/v1/draft",
-                didFailPatch: didFailPatch)
+                shouldBlockRefresh: didFailWrite && request.httpMethod == "GET" && request.url?.path == "/v1/draft",
+                didFailWrite: didFailWrite)
         }
-        if request.httpMethod == "PATCH" {
-            Self.lock.withLock { Self.patchFailed = true }
+        if request.httpMethod == Self.failedMethod {
+            Self.lock.withLock { Self.failedMethod = nil }
             client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
             return
         }
@@ -309,7 +330,7 @@ private final class TransportDuringPatchProtocol: URLProtocol, @unchecked Sendab
         }
         let body = request.url?.path == "/v1/pipelines"
             ? Fixtures.pipelines
-            : draftResponse(generation: state.didFailPatch ? 6 : 4)
+            : draftResponse(generation: state.didFailWrite ? 6 : 4)
         let response = HTTPURLResponse(
             url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
             headerFields: ["Content-Type": "application/json"])!
