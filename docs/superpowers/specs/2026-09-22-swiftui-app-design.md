@@ -1,6 +1,6 @@
 # Motion iPhone app (SwiftUI) — design
 
-Date: 2026-09-22 · Status: approved in chat; pending written-spec review ·
+Date: 2026-09-22 · Status: approved; Phases 1–2 implemented ·
 Sub-project 2 of 2 of `2026-09-21-vps-control-plane-api-design.md`
 
 The API that this app consumes is sub-project 1 and has shipped (slices 1–6, live at the `motion-vps`
@@ -142,8 +142,8 @@ Each phase is installable and usable on its own.
 
 | # | Boards | Spends? |
 |---|---|---|
-| 1 | Skeleton, Settings (seeded secrets, Test), Runs + Empty, Run progress, Outputs | No |
-| 2 | Materials, Uploading | No |
+| 1 | Skeleton, Settings (seeded secrets, Test), Runs + Empty, Run progress, Outputs — implemented | No |
+| 2 | Materials, Uploading — implemented per `2026-09-22-swiftui-app-phase-2-design.md` | No |
 | 3 | New job (Single) | No |
 | 4 | Try-on preview, Rent GPU, Out of stock — **confirm, resume** | Yes: Gemini/Qwen quota + pod |
 | 5 | Pod & cost — kill, GPU choice, balance, migrate | Yes |
