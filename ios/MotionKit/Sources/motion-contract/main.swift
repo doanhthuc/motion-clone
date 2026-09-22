@@ -49,6 +49,9 @@ if let newestRun {
     print("skip GET /v1/runs/{id} (no runs on the server)")
 }
 await check("GET /v1/pod") { _ = try await client.get(PodStatus.self, "v1", "pod") }
+await check("GET /v1/materials") {
+    _ = try await client.get(MaterialsResponse.self, "v1", "materials")
+}
 var newestVideo: (batch: String, file: String)?
 await check("GET /v1/outputs") {
     let batches = try await client.get(OutputsResponse.self, "v1", "outputs").outputs

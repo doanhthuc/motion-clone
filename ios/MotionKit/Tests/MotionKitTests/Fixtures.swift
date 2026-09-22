@@ -60,6 +60,28 @@ enum Fixtures {
     ]}
     """#
 
+    static let materials = #"""
+    {"materials": [
+      {"id": "app/áo dài.png", "owner": "app", "name": "áo dài.png", "bytes": 901,
+       "updated_at": 1790000100.5, "kind": "image"},
+      {"id": "42/driver.mp4", "owner": "42", "name": "driver.mp4", "bytes": 33554449,
+       "updated_at": 1790000000, "kind": "future_kind"}
+    ]}
+    """#
+
+    static let uploadOpen =
+        #"{"upload_id":"abc123","chunk_size":33554432,"chunks_total":2}"#
+
+    static let uploadStatus =
+        #"{"upload_id":"abc123","file_name":"driver.mp4","size":33554449,"chunk_size":33554432,"chunks_total":2,"received":[0]}"#
+
+    static let uploadComplete = #"""
+    {"material":{"id":"app/driver.mp4","owner":"app","name":"driver.mp4","bytes":33554449,
+     "updated_at":1790000200,"kind":"video"},
+     "probe":{"kind":"video","width":1080,"height":1920,"duration_s":12.5,
+     "bitrate_kbps":4200,"size_bytes":33554449,"warning":"Video is larger than recommended."}}
+    """#
+
     static let errorConflict = #"{"error": {"code": "stale_panel", "message": "the panel changed"}}"#
 
     static let cloudflareHTML = "<!DOCTYPE html><html><head><title>Access denied | Error 1010</title></head></html>"

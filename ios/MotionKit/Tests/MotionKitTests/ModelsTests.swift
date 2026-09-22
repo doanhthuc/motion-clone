@@ -48,4 +48,33 @@ import Testing
         #expect(o.outputs[0].files.map(\.isVideo) == [true, false])
         #expect(o.outputs[0].id == "2026-09-21-0900")
     }
+
+    @Test func decodesMaterialsAndKeepsUnknownKinds() throws {
+        let response = try decoder.decode(MaterialsResponse.self, from: Fixtures.data(Fixtures.materials))
+        #expect(response.materials.count == 2)
+        #expect(response.materials[0].kind == .image)
+        #expect(response.materials[0].canDelete)
+        #expect(response.materials[1].kind == .unknown)
+        #expect(!response.materials[1].canDelete)
+    }
+
+    @Test func decodesUploadLifecycleResponses() throws {
+        let opened = try decoder.decode(UploadOpenResponse.self, from: Fixtures.data(Fixtures.uploadOpen))
+        #expect(opened.uploadId == "abc123")
+        #expect(opened.chunkSize == 33_554_432)
+        #expect(opened.chunksTotal == 2)
+
+        let status = try decoder.decode(UploadStatus.self, from: Fixtures.data(Fixtures.uploadStatus))
+        #expect(status.fileName == "driver.mp4")
+        #expect(status.received == [0])
+        #expect(status.material == nil)
+        #expect(status.probe == nil)
+
+        let complete = try decoder.decode(
+            UploadCompleteResponse.self, from: Fixtures.data(Fixtures.uploadComplete))
+        #expect(complete.material.kind == .video)
+        #expect(complete.probe.width == 1080)
+        #expect(complete.probe.durationS == 12.5)
+        #expect(complete.probe.warning == "Video is larger than recommended.")
+    }
 }
