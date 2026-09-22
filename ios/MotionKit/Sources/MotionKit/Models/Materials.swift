@@ -75,4 +75,9 @@ public struct UploadStatus: Decodable, Sendable, Equatable {
 public struct UploadCompleteResponse: Decodable, Sendable, Equatable {
     public let material: Material
     public let probe: MaterialProbe
+
+    public init(material: Material, probe: MaterialProbe) {
+        self.material = material
+        self.probe = probe
+    }
 }

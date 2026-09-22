@@ -43,6 +43,25 @@ public struct UploadCheckpointJournal: Sendable {
         root.appending(component: (checkpoint.localFileName as NSString).lastPathComponent)
     }
 
+    public func stageSource(from source: URL, fileName: String) throws -> String {
+        if FileManager.default.fileExists(atPath: root.path) {
+            try FileManager.default.removeItem(at: root)
+        }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let ext = (fileName as NSString).pathExtension
+            .filter { $0.isLetter || $0.isNumber }
+            .lowercased()
+        let localName = ext.isEmpty ? "source" : "source.\(ext)"
+        let destination = root.appending(component: localName)
+        do {
+            try FileManager.default.copyItem(at: source, to: destination)
+        } catch {
+            try? clear()
+            throw error
+        }
+        return localName
+    }
+
     public func clear() throws {
         guard FileManager.default.fileExists(atPath: root.path) else { return }
         try FileManager.default.removeItem(at: root)
