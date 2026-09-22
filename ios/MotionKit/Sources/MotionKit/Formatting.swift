@@ -1,5 +1,15 @@
 import Foundation
 
+public enum ImportedFilename {
+    public static func sanitize(_ providerName: String?) -> String {
+        let normalized = (providerName ?? "").replacingOccurrences(of: "\\", with: "/")
+        let name = (normalized as NSString).lastPathComponent
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, name != ".", name != ".." else { return "upload.bin" }
+        return name
+    }
+}
+
 public enum Format {
     /// "12:34" under an hour, "1:12:47" from an hour.
     public static func clock(_ seconds: Double) -> String {

@@ -19,6 +19,7 @@ final class AppModel {
     private(set) var client: APIClient?
     private(set) var runs: RunsStore?
     private(set) var pod: PodStore?
+    private(set) var materials: MaterialsStore?
     private(set) var outputs: OutputsStore?
 
     init() {
@@ -28,13 +29,14 @@ final class AppModel {
 
     func reconnect() {
         guard let credentials = vault.load() else {
-            client = nil; runs = nil; pod = nil; outputs = nil
+            client = nil; runs = nil; pod = nil; materials = nil; outputs = nil
             return
         }
         let client = APIClient(credentials: credentials)
         self.client = client
         runs = RunsStore(client: client)
         pod = PodStore(client: client)
+        materials = MaterialsStore(client: client)
         outputs = OutputsStore(client: client)
     }
 }
