@@ -1,0 +1,35 @@
+import Foundation
+
+public enum Format {
+    /// "12:34" under an hour, "1:12:47" from an hour.
+    public static func clock(_ seconds: Double) -> String {
+        let s = max(0, Int(seconds))
+        let h = s / 3600, m = (s % 3600) / 60, sec = s % 60
+        return h > 0 ? String(format: "%d:%02d:%02d", h, m, sec) : String(format: "%02d:%02d", m, sec)
+    }
+
+    public static func usd(_ value: Double) -> String { String(format: "$%.2f", value) }
+
+    public static func ago(_ seconds: Double) -> String {
+        let s = max(0, Int(seconds))
+        if s < 60 { return "\(s)s ago" }
+        if s < 3600 { return "\(s / 60)m ago" }
+        return "\(s / 3600)h ago"
+    }
+
+    /// Journal stage keys ("tryon", "motion", "enhance") → labels.
+    public static func stageName(_ raw: String) -> String {
+        if raw == "tryon" { return "Try-on" }
+        let spaced = raw.replacingOccurrences(of: "_", with: " ")
+        return spaced.prefix(1).uppercased() + spaced.dropFirst()
+    }
+}
+
+public enum CostEstimate {
+    /// elapsed × quoted rate. A quote, not the invoice (`runpodctl billing`
+    /// is the invoice); nil when the lease carries no rate (Vast).
+    public static func usd(elapsed: Double, ratePerHour: Double?) -> Double? {
+        guard let rate = ratePerHour else { return nil }
+        return max(0, elapsed) / 3600 * rate
+    }
+}

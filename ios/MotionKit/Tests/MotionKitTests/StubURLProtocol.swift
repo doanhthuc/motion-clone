@@ -1,5 +1,10 @@
 import Foundation
+import Testing
 @testable import MotionKit
+
+/// Every suite using StubURLProtocol lives under this serialized parent because
+/// the URL loading system requires the protocol handler to be process-global.
+@Suite(.serialized) struct URLProtocolTests {}
 
 /// Answers every request from a handler; records requests. Global state, so
 /// every suite that uses it is `.serialized` and calls `install` first.

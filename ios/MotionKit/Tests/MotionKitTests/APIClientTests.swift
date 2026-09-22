@@ -2,7 +2,8 @@ import Foundation
 import Testing
 @testable import MotionKit
 
-@Suite(.serialized) struct APIClientTests {
+extension URLProtocolTests {
+@Suite struct APIClientTests {
     @Test func sendsAllAuthHeadersAndUserAgent() async throws {
         StubURLProtocol.install { _ in TestSupport.json(Fixtures.runs) }
         _ = try await TestSupport.client().get(RunsResponse.self, "v1", "runs")
@@ -95,4 +96,5 @@ import Testing
                 == "Server error (internal).")
         #expect(APIError.transport("offline").isOffline)
     }
+}
 }
