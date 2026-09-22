@@ -12,10 +12,12 @@ from __future__ import annotations
 import argparse
 import contextlib
 import hashlib
+import hmac
 import html
 import json
 import os
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -56,7 +58,7 @@ from control.drafts import DraftStore, PROVIDER_LABELS
 from control.idempotency import IdempotencyStore
 from control.materials import fold_diacritics as _fold_diacritics, safe_name as _safe_name
 from control.paths import safe_child as _safe_child
-from control.runs import Outcome, status_for
+from control.runs import Outcome, quoted_usd_per_hr, status_for
 from tgbot import tiktok
 from tgbot.ingest import (Probe, describe, probe, quality_warning,
                          quality_warning_html,
@@ -4165,6 +4167,61 @@ def _report_gpu_stock(tg: Tg, chat_id: int, *, message_id: int | None = None,
                  [[("Refresh", _CB_GPU_REFRESH, _ce_id(ICON_REFRESH_CE))]], parse_mode=PARSE_HTML)
 
 
+def _gpu_stock_data(*, force: bool) -> dict:
+    """`_report_gpu_stock`'s numbers as JSON for the phone (`GET /v1/gpu/stock`).
+
+    A twin, not a caller: `_report_gpu_stock` also sends or edits a Telegram
+    message, and this only returns data. The selection logic below is
+    therefore copied from it on purpose — `entries[0]` for name and price,
+    `home` = the entry at the volume's datacenter, `elsewhere` = the non-home
+    entries with any stock, best first, two per GPU — and a test builds one
+    stock dict and checks both agree, so an edit to one that forgets the
+    other turns red instead of drifting.
+
+    Takes no lock and must not be called under one: `stock_at` is a
+    runpodctl round trip (~30s worst case, its own timeout). Raises
+    RuntimeError when the stock check does; `AppPod.gpu_stock` maps that to
+    502, where the Telegram report says "couldn't reach runpodctl".
+    """
+    volume_id = env_get(ROOT / ".env", "POD_VOLUME_ID")
+    home_dc = volume_datacenter(volume_id)
+    wanted = [_PRIMARY_GPU_ID, *_FALLBACK_GPU_IDS]
+    stock = stock_at(wanted) if force else stock_at_cached(wanted)
+
+    gpus, other_regions = [], []
+    for wanted_id in wanted:
+        entries = stock.get(wanted_id)
+        if not entries:
+            gpus.append({"gpu": wanted_id,
+                         "name": _GPU_DISPLAY_SHORT.get(wanted_id, wanted_id),
+                         "usd_per_hr": None, "home": None,
+                         "sold_out_everywhere": True})
+            continue
+        name = _plain(entries[0].display_name)
+        # A price of 0/None is "?" in the Telegram text; null here, never 0.
+        price = entries[0].price_per_hr or None
+        # None when home_dc itself is unknown: same "no basis for a claim"
+        # reasoning as the report's own comment on this line.
+        home = next((e for e in entries if home_dc and e.datacenter_id == home_dc),
+                    None)
+        gpus.append({"gpu": wanted_id, "name": name, "usd_per_hr": price,
+                     "home": ({"stock": _plain(home.stock_status)}
+                              if home is not None else None),
+                     "sold_out_everywhere": False})
+        elsewhere = sorted(
+            (e for e in entries if e is not home and e.stock_status.lower() != "none"),
+            key=lambda e: _STOCK_RANK.get(e.stock_status.lower(), 9))
+        for e in elsewhere[:2]:
+            other_regions.append({"gpu": wanted_id, "name": _plain(e.display_name),
+                                  "datacenter": _plain(e.datacenter_id),
+                                  "stock": _plain(e.stock_status),
+                                  "usd_per_hr": e.price_per_hr or None})
+    # The primary when .env has no GPU=, the same fallback GET /v1/pod and
+    # _gpu_mismatch use — two screens must not show two answers for one value.
+    return {"selected": env_get(ROOT / ".env", "GPU") or _PRIMARY_GPU_ID,
+            "home_datacenter": home_dc, "gpus": gpus, "other_regions": other_regions}
+
+
 # Below this many hours of runway, /balance warns before a rent is attempted:
 # one motion job runs ~40 minutes on the 5090, plus pod setup, so under an
 # hour a single job may not finish before the balance runs dry.
@@ -4196,6 +4253,46 @@ def _report_balance(tg: Tg, chat_id: int, *, message_id: int | None = None) -> N
         lines.append(f"{ICON_WARN} Under {_LOW_RUNWAY_HOURS:g}h — top up before renting, "
                      "one motion job may not finish.")
     _edit_or_send(tg, chat_id, message_id, "\n".join(lines), buttons, parse_mode=PARSE_HTML)
+
+
+def _balance_data(*, vast: bool) -> dict:
+    """`_report_balance`'s numbers as JSON (`GET /v1/balance`), plus the Vast
+    credit when `vast` is set.
+
+    Same price as the report (`_panel_price`, i.e. what the [Run] button
+    quotes), so the phone and Telegram never give two runways for one
+    balance. Fails soft where the report does: a dead runpodctl is
+    `runpod: None` and a reason in `errors`, not an exception — a balance
+    screen that 500s says less than one that says "could not read it".
+
+    `vast` is opt-in because `vast_credit()` is its own ~30s subprocess
+    (spec 5.9). Absent from the body when not asked; `{"usd": None}` plus an
+    error when asked and unreadable, never `0`: an unreadable account must not
+    read as an empty one (vast_account's own contract).
+
+    Takes no lock; every call here is a network round trip.
+    """
+    errors: list[str] = []
+    runpod = None
+    try:
+        balance = account_balance()
+    except RuntimeError as exc:
+        errors.append(_plain(f"couldn't reach runpodctl: {exc}"))
+    else:
+        price = _panel_price()
+        hours = balance / price if price > 0 else 0.0
+        runpod = {"usd": balance, "usd_per_hr": price,
+                  "runway_hours": round(hours, 2),
+                  "low_runway": hours < _LOW_RUNWAY_HOURS}
+    data: dict = {"runpod": runpod}
+    if vast:
+        try:
+            data["vast"] = {"usd": vast_credit()}
+        except RuntimeError as exc:
+            data["vast"] = {"usd": None}
+            errors.append(_plain(f"couldn't read the Vast credit: {exc}"))
+    data["errors"] = errors
+    return data
 
 
 # One-shot GPU-stock watches: (gpu_id, datacenter_id) pairs a chat asked to
@@ -5138,7 +5235,7 @@ def _signal_drain_group(proc, sig: int) -> None:
         (proc.terminate if sig == signal.SIGTERM else proc.kill)()
 
 
-def _do_kill(tg: Tg, chat_id: int) -> None:
+def _do_kill(tg: Tg, chat_id: int) -> Outcome:
     """The emergency stop (2026-09-02): destroy the pod right now, on request.
 
     Two layers, because neither alone is trustworthy. Signalling the Popen's process group
@@ -5165,6 +5262,17 @@ def _do_kill(tg: Tg, chat_id: int) -> None:
     don't-trust-the-ask idiom _run_token encodes. That matters more here than
     usual: a phase can finish, or a drain can start, in the seconds a confirm
     button sits unanswered.
+
+    Returns an Outcome for the phone (slice 5, spec §5.9), but unlike
+    _do_confirm it keeps plain `tg.send_message` throughout: none of these
+    messages is a refusal, so none of them is what _AppTg/_refuse suppresses.
+    A destroy that could not be verified means a pod that may still be
+    billing, and that has to reach the Telegram chat whoever asked for it.
+
+    What this function does NOT have is an idle check: called with nothing
+    running it goes straight to the destroy branch and tears down whatever pod
+    .env happens to name. _ask_kill carries that check for Telegram; AppPod's
+    kill worker repeats it under BOT_LOCK for the phone.
     """
     manifest_path = _job_manifest_path(chat_id)
     if phase_a_running(manifest_path) and not drain_running(manifest_path):
@@ -5178,7 +5286,9 @@ def _do_kill(tg: Tg, chat_id: int) -> None:
             "🛑 Stopped the try-on phase. Nothing was rented, and Gemini calls "
             "already made are not refunded." if stopped else
             "the try-on phase had already finished — nothing to stop.")
-        return
+        return (Outcome(True, "phase_a_stopped", "stopped the try-on phase") if stopped
+                else Outcome(False, "phase_a_finished",
+                             "the try-on phase had already finished — nothing to stop"))
 
     proc = _RUNNING.get(manifest_path.resolve())
     if proc is not None and proc.poll() is None:
@@ -5214,11 +5324,18 @@ def _do_kill(tg: Tg, chat_id: int) -> None:
 
     if destroyed:
         tg.send_message(chat_id, "🛑 Killed. Pod destroyed and verified gone.")
-    else:
-        tg.send_message(chat_id,
-                        f"{ICON_WARN} <b>gpu-destroy may not have worked</b> — check "
-                        f"manually, it may still be billing.{detail}",
-                        parse_mode=PARSE_HTML)
+        return Outcome(True, "killed", "pod destroyed and verified gone")
+    tg.send_message(chat_id,
+                    f"{ICON_WARN} <b>gpu-destroy may not have worked</b> — check "
+                    f"manually, it may still be billing.{detail}",
+                    parse_mode=PARSE_HTML)
+    # The message carries the command's own tail; the Outcome deliberately
+    # does not. It ends up in GET /v1/pod's last_kill, which is polled, and
+    # an expandable blockquote of make output is not something a phone can
+    # show — the actionable half ("check it by hand") is.
+    return Outcome(False, "destroy_unverified",
+                   "gpu-destroy may not have worked — check the pod by hand, "
+                   "it may still be billing")
 
 
 def _ask_migrate(tg: Tg, chat_id: int, to_dc: str) -> None:
@@ -5245,18 +5362,57 @@ def _ask_migrate(tg: Tg, chat_id: int, to_dc: str) -> None:
                   ("Cancel", _CB_MIGRATE_NO)]])
 
 
-def _start_migration(tg: Tg, chat_id: int, to_dc: str) -> None:
+# How long the phone's migration confirmation stays valid. Long enough to
+# read the warning and think about it, short enough that a token left in a
+# backgrounded app cannot start a copy against state that has since moved —
+# and every guard is re-checked at spend time anyway, so this is the outer
+# bound, not the protection.
+_MIGRATE_CONFIRM_TTL_SEC = 600
+
+
+def _migrate_warning(to_dc: str) -> str:
+    """`_ask_migrate`'s confirm text as plain prose, for the phone's own
+    confirm screen (spec §5.9).
+
+    A twin of the message above rather than a caller of it: `_ask_migrate`
+    sends a Telegram message and builds HTML buttons, and this only ever
+    returns a string. Kept next to it so the two are edited together — what
+    the user is warned about before the source volume is deleted must not
+    depend on which client asked. `_plain` on the way out for the promise the
+    whole JSON surface makes (no tags, no absolute paths).
+    """
+    return _plain(
+        f"This copies your Network Volume to {to_dc}: ~2 temporary CPU pods "
+        f"for the duration, then deletes the current volume once the copy is "
+        f"verified byte-for-byte. {MIGRATE_DURATION_TEXT}. "
+        f"Cannot be undone once the old volume is deleted.")
+
+
+def _start_migration(tg: Tg, chat_id: int, to_dc: str) -> Outcome:
     """Launch scripts/volume_migrate.py, once.
 
     The marker is written BEFORE Popen and synchronously, not after: the whole
     point is to close the window between deciding to launch and
     volume_migrate.py writing its own lease minutes later. See
     _migrate_launch_marker for what a second migration in that window costs.
+
+    Both failures are refusals (slice 5, spec §5.9), so they go through
+    _refuse: a phone that asked for this gets the answer, and the Telegram
+    chat is not told about a request its user never made. The success message
+    stays a plain send — progress is reported in the chat, which owns it.
     """
     if migration_running():
-        tg.send_message(chat_id, "a volume migration is already in progress")
-        return
+        return _refuse(tg, chat_id, "migration",
+                       "a volume migration is already in progress")
 
+    # Any handle still here belongs to a migration that is over: migration_running()
+    # just said no, and a live one holds either its lease or this marker. It is
+    # dropped BEFORE the marker is written because _migration_launching() unlinks
+    # the marker of a finished handle — and GET /v1/pod (slice 5) reads
+    # migration_running() without BOT_LOCK, so it can land between the write below
+    # and the assignment after Popen. Left in place, that read deletes the marker
+    # this launch just wrote and reopens the window the marker exists to close.
+    _MIGRATE_PROC.pop(_MIGRATE_PROC_KEY, None)
     marker = _migrate_launch_marker()
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text(json.dumps({"at": time.time(), "to_dc": to_dc}),
@@ -5277,14 +5433,15 @@ def _start_migration(tg: Tg, chat_id: int, to_dc: str) -> None:
         # _MIGRATE_LAUNCH_GRACE_SEC for a migration that never started.
         marker.unlink(missing_ok=True)
         log(f"could not start volume_migrate.py: {exc!r}")
-        tg.send_message(chat_id, "could not start the migration — check the box. "
-                                 "Nothing was created.")
-        return
+        return _refuse(tg, chat_id, "launch_failed",
+                       "could not start the migration — check the box. "
+                       "Nothing was created.")
     _MIGRATE_PROC[_MIGRATE_PROC_KEY] = proc
 
     tg.send_message(chat_id, f"{ICON_DEPART_CE} Migration to {_esc(to_dc)} started — this will take "
                              f"{MIGRATE_DURATION_PLAIN}. I will report progress here.",
                     parse_mode=PARSE_HTML)
+    return Outcome(True, "started")
 
 
 def _again(tg: Tg, chat_id: int) -> None:
@@ -6585,6 +6742,48 @@ def _run_error(code: str, message: str) -> dict:
     return {"error": {"code": code, "message": message}}
 
 
+@contextlib.contextmanager
+def _bot_locked():
+    """`with _bot_locked() as busy:` — `busy` is `None` once `BOT_LOCK` is
+    held, or the ready-made 503 body when the wait timed out. The caller's own
+    job is to `idem.forget` in the timeout case (this helper does not know the
+    scope/key) and return the 503 as-is, unrecorded.
+
+    Module level rather than a method, because `AppRuns` and `AppPod` must
+    take the SAME lock object with the same timeout: two copies of this body
+    would be one rewording away from two different discipines on the one lock
+    that keeps a paid drain from interleaving with the bot's own loop.
+    """
+    if BOT_LOCK.acquire(timeout=BOT_LOCK_TIMEOUT_SEC):
+        try:
+            yield None
+        finally:
+            BOT_LOCK.release()
+    else:
+        yield (503, _run_error("bot_busy", "the bot is busy — try again in a moment"))
+
+
+def _gpu_mismatch(body: dict) -> Outcome | None:
+    """The optional `gpu` on `confirm` and `resume` (spec 5.9): the GPU the
+    phone priced its panel for. `.env`'s GPU can move under it — the phone's
+    own `PUT /v1/pod/gpu`, or Telegram's switch — and spending at a different
+    card than the one shown is a different price. A refusal, decided before
+    anything is rented.
+
+    Omitted `gpu` is no check (an older client). The comparison is against
+    the same `.env` GPU (falling back to the primary) that `_do_confirm` and
+    the rent panel read, so "what the app was shown" and "what would be
+    rented" are the one value.
+    """
+    if "gpu" not in body or body["gpu"] is None:
+        return None
+    current = env_get(ROOT / ".env", "GPU") or _PRIMARY_GPU_ID
+    if body["gpu"] == current:
+        return None
+    return Outcome(False, "stale_panel",
+                   "the selected GPU changed since the panel was read — read it again")
+
+
 def _rent_panel_data(chat_id: int, *, force: bool, manifest: Manifest | None) -> dict:
     """The `runpod`/`vast` numbers for the phone's rent panel — the same
     primitives `_offer_run_confirm` and `_offer_vast_panel` read, called
@@ -6672,19 +6871,11 @@ class AppRuns:
         _, _, generation = self.drafts.runnable()
         return f"{_run_token(self.chat_id)}.{generation}"
 
-    @contextlib.contextmanager
     def _locked(self):
-        """`with self._locked() as busy:` — `busy` is `None` once `BOT_LOCK`
-        is held, or the ready-made 503 body when the wait timed out. The
-        caller's own job is to `idem.forget` in the timeout case (this method
-        does not know the scope/key) and return the 503 as-is, unrecorded."""
-        if BOT_LOCK.acquire(timeout=BOT_LOCK_TIMEOUT_SEC):
-            try:
-                yield None
-            finally:
-                BOT_LOCK.release()
-        else:
-            yield (503, _run_error("bot_busy", "the bot is busy — try again in a moment"))
+        """`with self._locked() as busy:` — the module-level `_bot_locked()`,
+        kept under its old name so every call site in this class reads as it
+        did. `AppPod` uses the same helper directly."""
+        return _bot_locked()
 
     def _draft_jobs(self) -> tuple[list[Job] | None, Outcome | None]:
         """What Phase A and confirm's fresh-spend branch both need from the
@@ -6739,6 +6930,8 @@ class AppRuns:
             if body.get("panel_token") != self.panel_token():
                 out = Outcome(False, "stale_panel",
                               "the job changed since the panel was read — read it again")
+            elif (mismatch := _gpu_mismatch(body)) is not None:
+                out = mismatch
             elif _PHASE_A_OFFERED.get(self.chat_id) == _run_token(self.chat_id):
                 # The app's own chooser-less equivalent of the rent panel's
                 # spend button: Phase A already ran for this exact manifest,
@@ -6900,6 +7093,436 @@ class AppRuns:
         return response
 
 
+class AppPod:
+    """The pod-side calls the phone can make (spec §5.9): stop what is
+    running, and retry a rental that already failed once.
+
+    Same discipline as `AppRuns` — `BOT_LOCK` around every read or change of
+    bot state, an `IdempotencyStore` record written `pending` before anything
+    acts — and the same `_AppTg` wrapper, so a refusal answers the phone
+    while a real outcome still posts to the Telegram chat that owns the slot.
+    """
+
+    def __init__(self, tg: Tg, chat_id: int, idem: IdempotencyStore):
+        self.tg, self.chat_id, self.idem = tg, chat_id, idem
+        # The kill's answer, for GET /v1/pod to poll: the request itself only
+        # ever gets a 202 (see kill()).
+        self.last_kill: dict | None = None
+        self._kill_thread: threading.Thread | None = None
+        # The outstanding migration confirmation, or None. In memory on
+        # purpose (spec §5.9): a bot restart voids it and the user asks again,
+        # which is the right default for the one call that deletes data.
+        self._migrate_ask: dict | None = None
+
+    @property
+    def run_id(self) -> str:
+        return _job_manifest_path(self.chat_id).stem
+
+    def _something_live(self) -> bool:
+        """`_ask_kill`'s predicate, repeated for the app — the idle check
+        `_do_kill` itself does not have. Without it a kill with nothing
+        running destroys whatever pod .env happens to name.
+
+        Both halves resolve through `run_mod`, not the names imported at the
+        top of this file, for `_busy_reason`'s reason: that is how `busy()`
+        resolves them, so the two can never disagree about the same manifest.
+        """
+        manifest_path = _job_manifest_path(self.chat_id)
+        return (run_mod.drain_running(manifest_path)
+                or run_mod.phase_a_running(manifest_path))
+
+    def _kill_worker(self) -> None:
+        """`_do_kill` on its own thread, under `BOT_LOCK`.
+
+        A thread because `_do_kill` waits up to 30s for the drain to die and
+        up to 180s for `make gpu-destroy`, and Cloudflare closes a request at
+        ~100s — the phone would see a dead connection and have no idea
+        whether the pod was destroyed. The lock is held for the whole run,
+        exactly as the bot's own loop was blocked by it before; no timeout,
+        because this is not a client that can be told to retry.
+
+        The live check is repeated HERE, not only in `kill()`: a drain can
+        finish in the seconds between the request and this thread getting the
+        lock, and `_do_kill` would then destroy an unrelated pod.
+        """
+        try:
+            with BOT_LOCK:
+                if not self._something_live():
+                    self.last_kill = {
+                        "at": time.time(), "ok": False, "code": "nothing_running",
+                        "message": "nothing was running any more by the time the "
+                                   "kill got the lock — nothing was destroyed"}
+                    return
+                out = _do_kill(_AppTg(self.tg), self.chat_id)
+                self.last_kill = {"at": time.time(), "ok": bool(out.ok),
+                                  "code": out.code, "message": _plain(out.message)}
+        except Exception as exc:   # noqa: BLE001 - see below
+            # A worker thread's exception has nowhere to go: unrecorded, the
+            # phone polls last_kill forever and reads the previous kill's
+            # answer, or None, for a kill that actually crashed mid-destroy.
+            self.last_kill = {"at": time.time(), "ok": False, "code": "error",
+                              "message": _plain(f"the kill failed: {exc}")}
+            log(f"kill worker for chat {self.chat_id} failed: {exc!r}")
+
+    def kill(self, run_id: str, key) -> tuple[int, dict]:
+        if run_id != self.run_id:
+            return 404, _run_error("not_found", "no such run")
+        replay = self.idem.begin("kill", key)
+        if replay is not None:
+            return replay
+        with _bot_locked() as busy_response:
+            if busy_response is not None:
+                self.idem.forget("kill", key)
+                return busy_response
+            if self._kill_thread is not None and self._kill_thread.is_alive():
+                response = (409, _run_error("kill_in_progress",
+                                            "a kill is already running"))
+            elif not self._something_live():
+                response = (409, _run_error(
+                    "nothing_running",
+                    "nothing is running — there is no pod to kill"))
+            else:
+                self._kill_thread = threading.Thread(target=self._kill_worker,
+                                                     daemon=True)
+                self._kill_thread.start()
+                response = (202, {"run_id": self.run_id, "outcome": "kill_started"})
+        self.idem.finish("kill", key, *response)
+        return response
+
+    def resume(self, run_id: str, body: dict, key) -> tuple[int, dict]:
+        """Retry a rental that already failed — `_do_resume`, the same body
+        the recovery buttons reach.
+
+        Two gates the Telegram buttons get for free from being drawn only
+        under a failure card: an outstanding `provision-failed.json` (without
+        it, "resume" on a finished batch rents a pod to do nothing) and the
+        run's current token (the manifest must not have changed since the
+        phone read it). The app's draft is deliberately left alone — a resume
+        is about a manifest that was confirmed long ago.
+        """
+        if run_id != self.run_id:
+            return 404, _run_error("not_found", "no such run")
+        provider = body.get("provider")
+        if provider not in ("runpod", "vast"):
+            return 400, _run_error("bad_request",
+                                   'provider must be "runpod" or "vast"')
+        if not body.get("run_token"):
+            return 400, _run_error("bad_request", "run_token is required")
+        replay = self.idem.begin("resume", key)
+        if replay is not None:
+            return replay
+        manifest_path = _job_manifest_path(self.chat_id)
+        with _bot_locked() as busy_response:
+            if busy_response is not None:
+                self.idem.forget("resume", key)
+                return busy_response
+            if body.get("run_token") != _run_token(self.chat_id):
+                out = Outcome(False, "stale_run",
+                              "the run changed since it was read — read it again")
+            elif read_provision_failure(provision_failure_path(manifest_path)) is None:
+                out = Outcome(False, "no_failure",
+                              "no failed rental to retry for this run")
+            elif (mismatch := _gpu_mismatch(body)) is not None:
+                out = mismatch
+            else:
+                out = _do_resume(_AppTg(self.tg), self.chat_id, manifest_path,
+                                 dry_run=False, gpu_provider=provider)
+            response = ((202, {"run_id": self.run_id, "outcome": out.code}) if out
+                        else (status_for(out), _run_error(out.code, out.message)))
+        self.idem.finish("resume", key, *response)
+        return response
+
+    def _migration_state(self) -> dict:
+        """The migration block of `GET /v1/pod`, from files only.
+
+        `running` is `migration_running()` (lease or launch marker);
+        everything else is read back from the files volume_migrate.py and
+        `_start_migration` write, the same ones `tick_migration_progress`
+        renders. Nothing here is derived from the clock — `started_at` is the
+        stored timestamp and the phone computes elapsed itself — so an idle
+        or unchanged migration gives a byte-identical body (the ETag rule).
+
+        `to_dc` has three homes because the progress file only carries it in
+        its first ("create") phase: the lease is the durable one, the launch
+        marker covers the window before the lease exists.
+        """
+        progress: dict = {}
+        try:
+            raw = json.loads(_migrate_progress_path().read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                progress = raw
+        except (OSError, ValueError):
+            pass
+        lease = read_migrate_lease(_migrate_lease_path())
+        marker: dict = {}
+        try:
+            raw = json.loads(_migrate_launch_marker().read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                marker = raw
+        except (OSError, ValueError):
+            pass
+
+        def number(value):
+            return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+        phase = progress.get("phase")
+        to_dc = progress.get("to_dc") or (lease.to_dc if lease else None) or marker.get("to_dc")
+        return {"running": bool(migration_running()),
+                "phase": _plain(str(phase)) if phase else None,
+                "to_dc": _plain(str(to_dc)) if to_dc else None,
+                "started_at": number(progress.get("started_at"))
+                              or (lease.started_at if lease else None),
+                "bytes_copied": number(progress.get("bytes_copied")),
+                "total_bytes": number(progress.get("total_bytes"))}
+
+    def pod(self) -> tuple[int, dict]:
+        """`GET /v1/pod`: the lease, the selected GPU, the migration and the
+        last kill — files and memory only, so it is cheap to poll (spec 5.4).
+
+        No network call (a test proves it) and no field that changes with each
+        poll (a test proves that too): the body is hashed into an ETag, and
+        one that moves with the clock never gets a 304. The phone computes
+        elapsed from `lease.provisioned_at` itself. The one clock comparison
+        underneath is the pre-existing launch-marker grace inside
+        `migration_running()`, which after `_MIGRATE_LAUNCH_GRACE_SEC` flips
+        `migration.running` to False — and unlinks the stale marker as it
+        does. That is a state change, not a per-poll one: it happens once.
+
+        Takes NO `BOT_LOCK`, on purpose. The kill worker holds that lock for
+        the whole destroy (up to ~210 s), and this is the route the phone
+        polls to learn the kill finished: behind the lock it would answer
+        `503 bot_busy` for exactly as long as the answer is wanted. What it
+        reads is files, plus `last_kill` (only ever replaced whole, never
+        mutated) and whether the worker thread is alive (`kill_running`); a
+        snapshot that is a moment stale is fine for a status poll, and
+        nothing here decides anything that spends money.
+        """
+        manifest_path = _job_manifest_path(self.chat_id)
+        lease = lease_for(manifest_path) or read_lease(LEASE_PATH)
+        failure = read_provision_failure(provision_failure_path(manifest_path))
+        last_kill = self.last_kill
+        thread = self._kill_thread
+        body = {
+            "run_id": self.run_id,
+            "gpu": env_get(ROOT / ".env", "GPU") or _PRIMARY_GPU_ID,
+            "lease": None if lease is None else {
+                "provider": lease.provider,
+                "provisioned_at": lease.provisioned_at,
+                "abs_max_min": lease.abs_max_min,
+                "quoted_usd_per_hr": quoted_usd_per_hr(lease.provider),
+                # The stem only: the lease's manifest is an absolute path.
+                "run_id": Path(lease.manifest).stem or None,
+            },
+            "migration": self._migration_state(),
+            "kill_running": thread is not None and thread.is_alive(),
+            # Plain again on the way out: the worker already stripped it,
+            # but this body is where "no absolute path, no HTML" is
+            # promised, so it does not rest on a writer elsewhere.
+            "last_kill": ({**last_kill,
+                           "message": _plain(str(last_kill.get("message", "")))}
+                          if last_kill else None),
+            "failed_rental": None if failure is None else {
+                "gpu": _plain(failure.gpu),
+                "datacenter": _plain(failure.datacenter) if failure.datacenter else None,
+                "stock_out": failure.stock_out,
+                "detail": _plain(failure.detail)},
+        }
+        return 200, body
+
+    def gpu_stock(self, force: bool) -> tuple[int, dict]:
+        """`GET /v1/gpu/stock[?force=1]`. Takes no lock: nothing it reads is
+        bot state, and a runpodctl round trip held under `BOT_LOCK` would stall
+        every Telegram update for as long as it runs (`_rent_panel_data`'s
+        reasoning). A dead runpodctl is 502 here, where the rent panel fails
+        open — this endpoint's only job is the stock, so "no data" is the
+        honest answer, not an empty list that reads as "sold out"."""
+        try:
+            return 200, _gpu_stock_data(force=bool(force))
+        except RuntimeError as exc:
+            return 502, _run_error("upstream_unavailable",
+                                   _plain(f"couldn't reach runpodctl: {exc}"))
+
+    def balance(self, vast: bool) -> tuple[int, dict]:
+        """`GET /v1/balance[?vast=1]`. No lock, for `gpu_stock`'s reason; the
+        soft-failure shape is `_balance_data`'s."""
+        return 200, _balance_data(vast=bool(vast))
+
+    def set_gpu(self, body: dict) -> tuple[int, dict]:
+        """`PUT /v1/pod/gpu`: `.env`'s GPU, one of the bot's five.
+
+        No run or drain guard, by design: Telegram's own switch button
+        (`_CB_RUN_SWITCH`) has none either, and a rental already in flight
+        read its GPU when it started. Only catalog membership is checked, by
+        full id — the ids `GET /v1/gpu/stock` hands out. The lock is for the
+        `.env` rewrite (`env_set`), not for anything the check reads.
+        """
+        gpu = body.get("gpu") if isinstance(body, dict) else None
+        if not isinstance(gpu, str) or gpu not in _GPU_CATALOG:
+            return 400, _run_error("bad_request", "gpu must be one of the catalog ids "
+                                                  "from GET /v1/gpu/stock")
+        with _bot_locked() as busy_response:
+            if busy_response is not None:
+                return busy_response
+            env_set(ROOT / ".env", "GPU", gpu)
+        return 200, {"gpu": gpu, "name": _GPU_DISPLAY_SHORT.get(gpu, gpu)}
+
+    def _migrate_blocked(self) -> tuple[int, dict] | None:
+        """The live-state guards both halves of the migration share, read
+        under `BOT_LOCK` from files and memory only — no network, so holding
+        the lock across them costs microseconds.
+
+        Stricter than Telegram's `_ask_migrate`, which only checks
+        `migration_running()` (spec §5.9). A migration copies the volume the
+        pod is reading from and then deletes the original, so a live lease or
+        a busy run is a refusal here even though a Telegram user can tap
+        through it — the phone has no chat in front of it explaining what is
+        running.
+        """
+        if migration_running():
+            return 409, _run_error("migration",
+                                   "a volume migration is already in progress")
+        if read_lease(LEASE_PATH) is not None:
+            return 409, _run_error("run_active",
+                                   "a pod is live — stop it before moving the volume")
+        if busy(_job_manifest_path(self.chat_id)):
+            return 409, _run_error("run_active",
+                                   "this run is busy — wait for it before moving the volume")
+        return None
+
+    def migrate_ask(self, body: dict) -> tuple[int, dict]:
+        """`POST /v1/pod/migrate/ask`: the first half of the two-step.
+
+        Returns the warning the phone must show and a single-use
+        `confirm_token` bound to `to_dc` AND to the volume id the warning was
+        written about. No `Idempotency-Key`: nothing here acts, and a repeat
+        ask simply replaces the token.
+
+        The two network reads (`volume_datacenter`, `stock_at_cached`) run
+        OUTSIDE `BOT_LOCK` — a runpodctl round trip held under it would stall
+        every Telegram update for as long as it runs (`_rent_panel_data`'s
+        reasoning) — and the destination is then checked against what the
+        stock call actually listed. That check FAILS CLOSED: unlike
+        `_offer_run_confirm`, which degrades to "no evidence of stock", a dead
+        runpodctl here would mean starting an irreversible copy toward a
+        datacenter nothing has confirmed exists.
+        """
+        to_dc = body.get("to_dc") if isinstance(body, dict) else None
+        if not isinstance(to_dc, str) or not to_dc:
+            return 400, _run_error("bad_request", "to_dc is required")
+        volume_id = env_get(ROOT / ".env", "POD_VOLUME_ID") or ""
+        home = volume_datacenter(volume_id)
+        if not home:
+            return 409, _run_error("home_unknown",
+                                   "cannot tell which datacenter the volume is in — "
+                                   "nothing was started")
+        if to_dc == home:
+            return 409, _run_error("same_datacenter",
+                                   f"the volume is already in {_plain(to_dc)}")
+        try:
+            stock = stock_at_cached([_PRIMARY_GPU_ID, *_FALLBACK_GPU_IDS])
+        except RuntimeError as exc:
+            return 502, _run_error("upstream_unavailable",
+                                   _plain(f"couldn't reach runpodctl: {exc}"))
+        # The same set `_migrate_options` offers buttons for: every datacenter
+        # one of the wanted GPUs is stocked at, minus home. A destination with
+        # no GPU to rent is a copy that buys nothing.
+        offered = {entry.datacenter_id for entries in stock.values()
+                   for entry in entries if entry.stock_status.lower() != "none"}
+        if to_dc not in offered:
+            return 409, _run_error("unknown_datacenter",
+                                   "no GPU is currently offered in that datacenter")
+        with _bot_locked() as busy_response:
+            if busy_response is not None:
+                return busy_response
+            blocked = self._migrate_blocked()
+            if blocked is not None:
+                return blocked
+            token = secrets.token_urlsafe(16)
+            self._migrate_ask = {"token": token, "to_dc": to_dc,
+                                 "volume_id": volume_id,
+                                 # monotonic, not time.time(): an NTP step
+                                 # must not extend or void a confirmation.
+                                 "expires": time.monotonic() + _MIGRATE_CONFIRM_TTL_SEC}
+        return 200, {"to_dc": to_dc, "home_datacenter": home,
+                     "confirm_token": token,
+                     "expires_in_sec": _MIGRATE_CONFIRM_TTL_SEC,
+                     "warning": _migrate_warning(to_dc)}
+
+    def _migrate_token_stale(self, to_dc: str, token: str) -> tuple[int, dict] | None:
+        """Whether the confirmation is still the one `migrate_ask` issued.
+
+        One refusal code for every way of failing, on purpose: which of them
+        it was is not something a client can act on differently (ask again),
+        and saying "the token was right but expired" tells a guesser it was
+        right. `hmac.compare_digest` for the same reason — the comparison
+        runs on a value the caller chose.
+
+        Files and `.env` only, no network: this runs under `BOT_LOCK`.
+        """
+        record = self._migrate_ask
+        stale = (409, _run_error("bad_confirm_token",
+                                 "that confirmation is no longer valid — ask again"))
+        if record is None or not hmac.compare_digest(record["token"], token):
+            return stale
+        if record["to_dc"] != to_dc or time.monotonic() > record["expires"]:
+            return stale
+        # The volume the warning was written about. `.env` can be rewritten
+        # between the two calls (a finished migration does exactly that), and
+        # deleting a volume the user was never warned about is the one mistake
+        # this whole two-step exists to prevent.
+        if (env_get(ROOT / ".env", "POD_VOLUME_ID") or "") != record["volume_id"]:
+            return stale
+        return None
+
+    def migrate(self, body: dict, key) -> tuple[int, dict]:
+        """`POST /v1/pod/migrate`: the second half — `_start_migration` itself.
+
+        This is the most destructive call in the API: `volume_migrate.py`
+        copies the Network Volume and then DELETES the source, which holds the
+        models, Postgres and MinIO. So every guard `migrate_ask` checked is
+        checked AGAIN here, under `BOT_LOCK`, from files and memory only — a
+        drain can start, or a migration can be launched from Telegram, in the
+        minutes between the two calls.
+
+        The token is popped BEFORE `_start_migration` runs. If that call
+        crashed after launching the subprocess, a token still in memory would
+        let a second migration start against a volume already being deleted.
+        The "Migration started" Telegram message is `_start_migration`'s own,
+        as it is for the Telegram button — progress lives in the chat.
+        """
+        to_dc = body.get("to_dc") if isinstance(body, dict) else None
+        token = body.get("confirm_token") if isinstance(body, dict) else None
+        if not isinstance(to_dc, str) or not to_dc:
+            return 400, _run_error("bad_request", "to_dc is required")
+        if not isinstance(token, str) or not token:
+            return 400, _run_error("bad_request", "confirm_token is required")
+        if not token.isascii():
+            # Checked before the idempotency record exists: `compare_digest`
+            # raises TypeError on a non-ASCII str, and by then the key would
+            # be stuck `pending` — a retry would answer `outcome_unknown`, the
+            # most alarming message on the route, for a migration that never
+            # began. Tokens are `token_urlsafe`, so ASCII is all a real one is.
+            return 400, _run_error("bad_request", "confirm_token is not valid")
+        replay = self.idem.begin("migrate", key)
+        if replay is not None:
+            return replay
+        with _bot_locked() as busy_response:
+            if busy_response is not None:
+                self.idem.forget("migrate", key)
+                return busy_response
+            refusal = (self._migrate_blocked()
+                       or self._migrate_token_stale(to_dc, token))
+            if refusal is not None:
+                response = refusal
+            else:
+                self._migrate_ask = None
+                out = _start_migration(_AppTg(self.tg), self.chat_id, to_dc)
+                response = ((202, {"outcome": out.code, "to_dc": to_dc}) if out
+                            else (status_for(out), _run_error(out.code, out.message)))
+        self.idem.finish("migrate", key, *response)
+        return response
+
+
 def _handle_locked(tg: Tg, update: dict, **kwargs) -> None:
     """`handle()`, under `BOT_LOCK` — spec §5.8's other half of the guard
     `AppRuns` takes on the HTTP side. No timeout here: this is the bot's own
@@ -6964,8 +7587,12 @@ def _start_control_api(tg: Tg, chat_id: int):
         # built after make_server — and it must exist before the thread
         # starts, or the first phone request could see server.app_runs still
         # unset and get a spurious 503.
-        server.app_runs = AppRuns(tg, chat_id, server.drafts,
-                                  IdempotencyStore(ROOT / "batch" / "idempotency"))
+        idem = IdempotencyStore(ROOT / "batch" / "idempotency")
+        server.app_runs = AppRuns(tg, chat_id, server.drafts, idem)
+        # One AppPod for the life of the process, sharing AppRuns's store: the
+        # migrate confirm token is held on the instance, so building one per
+        # request would void every token before the phone could use it.
+        server.app_pod = AppPod(tg, chat_id, idem)
         start_in_thread(server)
     except (OSError, ValueError, RuntimeError) as exc:
         # RuntimeError: the OS refused to create the daemon thread (e.g. a

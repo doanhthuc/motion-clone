@@ -428,6 +428,40 @@ class TestBotStartsApi(unittest.TestCase):
         self.addCleanup(server.server_close); self.addCleanup(server.shutdown)
         self.assertEqual(server.server_address, ("127.0.0.1", port))
 
+    def test_app_pod_is_built_once_and_wired_before_the_thread_starts(self):
+        # The migrate confirm token lives on the AppPod instance, so a
+        # per-request instance would void every token, and a server that
+        # starts serving before app_pod is set would answer 503 to the first
+        # phone request (the reason app_runs is wired the same way).
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]
+        built = []
+        real = self.bot.AppPod
+
+        def build(*args, **kwargs):
+            built.append(real(*args, **kwargs))
+            return built[-1]
+
+        seen = {}
+
+        def fake_start(server):
+            seen["app_pod"] = server.app_pod
+            seen["app_runs"] = server.app_runs
+            return mock.Mock()
+
+        with self.env(CONTROL_API_TOKEN="x", CONTROL_API_PORT=str(port)), \
+             mock.patch.object(self.bot, "AppPod", side_effect=build), \
+             mock.patch.object(self.bot, "start_in_thread", side_effect=fake_start):
+            server = self.bot._start_control_api(self.tg, 7)
+        self.addCleanup(server.server_close)
+        self.assertEqual(len(built), 1)
+        self.assertIs(seen["app_pod"], built[0])
+        self.assertIs(server.app_pod, built[0])
+        # One idempotency store for both classes: a key is unique across the
+        # whole API, and the staging-prune sweep covers one directory.
+        self.assertIs(built[0].idem, seen["app_runs"].idem)
+        self.assertEqual(built[0].chat_id, 7)
+
     def test_port_in_use_reports_and_keeps_the_bot_alive(self):
         with socket.socket() as s:
             s.bind(("127.0.0.1", 0)); s.listen(); port = s.getsockname()[1]
@@ -916,6 +950,215 @@ class TestAppRunRoutesUnavailable(HttpWriteBase):
                 resp, body = self.send(method, path, headers=headers, json_body=payload)
                 self.assertEqual(resp.status, 503, path)
                 self.assertEqual(json.loads(body)["error"]["code"], "runs_unavailable", path)
+
+
+class FakeAppPod:
+    """The `FakeAppRuns` pattern for slice 5: records every call `_route`
+    makes and answers with whatever the test set up. The real `AppPod`
+    (bot.py) has its own unit tests; here only the routing, the
+    Idempotency-Key gate and the 503 wiring are under test — and nothing
+    here can reach `_do_kill`, `_start_migration` or a pod."""
+
+    def __init__(self):
+        self.calls = []
+        self.kill_response = (202, {"run_id": "tg-1", "outcome": "kill_started"})
+        self.resume_response = (202, {"run_id": "tg-1", "outcome": "resumed"})
+        self.pod_response = (200, {"run_id": "tg-1", "kill_running": False, "last_kill": None})
+        self.gpu_stock_response = (200, {"gpus": []})
+        self.balance_response = (200, {"runpod": None})
+        self.set_gpu_response = (200, {"gpu": "NVIDIA GeForce RTX 5090"})
+        self.migrate_ask_response = (200, {"confirm_token": "tok", "to_dc": "EU-CZ-1"})
+        self.migrate_response = (202, {"outcome": "started", "to_dc": "EU-CZ-1"})
+
+    def kill(self, run_id, key):
+        self.calls.append(("kill", run_id, key))
+        return self.kill_response
+
+    def resume(self, run_id, body, key):
+        self.calls.append(("resume", run_id, body, key))
+        return self.resume_response
+
+    def pod(self):
+        self.calls.append(("pod",))
+        return self.pod_response
+
+    def gpu_stock(self, force):
+        self.calls.append(("gpu_stock", force))
+        return self.gpu_stock_response
+
+    def balance(self, vast):
+        self.calls.append(("balance", vast))
+        return self.balance_response
+
+    def set_gpu(self, body):
+        self.calls.append(("set_gpu", body))
+        return self.set_gpu_response
+
+    def migrate_ask(self, body):
+        self.calls.append(("migrate_ask", body))
+        return self.migrate_ask_response
+
+    def migrate(self, body, key):
+        self.calls.append(("migrate", body, key))
+        return self.migrate_response
+
+
+# (method, path) of every route slice 5 adds, with whether it takes a body
+# and an Idempotency-Key. One table so the auth, 503 and key tests cannot
+# drift from the routes themselves.
+_POD_ROUTES = [
+    ("POST", "/v1/runs/tg-1/kill", False, True),
+    ("POST", "/v1/runs/tg-1/resume", True, True),
+    ("GET", "/v1/pod", False, False),
+    ("GET", "/v1/gpu/stock", False, False),
+    ("GET", "/v1/balance", False, False),
+    ("PUT", "/v1/pod/gpu", True, False),
+    ("POST", "/v1/pod/migrate/ask", True, False),
+    ("POST", "/v1/pod/migrate", True, True),
+]
+
+
+class TestAppPodRoutes(HttpWriteBase):
+    def setUp(self):
+        self.fake = FakeAppPod()
+        super().setUp()
+        self.server.app_pod = self.fake
+
+    def test_kill_reaches_app_pod_with_the_key(self):
+        resp, body = self.send("POST", "/v1/runs/tg-1/kill", headers={"Idempotency-Key": "k1"})
+        self.assertEqual((resp.status, json.loads(body)), self.fake.kill_response)
+        self.assertEqual(self.fake.calls, [("kill", "tg-1", "k1")])
+
+    def test_resume_reaches_app_pod_with_body_and_key(self):
+        payload = {"provider": "runpod", "run_token": "rt1", "gpu": "NVIDIA GeForce RTX 5090"}
+        resp, body = self.send("POST", "/v1/runs/tg-1/resume", json_body=payload,
+                               headers={"Idempotency-Key": "k2"})
+        self.assertEqual((resp.status, json.loads(body)), self.fake.resume_response)
+        self.assertEqual(self.fake.calls, [("resume", "tg-1", payload, "k2")])
+
+    def test_pod_reaches_app_pod_and_needs_no_key(self):
+        resp, body = self.send("GET", "/v1/pod")
+        self.assertEqual((resp.status, json.loads(body)), self.fake.pod_response)
+        self.assertEqual(self.fake.calls, [("pod",)])
+
+    def test_gpu_stock_parses_force_only_for_the_exact_string_1(self):
+        for query, expected in (("", False), ("?force=1", True), ("?force=0", False),
+                                ("?force=true", False), ("?force=11", False), ("?force=", False)):
+            with self.subTest(query=query):
+                self.fake.calls.clear()
+                resp, body = self.send("GET", "/v1/gpu/stock" + query)
+                self.assertEqual((resp.status, json.loads(body)), self.fake.gpu_stock_response)
+                self.assertEqual(self.fake.calls, [("gpu_stock", expected)])
+
+    def test_balance_parses_vast_only_for_the_exact_string_1(self):
+        for query, expected in (("", False), ("?vast=1", True), ("?vast=0", False),
+                                ("?vast=yes", False), ("?vast=10", False)):
+            with self.subTest(query=query):
+                self.fake.calls.clear()
+                resp, body = self.send("GET", "/v1/balance" + query)
+                self.assertEqual((resp.status, json.loads(body)), self.fake.balance_response)
+                self.assertEqual(self.fake.calls, [("balance", expected)])
+
+    def test_set_gpu_reaches_app_pod_and_needs_no_key(self):
+        payload = {"gpu": "NVIDIA GeForce RTX 5090"}
+        resp, body = self.send("PUT", "/v1/pod/gpu", json_body=payload)
+        self.assertEqual((resp.status, json.loads(body)), self.fake.set_gpu_response)
+        self.assertEqual(self.fake.calls, [("set_gpu", payload)])
+
+    def test_migrate_ask_reaches_app_pod_and_needs_no_key(self):
+        payload = {"to_dc": "EU-CZ-1"}
+        resp, body = self.send("POST", "/v1/pod/migrate/ask", json_body=payload)
+        self.assertEqual((resp.status, json.loads(body)), self.fake.migrate_ask_response)
+        self.assertEqual(self.fake.calls, [("migrate_ask", payload)])
+
+    def test_migrate_reaches_app_pod_with_body_and_key(self):
+        payload = {"to_dc": "EU-CZ-1", "confirm_token": "tok"}
+        resp, body = self.send("POST", "/v1/pod/migrate", json_body=payload,
+                               headers={"Idempotency-Key": "k3"})
+        self.assertEqual((resp.status, json.loads(body)), self.fake.migrate_response)
+        self.assertEqual(self.fake.calls, [("migrate", payload, "k3")])
+
+    def test_migrate_202_body_has_no_run_id(self):
+        # kill and resume answer with a run_id; migrate is about the volume,
+        # not a run, and the phone must not look for one.
+        resp, body = self.send("POST", "/v1/pod/migrate",
+                               json_body={"to_dc": "EU-CZ-1", "confirm_token": "tok"},
+                               headers={"Idempotency-Key": "k3"})
+        self.assertEqual(resp.status, 202)
+        self.assertNotIn("run_id", json.loads(body))
+
+    def test_a_refusal_from_app_pod_passes_through(self):
+        self.fake.kill_response = (409, {"error": {"code": "nothing_running", "message": "m"}})
+        resp, body = self.send("POST", "/v1/runs/tg-1/kill", headers={"Idempotency-Key": "k1"})
+        self.assertEqual((resp.status, json.loads(body)), self.fake.kill_response)
+
+    def test_the_keyed_routes_without_a_key_are_400_and_never_reach_app_pod(self):
+        for method, path, has_body, keyed in _POD_ROUTES:
+            if not keyed:
+                continue
+            with self.subTest(path=path):
+                resp, body = self.send(method, path, json_body={"x": 1} if has_body else None)
+                self.assertEqual(resp.status, 400, path)
+                self.assertEqual(json.loads(body)["error"]["code"], "bad_request", path)
+        self.assertEqual(self.fake.calls, [])
+
+    def test_the_key_is_checked_before_the_body_is_read(self):
+        # A body that is not JSON would answer 400 "not valid JSON" if it were
+        # read first; the missing key must win, so the message names the key.
+        resp, body = self.send("POST", "/v1/pod/migrate", b"{not json")
+        self.assertEqual(resp.status, 400)
+        self.assertIn("Idempotency-Key", json.loads(body)["error"]["message"])
+        self.assertEqual(self.fake.calls, [])
+
+    def test_a_non_object_body_is_400_and_never_reaches_app_pod(self):
+        for method, path, has_body, _keyed in _POD_ROUTES:
+            if not has_body:
+                continue
+            with self.subTest(path=path):
+                resp, body = self.send(method, path, b"[1, 2]",
+                                       headers={"Idempotency-Key": "k9"})
+                self.assertEqual(resp.status, 400, path)
+                self.assertEqual(json.loads(body)["error"]["code"], "bad_request", path)
+        self.assertEqual(self.fake.calls, [])
+
+    def test_every_new_route_needs_the_bearer_token(self):
+        for method, path, has_body, _keyed in _POD_ROUTES:
+            with self.subTest(method=method, path=path):
+                resp, body = self.send(method, path, token=None,
+                                       headers={"Idempotency-Key": "k9"},
+                                       json_body={"x": 1} if has_body else None)
+                self.assertEqual(resp.status, 401, path)
+                self.assertEqual(json.loads(body)["error"]["code"], "unauthorized", path)
+        self.assertEqual(self.fake.calls, [])
+
+    def test_a_wrong_method_on_a_new_path_is_404_not_a_call(self):
+        for method, path in (("GET", "/v1/runs/tg-1/kill"), ("POST", "/v1/pod"),
+                             ("GET", "/v1/pod/gpu"), ("POST", "/v1/pod/gpu"),
+                             ("GET", "/v1/pod/migrate"), ("PUT", "/v1/pod/migrate/ask"),
+                             ("POST", "/v1/balance"), ("POST", "/v1/gpu/stock")):
+            with self.subTest(method=method, path=path):
+                resp, _ = self.send(method, path, json_body={} if method != "GET" else None,
+                                    headers={"Idempotency-Key": "k9"})
+                self.assertEqual(resp.status, 404, (method, path))
+        self.assertEqual(self.fake.calls, [])
+
+    def test_existing_routes_are_unaffected_by_app_pod_being_set(self):
+        resp, body = self.send("GET", "/v1/runs")
+        self.assertEqual(resp.status, 200)
+        resp, body = self.send("GET", "/v1/runs/r1")
+        self.assertEqual(json.loads(body)["status"], "done")
+        self.assertEqual(self.fake.calls, [])
+
+
+class TestAppPodRoutesUnavailable(HttpWriteBase):
+    def test_every_new_route_is_503_pod_unavailable_when_app_pod_is_unset(self):
+        self.assertIsNone(self.server.app_pod)
+        for method, path, has_body, _keyed in _POD_ROUTES:
+            with self.subTest(method=method, path=path):
+                resp, body = self.send(method, path, headers={"Idempotency-Key": "k1"},
+                                       json_body={"x": 1} if has_body else None)
+                self.assertEqual(resp.status, 503, path)
+                self.assertEqual(json.loads(body)["error"]["code"], "pod_unavailable", path)
 
 
 if __name__ == "__main__":

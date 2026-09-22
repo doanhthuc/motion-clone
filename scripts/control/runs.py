@@ -1,7 +1,7 @@
 """Runs, read from the on-disk journals — never from the pod.
 
 The journal (`batch/<id>.state.json`) is the same source `progress_text` and
-`batch_status` read, so a run stays reportable after `make gpu-destroy`: the
+`batch_status` read, so a run stays reportable after the pod is destroyed: the
 pod is the thing most likely to be gone by the time the phone asks.
 
 Liveness comes from `tgbot.run` through the module, not through imported
@@ -17,6 +17,22 @@ from batchlib.manifest import load_state, state_path_for
 from control.outputs import final_names
 from control.paths import safe_child
 import tgbot.run as run_mod
+
+
+# The flat rate the bot's own /kill text and [Run] fallback quote for RunPod
+# (`_gpu_price`'s 0.99 fallback, the 5090's price). A QUOTE, not the invoice:
+# CLAUDE.md is explicit that cost claims come from `runpodctl billing pods`,
+# and this number is what a phone shows next to "elapsed" as an estimate. It
+# is a constant on purpose: a rate looked up live (or an accrued dollar
+# amount) would move between polls and break the ETag rule of spec 5.3.
+RUNPOD_FLAT_USD_PER_HR = 0.99
+
+
+def quoted_usd_per_hr(provider: str) -> float | None:
+    """The quote for a lease's provider. None for Vast: its lease does not
+    carry the rented offer's price, and guessing one would be a made-up number
+    next to a real bill."""
+    return RUNPOD_FLAT_USD_PER_HR if provider == "runpod" else None
 
 
 def _status(manifest: Path, jobs: dict) -> str:
@@ -93,6 +109,10 @@ def run_detail(batch_dir: Path, out_dir: Path, run_id: str) -> dict | None:
         "provider": lease.provider,
         "provisioned_at": lease.provisioned_at,
         "abs_max_min": lease.abs_max_min,
+        # Constant per provider (see RUNPOD_FLAT_USD_PER_HR), so this adds
+        # nothing that changes between two polls of the same lease. The
+        # client computes elapsed x rate itself.
+        "quoted_usd_per_hr": quoted_usd_per_hr(lease.provider),
     }
     detail["outputs"] = final_names(out_dir, detail["batch"]) if detail["batch"] else []
     return detail
@@ -114,6 +134,11 @@ OUTCOME_STATUS = {
     "not_found": 404,
     "nothing_to_run": 422, "not_validated": 422, "invalid": 422, "manifest_error": 422,
     "bot_busy": 503,
+    # Slice 5: a refusal the caller can fix (a bad field) versus one nothing
+    # on this box can fix (runpodctl/vastai unreachable). Both would otherwise
+    # fall into the catch-all 409, which tells a phone client to retry the
+    # same body forever.
+    "upstream_unavailable": 502, "bad_request": 400,
 }
 
 

@@ -132,6 +132,29 @@ class TestDetail(RunsTestBase):
         self.assertEqual(got["provisioned_at"], provisioned_at)
         self.assertNotIn("elapsed_sec", got)
 
+    def test_run_detail_lease_carries_a_quote(self):
+        # A quote, not the invoice (CLAUDE.md: cost claims need the invoice):
+        # the flat $0.99/h the bot's own /kill text uses for RunPod. Vast's
+        # lease does not carry the offer's price, so its quote is None.
+        write_run(self.batch, "r", STATE)
+
+        def lease(provider: str) -> Lease:
+            return Lease(pod_id="p1", provisioned_at=1_800_000_000.0,
+                         manifest=str(self.batch / "r.yaml"), abs_max_min=120,
+                         provider=provider)
+
+        with mock.patch.object(run_mod, "lease_for", return_value=lease("runpod")):
+            first = runs.run_detail(self.batch, self.out, "r")
+            second = runs.run_detail(self.batch, self.out, "r")
+        self.assertEqual(first["lease"]["quoted_usd_per_hr"], 0.99)
+        self.assertEqual(runs.RUNPOD_FLAT_USD_PER_HR, 0.99)
+        # ETag stability (spec 5.3): the quote is a constant, so two polls of
+        # an unchanged run are byte-identical.
+        self.assertEqual(first, second)
+        with mock.patch.object(run_mod, "lease_for", return_value=lease("vast")):
+            vast = runs.run_detail(self.batch, self.out, "r")
+        self.assertIsNone(vast["lease"]["quoted_usd_per_hr"])
+
     def test_outputs_list_final_files_only(self):
         write_run(self.batch, "r", STATE)
         final = self.out / "2026-09-20-1000" / "_final"

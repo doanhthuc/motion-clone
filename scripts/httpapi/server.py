@@ -180,6 +180,16 @@ class _Handler(BaseHTTPRequestHandler):
             raise ApiError(503, "runs_unavailable", "the app's run routes are not available")
         return app_runs
 
+    def _app_pod(self):
+        """The `AppPod` the bot builds in `_start_control_api`, or the 503
+        every pod route answers when it is not wired — the same shape and
+        reason as `_app_runs`, with its own code so the phone can tell "no
+        runs" from "no pod"."""
+        app_pod = self.server.app_pod
+        if app_pod is None:
+            raise ApiError(503, "pod_unavailable", "the app's pod routes are not available")
+        return app_pod
+
     def _idempotency_key(self) -> str:
         # Checked here, before any AppRuns method runs, so a missing key
         # never reaches — and never spends — anything: the shape check on a
@@ -258,6 +268,47 @@ class _Handler(BaseHTTPRequestHandler):
             key = self._idempotency_key()
             payload = self._read_json()
             status, body = app_runs.regen(rest[1], rest[3], payload, key)
+            return self._send_json(status, body)
+        if method == "POST" and len(rest) == 3 and rest[0] == "runs" and rest[2] == "kill":
+            app_pod = self._app_pod()
+            key = self._idempotency_key()
+            status, body = app_pod.kill(rest[1], key)
+            return self._send_json(status, body)
+        if method == "POST" and len(rest) == 3 and rest[0] == "runs" and rest[2] == "resume":
+            app_pod = self._app_pod()
+            key = self._idempotency_key()
+            payload = self._read_json()
+            status, body = app_pod.resume(rest[1], payload, key)
+            return self._send_json(status, body)
+        if method == "GET" and rest == ["pod"]:
+            status, body = self._app_pod().pod()
+            return self._send_json(status, body)
+        if method == "GET" and rest == ["gpu", "stock"]:
+            # Only the exact string "1" turns these on, like rent-panel's force:
+            # "true" or "11" silently meaning yes would make a paid-for slow call
+            # (or a forced runpodctl round trip) depend on a spelling.
+            force = parse_qs(urlsplit(self.path).query).get("force", ["0"])[0] == "1"
+            status, body = self._app_pod().gpu_stock(force)
+            return self._send_json(status, body)
+        if method == "GET" and rest == ["balance"]:
+            vast = parse_qs(urlsplit(self.path).query).get("vast", ["0"])[0] == "1"
+            status, body = self._app_pod().balance(vast)
+            return self._send_json(status, body)
+        if method == "PUT" and rest == ["pod", "gpu"]:
+            app_pod = self._app_pod()
+            payload = self._read_json()
+            status, body = app_pod.set_gpu(payload)
+            return self._send_json(status, body)
+        if method == "POST" and rest == ["pod", "migrate", "ask"]:
+            app_pod = self._app_pod()
+            payload = self._read_json()
+            status, body = app_pod.migrate_ask(payload)
+            return self._send_json(status, body)
+        if method == "POST" and rest == ["pod", "migrate"]:
+            app_pod = self._app_pod()
+            key = self._idempotency_key()
+            payload = self._read_json()
+            status, body = app_pod.migrate(payload, key)
             return self._send_json(status, body)
         if method == "POST" and rest == ["uploads"]:
             body = self._read_json()
@@ -373,7 +424,8 @@ class _Server(ThreadingHTTPServer):
 def make_server(*, token: str, batch_dir: Path, out_dir: Path,
                 host: str = "127.0.0.1", port: int = 0, log=print,
                 default_pipeline: str = "tryon-motion-enhance",
-                default_provider: str = "gemini", probe=None, app_runs=None) -> _Server:
+                default_provider: str = "gemini", probe=None, app_runs=None,
+                app_pod=None) -> _Server:
     if not token:
         raise ValueError("an empty token would authenticate nothing")
     server = _Server((host, port), _Handler)
@@ -391,6 +443,10 @@ def make_server(*, token: str, batch_dir: Path, out_dir: Path,
     # needs this server's own `drafts` store. None until then, and every
     # /v1/runs/... route in this section answers 503 rather than AttributeError.
     server.app_runs = app_runs
+    # Same story for AppPod (slice 5), which shares AppRuns's idempotency store
+    # and is built beside it; its migrate confirm token lives on the instance,
+    # so exactly one is built, before the thread starts.
+    server.app_pod = app_pod
     return server
 
 

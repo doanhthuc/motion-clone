@@ -1031,3 +1031,88 @@ had two done try-on runs from a prior session — nothing here rents anything:
 | `motion-bot` RSS | 38,520 KB before the deploy → 39,868 KB after this run |
 
 No real `confirm` was sent — that needs the user's explicit go, since it rents a pod at ~$1/hour.
+
+### Slice 5 (pod, kill, resume, GPU, balance, migrate)
+
+The pod-side of the run slot (spec §5.9): stop what is running, retry a rental that failed, read the
+pod, the GPU stock and the balance, choose the GPU, and move the Network Volume to another
+datacenter. Everything goes through the bot's own `_do_kill`, `_do_resume` and `_start_migration`,
+under the same `BOT_LOCK` and `Idempotency-Key` machinery as slice 4 — the phone has no second path
+to a pod. Nothing here rents a pod except `resume`; `kill` and `migrate` destroy things.
+
+| Method + path | Does |
+|---|---|
+| `POST /v1/runs/<id>/kill` | stop the run and destroy its pod; answers `202 kill_started` at once (see below) |
+| `POST /v1/runs/<id>/resume` `{provider, run_token, gpu?}` | retry a rental that already failed once — rents a pod |
+| `GET /v1/pod` | the lease, the selected GPU, the migration, the last kill, and any failed rental — files and memory only, no network |
+| `GET /v1/gpu/stock[?force=1]` | stock and price of the bot's five GPUs, at the volume's datacenter and elsewhere; `force=1` bypasses the stock cache |
+| `GET /v1/balance[?vast=1]` | RunPod prepaid balance and runway hours; the Vast credit only when `vast=1` |
+| `PUT /v1/pod/gpu` `{gpu}` | choose the GPU (`.env`'s `GPU`); one of the ids `GET /v1/gpu/stock` lists |
+| `POST /v1/pod/migrate/ask` `{to_dc}` | step one of a volume migration: returns the warning and a `confirm_token` |
+| `POST /v1/pod/migrate` `{to_dc, confirm_token}` | step two: starts the migration; `202 {outcome, to_dc}` (no `run_id` — it is about the volume, not a run) |
+
+`<id>` must be the live slot's own run id, as in slice 4; any other id is `404`.
+
+- **`Idempotency-Key` is required on `kill`, `resume` and `migrate` only** — a missing key is
+  `400 bad_request`, checked before the body is read and before anything runs. `migrate/ask`,
+  `PUT /v1/pod/gpu` and every `GET` take none. The key semantics (replay, `409 outcome_unknown`,
+  `503 bot_busy` not being recorded) are slice 4's.
+- **`kill` is `202 kill_started`, then poll `GET /v1/pod`.** `_do_kill` waits for the drain to die and
+  then for `make gpu-destroy`; that is far longer than a request can live behind Cloudflare, so it runs
+  on a worker thread. `GET /v1/pod` reports `kill_running` (the worker is alive) and `last_kill`
+  (`{at, ok, code, message}` once it ended). `nothing_running` is `409` — `kill` never destroys a pod
+  unless a drain or Phase A is live, and the worker re-checks that under the lock immediately before
+  destroying. A destroy that could not be verified is `last_kill.ok: false, code: destroy_unverified`
+  and is also posted to Telegram, because a pod may still be billing.
+- **A stuck kill is visible only as `kill_running: true`.** The worker holds `BOT_LOCK` for the whole
+  destroy and waiting on it has no timeout, so every other call that needs the lock — including a
+  second `kill` — answers `503 bot_busy` (a double-tap on kill normally gets exactly that; a second
+  kill that does get in is `409 kill_in_progress`). If `kill_running` stays `true` for a long time the
+  destroy is hung: look at the pod in the RunPod console and in `runpodctl`, not at the phone, and
+  destroy it by hand if it is still there. `GET /v1/pod` deliberately takes no lock, so it keeps
+  answering while this happens.
+- **A bot restart forgets a kill.** `last_kill` and the worker are in memory: after a restart
+  `GET /v1/pod` says `kill_running: false, last_kill: null` whether the kill finished or was cut
+  off, and the same `Idempotency-Key` replays the old `202`. If a pod may still be up, send `kill`
+  again with a **new** key (it destroys only if a drain or Phase A is live, from the lease file).
+- **`resume` needs an outstanding failed rental and the run's current token.** `GET /v1/pod`'s
+  `failed_rental` is non-null exactly when Telegram would draw its recovery buttons; without one,
+  `resume` is `409 no_failure` (resuming a finished batch would rent a pod to do nothing). `run_token`
+  is the run's current one, the same value `GET /v1/runs/<id>/tryon` returns for `regen`; a changed
+  manifest is `409 stale_run`.
+  `provider` is `runpod` or `vast`, as on `confirm`.
+- **`gpu` on `confirm` and `resume` is optional**, and when sent it must equal the selected GPU or the
+  answer is `409 stale_panel`: the price the phone showed was for one GPU, and `PUT /v1/pod/gpu` (or
+  Telegram) may have changed it since.
+- **`GET /v1/balance?vast=1` is slow.** The Vast credit is its own `vastai` subprocess, on top of the
+  RunPod call; leave `vast` off for a routine refresh and ask for it only when the Vast tab is open.
+  Only the exact string `1` turns `vast` (and `force`) on. An unreadable balance is `null` with the
+  reason in `errors`, never `0`.
+- **Migration is two steps, on purpose: step two deletes the source volume.** `volume_migrate.py`
+  copies the Network Volume (models, Postgres, MinIO) to the new datacenter and, once the copy
+  verifies, **deletes the original. That cannot be undone.**
+  - `migrate/ask` returns a `confirm_token` bound to `to_dc` and to the volume id the warning was
+    written about. The token lasts 10 minutes, is held in memory (a bot restart voids it — ask
+    again), and is single use: `migrate` consumes it before starting anything, so a retry with the
+    same token is refused rather than started twice. Any way of failing the token is one
+    `409 bad_confirm_token`; the client's only move is to ask again.
+  - The phone is refused (`409`) while a migration is running (`migration`), while a lease is live
+    or the run is busy (`run_active`), when `to_dc` is the volume's current datacenter
+    (`same_datacenter`), or when `to_dc` is not a datacenter the stock check currently lists
+    (`unknown_datacenter`), or when the volume's datacenter cannot be determined (`home_unknown` —
+    including when `runpodctl` is down, which is why that case is this `409` and not a `502`). This
+    is stricter than Telegram, which lets a migration start under a live
+    drain. `migrate` re-checks every one of these under the lock, because a drain can start in the
+    minutes between the two calls.
+  - Progress is not streamed: read `GET /v1/pod`'s `migration` (`running`, `phase`, `to_dc`,
+    `started_at`, `bytes_copied`, `total_bytes`), and expect the same progress messages in Telegram.
+- **`502 upstream_unavailable`**: a `runpodctl` call the endpoint cannot do without failed —
+  `GET /v1/gpu/stock`, and `migrate/ask` once the volume's datacenter is known (it fails closed: it
+  will not start an irreversible copy toward a datacenter nothing confirmed). `GET /v1/balance` does not use it; it degrades to `null`
+  plus `errors`.
+- **`503 pod_unavailable`**: the bot built no `AppPod` (the phone API is not fully wired) — every
+  route above answers it, never a `500`.
+
+No test and no check in this repo ever calls the real `volume_migrate.py` or `make gpu-destroy`: the
+HTTP tests use a fake `AppPod`, and an invariant test greps `scripts/control/` and `scripts/httpapi/`
+for both names.
