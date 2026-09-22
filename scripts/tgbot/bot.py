@@ -51,7 +51,7 @@ import batch_clean
 # raises ImportError regardless of sys.path. The insert above puts scripts/ on
 # the path, which is what makes the absolute form work from either entry point.
 from tgbot.tgclient import Tg, TgError
-from httpapi.server import make_server, start_in_thread
+from httpapi.server import ApiError, make_server, start_in_thread
 from control import BOT_LOCK, BOT_LOCK_TIMEOUT_SEC, materials, uploads
 import control.drafts as drafts
 from control.drafts import DraftStore, PROVIDER_LABELS
@@ -7051,12 +7051,22 @@ class AppRuns:
         `None` — including when the journal's own `file` field, for any
         reason, resolves outside `ROOT / "out"`: this is served to the
         phone over HTTP, so a path that escapes `out/` must never reach the
-        caller that opens it."""
+        caller that opens it.
+
+        Raises `ApiError(503, "bot_busy", ...)` when the lock wait times out —
+        a distinct case from "no such image", which `None` still means. A
+        60s+ lock hold became routine once slice 5 added `kill` (the worker
+        holds `BOT_LOCK` for the whole destroy), and this used to answer that
+        with the same `404` a genuinely missing preview gets: a phone polling
+        during a kill would conclude the image had vanished rather than that
+        the bot was busy for a moment.
+        """
         if run_id != self.run_id:
             return None
         with self._locked() as busy:
             if busy is not None:
-                return None
+                status, body = busy
+                raise ApiError(status, body["error"]["code"], body["error"]["message"])
             entry = next((e for i, _r, _s, e in self._tryon_entries() if i == index), None)
         if entry is None:
             return None
@@ -7093,6 +7103,37 @@ class AppRuns:
         return response
 
 
+def _kill_result_path(chat_id: int) -> Path:
+    """Where `AppPod`'s `last_kill` survives a bot restart. A worker thread
+    holds `BOT_LOCK` for the whole destroy (up to ~210s), and systemd's
+    `Restart=always` can land in the middle of that — losing `last_kill` then
+    would answer `GET /v1/pod` with "nothing happened" for a kill that may
+    have destroyed a pod seconds before the restart."""
+    return ROOT / "batch" / f"tg-{chat_id}.last-kill.json"
+
+
+def _save_kill_result(chat_id: int, result: dict | None) -> None:
+    if result is None:
+        return
+    path = _kill_result_path(chat_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(result), encoding="utf-8")
+    tmp.replace(path)   # atomic: a reader never sees a half-written record
+
+
+def _load_kill_result(chat_id: int) -> dict | None:
+    """None means "nothing to restore" — including a corrupt file: the same
+    fail-quiet posture as batchlib_ext.lease.read_lease, and for the same
+    reason, this is read once at process start and a bad answer here must
+    not stop the bot from starting."""
+    try:
+        raw = json.loads(_kill_result_path(chat_id).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
 class AppPod:
     """The pod-side calls the phone can make (spec §5.9): stop what is
     running, and retry a rental that already failed once.
@@ -7106,8 +7147,14 @@ class AppPod:
     def __init__(self, tg: Tg, chat_id: int, idem: IdempotencyStore):
         self.tg, self.chat_id, self.idem = tg, chat_id, idem
         # The kill's answer, for GET /v1/pod to poll: the request itself only
-        # ever gets a 202 (see kill()).
-        self.last_kill: dict | None = None
+        # ever gets a 202 (see kill()). Loaded from disk, not always None: a
+        # bot restart rebuilds this instance from scratch (systemd
+        # Restart=always can land mid-kill), and without this GET /v1/pod
+        # would answer "nothing happened" for a kill that may have destroyed
+        # a pod seconds earlier. `kill_running` still answers False right
+        # after a restart regardless — that field means "a kill is running
+        # in THIS process" — this only restores the last known OUTCOME.
+        self.last_kill: dict | None = _load_kill_result(chat_id)
         self._kill_thread: threading.Thread | None = None
         # The outstanding migration confirmation, or None. In memory on
         # purpose (spec §5.9): a bot restart voids it and the user asks again,
@@ -7163,6 +7210,12 @@ class AppPod:
             self.last_kill = {"at": time.time(), "ok": False, "code": "error",
                               "message": _plain(f"the kill failed: {exc}")}
             log(f"kill worker for chat {self.chat_id} failed: {exc!r}")
+        finally:
+            # Persisted so a bot restart mid-kill (or right after one) does
+            # not lose the answer — see __init__'s _load_kill_result. Every
+            # exit of this method sets self.last_kill first, so this always
+            # has something to write.
+            _save_kill_result(self.chat_id, self.last_kill)
 
     def kill(self, run_id: str, key) -> tuple[int, dict]:
         if run_id != self.run_id:

@@ -20,7 +20,7 @@ import control.runs as runs
 import tgbot.run as run_mod
 import httpapi.files as files_module
 from httpapi.files import parse_range
-from httpapi.server import _Handler, make_server, start_in_thread
+from httpapi.server import ApiError, _Handler, make_server, start_in_thread
 from tgbot.ingest import Probe
 
 TOKEN = "t-123"
@@ -814,6 +814,7 @@ class FakeAppRuns:
         self.tryon_response = (200, {"run_id": "tg-1", "previews": []})
         self.regen_response = (202, {"run_id": "tg-1", "outcome": "started"})
         self.tryon_image_path = None
+        self.tryon_image_error = None
 
     def phase_a(self, key):
         self.calls.append(("phase_a", key))
@@ -833,6 +834,8 @@ class FakeAppRuns:
 
     def tryon_image(self, run_id, index):
         self.calls.append(("tryon_image", run_id, index))
+        if self.tryon_image_error is not None:
+            raise self.tryon_image_error
         return self.tryon_image_path
 
     def regen(self, run_id, index, body, key):
@@ -906,6 +909,16 @@ class TestAppRunRoutes(HttpWriteBase):
         resp, body = self.send("GET", "/v1/runs/tg-1/tryon/0")
         self.assertEqual(resp.status, 404)
         self.assertEqual(json.loads(body)["error"]["code"], "not_found")
+
+    def test_tryon_image_503s_on_bot_busy_not_404(self):
+        # AppRuns.tryon_image raises ApiError(503, "bot_busy", ...) on a lock
+        # timeout, distinct from the None it returns for a genuinely missing
+        # preview; the route must let it through, not fold it into 404.
+        self.fake.tryon_image_error = ApiError(503, "bot_busy",
+                                               "the bot is busy — try again in a moment")
+        resp, body = self.send("GET", "/v1/runs/tg-1/tryon/0")
+        self.assertEqual(resp.status, 503)
+        self.assertEqual(json.loads(body)["error"]["code"], "bot_busy")
 
     def test_regen_reaches_app_runs_with_body_and_key(self):
         resp, body = self.send("POST", "/v1/runs/tg-1/tryon/2/regen",
