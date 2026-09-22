@@ -16,6 +16,9 @@ public final class DraftStore {
     public private(set) var needsMaterialsRefresh = false
 
     private let client: APIClient
+    // Assignment can probe for 60 s and validation for 90 s; stay below
+    // Cloudflare's 100 s origin ceiling without extending unrelated calls.
+    private static let slowDraftTimeout: TimeInterval = 95
 
     public init(client: APIClient) {
         self.client = client
@@ -88,7 +91,8 @@ public final class DraftStore {
     public func assign(role: String, materialID: String?) async {
         await mutate(materialAssignment: true) {
             try await self.client.patch(
-                Draft.self, body: SlotPatch(role: role, materialID: materialID), "v1", "draft")
+                Draft.self, body: SlotPatch(role: role, materialID: materialID),
+                timeout: Self.slowDraftTimeout, "v1", "draft")
         }
     }
 
@@ -120,7 +124,9 @@ public final class DraftStore {
         message = nil
         defer { isValidating = false }
         do {
-            let response = try await client.post(DraftValidationResponse.self, "v1", "draft", "validate")
+            let response = try await client.post(
+                DraftValidationResponse.self, timeout: Self.slowDraftTimeout,
+                "v1", "draft", "validate")
             accept(response.draft)
             validationWasStale = response.stale
             if response.stale {
@@ -128,7 +134,9 @@ public final class DraftStore {
             }
         } catch {
             let api = apiError(error)
-            if api.isOffline {
+            if case .server(status: 422, code: "invalid", message: _) = api {
+                await refreshAfterAmbiguousWrite()
+            } else if api.isOffline {
                 await refreshAfterAmbiguousWrite()
             }
             self.error = api
@@ -187,6 +195,7 @@ public final class DraftStore {
 
     private func accept(_ draft: Draft) {
         self.draft = draft
+        validationWasStale = false
         loaded = true
         lastSuccess = .now
         error = nil

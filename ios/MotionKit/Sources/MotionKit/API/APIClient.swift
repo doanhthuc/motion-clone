@@ -83,15 +83,17 @@ public actor APIClient {
     }
 
     public func post<Response: Decodable & Sendable>(
-        _ response: Response.Type, _ components: String...
+        _ response: Response.Type, timeout: TimeInterval = 30, _ components: String...
     ) async throws(APIError) -> Response {
         let (data, _) = try await send(
-            url(components), method: "POST", extraHeaders: [:], okStatuses: [200, 201])
+            url(components), method: "POST", timeout: timeout,
+            extraHeaders: [:], okStatuses: [200, 201])
         return try decode(response, data)
     }
 
     public func patch<Response: Decodable & Sendable, Body: Encodable & Sendable>(
-        _ response: Response.Type, body: Body, _ components: String...
+        _ response: Response.Type, body: Body, timeout: TimeInterval = 30,
+        _ components: String...
     ) async throws(APIError) -> Response {
         let encoded: Data
         do {
@@ -103,7 +105,7 @@ public actor APIClient {
         }
         let (data, _) = try await send(
             url(components), method: "PATCH", body: encoded, contentType: "application/json",
-            extraHeaders: [:], okStatuses: [200])
+            timeout: timeout, extraHeaders: [:], okStatuses: [200])
         return try decode(response, data)
     }
 

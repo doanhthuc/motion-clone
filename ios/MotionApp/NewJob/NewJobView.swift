@@ -95,6 +95,7 @@ struct NewJobView: View {
                     onSelect: { materialID in
                         Task { await store.assign(role: role, materialID: materialID) }
                     })
+                    .interactiveDismissDisabled(store.isBusy)
             }
         }
     }
@@ -140,7 +141,8 @@ struct NewJobView: View {
                     required: true,
                     kind: pipeline.roles[role] ?? .unknown,
                     slot: draft.slots[role],
-                    materials: materials) {
+                    materials: materials,
+                    disabled: store.isBusy) {
                         selectedRole = role
                     }
             }
@@ -150,7 +152,8 @@ struct NewJobView: View {
                     required: false,
                     kind: pipeline.roles[role] ?? .unknown,
                     slot: draft.slots[role],
-                    materials: materials) {
+                    materials: materials,
+                    disabled: store.isBusy) {
                         selectedRole = role
                     }
             }
@@ -208,6 +211,10 @@ struct NewJobView: View {
                             Text(entry.digest)
                                 .font(Theme.mono(11, .medium))
                                 .foregroundStyle(Theme.ink1)
+                                .lineLimit(1)
+                            Text(entry.runID)
+                                .font(Theme.mono(10))
+                                .foregroundStyle(Theme.ink2)
                                 .lineLimit(1)
                             Text("\(entry.pipeline) · \(entry.provider)")
                                 .font(Theme.mono(10))
@@ -300,6 +307,7 @@ private struct SlotMaterialRow: View {
     let kind: PipelineRoleKind
     let slot: DraftSlot?
     let materials: MaterialsStore
+    let disabled: Bool
     let onTap: () -> Void
     @State private var thumbnail: Data?
 
@@ -315,6 +323,7 @@ private struct SlotMaterialRow: View {
             kind: kind,
             slot: slot,
             thumbnail: thumbnail,
+            disabled: disabled,
             onTap: onTap)
             .task(id: material?.id) {
                 guard let material else {

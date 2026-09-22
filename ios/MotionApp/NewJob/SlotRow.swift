@@ -8,6 +8,7 @@ struct SlotRow: View {
     let kind: PipelineRoleKind
     let slot: DraftSlot?
     let thumbnail: Data?
+    let disabled: Bool
     let onTap: () -> Void
 
     private var assigned: Bool {
@@ -61,6 +62,7 @@ struct SlotRow: View {
             .card(border: required && !assigned ? Theme.amber.opacity(0.35) : Theme.line)
         }
         .buttonStyle(.plain)
+        .disabled(disabled)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(displayName(role))
         .accessibilityValue(stateText)

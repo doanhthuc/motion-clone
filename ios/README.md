@@ -65,7 +65,8 @@ row is removed by its stable digest rather than its position. Validation is free
 come from the server, and the next draft edit clears Ready.
 
 The Phase 3 UI intentionally contains no Phase A, Run, rent, pod, confirm, resume, or other
-spend-capable action. It talks only to the free draft endpoints; later phases introduce spend actions.
+spend-capable action. Its mutations use only the free draft endpoints; its reads use the free pipeline,
+draft, material, and authenticated-thumbnail routes. Later phases introduce spend actions.
 
 ### Phase 3 simulator/iPhone smoke (pending)
 

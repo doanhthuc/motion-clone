@@ -157,6 +157,32 @@ extension URLProtocolTests {
         #expect(slots["driver"] as? String == "app/dance.mp4")
     }
 
+    @Test func draftAssignmentPatchUsesExplicitRequestTimeout() async throws {
+        StubURLProtocol.install { _ in TestSupport.json(Fixtures.draft) }
+
+        _ = try await TestSupport.client().patch(
+            Draft.self,
+            body: SlotPatch(role: "driver", materialID: "app/dance.mp4"),
+            timeout: 95,
+            "v1", "draft")
+
+        let request = try #require(StubURLProtocol.requests.first)
+        #expect(request.httpMethod == "PATCH")
+        #expect(request.timeoutInterval == 95)
+    }
+
+    @Test func draftValidationPostUsesExplicitRequestTimeout() async throws {
+        StubURLProtocol.install { _ in TestSupport.json(Fixtures.validatedDraft) }
+
+        _ = try await TestSupport.client().post(
+            DraftValidationResponse.self, timeout: 95, "v1", "draft", "validate")
+
+        let request = try #require(StubURLProtocol.requests.first)
+        #expect(request.httpMethod == "POST")
+        #expect(request.httpBody == nil)
+        #expect(request.timeoutInterval == 95)
+    }
+
     @Test func patchConvertsCamelCaseBodyKeysToSnakeCase() async throws {
         StubURLProtocol.install { _ in TestSupport.json(Fixtures.draft) }
         _ = try await TestSupport.client().patch(

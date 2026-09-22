@@ -77,6 +77,8 @@ extension URLProtocolTests {
         #expect(StubURLProtocol.requests.map { $0.url?.path } ==
                 ["/v1/pipelines", "/v1/draft", "/v1/draft", "/v1/draft", "/v1/draft",
                  "/v1/draft/add-to-batch", "/v1/draft/batch/abc123def0", "/v1/draft/clear"])
+        #expect(StubURLProtocol.requests.map(\.timeoutInterval) ==
+                [30, 30, 30, 30, 95, 30, 30, 30])
     }
 
     @Test func rejectsASecondMutationWhileTheFirstWriteIsActive() async {
@@ -122,6 +124,7 @@ extension URLProtocolTests {
         #expect(store.draft?.generation == 8)
         #expect(store.draft?.estimateMin == 48)
         #expect(store.isReady && !store.validationWasStale)
+        #expect(StubURLProtocol.requests.last?.timeoutInterval == 95)
     }
 
     @Test func staleValidationInstallsTheNestedDraftWithoutReportingReady() async {
@@ -145,6 +148,34 @@ extension URLProtocolTests {
         #expect(store.message == "The draft changed during validation. Validate it again.")
     }
 
+    @Test func authoritativeRefreshClearsAStaleValidationLatch() async throws {
+        let staleResponse = Fixtures.validatedDraft.replacingOccurrences(
+            of: "\"stale\":false", with: "\"stale\":true")
+        let drafts = DraftResponses([
+            Fixtures.draft,
+            try validationDraft(validated: true),
+        ])
+        StubURLProtocol.install { request in
+            switch request.url?.path {
+            case "/v1/pipelines": TestSupport.json(Fixtures.pipelines)
+            case "/v1/draft/validate": TestSupport.json(staleResponse)
+            default: TestSupport.json(drafts.next())
+            }
+        }
+        let store = DraftStore(client: TestSupport.client())
+        await store.load()
+
+        await store.validate()
+        #expect(store.validationWasStale)
+        #expect(!store.isReady)
+
+        await store.refresh()
+
+        #expect(store.draft?.validated == true)
+        #expect(!store.validationWasStale)
+        #expect(store.isReady)
+    }
+
     @Test func validationConflictKeepsTheLastDraftAndShowsTheServerMessage() async {
         StubURLProtocol.install { request in
             request.url?.path == "/v1/pipelines"
@@ -164,6 +195,57 @@ extension URLProtocolTests {
         #expect(store.draft?.generation == 4)
         #expect(store.error?.userMessage == "Assign driver before validating.")
         #expect(store.message == "Assign driver before validating.")
+        #expect(StubURLProtocol.requests.map(\.httpMethod) == ["POST"])
+    }
+
+    @Test func invalidValidationReconcilesBeforeReleasingTheGateAndKeepsTheServerError() async throws {
+        let gate = RequestGate()
+        let drafts = DraftResponses([
+            try validationDraft(validated: true),
+            try validationDraft(validated: false),
+        ])
+        StubURLProtocol.install { request in
+            switch (request.httpMethod, request.url?.path) {
+            case (_, "/v1/pipelines"):
+                return TestSupport.json(Fixtures.pipelines)
+            case ("POST", "/v1/draft/validate"):
+                return TestSupport.json(
+                    #"{"error":{"code":"invalid","message":"Driver video is unreadable."}}"#,
+                    status: 422)
+            case ("GET", "/v1/draft"):
+                let response = drafts.next()
+                if StubURLProtocol.requests.filter({
+                    $0.httpMethod == "GET" && $0.url?.path == "/v1/draft"
+                }).count == 2 {
+                    gate.release.wait()
+                }
+                return TestSupport.json(response)
+            default:
+                return TestSupport.json(#"{"error":{"code":"unexpected","message":"unexpected request"}}"#, status: 500)
+            }
+        }
+        let store = DraftStore(client: TestSupport.client())
+        await store.load()
+        #expect(store.isReady)
+
+        let validation = Task { await store.validate() }
+        for _ in 0..<1_000 {
+            if StubURLProtocol.requests.count == 4 { break }
+            await Task.yield()
+        }
+
+        #expect(StubURLProtocol.requests.map(\.httpMethod) == ["GET", "GET", "POST", "GET"])
+        #expect(store.isValidating)
+        #expect(store.draft?.validated == true)
+        gate.release.signal()
+        await validation.value
+
+        #expect(!store.isValidating)
+        #expect(store.draft?.validated == false)
+        #expect(!store.isReady)
+        #expect(store.error == .server(
+            status: 422, code: "invalid", message: "Driver video is unreadable."))
+        #expect(store.message == "Driver video is unreadable.")
     }
 
     @Test func transportFailureReconcilesBeforeValidationCompletes() async {
@@ -282,6 +364,16 @@ private func draftResponse(generation: Int, dropped: [String] = []) -> String {
             with: "\"estimate_min\":null,\"dropped\":[\(encoded)]}")
     }
     return result
+}
+
+private func validationDraft(validated: Bool) throws -> String {
+    let data = Data(Fixtures.validatedDraft.utf8)
+    guard let envelope = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+          var draft = envelope["draft"] as? [String: Any] else {
+        throw APIError.decoding("invalid validation fixture")
+    }
+    draft["validated"] = validated
+    return String(decoding: try JSONSerialization.data(withJSONObject: draft), as: UTF8.self)
 }
 
 private final class TransportDuringWriteProtocol: URLProtocol, @unchecked Sendable {
