@@ -994,7 +994,7 @@ still only one GPU and one slot; the phone does not get a second one.
 | `GET /v1/runs/<id>/rent-panel[?force=1]` | RunPod stock/price and the Vast tab for the run that `/confirm` would start; `force=1` bypasses the stock cache |
 | `POST /v1/runs/<id>/confirm` `{provider, panel_token, tryon?}` | spend money: rent a pod and start the run (or resume one Phase A already offered) |
 | `GET /v1/runs/<id>/tryon` | this run's try-on previews (status per job, no image bytes) |
-| `GET /v1/runs/<id>/tryon/<index>` | one try-on preview image, streamed; `404` if it isn't ready |
+| `GET /v1/runs/<id>/tryon/<index>` | one try-on preview image, streamed; `404` if it isn't ready, `503 bot_busy` if the bot was busy — a slice-5 `kill` can hold the lock for a while, so the two are told apart rather than both reading as "not ready" |
 | `POST /v1/runs/<id>/tryon/<index>/regen` `{run_token}` | regenerate one try-on preview |
 
 `<id>` must be the live slot's own run id (`GET /v1/runs` — the same list Telegram's run shows up
@@ -1071,10 +1071,15 @@ to a pod. Nothing here rents a pod except `resume`; `kill` and `migrate` destroy
   destroy is hung: look at the pod in the RunPod console and in `runpodctl`, not at the phone, and
   destroy it by hand if it is still there. `GET /v1/pod` deliberately takes no lock, so it keeps
   answering while this happens.
-- **A bot restart forgets a kill.** `last_kill` and the worker are in memory: after a restart
-  `GET /v1/pod` says `kill_running: false, last_kill: null` whether the kill finished or was cut
-  off, and the same `Idempotency-Key` replays the old `202`. If a pod may still be up, send `kill`
-  again with a **new** key (it destroys only if a drain or Phase A is live, from the lease file).
+- **A bot restart forgets that a kill is *running*, not its last *answer*.** The worker thread itself
+  is in memory, so `kill_running` is always `false` right after a restart, whether or not a destroy was
+  mid-flight when systemd restarted `motion-bot`. `last_kill` survives, though: it is written to disk
+  (`batch/tg-<chat>.last-kill.json`) the moment it is set, and read back when `AppPod` is rebuilt — so
+  `GET /v1/pod` after a restart still shows the last kill's real outcome, not `null`. What a restart
+  cannot tell you is whether a destroy that was running at the moment of the restart finished. If in
+  doubt, check the pod directly (as for a stuck kill, above) and send `kill` again with a **new**
+  `Idempotency-Key` if it is still there — a replayed key still answers with the old, possibly stale
+  `202`.
 - **`resume` needs an outstanding failed rental and the run's current token.** `GET /v1/pod`'s
   `failed_rental` is non-null exactly when Telegram would draw its recovery buttons; without one,
   `resume` is `409 no_failure` (resuming a finished batch would rent a pod to do nothing). `run_token`
