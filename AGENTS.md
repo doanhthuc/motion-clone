@@ -1,33 +1,188 @@
-# Repository Guidelines
+# AGENTS.md
 
-## Project Structure & Module Organization
+This file provides guidance to Codex, Claude Code, and other coding agents working in this
+repository. `CLAUDE.md` carries the same content — keep both in sync when either changes.
 
-This repository separates the local frontend from GPU-backed services. `motions/` contains the Nuxt 4 frontend; its pages, components, composables, server routes, and public assets live under their standard Nuxt directories. `motions-studio/` contains the Express API, Python worker, ComfyUI integration, deployment setup, and backend tests. Root-level `scripts/` and `Makefile` targets manage GPU pods and batch jobs. Batch manifests belong in `batch/`, generated results in ignored `out/`, and operational or design documentation in `docs/`.
+## What this repo is
 
-## Build, Test, and Development Commands
+A monorepo for a Vietnamese AI video/image generation product ("Motion"). Two halves that are
+deployed to different machines:
 
-- `make setup`: install frontend dependencies and create `motions/.env` if absent.
-- `make dev`: run Nuxt locally at `http://localhost:2030`.
-- `cd motions && npm run build`: produce the production frontend bundle.
-- `cd motions && npm run typecheck`: run Nuxt/Vue TypeScript checks.
-- `make batch-test`: run the Python batch-runner unit suite without a GPU.
-- `make check-job-types check-comfy-nodes check-batch-params`: detect drift between worker and deployment registries.
-- `make gpu-preflight`: validate configuration before renting GPU capacity.
+- `motions/` — Nuxt 4 frontend. Runs **locally** (`make dev` → localhost:2030), or optionally on the pod.
+- `motions-studio/` — the whole backend (Express API + Postgres + MinIO + ComfyUI + Python worker).
+  Needs an NVIDIA GPU ≥24GB VRAM, so it runs on a **rented GPU pod** (RunPod), never on the dev machine.
+- Root `Makefile` + `scripts/` — pod lifecycle, gates, and the batch runner. This layer is repo-specific
+  glue and is where most infra work happens.
 
-Run `make help` for the full pod lifecycle. Do not start a paid pod merely to perform checks that have a local gate.
+There is no local backend. Any change to `motions-studio/` is verified by rsyncing it to a rented pod
+(`make gpu-bootstrap`) — which costs money by the hour. Read `docs/gpu-pod.md` §Runbook before doing
+anything that starts a pod.
 
-## Coding Style & Naming Conventions
+## Money is a first-class constraint
 
-Write new code, documentation, comments, commits, and PR descriptions in English. Follow existing formatting: two-space indentation in Vue/JavaScript and four spaces in Python. Use `camelCase` for JavaScript variables and functions, `PascalCase` for Vue components, and `snake_case` for Python identifiers. Name Python tests `test_<behavior>.py` with `test_<scenario>` methods. Comments should explain why, especially for measured performance or cost decisions; do not add legacy `#region ALD` markers.
+- The GPU pod bills ~$1/hour **while it exists**, including while stopped (container disk).
+  `make gpu-destroy` is the default "done for now" action, not `gpu-down`. See `docs/gpu-pod.md#destroy-first`.
+- The Network Volume bills monthly even with no pod. That is deliberate — it holds ~33GB of models,
+  Postgres data and MinIO. Never suggest deleting it casually.
+- Never assert cost from `currentSpendPerHr`. Use `runpodctl billing pods` (real invoice).
+- Free gates that catch mistakes **before** spending: `make gpu-preflight`, `make batch-validate`,
+  `make batch-test`, `make check-job-types`, `make check-comfy-nodes`, `make check-batch-params`,
+  `make check-vast-models`. Run them instead of "just trying it on the pod".
 
-## Testing Guidelines
+## Commands
 
-Batch tests use Python `unittest` under `scripts/tests/`; worker tests live in `motions-studio/worker/tests/`. Run a focused module with `python3 -m unittest scripts.tests.test_batch_run`, then run `make batch-test` and relevant registry gates before submitting. Backend GPU behavior requires the documented pod smoke flow; distinguish local unit coverage from paid end-to-end validation.
+```bash
+# Frontend (local)
+make setup                 # npm install + create motions/.env
+make dev                   # nuxt dev on :2030
+cd motions && npm run build / npm run typecheck
 
-## Commit & Pull Request Guidelines
+# Pod lifecycle (in order; see docs/gpu-pod.md §Runbook)
+make gpu-preflight                          # validate .env — free, do this first
+bash scripts/pod-provision.sh               # DRY RUN: prints the create command + price
+CONFIRM=yes bash scripts/pod-provision.sh   # actually rents — clock starts
+make gpu-wait                               # waits for SSH, writes GPU_SSH_HOST/PORT into .env
+make gpu-bootstrap                          # rsync motions-studio/ + run setup-<SETUP_PROFILE>.sh (idempotent)
+make gpu-fe                                 # deploy frontend to the pod (separate step, ~15s via CI artifact)
+make gpu-smoke                              # 9-layer end-to-end proof; /health alone lies
+make gpu-status / gpu-logs (LOG=api|worker|comfyui|wf-worker|minio)
+make gpu-destroy                            # DEFAULT when done — verifies the pod is really gone, clears .env
 
-Recent commits use short, imperative summaries, often scoped by subsystem, such as `Telegram bot: ...` or `docs(vps): ...`. Keep each commit focused. PRs should explain the behavior change, validation performed, cost/GPU implications, and linked issue. Include screenshots for frontend changes and logs or measurements for operational claims.
+# Batch runner (many jobs without clicking the UI)
+make batch-scan DIR=~/materials MODE=pair|cross   # emits a DRAFT batch/<date>.yaml to review
+make batch-validate FILE=batch/….yaml             # no GPU spend
+make batch FILE=batch/….yaml [RESUME=1] [FAIL_FAST=1]
+make batch-params TYPE=motion|tryon|enhance       # which params a job type actually accepts
+make batch-clean [KEEP=3] [DRY=1]                 # only deletes runs/, never _final/
 
-## Security & Configuration
+# Gates (all free, no pod)
+make batch-test                                   # python unittest, scripts/tests/
+python3 -m unittest discover -s scripts/tests -p 'test_batch_run.py'   # single module
+make check-job-types                              # the 4 job-type lists must agree
+make check-comfy-nodes                            # the 4 ComfyUI custom-node lists must agree
+make check-batch-params                           # scripts/batch-params.json vs linux.py
+make check-vast-models                            # scripts/batchlib/vast_models.py vs PIPELINES/catalog
+make batch-coverage [FULL=1]
+motions-studio/setup/scrub-secrets.sh --check     # MUST exit 0 before every commit — repo is public
 
-This repository is public. Never commit `.env`, credentials, personal media, or generated outputs. Before every commit, run `motions-studio/setup/scrub-secrets.sh --check` and require exit code 0.
+# Backend unit tests (pure-python, no GPU)
+cd motions-studio/worker && python3 -m unittest discover -s tests
+```
+
+## Architecture
+
+### Job flow
+
+```
+FE (Nuxt) ──X-API-Key / JWT──▶ Express API ──jobs table (Postgres)──▶ Python worker polls /worker/claim
+                                    │                                        │
+                                MinIO (S3, presigned URLs)          HTTP ──▶ ComfyUI (Wan 2.2 Animate, Qwen, LTX)
+```
+
+One generic `jobs` table: `type` · `inputs` (MinIO storage keys, one per upload field) · `params` ·
+`output_key`. Workers claim atomically with `SKIP LOCKED`. Everything — motion transfer, try-on,
+upscale, lip-sync — is the same API with a different `type`.
+
+### The three registries you must keep in sync
+
+1. `motions-studio/worker/worker_runtime/linux.py` — a ~10k-line file ending in `PIPELINES = {...}`,
+   mapping job type → `run_xxx(job)`. This is the real dispatch table.
+2. `JOB_TYPES` (env, per box/worker) — which types that worker will *claim*. **A type missing here
+   fails silently**: the job sits `queued` forever, no error, no log. This is the single most common
+   silent failure in this repo.
+3. Setup profiles (`motions-studio/setup/setup-*.sh`), ComfyUI catalogs
+   (`comfyui/catalog*.json`) and the serverless images — each locks a box to a subset of types/models.
+
+`make check-job-types` and `make check-comfy-nodes` exist precisely because these lists were copied by
+hand into 4–5 places and drifted. Adding a handler to `PIPELINES` turns them red on purpose — that
+forces a decision instead of a silent omission.
+
+**Adding a pipeline:** write `run_xxx(job)` in `linux.py`, register in `PIPELINES`, add the type to
+`JOB_TYPES` in the relevant setup profile / `.env.example`, then run `make check-job-types`.
+
+### No-code workflow layer
+
+The FE is a node-graph builder (`@vue-flow`). Each FE node → a handler in
+`api/src/wf-worker/handlers.js` → creates a job of some type. `wf-worker` (PM2 process) runs graphs;
+`api/src/wf-worker/engine.js` is the executor. So a "node" is FE config + handler mapping + a worker
+pipeline — three layers, all three needed.
+
+### Deploy shape — three env vars
+
+```
+COMPUTE_TYPE=gpu|cpu
+SETUP_PROFILE=motion-transfer|full|create-image|tryon|cpu-box   # which features the box installs (locked catalog)
+WORKER_SOURCE=local|serverless|both                             # who runs jobs
+```
+
+Current shape (settled 2026-08-04): **GPU pod + `local`** — this is a personal, per-session tool, not a
+24/7 service. Serverless loses here because you already paid for the GPU, plus ~155s cold start and
+observed indefinite `IN_QUEUE` throttling. `docs/gpu-pod.md#deploy-shapes` has the full comparison and
+the crossover math (~79 jobs/day). Don't re-litigate it from first principles; the numbers are measured.
+
+### On-pod runtime
+
+PM2, **not Docker** (`ecosystem.config.cjs`): `api` · `worker` · `wf-worker` · `comfyui` · `minio` ·
+optionally `motions` (FE) and `mc-dispatcher` (serverless). Postgres is native. `api` and `wf-worker`
+read only `process.env`, so every variable must be passed through `ecosystem.config.cjs`.
+
+Rented pods are NAT'd, so ingress is a Cloudflare Tunnel with two hostnames (`DOMAIN`→:8080,
+`FE_DOMAIN`→:2030), not open ports. Models, `PGDATA` and MinIO are symlinked onto the Network Volume
+**before** setup runs — otherwise Postgres builds a cluster on container disk and it dies with the pod.
+
+### Batch runner (`scripts/batchlib/`)
+
+Runs many jobs from a YAML manifest. Hard boundary: **`batch/<name>.yaml` is yours, everything else is
+the machine's** — the runner journals to `batch/<name>.state.json` (never rewrites the YAML, because
+`safe_dump` would strip your comments). `RESUME=1` first re-attaches to the *existing* `job_id` before
+resubmitting, so a batch interrupted at minute 39 of a 40-minute job doesn't restart it. Try-on with
+`provider: gemini` or `provider: qwen-max` runs locally (no pod) — both are pure hosted-API calls
+(`scripts/batchlib/local_tryon.py`'s `LOCAL_PROVIDERS`) — and is the only stage allowed to run
+concurrently — the pod has one GPU and `run_enhance` calls `comfy_recycle`, which assumes exclusive use.
+
+An MCP server (`.mcp.json` → `scripts/batch_mcp.py`) exposes `batch_validate` / `batch_run` /
+`batch_status` / `batch_rerun`. **Editing `batchlib/mcp_tools.py` requires restarting the agent's
+session** — the server process stays alive for the session and keeps the old module in memory.
+`make batch-mcp-check` will NOT catch this (it spawns a fresh process). Full guide: `docs/batch-runner.md`.
+
+### Telegram bot & phone control-plane API (`scripts/tgbot/`, `scripts/control/`, `scripts/httpapi/`)
+
+`scripts/tgbot/bot.py` is a Telegram bot that drives the whole job/pod lifecycle by hand: upload
+material, compose a job, try-on preview, rent a GPU, run, kill, migrate. Since 2026-09-21 the same
+process also runs a small stdlib HTTP API (`scripts/httpapi/`, a daemon thread inside the bot) so a
+native iPhone app can do the same things — `scripts/control/` holds the Telegram-free core both
+adapters share (drafts, materials, runs, pod, the try-on library). The full design, amended in place
+as each slice shipped, lives in
+`docs/superpowers/specs/2026-09-21-vps-control-plane-api-design.md` — read it before touching either
+adapter; it is the durable record of what was decided and why, not just this file.
+
+Runs on `motion-vps` (a DigitalOcean droplet, reached with `doctl compute ssh motion-vps`, never a
+bare `ssh`). Pushing to `main` under `scripts/**` auto-deploys via GitHub Actions
+(`.github/workflows/deploy-bot.yml`), which restarts `motion-bot` — and the phone API with it. Check
+the VPS for a live drain/Phase A/lease/migration first (`batch/*.state.json`, `.env`'s
+`GPU_INSTANCE_ID`, `pgrep -af 'drain.py|batch_run.py'`): a restart mid-drain does not lose the job
+(state is on disk), but do the check anyway before merging anything under `scripts/**`.
+
+## Conventions
+
+- **Write in English** — docs, code comments, commit messages, PR bodies. Much of the existing repo is
+  Vietnamese; that is legacy, not a pattern to copy. Don't translate it in passing — a conversion pass
+  is its own task.
+- **Don't add `# #region ALD <DD/MM/YYYY> - …` markers.** That style came with the purchased source and
+  is retired. Existing ones stay where they are; write new comments as plain comments.
+- Keep the habit those comments encoded, though: explain **why**, with the number that was measured and
+  the date it was measured. When you change behavior a comment justifies, replace its measurement with
+  your own rather than deleting the reasoning.
+- Claims about performance/cost/quality in this repo are expected to be backed by a real run, not a
+  plausible argument. Design docs live in `docs/superpowers/specs/` and record what was measured,
+  including approaches that were tried and rejected.
+- `motions/` and `motions-studio/` originated from a purchased source (`ALD-Project`) but as of
+  2026-08-02 are fully owned here. Edit them directly; there is no upstream to preserve.
+
+## Secrets — repo is public
+
+`motions-studio/setup/scrub-secrets.sh --check` must exit 0 before any commit. It scans every tracked
+file, including `docs/`. Never-committed files: `.env` (root and `motions/`),
+`motions-studio/setup/templates.json`, `motions-studio/setup/pod.env`. Batch material, `out/`,
+`.smoke/` and `ab-results/` are gitignored personal media — but `out/` also holds the only evidence
+behind past A/B measurements, so don't delete it when cleaning disk.

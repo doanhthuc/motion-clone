@@ -1,6 +1,8 @@
 # CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+`AGENTS.md` (read by Codex and other tools) carries the same content — keep both in sync when either
+changes.
 
 ## What this repo is
 
@@ -143,6 +145,24 @@ An MCP server (`.mcp.json` → `scripts/batch_mcp.py`) exposes `batch_validate` 
 `batch_status` / `batch_rerun`. **Editing `batchlib/mcp_tools.py` requires restarting Claude Code** —
 the server process stays alive for the session and keeps the old module in memory. `make batch-mcp-check`
 will NOT catch this (it spawns a fresh process). Full guide: `docs/batch-runner.md`.
+
+### Telegram bot & phone control-plane API (`scripts/tgbot/`, `scripts/control/`, `scripts/httpapi/`)
+
+`scripts/tgbot/bot.py` is a Telegram bot that drives the whole job/pod lifecycle by hand: upload
+material, compose a job, try-on preview, rent a GPU, run, kill, migrate. Since 2026-09-21 the same
+process also runs a small stdlib HTTP API (`scripts/httpapi/`, a daemon thread inside the bot) so a
+native iPhone app can do the same things — `scripts/control/` holds the Telegram-free core both
+adapters share (drafts, materials, runs, pod, the try-on library). The full design, amended in place
+as each slice shipped, lives in
+`docs/superpowers/specs/2026-09-21-vps-control-plane-api-design.md` — read it before touching either
+adapter; it is the durable record of what was decided and why, not just this file.
+
+Runs on `motion-vps` (a DigitalOcean droplet, reached with `doctl compute ssh motion-vps`, never a
+bare `ssh`). Pushing to `main` under `scripts/**` auto-deploys via GitHub Actions
+(`.github/workflows/deploy-bot.yml`), which restarts `motion-bot` — and the phone API with it. Check
+the VPS for a live drain/Phase A/lease/migration first (`batch/*.state.json`, `.env`'s
+`GPU_INSTANCE_ID`, `pgrep -af 'drain.py|batch_run.py'`): a restart mid-drain does not lose the job
+(state is on disk), but do the check anyway before merging anything under `scripts/**`.
 
 ## Conventions
 
