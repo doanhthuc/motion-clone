@@ -55,3 +55,11 @@ Result: passed; source reported clean with no known secrets or personal emails.
 ## Concerns
 
 None identified within the requested scope. No live service or iOS simulator verification was needed for these pure MotionKit transport primitives.
+
+## Fix Round 1
+
+- Changed `ios/MotionKit/Tests/MotionKitTests/APIClientTests.swift` only.
+- Added the test-only `CamelCasePatchBody` payload with a `materialID` property.
+- Added `patchConvertsCamelCaseBodyKeysToSnakeCase`, which asserts `material_id` is emitted and `materialID` is absent. This directly proves the PATCH encoder's snake-case strategy.
+- Command: `cd ios/MotionKit && swift test --filter APIClientTests`
+- Output: passed; 21 tests in 2 suites passed.

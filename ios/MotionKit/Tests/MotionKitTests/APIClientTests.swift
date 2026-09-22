@@ -2,6 +2,10 @@ import Foundation
 import Testing
 @testable import MotionKit
 
+private struct CamelCasePatchBody: Encodable, Sendable {
+    let materialID: String
+}
+
 extension URLProtocolTests {
 @Suite struct APIClientTests {
     @Test func sendsAllAuthHeadersAndUserAgent() async throws {
@@ -151,6 +155,16 @@ extension URLProtocolTests {
         let json = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
         let slots = try #require(json["slots"] as? [String: Any])
         #expect(slots["driver"] as? String == "app/dance.mp4")
+    }
+
+    @Test func patchConvertsCamelCaseBodyKeysToSnakeCase() async throws {
+        StubURLProtocol.install { _ in TestSupport.json(Fixtures.draft) }
+        _ = try await TestSupport.client().patch(
+            Draft.self, body: CamelCasePatchBody(materialID: "app/dance.mp4"), "v1", "draft")
+        let data = try #require(StubURLProtocol.requests.first?.httpBody)
+        let json = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        #expect(json["material_id"] as? String == "app/dance.mp4")
+        #expect(json["materialID"] == nil)
     }
 
     @Test func patchPreservesExplicitNullSlot() async throws {
