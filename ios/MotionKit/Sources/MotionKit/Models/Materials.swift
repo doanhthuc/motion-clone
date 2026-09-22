@@ -34,6 +34,16 @@ public struct MaterialsResponse: Decodable, Sendable, Equatable {
     public let materials: [Material]
 }
 
+public struct UploadOpenRequest: Encodable, Sendable, Equatable {
+    public let fileName: String
+    public let size: Int64
+
+    public init(fileName: String, size: Int64) {
+        self.fileName = fileName
+        self.size = size
+    }
+}
+
 public struct UploadOpenResponse: Decodable, Sendable, Equatable {
     public let uploadId: String
     public let chunkSize: Int64

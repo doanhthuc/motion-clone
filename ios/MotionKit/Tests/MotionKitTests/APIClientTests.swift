@@ -110,6 +110,64 @@ extension URLProtocolTests {
         #expect(response.acceptsRanges)
     }
 
+    @Test func postEncodesJSONAndAccepts201() async throws {
+        StubURLProtocol.install { _ in TestSupport.json(Fixtures.uploadOpen, status: 201) }
+        let result = try await TestSupport.client().post(
+            UploadOpenResponse.self,
+            body: UploadOpenRequest(fileName: "áo dài.png", size: 901),
+            "v1", "uploads")
+        let request = try #require(StubURLProtocol.requests.first)
+        #expect(result.chunkSize == 33_554_432)
+        #expect(request.httpMethod == "POST")
+        #expect(request.value(forHTTPHeaderField: "Content-Type") == "application/json")
+        #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer bearer-789")
+        let body = try #require(request.httpBody)
+        let json = try #require(try JSONSerialization.jsonObject(with: body) as? [String: Any])
+        #expect(json["file_name"] as? String == "áo dài.png")
+        #expect(json["size"] as? Int == 901)
+    }
+
+    @Test func bodylessPostSendsNoInventedJSON() async throws {
+        StubURLProtocol.install { _ in TestSupport.json(Fixtures.uploadComplete, status: 201) }
+        _ = try await TestSupport.client().post(
+            UploadCompleteResponse.self, "v1", "uploads", "abc123", "complete")
+        let request = try #require(StubURLProtocol.requests.first)
+        #expect(request.httpMethod == "POST")
+        #expect(request.httpBody == nil)
+        #expect(request.value(forHTTPHeaderField: "Content-Type") == nil)
+        #expect(request.value(forHTTPHeaderField: "CF-Access-Client-Id") == "id-123")
+    }
+
+    @Test func putSendsExactBinaryBodyAndAuth() async throws {
+        StubURLProtocol.install { _ in TestSupport.json(#"{"received":1}"#) }
+        let body = Data([0, 1, 2, 255])
+        try await TestSupport.client().put(
+            data: body, "v1", "uploads", "abc123", "chunks", "1")
+        let request = try #require(StubURLProtocol.requests.first)
+        #expect(request.httpMethod == "PUT")
+        #expect(request.httpBody == body)
+        #expect(request.value(forHTTPHeaderField: "Content-Type") == "application/octet-stream")
+        #expect(request.value(forHTTPHeaderField: "CF-Access-Client-Secret") == "secret-456")
+    }
+
+    @Test func deleteAccepts204AndEncodesPathSegments() async throws {
+        StubURLProtocol.install { _ in (204, [:], Data()) }
+        try await TestSupport.client().delete("v1", "materials", "app", "áo/dài.png")
+        let request = try #require(StubURLProtocol.requests.first)
+        #expect(request.httpMethod == "DELETE")
+        #expect(request.url?.absoluteString ==
+                "https://api.example.test/v1/materials/app/%C3%A1o%2Fd%C3%A0i.png")
+        #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer bearer-789")
+    }
+
+    @Test func writeMethodsMapJSONErrors() async {
+        StubURLProtocol.install { _ in TestSupport.json(Fixtures.errorConflict, status: 409) }
+        await #expect(throws: APIError.server(
+            status: 409, code: "stale_panel", message: "the panel changed")) {
+            try await TestSupport.client().delete("v1", "materials", "app", "busy.png")
+        }
+    }
+
     @Test func userMessages() {
         #expect(APIError.server(status: 401, code: "unauthorized", message: "x").userMessage
                 == "Bearer token rejected — check Settings.")

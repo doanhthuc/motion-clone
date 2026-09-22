@@ -65,6 +65,42 @@ public actor APIClient {
         try await send(url(components), extraHeaders: [:], okStatuses: [200]).0
     }
 
+    public func post<Response: Decodable & Sendable, Body: Encodable & Sendable>(
+        _ response: Response.Type, body: Body, _ components: String...
+    ) async throws(APIError) -> Response {
+        let encoded: Data
+        do {
+            let encoder = JSONEncoder()
+            encoder.keyEncodingStrategy = .convertToSnakeCase
+            encoded = try encoder.encode(body)
+        } catch {
+            throw .transport("couldn't encode the request: \(error.localizedDescription)")
+        }
+        let (data, _) = try await send(
+            url(components), method: "POST", body: encoded, contentType: "application/json",
+            extraHeaders: [:], okStatuses: [200, 201])
+        return try decode(response, data)
+    }
+
+    public func post<Response: Decodable & Sendable>(
+        _ response: Response.Type, _ components: String...
+    ) async throws(APIError) -> Response {
+        let (data, _) = try await send(
+            url(components), method: "POST", extraHeaders: [:], okStatuses: [200, 201])
+        return try decode(response, data)
+    }
+
+    public func put(data: Data, _ components: String...) async throws(APIError) {
+        _ = try await send(
+            url(components), method: "PUT", body: data, contentType: "application/octet-stream",
+            timeout: 120, extraHeaders: [:], okStatuses: [200])
+    }
+
+    public func delete(_ components: String...) async throws(APIError) {
+        _ = try await send(
+            url(components), method: "DELETE", extraHeaders: [:], okStatuses: [204])
+    }
+
     /// Fetches one byte range with the same Access and bearer headers as every
     /// other request. Used by AVAssetResourceLoader for authenticated seeking.
     public func byteRange(from offset: Int64, length: Int?,
@@ -106,11 +142,15 @@ public actor APIClient {
         return file
     }
 
-    private func send(_ url: URL, extraHeaders: [String: String],
+    private func send(_ url: URL, method: String = "GET", body: Data? = nil,
+                      contentType: String? = nil, timeout: TimeInterval = 30,
+                      extraHeaders: [String: String],
                       okStatuses: Set<Int>) async throws(APIError) -> (Data, HTTPURLResponse) {
         var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.timeoutInterval = 30
+        request.httpMethod = method
+        request.httpBody = body
+        request.timeoutInterval = timeout
+        if let contentType { request.setValue(contentType, forHTTPHeaderField: "Content-Type") }
         for (k, v) in authHeaders.merging(extraHeaders, uniquingKeysWith: { $1 }) {
             request.setValue(v, forHTTPHeaderField: k)
         }
