@@ -1116,3 +1116,23 @@ to a pod. Nothing here rents a pod except `resume`; `kill` and `migrate` destroy
 No test and no check in this repo ever calls the real `volume_migrate.py` or `make gpu-destroy`: the
 HTTP tests use a fake `AppPod`, and an invariant test greps `scripts/control/` and `scripts/httpapi/`
 for both names.
+
+**Measured 2026-09-22**, live through the tunnel, money-free (no pod was created, no volume was
+touched — `runpodctl pod list` was empty before and after, and no lease or migration file was written):
+
+| Call | Result |
+|---|---|
+| `GET /v1/pod`, idle | `200`, 0.26s — `lease: null`, `kill_running: false`, `last_kill: null` |
+| `GET /v1/gpu/stock` | `200`, 1.85s — live RunPod stock for all five GPUs |
+| `GET /v1/balance` | `200`, 1.29s — RunPod balance only (no `?vast=1` asked) |
+| `POST kill`, no `Idempotency-Key` | `400 bad_request` |
+| `POST kill`, idle, with key | `409 nothing_running` — no destroy attempted |
+| `POST resume`, bogus `run_token` | `409 stale_run` — no `start_drain` |
+| `PUT /v1/pod/gpu`, unknown id | `400 bad_request` |
+| `POST migrate/ask`, unknown datacenter | `409 unknown_datacenter` |
+| `POST migrate`, no prior ask | `409 bad_confirm_token` — no launch |
+| `GET /v1/pod` again | identical to the first read |
+
+One idempotency record was written per keyed call (`kill`, `resume`, `migrate`) — proof each refusal
+was recorded, not just answered. No real `kill`, `resume` or `migrate` was sent — those need the
+user's explicit go, since a kill destroys a real pod and a migrate deletes the source volume.
