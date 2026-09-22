@@ -137,6 +137,21 @@ class TestRenderManifest(unittest.TestCase):
         self.assertIn("camera-tryon: { provider: gemini }", text)
         self.assertIn("camera-motion: { preset: drv-15s }", text)
 
+    def test_a_tryon_seed_lands_on_the_tryon_stage_beside_the_provider(self):
+        # §5.10, slice 6: the manifest is the ONLY channel that carries a seed
+        # from "the app composed this job" to batchlib/runner.py's _one(), which
+        # is where it must be intercepted before run_local_tryon spends quota.
+        job = Job(slots={"character": Path("/c.png"), "outfit": Path("/o.png")},
+                  probes={}, pipeline="tryon-motion-enhance", provider="gemini",
+                  tryon_seed=Path("/lib/app/abc123.png"))
+        text = render_manifest([job], now="2026-09-22 09:00:00")
+        self.assertIn("tryon: { provider: gemini, seedImage: /lib/app/abc123.png }", text)
+
+    def test_no_seed_writes_no_seed_image(self):
+        job = Job(slots={"character": Path("/c.png"), "outfit": Path("/o.png")},
+                  probes={}, pipeline="tryon-motion-enhance", provider="gemini")
+        self.assertNotIn("seedImage", render_manifest([job], now="2026-09-22 09:00:00"))
+
     def test_pipeline_with_no_tryon_stage_has_none(self):
         self.assertIsNone(_tryon_stage("motion-enhance"))
         self.assertIsNone(_tryon_stage("character-swap-enhance"))

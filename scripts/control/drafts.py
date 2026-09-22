@@ -17,8 +17,10 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import control
+from batchlib.local_tryon import is_local_provider
 from batchlib.pipelines import PIPELINES, optional_roles, required_roles
 from control import materials
+from control.tryon_library import TryonLibrary
 from tgbot import ingest
 from tgbot.ingest import Probe
 from tgbot.job import DEFAULT_PROVIDER, Job, _tryon_stage, _unique_ids, missing_slots, write_manifest
@@ -69,19 +71,25 @@ def copy_job(job: Job) -> Job:
     it would silently rewrite an entry the user already committed to the batch.
     """
     return Job(pipeline=job.pipeline, slots=dict(job.slots),
-               probes=dict(job.probes), provider=job.provider)
+               probes=dict(job.probes), provider=job.provider,
+               tryon_seed=job.tryon_seed)
 
 
 def signature(job: Job) -> tuple:
-    """What makes two runs the same run — pipeline, material, and provider.
+    """What makes two runs the same run — pipeline, material, provider, seed.
 
     Provider is part of the identity, not just a cosmetic setting: same
     material through gemini vs qwen is two different runs (different API,
     different cost, possibly different output) — collapsing them into "the
     same job" would make _job_digest collide and an edit/drop tap on one
     basket row silently act on the other.
+
+    The try-on seed (§5.10, slice 6) is part of it for exactly the same
+    reason: the same four materials seeded from a saved image and run fresh
+    produce different try-ons at different cost.
     """
     return (job.pipeline, job.provider,
+            str(job.tryon_seed) if job.tryon_seed else None,
             tuple(sorted((r, str(p)) for r, p in job.slots.items())))
 
 
@@ -128,7 +136,8 @@ def dump_jobs(jobs: list[Job]) -> list[dict]:
     return [{"pipeline": j.pipeline,
              "provider": j.provider,
              "slots": {r: str(v) for r, v in j.slots.items()},
-             "probes": {r: asdict(pr) for r, pr in j.probes.items()}}
+             "probes": {r: asdict(pr) for r, pr in j.probes.items()},
+             "tryon_seed": str(j.tryon_seed) if j.tryon_seed else None}
             for j in jobs]
 
 
@@ -140,7 +149,10 @@ def load_jobs(payload: list) -> list[Job]:
                 # the failure _load_draft's own docstring warns against.
                 provider=entry.get("provider", DEFAULT_PROVIDER),
                 slots={r: Path(v) for r, v in entry["slots"].items()},
-                probes={r: Probe(**d) for r, d in entry["probes"].items()})
+                probes={r: Probe(**d) for r, d in entry["probes"].items()},
+                # .get for the same reason as provider above: a draft written
+                # before slice 6 has no such key.
+                tryon_seed=Path(entry["tryon_seed"]) if entry.get("tryon_seed") else None)
             for entry in payload]
 
 
@@ -183,7 +195,7 @@ class _Draft:
     generation: int = 0
 
 
-_PATCH_KEYS = frozenset({"pipeline", "provider", "slots"})
+_PATCH_KEYS = frozenset({"pipeline", "provider", "slots", "tryon_seed"})
 
 
 class DraftStore:
@@ -197,7 +209,8 @@ class DraftStore:
     """
 
     def __init__(self, batch_dir: Path, staging_root: Path, owner: str, *,
-                 default_pipeline: str, default_provider: str, probe=ingest.probe):
+                 default_pipeline: str, default_provider: str,
+                 tryon_library: TryonLibrary, probe=ingest.probe):
         self.batch_dir, self.owner = batch_dir, owner
         # Resolved once here so it matches materials.resolve_material's own
         # resolved paths (control/paths.py's safe_child): on macOS /var is a
@@ -207,6 +220,10 @@ class DraftStore:
         # 2026-09-21, tempfile.mkdtemp() under /var/folders/...).
         self.staging_root = staging_root.resolve()
         self.default_pipeline, self.default_provider = default_pipeline, default_provider
+        # Required, no default: a store built without a library silently
+        # refuses every tryon_seed with "no such entry" — a bug the test
+        # suite should fail on, not paper over.
+        self.tryon_library = tryon_library
         self._probe = probe
         self.path = batch_dir / f"{owner}.draft.json"
 
@@ -336,7 +353,8 @@ class DraftStore:
 
     def patch(self, body: dict) -> dict:
         if not isinstance(body, dict) or not body or set(body) - _PATCH_KEYS:
-            raise DraftError("bad_request", "expected an object with pipeline, provider and/or slots")
+            raise DraftError("bad_request",
+                             "expected an object with pipeline, provider, slots and/or tryon_seed")
         pipeline, provider, slots = body.get("pipeline"), body.get("provider"), body.get("slots", {})
         if pipeline is not None and not isinstance(pipeline, str):
             raise DraftError("bad_request", "pipeline must be a string")
@@ -344,6 +362,19 @@ class DraftStore:
             raise DraftError("bad_request", "provider must be a string")
         if not isinstance(slots, dict):
             raise DraftError("bad_request", "slots must be an object of role -> material id or null")
+        # Resolved outside the lock like the slot probes below, for the same
+        # reason: resolve_image takes control.LOCK itself, and control.LOCK is
+        # reentrant only for the thread that already holds it — doing this
+        # inside the `with` below would work, but would also make the lock's
+        # "slow work stays outside" rule one exception weaker.
+        tryon_seed = body.get("tryon_seed")
+        if tryon_seed is not None and not isinstance(tryon_seed, str):
+            raise DraftError("bad_request", "tryon_seed must be a string id or null")
+        seed_path: Path | None = None
+        if tryon_seed:
+            seed_path = self.tryon_library.resolve_image(tryon_seed)
+            if seed_path is None:
+                raise DraftError("not_found", f"no such try-on library entry: {tryon_seed}")
         if pipeline is not None and pipeline not in PIPELINES:
             raise DraftError("unknown_pipeline", f"unknown pipeline {pipeline!r}")
         if provider is not None and provider not in PROVIDER_LABELS:
@@ -378,6 +409,22 @@ class DraftStore:
                                      f"{role} must be {role_kind(role)}, {path.name} is {probed.kind}")
             if provider is not None and _tryon_stage(target) is None:
                 raise DraftError("not_applicable", f"{target} has no try-on stage to pick a provider for")
+            # Both halves of the post-patch job, not the stored one: setting a
+            # seed and a local provider in the SAME patch is a good request.
+            #
+            # A seed beside a non-local provider is never read: runner.py's
+            # _local_tryon_stage only names a stage whose provider passes
+            # is_local_provider, so Phase A skips the run and the job goes on to
+            # a real, PAID pod try-on while the caller believes they asked for a
+            # reuse. Refuse loudly instead — the same call the bot's _regen_tryon
+            # already refuses with "not_local" for the same underlying condition.
+            resolved_provider = provider if provider is not None else d.job.provider
+            resolved_seed = seed_path if "tryon_seed" in body else d.job.tryon_seed
+            if (resolved_seed is not None and _tryon_stage(target) is not None
+                    and not is_local_provider(resolved_provider)):
+                raise DraftError("not_local",
+                                 "tryon_seed only applies to a local try-on provider "
+                                 "(gemini or qwen-max) — switch the provider first")
             # Re-checked under the lock, right before applying: ffprobe (above)
             # ran outside the lock, so a delete could land in the gap between
             # resolving/probing a path and getting here.
@@ -394,6 +441,8 @@ class DraftStore:
                     d.job.probes.pop(role, None)
                 else:
                     d.job.slots[role], d.job.probes[role] = filled[role]
+            if "tryon_seed" in body:
+                d.job.tryon_seed = seed_path
             view = self._changed(d)
         view["dropped"] = dropped
         return view

@@ -6,15 +6,17 @@ Everything here is free: start_drain / start_phase_a are patched, so no pod
 is rented and no try-on API is called.
 """
 import json, sys, tempfile, threading, time, unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from batchlib.manifest import load_manifest, state_path_for
+from batchlib.manifest import load_manifest, load_state, save_state, state_path_for
 from batchlib_ext.gpu_stock import Stock
 from batchlib_ext.handoff import mailbox_path
 import control.drafts as drafts
 from control.idempotency import IdempotencyStore
+from control.tryon_library import TryonLibrary
 from control.runs import Outcome
 import tgbot.bot as bot
 from tgbot.ingest import Probe
@@ -292,9 +294,10 @@ class _AppRunsFixture(_Fixture):
         super().setUp()
         staging = self.root / "batch" / "tg-staging"
         staging.mkdir(parents=True, exist_ok=True)
-        self.store = drafts.DraftStore(self.root / "batch", staging, "app",
-                                       default_pipeline="motion-enhance",
-                                       default_provider="gemini")
+        self.store = drafts.DraftStore(
+            self.root / "batch", staging, "app",
+            default_pipeline="motion-enhance", default_provider="gemini",
+            tryon_library=TryonLibrary(self.root / "batch" / "tryon-library", "app"))
         self.idem = IdempotencyStore(self.root / "batch" / "idempotency")
         self.runs = bot.AppRuns(self.tg, ME, self.store, self.idem)
 
@@ -505,6 +508,178 @@ class TestAppRunsConfirm(_AppRunsFixture):
         self.patches["start_drain"].assert_not_called()
 
 
+class TestConfirmAfterADroppedBatchJob(_Fixture):
+    """§5.10: dropping a job from the draft's basket after Phase A already ran
+    for it must shrink what gets rented, not silently rent the stale,
+    already-on-disk manifest via the resume branch."""
+
+    def setUp(self):
+        super().setUp()
+        self.staging = self.root / "batch" / "tg-staging"
+        (self.staging / "app").mkdir(parents=True, exist_ok=True)
+        self.store = drafts.DraftStore(
+            self.root / "batch", self.staging, "app",
+            default_pipeline="tryon-motion-enhance", default_provider="gemini",
+            tryon_library=TryonLibrary(self.root / "batch" / "tryon-library", "app"),
+            probe=self._probe)
+        self.idem = IdempotencyStore(self.root / "batch" / "idempotency")
+        self.runs = bot.AppRuns(self.tg, ME, self.store, self.idem)
+
+    @staticmethod
+    def _probe(path: Path) -> Probe:
+        if path.suffix == ".mp4":
+            return Probe(kind="video", width=1080, height=1920, duration_s=5.0,
+                        bitrate_kbps=3000, size_bytes=10)
+        return Probe(kind="image", width=1080, height=1920, duration_s=0.0,
+                    bitrate_kbps=0, size_bytes=10)
+
+    def _material(self, name: str, data: bytes) -> str:
+        (self.staging / "app" / name).write_bytes(data)
+        return f"app/{name}"
+
+    def _mark_validated(self) -> None:
+        # Same shortcut _AppRunsFixture._seed_draft uses: the app already
+        # validated its draft before calling Phase A/confirm, so these tests
+        # go straight to a validated draft rather than shelling out to the
+        # real `make batch-validate` (that path belongs to
+        # test_batch_control_drafts.py's TestValidate).
+        d = self.store._load()
+        d.validated = True
+        self.store._save(d)
+
+    def test_a_dropped_job_is_not_rented(self):
+        character = self._material("character.png", b"c")
+        driver = self._material("driver.mp4", b"d")
+        outfit1 = self._material("outfit1.png", b"o1")
+        outfit2 = self._material("outfit2.png", b"o2")
+
+        # Two distinct basket entries, differing only by outfit — the exact
+        # PATCH/add-to-batch sequence test_batch_control_drafts.py's TestBatch
+        # uses to build a runnable draft (e.g. test_add_keeps_editing_a_copy).
+        self.store.patch({"slots": {"character": character, "driver": driver,
+                                    "outfit": outfit1}})
+        self.store.add_to_batch()
+        self.store.patch({"slots": {"outfit": outfit2}})
+        self.store.add_to_batch()
+        # Clear the slot still being edited so the draft's runnable jobs are
+        # exactly the two basket entries, not the basket plus whatever the
+        # (now-unsaved) current job happens to duplicate.
+        self.store.patch({"slots": {"outfit": None}})
+        self._mark_validated()
+
+        with mock.patch("tgbot.bot.start_phase_a"):
+            status, _ = self.runs.phase_a("k1")
+        self.assertEqual(status, 202)
+        manifest = load_manifest(bot._job_manifest_path(ME))
+        self.assertEqual(len(manifest.runs), 2)
+
+        # Phase A "finished": mark both runs' try-on stage done in the
+        # journal, as a real Phase A run would, then set the offered-token
+        # gate its own completion callback sets — start_phase_a is stubbed
+        # above, so nothing else does that here.
+        state_file = state_path_for(manifest.path)
+        state = {"version": 1, "batch": "2026-09-22-0000", "runs": {}}
+        for run in manifest.runs:
+            out_file = self.root / f"{run.id}.png"
+            out_file.write_bytes(b"img")
+            state["runs"][run.id] = {"status": "done", "stages": {
+                "tryon": {"status": "done", "file": str(out_file),
+                          "params_manifest": {}}}}
+        save_state(state_file, state)
+        bot._PHASE_A_OFFERED[ME] = bot._run_token(ME)
+
+        # Drop the second basket entry (the outfit2 job) — the app's DELETE
+        # /v1/draft/batch/{digest}.
+        view = self.store.view()
+        self.assertEqual(len(view["batch"]), 2)
+        self.store.drop_from_batch(view["batch"][1]["digest"])
+        self._mark_validated()
+
+        with mock.patch("tgbot.bot.start_drain") as fake_start_drain:
+            status, body = self.runs.confirm(
+                self.runs.run_id,
+                {"provider": "runpod", "panel_token": self.runs.panel_token()}, "k2")
+
+        self.assertEqual(status, 202)
+        self.assertEqual(body["outcome"], "started")
+        # The rewritten manifest has one run, not two — _do_confirm re-wrote
+        # it for the CURRENT (shrunk) draft instead of _do_resume re-renting
+        # the stale, two-run manifest still on disk.
+        rewritten = load_manifest(bot._job_manifest_path(ME))
+        self.assertEqual(len(rewritten.runs), 1)
+        self.assertEqual(rewritten.runs[0].id, manifest.runs[0].id)
+        # And it is the shrunk manifest that actually got rented, not just
+        # rewritten and ignored.
+        fake_start_drain.assert_called_once()
+        self.assertEqual(fake_start_drain.call_args.args[0], bot._job_manifest_path(ME))
+
+
+class TestPhaseAMatchesDraft(_AppRunsFixture):
+    """§5.10: `_phase_a_matches_draft` is the one predicate that decides
+    whether a confirm resumes the manifest already on disk or re-derives it.
+    Run ids alone are not enough — `run_id_for` hashes material file stems
+    (job.py:107), so a provider switch or a try-on seed added after Phase A
+    leaves every id identical while changing what the run actually costs and
+    produces. That is `signature()`'s identity (drafts.py:78), and this
+    predicate has to use the same one.
+    """
+
+    def _seed_jobs(self, jobs: list[Job], *, validated: bool = True) -> None:
+        # Into the basket, not `d.job`: the basket is what `_jobs()` reports
+        # verbatim, while the current job is only counted when complete — a
+        # fresh (empty) `d.job` keeps these tests to exactly `jobs`.
+        d = self.store._load()
+        d.basket = list(jobs)
+        d.validated = validated
+        self.store._save(d)
+
+    def test_an_unchanged_draft_still_matches(self):
+        job = self._tryon_job()
+        self._seed_jobs([job])
+        self._write_live_manifest(job)
+        self.assertTrue(self.runs._phase_a_matches_draft())
+
+    def test_a_provider_switch_with_the_same_material_does_not_match(self):
+        job = self._tryon_job()
+        self._write_live_manifest(job)
+        # Same four files, so the same run id — only the provider moved.
+        self._seed_jobs([replace(job, provider="qwen-max")])
+        self.assertFalse(self.runs._phase_a_matches_draft())
+
+    def test_a_seed_added_after_phase_a_does_not_match(self):
+        job = self._tryon_job()
+        self._write_live_manifest(job)
+        seed = self.root / "saved-tryon.png"
+        seed.write_bytes(b"s")
+        self._seed_jobs([replace(job, tryon_seed=seed)])
+        self.assertFalse(self.runs._phase_a_matches_draft())
+
+    def test_a_seed_cleared_after_phase_a_does_not_match(self):
+        seed = self.root / "saved-tryon.png"
+        seed.write_bytes(b"s")
+        job = self._tryon_job()
+        self._write_live_manifest(replace(job, tryon_seed=seed))
+        self._seed_jobs([job])
+        self.assertFalse(self.runs._phase_a_matches_draft())
+
+    def test_a_confirm_after_a_provider_switch_re_derives_the_manifest(self):
+        # The money consequence of the above: the resume branch would rent the
+        # manifest still naming gemini for a draft the user moved to qwen-max.
+        job = self._tryon_job()
+        self._write_live_manifest(job)
+        state_path_for(self._live()).write_text(
+            json.dumps({"batch": "2026-09-22-0000", "runs": {}}), encoding="utf-8")
+        bot._PHASE_A_OFFERED[ME] = bot._run_token(ME)
+        self._seed_jobs([replace(job, provider="qwen-max")])
+
+        status, body = self.runs.confirm(
+            self.runs.run_id,
+            {"provider": "runpod", "panel_token": self.runs.panel_token()}, "k1")
+        self.assertEqual((status, body["outcome"]), (202, "started"))
+        rewritten = load_manifest(bot._job_manifest_path(ME))
+        self.assertEqual(rewritten.runs[0].stage_params["tryon"]["provider"], "qwen-max")
+
+
 class TestBotLoopLocking(_AppRunsFixture):
     def test_handle_and_ticks_hold_the_bot_lock(self):
         seen = []
@@ -586,6 +761,50 @@ class TestRentPanel(_AppRunsFixture):
         self.assertEqual(status, 200)
         self.assertEqual((body["jobs"], body["estimate_min"]), (0, 0))
         draft_manifest.assert_not_called()
+
+    def test_rent_panel_prices_the_draft_when_it_changed_since_phase_a(self):
+        # The panel and `confirm` must never disagree about what is being
+        # rented: `confirm` re-derives from the draft once
+        # `_phase_a_matches_draft()` is False, so a panel still reporting the
+        # one-run manifest on disk would quote half the jobs (and half the
+        # minutes) of what the spend actually starts.
+        first, second = self._job("app-a"), self._job("app-b")
+        self._write_live_manifest(first)
+        bot._PHASE_A_OFFERED[ME] = bot._run_token(ME)
+        d = self.store._load()
+        d.basket = [first, second]
+        d.validated = True
+        self.store._save(d)
+
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()), \
+             mock.patch("tgbot.bot.vast_fetch_quote", side_effect=RuntimeError("no vastai")), \
+             mock.patch("tgbot.bot.vast_credit", return_value=25.0):
+            status, body = self.runs.rent_panel(self.runs.run_id, force=False)
+        self.assertEqual(status, 200)
+        self.assertFalse(body["after_phase_a"])
+        self.assertEqual(body["jobs"], 2)
+        self.assertEqual(body["estimate_min"],
+                         sum(bot.estimate_minutes(j) for j in (first, second)))
+
+    def test_rent_panel_still_reads_the_manifest_when_the_draft_is_unchanged(self):
+        # The regression the fix above must not cause: an untouched draft
+        # still prices the manifest Phase A already ran for.
+        job = self._tryon_job()
+        self._write_live_manifest(job)
+        bot._PHASE_A_OFFERED[ME] = bot._run_token(ME)
+        d = self.store._load()
+        d.basket = [job]
+        d.validated = True
+        self.store._save(d)
+
+        with mock.patch("tgbot.bot.volume_datacenter", return_value="EU-RO-1"), \
+             mock.patch("tgbot.bot.stock_at_cached", return_value=self._stock()), \
+             mock.patch("tgbot.bot.vast_fetch_quote", side_effect=RuntimeError("no vastai")), \
+             mock.patch("tgbot.bot.vast_credit", return_value=25.0):
+            _, body = self.runs.rent_panel(self.runs.run_id, force=False)
+        self.assertTrue(body["after_phase_a"])
+        self.assertEqual(body["jobs"], 1)
 
     def test_rent_panel_token_matches_what_confirm_accepts(self):
         self._seed_draft(validated=True)
@@ -746,6 +965,114 @@ class TestRegenViaAppRuns(_AppRunsFixture):
         status, body = self.runs.regen("not-the-run-id", "0", {"run_token": "x"}, "k")
         self.assertEqual(status, 404)
         self.assertEqual(body["error"]["code"], "not_found")
+
+    def test_regen_with_unknown_guidance_is_400_and_calls_nothing(self):
+        with mock.patch("tgbot.bot._regen_tryon") as fake_regen:
+            status, body = self.runs.regen(
+                self.runs.run_id, "0",
+                {"run_token": "whatever", "guidance": ["not_a_real_flag"]}, "k1")
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "bad_request")
+        fake_regen.assert_not_called()
+
+    def test_regen_with_valid_guidance_reaches_regen_tryon(self):
+        with mock.patch("tgbot.bot._regen_tryon") as fake_regen:
+            fake_regen.return_value = Outcome(True, "regenerated")
+            self.runs.regen(self.runs.run_id, "0",
+                            {"run_token": "whatever",
+                             "guidance": ["keep_face", "tighter_crop"]}, "k2")
+        _args, kwargs = fake_regen.call_args
+        self.assertEqual(kwargs.get("guidance"), ["keep_face", "tighter_crop"])
+
+    def _seed_seeded_tryon_run(self) -> str:
+        """A run whose try-on came from the saved library: the manifest carries
+        `seedImage`, so runner.py's `_one()` copies that file in and never
+        calls the provider at all."""
+        seed = self.root / "saved-tryon.png"
+        seed.write_bytes(b"s")
+        job = replace(self._tryon_job(), tryon_seed=seed)
+        manifest = self._write_live_manifest(job)
+        run_id = manifest.runs[0].id
+        image = self.root / "out" / "batch1" / "runs" / run_id / "01-tryon.png"
+        image.parent.mkdir(parents=True, exist_ok=True)
+        image.write_bytes(b"img")
+        self._write_journal(run_id, tryon={"status": "done", "file": str(image)})
+        return run_id
+
+    def test_regen_of_a_seeded_run_is_refused_and_changes_nothing(self):
+        # There is no provider call behind a seeded try-on, so "regenerate"
+        # would re-copy the same saved file — a silent no-op the phone would
+        # render as a successful regeneration.
+        run_id = self._seed_seeded_tryon_run()
+        before = json.loads(state_path_for(self._live()).read_text(encoding="utf-8"))
+        status, body = self.runs.regen(
+            self.runs.run_id, "0", {"run_token": bot._run_token(ME)}, "k-seeded")
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["code"], "seeded")
+        self.patches["start_phase_a"].assert_not_called()
+        after = json.loads(state_path_for(self._live()).read_text(encoding="utf-8"))
+        self.assertEqual(after, before)
+        self.assertEqual(after["runs"][run_id]["stages"]["tryon"]["status"], "done")
+
+    def test_regen_of_a_seeded_run_is_refused_even_with_guidance(self):
+        self._seed_seeded_tryon_run()
+        status, body = self.runs.regen(
+            self.runs.run_id, "0",
+            {"run_token": bot._run_token(ME), "guidance": ["keep_face"]}, "k-seeded-g")
+        self.assertEqual((status, body["error"]["code"]), (409, "seeded"))
+        self.patches["start_phase_a"].assert_not_called()
+
+    def test_regen_with_guidance_persists_it_into_the_journal(self):
+        # _regen_tryon has no Job list to rewrite the manifest from (unlike
+        # _retry_tryon's provider switch), and start_phase_a's subprocess
+        # re-reads the manifest fresh from disk — so guidance must survive
+        # through the journal write _regen_tryon already makes, not a
+        # manifest edit that never reaches disk. Real _regen_tryon here
+        # (not mocked), so this exercises the actual persistence.
+        run_id = self._seed_tryon_run()
+        token = bot._run_token(ME)
+        status, _body = self.runs.regen(
+            self.runs.run_id, "0",
+            {"run_token": token, "guidance": ["keep_face", "tighter_crop"]}, "k-guidance")
+        self.assertEqual(status, 202)
+        state = load_state(state_path_for(self._live()))
+        self.assertEqual(state["runs"][run_id]["regen_guidance"],
+                         {"tryon": {"keepFace": "1", "tighterCrop": "1"}})
+
+
+class TestTryonVersionImage(_AppRunsFixture):
+    """AppRuns.tryon_version_image — the version history `_regen_tryon`
+    already keeps on disk (_tryon_versions), served over HTTP (§5.10, slice 6)."""
+
+    def _seed_tryon_run_with_version(self) -> tuple[str, Path]:
+        job = self._tryon_job()
+        manifest = self._write_live_manifest(job)
+        run_id = manifest.runs[0].id
+        image = self.root / "out" / "batch1" / "runs" / run_id / "01-tryon.png"
+        image.parent.mkdir(parents=True, exist_ok=True)
+        image.write_bytes(b"img")
+        version = image.with_name("01-tryon.v1.png")
+        version.write_bytes(b"old img")
+        self._write_journal(run_id, tryon={"status": "done", "file": str(image)})
+        return run_id, version
+
+    def test_version_image_returns_an_older_version(self):
+        _run_id, version = self._seed_tryon_run_with_version()
+        path = self.runs.tryon_version_image(self.runs.run_id, "0", "1")
+        self.assertEqual(path, version.resolve())
+
+    def test_version_image_out_of_range_is_none(self):
+        self._seed_tryon_run_with_version()
+        self.assertIsNone(self.runs.tryon_version_image(self.runs.run_id, "0", "99"))
+
+    def test_version_image_no_such_preview_is_none(self):
+        self.assertIsNone(self.runs.tryon_version_image(self.runs.run_id, "0", "1"))
+
+    def test_version_image_wrong_run_id_is_none(self):
+        # Same contract as tryon_image's own first line — a stale/wrong
+        # run_id in the URL must 404, never a real (wrong-context) image.
+        self._seed_tryon_run_with_version()
+        self.assertIsNone(self.runs.tryon_version_image("not-the-run-id", "0", "1"))
 
 
 class TestNoAbsolutePaths(_AppRunsFixture):

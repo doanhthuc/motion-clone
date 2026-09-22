@@ -3072,8 +3072,12 @@ def _refuse(tg: Tg, chat_id: int, code: str, text: str, **send_kwargs) -> Outcom
     return Outcome(False, code, _plain(text))
 
 
+_GUIDANCE_FLAGS = {"keep_face": "keepFace", "tighter_crop": "tighterCrop",
+                   "match_lighting": "matchLighting"}
+
+
 def _regen_tryon(tg: Tg, chat_id: int, index: str, token: str, *,
-                 dry_run: bool) -> Outcome:
+                 dry_run: bool, guidance: list[str] | None = None) -> Outcome:
     """Redo ONE run's try-on image, leaving every other run's untouched.
 
     Reached from the 🔄 button under a Phase A preview. The mechanism is the
@@ -3125,6 +3129,24 @@ def _regen_tryon(tg: Tg, chat_id: int, index: str, token: str, *,
                        f"{run.id}'s try-on no longer runs over the API "
                        "(its provider changed), so there is nothing to "
                        "regenerate here.")
+    # Before the guidance check on purpose: a seeded run has no provider call
+    # behind it at all (runner.py's _one() copies seedImage in and returns),
+    # so a plain Regenerate tap is just as much a no-op as a guided one —
+    # both would re-copy the identical saved file while the phone rendered a
+    # successful regeneration (§5.10, slice 6).
+    if effective_stage_params(stage_name, run.stage_params.get(stage_name)).get("seedImage"):
+        return _refuse(tg, chat_id, "seeded",
+                       f"{run.id}'s try-on came from your saved library, not a provider "
+                       "call — there is nothing to regenerate. Clear the seed and try "
+                       "again to run it through the provider.")
+    guidance_params = None
+    if guidance:
+        unknown = [g for g in guidance if g not in _GUIDANCE_FLAGS]
+        if unknown:
+            return _refuse(tg, chat_id, "bad_request",
+                           f"unknown guidance value(s): {', '.join(unknown)} — only "
+                           f"{', '.join(sorted(_GUIDANCE_FLAGS))} are accepted")
+        guidance_params = {_GUIDANCE_FLAGS[g]: "1" for g in guidance}
 
     state_file = state_path_for(manifest_path)
     state = load_state(state_file)
@@ -3154,6 +3176,14 @@ def _regen_tryon(tg: Tg, chat_id: int, index: str, token: str, *,
              "entry": recorded, "run_status": entry.get("status"),
              "run_error": entry.get("error")}
     stages.pop(stage_name, None)
+    if guidance_params:
+        # Persisted through the journal, not the manifest: start_phase_a's
+        # subprocess re-reads the manifest fresh from disk, and this function
+        # has no Job list to rewrite it from (unlike _do_phase_a/_do_confirm,
+        # which always render a live manifest from Job objects before
+        # spawning). runner.py's _one() pops this exactly once and merges it
+        # into the effective params for this one regenerate call only.
+        entry["regen_guidance"] = {stage_name: guidance_params}
     save_state(state_file, state)
 
     # Seeded with every OTHER image already previewed, so the re-run sends
@@ -6889,6 +6919,58 @@ class AppRuns:
                                  "validate the draft first (POST /v1/draft/validate)")
         return jobs, None
 
+    def _phase_a_matches_draft(self) -> bool:
+        """True when the manifest Phase A already ran for is exactly the app's
+        current draft. False when the draft changed since — a job dropped via
+        DELETE /v1/draft/batch/{digest}, or added — in which case `confirm`
+        must not take the resume branch below: `_do_resume` re-rents the
+        manifest already on disk, which still names the dropped job. False
+        routes to the `else` branch instead, which already handles this
+        correctly: `_do_confirm` re-writes the manifest for the CURRENT
+        draft and offers its own reuse/rerun chooser for any job whose
+        try-on is still journalled `done` under its stable, content-hashed
+        run id (§5.10, slice 6).
+
+        Run ids alone would not be enough: `run_id_for` hashes material file
+        stems only, so switching a job's provider or adding/clearing its
+        try-on seed leaves every id byte-identical while changing what the
+        run costs and produces. The draft's own identity for two runs being
+        "the same run" is `drafts.signature()` — pipeline, material, provider
+        AND seed — so this compares the last three against what the manifest
+        actually recorded, reading back `render_manifest`'s convention:
+        `provider` is only written when it differs from DEFAULT_PROVIDER, and
+        `seedImage` only when the job carries a seed.
+        """
+        jobs, validated, _ = self.drafts.runnable()
+        if validated is not True:
+            return False
+        try:
+            manifest = load_manifest(_job_manifest_path(self.chat_id))
+        except (ManifestError, OSError):
+            return False
+        ids = _unique_ids(jobs)
+        if set(ids) != {run.id for run in manifest.runs}:
+            return False
+        manifest_by_id = {run.id: run for run in manifest.runs}
+        for job, run_id in zip(jobs, ids):
+            run = manifest_by_id.get(run_id)
+            if run is None:
+                return False
+            stage = _tryon_stage(job.pipeline)
+            if stage is None:
+                # No try-on stage means the manifest never carried either
+                # field, and neither is read downstream — nothing to compare.
+                continue
+            job_fp = (job.provider if job.provider != DEFAULT_PROVIDER else None,
+                      str(job.tryon_seed) if job.tryon_seed else None)
+            # Raw stage_params, not effective_stage_params: the comparison is
+            # against what render_manifest WROTE, and the pipeline defaults
+            # the effective view merges in were never part of the job.
+            run_params = run.stage_params.get(stage) or {}
+            if job_fp != (run_params.get("provider"), run_params.get("seedImage")):
+                return False
+        return True
+
     def phase_a(self, key) -> tuple[int, dict]:
         replay = self.idem.begin("phase-a", key)
         if replay is not None:
@@ -6932,7 +7014,8 @@ class AppRuns:
                               "the job changed since the panel was read — read it again")
             elif (mismatch := _gpu_mismatch(body)) is not None:
                 out = mismatch
-            elif _PHASE_A_OFFERED.get(self.chat_id) == _run_token(self.chat_id):
+            elif (_PHASE_A_OFFERED.get(self.chat_id) == _run_token(self.chat_id)
+                    and self._phase_a_matches_draft()):
                 # The app's own chooser-less equivalent of the rent panel's
                 # spend button: Phase A already ran for this exact manifest,
                 # so this is a resume, never a fresh _do_confirm (see
@@ -6977,7 +7060,13 @@ class AppRuns:
             if busy is not None:
                 return busy
             token = self.panel_token()
-            after_phase_a = _PHASE_A_OFFERED.get(self.chat_id) == _run_token(self.chat_id)
+            # The SAME predicate `confirm` gates its resume branch on, not
+            # just the offered-token check: this panel is the price the user
+            # says yes to, and if `confirm` is going to re-derive from a draft
+            # that changed since Phase A, the panel must quote THAT draft's
+            # job count and minutes — not the stale manifest still on disk.
+            after_phase_a = (_PHASE_A_OFFERED.get(self.chat_id) == _run_token(self.chat_id)
+                             and self._phase_a_matches_draft())
             if after_phase_a:
                 try:
                     manifest = load_manifest(_job_manifest_path(self.chat_id))
@@ -7079,6 +7168,49 @@ class AppRuns:
             return None
         return image
 
+    def tryon_version_image(self, run_id: str, index: str, n: str) -> Path | None:
+        """An earlier version of the try-on image at `index`, oldest = "1"
+        (§5.10, slice 6). Same shape as tryon_image: `None` covers both "no
+        such preview" and "n out of range", never an exception."""
+        if run_id != self.run_id:
+            return None
+        if not n.isdigit() or int(n) < 1:
+            return None
+        image = self.tryon_image(run_id, index)
+        if image is None:
+            return None
+        versions = _tryon_versions(image)
+        position = int(n) - 1
+        if position >= len(versions):
+            return None
+        return versions[position]
+
+    def tryon_save_info(self, index: str) -> tuple[Path, dict, str] | None:
+        """(image_path, material_ids, provider) for the current try-on
+        preview at `index`, for the try-on library to save — or `None` when
+        there is no such preview. Reuses `tryon_image`'s own resolution so
+        the two routes can never disagree about which file "the current
+        preview at this index" means (§5.10)."""
+        image = self.tryon_image(self.run_id, index)
+        if image is None:
+            return None
+        match = next(((r, e) for i, r, _s, e in self._tryon_entries() if i == index), None)
+        if match is None:
+            return None
+        run, entry = match
+        # "driver" is the video the motion transfer runs against, not
+        # material the try-on image is made of — VIDEO_ROLES in
+        # control/drafts.py draws the same line.
+        material_ids = {role: f"app/{path.name}" for role, path in run.inputs.items()
+                        if role != "driver"}
+        # Not job.py's DEFAULT_PROVIDER ("qwen", self-host — needs the pod):
+        # _tryon_entries only ever finds runs a LOCAL try-on stage produced
+        # (_local_tryon_stage), so params_manifest always names gemini or
+        # qwen-max here; "gemini" is a defensive fallback, never the real
+        # answer to "which provider made this image".
+        provider = str(entry.get("params_manifest", {}).get("provider") or "gemini")
+        return image, material_ids, provider
+
     def regen(self, run_id: str, index: str, body: dict, key) -> tuple[int, dict]:
         """Regenerate one run's try-on image — `_regen_tryon` itself,
         wrapped the same way `confirm` wraps `_do_confirm`/`_do_resume`."""
@@ -7087,6 +7219,14 @@ class AppRuns:
         token = body.get("run_token")
         if not token:
             return 400, _run_error("bad_request", "run_token is required")
+        guidance = body.get("guidance")
+        if guidance is not None:
+            if not isinstance(guidance, list) or not all(isinstance(g, str) for g in guidance):
+                return 400, _run_error("bad_request", "guidance must be a list of strings")
+            unknown = [g for g in guidance if g not in _GUIDANCE_FLAGS]
+            if unknown:
+                return 400, _run_error("bad_request",
+                                       f"unknown guidance value(s): {', '.join(unknown)}")
         replay = self.idem.begin("regen", key)
         if replay is not None:
             return replay
@@ -7094,7 +7234,8 @@ class AppRuns:
             if busy is not None:
                 self.idem.forget("regen", key)
                 return busy
-            out = _regen_tryon(_AppTg(self.tg), self.chat_id, index, token, dry_run=False)
+            out = _regen_tryon(_AppTg(self.tg), self.chat_id, index, token, dry_run=False,
+                               guidance=guidance)
             if out:
                 response = (202, {"run_id": self.run_id, "outcome": out.code})
             else:

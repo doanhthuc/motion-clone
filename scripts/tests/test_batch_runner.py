@@ -1343,6 +1343,146 @@ class TestRunLocalPhase(unittest.TestCase):
                                 resume=False, log=lambda _m: None)
             self.assertEqual(thay, ["2026-08-21-0900"])
 
+    def test_seed_image_skips_the_provider_and_copies_the_file(self):
+        # §5.10, slice 6: a seeded try-on must never reach the provider — the
+        # whole point of seeding is not paying for an image the user already has.
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            seed = tmp / "seed.png"
+            seed.write_bytes(b"seed-bytes")
+            manifest_text = MANIFEST_TRYON_GEMINI.replace(
+                "tryon: { provider: gemini }",
+                f"tryon: {{ provider: gemini, seedImage: {seed} }}")
+            manifest = load_manifest(_fixture_tryon(tmp, manifest_text))
+
+            def must_not_be_called(*_a, **_k):
+                raise AssertionError("run_local_tryon must not be called for a seeded job")
+
+            with mock.patch("batchlib.runner.run_local_tryon", must_not_be_called):
+                result = run_local_phase(settings=GEMINI_SETTINGS, manifest=manifest,
+                                         out_root=tmp / "out", batch_id="2026-09-22-0000",
+                                         resume=False, log=lambda _m: None)
+
+            self.assertEqual(result.done, ["runA"])
+            self.assertEqual(result.failed, {})
+            stage = result.state["runs"]["runA"]["stages"]["tryon"]
+            self.assertEqual(stage["status"], "done")
+            self.assertEqual(Path(stage["file"]).read_bytes(), b"seed-bytes")
+            # The same stage_dest path formula Phase B checks — a mismatch means
+            # the pod re-runs the try-on it was just handed.
+            run_dir = result.out_dir / "runs" / "runA"
+            self.assertEqual(Path(stage["file"]),
+                             stage_dest(manifest.runs[0], run_dir, "tryon"))
+            # EXACTLY the shape of a real Phase A result: a key missing here makes
+            # local_tryon_reusable/_local_provenance_stale judge a resume differently.
+            self.assertEqual(set(stage), {"status", "elapsed_sec", "file", "bytes",
+                                          "params_sent", "params_manifest", "phase"})
+            self.assertEqual(stage["phase"], "local")
+            self.assertEqual(stage["bytes"], len(b"seed-bytes"))
+            self.assertEqual(stage["params_sent"], stage["params_manifest"])
+            self.assertTrue(local_tryon_reusable(manifest.runs[0], "tryon", stage,
+                                                 Path(stage["file"])))
+            self.assertEqual(load_state(result.state_file)["runs"]["runA"]["stages"]["tryon"],
+                             stage)
+
+    def test_regen_guidance_in_the_journal_reaches_run_local_tryon_once(self):
+        # §5.10, slice 6: _regen_tryon persists a guided regenerate's flags
+        # into the journal (it has no Job list to rewrite the manifest from,
+        # and start_phase_a's subprocess re-reads the manifest fresh from
+        # disk). _one() must pop them exactly once and merge them into the
+        # ACTUAL params dict run_local_tryon receives.
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            manifest = load_manifest(_fixture_tryon(tmp, MANIFEST_TRYON_GEMINI))
+            state_file = state_path_for(manifest.path)
+            save_state(state_file, {"version": 1, "runs": {
+                "runA": {"status": "pending", "stages": {},
+                        "regen_guidance": {"tryon": {"keepFace": "1",
+                                                     "tighterCrop": "1"}}}}})
+
+            received = []
+
+            def fake_run_local_tryon(run, params, settings_, out_path):
+                received.append(dict(params))
+                out_path.write_bytes(b"ok")
+                return 1, 2
+
+            with mock.patch("batchlib.runner.run_local_tryon", fake_run_local_tryon):
+                result = run_local_phase(settings=GEMINI_SETTINGS, manifest=manifest,
+                                         out_root=tmp / "out", batch_id="2026-09-22-0100",
+                                         resume=True, log=lambda _m: None)
+
+            self.assertEqual(result.done, ["runA"])
+            self.assertEqual(len(received), 1)
+            self.assertEqual(received[0]["keepFace"], "1")
+            self.assertEqual(received[0]["tighterCrop"], "1")
+            # Popped exactly once, from both the in-memory and the on-disk
+            # journal — a later resume must never reapply stale guidance.
+            self.assertNotIn("regen_guidance", result.state["runs"]["runA"])
+            self.assertNotIn("regen_guidance",
+                             load_state(result.state_file)["runs"]["runA"])
+
+    def test_regen_guidance_does_not_poison_params_manifest_for_the_next_resume(self):
+        # Regression for a real bug: journaling the GUIDANCE-MERGED dict as
+        # params_manifest makes local_tryon_reusable's re-check against the
+        # manifest (which never contains keepFace/tighterCrop/matchLighting)
+        # fail forever. drain.py's normal confirm/drain flow always calls
+        # run_local_phase(resume=True) again right after a regen — so a
+        # permanently-failing reuse check means the very next resume
+        # silently redoes the try-on UNGUIDED, with no backup, and the pod
+        # stage ends up consuming the wrong image. params_manifest must
+        # stay the pre-merge snapshot so the reuse check still passes.
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            manifest = load_manifest(_fixture_tryon(tmp, MANIFEST_TRYON_GEMINI))
+            state_file = state_path_for(manifest.path)
+            save_state(state_file, {"version": 1, "runs": {
+                "runA": {"status": "pending", "stages": {},
+                        "regen_guidance": {"tryon": {"keepFace": "1"}}}}})
+
+            def fake_run_local_tryon(run, params, settings_, out_path):
+                out_path.write_bytes(b"ok")
+                return 1, 2
+
+            with mock.patch("batchlib.runner.run_local_tryon", fake_run_local_tryon):
+                result = run_local_phase(settings=GEMINI_SETTINGS, manifest=manifest,
+                                         out_root=tmp / "out", batch_id="2026-09-22-0200",
+                                         resume=True, log=lambda _m: None)
+
+            stage = result.state["runs"]["runA"]["stages"]["tryon"]
+            self.assertNotIn("keepFace", stage["params_manifest"])
+            self.assertEqual(stage["params_sent"]["keepFace"], "1")
+            dest = Path(stage["file"])
+            self.assertTrue(local_tryon_reusable(manifest.runs[0], "tryon", stage, dest))
+
+    def test_seed_image_missing_file_is_a_run_error_not_a_silent_gemini_call(self):
+        # A vanished seed MUST be a run error. Falling through to run_local_tryon
+        # here spends real quota on the very image the user asked to reuse.
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            missing = tmp / "does-not-exist.png"
+            manifest_text = MANIFEST_TRYON_GEMINI.replace(
+                "tryon: { provider: gemini }",
+                f"tryon: {{ provider: gemini, seedImage: {missing} }}")
+            manifest = load_manifest(_fixture_tryon(tmp, manifest_text))
+
+            def must_not_be_called(*_a, **_k):
+                raise AssertionError("run_local_tryon must not be called")
+
+            with mock.patch("batchlib.runner.run_local_tryon", must_not_be_called):
+                result = run_local_phase(settings=GEMINI_SETTINGS, manifest=manifest,
+                                         out_root=tmp / "out", batch_id="2026-09-22-0000",
+                                         resume=False, log=lambda _m: None)
+
+            self.assertEqual(result.done, [])
+            self.assertIn("runA", result.failed)
+            self.assertIn("seedImage", result.failed["runA"])
+            entry = result.state["runs"]["runA"]
+            self.assertEqual(entry["status"], "error")
+            self.assertEqual(entry["stages"]["tryon"]["status"], "error")
+            self.assertIn("seedImage",
+                          (result.out_dir / "runs" / "runA" / "run.log").read_text(encoding="utf-8"))
+
 
 class TestLocalTryonReuseIsParamsAware(unittest.TestCase):
     """A journalled try-on may stand in for a request ONLY at the same params.

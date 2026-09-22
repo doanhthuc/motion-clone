@@ -588,6 +588,28 @@ def run_local_phase(*, settings: Settings, manifest: Manifest, out_root: Path, b
         with lock:
             entry = state["runs"].setdefault(run.id, {"status": "pending", "stages": {}})
             recorded = entry["stages"].get(stage_name) or {}
+            # §5.10, slice 6: a guidance chip for ONE regenerate call, popped
+            # exactly once so a later resume never reapplies stale guidance.
+            regen_guidance = (entry.pop("regen_guidance", None) or {}).get(stage_name)
+            if regen_guidance:
+                save_state(state_file, state)
+        if regen_guidance:
+            # local_tryon_reusable recomputes params_manifest FROM THE
+            # MANIFEST (effective_stage_params), which never contains
+            # keepFace/tighterCrop/matchLighting — guidance is deliberately
+            # never written there (§5.10). Journaling the merged dict as
+            # params_manifest would make that comparison fail forever, so a
+            # guided run's very next resume (drain.py always calls
+            # run_local_phase(resume=True) right after a regen) would
+            # silently redo the try-on UNGUIDED and overwrite `dest` with no
+            # backup. params_manifest keeps the pre-merge snapshot;
+            # params_sent (below) is the merged dict, since that genuinely is
+            # what was sent.
+            params_manifest_snapshot = dict(params)
+            params = dict(params)
+            params.update(regen_guidance)
+        else:
+            params_manifest_snapshot = params
         run_dir = out_dir / "runs" / run.id
         run_dir.mkdir(parents=True, exist_ok=True)
         log_file = run_dir / "run.log"
@@ -631,7 +653,7 @@ def run_local_phase(*, settings: Settings, manifest: Manifest, out_root: Path, b
             with lock:
                 entry["stages"][stage_name] = {"status": "error",
                                             "elapsed_sec": int(time.time() - started),
-                                            "params_manifest": dict(params)}
+                                            "params_manifest": dict(params_manifest_snapshot)}
                 # Mức run, không chỉ mức chặng — đúng giao ước của run_batch. Để nguyên
                 # "pending" thì journal nói dối: run hỏng ở Pha A trông y hệt run chưa
                 # chạy. Không chặn tự chữa ở Pha B: vòng lặp của run_batch chỉ bỏ qua khi
@@ -645,25 +667,53 @@ def run_local_phase(*, settings: Settings, manifest: Manifest, out_root: Path, b
             log(f"    ✗ {run.id}/{stage_name} (local): {loi}")
             return False, loi
 
-        try:
-            elapsed, size = run_local_tryon(run, params, settings, dest)
-        except JobError as exc:
-            return _ghi_hong(exc)
-        except Exception as exc:   # noqa: BLE001 — cố ý bắt rộng, xem dưới
-            # Phòng thủ nhiều lớp. Bắt mỗi JobError là đủ CHO ĐÚNG hôm nay và chỉ vì
-            # local_tryon.py bọc mọi lỗi mạng lại; bất kỳ thứ gì khác (TimeoutError lọt
-            # lưới, provider mới như qwen-max ném exception riêng, bug lập trình) sẽ bay
-            # qua done_future.result() lên tận main() và giết CẢ Pha A vì MỘT run — các
-            # run khác mất trắng, và run này kẹt "pending" trong journal thay vì "error".
-            return _ghi_hong(exc)
+        seed_image = params.get("seedImage")
+        if seed_image:
+            # §5.10, slice 6: control/drafts.py's tryon_seed already resolved this
+            # path through TryonLibrary.resolve_image before it reached the
+            # manifest, but the manifest is the only channel that survives from
+            # "the app composed this job" to "the runner is about to try it":
+            # the bot never knows a batch's batch_id/out_dir in advance, since
+            # drain.py picks those in a later subprocess. So a vanished file is
+            # caught HERE, not there — falling through to run_local_tryon would
+            # spend real Gemini/Qwen quota on the very image the user just asked
+            # to reuse.
+            seed_path = Path(str(seed_image))
+            if not seed_path.is_file():
+                return _ghi_hong(JobError(
+                    f"run {run.id!r}: seedImage is not a file: {seed_path}"))
+            shutil.copy2(seed_path, dest)
+            # elapsed 0: there is no API call to time. The journal still needs
+            # "this stage is done and the file is here" in the same shape a
+            # real Phase A result leaves, so the shared write below is reused
+            # unchanged — local_tryon_reusable must not be able to tell the
+            # two apart on a later resume.
+            elapsed, size = 0, dest.stat().st_size
+        else:
+            try:
+                elapsed, size = run_local_tryon(run, params, settings, dest)
+            except JobError as exc:
+                return _ghi_hong(exc)
+            except Exception as exc:   # noqa: BLE001 — cố ý bắt rộng, xem dưới
+                # Phòng thủ nhiều lớp. Bắt mỗi JobError là đủ CHO ĐÚNG hôm nay và chỉ vì
+                # local_tryon.py bọc mọi lỗi mạng lại; bất kỳ thứ gì khác (TimeoutError lọt
+                # lưới, provider mới như qwen-max ném exception riêng, bug lập trình) sẽ bay
+                # qua done_future.result() lên tận main() và giết CẢ Pha A vì MỘT run — các
+                # run khác mất trắng, và run này kẹt "pending" trong journal thay vì "error".
+                return _ghi_hong(exc)
         # params_sent == params_manifest ở đây KHÔNG phải copy-paste: hai cột đó lệch nhau
         # được là vì API nắn param trước khi ghi DB (xem docstring write_index). Pha A
         # không đi qua API nào cả — nó gọi thẳng Gemini với đúng param của manifest, nên
         # "xin gì" và "được gì" thật sự là một.
+        #
+        # Except when a guided regenerate is in play (§5.10, slice 6): params_sent is
+        # `params` (merged with regen_guidance above), params_manifest is the pre-merge
+        # params_manifest_snapshot — see the comment above the `if regen_guidance:` block
+        # for why that split must never collapse back into one dict.
         with lock:
             entry["stages"][stage_name] = {
                 "status": "done", "elapsed_sec": elapsed, "file": str(dest), "bytes": size,
-                "params_sent": dict(params), "params_manifest": dict(params),
+                "params_sent": dict(params), "params_manifest": dict(params_manifest_snapshot),
                 # Provenance, so run_one can tell a pod stage's output from a
                 # local one. Without it a /provider switch away from a local
                 # provider leaves run_one skipping a stage that now belongs to

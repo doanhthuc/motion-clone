@@ -633,6 +633,21 @@ class TestHandsPrompts(GeminiServerCase):
                         self.assertEqual("wristwatch" in calls[0][1]["negative_prompt"], flagged)
 
 
+class TestGuidancePrompts(unittest.TestCase):
+    def test_keep_face_adds_the_reinforcing_clause(self):
+        pos, neg = lt.tryon_guidance_prompts({"keepFace": "1"})
+        self.assertIn("facial identity", pos.lower())
+        self.assertEqual(neg, "")
+
+    def test_tighter_crop_and_match_lighting_stack(self):
+        pos, neg = lt.tryon_guidance_prompts({"tighterCrop": "1", "matchLighting": "1"})
+        self.assertIn("crop", pos.lower())
+        self.assertIn("lighting", pos.lower())
+
+    def test_no_flags_is_empty(self):
+        self.assertEqual(lt.tryon_guidance_prompts({}), ("", ""))
+
+
 class TestCameraComposition(GeminiServerCase):
     def test_ordinary_path_ignores_driver_and_preserves_legacy_aspect(self):
         from PIL import Image

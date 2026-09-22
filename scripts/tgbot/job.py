@@ -26,6 +26,11 @@ class Job:
     probes: dict[str, Probe]
     pipeline: str
     provider: str = DEFAULT_PROVIDER
+    # A try-on image saved earlier (control/tryon_library.py) to stand in for
+    # this job's try-on stage instead of paying a provider for it again —
+    # spec §5.10, slice 6. Already resolved to a path by the time it lands
+    # here; see render_manifest for how it reaches the runner.
+    tryon_seed: Path | None = None
 
 
 def _driver_stage(pipeline: str) -> str | None:
@@ -185,6 +190,12 @@ def render_manifest(jobs: list[Job], *, now) -> str:
         # — writing it out unconditionally would just be noise on every run.
         if tryon_stage and job.provider != DEFAULT_PROVIDER:
             stage_params.setdefault(tryon_stage, {})["provider"] = job.provider
+        # The manifest is the ONLY channel a seed can travel on: the bot never
+        # knows a job's batch_id/out_dir in advance — drain.py/batch_run.py pick
+        # those in a later subprocess — so batchlib/runner.py's run_local_phase
+        # reads it back from here, before run_local_tryon is ever called.
+        if tryon_stage and job.tryon_seed is not None:
+            stage_params.setdefault(tryon_stage, {})["seedImage"] = str(job.tryon_seed)
         for stage_name, params in stage_params.items():
             kv = ", ".join(f"{k}: {v}" for k, v in params.items())
             lines.append(f"    {stage_name}: {{ {kv} }}")

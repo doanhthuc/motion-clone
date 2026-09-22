@@ -10,8 +10,9 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import control
 from control import drafts
+from control.tryon_library import TryonLibrary
 from tgbot.ingest import Probe
-from tgbot.job import Job
+from tgbot.job import Job, render_manifest
 
 IMG = Probe(kind="image", width=1080, height=1920, duration_s=0.0, bitrate_kbps=0, size_bytes=10)
 VID = Probe(kind="video", width=1080, height=1920, duration_s=12.0, bitrate_kbps=9000, size_bytes=10)
@@ -111,9 +112,16 @@ class StoreCase(unittest.TestCase):
                 raise RuntimeError("ffprobe could not read it")
             return VID if path.suffix == ".mp4" else IMG
 
+        self.library = TryonLibrary(self.batch / "tryon-library", "app")
         self.store = drafts.DraftStore(self.batch, self.staging, "app",
                                        default_pipeline="tryon-motion-enhance",
-                                       default_provider="gemini", probe=fake_probe)
+                                       default_provider="gemini",
+                                       tryon_library=self.library, probe=fake_probe)
+
+    def saved_seed(self, data=b"seed-bytes"):
+        source = self.tmp / "seed.png"
+        source.write_bytes(data)
+        return self.library.save(image=source, material_ids={}, provider="gemini")["id"]
 
     def tearDown(self):
         shutil.rmtree(self.tmp)
@@ -326,6 +334,86 @@ class TestPatch(StoreCase):
         # count (jobs_for's own missing_slots() only checks
         # which roles have a dict entry, not whether the file still exists).
         self.assertEqual(v["jobs"], 0)
+
+    def test_tryon_seed_resolves_a_library_entry_and_reaches_the_manifest(self):
+        # §5.10, slice 6. The id is resolved to a real path HERE (the phone only
+        # ever names a library entry) and rendered into the manifest, which is
+        # the only channel that reaches batchlib/runner.py's Phase A.
+        self.fill()
+        entry_id = self.saved_seed()
+        v = self.store.patch({"tryon_seed": entry_id})
+        self.assertEqual(v["missing"], [])
+        seed = self.store._load().job.tryon_seed
+        self.assertIsNotNone(seed)
+        self.assertEqual(seed.read_bytes(), b"seed-bytes")
+        # Survives the round trip through the on-disk draft, and lands in the
+        # manifest the runner will actually read.
+        jobs, _validated, _generation = self.store.runnable()
+        self.assertIn(f"seedImage: {seed}", render_manifest(jobs, now="2026-09-22 09:00:00"))
+
+    def test_tryon_seed_null_clears_it(self):
+        self.fill()
+        self.store.patch({"tryon_seed": self.saved_seed()})
+        self.store.patch({"tryon_seed": None})
+        self.assertIsNone(self.store._load().job.tryon_seed)
+
+    def test_tryon_seed_refusals(self):
+        self.assertRefused("not_found", self.store.patch, {"tryon_seed": "nope"})
+        self.assertRefused("bad_request", self.store.patch, {"tryon_seed": 3})
+        # An unknown id must not half-apply the rest of the same patch.
+        self.assertRefused("not_found", self.store.patch,
+                           {"provider": "qwen-max", "tryon_seed": "nope"})
+        self.assertEqual(self.store.view()["provider"], "gemini")
+
+    def test_tryon_seed_needs_a_local_provider(self):
+        # Money is a first-class constraint: a seed sitting beside a non-local
+        # provider is never read by Phase A (runner.py's _local_tryon_stage
+        # only names a stage whose provider is_local_provider), so the job goes
+        # on to a real, paid pod try-on while the caller believes they asked
+        # for a reuse. Refuse loudly, the way _regen_tryon's "not_local" does.
+        self.fill()
+        self.store.patch({"provider": "qwen"})
+        self.assertRefused("not_local", self.store.patch, {"tryon_seed": self.saved_seed()})
+        self.assertIsNone(self.store._load().job.tryon_seed)
+
+    def test_provider_cannot_move_away_from_local_while_a_seed_is_set(self):
+        # The other direction of the same rule — otherwise the manifest ends up
+        # carrying BOTH a non-local provider and a seed the runner never sees.
+        self.fill()
+        self.store.patch({"tryon_seed": self.saved_seed()})
+        self.assertRefused("not_local", self.store.patch, {"provider": "qwen"})
+        d = self.store._load()
+        self.assertEqual(d.job.provider, "gemini")
+        self.assertIsNotNone(d.job.tryon_seed)
+
+    def test_seed_and_local_provider_in_one_patch_is_allowed(self):
+        # The check must read the POST-patch provider, not the stored one:
+        # setting both at once is a perfectly good request.
+        self.fill()
+        self.store.patch({"provider": "qwen"})
+        v = self.store.patch({"provider": "qwen-max", "tryon_seed": self.saved_seed()})
+        self.assertEqual(v["provider"], "qwen-max")
+        self.assertIsNotNone(self.store._load().job.tryon_seed)
+
+    def test_tryon_seed_survives_add_to_batch(self):
+        # copy_job must carry it, or the batch entry silently loses the seed and
+        # re-spends on an image the user already has.
+        self.fill()
+        self.store.patch({"tryon_seed": self.saved_seed()})
+        self.store.add_to_batch()
+        d = self.store._load()
+        self.assertEqual(d.basket[0].tryon_seed, d.job.tryon_seed)
+
+    def test_two_jobs_differing_only_by_seed_are_two_jobs(self):
+        # Same reasoning as provider: same material through a seed vs a fresh
+        # try-on are different runs, so signature() must tell them apart or
+        # job_digest collides and a drop tap acts on the wrong basket row.
+        a = job(character="/s/a.png")
+        b = job(character="/s/a.png")
+        b.tryon_seed = Path("/lib/app/abc.png")
+        self.assertNotEqual(drafts.signature(a), drafts.signature(b))
+        self.assertEqual(drafts.load_jobs(drafts.dump_jobs([b]))[0].tryon_seed, b.tryon_seed)
+        self.assertIsNone(drafts.load_jobs(drafts.dump_jobs([a]))[0].tryon_seed)
 
 
 class TestBatch(StoreCase):
