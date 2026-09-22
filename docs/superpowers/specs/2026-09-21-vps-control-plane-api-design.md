@@ -92,6 +92,7 @@ No Telegram imports. One module per responsibility:
 | `runs.py` | Validate, Phase A, try-on regenerate, rent-panel data, **confirm**, progress, kill, resume |
 | `pod.py` | Lease state, GPU stock, balance, Vast, migration |
 | `outputs.py` | Listing `out/*/_final` and resolving a file inside it |
+| `tryon_library.py` | Saved try-on entries, per owner (§5.10, slice 6): list, save, delete, and the image each one points to |
 
 - **State is keyed by `owner: str`, not `chat_id`.** The bot uses `owner="tg-<chat_id>"`, the app
   `owner="app"`. Existing on-disk file names (`batch/tg-<chat_id>-*`) do not change for the bot, so no
@@ -162,9 +163,9 @@ uploads directory (it currently only ages out staged files after `STAGING_MAX_AG
 |---|---|
 | `GET /v1/pipelines` | Pipelines with required/optional roles and providers, derived from `batchlib.pipelines.PIPELINES`/`STAGES` — the app never hardcodes a pipeline |
 | `GET /v1/draft` | Current job, the batch so far, missing slots, the "next step" line |
-| `PATCH /v1/draft` `{pipeline?, provider?, slots?: {role: material_id}}` | Same rules as `_switch_pipeline` / `_switch_provider` / `_fill_slot` |
-| `POST /v1/draft/add-to-batch` | `_add_to_batch` |
-| `DELETE /v1/draft/batch/{digest}` | `_drop_from_batch` |
+| `PATCH /v1/draft` `{pipeline?, provider?, slots?: {role: material_id}, tryon_seed?: id \| null}` | Same rules as `_switch_pipeline` / `_switch_provider` / `_fill_slot`. `tryon_seed` names a try-on library entry to seed the job's try-on stage from (§5.10, slice 6) |
+| `POST /v1/draft/add-to-batch` | `_add_to_batch` — already accepts any number of jobs; a "1 character × N outfits" cross build is the app calling `PATCH` + this once per outfit (§5.10) |
+| `DELETE /v1/draft/batch/{digest}` | `_drop_from_batch` — free (nothing rented yet), so this is how the app drops one try-on from a batch before renting (§5.10) |
 | `POST /v1/draft/clear` | `_clear_job` |
 | `POST /v1/draft/validate` | `make batch-validate` — free, no pod |
 
@@ -172,14 +173,15 @@ uploads directory (it currently only ages out staged files after `STAGING_MAX_AG
 
 | Method + path | Behaviour |
 |---|---|
-| `POST /v1/runs/phase-a` → `Run` | `_do_phase_a` for the app's draft |
-| `POST /v1/runs/{id}/tryon/{index}/regen` `{provider?}` | `_regen_tryon` / `_retry_tryon` |
-| `GET /v1/runs/{id}/tryon/{index}` | The try-on preview image |
+| `POST /v1/runs/phase-a` → `Run` | `_do_phase_a` for the app's draft — already runs every job in the draft's basket, not just one (§5.10) |
+| `POST /v1/runs/{id}/tryon/{index}/regen` `{provider?, guidance?: string[]}` | `_regen_tryon` / `_retry_tryon`. `guidance` is zero or more of `keep_face`, `tighter_crop`, `match_lighting` (§5.10, slice 6); unknown values are `400` |
+| `GET /v1/runs/{id}/tryon/{index}` | The current try-on preview image |
+| `GET /v1/runs/{id}/tryon/{index}/versions/{n}` | An earlier version of that image, oldest = 1 (`_tryon_versions`, already kept by every regenerate — §5.10) |
 | `GET /v1/runs/{id}/rent-panel` | Per-GPU stock and price at the home datacenter, RunPod and Vast, Vast refusals, and a `panel_token` |
 | `POST /v1/runs/{id}/confirm` `{gpu, provider, panel_token}` | **The money gate** (§5.5) |
 | `GET /v1/runs` | Runs, newest first, from the on-disk journals |
 | `GET /v1/runs/{id}` | Stages, per-job state, the lease's `provisioned_at` (epoch; the client computes elapsed), cost estimate (slice 5). Read from `state.json` (`progress_text`'s source), so it stays true after the pod is gone. Supports `ETag` / `If-None-Match`, compared weakly because Cloudflare turns ETags into `W/"…"` when it compresses. The body must hold no field derived from the current time, or the ETag changes on every poll |
-| `POST /v1/runs/{id}/kill` | `_do_kill`, run on a worker thread; `202` at once (§5.9) |
+| `POST /v1/runs/{id}/kill` | `_do_kill`, run on a worker thread; `202` at once (§5.9) — kills every job left in a batch run, not only one, since one manifest has one drain |
 | `POST /v1/runs/{id}/resume` `{provider, run_token, gpu?}` | `_do_resume`, only for a run whose pod rental failed (§5.9) |
 
 A run's `id` is the manifest stem (`batch/<id>.yaml`).
@@ -305,6 +307,78 @@ holds the models, Postgres and MinIO**. Both sit behind the slice-4 machinery (`
   and the panel's Vast tab exist in Telegram; `provider` on `resume` picks between them), `/subscribe`
   stock watches, and cancelling a running migration.
 
+### 5.10 Batch cross-mode, try-on library and guided regenerate (slice 6, decided 2026-09-22)
+
+Triggered by mapping a SwiftUI prototype's screens (a Claude Design canvas, 17 artboards) onto the
+API slices 1–5 already ship. Most of what the prototype's batch screens need turned out to already
+exist; two pieces genuinely do not.
+
+**§5.8's "one run slot" undersold what it built.** `_do_phase_a` and `_do_confirm` already take an
+optional `jobs: list[Job]` that is *the app's whole draft basket*, not one job — `AppRuns.phase_a` and
+`AppRuns.confirm` already pass `self.drafts.runnable()`'s jobs straight through. A manifest with N runs,
+per-job progress (`run_detail`'s `jobs` array), one drain, and one kill for the whole batch were true
+from slice 4 onward. Slice 6 adds no new machinery for this — it is the app actually driving what was
+already there:
+
+- **Cross build** (1 character × N outfits × 1 driver → N jobs): the app calls `PATCH /v1/draft`
+  once per outfit (character and driver slots unchanged) followed by
+  `POST /v1/draft/add-to-batch`, exactly as composing one job N times. No new route.
+- **Drop before renting** (a bad try-on out of a kept batch): `DELETE /v1/draft/batch/{digest}`
+  already removes a job from the basket, but that alone does not do what the prototype's `BatchTryon`
+  screen needs. Once Phase A has run, `AppRuns.confirm` takes the *resume* branch
+  (`_PHASE_A_OFFERED` matches the manifest's token), and `_do_resume` rents the manifest **already on
+  disk** — it does not re-read the draft, so a job dropped from the basket after Phase A stays in what
+  gets rented. This is a real gap, not just a missing test: `AppRuns.confirm` must compare the draft's
+  current jobs (by `signature`) against the frozen manifest before choosing that branch, and when the
+  draft is a strict subset, call `_do_phase_a` again with the smaller list instead of resuming — cheap,
+  because every kept job's try-on stage is already journalled `done` and `local_tryon_reusable` skips
+  it, so only the manifest shrinks and no provider is called again. The resume branch stays exactly as
+  it is when the draft has not changed since Phase A.
+
+**Try-on library (new).** Kept try-on images that outlive one draft/manifest, so the app can build a
+video from a try-on generated in an earlier session without spending Gemini/Qwen quota again.
+Opt-in — saved only when the app asks, never automatically on every preview, so quota spent on a
+regenerate the user never liked does not silently become disk the user never asked to keep either.
+
+- Storage: `control/tryon_library.py`, a new module shaped like `drafts.py`'s `DraftStore` — one
+  JSON index per owner (`batch/tryon-library/{owner}.json`) plus the images themselves
+  (`batch/tryon-library/{owner}/{id}.png`), under `control.LOCK`. Deliberately outside `out/`, so
+  `batch-clean` and `_final` pruning can never remove a saved entry.
+- `GET /v1/tryon-library` → `[{id, material_ids: {character, outfit, background?}, provider,
+  saved_at}]`.
+- `POST /v1/tryon-library` `{run_id, index}` → copies that run's current try-on image (the same file
+  `GET /v1/runs/{id}/tryon/{index}` serves) into the library and records the job's material ids and
+  provider. No `Idempotency-Key`: a file copy, not a spend, same as every other `/v1/draft/*` mutation.
+- `GET /v1/tryon-library/{id}/image` → the stored image.
+- `DELETE /v1/tryon-library/{id}` → removes the entry and its image.
+- **Using an entry** is `PATCH /v1/draft {tryon_seed: id}`, recorded on the draft's `Job` (a new
+  field, empty for every job composed the ordinary way). The app never touches a file path — the
+  server does the copy, at the one point a job's stage-file path is knowable: inside `_do_phase_a`,
+  right after `write_manifest` assigns the job its run id, for any queued job carrying a
+  `tryon_seed`. It copies the library image to that job's `stage_dest` and journals the try-on stage
+  `done` there, the same "already done, skip it" state `_regen_tryon`'s own resume already leaves
+  behind for every *other* job in a batch. Phase A then only calls Gemini/Qwen for jobs that are not
+  seeded. This reuses an existing contract rather than teaching the runner a new one — but it has not
+  been proven against `run_local_phase` yet, and is a spike inside slice 6's plan before it is a
+  promised behaviour.
+- Not in slice 6: editing a saved entry's material ids, and a size cap or expiry on the library (the
+  user prunes it by hand, the way materials are pruned by hand today).
+
+**Guided regenerate.** `_regen_tryon` already keeps every previous image as `<stem>.v<N><ext>`
+(`_tryon_versions`) — slice 6 only exposes that history over HTTP
+(`GET /v1/runs/{id}/tryon/{index}/versions/{n}`, above); no new storage. What is new: `regen`'s body
+gains `guidance: string[]`, zero or more of `keep_face`, `tighter_crop`, `match_lighting` — a closed
+vocabulary, not free text, so the phone never sends prose the provider prompt was not written to
+expect. `_regen_tryon` threads `guidance` down to `local_tryon.py`'s Gemini/Qwen call, which appends a
+fixed instruction fragment per flag to the prompt it already sends. Unknown values are `400
+bad_request` before anything runs.
+
+Not in slice 6, deferred on purpose: **stock-watch notifications** ("tell me on Telegram when GPU X is
+back in datacenter Y"). Every other slice is one HTTP request answered from files already on disk or
+one upstream call; a stock watch needs a background poller with its own schedule, independent of any
+request — the first piece of always-on infrastructure this API would own. It gets its own slice once
+slices 1–6 are live in the app, not folded in here to keep this slice's shape consistent with the rest.
+
 ## 6. Delivery in slices
 
 Each slice deploys on its own; `scripts/tests/test_batch_bot.py` stays green after every slice.
@@ -316,6 +390,7 @@ Each slice deploys on its own; `scripts/tests/test_batch_bot.py` stays green aft
 | 3 | Drafts keyed by owner | `_STATE`, `_job_for`, `_switch_*`, `_fill_slot`, batch and draft functions | Compose jobs |
 | 4 | Phase A, regenerate, rent panel, **confirm** — one shared run slot (§5.8) | nothing moves; `_do_phase_a`, `_do_confirm`, `_do_resume`, `_regen_tryon` return outcomes; data half of the rent panel | Run jobs |
 | 5 | Pod: kill, resume, GPU stock and choice, balance, migrate — §5.9 | nothing moves; `_do_kill` and `_start_migration` return outcomes; data halves of `_report_gpu_stock` and `_report_balance` | Pod / cost |
+| 6 | Batch cross-build/drop over the existing basket, a new try-on library, guided regenerate — §5.10 | nothing moves for batch (already there); `tryon_library.py` is new; `_regen_tryon` gains `guidance` | Bulk try-on → N videos, reuse a saved try-on, steer a regenerate |
 
 The SwiftUI app (sub-project 2) can start against slice 1.
 
@@ -336,6 +411,12 @@ picks them up.
   - `Range` requests return `206` with correct `Content-Range`.
   - A refusal produces the same message text in Telegram as before the extraction.
 - A test that greps `start_drain` call sites (§5.5).
+- Slice 6: a batch of N jobs, one dropped via `DELETE /v1/draft/batch/{digest}` **after** Phase A has
+  already recorded its try-on `done` but **before** `confirm`, then confirmed — asserts the resulting
+  manifest has N-1 runs and that the kept runs' try-on stage is not re-run (no second call into the
+  stubbed provider for them). A `tryon_seed` job whose seeded stage is journalled `done` before Phase A
+  runs, asserting Phase A calls the stubbed provider for every *other* job in the same batch but not
+  that one. `regen` with an unknown `guidance` value is `400` and calls nothing.
 
 ## 8. Deploy and verification on the VPS
 
@@ -356,3 +437,6 @@ picks them up.
 - Push notifications (needs the paid Apple account; Telegram covers it).
 - Multi-user: there is one user; `owner` is a namespace, not an account system.
 - Moving the core into its own process (approach B) — kept possible, not done.
+- Stock-watch notifications (§5.10) — needs a background poller, a different shape of work than every
+  slice so far; a later slice once the app covers slices 1–6.
+- Editing or expiring a try-on library entry automatically (§5.10) — pruned by hand, like materials.
