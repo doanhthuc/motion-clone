@@ -127,6 +127,9 @@
       },
       "driverDurSec": {
         "why": "camera guide extraction uses the same selected driver segment as camera-motion"
+      },
+      "seedImage": {
+        "why": "Phase A only — control/drafts.py's PATCH /v1/draft tryon_seed field. batchlib/runner.py's run_local_phase intercepts it before run_local_tryon is ever called, so linux.py and the real API never see it (spec §5.10, slice 6)."
       }
     },
     "api": {},

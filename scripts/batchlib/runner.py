@@ -645,17 +645,40 @@ def run_local_phase(*, settings: Settings, manifest: Manifest, out_root: Path, b
             log(f"    ✗ {run.id}/{stage_name} (local): {loi}")
             return False, loi
 
-        try:
-            elapsed, size = run_local_tryon(run, params, settings, dest)
-        except JobError as exc:
-            return _ghi_hong(exc)
-        except Exception as exc:   # noqa: BLE001 — cố ý bắt rộng, xem dưới
-            # Phòng thủ nhiều lớp. Bắt mỗi JobError là đủ CHO ĐÚNG hôm nay và chỉ vì
-            # local_tryon.py bọc mọi lỗi mạng lại; bất kỳ thứ gì khác (TimeoutError lọt
-            # lưới, provider mới như qwen-max ném exception riêng, bug lập trình) sẽ bay
-            # qua done_future.result() lên tận main() và giết CẢ Pha A vì MỘT run — các
-            # run khác mất trắng, và run này kẹt "pending" trong journal thay vì "error".
-            return _ghi_hong(exc)
+        seed_image = params.get("seedImage")
+        if seed_image:
+            # §5.10, slice 6: control/drafts.py's tryon_seed already resolved this
+            # path through TryonLibrary.resolve_image before it reached the
+            # manifest, but the manifest is the only channel that survives from
+            # "the app composed this job" to "the runner is about to try it":
+            # the bot never knows a batch's batch_id/out_dir in advance, since
+            # drain.py picks those in a later subprocess. So a vanished file is
+            # caught HERE, not there — falling through to run_local_tryon would
+            # spend real Gemini/Qwen quota on the very image the user just asked
+            # to reuse.
+            seed_path = Path(str(seed_image))
+            if not seed_path.is_file():
+                return _ghi_hong(JobError(
+                    f"run {run.id!r}: seedImage is not a file: {seed_path}"))
+            shutil.copy2(seed_path, dest)
+            # elapsed 0: there is no API call to time. The journal still needs
+            # "this stage is done and the file is here" in the same shape a
+            # real Phase A result leaves, so the shared write below is reused
+            # unchanged — local_tryon_reusable must not be able to tell the
+            # two apart on a later resume.
+            elapsed, size = 0, dest.stat().st_size
+        else:
+            try:
+                elapsed, size = run_local_tryon(run, params, settings, dest)
+            except JobError as exc:
+                return _ghi_hong(exc)
+            except Exception as exc:   # noqa: BLE001 — cố ý bắt rộng, xem dưới
+                # Phòng thủ nhiều lớp. Bắt mỗi JobError là đủ CHO ĐÚNG hôm nay và chỉ vì
+                # local_tryon.py bọc mọi lỗi mạng lại; bất kỳ thứ gì khác (TimeoutError lọt
+                # lưới, provider mới như qwen-max ném exception riêng, bug lập trình) sẽ bay
+                # qua done_future.result() lên tận main() và giết CẢ Pha A vì MỘT run — các
+                # run khác mất trắng, và run này kẹt "pending" trong journal thay vì "error".
+                return _ghi_hong(exc)
         # params_sent == params_manifest ở đây KHÔNG phải copy-paste: hai cột đó lệch nhau
         # được là vì API nắn param trước khi ghi DB (xem docstring write_index). Pha A
         # không đi qua API nào cả — nó gọi thẳng Gemini với đúng param của manifest, nên

@@ -15,6 +15,7 @@ from batchlib_ext.gpu_stock import Stock
 from batchlib_ext.handoff import mailbox_path
 import control.drafts as drafts
 from control.idempotency import IdempotencyStore
+from control.tryon_library import TryonLibrary
 from control.runs import Outcome
 import tgbot.bot as bot
 from tgbot.ingest import Probe
@@ -292,9 +293,10 @@ class _AppRunsFixture(_Fixture):
         super().setUp()
         staging = self.root / "batch" / "tg-staging"
         staging.mkdir(parents=True, exist_ok=True)
-        self.store = drafts.DraftStore(self.root / "batch", staging, "app",
-                                       default_pipeline="motion-enhance",
-                                       default_provider="gemini")
+        self.store = drafts.DraftStore(
+            self.root / "batch", staging, "app",
+            default_pipeline="motion-enhance", default_provider="gemini",
+            tryon_library=TryonLibrary(self.root / "batch" / "tryon-library", "app"))
         self.idem = IdempotencyStore(self.root / "batch" / "idempotency")
         self.runs = bot.AppRuns(self.tg, ME, self.store, self.idem)
 
@@ -517,6 +519,7 @@ class TestConfirmAfterADroppedBatchJob(_Fixture):
         self.store = drafts.DraftStore(
             self.root / "batch", self.staging, "app",
             default_pipeline="tryon-motion-enhance", default_provider="gemini",
+            tryon_library=TryonLibrary(self.root / "batch" / "tryon-library", "app"),
             probe=self._probe)
         self.idem = IdempotencyStore(self.root / "batch" / "idempotency")
         self.runs = bot.AppRuns(self.tg, ME, self.store, self.idem)

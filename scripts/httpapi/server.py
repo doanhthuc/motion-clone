@@ -469,6 +469,7 @@ def make_server(*, token: str, batch_dir: Path, out_dir: Path,
     server.drafts = drafts.DraftStore(
         batch_dir, server.staging_root, materials.APP_OWNER,
         default_pipeline=default_pipeline, default_provider=default_provider,
+        tryon_library=server.tryon_library,
         **({"probe": probe} if probe is not None else {}))
     # Set by the caller (bot._start_control_api) once its own AppRuns exists
     # — a chicken-and-egg the constructor can't resolve itself, since AppRuns
