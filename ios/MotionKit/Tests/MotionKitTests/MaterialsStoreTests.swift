@@ -161,5 +161,38 @@ extension URLProtocolTests {
         #expect(store.materials.isEmpty)
         #expect(store.errorMessage == nil)
     }
+
+    @Test func failedUploadCanBeExplicitlyDiscarded() async throws {
+        let parent = FileManager.default.temporaryDirectory.appending(component: UUID().uuidString)
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let file = parent.appending(component: "driver.mp4")
+        try Data("abcd".utf8).write(to: file)
+        let journal = UploadCheckpointJournal(root: parent.appending(component: "journal"))
+        StubURLProtocol.install { request in
+            switch (request.httpMethod, request.url?.path) {
+            case ("POST", "/v1/uploads"):
+                return TestSupport.json(
+                    #"{"upload_id":"abc123","chunk_size":4,"chunks_total":1}"#, status: 201)
+            case ("GET", "/v1/uploads/abc123"):
+                return TestSupport.json(#"{"upload_id":"abc123","file_name":"driver.mp4","size":4,"chunk_size":4,"chunks_total":1,"received":[]}"#)
+            default:
+                return TestSupport.json(
+                    #"{"error":{"code":"offline","message":"try again"}}"#, status: 500)
+            }
+        }
+        let client = TestSupport.client()
+        let store = MaterialsStore(
+            client: client, uploader: Uploader(client: client, journal: journal))
+
+        await store.startUpload(fileURL: file, fileName: "driver.mp4")
+        #expect(store.hasPendingUpload)
+        #expect(try journal.load() != nil)
+
+        await store.discardPendingUpload()
+        #expect(!store.hasPendingUpload)
+        #expect(store.uploadProgress == nil && store.errorMessage == nil)
+        #expect(try journal.load() == nil)
+    }
 }
 }

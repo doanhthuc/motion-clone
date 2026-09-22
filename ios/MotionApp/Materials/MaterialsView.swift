@@ -125,11 +125,24 @@ struct MaterialsView: View {
             Image(systemName: "exclamationmark.triangle").foregroundStyle(Theme.red)
             Text(message).font(Theme.sans(13)).foregroundStyle(Theme.ink1)
             Spacer(minLength: 0)
-            Button("Dismiss") {
-                importError = nil
-                store.clearError()
+            if store.hasPendingUpload {
+                Menu {
+                    Button("Retry upload", systemImage: "arrow.clockwise") {
+                        Task { await store.resumePendingUpload() }
+                    }
+                    Button("Discard upload", systemImage: "trash", role: .destructive) {
+                        Task { await store.discardPendingUpload() }
+                    }
+                } label: {
+                    Text("Upload").font(Theme.sans(12, .semibold)).foregroundStyle(Theme.lime)
+                }
+            } else {
+                Button("Dismiss") {
+                    importError = nil
+                    store.clearError()
+                }
+                .font(Theme.sans(12, .semibold)).foregroundStyle(Theme.lime)
             }
-            .font(Theme.sans(12, .semibold)).foregroundStyle(Theme.lime)
         }
         .padding(12)
         .background(Theme.redDim, in: .rect(cornerRadius: 12))

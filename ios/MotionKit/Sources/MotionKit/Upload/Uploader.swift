@@ -83,6 +83,10 @@ public actor Uploader {
         (try? journal.load()) != nil
     }
 
+    public func clearPendingUpload() throws {
+        try journal.clear()
+    }
+
     public func start(fileURL: URL, fileName: String,
                       progress: ProgressHandler) async throws -> UploadCompleteResponse {
         guard (try journal.load()) == nil else { throw UploadFailure.uploadInProgress }
@@ -120,7 +124,11 @@ public actor Uploader {
             status = try await client.get(
                 UploadStatus.self, "v1", "uploads", checkpoint.uploadId)
         } catch let error {
-            if case .server(status: 404, _, _) = error { try? journal.clear() }
+            if case .server(status: 404, _, _) = error {
+                try? journal.clear()
+                throw UploadFailure.invalidLocalFile(
+                    "The saved upload expired; select the file again.")
+            }
             throw error
         }
         if let material = status.material, let probe = status.probe {

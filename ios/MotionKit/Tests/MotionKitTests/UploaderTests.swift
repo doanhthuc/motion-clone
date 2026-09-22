@@ -162,9 +162,14 @@ extension URLProtocolTests {
             }
             return response(request, received: [])
         }
-        await #expect(throws: APIError.self) {
+        do {
             _ = try await Uploader(client: TestSupport.client(), journal: journal).start(
                 fileURL: file, fileName: "driver.mp4") { _ in }
+            Issue.record("Expected the expired upload to fail")
+        } catch let error as UploadFailure {
+            #expect(error == .invalidLocalFile("The saved upload expired; select the file again."))
+        } catch {
+            Issue.record("Expected UploadFailure, got \(error)")
         }
         #expect(try journal.load() == nil)
     }

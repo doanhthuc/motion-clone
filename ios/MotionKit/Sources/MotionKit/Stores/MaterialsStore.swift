@@ -9,6 +9,7 @@ public final class MaterialsStore {
     public private(set) var errorMessage: String?
     public private(set) var uploadProgress: UploadProgress?
     public private(set) var isUploading = false
+    public private(set) var hasPendingUpload = false
 
     private let client: APIClient
     private let uploader: Uploader
@@ -65,23 +66,39 @@ public final class MaterialsStore {
             let completed = try await uploader.start(
                 fileURL: fileURL, fileName: fileName, progress: progressHandler())
             retainWarning(from: completed)
+            hasPendingUpload = false
             await refresh()
         } catch {
+            hasPendingUpload = await uploader.hasPendingUpload()
             errorMessage = Self.message(for: error)
         }
     }
 
     public func resumePendingUpload() async {
         guard !isUploading else { return }
-        guard await uploader.hasPendingUpload() else { return }
+        hasPendingUpload = await uploader.hasPendingUpload()
+        guard hasPendingUpload else { return }
         isUploading = true
         errorMessage = nil
         defer { isUploading = false }
         do {
             if let completed = try await uploader.resume(progress: progressHandler()) {
                 retainWarning(from: completed)
+                hasPendingUpload = false
                 await refresh()
             }
+        } catch {
+            hasPendingUpload = await uploader.hasPendingUpload()
+            errorMessage = Self.message(for: error)
+        }
+    }
+
+    public func discardPendingUpload() async {
+        do {
+            try await uploader.clearPendingUpload()
+            hasPendingUpload = false
+            uploadProgress = nil
+            errorMessage = nil
         } catch {
             errorMessage = Self.message(for: error)
         }
