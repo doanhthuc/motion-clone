@@ -1,0 +1,43 @@
+name: MotionApp
+options:
+  bundleIdPrefix: xyz.doanhthuc
+  deploymentTarget:
+    iOS: "26.0"
+  createIntermediateGroups: true
+packages:
+  MotionKit:
+    path: MotionKit
+targets:
+  MotionApp:
+    type: application
+    platform: iOS
+    sources:
+      - path: MotionApp
+        excludes: ["Info.plist"]
+    configFiles:
+      Debug: Secrets.xcconfig
+      Release: Secrets.xcconfig
+    dependencies:
+      - package: MotionKit
+        product: MotionKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: xyz.doanhthuc.motion
+        PRODUCT_NAME: Motion
+        SWIFT_VERSION: "6.0"
+        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGN_STYLE: Automatic
+        ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS: NO
+    info:
+      path: MotionApp/Info.plist
+      properties:
+        CFBundleDisplayName: Motion
+        UILaunchScreen: {}
+        UIUserInterfaceStyle: Dark
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        UIAppFonts: [SpaceGrotesk.ttf, JetBrainsMono.ttf]
+        NSPhotoLibraryAddUsageDescription: Save finished videos and images to Photos.
+        CONTROL_API_URL: $(CONTROL_API_URL)
+        CF_ACCESS_CLIENT_ID: $(CF_ACCESS_CLIENT_ID)
+        CF_ACCESS_CLIENT_SECRET: $(CF_ACCESS_CLIENT_SECRET)
+        CONTROL_API_TOKEN: $(CONTROL_API_TOKEN)
