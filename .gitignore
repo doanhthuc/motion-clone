@@ -93,6 +93,11 @@ batch/tg-staging/
 # Personal media, like tg-staging/ above.
 batch/uploads/
 batch/thumbs/
+# The try-on library's index and its saved images (control/tryon_library.py).
+# The user's own photographs, kept on purpose across runs — on the VPS this
+# path is inside the repo working tree, so it would otherwise show up in
+# `git status` and be one `git add .` away from a public commit.
+batch/tryon-library/
 
 # Downscaled JPEGs the bot builds so a slot question can be answered by eye
 # (tgbot/preview.py). Throwaways, but they are still the user's own photographs

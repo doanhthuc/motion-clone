@@ -3129,6 +3129,16 @@ def _regen_tryon(tg: Tg, chat_id: int, index: str, token: str, *,
                        f"{run.id}'s try-on no longer runs over the API "
                        "(its provider changed), so there is nothing to "
                        "regenerate here.")
+    # Before the guidance check on purpose: a seeded run has no provider call
+    # behind it at all (runner.py's _one() copies seedImage in and returns),
+    # so a plain Regenerate tap is just as much a no-op as a guided one —
+    # both would re-copy the identical saved file while the phone rendered a
+    # successful regeneration (§5.10, slice 6).
+    if effective_stage_params(stage_name, run.stage_params.get(stage_name)).get("seedImage"):
+        return _refuse(tg, chat_id, "seeded",
+                       f"{run.id}'s try-on came from your saved library, not a provider "
+                       "call — there is nothing to regenerate. Clear the seed and try "
+                       "again to run it through the provider.")
     guidance_params = None
     if guidance:
         unknown = [g for g in guidance if g not in _GUIDANCE_FLAGS]
@@ -6920,6 +6930,16 @@ class AppRuns:
         draft and offers its own reuse/rerun chooser for any job whose
         try-on is still journalled `done` under its stable, content-hashed
         run id (§5.10, slice 6).
+
+        Run ids alone would not be enough: `run_id_for` hashes material file
+        stems only, so switching a job's provider or adding/clearing its
+        try-on seed leaves every id byte-identical while changing what the
+        run costs and produces. The draft's own identity for two runs being
+        "the same run" is `drafts.signature()` — pipeline, material, provider
+        AND seed — so this compares the last three against what the manifest
+        actually recorded, reading back `render_manifest`'s convention:
+        `provider` is only written when it differs from DEFAULT_PROVIDER, and
+        `seedImage` only when the job carries a seed.
         """
         jobs, validated, _ = self.drafts.runnable()
         if validated is not True:
@@ -6928,7 +6948,28 @@ class AppRuns:
             manifest = load_manifest(_job_manifest_path(self.chat_id))
         except (ManifestError, OSError):
             return False
-        return set(_unique_ids(jobs)) == {run.id for run in manifest.runs}
+        ids = _unique_ids(jobs)
+        if set(ids) != {run.id for run in manifest.runs}:
+            return False
+        manifest_by_id = {run.id: run for run in manifest.runs}
+        for job, run_id in zip(jobs, ids):
+            run = manifest_by_id.get(run_id)
+            if run is None:
+                return False
+            stage = _tryon_stage(job.pipeline)
+            if stage is None:
+                # No try-on stage means the manifest never carried either
+                # field, and neither is read downstream — nothing to compare.
+                continue
+            job_fp = (job.provider if job.provider != DEFAULT_PROVIDER else None,
+                      str(job.tryon_seed) if job.tryon_seed else None)
+            # Raw stage_params, not effective_stage_params: the comparison is
+            # against what render_manifest WROTE, and the pipeline defaults
+            # the effective view merges in were never part of the job.
+            run_params = run.stage_params.get(stage) or {}
+            if job_fp != (run_params.get("provider"), run_params.get("seedImage")):
+                return False
+        return True
 
     def phase_a(self, key) -> tuple[int, dict]:
         replay = self.idem.begin("phase-a", key)
@@ -7019,7 +7060,13 @@ class AppRuns:
             if busy is not None:
                 return busy
             token = self.panel_token()
-            after_phase_a = _PHASE_A_OFFERED.get(self.chat_id) == _run_token(self.chat_id)
+            # The SAME predicate `confirm` gates its resume branch on, not
+            # just the offered-token check: this panel is the price the user
+            # says yes to, and if `confirm` is going to re-derive from a draft
+            # that changed since Phase A, the panel must quote THAT draft's
+            # job count and minutes — not the stale manifest still on disk.
+            after_phase_a = (_PHASE_A_OFFERED.get(self.chat_id) == _run_token(self.chat_id)
+                             and self._phase_a_matches_draft())
             if after_phase_a:
                 try:
                     manifest = load_manifest(_job_manifest_path(self.chat_id))

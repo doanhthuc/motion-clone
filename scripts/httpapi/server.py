@@ -40,6 +40,10 @@ _DOMAIN_STATUS = {"bad_request": 400, "forbidden": 403, "not_found": 404, "in_us
                   "unprobeable": 422, "no_space": 507,
                   "unknown_pipeline": 422, "unknown_provider": 422, "unknown_role": 422,
                   "wrong_kind": 422, "not_applicable": 422, "missing_slots": 422,
+                  # DraftStore.patch's refusal of a tryon_seed on a job whose
+                  # try-on does not run locally: a semantic no, like its
+                  # siblings above — without this it fell through to 400.
+                  "not_local": 422,
                   "duplicate": 422, "nothing_to_validate": 422, "invalid": 422}
 MAX_JSON_BODY = 64 * 1024
 # A body this size or smaller is read and thrown away to keep the connection

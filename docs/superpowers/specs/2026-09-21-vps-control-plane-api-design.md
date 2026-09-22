@@ -329,11 +329,12 @@ already there:
   (`_PHASE_A_OFFERED` matches the manifest's token), and `_do_resume` rents the manifest **already on
   disk** — it does not re-read the draft, so a job dropped from the basket after Phase A stays in what
   gets rented. This is a real gap, not just a missing test: `AppRuns.confirm` must compare the draft's
-  current jobs (by `signature`) against the frozen manifest before choosing that branch, and when the
-  draft is a strict subset, call `_do_phase_a` again with the smaller list instead of resuming — cheap,
-  because every kept job's try-on stage is already journalled `done` and `local_tryon_reusable` skips
-  it, so only the manifest shrinks and no provider is called again. The resume branch stays exactly as
-  it is when the draft has not changed since Phase A.
+  current jobs (by `signature`) against the frozen manifest before choosing that branch, and when they
+  disagree, fall through to its existing `else` branch — `_do_confirm` with the current draft's jobs,
+  which re-writes the manifest and offers its own reuse/rerun chooser. Cheap, because every kept job's
+  try-on stage is already journalled `done` under its stable, content-hashed run id and
+  `local_tryon_reusable` skips it, so only the manifest changes and no provider is called again. The
+  resume branch stays exactly as it is when the draft has not changed since Phase A.
 
 **Try-on library (new).** Kept try-on images that outlive one draft/manifest, so the app can build a
 video from a try-on generated in an earlier session without spending Gemini/Qwen quota again.
@@ -353,14 +354,14 @@ regenerate the user never liked does not silently become disk the user never ask
 - `DELETE /v1/tryon-library/{id}` → removes the entry and its image.
 - **Using an entry** is `PATCH /v1/draft {tryon_seed: id}`, recorded on the draft's `Job` (a new
   field, empty for every job composed the ordinary way). The app never touches a file path — the
-  server does the copy, at the one point a job's stage-file path is knowable: inside `_do_phase_a`,
-  right after `write_manifest` assigns the job its run id, for any queued job carrying a
-  `tryon_seed`. It copies the library image to that job's `stage_dest` and journals the try-on stage
-  `done` there, the same "already done, skip it" state `_regen_tryon`'s own resume already leaves
-  behind for every *other* job in a batch. Phase A then only calls Gemini/Qwen for jobs that are not
-  seeded. This reuses an existing contract rather than teaching the runner a new one — but it has not
-  been proven against `run_local_phase` yet, and is a spike inside slice 6's plan before it is a
-  promised behaviour.
+  server does the copy, at the one point a job's stage-file path is knowable: inside
+  `batchlib/runner.py`'s `run_local_phase`/`_one()`, which intercepts a `seedImage` stage param and
+  copies that file to the stage's `dest` instead of calling `run_local_tryon`. `render_manifest`
+  carries the resolved path there, because the manifest is the only channel that survives from "the
+  app composed this job" to "the runner is about to run it" — the bot never knows a batch's
+  `batch_id`/`out_dir` in advance. The shared journal write below it then records the stage `done`
+  in exactly the shape a real provider call leaves, so `local_tryon_reusable` cannot tell the two
+  apart on a later resume, and Phase A only calls Gemini/Qwen for jobs that are not seeded.
 - Not in slice 6: editing a saved entry's material ids, and a size cap or expiry on the library (the
   user prunes it by hand, the way materials are pruned by hand today).
 
