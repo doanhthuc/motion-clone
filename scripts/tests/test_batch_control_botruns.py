@@ -909,15 +909,21 @@ class TestTryonVersionImage(_AppRunsFixture):
 
     def test_version_image_returns_an_older_version(self):
         _run_id, version = self._seed_tryon_run_with_version()
-        path = self.runs.tryon_version_image("0", "1")
+        path = self.runs.tryon_version_image(self.runs.run_id, "0", "1")
         self.assertEqual(path, version.resolve())
 
     def test_version_image_out_of_range_is_none(self):
         self._seed_tryon_run_with_version()
-        self.assertIsNone(self.runs.tryon_version_image("0", "99"))
+        self.assertIsNone(self.runs.tryon_version_image(self.runs.run_id, "0", "99"))
 
     def test_version_image_no_such_preview_is_none(self):
-        self.assertIsNone(self.runs.tryon_version_image("0", "1"))
+        self.assertIsNone(self.runs.tryon_version_image(self.runs.run_id, "0", "1"))
+
+    def test_version_image_wrong_run_id_is_none(self):
+        # Same contract as tryon_image's own first line — a stale/wrong
+        # run_id in the URL must 404, never a real (wrong-context) image.
+        self._seed_tryon_run_with_version()
+        self.assertIsNone(self.runs.tryon_version_image("not-the-run-id", "0", "1"))
 
 
 class TestNoAbsolutePaths(_AppRunsFixture):

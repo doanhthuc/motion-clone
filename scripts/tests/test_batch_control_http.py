@@ -845,8 +845,8 @@ class FakeAppRuns:
         self.calls.append(("regen", run_id, index, body, key))
         return self.regen_response
 
-    def tryon_version_image(self, index, n):
-        self.calls.append(("tryon_version_image", index, n))
+    def tryon_version_image(self, run_id, index, n):
+        self.calls.append(("tryon_version_image", run_id, index, n))
         return self.tryon_version_image_path
 
     def tryon_save_info(self, index):
@@ -938,7 +938,7 @@ class TestAppRunRoutes(HttpWriteBase):
         self.fake.tryon_version_image_path = image
         resp, body = self.send("GET", "/v1/runs/tg-1/tryon/0/versions/1")
         self.assertEqual((resp.status, body), (200, image.read_bytes()))
-        self.assertEqual(self.fake.calls, [("tryon_version_image", "0", "1")])
+        self.assertEqual(self.fake.calls, [("tryon_version_image", "tg-1", "0", "1")])
 
     def test_tryon_version_route_404s_for_an_unknown_version(self):
         self.fake.tryon_version_image_path = None

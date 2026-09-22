@@ -1422,6 +1422,39 @@ class TestRunLocalPhase(unittest.TestCase):
             self.assertNotIn("regen_guidance",
                              load_state(result.state_file)["runs"]["runA"])
 
+    def test_regen_guidance_does_not_poison_params_manifest_for_the_next_resume(self):
+        # Regression for a real bug: journaling the GUIDANCE-MERGED dict as
+        # params_manifest makes local_tryon_reusable's re-check against the
+        # manifest (which never contains keepFace/tighterCrop/matchLighting)
+        # fail forever. drain.py's normal confirm/drain flow always calls
+        # run_local_phase(resume=True) again right after a regen — so a
+        # permanently-failing reuse check means the very next resume
+        # silently redoes the try-on UNGUIDED, with no backup, and the pod
+        # stage ends up consuming the wrong image. params_manifest must
+        # stay the pre-merge snapshot so the reuse check still passes.
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            manifest = load_manifest(_fixture_tryon(tmp, MANIFEST_TRYON_GEMINI))
+            state_file = state_path_for(manifest.path)
+            save_state(state_file, {"version": 1, "runs": {
+                "runA": {"status": "pending", "stages": {},
+                        "regen_guidance": {"tryon": {"keepFace": "1"}}}}})
+
+            def fake_run_local_tryon(run, params, settings_, out_path):
+                out_path.write_bytes(b"ok")
+                return 1, 2
+
+            with mock.patch("batchlib.runner.run_local_tryon", fake_run_local_tryon):
+                result = run_local_phase(settings=GEMINI_SETTINGS, manifest=manifest,
+                                         out_root=tmp / "out", batch_id="2026-09-22-0200",
+                                         resume=True, log=lambda _m: None)
+
+            stage = result.state["runs"]["runA"]["stages"]["tryon"]
+            self.assertNotIn("keepFace", stage["params_manifest"])
+            self.assertEqual(stage["params_sent"]["keepFace"], "1")
+            dest = Path(stage["file"])
+            self.assertTrue(local_tryon_reusable(manifest.runs[0], "tryon", stage, dest))
+
     def test_seed_image_missing_file_is_a_run_error_not_a_silent_gemini_call(self):
         # A vanished seed MUST be a run error. Falling through to run_local_tryon
         # here spends real quota on the very image the user asked to reuse.

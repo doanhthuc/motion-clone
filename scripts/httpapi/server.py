@@ -265,7 +265,7 @@ class _Handler(BaseHTTPRequestHandler):
                 raise NOT_FOUND
         if (method == "GET" and len(rest) == 6 and rest[0] == "runs" and rest[2] == "tryon"
                 and rest[4] == "versions"):
-            image = self._app_runs().tryon_version_image(rest[3], rest[5])
+            image = self._app_runs().tryon_version_image(rest[1], rest[3], rest[5])
             if image is None:
                 raise NOT_FOUND
             try:

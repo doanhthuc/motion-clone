@@ -7121,13 +7121,15 @@ class AppRuns:
             return None
         return image
 
-    def tryon_version_image(self, index: str, n: str) -> Path | None:
+    def tryon_version_image(self, run_id: str, index: str, n: str) -> Path | None:
         """An earlier version of the try-on image at `index`, oldest = "1"
         (§5.10, slice 6). Same shape as tryon_image: `None` covers both "no
         such preview" and "n out of range", never an exception."""
+        if run_id != self.run_id:
+            return None
         if not n.isdigit() or int(n) < 1:
             return None
-        image = self.tryon_image(self.run_id, index)
+        image = self.tryon_image(run_id, index)
         if image is None:
             return None
         versions = _tryon_versions(image)

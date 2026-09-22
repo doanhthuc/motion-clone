@@ -594,8 +594,22 @@ def run_local_phase(*, settings: Settings, manifest: Manifest, out_root: Path, b
             if regen_guidance:
                 save_state(state_file, state)
         if regen_guidance:
+            # local_tryon_reusable recomputes params_manifest FROM THE
+            # MANIFEST (effective_stage_params), which never contains
+            # keepFace/tighterCrop/matchLighting — guidance is deliberately
+            # never written there (§5.10). Journaling the merged dict as
+            # params_manifest would make that comparison fail forever, so a
+            # guided run's very next resume (drain.py always calls
+            # run_local_phase(resume=True) right after a regen) would
+            # silently redo the try-on UNGUIDED and overwrite `dest` with no
+            # backup. params_manifest keeps the pre-merge snapshot;
+            # params_sent (below) is the merged dict, since that genuinely is
+            # what was sent.
+            params_manifest_snapshot = dict(params)
             params = dict(params)
             params.update(regen_guidance)
+        else:
+            params_manifest_snapshot = params
         run_dir = out_dir / "runs" / run.id
         run_dir.mkdir(parents=True, exist_ok=True)
         log_file = run_dir / "run.log"
@@ -639,7 +653,7 @@ def run_local_phase(*, settings: Settings, manifest: Manifest, out_root: Path, b
             with lock:
                 entry["stages"][stage_name] = {"status": "error",
                                             "elapsed_sec": int(time.time() - started),
-                                            "params_manifest": dict(params)}
+                                            "params_manifest": dict(params_manifest_snapshot)}
                 # Mức run, không chỉ mức chặng — đúng giao ước của run_batch. Để nguyên
                 # "pending" thì journal nói dối: run hỏng ở Pha A trông y hệt run chưa
                 # chạy. Không chặn tự chữa ở Pha B: vòng lặp của run_batch chỉ bỏ qua khi
@@ -691,10 +705,15 @@ def run_local_phase(*, settings: Settings, manifest: Manifest, out_root: Path, b
         # được là vì API nắn param trước khi ghi DB (xem docstring write_index). Pha A
         # không đi qua API nào cả — nó gọi thẳng Gemini với đúng param của manifest, nên
         # "xin gì" và "được gì" thật sự là một.
+        #
+        # Except when a guided regenerate is in play (§5.10, slice 6): params_sent is
+        # `params` (merged with regen_guidance above), params_manifest is the pre-merge
+        # params_manifest_snapshot — see the comment above the `if regen_guidance:` block
+        # for why that split must never collapse back into one dict.
         with lock:
             entry["stages"][stage_name] = {
                 "status": "done", "elapsed_sec": elapsed, "file": str(dest), "bytes": size,
-                "params_sent": dict(params), "params_manifest": dict(params),
+                "params_sent": dict(params), "params_manifest": dict(params_manifest_snapshot),
                 # Provenance, so run_one can tell a pod stage's output from a
                 # local one. Without it a /provider switch away from a local
                 # provider leaves run_one skipping a stage that now belongs to
