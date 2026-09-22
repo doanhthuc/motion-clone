@@ -144,7 +144,7 @@ Each phase is installable and usable on its own.
 |---|---|---|
 | 1 | Skeleton, Settings (seeded secrets, Test), Runs + Empty, Run progress, Outputs — implemented | No |
 | 2 | Materials, Uploading — implemented per `2026-09-22-swiftui-app-phase-2-design.md` | No |
-| 3 | New job (Single) — implemented per `2026-09-22-swiftui-app-phase-3-design.md` | No |
+| 3 | New job (Single) — implemented per [Phase 3 design](2026-09-22-swiftui-app-phase-3-design.md) | No |
 | 4 | Try-on preview, Rent GPU, Out of stock — **confirm, resume** | Yes: Gemini/Qwen quota + pod |
 | 5 | Pod & cost — kill, GPU choice, balance, migrate | Yes |
 | 6 | New batch, Bulk try-on, Batch progress, Saved try-ons, Regenerate | Yes |
