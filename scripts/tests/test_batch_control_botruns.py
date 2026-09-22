@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from batchlib.manifest import load_manifest, state_path_for
+from batchlib.manifest import load_manifest, save_state, state_path_for
 from batchlib_ext.gpu_stock import Stock
 from batchlib_ext.handoff import mailbox_path
 import control.drafts as drafts
@@ -503,6 +503,111 @@ class TestAppRunsConfirm(_AppRunsFixture):
         self.assertEqual(status, 400)
         self.assertEqual(resp["error"]["code"], "bad_request")
         self.patches["start_drain"].assert_not_called()
+
+
+class TestConfirmAfterADroppedBatchJob(_Fixture):
+    """§5.10: dropping a job from the draft's basket after Phase A already ran
+    for it must shrink what gets rented, not silently rent the stale,
+    already-on-disk manifest via the resume branch."""
+
+    def setUp(self):
+        super().setUp()
+        self.staging = self.root / "batch" / "tg-staging"
+        (self.staging / "app").mkdir(parents=True, exist_ok=True)
+        self.store = drafts.DraftStore(
+            self.root / "batch", self.staging, "app",
+            default_pipeline="tryon-motion-enhance", default_provider="gemini",
+            probe=self._probe)
+        self.idem = IdempotencyStore(self.root / "batch" / "idempotency")
+        self.runs = bot.AppRuns(self.tg, ME, self.store, self.idem)
+
+    @staticmethod
+    def _probe(path: Path) -> Probe:
+        if path.suffix == ".mp4":
+            return Probe(kind="video", width=1080, height=1920, duration_s=5.0,
+                        bitrate_kbps=3000, size_bytes=10)
+        return Probe(kind="image", width=1080, height=1920, duration_s=0.0,
+                    bitrate_kbps=0, size_bytes=10)
+
+    def _material(self, name: str, data: bytes) -> str:
+        (self.staging / "app" / name).write_bytes(data)
+        return f"app/{name}"
+
+    def _mark_validated(self) -> None:
+        # Same shortcut _AppRunsFixture._seed_draft uses: the app already
+        # validated its draft before calling Phase A/confirm, so these tests
+        # go straight to a validated draft rather than shelling out to the
+        # real `make batch-validate` (that path belongs to
+        # test_batch_control_drafts.py's TestValidate).
+        d = self.store._load()
+        d.validated = True
+        self.store._save(d)
+
+    def test_a_dropped_job_is_not_rented(self):
+        character = self._material("character.png", b"c")
+        driver = self._material("driver.mp4", b"d")
+        outfit1 = self._material("outfit1.png", b"o1")
+        outfit2 = self._material("outfit2.png", b"o2")
+
+        # Two distinct basket entries, differing only by outfit — the exact
+        # PATCH/add-to-batch sequence test_batch_control_drafts.py's TestBatch
+        # uses to build a runnable draft (e.g. test_add_keeps_editing_a_copy).
+        self.store.patch({"slots": {"character": character, "driver": driver,
+                                    "outfit": outfit1}})
+        self.store.add_to_batch()
+        self.store.patch({"slots": {"outfit": outfit2}})
+        self.store.add_to_batch()
+        # Clear the slot still being edited so the draft's runnable jobs are
+        # exactly the two basket entries, not the basket plus whatever the
+        # (now-unsaved) current job happens to duplicate.
+        self.store.patch({"slots": {"outfit": None}})
+        self._mark_validated()
+
+        with mock.patch("tgbot.bot.start_phase_a"):
+            status, _ = self.runs.phase_a("k1")
+        self.assertEqual(status, 202)
+        manifest = load_manifest(bot._job_manifest_path(ME))
+        self.assertEqual(len(manifest.runs), 2)
+
+        # Phase A "finished": mark both runs' try-on stage done in the
+        # journal, as a real Phase A run would, then set the offered-token
+        # gate its own completion callback sets — start_phase_a is stubbed
+        # above, so nothing else does that here.
+        state_file = state_path_for(manifest.path)
+        state = {"version": 1, "batch": "2026-09-22-0000", "runs": {}}
+        for run in manifest.runs:
+            out_file = self.root / f"{run.id}.png"
+            out_file.write_bytes(b"img")
+            state["runs"][run.id] = {"status": "done", "stages": {
+                "tryon": {"status": "done", "file": str(out_file),
+                          "params_manifest": {}}}}
+        save_state(state_file, state)
+        bot._PHASE_A_OFFERED[ME] = bot._run_token(ME)
+
+        # Drop the second basket entry (the outfit2 job) — the app's DELETE
+        # /v1/draft/batch/{digest}.
+        view = self.store.view()
+        self.assertEqual(len(view["batch"]), 2)
+        self.store.drop_from_batch(view["batch"][1]["digest"])
+        self._mark_validated()
+
+        with mock.patch("tgbot.bot.start_drain") as fake_start_drain:
+            status, body = self.runs.confirm(
+                self.runs.run_id,
+                {"provider": "runpod", "panel_token": self.runs.panel_token()}, "k2")
+
+        self.assertEqual(status, 202)
+        self.assertEqual(body["outcome"], "started")
+        # The rewritten manifest has one run, not two — _do_confirm re-wrote
+        # it for the CURRENT (shrunk) draft instead of _do_resume re-renting
+        # the stale, two-run manifest still on disk.
+        rewritten = load_manifest(bot._job_manifest_path(ME))
+        self.assertEqual(len(rewritten.runs), 1)
+        self.assertEqual(rewritten.runs[0].id, manifest.runs[0].id)
+        # And it is the shrunk manifest that actually got rented, not just
+        # rewritten and ignored.
+        fake_start_drain.assert_called_once()
+        self.assertEqual(fake_start_drain.call_args.args[0], bot._job_manifest_path(ME))
 
 
 class TestBotLoopLocking(_AppRunsFixture):

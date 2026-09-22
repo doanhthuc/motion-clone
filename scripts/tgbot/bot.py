@@ -6889,6 +6889,27 @@ class AppRuns:
                                  "validate the draft first (POST /v1/draft/validate)")
         return jobs, None
 
+    def _phase_a_matches_draft(self) -> bool:
+        """True when the manifest Phase A already ran for is exactly the app's
+        current draft. False when the draft changed since — a job dropped via
+        DELETE /v1/draft/batch/{digest}, or added — in which case `confirm`
+        must not take the resume branch below: `_do_resume` re-rents the
+        manifest already on disk, which still names the dropped job. False
+        routes to the `else` branch instead, which already handles this
+        correctly: `_do_confirm` re-writes the manifest for the CURRENT
+        draft and offers its own reuse/rerun chooser for any job whose
+        try-on is still journalled `done` under its stable, content-hashed
+        run id (§5.10, slice 6).
+        """
+        jobs, validated, _ = self.drafts.runnable()
+        if validated is not True:
+            return False
+        try:
+            manifest = load_manifest(_job_manifest_path(self.chat_id))
+        except (ManifestError, OSError):
+            return False
+        return set(_unique_ids(jobs)) == {run.id for run in manifest.runs}
+
     def phase_a(self, key) -> tuple[int, dict]:
         replay = self.idem.begin("phase-a", key)
         if replay is not None:
@@ -6932,7 +6953,8 @@ class AppRuns:
                               "the job changed since the panel was read — read it again")
             elif (mismatch := _gpu_mismatch(body)) is not None:
                 out = mismatch
-            elif _PHASE_A_OFFERED.get(self.chat_id) == _run_token(self.chat_id):
+            elif (_PHASE_A_OFFERED.get(self.chat_id) == _run_token(self.chat_id)
+                    and self._phase_a_matches_draft()):
                 # The app's own chooser-less equivalent of the rent panel's
                 # spend button: Phase A already ran for this exact manifest,
                 # so this is a resume, never a fresh _do_confirm (see
