@@ -680,6 +680,31 @@ class TestTryonPreviews(_AppRunsFixture):
     def test_tryon_image_wrong_run_id_is_none(self):
         self.assertIsNone(self.runs.tryon_image("not-the-run-id", "0"))
 
+    def test_tryon_image_bot_busy_is_503_not_404(self):
+        # A lock timeout is "try again in a moment", not "no such image" —
+        # the two used to share one `None` return and a busy poll during a
+        # kill (slice 5 makes 60s+ lock holds routine) read as a vanished
+        # preview.
+        held, release = threading.Event(), threading.Event()
+
+        def hold() -> None:
+            with bot.BOT_LOCK:
+                held.set()
+                release.wait(5)
+
+        t = threading.Thread(target=hold)
+        t.start()
+        try:
+            self.assertTrue(held.wait(5))
+            with mock.patch.object(bot, "BOT_LOCK_TIMEOUT_SEC", 0.2):
+                with self.assertRaises(bot.ApiError) as ctx:
+                    self.runs.tryon_image(self.runs.run_id, "0")
+        finally:
+            release.set()
+            t.join(5)
+        self.assertEqual(ctx.exception.status, 503)
+        self.assertEqual(ctx.exception.code, "bot_busy")
+
 
 class TestRegenViaAppRuns(_AppRunsFixture):
     """`AppRuns.regen` — `_regen_tryon` itself, wrapped in the idempotency

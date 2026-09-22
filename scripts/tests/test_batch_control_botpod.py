@@ -369,6 +369,46 @@ class TestAppPodKill(_PodFixture):
         self.assertEqual(self.pod.last_kill["code"], "error")
 
 
+class TestKillSurvivesARestart(_PodFixture):
+    """A bot restart rebuilds `AppPod` from scratch (systemd's
+    `Restart=always` can land mid-destroy); `last_kill` must not silently
+    read back as "nothing happened" for a kill that may have finished a
+    moment before."""
+
+    def test_a_finished_kill_is_readable_by_a_new_apppod_instance(self):
+        self._live_drain()
+        self.assertEqual(self.pod.kill(self.pod.run_id, "k1")[0], 202)
+        self.pod._kill_thread.join(5)
+        original = self.pod.last_kill
+        self.assertIsNotNone(original)
+
+        # A fresh instance, as a restarted process would build — same chat,
+        # no state shared except what's on disk.
+        restarted = bot.AppPod(self.tg, ME, self.idem)
+        self.assertEqual(restarted.last_kill, original)
+        # Only the OUTCOME is restored; whether a kill is running right now
+        # in THIS process is not — a restart cannot know that, and claiming
+        # otherwise would be a lie in the direction that hides a live one.
+        self.assertIsNone(restarted._kill_thread)
+
+    def test_no_prior_kill_is_none_not_a_crash(self):
+        self.assertIsNone(bot.AppPod(self.tg, ME, self.idem).last_kill)
+
+    def test_a_corrupt_record_is_none_not_a_crash(self):
+        bot._kill_result_path(ME).parent.mkdir(parents=True, exist_ok=True)
+        bot._kill_result_path(ME).write_text("not json", encoding="utf-8")
+        self.assertIsNone(bot.AppPod(self.tg, ME, self.idem).last_kill)
+
+    def test_save_ignores_none_and_write_is_atomic(self):
+        # kill()'s early "nothing running" exit and the crash path both set
+        # last_kill before returning, so this only guards a hypothetical
+        # future caller — save(None) must be a no-op, not an empty file.
+        bot._save_kill_result(ME, None)
+        self.assertFalse(bot._kill_result_path(ME).exists())
+        self.assertFalse(bot._kill_result_path(ME).with_name(
+            bot._kill_result_path(ME).name + ".tmp").exists())
+
+
 class TestAppPodResume(_PodFixture):
     def setUp(self):
         super().setUp()
