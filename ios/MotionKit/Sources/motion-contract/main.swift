@@ -49,5 +49,29 @@ if let newestRun {
     print("skip GET /v1/runs/{id} (no runs on the server)")
 }
 await check("GET /v1/pod") { _ = try await client.get(PodStatus.self, "v1", "pod") }
-await check("GET /v1/outputs") { _ = try await client.get(OutputsResponse.self, "v1", "outputs") }
+var newestVideo: (batch: String, file: String)?
+await check("GET /v1/outputs") {
+    let batches = try await client.get(OutputsResponse.self, "v1", "outputs").outputs
+    for batch in batches {
+        if let file = batch.files.first(where: \.isVideo) {
+            newestVideo = (batch.batch, file.name)
+            break
+        }
+    }
+}
+if let newestVideo {
+    await check("GET /v1/outputs/{batch}/{video} Range") {
+        let response = try await client.byteRange(
+            from: 0, length: 1024, "v1", "outputs", newestVideo.batch, newestVideo.file)
+        guard response.acceptsRanges, response.totalLength != nil, !response.data.isEmpty else {
+            throw ContractError.invalidRangeResponse
+        }
+    }
+} else {
+    print("skip GET /v1/outputs/{batch}/{video} Range (no videos on the server)")
+}
 exit(failed == 0 ? 0 : 1)
+
+enum ContractError: Error {
+    case invalidRangeResponse
+}

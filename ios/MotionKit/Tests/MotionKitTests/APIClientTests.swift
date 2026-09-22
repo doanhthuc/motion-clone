@@ -84,6 +84,32 @@ extension URLProtocolTests {
         #expect(try Data(contentsOf: file) == Data([0, 1, 2]))
     }
 
+    @Test func byteRangeSendsAuthenticatedRangeAndParses206Metadata() async throws {
+        StubURLProtocol.install { request in
+            #expect(request.value(forHTTPHeaderField: "Range") == "bytes=100-199")
+            #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer bearer-789")
+            return (206, ["Content-Type": "video/mp4", "Accept-Ranges": "bytes",
+                          "Content-Range": "bytes 100-199/1000"], Data(repeating: 7, count: 100))
+        }
+        let response = try await TestSupport.client().byteRange(
+            from: 100, length: 100, "v1", "outputs", "batch", "clip.mp4")
+        #expect(response.data == Data(repeating: 7, count: 100))
+        #expect(response.contentType == "video/mp4")
+        #expect(response.totalLength == 1000)
+        #expect(response.acceptsRanges)
+    }
+
+    @Test func byteRangeCanRequestToEnd() async throws {
+        StubURLProtocol.install { request in
+            #expect(request.value(forHTTPHeaderField: "Range") == "bytes=900-")
+            return (206, ["Content-Range": "bytes 900-999/1000"], Data(repeating: 1, count: 100))
+        }
+        let response = try await TestSupport.client().byteRange(
+            from: 900, length: nil, "v1", "outputs", "batch", "clip.mp4")
+        #expect(response.totalLength == 1000)
+        #expect(response.acceptsRanges)
+    }
+
     @Test func userMessages() {
         #expect(APIError.server(status: 401, code: "unauthorized", message: "x").userMessage
                 == "Bearer token rejected — check Settings.")

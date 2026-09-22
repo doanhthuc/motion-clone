@@ -23,8 +23,3 @@ struct RootView: View {
         .background(Theme.bg)
     }
 }
-
-struct OutputsView: View {
-    let store: OutputsStore
-    var body: some View { Text("Outputs") }
-}

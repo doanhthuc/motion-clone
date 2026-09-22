@@ -1,5 +1,12 @@
 import Foundation
 
+public struct ByteRangeResponse: Sendable, Equatable {
+    public let data: Data
+    public let contentType: String?
+    public let totalLength: Int64?
+    public let acceptsRanges: Bool
+}
+
 public actor APIClient {
     public nonisolated let credentials: Credentials
     private let session: URLSession
@@ -58,6 +65,31 @@ public actor APIClient {
         try await send(url(components), extraHeaders: [:], okStatuses: [200]).0
     }
 
+    /// Fetches one byte range with the same Access and bearer headers as every
+    /// other request. Used by AVAssetResourceLoader for authenticated seeking.
+    public func byteRange(from offset: Int64, length: Int?,
+                          _ components: String...) async throws(APIError) -> ByteRangeResponse {
+        guard offset >= 0 else { throw .transport("invalid negative byte offset") }
+        var range = "bytes=\(offset)-"
+        if let length {
+            guard length > 0 else { throw .transport("invalid empty byte range") }
+            let (end, overflow) = offset.addingReportingOverflow(Int64(length - 1))
+            guard !overflow else { throw .transport("byte range overflow") }
+            range += "\(end)"
+        }
+        let (body, response) = try await send(
+            url(components), extraHeaders: ["Range": range], okStatuses: [206])
+        let contentRange = response.value(forHTTPHeaderField: "Content-Range")
+        let totalLength = contentRange.flatMap(Self.totalLength)
+        let acceptsRanges = response.statusCode == 206
+            || response.value(forHTTPHeaderField: "Accept-Ranges")?.lowercased() == "bytes"
+        return ByteRangeResponse(
+            data: body,
+            contentType: response.value(forHTTPHeaderField: "Content-Type"),
+            totalLength: totalLength,
+            acceptsRanges: acceptsRanges)
+    }
+
     /// Downloads to a temp file that keeps the source extension — Photos
     /// decides video vs image from it.
     public func download(_ components: String...) async throws(APIError) -> URL {
@@ -102,6 +134,12 @@ public actor APIClient {
         if status == 403 { return .accessDenied(status: status) }
         let text = String(decoding: body.prefix(200), as: UTF8.self)
         return .server(status: status, code: "http_\(status)", message: text)
+    }
+
+    private static func totalLength(_ contentRange: String) -> Int64? {
+        guard contentRange.lowercased().hasPrefix("bytes "),
+              let slash = contentRange.lastIndex(of: "/") else { return nil }
+        return Int64(contentRange[contentRange.index(after: slash)...])
     }
 
     private func decode<T: Decodable>(_ type: T.Type, _ data: Data) throws(APIError) -> T {
