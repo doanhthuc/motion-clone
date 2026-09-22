@@ -17,6 +17,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import control
+from batchlib.local_tryon import is_local_provider
 from batchlib.pipelines import PIPELINES, optional_roles, required_roles
 from control import materials
 from control.tryon_library import TryonLibrary
@@ -408,6 +409,22 @@ class DraftStore:
                                      f"{role} must be {role_kind(role)}, {path.name} is {probed.kind}")
             if provider is not None and _tryon_stage(target) is None:
                 raise DraftError("not_applicable", f"{target} has no try-on stage to pick a provider for")
+            # Both halves of the post-patch job, not the stored one: setting a
+            # seed and a local provider in the SAME patch is a good request.
+            #
+            # A seed beside a non-local provider is never read: runner.py's
+            # _local_tryon_stage only names a stage whose provider passes
+            # is_local_provider, so Phase A skips the run and the job goes on to
+            # a real, PAID pod try-on while the caller believes they asked for a
+            # reuse. Refuse loudly instead — the same call the bot's _regen_tryon
+            # already refuses with "not_local" for the same underlying condition.
+            resolved_provider = provider if provider is not None else d.job.provider
+            resolved_seed = seed_path if "tryon_seed" in body else d.job.tryon_seed
+            if (resolved_seed is not None and _tryon_stage(target) is not None
+                    and not is_local_provider(resolved_provider)):
+                raise DraftError("not_local",
+                                 "tryon_seed only applies to a local try-on provider "
+                                 "(gemini or qwen-max) — switch the provider first")
             # Re-checked under the lock, right before applying: ffprobe (above)
             # ran outside the lock, so a delete could land in the gap between
             # resolving/probing a path and getting here.

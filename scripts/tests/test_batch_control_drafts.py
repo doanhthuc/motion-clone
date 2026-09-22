@@ -365,6 +365,36 @@ class TestPatch(StoreCase):
                            {"provider": "qwen-max", "tryon_seed": "nope"})
         self.assertEqual(self.store.view()["provider"], "gemini")
 
+    def test_tryon_seed_needs_a_local_provider(self):
+        # Money is a first-class constraint: a seed sitting beside a non-local
+        # provider is never read by Phase A (runner.py's _local_tryon_stage
+        # only names a stage whose provider is_local_provider), so the job goes
+        # on to a real, paid pod try-on while the caller believes they asked
+        # for a reuse. Refuse loudly, the way _regen_tryon's "not_local" does.
+        self.fill()
+        self.store.patch({"provider": "qwen"})
+        self.assertRefused("not_local", self.store.patch, {"tryon_seed": self.saved_seed()})
+        self.assertIsNone(self.store._load().job.tryon_seed)
+
+    def test_provider_cannot_move_away_from_local_while_a_seed_is_set(self):
+        # The other direction of the same rule — otherwise the manifest ends up
+        # carrying BOTH a non-local provider and a seed the runner never sees.
+        self.fill()
+        self.store.patch({"tryon_seed": self.saved_seed()})
+        self.assertRefused("not_local", self.store.patch, {"provider": "qwen"})
+        d = self.store._load()
+        self.assertEqual(d.job.provider, "gemini")
+        self.assertIsNotNone(d.job.tryon_seed)
+
+    def test_seed_and_local_provider_in_one_patch_is_allowed(self):
+        # The check must read the POST-patch provider, not the stored one:
+        # setting both at once is a perfectly good request.
+        self.fill()
+        self.store.patch({"provider": "qwen"})
+        v = self.store.patch({"provider": "qwen-max", "tryon_seed": self.saved_seed()})
+        self.assertEqual(v["provider"], "qwen-max")
+        self.assertIsNotNone(self.store._load().job.tryon_seed)
+
     def test_tryon_seed_survives_add_to_batch(self):
         # copy_job must carry it, or the batch entry silently loses the seed and
         # re-spends on an image the user already has.
