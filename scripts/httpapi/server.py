@@ -21,6 +21,7 @@ import control.drafts as drafts
 import control.materials as materials
 import control.outputs as outputs
 import control.runs as runs
+import control.tryon_library as tryon_library
 import control.uploads as uploads
 from control.idempotency import IdempotencyError
 from httpapi.files import send_file
@@ -349,6 +350,36 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send_empty(204)
         if method == "GET" and rest == ["pipelines"]:
             return self._send_json(200, {"pipelines": drafts.pipeline_catalog()})
+        if method == "GET" and rest == ["tryon-library"]:
+            return self._send_json(200, {"entries": s.tryon_library.list()})
+        if method == "POST" and rest == ["tryon-library"]:
+            # No Idempotency-Key: this is a file copy of a preview already
+            # sitting on disk, not a spend — unlike phase-a/confirm/regen,
+            # which rent or drain a pod.
+            app_runs = self._app_runs()
+            body = self._read_json()
+            run_id, index = str(body.get("run_id") or ""), str(body.get("index") or "")
+            info = app_runs.tryon_save_info(index) if run_id == app_runs.run_id else None
+            if info is None:
+                raise NOT_FOUND
+            image, material_ids, provider = info
+            record = s.tryon_library.save(image=image, material_ids=material_ids, provider=provider)
+            return self._send_json(200, record)
+        if method == "GET" and len(rest) == 3 and rest[0] == "tryon-library" and rest[2] == "image":
+            image = s.tryon_library.resolve_image(rest[1])
+            if image is None:
+                raise NOT_FOUND
+            try:
+                self._settle_body()
+                return send_file(self, image)
+            except FileNotFoundError:
+                raise NOT_FOUND
+        if method == "DELETE" and len(rest) == 2 and rest[0] == "tryon-library":
+            try:
+                s.tryon_library.delete(rest[1])
+            except tryon_library.TryonLibraryError as exc:
+                raise ApiError(404 if exc.code == "not_found" else 400, exc.code, exc.message)
+            return self._send_json(200, {"ok": True})
         if rest[:1] == ["draft"]:
             return self._route_draft(method, rest[1:])
         raise NOT_FOUND
@@ -434,6 +465,7 @@ def make_server(*, token: str, batch_dir: Path, out_dir: Path,
     server.uploads_root = batch_dir / "uploads"
     server.thumbs_root = batch_dir / "thumbs"
     server.repo_root = batch_dir.parent
+    server.tryon_library = tryon_library.TryonLibrary(batch_dir / "tryon-library", materials.APP_OWNER)
     server.drafts = drafts.DraftStore(
         batch_dir, server.staging_root, materials.APP_OWNER,
         default_pipeline=default_pipeline, default_provider=default_provider,

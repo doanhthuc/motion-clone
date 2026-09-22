@@ -7101,6 +7101,32 @@ class AppRuns:
             return None
         return image
 
+    def tryon_save_info(self, index: str) -> tuple[Path, dict, str] | None:
+        """(image_path, material_ids, provider) for the current try-on
+        preview at `index`, for the try-on library to save — or `None` when
+        there is no such preview. Reuses `tryon_image`'s own resolution so
+        the two routes can never disagree about which file "the current
+        preview at this index" means (§5.10)."""
+        image = self.tryon_image(self.run_id, index)
+        if image is None:
+            return None
+        match = next(((r, e) for i, r, _s, e in self._tryon_entries() if i == index), None)
+        if match is None:
+            return None
+        run, entry = match
+        # "driver" is the video the motion transfer runs against, not
+        # material the try-on image is made of — VIDEO_ROLES in
+        # control/drafts.py draws the same line.
+        material_ids = {role: f"app/{path.name}" for role, path in run.inputs.items()
+                        if role != "driver"}
+        # Not job.py's DEFAULT_PROVIDER ("qwen", self-host — needs the pod):
+        # _tryon_entries only ever finds runs a LOCAL try-on stage produced
+        # (_local_tryon_stage), so params_manifest always names gemini or
+        # qwen-max here; "gemini" is a defensive fallback, never the real
+        # answer to "which provider made this image".
+        provider = str(entry.get("params_manifest", {}).get("provider") or "gemini")
+        return image, material_ids, provider
+
     def regen(self, run_id: str, index: str, body: dict, key) -> tuple[int, dict]:
         """Regenerate one run's try-on image — `_regen_tryon` itself,
         wrapped the same way `confirm` wraps `_do_confirm`/`_do_resume`."""

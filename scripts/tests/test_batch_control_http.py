@@ -808,6 +808,7 @@ class FakeAppRuns:
 
     def __init__(self):
         self.calls = []
+        self.run_id = "tg-1"
         self.phase_a_response = (202, {"run_id": "tg-1", "outcome": "started"})
         self.confirm_response = (202, {"run_id": "tg-1", "outcome": "started"})
         self.rent_panel_response = (200, {"run_id": "tg-1", "panel_token": "p1"})
@@ -815,6 +816,7 @@ class FakeAppRuns:
         self.regen_response = (202, {"run_id": "tg-1", "outcome": "started"})
         self.tryon_image_path = None
         self.tryon_image_error = None
+        self.tryon_save_info_result = None
 
     def phase_a(self, key):
         self.calls.append(("phase_a", key))
@@ -841,6 +843,10 @@ class FakeAppRuns:
     def regen(self, run_id, index, body, key):
         self.calls.append(("regen", run_id, index, body, key))
         return self.regen_response
+
+    def tryon_save_info(self, index):
+        self.calls.append(("tryon_save_info", index))
+        return self.tryon_save_info_result
 
 
 class TestAppRunRoutes(HttpWriteBase):
@@ -946,6 +952,81 @@ class TestAppRunRoutes(HttpWriteBase):
         self.assertEqual(resp.getheader("Connection"), "close")
 
 
+class TestTryonLibraryRoutes(HttpWriteBase):
+    """§5.10: a saved try-on entry that outlives one draft — separate from
+    AppRuns's per-run previews, so listing/reading/deleting an entry works
+    even with `app_runs` unset; only the save itself needs AppRuns to hand
+    back the preview file (`FakeAppRuns.tryon_save_info`)."""
+
+    def setUp(self):
+        self.fake = FakeAppRuns()
+        super().setUp()
+        self.server.app_runs = self.fake
+
+    def request(self, method, path, body=None):
+        resp, data = self.send(method, path, json_body=body) if body is not None \
+            else self.send(method, path)
+        return resp.status, (json.loads(data) if data else None)
+
+    def test_tryon_library_round_trip(self):
+        # Seed one preview the fake AppRuns can hand back.
+        image = self.batch / "preview.png"
+        image.write_bytes(b"preview-bytes")
+        self.fake.tryon_save_info_result = (image, {"character": "app/c.png"}, "gemini")
+
+        status, body = self.request("POST", "/v1/tryon-library", {"run_id": "tg-1", "index": "0"})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.fake.calls, [("tryon_save_info", "0")])
+        self.assertEqual(body["material_ids"], {"character": "app/c.png"})
+        self.assertEqual(body["provider"], "gemini")
+        entry_id = body["id"]
+
+        status, listed = self.request("GET", "/v1/tryon-library")
+        self.assertEqual(status, 200)
+        self.assertEqual([e["id"] for e in listed["entries"]], [entry_id])
+
+        resp, image_body = self.send("GET", f"/v1/tryon-library/{entry_id}/image")
+        self.assertEqual((resp.status, image_body), (200, b"preview-bytes"))
+
+        status, _ = self.request("DELETE", f"/v1/tryon-library/{entry_id}")
+        self.assertEqual(status, 200)
+        status, listed = self.request("GET", "/v1/tryon-library")
+        self.assertEqual(listed["entries"], [])
+
+    def test_tryon_library_save_with_no_such_preview_is_404(self):
+        self.fake.tryon_save_info_result = None
+        status, body = self.request("POST", "/v1/tryon-library", {"run_id": "tg-1", "index": "0"})
+        self.assertEqual((status, body["error"]["code"]), (404, "not_found"))
+
+    def test_tryon_library_save_wrong_run_id_is_404_and_never_reaches_app_runs(self):
+        # A stale run_id (e.g. a panel from a chat that has since restarted)
+        # must not fall through to whatever preview `tryon_save_info` would
+        # happen to return for the wrong run.
+        image = self.batch / "preview.png"
+        image.write_bytes(b"preview-bytes")
+        self.fake.tryon_save_info_result = (image, {}, "gemini")
+        status, body = self.request("POST", "/v1/tryon-library", {"run_id": "tg-9", "index": "0"})
+        self.assertEqual((status, body["error"]["code"]), (404, "not_found"))
+        self.assertEqual(self.fake.calls, [])
+
+    def test_tryon_library_image_of_unknown_id_is_404(self):
+        status, body = self.request("GET", "/v1/tryon-library/nope/image")
+        self.assertEqual((status, body["error"]["code"]), (404, "not_found"))
+
+    def test_tryon_library_delete_of_unknown_id_is_404(self):
+        status, body = self.request("DELETE", "/v1/tryon-library/nope")
+        self.assertEqual((status, body["error"]["code"]), (404, "not_found"))
+
+    def test_post_tryon_library_needs_no_idempotency_key(self):
+        # A file copy, not a spend — unlike phase-a/confirm/regen, this route
+        # must not gate on Idempotency-Key.
+        image = self.batch / "preview.png"
+        image.write_bytes(b"preview-bytes")
+        self.fake.tryon_save_info_result = (image, {}, "gemini")
+        status, body = self.request("POST", "/v1/tryon-library", {"run_id": "tg-1", "index": "0"})
+        self.assertEqual(status, 200)
+
+
 class TestAppRunRoutesUnavailable(HttpWriteBase):
     def test_every_new_route_is_503_when_app_runs_is_unset(self):
         cases = [
@@ -957,12 +1038,23 @@ class TestAppRunRoutesUnavailable(HttpWriteBase):
             ("GET", "/v1/runs/tg-1/tryon/0", {}, None),
             ("POST", "/v1/runs/tg-1/tryon/0/regen", {"Idempotency-Key": "k3"},
              {"run_token": "rt1"}),
+            ("POST", "/v1/tryon-library", {}, {"run_id": "tg-1", "index": "0"}),
         ]
         for method, path, headers, payload in cases:
             with self.subTest(method=method, path=path):
                 resp, body = self.send(method, path, headers=headers, json_body=payload)
                 self.assertEqual(resp.status, 503, path)
                 self.assertEqual(json.loads(body)["error"]["code"], "runs_unavailable", path)
+
+    def test_tryon_library_list_read_delete_work_without_app_runs(self):
+        # Only the save itself asks AppRuns for the preview; the rest of the
+        # library is independent state and must not 503 alongside it.
+        resp, body = self.send("GET", "/v1/tryon-library")
+        self.assertEqual((resp.status, json.loads(body)), (200, {"entries": []}))
+        resp, body = self.send("GET", "/v1/tryon-library/nope/image")
+        self.assertEqual(resp.status, 404)
+        resp, body = self.send("DELETE", "/v1/tryon-library/nope")
+        self.assertEqual(resp.status, 404)
 
 
 class FakeAppPod:
