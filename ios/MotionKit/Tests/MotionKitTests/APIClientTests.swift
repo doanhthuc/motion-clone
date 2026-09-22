@@ -138,6 +138,41 @@ extension URLProtocolTests {
         #expect(request.value(forHTTPHeaderField: "CF-Access-Client-Id") == "id-123")
     }
 
+    @Test func patchEncodesJSONAndAuthHeaders() async throws {
+        StubURLProtocol.install { _ in TestSupport.json(Fixtures.draft) }
+        _ = try await TestSupport.client().patch(
+            Draft.self, body: SlotPatch(role: "driver", materialID: "app/dance.mp4"),
+            "v1", "draft")
+        let request = try #require(StubURLProtocol.requests.first)
+        #expect(request.httpMethod == "PATCH")
+        #expect(request.value(forHTTPHeaderField: "Content-Type") == "application/json")
+        #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer bearer-789")
+        let data = try #require(request.httpBody)
+        let json = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let slots = try #require(json["slots"] as? [String: Any])
+        #expect(slots["driver"] as? String == "app/dance.mp4")
+    }
+
+    @Test func patchPreservesExplicitNullSlot() async throws {
+        StubURLProtocol.install { _ in TestSupport.json(Fixtures.draft) }
+        _ = try await TestSupport.client().patch(
+            Draft.self, body: SlotPatch(role: "outfit", materialID: nil), "v1", "draft")
+        let data = try #require(StubURLProtocol.requests.first?.httpBody)
+        let json = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let slots = try #require(json["slots"] as? [String: Any])
+        #expect(slots["outfit"] is NSNull)
+    }
+
+    @Test func decodedDeleteAccepts200AndEncodesDigest() async throws {
+        StubURLProtocol.install { _ in TestSupport.json(Fixtures.draft) }
+        let draft = try await TestSupport.client().delete(
+            Draft.self, "v1", "draft", "batch", "a/b c")
+        #expect(draft.generation == 4)
+        let request = try #require(StubURLProtocol.requests.first)
+        #expect(request.httpMethod == "DELETE")
+        #expect(request.url?.absoluteString.hasSuffix("/v1/draft/batch/a%2Fb%20c") == true)
+    }
+
     @Test func putSendsExactBinaryBodyAndAuth() async throws {
         StubURLProtocol.install { _ in TestSupport.json(#"{"received":1}"#) }
         let body = Data([0, 1, 2, 255])

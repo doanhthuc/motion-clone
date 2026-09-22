@@ -90,6 +90,23 @@ public actor APIClient {
         return try decode(response, data)
     }
 
+    public func patch<Response: Decodable & Sendable, Body: Encodable & Sendable>(
+        _ response: Response.Type, body: Body, _ components: String...
+    ) async throws(APIError) -> Response {
+        let encoded: Data
+        do {
+            let encoder = JSONEncoder()
+            encoder.keyEncodingStrategy = .convertToSnakeCase
+            encoded = try encoder.encode(body)
+        } catch {
+            throw .transport("couldn't encode the request: \(error.localizedDescription)")
+        }
+        let (data, _) = try await send(
+            url(components), method: "PATCH", body: encoded, contentType: "application/json",
+            extraHeaders: [:], okStatuses: [200])
+        return try decode(response, data)
+    }
+
     public func put(data: Data, _ components: String...) async throws(APIError) {
         _ = try await send(
             url(components), method: "PUT", body: data, contentType: "application/octet-stream",
@@ -99,6 +116,14 @@ public actor APIClient {
     public func delete(_ components: String...) async throws(APIError) {
         _ = try await send(
             url(components), method: "DELETE", extraHeaders: [:], okStatuses: [204])
+    }
+
+    public func delete<Response: Decodable & Sendable>(
+        _ response: Response.Type, _ components: String...
+    ) async throws(APIError) -> Response {
+        let (data, _) = try await send(
+            url(components), method: "DELETE", extraHeaders: [:], okStatuses: [200])
+        return try decode(response, data)
     }
 
     /// Fetches one byte range with the same Access and bearer headers as every
