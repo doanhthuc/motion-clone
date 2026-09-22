@@ -1,0 +1,6 @@
+Secrets.xcconfig
+MotionApp.xcodeproj/
+MotionApp/Info.plist
+MotionKit/.build/
+MotionKit/.swiftpm/
+.build-sim/
