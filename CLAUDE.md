@@ -12,6 +12,8 @@ deployed to different machines:
 - `motions/` — Nuxt 4 frontend. Runs **locally** (`make dev` → localhost:2030), or optionally on the pod.
 - `motions-studio/` — the whole backend (Express API + Postgres + MinIO + ComfyUI + Python worker).
   Needs an NVIDIA GPU ≥24GB VRAM, so it runs on a **rented GPU pod** (RunPod), never on the dev machine.
+- `ios/` — the native iPhone app (SwiftUI + the `MotionKit` package). Talks only to the control-plane
+  API on `motion-vps`, never to a pod. `ios/README.md` covers build and install.
 - Root `Makefile` + `scripts/` — pod lifecycle, gates, and the batch runner. This layer is repo-specific
   glue and is where most infra work happens.
 
@@ -64,6 +66,10 @@ make check-comfy-nodes                            # the 4 ComfyUI custom-node li
 make check-batch-params                           # scripts/batch-params.json vs linux.py
 make check-vast-models                            # scripts/batchlib/vast_models.py vs PIPELINES/catalog
 make batch-coverage [FULL=1]
+make ios-test                                     # MotionKit logic (swift test, no simulator)
+make ios-audio-test                               # Silent Mode playback regression (booted simulator)
+make ios-build                                    # app compiles for the simulator (runs ios-gen)
+make ios-contract                                 # live phone API decodes with the app's models (GET only)
 motions-studio/setup/scrub-secrets.sh --check     # MUST exit 0 before every commit — repo is public
 
 # Backend unit tests (pure-python, no GPU)
@@ -142,9 +148,9 @@ resubmitting, so a batch interrupted at minute 39 of a 40-minute job doesn't res
 concurrently — the pod has one GPU and `run_enhance` calls `comfy_recycle`, which assumes exclusive use.
 
 An MCP server (`.mcp.json` → `scripts/batch_mcp.py`) exposes `batch_validate` / `batch_run` /
-`batch_status` / `batch_rerun`. **Editing `batchlib/mcp_tools.py` requires restarting Claude Code** —
-the server process stays alive for the session and keeps the old module in memory. `make batch-mcp-check`
-will NOT catch this (it spawns a fresh process). Full guide: `docs/batch-runner.md`.
+`batch_status` / `batch_rerun`. **Editing `batchlib/mcp_tools.py` requires restarting the agent's
+session** — the server process stays alive for the session and keeps the old module in memory.
+`make batch-mcp-check` will NOT catch this (it spawns a fresh process). Full guide: `docs/batch-runner.md`.
 
 ### Telegram bot & phone control-plane API (`scripts/tgbot/`, `scripts/control/`, `scripts/httpapi/`)
 
