@@ -21,6 +21,7 @@ final class AppModel {
     private(set) var pod: PodStore?
     private(set) var materials: MaterialsStore?
     private(set) var outputs: OutputsStore?
+    private var materialResumeTask: Task<Void, Never>?
 
     init() {
         vault.seedIfEmpty(from: Bundle.main.infoDictionary ?? [:])
@@ -28,6 +29,8 @@ final class AppModel {
     }
 
     func reconnect() {
+        materialResumeTask?.cancel()
+        materialResumeTask = nil
         guard let credentials = vault.load() else {
             client = nil; runs = nil; pod = nil; materials = nil; outputs = nil
             return
@@ -38,5 +41,14 @@ final class AppModel {
         pod = PodStore(client: client)
         materials = MaterialsStore(client: client)
         outputs = OutputsStore(client: client)
+        resumeMaterialsUpload()
+    }
+
+    func resumeMaterialsUpload() {
+        guard materialResumeTask == nil, let materials else { return }
+        materialResumeTask = Task { [weak self] in
+            await materials.resumePendingUpload()
+            self?.materialResumeTask = nil
+        }
     }
 }

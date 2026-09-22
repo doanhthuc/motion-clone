@@ -58,7 +58,8 @@ extension URLProtocolTests {
             case ("POST", "/v1/uploads/abc123/complete"):
                 return TestSupport.json(#"{"material":{"id":"app/driver.mp4","owner":"app","name":"driver.mp4","bytes":12,"updated_at":1790000200,"kind":"video"},"probe":{"kind":"video","width":1080,"height":1920,"duration_s":2,"bitrate_kbps":4200,"size_bytes":12,"warning":"Low bitrate."}}"#, status: 201)
             case ("GET", "/v1/materials"):
-                return TestSupport.json(#"{"materials":[{"id":"app/driver.mp4","owner":"app","name":"driver.mp4","bytes":12,"updated_at":1790000200,"kind":"video"}]}"#)
+                return TestSupport.json(
+                    #"{"error":{"code":"offline","message":"list unavailable"}}"#, status: 502)
             default:
                 return TestSupport.json(#"{"error":{"code":"unexpected","message":"unexpected request"}}"#, status: 500)
             }
@@ -74,7 +75,7 @@ extension URLProtocolTests {
         #expect(store.materials.map(\.id) == ["app/driver.mp4"])
         #expect(store.uploadProgress?.phase == .complete)
         #expect(store.warning(for: "app/driver.mp4") == "Low bitrate.")
-        #expect(!store.isUploading && store.errorMessage == nil)
+        #expect(!store.isUploading && store.isStale)
     }
 
     @Test func deleteHonorsOwnershipAndServerOutcomes() async throws {

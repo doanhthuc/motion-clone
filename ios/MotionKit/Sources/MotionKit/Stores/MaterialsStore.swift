@@ -65,7 +65,7 @@ public final class MaterialsStore {
         do {
             let completed = try await uploader.start(
                 fileURL: fileURL, fileName: fileName, progress: progressHandler())
-            retainWarning(from: completed)
+            accept(completed)
             hasPendingUpload = false
             await refresh()
         } catch {
@@ -83,7 +83,7 @@ public final class MaterialsStore {
         defer { isUploading = false }
         do {
             if let completed = try await uploader.resume(progress: progressHandler()) {
-                retainWarning(from: completed)
+                accept(completed)
                 hasPendingUpload = false
                 await refresh()
             }
@@ -130,9 +130,16 @@ public final class MaterialsStore {
         }
     }
 
-    private func retainWarning(from completed: UploadCompleteResponse) {
-        guard !completed.probe.warning.isEmpty else { return }
-        warnings[completed.material.id] = completed.probe.warning
+    private func accept(_ completed: UploadCompleteResponse) {
+        if let index = materials.firstIndex(where: { $0.id == completed.material.id }) {
+            materials[index] = completed.material
+        } else {
+            materials.insert(completed.material, at: 0)
+        }
+        loaded = true
+        if !completed.probe.warning.isEmpty {
+            warnings[completed.material.id] = completed.probe.warning
+        }
     }
 
     private static func message(for error: any Error) -> String {

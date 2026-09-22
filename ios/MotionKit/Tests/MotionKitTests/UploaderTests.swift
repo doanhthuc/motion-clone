@@ -45,6 +45,10 @@ extension URLProtocolTests {
         var current: Int { lock.withLock { value } }
     }
 
+    final class RequestGate: @unchecked Sendable {
+        let release = DispatchSemaphore(value: 0)
+    }
+
     actor ProgressRecorder {
         var values: [UploadProgress] = []
         func append(_ value: UploadProgress) { values.append(value) }
@@ -58,7 +62,8 @@ extension URLProtocolTests {
         return (parent, file)
     }
 
-    private func response(_ request: URLRequest, received: [Int] = [0])
+    private func response(_ request: URLRequest, received: [Int] = [0],
+                          statusFileName: String = "driver.mp4")
         -> (Int, [String: String], Data) {
         let path = request.url?.path ?? ""
         if request.httpMethod == "POST", path == "/v1/uploads" {
@@ -68,7 +73,7 @@ extension URLProtocolTests {
         if request.httpMethod == "GET", path == "/v1/uploads/abc123" {
             let got = received.map(String.init).joined(separator: ",")
             return TestSupport.json(
-                #"{"upload_id":"abc123","file_name":"driver.mp4","size":12,"chunk_size":4,"chunks_total":3,"received":[\#(got)]}"#)
+                #"{"upload_id":"abc123","file_name":"\#(statusFileName)","size":12,"chunk_size":4,"chunks_total":3,"received":[\#(got)]}"#)
         }
         if request.httpMethod == "PUT" { return TestSupport.json(#"{"received":1}"#) }
         if request.httpMethod == "POST", path.hasSuffix("/complete") {
@@ -131,6 +136,48 @@ extension URLProtocolTests {
         #expect(result?.material.name == "driver.mp4")
         #expect(!StubURLProtocol.requests.contains { $0.url?.path.hasSuffix("/chunks/0") == true })
         #expect(try journal.load() == nil)
+    }
+
+    @Test func acceptsTheCanonicalFilenameReturnedByTheServer() async throws {
+        let (parent, file) = try source()
+        defer { try? FileManager.default.removeItem(at: parent) }
+        StubURLProtocol.install { request in
+            response(request, statusFileName: "ao_dai.mp4")
+        }
+        let journal = UploadCheckpointJournal(root: parent.appending(component: "journal"))
+
+        let result = try await Uploader(client: TestSupport.client(), journal: journal).start(
+            fileURL: file, fileName: "áo dài.mp4") { _ in }
+
+        #expect(result.material.name == "driver.mp4")
+    }
+
+    @Test func actorRejectsASecondStartWhileTheFirstAwaitsNetwork() async throws {
+        let (parent, file) = try source()
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let counter = LockedCounter()
+        let gate = RequestGate()
+        StubURLProtocol.install { request in
+            if request.httpMethod == "POST", request.url?.path == "/v1/uploads",
+               counter.increment() == 1 {
+                gate.release.wait()
+            }
+            return response(request, received: [])
+        }
+        let uploader = Uploader(
+            client: TestSupport.client(),
+            journal: UploadCheckpointJournal(root: parent.appending(component: "journal")))
+        let first = Task {
+            try await uploader.start(fileURL: file, fileName: "driver.mp4") { _ in }
+        }
+        while StubURLProtocol.requests.isEmpty { await Task.yield() }
+
+        await #expect(throws: UploadFailure.uploadInProgress) {
+            _ = try await uploader.start(fileURL: file, fileName: "second.mp4") { _ in }
+        }
+        #expect(StubURLProtocol.requests.count == 1)
+        gate.release.signal()
+        _ = try await first.value
     }
 
     @Test func resumeRefusesChangedFileBeforeNetwork() async throws {

@@ -22,6 +22,12 @@ struct ImportedMedia: Transferable, Sendable {
 }
 
 enum ImportStaging {
+    static func stageAsync(_ source: URL, securityScoped: Bool) async throws -> ImportedMedia {
+        try await Task.detached(priority: .userInitiated) {
+            try stage(source, securityScoped: securityScoped)
+        }.value
+    }
+
     static func stage(_ source: URL, securityScoped: Bool) throws -> ImportedMedia {
         let accessed = securityScoped && source.startAccessingSecurityScopedResource()
         defer { if accessed { source.stopAccessingSecurityScopedResource() } }

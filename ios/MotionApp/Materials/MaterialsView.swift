@@ -5,7 +5,6 @@ import UniformTypeIdentifiers
 
 struct MaterialsView: View {
     let store: MaterialsStore
-    @Environment(\.scenePhase) private var scenePhase
     @State private var photoItem: PhotosPickerItem?
     @State private var showFiles = false
     @State private var deleteCandidate: MotionKit.Material?
@@ -56,13 +55,7 @@ struct MaterialsView: View {
             allowsMultipleSelection: false,
             onCompletion: importFile)
         .onChange(of: photoItem) { _, item in importPhoto(item) }
-        .onChange(of: scenePhase) { _, phase in
-            if phase == .active { Task { await store.resumePendingUpload() } }
-        }
-        .task {
-            await store.refresh()
-            await store.resumePendingUpload()
-        }
+        .task { await store.refresh() }
         .confirmationDialog(
             "Delete this material?",
             isPresented: Binding(
@@ -168,8 +161,15 @@ struct MaterialsView: View {
     private func importFile(_ result: Result<[URL], any Error>) {
         do {
             guard let source = try result.get().first else { return }
-            let imported = try ImportStaging.stage(source, securityScoped: true)
-            Task { await upload(imported) }
+            Task {
+                do {
+                    let imported = try await ImportStaging.stageAsync(
+                        source, securityScoped: true)
+                    await upload(imported)
+                } catch {
+                    importError = error.localizedDescription
+                }
+            }
         } catch {
             importError = error.localizedDescription
         }

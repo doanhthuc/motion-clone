@@ -73,6 +73,7 @@ public actor Uploader {
 
     private let client: APIClient
     private let journal: UploadCheckpointJournal
+    private var isActive = false
 
     public init(client: APIClient, journal: UploadCheckpointJournal = UploadCheckpointJournal()) {
         self.client = client
@@ -89,6 +90,8 @@ public actor Uploader {
 
     public func start(fileURL: URL, fileName: String,
                       progress: ProgressHandler) async throws -> UploadCompleteResponse {
+        try beginOperation()
+        defer { isActive = false }
         guard (try journal.load()) == nil else { throw UploadFailure.uploadInProgress }
         let size = try Self.regularFileSize(fileURL)
         await progress(UploadProgress(
@@ -109,6 +112,8 @@ public actor Uploader {
     }
 
     public func resume(progress: ProgressHandler) async throws -> UploadCompleteResponse? {
+        try beginOperation()
+        defer { isActive = false }
         guard let checkpoint = try journal.load() else { return nil }
         return try await transfer(checkpoint, progress: progress, allowIncompleteRetry: true)
     }
@@ -140,7 +145,6 @@ public actor Uploader {
             return completed
         }
         guard status.uploadId == checkpoint.uploadId,
-              status.fileName == checkpoint.fileName,
               status.size == checkpoint.fileSize else {
             throw UploadFailure.invalidLocalFile("server upload metadata does not match the saved file")
         }
@@ -189,6 +193,11 @@ public actor Uploader {
             throw UploadFailure.invalidLocalFile("select a non-empty regular file")
         }
         return Int64(size)
+    }
+
+    private func beginOperation() throws {
+        guard !isActive else { throw UploadFailure.uploadInProgress }
+        isActive = true
     }
 
     private static func readChunk(_ url: URL, plan: ChunkPlan, index: Int) throws -> Data {
