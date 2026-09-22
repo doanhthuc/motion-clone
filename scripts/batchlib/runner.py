@@ -588,6 +588,14 @@ def run_local_phase(*, settings: Settings, manifest: Manifest, out_root: Path, b
         with lock:
             entry = state["runs"].setdefault(run.id, {"status": "pending", "stages": {}})
             recorded = entry["stages"].get(stage_name) or {}
+            # §5.10, slice 6: a guidance chip for ONE regenerate call, popped
+            # exactly once so a later resume never reapplies stale guidance.
+            regen_guidance = (entry.pop("regen_guidance", None) or {}).get(stage_name)
+            if regen_guidance:
+                save_state(state_file, state)
+        if regen_guidance:
+            params = dict(params)
+            params.update(regen_guidance)
         run_dir = out_dir / "runs" / run.id
         run_dir.mkdir(parents=True, exist_ok=True)
         log_file = run_dir / "run.log"

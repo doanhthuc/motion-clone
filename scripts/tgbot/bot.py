@@ -3129,14 +3129,14 @@ def _regen_tryon(tg: Tg, chat_id: int, index: str, token: str, *,
                        f"{run.id}'s try-on no longer runs over the API "
                        "(its provider changed), so there is nothing to "
                        "regenerate here.")
+    guidance_params = None
     if guidance:
         unknown = [g for g in guidance if g not in _GUIDANCE_FLAGS]
         if unknown:
             return _refuse(tg, chat_id, "bad_request",
                            f"unknown guidance value(s): {', '.join(unknown)} — only "
                            f"{', '.join(sorted(_GUIDANCE_FLAGS))} are accepted")
-        run.stage_params.setdefault(stage_name, {}).update(
-            {_GUIDANCE_FLAGS[g]: "1" for g in guidance})
+        guidance_params = {_GUIDANCE_FLAGS[g]: "1" for g in guidance}
 
     state_file = state_path_for(manifest_path)
     state = load_state(state_file)
@@ -3166,6 +3166,14 @@ def _regen_tryon(tg: Tg, chat_id: int, index: str, token: str, *,
              "entry": recorded, "run_status": entry.get("status"),
              "run_error": entry.get("error")}
     stages.pop(stage_name, None)
+    if guidance_params:
+        # Persisted through the journal, not the manifest: start_phase_a's
+        # subprocess re-reads the manifest fresh from disk, and this function
+        # has no Job list to rewrite it from (unlike _do_phase_a/_do_confirm,
+        # which always render a live manifest from Job objects before
+        # spawning). runner.py's _one() pops this exactly once and merges it
+        # into the effective params for this one regenerate call only.
+        entry["regen_guidance"] = {stage_name: guidance_params}
     save_state(state_file, state)
 
     # Seeded with every OTHER image already previewed, so the re-run sends

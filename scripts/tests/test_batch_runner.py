@@ -1385,6 +1385,43 @@ class TestRunLocalPhase(unittest.TestCase):
             self.assertEqual(load_state(result.state_file)["runs"]["runA"]["stages"]["tryon"],
                              stage)
 
+    def test_regen_guidance_in_the_journal_reaches_run_local_tryon_once(self):
+        # §5.10, slice 6: _regen_tryon persists a guided regenerate's flags
+        # into the journal (it has no Job list to rewrite the manifest from,
+        # and start_phase_a's subprocess re-reads the manifest fresh from
+        # disk). _one() must pop them exactly once and merge them into the
+        # ACTUAL params dict run_local_tryon receives.
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            manifest = load_manifest(_fixture_tryon(tmp, MANIFEST_TRYON_GEMINI))
+            state_file = state_path_for(manifest.path)
+            save_state(state_file, {"version": 1, "runs": {
+                "runA": {"status": "pending", "stages": {},
+                        "regen_guidance": {"tryon": {"keepFace": "1",
+                                                     "tighterCrop": "1"}}}}})
+
+            received = []
+
+            def fake_run_local_tryon(run, params, settings_, out_path):
+                received.append(dict(params))
+                out_path.write_bytes(b"ok")
+                return 1, 2
+
+            with mock.patch("batchlib.runner.run_local_tryon", fake_run_local_tryon):
+                result = run_local_phase(settings=GEMINI_SETTINGS, manifest=manifest,
+                                         out_root=tmp / "out", batch_id="2026-09-22-0100",
+                                         resume=True, log=lambda _m: None)
+
+            self.assertEqual(result.done, ["runA"])
+            self.assertEqual(len(received), 1)
+            self.assertEqual(received[0]["keepFace"], "1")
+            self.assertEqual(received[0]["tighterCrop"], "1")
+            # Popped exactly once, from both the in-memory and the on-disk
+            # journal — a later resume must never reapply stale guidance.
+            self.assertNotIn("regen_guidance", result.state["runs"]["runA"])
+            self.assertNotIn("regen_guidance",
+                             load_state(result.state_file)["runs"]["runA"])
+
     def test_seed_image_missing_file_is_a_run_error_not_a_silent_gemini_call(self):
         # A vanished seed MUST be a run error. Falling through to run_local_tryon
         # here spends real quota on the very image the user asked to reuse.

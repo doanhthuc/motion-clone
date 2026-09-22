@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from batchlib.manifest import load_manifest, save_state, state_path_for
+from batchlib.manifest import load_manifest, load_state, save_state, state_path_for
 from batchlib_ext.gpu_stock import Stock
 from batchlib_ext.handoff import mailbox_path
 import control.drafts as drafts
@@ -872,6 +872,23 @@ class TestRegenViaAppRuns(_AppRunsFixture):
                              "guidance": ["keep_face", "tighter_crop"]}, "k2")
         _args, kwargs = fake_regen.call_args
         self.assertEqual(kwargs.get("guidance"), ["keep_face", "tighter_crop"])
+
+    def test_regen_with_guidance_persists_it_into_the_journal(self):
+        # _regen_tryon has no Job list to rewrite the manifest from (unlike
+        # _retry_tryon's provider switch), and start_phase_a's subprocess
+        # re-reads the manifest fresh from disk — so guidance must survive
+        # through the journal write _regen_tryon already makes, not a
+        # manifest edit that never reaches disk. Real _regen_tryon here
+        # (not mocked), so this exercises the actual persistence.
+        run_id = self._seed_tryon_run()
+        token = bot._run_token(ME)
+        status, _body = self.runs.regen(
+            self.runs.run_id, "0",
+            {"run_token": token, "guidance": ["keep_face", "tighter_crop"]}, "k-guidance")
+        self.assertEqual(status, 202)
+        state = load_state(state_path_for(self._live()))
+        self.assertEqual(state["runs"][run_id]["regen_guidance"],
+                         {"tryon": {"keepFace": "1", "tighterCrop": "1"}})
 
 
 class TestTryonVersionImage(_AppRunsFixture):
