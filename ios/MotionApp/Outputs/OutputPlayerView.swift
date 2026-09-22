@@ -54,6 +54,7 @@ struct OutputPlayerView: View {
 
     private func load() async {
         if file.isVideo {
+            try? PlaybackAudioSession.configure()
             let loader = AuthenticatedAssetResourceLoader(client: client, batch: batch, fileName: file.name)
             resourceLoader = loader
             let p = AVPlayer(playerItem: AVPlayerItem(asset: loader.makeAsset()))

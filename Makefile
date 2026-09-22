@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: gpu-facelock batch-mcp-check batch-coverage check-comfy-nodes help setup dev down clean gpu-preflight gpu-provision gpu-wait gpu-bootstrap gpu-fe gpu-up gpu-down gpu-destroy gpu-db-dump gpu-db-check gpu-status gpu-logs batch-test batch-params check-batch-params check-vast-models batch-scan batch-validate batch batch-clean watchdog-dry drain bot-dry api-smoke ios-test ios-secrets ios-contract ios-gen ios-build
+.PHONY: gpu-facelock batch-mcp-check batch-coverage check-comfy-nodes help setup dev down clean gpu-preflight gpu-provision gpu-wait gpu-bootstrap gpu-fe gpu-up gpu-down gpu-destroy gpu-db-dump gpu-db-check gpu-status gpu-logs batch-test batch-params check-batch-params check-vast-models batch-scan batch-validate batch batch-clean watchdog-dry drain bot-dry api-smoke ios-test ios-audio-test ios-secrets ios-contract ios-gen ios-build
 
 help: ## Show this help
 	@echo "motion-clone — make targets:"
@@ -294,6 +294,16 @@ gpu-logs: ## Tail PM2 logs on the pod (LOG=api|worker|comfyui|wf-worker|minio, d
 
 ios-test: ## iPhone app logic tests (swift test on the Mac, no simulator)
 	cd ios/MotionKit && swift test
+
+ios-audio-test: ## Verify media audio ignores Silent Mode (requires a booted iOS simulator)
+	@mkdir -p ios/.build-sim
+	@simulator_sdk="$$(xcrun --sdk iphonesimulator --show-sdk-path)"; \
+		xcrun --sdk iphonesimulator swiftc -parse-as-library -sdk "$$simulator_sdk" \
+		-target arm64-apple-ios26.0-simulator \
+		ios/MotionApp/PlaybackAudioSession.swift \
+		ios/MotionAppTests/PlaybackAudioSessionTestMain.swift \
+		-o ios/.build-sim/motion-playback-audio-test; \
+		xcrun simctl spawn booted "$$(pwd)/ios/.build-sim/motion-playback-audio-test"
 
 ios-secrets: ## Write ios/Secrets.xcconfig (gitignored) from the root .env
 	@bash scripts/ios-secrets.sh
