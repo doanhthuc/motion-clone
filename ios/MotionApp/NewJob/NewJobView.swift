@@ -12,6 +12,8 @@ struct NewJobView: View {
         Group {
             if let draft = store.draft, let pipeline = store.selectedPipeline {
                 composer(draft: draft, pipeline: pipeline)
+            } else if let error = store.error {
+                initialLoadFailure(error)
             } else if store.isRefreshing {
                 ProgressView("Loading draft…")
             } else {
@@ -45,6 +47,17 @@ struct NewJobView: View {
         } message: {
             Text(dropCandidate?.digest ?? "")
         }
+    }
+
+    private func initialLoadFailure(_ error: APIError) -> some View {
+        VStack(spacing: 16) {
+            ContentUnavailableView(
+                "New Job unavailable",
+                systemImage: "exclamationmark.triangle",
+                description: Text("The draft and pipeline catalog could not be loaded."))
+            ErrorBanner(error: error) { await store.load() }
+        }
+        .padding(.horizontal, 20)
     }
 
     private func composer(draft: Draft, pipeline: Pipeline) -> some View {

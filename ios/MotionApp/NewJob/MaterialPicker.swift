@@ -24,6 +24,9 @@ struct MaterialPicker: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     header
+                    if let message = materials.errorMessage, materials.loaded {
+                        refreshFailureBanner(message)
+                    }
                     content
                 }
                 .padding(.horizontal, 20)
@@ -75,6 +78,8 @@ struct MaterialPicker: View {
             .foregroundStyle(Theme.ink2)
             .frame(maxWidth: .infinity)
             .padding(.vertical, 48)
+        } else if !materials.loaded, let message = materials.errorMessage {
+            initialLoadFailure(message)
         } else if !materials.loaded {
             ProgressView("Loading materials…")
                 .frame(maxWidth: .infinity)
@@ -98,6 +103,44 @@ struct MaterialPicker: View {
                 }
             }
         }
+    }
+
+    private func initialLoadFailure(_ message: String) -> some View {
+        VStack(spacing: 14) {
+            Image(systemName: "exclamationmark.triangle")
+                .font(.system(size: 28, weight: .medium))
+                .foregroundStyle(Theme.red)
+            Text("Materials unavailable")
+                .font(Theme.sans(18, .bold))
+                .foregroundStyle(Theme.ink)
+            Text(message)
+                .font(Theme.sans(13))
+                .foregroundStyle(Theme.ink2)
+                .multilineTextAlignment(.center)
+            retryButton
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 48)
+    }
+
+    private func refreshFailureBanner(_ message: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle").foregroundStyle(Theme.amber)
+            Text(message).font(Theme.sans(13)).foregroundStyle(Theme.ink1)
+            Spacer(minLength: 0)
+            retryButton
+        }
+        .padding(12)
+        .background(Theme.surface2, in: .rect(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Theme.line2))
+    }
+
+    private var retryButton: some View {
+        Button("Retry") {
+            Task { await materials.refresh() }
+        }
+        .font(Theme.sans(12, .semibold))
+        .foregroundStyle(Theme.lime)
     }
 
     private var kindDescription: String {
