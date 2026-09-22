@@ -1,6 +1,6 @@
 # Motion iPhone app — Phase 3 New Job design
 
-Date: 2026-09-22 · Status: approved for implementation
+Date: 2026-09-22 · Status: implemented
 
 This spec refines Phase 3 of
 `docs/superpowers/specs/2026-09-22-swiftui-app-design.md`. Phases 1–2 are shipped. Phase 3 adds the
@@ -248,8 +248,9 @@ motions-studio/setup/scrub-secrets.sh --check
 
 Manual simulator/iPhone verification is free: switch pipelines, assign image/video materials, clear
 a required role, add and drop a basket entry, validate, then edit once more and confirm Ready clears.
-Phase 2's deferred physical-phone upload/resume smoke can be performed in the same session, but it is
-not a prerequisite for implementing Phase 3. No pod lifecycle command or live spend route is used.
+That Phase 3 smoke remains deferred and unrun, including its physical-phone portion. Phase 2's
+physical-phone upload/resume smoke also remains pending and unrun; neither is a prerequisite for
+the implemented Phase 3. No pod lifecycle command or live spend route is used.
 
 ## 8. Security and repository constraints
 
