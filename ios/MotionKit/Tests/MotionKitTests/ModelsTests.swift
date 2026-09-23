@@ -48,6 +48,24 @@ import Testing
         #expect(jobs[1].finishedSec == 7)
     }
 
+    @Test func batchSummaryCountsEachStatusSeparately() throws {
+        // 12 jobs — `BatchComposer.maxOutfits` — with a distinct count for every
+        // present status (done 5, pending 4, running 2, error 1) and no `.unknown`,
+        // so repointing any counter at any other status changes an asserted number.
+        // A fixture with one job per status cannot tell `done` from `failed`.
+        let json = #"""
+        [{"id":"j1","status":"done","stages":[]},{"id":"j2","status":"pending","stages":[]},
+         {"id":"j3","status":"done","stages":[]},{"id":"j4","status":"running","stages":[]},
+         {"id":"j5","status":"pending","stages":[]},{"id":"j6","status":"done","stages":[]},
+         {"id":"j7","status":"error","stages":[]},{"id":"j8","status":"pending","stages":[]},
+         {"id":"j9","status":"done","stages":[]},{"id":"j10","status":"running","stages":[]},
+         {"id":"j11","status":"pending","stages":[]},{"id":"j12","status":"done","stages":[]}]
+        """#
+        let jobs = try decoder.decode([JobProgress].self, from: Fixtures.data(json))
+        let summary = BatchSummary(jobs)
+        #expect((summary.total, summary.done, summary.running, summary.failed) == (12, 5, 2, 1))
+    }
+
     @Test func decodesPod() throws {
         let live = try decoder.decode(PodStatus.self, from: Fixtures.data(Fixtures.podLive))
         #expect(live.lease?.runId == "tg-1000")
