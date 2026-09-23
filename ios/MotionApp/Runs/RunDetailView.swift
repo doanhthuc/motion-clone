@@ -3,6 +3,7 @@ import MotionKit
 
 struct RunDetailView: View {
     @State var store: RunDetailStore
+    let flow: RunFlow
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
@@ -11,6 +12,19 @@ struct RunDetailView: View {
                 if let error = store.error, store.detail == nil { ErrorBanner(error: error) { await store.refresh() } }
                 if let d = store.detail {
                     StatusHero(detail: d, stale: store.isStale, lastSuccess: store.lastSuccess)
+                    if d.id == flow.runID, flow.canRetryRental, let failure = flow.pod?.failedRental {
+                        VStack(alignment: .leading, spacing: 8) {
+                            SectionLabel(text: "Rental failed")
+                            Text(failure.detail).font(Theme.sans(13)).foregroundStyle(Theme.ink1)
+                            Button("Retry rental · \(failure.gpu)") { Task { await flow.retryRental() } }
+                                .buttonStyle(PrimaryButtonStyle())
+                                .disabled(flow.isSpending)
+                            if let message = flow.message {
+                                Text(message).font(Theme.sans(12)).foregroundStyle(Theme.amber)
+                            }
+                        }
+                        .padding(14).card(border: Theme.redLine)
+                    }
                     ForEach(d.jobs) { job in JobTimeline(job: job, showTitle: d.jobs.count > 1) }
                     if !d.outputs.isEmpty {
                         SectionLabel(text: "Outputs")
@@ -35,6 +49,7 @@ struct RunDetailView: View {
             guard scenePhase == .active else { return }
             await store.poll()
         }
+        .task { await flow.refreshPod() }
     }
 }
 
