@@ -36,7 +36,7 @@ extension URLProtocolTests {
         }
     }
 
-    private func make(_ routes: Routes, gate: FakeSpendGate = FakeSpendGate()) -> RunFlow {
+    private func make(_ routes: Routes, gate: any SpendSending = FakeSpendGate()) -> RunFlow {
         StubURLProtocol.install { routes.answer($0) }
         return RunFlow(client: TestSupport.client(), gate: gate, sleep: { _ in })
     }
@@ -358,6 +358,33 @@ extension URLProtocolTests {
         #expect(await gate.intents == [.confirm(runID: "tg-1000", provider: .vast, panelToken: "55.6",
                                                 gpu: nil, tryon: .rerun)])
         #expect(flow.phase == .started(runID: "tg-1000"))
+    }
+
+    /// A re-entered `start` (e.g. popping back onto a shared RunFlow while a
+    /// spend is outstanding) must not overwrite the outcome that spend is
+    /// about to apply — it silently no-ops instead of re-reading `/v1/pod`.
+    @Test func startIsRefusedWhileASpendIsInFlight() async {
+        let routes = Routes()
+        let gate = SuspendingSpendGate()
+        let flow = make(routes, gate: gate)
+        await flow.start(.newJob)
+        let podHitsBeforeSpend = StubURLProtocol.requests.filter { $0.url?.path == "/v1/pod" }.count
+
+        async let spendTask: Void = flow.startPhaseA()
+        while !flow.isSpending { await Task.yield() }
+
+        let phaseDuringSpend = flow.phase
+        let tryonDuringSpend = flow.tryon
+
+        await flow.start(.newJob)
+        #expect(flow.phase == phaseDuringSpend)
+        #expect(flow.tryon == tryonDuringSpend)
+        #expect(StubURLProtocol.requests.filter { $0.url?.path == "/v1/pod" }.count == podHitsBeforeSpend)
+
+        routes.tryon = Fixtures.tryonRunning   // still running when apply()'s refreshTryon reads it
+        await gate.release()
+        await spendTask
+        #expect(flow.phase == .phaseARunning)
     }
 
     @Test func chooserRefusesWithoutAPrice() async {

@@ -39,7 +39,6 @@ struct RentPanelView: View {
                 ProgressView("Reading stock and prices…").frame(maxWidth: .infinity).padding(.top, 30)
             }
         }
-        .refreshable { await flow.loadPanel(force: true) }
     }
 
     private func runpodRow(_ row: RentPanelRunpod) -> some View {

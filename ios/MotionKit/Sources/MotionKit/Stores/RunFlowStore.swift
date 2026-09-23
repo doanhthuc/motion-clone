@@ -91,6 +91,7 @@ public final class RunFlow {
     // MARK: loading
 
     public func start(_ entry: Entry) async {
+        guard !isSpending else { return }
         phase = .loading
         error = nil
         do {

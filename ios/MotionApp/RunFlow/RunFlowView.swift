@@ -6,6 +6,7 @@ struct RunFlowView: View {
     let entry: RunFlow.Entry
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.dismiss) private var dismiss
+    @State private var didStart = false
 
     var body: some View {
         ScrollView {
@@ -24,7 +25,26 @@ struct RunFlowView: View {
         .background(Theme.bg)
         .navigationTitle("Run")
         .navigationBarTitleDisplayMode(.inline)
-        .task { await flow.start(entry) }
+        // A shared RunFlow survives navigation (Runs/NewJob both hold the same
+        // instance), so re-running `start` on every appear — e.g. popping back
+        // from RunDetailView after `.started` — would reset a phase that just
+        // finished, drop `.choiceRequired`, or race a spend in flight. `.task`
+        // itself restarts on every appear regardless of view identity, so the
+        // guard has to live here, not in the task's cancellation. A genuinely
+        // new navigation (new `RunFlowView` value) gets a fresh `didStart`.
+        .refreshable {
+            switch flow.phase {
+            case .rentPanel, .choiceRequired:
+                await flow.loadPanel(force: true)
+            default:
+                await flow.refreshTryon()
+            }
+        }
+        .task {
+            guard !didStart else { return }
+            didStart = true
+            await flow.start(entry)
+        }
         .task(id: scenePhase) {
             guard scenePhase == .active else { return }
             await flow.pollTryon()
@@ -34,7 +54,9 @@ struct RunFlowView: View {
     @ViewBuilder private var content: some View {
         switch flow.phase {
         case .loading:
-            ProgressView().frame(maxWidth: .infinity).padding(.top, 60)
+            if flow.error == nil {
+                ProgressView().frame(maxWidth: .infinity).padding(.top, 60)
+            }
         case .compose:
             compose
         case .phaseARunning:
@@ -58,14 +80,30 @@ struct RunFlowView: View {
                 .disabled(flow.isSpending)
         case .rentPanel:
             RentPanelView(flow: flow)
-        case .choiceRequired:
+        case let .choiceRequired(_, provider):
             SectionLabel(text: "Try-on already ran")
             Text("These inputs already have a try-on. Reusing it spends no Gemini/Qwen quota; re-running pays for it again.")
                 .font(Theme.sans(13)).foregroundStyle(Theme.ink2)
-            Button("Reuse try-on (no quota)") { Task { await flow.choose(.reuse) } }
-                .buttonStyle(PrimaryButtonStyle()).disabled(flow.isSpending)
-            Button("Re-run try-on") { Task { await flow.choose(.rerun) } }
-                .buttonStyle(SecondaryButtonStyle()).disabled(flow.isSpending)
+            let price = flow.quote(for: provider)
+            if let price {
+                let providerName = provider == .runpod ? (flow.panel?.runpod.gpu ?? "RunPod") : "Vast"
+                Text("~\(Format.usd(price)) quote on \(providerName)")
+                    .font(Theme.mono(11)).foregroundStyle(Theme.ink2)
+            } else {
+                Text("No price yet — pull to refresh the rent panel.")
+                    .font(Theme.sans(13)).foregroundStyle(Theme.amber)
+            }
+            // Both buttons rent a pod (a `confirm` with reuse/rerun try-on) —
+            // the label and the quote say so, so a tap here is never a
+            // surprise spend of a different kind than Confirm on the rent panel.
+            Button(price.map { "Reuse try-on & rent · ~\(Format.usd($0))" } ?? "Reuse try-on & rent") {
+                Task { await flow.choose(.reuse) }
+            }
+            .buttonStyle(PrimaryButtonStyle()).disabled(flow.isSpending || price == nil)
+            Button(price.map { "Re-run try-on & rent · ~\(Format.usd($0))" } ?? "Re-run try-on & rent") {
+                Task { await flow.choose(.rerun) }
+            }
+            .buttonStyle(SecondaryButtonStyle()).disabled(flow.isSpending || price == nil)
         case let .started(runID):
             Label("Started — progress is on the run screen and in Telegram.", systemImage: "checkmark.circle.fill")
                 .font(Theme.sans(14, .semibold)).foregroundStyle(Theme.lime)
