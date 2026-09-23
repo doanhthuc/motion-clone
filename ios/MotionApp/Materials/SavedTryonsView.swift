@@ -14,7 +14,7 @@ struct SavedTryonsView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
                 HStack(alignment: .firstTextBaseline) {
-                    Text("Saved try-ons").font(Theme.sans(28, .bold)).foregroundStyle(Theme.ink)
+                    Text("Saved try-ons").font(Theme.sans(33, .bold)).foregroundStyle(Theme.ink)
                     Spacer()
                     if library.isStale { StaleTag(lastSuccess: library.lastSuccess) }
                 }
@@ -85,7 +85,11 @@ private struct SavedTryonTile: View {
                 if let image {
                     Image(uiImage: image).resizable().scaledToFill()
                 } else {
-                    Rectangle().fill(Theme.surface2).overlay(ProgressView())
+                    // `image(id:)` answers nil for both "this entry has no image"
+                    // and "the server was unreachable", so a spinner here would
+                    // read as "still loading" and never resolve.
+                    Rectangle().fill(Theme.surface2)
+                        .overlay(Image(systemName: "photo").foregroundStyle(Theme.ink3))
                 }
             }
             .frame(height: 170).frame(maxWidth: .infinity).clipped()
@@ -109,6 +113,9 @@ private struct SavedTryonTile: View {
 
     private func name(_ role: String) -> String {
         guard let id = entry.materialIDs[role] else { return "—" }
+        // "(deleted)" means gone, so it is only honest once the list has landed:
+        // before that an id can be missing merely because nothing was fetched.
+        guard materials.loaded else { return "…" }
         return materials.materials.first { $0.id == id }?.name ?? "(deleted)"
     }
 }

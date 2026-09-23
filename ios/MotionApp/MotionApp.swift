@@ -13,7 +13,8 @@ struct MotionApp: App {
 
 enum AppTab: Hashable { case runs, materials, newJob, outputs, pod }
 
-/// New Job editor mode: `.single` edits one job, `.batch` a cross build.
+/// How many jobs the draft stands for: `.single` is the one job being edited,
+/// `.batch` is a cross build of many.
 enum NewJobMode: Hashable { case single, batch }
 
 /// Opens the migrate sheet (RootView presents it over every tab).
