@@ -114,7 +114,7 @@ struct RunFlowView: View {
                 .buttonStyle(SecondaryButtonStyle())
             }
         case .outcomeUnknown:
-            Label("Couldn't tell whether this went through. The Runs tab shows the pod.", systemImage: "questionmark.circle")
+            Label("Couldn't tell whether this went through. The Pod tab shows the pod.", systemImage: "questionmark.circle")
                 .font(Theme.sans(14, .semibold)).foregroundStyle(Theme.amber)
         }
     }

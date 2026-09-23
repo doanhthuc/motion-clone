@@ -37,13 +37,15 @@ struct PodView: View {
             async let a: Void = pod.refresh()
             async let b: Void = balance.load()
             async let c: Void = gpu.load(force: true)
-            _ = await (a, b, c)
+            async let d: Void = runs.refresh()
+            _ = await (a, b, c, d)
         }
         .task {
             async let a: Void = pod.refresh()
             async let b: Void = balance.load()
+            async let c: Void = runs.refresh()
             if gpu.stock == nil { await gpu.load() }
-            _ = await (a, b)
+            _ = await (a, b, c)
         }
         // Scoped to a visible Pod tab in an active scene; cancelled otherwise.
         .task(id: scenePhase) {
@@ -54,13 +56,26 @@ struct PodView: View {
 
     @ViewBuilder private var leaseSection: some View {
         if let status = pod.pod {
-            if let lease = status.lease {
-                LeaseCard(gpu: status.gpu, lease: lease)
-            } else {
-                Text("No pod running").font(Theme.sans(15, .semibold)).foregroundStyle(Theme.ink2)
-                    .padding(16).frame(maxWidth: .infinity, alignment: .leading).card()
-                    .accessibilityIdentifier("pod.none")
+            if pod.isStale {
+                HStack {
+                    StaleTag(lastSuccess: pod.lastSuccess)
+                    Spacer()
+                    Button("Retry") { Task { await pod.refresh() } }
+                        .font(Theme.sans(12, .semibold)).foregroundStyle(Theme.lime)
+                }
             }
+            Group {
+                if let lease = status.lease {
+                    LeaseCard(gpu: status.gpu, lease: lease)
+                } else {
+                    Text("No pod running").font(Theme.sans(15, .semibold)).foregroundStyle(Theme.ink2)
+                        .padding(16).frame(maxWidth: .infinity, alignment: .leading).card()
+                        .accessibilityIdentifier("pod.none")
+                }
+            }
+            .opacity(pod.isStale ? 0.6 : 1)
+            // The server decides kill's own visibility/state; staleness of the
+            // read never hides or disables it.
             if pod.showsKill(runStatus: runs.live?.status), let runID = status.runId {
                 KillButton(pod: pod, runID: runID, hasLease: status.lease != nil)
             } else {
@@ -135,10 +150,18 @@ struct BalanceCard: View {
         VStack(alignment: .leading, spacing: 8) {
             if let line = store.runpodLine {
                 let low = store.balance?.runpod?.lowRunway == true
-                Text("RunPod").font(Theme.mono(11)).foregroundStyle(Theme.ink3)
-                Text(line).font(Theme.mono(15, .semibold)).foregroundStyle(low ? Theme.amber : Theme.ink)
-                if low {
-                    Text("Under 1 h of runway — top up before renting.")
+                let refreshFailed = store.error != nil
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("RunPod").font(Theme.mono(11)).foregroundStyle(Theme.ink3)
+                    Text(line).font(Theme.mono(15, .semibold)).foregroundStyle(low ? Theme.amber : Theme.ink)
+                    if low {
+                        Text("Under 1 h of runway — top up before renting.")
+                            .font(Theme.sans(12)).foregroundStyle(Theme.amber)
+                    }
+                }
+                .opacity(refreshFailed ? 0.6 : 1)
+                if refreshFailed, let error = store.error {
+                    Text("Couldn't refresh — \(error.userMessage)")
                         .font(Theme.sans(12)).foregroundStyle(Theme.amber)
                 }
             } else if let error = store.error {
