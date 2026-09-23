@@ -342,7 +342,7 @@ struct NewJobView: View {
                     .padding(.vertical, 13)
                     .background(Theme.lime, in: .rect(cornerRadius: 12))
             }
-            .disabled(draft.jobs == 0 || store.isBusy)
+            .disabled(draft.jobs == 0 || store.isBusy || composer.isRunning)
 
             if store.isReady {
                 NavigationLink {
