@@ -111,7 +111,9 @@ On each `TryonPreviewCard` in `RunFlowView`:
 - Tap → confirmation → if the edited job equals the dropped entry (same slots, provider, seed),
   first `PATCH` that job's `outfit` slot to `null` (or, for a pipeline without `outfit`, its first
   required role in sorted order), so it cannot come back (§2) → `DELETE /v1/draft/batch/{digest}` →
-  re-read the draft, previews and rent panel.
+  `POST /v1/draft/validate` (every draft change resets `validated`, and confirm refuses
+  `not_validated`; validate is free, up to ~90 s) → re-read the draft, previews and rent panel.
+  An invalid or stale validation leaves the server's message on screen and confirm disabled.
 - Confirm then follows the Phase 4 path; on `choice_required` the existing chooser is shown with
   "Choose *reuse*: the remaining try-ons do not call Gemini/Qwen again."
 - A seeded job's card shows a "Saved try-on" badge. Regenerate still works on it and calls the
