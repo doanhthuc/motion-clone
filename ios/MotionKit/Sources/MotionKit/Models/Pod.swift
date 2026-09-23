@@ -8,7 +8,8 @@ public struct PodLease: Decodable, Sendable, Equatable {
     public let runId: String?
 }
 
-public struct KillResult: Decodable, Sendable, Equatable {
+/// Codable so `PodStore` can keep the last unverified kill across launches.
+public struct KillResult: Codable, Sendable, Equatable {
     public let at: Double
     public let ok: Bool
     public let code: String

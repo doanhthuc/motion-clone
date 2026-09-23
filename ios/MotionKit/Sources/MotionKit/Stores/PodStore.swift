@@ -28,6 +28,10 @@ public final class PodStore {
 
     /// `last_kill.at` the user said they checked by hand (design §4).
     static let ackKey = "pod.ackedKillAt"
+    /// The last unverified kill seen, as JSON. `last_kill` is overwritten by
+    /// any later kill — a harmless `nothing_running` too — so the banner
+    /// can't be keyed on it alone (design §4).
+    static let unverifiedKey = "pod.unverifiedKill"
     static let killPollInterval: Duration = .seconds(2)
     /// The server's kill takes up to ~210 s (30 s drain wait + 180 s destroy).
     static let killPollCap: TimeInterval = 300
@@ -43,6 +47,7 @@ public final class PodStore {
     private let now: @Sendable () -> Date
     private let makeKey: @Sendable () -> String
     private var ackedKillAt: Double?
+    private var storedUnverified: KillResult?
     /// `last_kill.at` before the current kill was sent — the server's own
     /// clock, so a changed value means a new result without any skew.
     private var killBaseline: Double?
@@ -57,6 +62,8 @@ public final class PodStore {
         self.now = now
         self.makeKey = makeKey
         ackedKillAt = defaults.object(forKey: Self.ackKey) as? Double
+        storedUnverified = defaults.data(forKey: Self.unverifiedKey)
+            .flatMap { try? JSONDecoder().decode(KillResult.self, from: $0) }
     }
 
     public var isStale: Bool { pod != nil && error != nil }
@@ -68,6 +75,7 @@ public final class PodStore {
             pod = try await client.get(PodStatus.self, "v1", "pod")
             error = nil
             lastSuccess = .now
+            track(pod?.lastKill)
         } catch {
             self.error = error
         }
@@ -97,7 +105,16 @@ public final class PodStore {
         case let .refused(code, text):
             killState = .idle
             killNotice = Notice(text: text, isError: true)
-            if code == "nothing_running" { await refresh() }
+            if code == "nothing_running" {
+                await refresh()
+                // The server's refusal is about this run; a lease still on
+                // file was taken by another one (a drain, a Telegram run).
+                if error == nil, pod?.lease != nil {
+                    killNotice = Notice(
+                        text: text + " — the lease belongs to another run; check Telegram or RunPod.",
+                        isError: true)
+                }
+            }
         case .busy:
             killState = .idle
             killNotice = Notice(text: "The bot is busy — tap Kill again.", isError: true)
@@ -109,11 +126,15 @@ public final class PodStore {
     /// After the 5-minute cap: one read, then either finish or keep following.
     public func checkKillAgain() async {
         guard killState == .idle, killStillRunning else { return }
+        // Claimed before the await so a double tap can't start two loops.
+        killState = .killing
         await refresh()
-        guard error == nil, let pod else { return }
+        guard error == nil, let pod else {
+            killState = .idle
+            return
+        }
         killStillRunning = false
         if pod.killRunning {
-            killState = .killing
             await followKill()
         } else {
             finishKill()
@@ -207,8 +228,7 @@ public final class PodStore {
     /// server clears the lease either way (`_do_kill`), so "no lease" proves
     /// nothing; only the user or a later successful kill clears this.
     public var unverifiedKill: KillResult? {
-        guard let kill = pod?.lastKill, !kill.ok, Self.unverifiedCodes.contains(kill.code),
-              kill.at != ackedKillAt else { return nil }
+        guard let kill = storedUnverified, kill.at != ackedKillAt else { return nil }
         return kill
     }
 
@@ -216,6 +236,28 @@ public final class PodStore {
         guard let kill = unverifiedKill else { return }
         ackedKillAt = kill.at
         defaults.set(kill.at, forKey: Self.ackKey)
+        store(nil)
+    }
+
+    /// Keeps an unverified kill until it is acknowledged or a later kill
+    /// succeeds; a later refusal (`nothing_running`, `phase_a_finished`)
+    /// proves nothing about the pod the unverified one may have left.
+    private func track(_ kill: KillResult?) {
+        guard let kill else { return }
+        if !kill.ok, Self.unverifiedCodes.contains(kill.code), kill.at != ackedKillAt {
+            if kill != storedUnverified { store(kill) }
+        } else if kill.ok, let stored = storedUnverified, kill.at > stored.at {
+            store(nil)
+        }
+    }
+
+    private func store(_ kill: KillResult?) {
+        storedUnverified = kill
+        if let kill, let data = try? JSONEncoder().encode(kill) {
+            defaults.set(data, forKey: Self.unverifiedKey)
+        } else {
+            defaults.removeObject(forKey: Self.unverifiedKey)
+        }
     }
 
     // MARK: migration

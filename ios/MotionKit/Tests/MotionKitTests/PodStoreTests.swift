@@ -116,6 +116,17 @@ extension URLProtocolTests {
         #expect(store.pod != nil)
     }
 
+    @Test func nothingRunningNextToALiveLeaseSaysTheLeaseIsAnotherRuns() async {
+        let routes = Routes(pods: [Self.pod(lease: true)],
+                            kills: [Self.refusal(409, "nothing_running", "nothing is running — there is no pod to kill")])
+        let store = make(routes)
+        await store.kill(runID: "tg-1000")
+        #expect(store.killNotice == .init(
+            text: "nothing is running — there is no pod to kill — the lease belongs to another run; check Telegram or RunPod.",
+            isError: true))
+        #expect(store.killState == .idle)
+    }
+
     @Test func botBusyReenablesWithoutResending() async {
         let routes = Routes(pods: [Self.pod(lease: true)],
                             kills: [Self.refusal(503, "bot_busy", "the bot is busy")])
@@ -221,6 +232,45 @@ extension URLProtocolTests {
         routes.setPods([Self.pod(lastKill: Self.lastKill(at: 9, ok: false, code: "destroy_unverified", message: "again"))])
         await relaunched.refresh()
         #expect(relaunched.unverifiedKill?.at == 9)
+    }
+
+    static let unverified = lastKill(at: 5, ok: false, code: "destroy_unverified", message: "check it")
+
+    @Test func aLaterHarmlessRefusalKeepsTheBanner() async {
+        let routes = Routes(pods: [Self.pod(lastKill: Self.unverified)])
+        let store = make(routes)
+        await store.refresh()
+        #expect(store.unverifiedKill?.at == 5)
+        routes.setPods([Self.pod(lastKill: Self.lastKill(at: 9, ok: false, code: "nothing_running", message: "m"))])
+        await store.refresh()
+        #expect(store.unverifiedKill?.at == 5)
+        #expect(store.unverifiedKill?.message == "check it")
+    }
+
+    @Test func aLaterSuccessfulKillClearsTheBanner() async {
+        let routes = Routes(pods: [Self.pod(lastKill: Self.unverified)])
+        let store = make(routes)
+        await store.refresh()
+        routes.setPods([Self.pod(lastKill: Self.lastKill(at: 9, ok: true, code: "killed", message: "gone"))])
+        await store.refresh()
+        #expect(store.unverifiedKill == nil)
+    }
+
+    @Test func theBannerSurvivesARelaunchAfterAHarmlessRefusal() async {
+        let defaults = Self.freshDefaults()
+        let routes = Routes(pods: [Self.pod(lastKill: Self.unverified)])
+        let store = make(routes, defaults: defaults)
+        await store.refresh()
+        routes.setPods([Self.pod(lastKill: Self.lastKill(at: 9, ok: false, code: "nothing_running", message: "m"))])
+        let relaunched = make(routes, defaults: defaults)
+        #expect(relaunched.unverifiedKill?.at == 5)
+        await relaunched.refresh()
+        #expect(relaunched.unverifiedKill?.at == 5)
+        relaunched.acknowledgeUnverifiedKill()
+        #expect(relaunched.unverifiedKill == nil)
+        let again = make(routes, defaults: defaults)
+        await again.refresh()
+        #expect(again.unverifiedKill == nil)
     }
 
     // MARK: migration poll
