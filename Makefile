@@ -311,7 +311,7 @@ ios-secrets: ## Write ios/Secrets.xcconfig (gitignored) from the root .env
 ios-contract: ## Decode the live phone API with the app's models (GET only, spends nothing)
 	cd ios/MotionKit && swift run -q motion-contract ../../.env
 
-ios-refusal-smoke: ## Live zero-spend check: bogus-token confirm/regen/resume must be refused (no pod)
+ios-refusal-smoke: ## Live zero-spend check: bogus-token confirm/regen/resume/migrate and an idle kill must be refused (no pod)
 	cd ios/MotionKit && swift run -q motion-contract ../../.env --refusal-smoke
 
 ios-gen: ## Generate ios/MotionApp.xcodeproj from ios/project.yml (needs ios/Secrets.xcconfig)

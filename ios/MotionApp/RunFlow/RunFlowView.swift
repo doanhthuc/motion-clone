@@ -107,14 +107,14 @@ struct RunFlowView: View {
         case let .started(runID):
             Label("Started — progress is on the run screen and in Telegram.", systemImage: "checkmark.circle.fill")
                 .font(Theme.sans(14, .semibold)).foregroundStyle(Theme.lime)
-            if let client = model.client {
+            if let client = model.client, let pod = model.pod {
                 NavigationLink("Open \(runID)") {
-                    RunDetailView(store: RunDetailStore(client: client, runID: runID), flow: flow)
+                    RunDetailView(store: RunDetailStore(client: client, runID: runID), flow: flow, pod: pod)
                 }
                 .buttonStyle(SecondaryButtonStyle())
             }
         case .outcomeUnknown:
-            Label("Couldn't tell whether this went through. The Runs tab shows the pod.", systemImage: "questionmark.circle")
+            Label("Couldn't tell whether this went through. The Pod tab shows the pod.", systemImage: "questionmark.circle")
                 .font(Theme.sans(14, .semibold)).foregroundStyle(Theme.amber)
         }
     }

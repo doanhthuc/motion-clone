@@ -34,7 +34,9 @@ struct RunsView: View {
         }
         .background(Theme.bg)
         .navigationDestination(for: String.self) { id in
-            if let client = runsClient { RunDetailView(store: RunDetailStore(client: client, runID: id), flow: flow) }
+            if let client = runsClient {
+                RunDetailView(store: RunDetailStore(client: client, runID: id), flow: flow, pod: pod)
+            }
         }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {

@@ -33,6 +33,13 @@ public enum Format {
         let spaced = raw.replacingOccurrences(of: "_", with: " ")
         return spaced.prefix(1).uppercased() + spaced.dropFirst()
     }
+
+    /// Balance runway: "12h 28m", or "45m" under an hour.
+    public static func runway(hours: Double) -> String {
+        let minutes = max(0, Int((hours * 60).rounded()))
+        let h = minutes / 60, m = minutes % 60
+        return h > 0 ? "\(h)h \(m)m" : "\(m)m"
+    }
 }
 
 public enum CostEstimate {

@@ -119,3 +119,36 @@ sender of an `Idempotency-Key`.
   `panel_token`/`run_token` through the real `SpendGate` against the live API and asserts each call is
   refused (`409 stale_panel` / `409 stale_run`) with no pod lease before or after — but it is a live call
   to the VPS and is opt-in: run it only after explicitly deciding to, never automatically.
+
+## Phase 5 pod and cost
+
+The Pod tab (`MotionApp/Pod/`) reads `GET /v1/pod`, `GET /v1/gpu/stock` and `GET /v1/balance`, and
+offers kill, GPU choice and the Network Volume migration. Design:
+`docs/superpowers/specs/2026-09-23-swiftui-app-phase-5-design.md`.
+
+- **Kill bypasses `SpendGate`.** `PodStore.kill` mints a fresh `Idempotency-Key` per tap, never
+  resends, and is never disabled by a pending spend — a kill must work exactly when a confirm is
+  unanswered. An ambiguous answer is followed by three `GET /v1/pod` probes; a `202` is followed every
+  2 s until `kill_running` is false, capped at 5 minutes (then **Check again**). The result is the
+  server's `last_kill`, compared by its own `at`.
+- **"Pod may still be billing" banner.** The server clears the lease even when `make gpu-destroy`
+  could not verify the pod is gone, so "no lease" proves nothing. After a `last_kill` with
+  `destroy_unverified` or `error`, a red banner stays on every tab until the user taps
+  **I checked — the pod is gone** (stored in `UserDefaults` by that kill's `at`) or a later kill
+  succeeds. Check the RunPod console or `runpodctl get pod` before acknowledging.
+- **GPU choice** (`PUT /v1/pod/gpu`) is free and immediate, refused while a spend is in flight. From
+  the rent panel's **Change GPU** it clears the old quote and re-reads the panel, so Confirm needs a
+  new tap at the new price.
+- **Balances.** The Vast credit is read only on **Check Vast credit** (a ~30 s subprocess on the VPS).
+  An unreadable balance never shows as `$0`; a failed stock read keeps the last list, dimmed.
+- **Migration** is ask → a sheet with the server's warning verbatim → type the destination
+  datacenter id exactly → **Migrate and delete the old volume**, before the 10-minute token (minus a
+  15 s margin) expires. The migrate call goes through `SpendGate` as `SpendIntent.migrate`, so an
+  interrupted tap is resent with its original key; an unanswered migrate shows on every tab with
+  **Check again**.
+- **UI smoke.** `Phase5SmokeTests` (recording gate) reads the Pod tab and opens the migrate sheet to
+  the locked confirm button; it asserts the gate recorded zero spends. It never taps a GPU row (that
+  rewrites the live `.env`), Kill, or Migrate. The migrate half is skipped while any pod is leased.
+- **Refusal smoke** now also sends a kill with nothing running (`409 nothing_running`) — only after a
+  fresh read shows no lease, no running kill, no Phase A and no live run — and a migrate with a bogus
+  `confirm_token` (`409 bad_confirm_token`).

@@ -75,7 +75,7 @@ public actor APIClient {
     }
 
     public func post<Response: Decodable & Sendable, Body: Encodable & Sendable>(
-        _ response: Response.Type, body: Body, _ components: String...
+        _ response: Response.Type, body: Body, timeout: TimeInterval = 30, _ components: String...
     ) async throws(APIError) -> Response {
         let encoded: Data
         do {
@@ -87,7 +87,7 @@ public actor APIClient {
         }
         let (data, _) = try await send(
             url(components), method: "POST", body: encoded, contentType: "application/json",
-            extraHeaders: [:], okStatuses: [200, 201])
+            timeout: timeout, extraHeaders: [:], okStatuses: [200, 201])
         return try decode(response, data)
     }
 
@@ -114,6 +114,25 @@ public actor APIClient {
         }
         let (data, _) = try await send(
             url(components), method: "PATCH", body: encoded, contentType: "application/json",
+            timeout: timeout, extraHeaders: [:], okStatuses: [200])
+        return try decode(response, data)
+    }
+
+    /// JSON PUT (`PUT /v1/pod/gpu`). Not a spend: no Idempotency-Key.
+    public func put<Response: Decodable & Sendable, Body: Encodable & Sendable>(
+        _ response: Response.Type, body: Body, timeout: TimeInterval = 30,
+        _ components: String...
+    ) async throws(APIError) -> Response {
+        let encoded: Data
+        do {
+            let encoder = JSONEncoder()
+            encoder.keyEncodingStrategy = .convertToSnakeCase
+            encoded = try encoder.encode(body)
+        } catch {
+            throw .transport("couldn't encode the request: \(error.localizedDescription)")
+        }
+        let (data, _) = try await send(
+            url(components), method: "PUT", body: encoded, contentType: "application/json",
             timeout: timeout, extraHeaders: [:], okStatuses: [200])
         return try decode(response, data)
     }

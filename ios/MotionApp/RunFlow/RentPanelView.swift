@@ -3,6 +3,8 @@ import SwiftUI
 
 struct RentPanelView: View {
     let flow: RunFlow
+    @Environment(AppModel.self) private var model
+    @State private var changingGpu = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -13,6 +15,20 @@ struct RentPanelView: View {
                     .font(Theme.mono(11)).foregroundStyle(Theme.ink2)
                 runpodRow(panel.runpod)
                 vastRow(panel.vast)
+                HStack(spacing: 10) {
+                    Button("Change GPU") { changingGpu = true }
+                        .buttonStyle(SecondaryButtonStyle())
+                        .disabled(flow.isSpending)
+                        .accessibilityIdentifier("runflow.changeGpu")
+                    if panel.runpod.soldOut {
+                        Button("Migrate →") {
+                            model.selectedTab = .pod
+                            model.migrateSheet = MigrateRequest(destination: nil)
+                        }
+                        .buttonStyle(SecondaryButtonStyle())
+                        .accessibilityIdentifier("runflow.migrate")
+                    }
+                }
                 if let price = flow.quote(for: flow.selectedProvider) {
                     // Shown but disabled while any spend is unanswered, so the
                     // price stays visible next to "Check again".
@@ -40,6 +56,24 @@ struct RentPanelView: View {
                 }
             } else if flow.isLoadingPanel {
                 ProgressView("Reading stock and prices…").frame(maxWidth: .infinity).padding(.top, 30)
+            }
+        }
+        .sheet(isPresented: $changingGpu) {
+            if let gpu = model.gpu {
+                NavigationStack {
+                    ScrollView {
+                        GpuPickerView(store: gpu, spending: flow.isSpending, hasLease: false,
+                                      onSelected: {
+                                          changingGpu = false
+                                          await flow.reloadPanelAfterGpuChange()
+                                      })
+                        .padding(20)
+                    }
+                    .background(Theme.bg)
+                    .navigationTitle("Change GPU")
+                    .navigationBarTitleDisplayMode(.inline)
+                    .task { if gpu.stock == nil { await gpu.load() } }
+                }
             }
         }
     }

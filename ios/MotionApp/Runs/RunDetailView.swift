@@ -4,6 +4,7 @@ import MotionKit
 struct RunDetailView: View {
     @State var store: RunDetailStore
     let flow: RunFlow
+    let pod: PodStore
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
@@ -37,6 +38,9 @@ struct RunDetailView: View {
                         }
                         .padding(14).card(border: Theme.redLine)
                     }
+                    if d.id == pod.pod?.runId, pod.showsKill(runStatus: d.status), let runID = pod.pod?.runId {
+                        KillButton(pod: pod, runID: runID, hasLease: pod.pod?.lease != nil)
+                    }
                     ForEach(d.jobs) { job in JobTimeline(job: job, showTitle: d.jobs.count > 1) }
                     if !d.outputs.isEmpty {
                         SectionLabel(text: "Outputs")
@@ -61,7 +65,11 @@ struct RunDetailView: View {
             guard scenePhase == .active else { return }
             await store.poll()
         }
-        .task { await flow.refreshPod() }
+        .task {
+            async let a: Void = flow.refreshPod()
+            async let b: Void = pod.refresh()
+            _ = await (a, b)
+        }
     }
 }
 

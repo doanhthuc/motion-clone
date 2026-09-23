@@ -40,10 +40,18 @@ var failed = 0
     }
 }
 
-// --refusal-smoke: three spend calls with deliberately bogus tokens, through
-// the real SpendGate. Each is refused by a token check that runs before any
-// provider or pod call (bot.py AppRuns.confirm / _regen_tryon / AppPod.resume,
-// verified 2026-09-23). phase-a is never sent: it has no token to refuse on.
+// --refusal-smoke: spend and destroy calls that must each be refused before
+// anything acts: confirm/regen/resume with bogus tokens (bot.py
+// AppRuns.confirm / _regen_tryon / AppPod.resume), migrate with a bogus
+// confirm_token (AppPod.migrate: _migrate_blocked passes with no lease, then
+// _migrate_token_stale refuses), and kill with nothing running
+// (AppPod.kill → nothing_running). Kill is sent only when a fresh read taken
+// right before it shows nothing live: a live Phase A, a running kill, a live
+// run or any lease would really be stopped and destroyed. The "before" lease
+// check is not enough on its own: drain.py writes the lease only after
+// provisioning, so a drain that is still renting has no lease yet while the
+// server's `_something_live()` is already true. phase-a is never sent: it has
+// no token to refuse on.
 if CommandLine.arguments.contains("--refusal-smoke") {
     let ledgerRoot = FileManager.default.temporaryDirectory.appending(component: "motion-refusal-\(UUID().uuidString)")
     let gate = SpendGate(client: client, ledger: IdempotencyLedger(root: ledgerRoot))
@@ -75,6 +83,65 @@ if CommandLine.arguments.contains("--refusal-smoke") {
             smokeFailed += 1
         }
     }
+    func describe(_ raw: RawSpendResponse) -> String {
+        switch raw {
+        case .http(let status, _): "HTTP \(status)"
+        case .transport(let detail): "transport: \(detail)"
+        }
+    }
+    /// Why the kill must not be sent, or nil. Every read must succeed; a run
+    /// with no journal (404) is the only error that means "not live".
+    func idleKillBlocker() async -> String? {
+        guard let fresh = try? await client.get(PodStatus.self, "v1", "pod") else {
+            return "GET /v1/pod failed"
+        }
+        guard let tryon = try? await client.get(TryonPreviews.self, "v1", "runs", runID, "tryon") else {
+            return "the try-on read failed"
+        }
+        var runLive = false
+        do {
+            runLive = try await client.get(RunDetail.self, "v1", "runs", runID).status.isLive
+        } catch APIError.server(status: 404, _, _) {
+            runLive = false
+        } catch {
+            return "GET /v1/runs/\(runID) failed: \(error)"
+        }
+        if fresh.lease != nil { return "a pod is leased" }
+        if fresh.killRunning { return "a kill is running" }
+        if tryon.phaseARunning { return "Phase A is running" }
+        if runLive { return "the run is live" }
+        return nil
+    }
+    if let blocker = await idleKillBlocker() {
+        print("skip idle kill (\(blocker))")
+    } else {
+        let raw = await client.spendPost(["v1", "runs", runID, "kill"], body: Data("{}".utf8),
+                                         idempotencyKey: UUID().uuidString)
+        if case let .http(409, body) = raw,
+           String(decoding: body, as: UTF8.self).contains("\"nothing_running\"") {
+            print("ok   idle kill → 409 nothing_running")
+        } else {
+            print("FAIL idle kill: \(describe(raw))")
+            smokeFailed += 1
+        }
+    }
+    let beforeMigrate = try? await client.get(PodStatus.self, "v1", "pod")
+    if beforeMigrate == nil {
+        print("skip migrate (GET /v1/pod failed)")
+    } else if beforeMigrate?.migration?.running == true {
+        print("skip migrate (a migration is running)")
+    } else if beforeMigrate?.lease != nil {
+        print("skip migrate (a pod is leased)")
+    } else {
+        let result = await gate.perform(.migrate(toDc: "refusal-smoke", confirmToken: bogus),
+                                        label: "refusal smoke: migrate") { _, _ in }
+        if case .refused(409, "bad_confirm_token", _, _) = result {
+            print("ok   migrate bogus confirm_token → 409 bad_confirm_token")
+        } else {
+            print("FAIL migrate bogus confirm_token: \(result)")
+            smokeFailed += 1
+        }
+    }
     if await noLease("after") == nil { smokeFailed += 1 }
     try? FileManager.default.removeItem(at: ledgerRoot)
     exit(smokeFailed == 0 ? 0 : 1)
@@ -96,6 +163,14 @@ if let newestRun {
 }
 var slot: PodStatus?
 await check("GET /v1/pod") { slot = try await client.get(PodStatus.self, "v1", "pod") }
+// Cached stock (no ?force=1); the migration block is decoded inside PodStatus.
+await check("GET /v1/gpu/stock") {
+    _ = try await client.get(GpuStock.self, timeout: 60, "v1", "gpu", "stock")
+}
+// No ?vast=1: the Vast credit is a ~30 s subprocess and is opt-in.
+await check("GET /v1/balance") {
+    _ = try await client.get(Balance.self, timeout: 45, "v1", "balance")
+}
 if let runID = slot?.runId {
     await check("GET /v1/runs/{slot}/tryon") {
         _ = try await client.get(TryonPreviews.self, "v1", "runs", runID, "tryon")

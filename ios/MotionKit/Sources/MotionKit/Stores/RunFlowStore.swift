@@ -258,6 +258,16 @@ public final class RunFlow {
         panel != nil && quote(for: provider) != nil && canSpend && !isLoadingPanel
     }
 
+    /// After `PUT /v1/pod/gpu`: the old quote and `panel_token` priced another
+    /// card, so both go before the re-read — Confirm reappears only with the
+    /// new price and needs a new tap. The pod is re-read too, so Retry rental
+    /// names the new card.
+    public func reloadPanelAfterGpuChange() async {
+        panel = nil
+        await refreshPod()
+        await loadPanel(force: false)
+    }
+
     private func confirmLabel(_ provider: SpendProvider, suffix: String = "") -> String {
         let where_ = provider == .runpod ? (panel?.runpod.gpu ?? "RunPod") : "Vast"
         let price = quote(for: provider).map { " · ~\(Format.usd($0)) quote" } ?? ""
@@ -308,6 +318,10 @@ public final class RunFlow {
         guard needsRecheck, inFlightLabel == nil else { return }
         let saved = await gate.pending()
         guard let intent = saved?.intent ?? pendingIntent else { needsRecheck = false; return }
+        guard intent.kind != .migrate else {
+            message = "The pending request is a volume migration — check it from the Pod tab."
+            return
+        }
         inFlightLabel = "Checking the earlier request…"
         message = nil
         let result = await gate.recheck { [weak self] attempt, reason in
@@ -331,6 +345,8 @@ public final class RunFlow {
         guard !didReplay else { return }
         didReplay = true
         guard let entry = await gate.pending() else { return }
+        // A pending migrate belongs to MigrateFlow; AppModel routes it there.
+        guard entry.intent.kind != .migrate else { return }
         pendingNotice = "Checking the earlier \(entry.label)…"
         let result = await gate.replayPending()
         pendingNotice = nil
@@ -397,6 +413,8 @@ public final class RunFlow {
             case .confirm, .resume:
                 phase = .started(runID: runID ?? self.runID ?? "")
                 pod = try? await client.get(PodStatus.self, "v1", "pod")
+            case .migrate:
+                break   // never sent by RunFlow
             }
         case let .refused(status, code, text, panelToken):
             needsRecheck = false
