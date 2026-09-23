@@ -43,6 +43,57 @@ import Testing
         #expect(idle.failedRental?.stockOut == true)
     }
 
+    @Test func decodesPodMigration() throws {
+        let migrating = try decoder.decode(PodStatus.self, from: Fixtures.data(Fixtures.podMigrating))
+        #expect(migrating.migration?.running == true)
+        #expect(migrating.migration?.toDc == "EU-CZ-1")
+        #expect(migrating.migration?.fractionCopied == 0.25)
+        let idle = try decoder.decode(PodStatus.self, from: Fixtures.data(Fixtures.podIdle))
+        #expect(idle.migration?.running == false)
+        #expect(idle.migration?.fractionCopied == nil)
+        let live = try decoder.decode(PodStatus.self, from: Fixtures.data(Fixtures.podLive))
+        #expect(live.migration == nil)
+    }
+
+    @Test func decodesGpuStockAndItsDestinations() throws {
+        let stock = try decoder.decode(GpuStock.self, from: Fixtures.data(Fixtures.gpuStock))
+        #expect(stock.selected == "NVIDIA GeForce RTX 5090")
+        #expect(stock.homeDatacenter == "EU-RO-1")
+        #expect(stock.gpus.count == 5)
+        #expect(stock.gpus[0].home?.stock == "Low")
+        #expect(stock.gpus[2].usdPerHr == nil && stock.gpus[2].soldOutEverywhere)
+        #expect(stock.destinations == [
+            MigrationDestination(datacenter: "EU-CZ-1", gpus: ["RTX 5090 (High)", "RTX 4090 (Medium)"]),
+            MigrationDestination(datacenter: "US-TX-3", gpus: ["RTX 4090 (Low)"]),
+        ])
+    }
+
+    @Test func gpuRowSummaryNeverInventsAPriceOrStock() throws {
+        let stock = try decoder.decode(GpuStock.self, from: Fixtures.data(Fixtures.gpuStock))
+        #expect(stock.gpus[0].summary == "$0.99/h · home stock Low")
+        #expect(stock.gpus[1].summary == "$0.69/h · home stock unknown")
+        #expect(stock.gpus[2].summary == "Sold out everywhere")
+    }
+
+    @Test func decodesBalances() throws {
+        let ok = try decoder.decode(Balance.self, from: Fixtures.data(Fixtures.balance))
+        #expect(ok.runpod?.usd == 12.34 && ok.runpod?.runwayHours == 12.46)
+        #expect(ok.vast == nil)
+        let down = try decoder.decode(Balance.self, from: Fixtures.data(Fixtures.balanceRunpodDown))
+        #expect(down.runpod == nil)
+        #expect(down.errors == ["couldn't reach runpodctl: timeout"])
+        let vastDown = try decoder.decode(Balance.self, from: Fixtures.data(Fixtures.balanceVastDown))
+        #expect(vastDown.vast != nil && vastDown.vast?.usd == nil)
+        #expect(vastDown.runpod?.lowRunway == true)
+    }
+
+    @Test func decodesMigrateAsk() throws {
+        let ask = try decoder.decode(MigrateAsk.self, from: Fixtures.data(Fixtures.migrateAsk))
+        #expect(ask.toDc == "EU-CZ-1" && ask.homeDatacenter == "EU-RO-1")
+        #expect(ask.confirmToken == "tok-abc" && ask.expiresInSec == 600)
+        #expect(ask.warning.contains("Cannot be undone"))
+    }
+
     @Test func decodesOutputs() throws {
         let o = try decoder.decode(OutputsResponse.self, from: Fixtures.data(Fixtures.outputs))
         #expect(o.outputs[0].files.map(\.isVideo) == [true, false])

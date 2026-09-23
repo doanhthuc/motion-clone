@@ -47,7 +47,9 @@ enum Fixtures {
 
     static let podIdle = #"""
     {"run_id": "tg-1000", "gpu": "NVIDIA GeForce RTX 5090", "lease": null,
-     "migration": {"state": "whatever"}, "kill_running": false, "last_kill": null,
+     "migration": {"running": false, "phase": null, "to_dc": null, "started_at": null,
+                   "bytes_copied": null, "total_bytes": null},
+     "kill_running": false, "last_kill": null,
      "failed_rental": {"gpu": "NVIDIA GeForce RTX 5090", "datacenter": "EU-RO-1",
                        "stock_out": true, "detail": "no stock"}}
     """#
@@ -59,6 +61,63 @@ enum Fixtures {
      "migration": null, "kill_running": false, "last_kill": null,
      "failed_rental": {"gpu": "NVIDIA GeForce RTX 5090", "datacenter": "EU-RO-1",
                        "stock_out": true, "detail": "no stock"}}
+    """#
+
+    static let podMigrating = #"""
+    {"run_id": "tg-1000", "gpu": "NVIDIA GeForce RTX 5090", "lease": null,
+     "migration": {"running": true, "phase": "copy", "to_dc": "EU-CZ-1", "started_at": 1790000000,
+                   "bytes_copied": 1000, "total_bytes": 4000},
+     "kill_running": false, "last_kill": null, "failed_rental": null}
+    """#
+
+    /// `GET /v1/gpu/stock` (bot.py `_gpu_stock_data`): five GPUs in catalog order.
+    static let gpuStock = #"""
+    {"selected": "NVIDIA GeForce RTX 5090", "home_datacenter": "EU-RO-1",
+     "gpus": [
+      {"gpu": "NVIDIA GeForce RTX 5090", "name": "RTX 5090", "usd_per_hr": 0.99,
+       "home": {"stock": "Low"}, "sold_out_everywhere": false},
+      {"gpu": "NVIDIA GeForce RTX 4090", "name": "RTX 4090", "usd_per_hr": 0.69,
+       "home": null, "sold_out_everywhere": false},
+      {"gpu": "NVIDIA RTX PRO 4500 Blackwell", "name": "RTX PRO 4500", "usd_per_hr": null,
+       "home": null, "sold_out_everywhere": true},
+      {"gpu": "NVIDIA L40S", "name": "L40S", "usd_per_hr": 0.86,
+       "home": {"stock": "None"}, "sold_out_everywhere": false},
+      {"gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition", "name": "RTX PRO 6000",
+       "usd_per_hr": 2.09, "home": {"stock": "High"}, "sold_out_everywhere": false}
+     ],
+     "other_regions": [
+      {"gpu": "NVIDIA GeForce RTX 5090", "name": "RTX 5090", "datacenter": "EU-CZ-1",
+       "stock": "High", "usd_per_hr": 0.99},
+      {"gpu": "NVIDIA GeForce RTX 4090", "name": "RTX 4090", "datacenter": "EU-CZ-1",
+       "stock": "Medium", "usd_per_hr": 0.69},
+      {"gpu": "NVIDIA GeForce RTX 4090", "name": "RTX 4090", "datacenter": "US-TX-3",
+       "stock": "Low", "usd_per_hr": 0.69}
+     ]}
+    """#
+
+    static let balance = #"""
+    {"runpod": {"usd": 12.34, "usd_per_hr": 0.99, "runway_hours": 12.46, "low_runway": false},
+     "errors": []}
+    """#
+
+    static let balanceRunpodDown = #"""
+    {"runpod": null, "errors": ["couldn't reach runpodctl: timeout"]}
+    """#
+
+    static let balanceVast = #"""
+    {"runpod": {"usd": 12.34, "usd_per_hr": 0.99, "runway_hours": 12.46, "low_runway": false},
+     "vast": {"usd": 7.5}, "errors": []}
+    """#
+
+    static let balanceVastDown = #"""
+    {"runpod": {"usd": 0.5, "usd_per_hr": 0.99, "runway_hours": 0.51, "low_runway": true},
+     "vast": {"usd": null}, "errors": ["couldn't read the Vast credit: exit 1"]}
+    """#
+
+    static let migrateAsk = #"""
+    {"to_dc": "EU-CZ-1", "home_datacenter": "EU-RO-1", "confirm_token": "tok-abc",
+     "expires_in_sec": 600,
+     "warning": "This copies your Network Volume to EU-CZ-1: ~2 temporary CPU pods for the duration, then deletes the current volume once the copy is verified byte-for-byte. Cannot be undone once the old volume is deleted."}
     """#
 
     static let outputs = #"""

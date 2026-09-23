@@ -26,4 +26,10 @@ import Testing
         #expect(CostEstimate.usd(elapsed: 1800, ratePerHour: 0.99) == 0.495)
         #expect(CostEstimate.usd(elapsed: 1800, ratePerHour: nil) == nil)
     }
+    @Test func runwayRoundsToWholeMinutes() {
+        #expect(Format.runway(hours: 12.46) == "12h 28m")
+        #expect(Format.runway(hours: 0.5) == "30m")
+        #expect(Format.runway(hours: 0) == "0m")
+        #expect(Format.runway(hours: -1) == "0m")
+    }
 }
