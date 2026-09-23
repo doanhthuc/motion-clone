@@ -9,6 +9,9 @@ struct MigrateSheet: View {
     let gpu: GpuStore
     let pod: PodStore
     let runStatus: RunStatus?
+    /// `!RunFlow.canSpend`: a Phase 4 spend is unanswered or replaying, and the
+    /// gate would refuse the migrate (design §6).
+    let spendBlocked: Bool
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -127,8 +130,12 @@ struct MigrateSheet: View {
                         .accessibilityIdentifier("migrate.typed")
                     Button("Migrate and delete the old volume") { Task { await flow.migrate() } }
                         .buttonStyle(DestructiveButtonStyle())
-                        .disabled(!flow.canMigrate(at: ctx.date))
+                        .disabled(!flow.canMigrate(at: ctx.date) || spendBlocked)
                         .accessibilityIdentifier("migrate.confirm")
+                    if spendBlocked {
+                        Text("Another spend request is unanswered — resolve it before migrating.")
+                            .font(Theme.sans(12)).foregroundStyle(Theme.amber)
+                    }
                     if left == 0 {
                         Button("Expired — ask again") { Task { await flow.ask(toDc: ask.toDc) } }
                             .buttonStyle(SecondaryButtonStyle())

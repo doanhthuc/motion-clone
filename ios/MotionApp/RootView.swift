@@ -44,7 +44,7 @@ struct RootView: View {
                 }
                 .sheet(item: $model.migrateSheet) { request in
                     MigrateSheet(request: request, flow: migrate, gpu: gpu, pod: pod,
-                                 runStatus: runs.live?.status)
+                                 runStatus: runs.live?.status, spendBlocked: !flow.canSpend)
                 }
                 .overlay(alignment: .bottomLeading) {
                     if AppModel.isUITestRecording {
@@ -72,6 +72,7 @@ struct RootView: View {
 
 /// Visible on every tab while a spend or migrate is outstanding or re-checked.
 struct SpendBanner: View {
+    @Environment(AppModel.self) private var model
     let flow: RunFlow
     let migrate: MigrateFlow
     var body: some View {
@@ -89,6 +90,23 @@ struct SpendBanner: View {
             }
             .padding(12)
             .card(border: Theme.limeLine)
+            .padding(.horizontal, 16)
+        } else if migrate.needsRecheck {
+            // Every Phase 4 spend is refused (.notSent) until this is answered,
+            // and nothing else outside the migrate sheet says why.
+            HStack(spacing: 10) {
+                Text("Migrate unanswered — the volume move may or may not have started.")
+                    .font(Theme.sans(13, .semibold)).foregroundStyle(Theme.amber)
+                Spacer(minLength: 0)
+                Button("Check again") {
+                    model.migrateSheet = MigrateRequest(destination: nil)
+                    model.selectedTab = .pod
+                }
+                .font(Theme.sans(13, .semibold)).foregroundStyle(Theme.lime)
+                .accessibilityIdentifier("banner.migrateCheckAgain")
+            }
+            .padding(12)
+            .card(border: Theme.line)
             .padding(.horizontal, 16)
         }
     }
