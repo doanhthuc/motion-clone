@@ -50,7 +50,7 @@ struct RunDetailView: View {
                     if d.jobs.count > 1 {
                         BatchProgressList(jobs: d.jobs)
                     } else {
-                        ForEach(d.jobs) { job in JobTimeline(job: job, showTitle: false) }
+                        ForEach(d.jobs) { job in JobTimeline(job: job) }
                     }
                     if !d.outputs.isEmpty {
                         SectionLabel(text: "Outputs")
@@ -134,15 +134,13 @@ struct StatusHero: View {
     }
 }
 
+/// The stages of one job. Callers print the job id when it is worth showing —
+/// `BatchProgressList`'s row header does; the single-job path does not.
 struct JobTimeline: View {
     let job: JobProgress
-    let showTitle: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if showTitle {
-                Text(job.id).font(Theme.mono(12, .semibold)).foregroundStyle(Theme.ink1).padding(.bottom, 10)
-            }
             ForEach(Array(job.stages.enumerated()), id: \.offset) { index, stage in
                 HStack(alignment: .top, spacing: 14) {
                     VStack(spacing: 0) {
@@ -220,12 +218,18 @@ struct BatchProgressList: View {
                             if job.finishedSec > 0 {
                                 Text(Format.clock(job.finishedSec)).font(Theme.mono(11)).foregroundStyle(Theme.ink2)
                             }
+                            // Decorative once the Button announces its own state.
                             Image(systemName: expanded.contains(job.id) ? "chevron.up" : "chevron.down")
                                 .foregroundStyle(Theme.ink3)
+                                .accessibilityHidden(true)
                         }
                     }
                     .buttonStyle(.plain)
-                    if expanded.contains(job.id) { JobTimeline(job: job, showTitle: false) }
+                    .accessibilityValue(expanded.contains(job.id) ? "expanded" : "collapsed")
+                    // Make the whole row width tappable, not just the glyphs — the
+                    // Spacer between the id and the clock is otherwise dead space.
+                    .contentShape(Rectangle())
+                    if expanded.contains(job.id) { JobTimeline(job: job) }
                 }
                 .padding(12).card()
             }

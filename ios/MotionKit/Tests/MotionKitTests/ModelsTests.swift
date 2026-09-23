@@ -37,7 +37,7 @@ import Testing
         let json = #"""
         [{"id":"a","status":"done","stages":[{"name":"tryon","status":"done","elapsed_sec":6},{"name":"motion","status":"done","elapsed_sec":60}]},
          {"id":"b","status":"running","stages":[{"name":"tryon","status":"done","elapsed_sec":7},{"name":"motion","status":"running","elapsed_sec":null}]},
-         {"id":"c","status":"error","stages":[{"name":"tryon","status":"error","elapsed_sec":null}]},
+         {"id":"c","status":"error","stages":[{"name":"tryon","status":"error","elapsed_sec":12}]},
          {"id":"d","status":"pending","stages":[]}]
         """#
         let jobs = try decoder.decode([JobProgress].self, from: Fixtures.data(json))
@@ -46,6 +46,11 @@ import Testing
         #expect(summary.ordered.map(\.id) == ["c", "b", "a", "d"])
         #expect(jobs[0].finishedSec == 66)
         #expect(jobs[1].finishedSec == 7)
+        // A failed stage keeps its elapsed on the wire — `batchlib/runner.py:220-221`
+        // stamps `status="error"` and `elapsed_sec` together (`:237` for `done`), and
+        // `control/runs.py:96` only yields `null` for a stage still running — so a
+        // failed job's row shows its pre-failure seconds rather than nothing.
+        #expect(jobs[2].finishedSec == 12)
     }
 
     @Test func batchSummaryCountsEachStatusSeparately() throws {
@@ -53,6 +58,8 @@ import Testing
         // present status (done 5, pending 4, running 2, error 1) and no `.unknown`,
         // so repointing any counter at any other status changes an asserted number.
         // A fixture with one job per status cannot tell `done` from `failed`.
+        // `stages` stays empty because no counter reads it; the wire shape of a
+        // stage's elapsed is pinned by `batchSummaryCountsAndPutsTroubleFirst`.
         let json = #"""
         [{"id":"j1","status":"done","stages":[]},{"id":"j2","status":"pending","stages":[]},
          {"id":"j3","status":"done","stages":[]},{"id":"j4","status":"running","stages":[]},

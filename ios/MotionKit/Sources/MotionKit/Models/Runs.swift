@@ -103,8 +103,9 @@ public struct BatchSummary: Equatable, Sendable {
         }
         // Equal-ranked jobs keep manifest order. `sorted(by:)` already guarantees
         // a stable sort; the explicit offset keeps that intent readable here and
-        // survives a swap to a non-stable algorithm — this list re-renders on
-        // every ETag poll, so a reshuffle would be user-visible.
+        // survives a swap to a non-stable algorithm. The list re-renders whenever a
+        // poll returns changed data — `RunDetailStore.refresh` assigns `detail` only
+        // on a non-304 — so a reshuffle would be user-visible.
         ordered = jobs.enumerated()
             .sorted { (rank($0.element), $0.offset) < (rank($1.element), $1.offset) }
             .map(\.element)
