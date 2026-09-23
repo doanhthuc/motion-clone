@@ -15,7 +15,7 @@ struct NewJobView: View {
     var body: some View {
         Group {
             if let draft = store.draft, let pipeline = store.selectedPipeline {
-                composer(draft: draft, pipeline: pipeline)
+                editor(draft: draft, pipeline: pipeline)
             } else if let error = store.error {
                 initialLoadFailure(error)
             } else if store.isRefreshing {
@@ -35,6 +35,20 @@ struct NewJobView: View {
                 store.acknowledgeMaterialsRefresh()
                 closePickerIfSelectionDisappeared()
             }
+        }
+        // Both seed observers sit above the Single|Batch split so they outlive the
+        // Batch arm: Single mode edits the same draft slots through
+        // `slots(draft:pipeline:)`, and an arm removed while they changed never
+        // re-picks. The seed chosen for the old character/outfit pair would then be
+        // PATCHed for the new one, and Phase A skips the provider and seeds the job
+        // from an image made from different materials. `library.loaded` is observed
+        // too because `matches(for:)` is empty against an unfetched library, so an
+        // outfit chosen before `load()` returns would keep no seed at all; no manual
+        // pick can be lost by that, since the seed toggle is disabled while
+        // `matches` is empty.
+        .onChange(of: composer.sharedSlots) { _, _ in composer.refreshSeeds() }
+        .onChange(of: library.loaded) { _, loaded in
+            if loaded { composer.refreshSeeds() }
         }
         .confirmationDialog(
             "Drop this batch entry?",
@@ -65,8 +79,14 @@ struct NewJobView: View {
         .padding(.horizontal, 20)
     }
 
-    private func composer(draft: Draft, pipeline: Pipeline) -> some View {
-        ScrollView {
+    private func editor(draft: Draft, pipeline: Pipeline) -> some View {
+        let isBatch = model.newJobMode == .batch
+        // Cross build needs a character + outfit pair, so Batch mode offers only the
+        // pipelines that have one. When none qualify there is nothing to choose, so
+        // the picker is disabled instead of opening an empty menu behind a label
+        // that still names the pipeline the user is on.
+        let batchCatalog = store.catalog.filter(BatchComposer.supports)
+        return ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 header(draft)
                 Picker("Mode", selection: Binding(get: { model.newJobMode }, set: { model.newJobMode = $0 })) {
@@ -79,12 +99,12 @@ struct NewJobView: View {
                 banners
                 PipelinePicker(
                     pipeline: pipeline,
-                    pipelines: model.newJobMode == .batch ? store.catalog.filter(BatchComposer.supports) : store.catalog,
+                    pipelines: isBatch ? batchCatalog : store.catalog,
                     selectedProvider: draft.provider,
-                    disabled: store.isBusy || composer.isRunning,
+                    disabled: store.isBusy || composer.isRunning || (isBatch && batchCatalog.isEmpty),
                     onPipelineSelected: { id in await store.selectPipeline(id) },
                     onProviderSelected: { id in await store.selectProvider(id) })
-                if model.newJobMode == .batch {
+                if isBatch {
                     BatchComposerSection(store: store, composer: composer,
                                          materials: materials, pipeline: pipeline,
                                          onPickRole: { selectedRole = $0 })
@@ -269,7 +289,7 @@ struct NewJobView: View {
                         Button("Drop", role: .destructive) { dropCandidate = entry }
                             .font(Theme.sans(12, .semibold))
                             .foregroundStyle(Theme.red)
-                            .disabled(store.isBusy)
+                            .disabled(store.isBusy || composer.isRunning)
                     }
                     .padding(12)
                     .card()

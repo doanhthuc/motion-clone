@@ -19,7 +19,9 @@ struct BatchComposerSection: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             if !BatchComposer.supports(pipeline) {
-                Text("This pipeline has no character + outfit pair. Pick a try-on pipeline for a batch.")
+                Text(store.catalog.contains(where: BatchComposer.supports)
+                     ? "This pipeline has no character + outfit pair. Pick a try-on pipeline for a batch."
+                     : "No pipeline on this server pairs a character with an outfit, so a batch is unavailable.")
                     .font(Theme.sans(13)).foregroundStyle(Theme.amber)
             } else {
                 SectionLabel(text: "Shared")
@@ -38,8 +40,14 @@ struct BatchComposerSection: View {
                 runButton
             }
         }
-        .onChange(of: composer.sharedSlots) { _, _ in composer.refreshSeeds() }
+        // No seed observer here on purpose: `NewJobView` owns it, above the
+        // Single|Batch split, because this view only exists in the Batch arm.
         .sheet(isPresented: $pickingOutfits) {
+            // `.image` here but `.unknown` for the shared rows above: `accepts`
+            // is false for every material under `.unknown`, and an outfit sheet
+            // with no rows is a dead end, while an images-only one still builds
+            // a batch. The shared rows can afford `.unknown` — `MaterialPicker`
+            // renders an explanation for it.
             OutfitMultiPicker(composer: composer, materials: materials,
                               kind: pipeline.roles[BatchComposer.outfitRole] ?? .image)
         }
@@ -47,10 +55,12 @@ struct BatchComposerSection: View {
 
     private func outfitRow(_ outfit: CrossOutfit) -> some View {
         let matches = composer.matches(for: outfit.outfitID)
-        let name = materials.materials.first { $0.id == outfit.outfitID }?.name ?? outfit.outfitID
+        let material = materials.materials.first { $0.id == outfit.outfitID }
         return VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text(name).font(Theme.sans(14, .semibold)).foregroundStyle(Theme.ink1).lineLimit(1)
+            HStack(spacing: 10) {
+                OutfitThumbnail(material: material, materials: materials)
+                Text(material?.name ?? outfit.outfitID)
+                    .font(Theme.sans(14, .semibold)).foregroundStyle(Theme.ink1).lineLimit(1)
                 Spacer()
                 Button(role: .destructive) { composer.toggle(outfitID: outfit.outfitID) } label: {
                     Image(systemName: "xmark.circle")
@@ -111,6 +121,42 @@ struct BatchComposerSection: View {
         .buttonStyle(PrimaryButtonStyle())
         .accessibilityIdentifier("batch.run")
         .disabled(!composer.canRun)
+    }
+}
+
+/// The outfit's own thumbnail. Its own view because a `@ViewBuilder` function
+/// cannot hold `@State`, and `SlotMaterialRow` fetches one the same way.
+@MainActor
+private struct OutfitThumbnail: View {
+    let material: MotionKit.Material?
+    let materials: MaterialsStore
+    @State private var thumbnail: Data?
+
+    var body: some View {
+        Group {
+            if let thumbnail, let image = UIImage(data: thumbnail) {
+                Image(uiImage: image).resizable().scaledToFill()
+            } else {
+                ZStack {
+                    Theme.surface2
+                    Image(systemName: "photo")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(Theme.ink3)
+                }
+            }
+        }
+        .frame(width: 34, height: 34)
+        .clipShape(.rect(cornerRadius: 8))
+        // Decorative: the row already names the outfit, and hiding it keeps the
+        // card's accessibility tree the shape the seed and row identifiers expect.
+        .accessibilityHidden(true)
+        .task(id: material?.id) {
+            guard let material else {
+                thumbnail = nil
+                return
+            }
+            thumbnail = await materials.thumbnail(for: material)
+        }
     }
 }
 
