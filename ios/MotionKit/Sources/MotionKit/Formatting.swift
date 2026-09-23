@@ -42,4 +42,12 @@ public enum CostEstimate {
         guard let rate = ratePerHour else { return nil }
         return max(0, elapsed) / 3600 * rate
     }
+
+    /// The rent panel's price: estimated minutes × the row's rate. A quote
+    /// shown before the tap; nil when the row has no rate, and then no spend
+    /// button is drawn for it.
+    public static func quote(estimateMin: Double, usdPerHr: Double?) -> Double? {
+        guard let rate = usdPerHr else { return nil }
+        return max(0, estimateMin) / 60 * rate
+    }
 }
