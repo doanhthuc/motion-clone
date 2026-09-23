@@ -1,6 +1,6 @@
 # Motion iPhone app — Phase 4 run flow design
 
-Date: 2026-09-23 · Status: implemented (zero-spend); live spend path not yet exercised
+Date: 2026-09-23 · Status: implemented (zero-spend); live spend path not yet exercised; `make ios-refusal-smoke` implemented; acceptance run outstanding (awaiting user go-ahead)
 
 This spec refines Phase 4 of
 `docs/superpowers/specs/2026-09-22-swiftui-app-design.md`. Phases 1–3 are shipped
@@ -98,8 +98,11 @@ has no owner).
   runnable; `NewJobView` itself still holds no spend button. The Runs hero card of a `phase_a` run
   opens the flow. `RunDetailView` for the live slot shows **Retry rental** only when
   `pod.failedRental != nil`, beside its `detail`; the tap sends `resume {provider: "runpod",
-  run_token, gpu}` through `SpendGate`. A `no_failure` refusal (the failure cleared meanwhile) is shown
-  verbatim.
+  run_token, gpu}` through `SpendGate`, where `gpu` is `pod.gpu` (the current `.env` card the server
+  rents). The button is labelled with that card; when `failedRental.gpu` differs, a line says "Last
+  failure was on X; this retries on Y." A `stale_panel` refusal on resume (the server's gpu-mismatch
+  code) re-reads `/v1/pod` so the button names the new card. A `no_failure` refusal (the failure
+  cleared meanwhile) is shown verbatim.
 - **Out of stock.** RunPod `sold_out` and Vast `can_spend == false` → both reasons shown, no spend
   button. GPU change and migration are Phase 5.
 - **Refusal text.** `409`/`422` messages are shown verbatim, as the parent design §4 requires.
@@ -122,9 +125,16 @@ spend button disabled, the in-flight label shown with a spinner".
 1. New UUID key → ledger entry written → request sent with `Idempotency-Key`, a 90 s timeout
    (under Cloudflare's ~100 s).
 2. Classify the answer:
-   - **Definitive** — any response with the JSON error envelope or a `2xx`, except `bot_busy`:
-     clear the ledger, return a result. Includes `409 stale_panel`, `choice_required`,
-     `outcome_unknown`, `422`, and a JSON `502 upstream_unavailable`.
+   - **Definitive** — a `2xx`, or a JSON error envelope with a status below 500: clear the ledger,
+     return a result. Includes `409 stale_panel`, `choice_required`, `outcome_unknown` and `422`.
+   - **JSON 5xx other than `bot_busy`** (e.g. `500 internal`, `502 upstream_unavailable`) — not an
+     answer the first time. `server.py` turns an unhandled exception into `500 internal` *after*
+     `idem.begin` wrote `pending`, so a pod may be half-rented. Keep the entry and resend the same
+     key on the ambiguous schedule (2 s, 5 s). The **same status and code** coming back for that key
+     is the server's stored answer (`idem.finish`): definitive, clear the ledger, `.refused`. A
+     resend that finds the pending record answers `409 outcome_unknown`, which stays definitive.
+     Retries exhausted with differing or ambiguous answers → `.unreachable`, entry kept. The launch
+     replay stays a single attempt: a JSON 5xx there is `.unreachable` with the entry kept.
    - **`503 bot_busy`** — the server forgot the key. Resend the same key after 5 s, at most 3 times,
      publishing the attempt count. Still busy → clear the ledger, return `.busy` (nothing was
      recorded server-side, so the next tap's new key is safe).
@@ -180,13 +190,21 @@ that returns the raw status and body, or a transport failure, and never throws.
   `perform` refuses while one exists; an atomic rewrite survives an interrupted write.
 - Transport failure and non-JSON 5xx resend the same key; `recheck()` reuses it; only `perform` mints.
 - `503 bot_busy` → three same-key retries 5 s apart, then `.busy` and an empty ledger.
+- JSON 5xx: `500 internal` then `409 outcome_unknown` → `.outcomeUnknown`, one key sent twice;
+  `502 upstream_unavailable` twice → `.refused(502)`, ledger cleared, two requests; `500` then `202`
+  → `.accepted` on the same key; JSON `422` → `.refused` after one request; a JSON 5xx on launch
+  replay → `.unreachable`, entry kept.
+- After `.unreachable` every spend button is disabled (`RunFlow.canSpend`); a further spend the gate
+  refuses (`.notSent`) keeps **Check again** and the pending intent; `recheck()` applies the intent
+  from the gate's ledger entry.
 - `409 outcome_unknown` → sent once, not retried, phase `outcomeUnknown`.
 - `409 stale_panel` on confirm → one panel re-read, zero further confirm requests, new `panelToken`.
 - `choice_required` → chooser; extra `panel_token` decoded; each choice uses a new key.
 - Launch replay: entry < 20 h resent once with the same key; entry ≥ 20 h discarded, never sent.
 - `Guidance` encodes only the three wire values; quote maths; `nil` rate hides Confirm.
 - `RunFlow` phase derivation from fixtures: compose, Phase A running, previews, rent panel, sold-out
-  with Vast blocked (no spend button); Retry rental visible only with `failedRental`.
+  with Vast blocked (no spend button); Retry rental visible only with `failedRental`, sends and names
+  `pod.gpu` (not `failedRental.gpu`), and a `stale_panel` refusal on resume re-reads `/v1/pod`.
 - Handwritten fixtures shaped on `AppRuns.tryon` / `rent_panel` / `AppPod.pod`, with made-up ids.
 
 **`make ios-ui-test`** — extended, zero-spend: a launch argument replaces `SpendGate` with a recording
