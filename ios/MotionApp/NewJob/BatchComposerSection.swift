@@ -7,7 +7,6 @@ import SwiftUI
 struct BatchComposerSection: View {
     let store: DraftStore
     let composer: BatchComposer
-    let library: TryonLibraryStore
     let materials: MaterialsStore
     let pipeline: Pipeline
     let onPickRole: (String) -> Void

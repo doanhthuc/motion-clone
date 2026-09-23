@@ -85,7 +85,7 @@ struct NewJobView: View {
                     onPipelineSelected: { id in await store.selectPipeline(id) },
                     onProviderSelected: { id in await store.selectProvider(id) })
                 if model.newJobMode == .batch {
-                    BatchComposerSection(store: store, composer: composer, library: library,
+                    BatchComposerSection(store: store, composer: composer,
                                          materials: materials, pipeline: pipeline,
                                          onPickRole: { selectedRole = $0 })
                 } else {
