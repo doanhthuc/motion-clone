@@ -42,6 +42,10 @@ struct RootView: View {
                     Task { await pod.refresh() }
                     flow.acknowledgePodRequest()
                 }
+                .sheet(item: $model.migrateSheet) { request in
+                    MigrateSheet(request: request, flow: migrate, gpu: gpu, pod: pod,
+                                 runStatus: runs.live?.status)
+                }
                 .overlay(alignment: .bottomLeading) {
                     if AppModel.isUITestRecording {
                         Color.clear.frame(width: 1, height: 1)
