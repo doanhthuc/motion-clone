@@ -1,6 +1,6 @@
 # Motion iPhone app — Phase 4 run flow design
 
-Date: 2026-09-23 · Status: approved design; not implemented
+Date: 2026-09-23 · Status: implemented (zero-spend); live spend path not yet exercised
 
 This spec refines Phase 4 of
 `docs/superpowers/specs/2026-09-22-swiftui-app-design.md`. Phases 1–3 are shipped
