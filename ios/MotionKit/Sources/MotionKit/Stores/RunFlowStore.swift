@@ -47,7 +47,7 @@ public final class RunFlow {
     private let sleep: @Sendable (Duration) async throws -> Void
     private var images: [String: Data] = [:]
     private var keptKeys: Set<String> = []
-    private var pendingKind: SpendKind?
+    private var pendingIntent: SpendIntent?
     private var didReplay = false
 
     public init(client: APIClient, gate: any SpendSending,
@@ -265,10 +265,19 @@ public final class RunFlow {
     }
 
     /// The reuse/rerun answer to `choice_required` — its own tap, its own key.
+    /// The provider comes from the phase (the confirm that was actually sent,
+    /// set from the refused `SpendIntent`), never from `selectedProvider`,
+    /// which may have moved on while this was outstanding. Refuses to send
+    /// without a fresh panel and quote — otherwise a stale-GPU guard could be
+    /// bypassed and no price would be shown before the tap.
     public func choose(_ choice: TryonChoice) async {
         guard let runID, case let .choiceRequired(token, provider) = phase else { return }
+        guard let panel, quote(for: provider) != nil else {
+            message = "Couldn't price this confirm — pull to refresh the rent panel, then choose again."
+            return
+        }
         await spend(.confirm(runID: runID, provider: provider, panelToken: token,
-                             gpu: provider == .runpod ? panel?.runpod.gpu : nil, tryon: choice),
+                             gpu: provider == .runpod ? panel.runpod.gpu : nil, tryon: choice),
                     label: confirmLabel(provider, suffix: choice == .reuse ? " (reuse try-on)" : " (re-run try-on)"))
     }
 
@@ -287,7 +296,7 @@ public final class RunFlow {
     /// Resends the saved request with its saved key. Never mints a new one.
     public func recheck() async {
         guard needsRecheck, inFlightLabel == nil else { return }
-        let kind = pendingKind ?? .confirm
+        guard let intent = pendingIntent else { needsRecheck = false; return }
         inFlightLabel = "Checking the earlier request…"
         message = nil
         let result = await gate.recheck { [weak self] attempt, reason in
@@ -295,7 +304,7 @@ public final class RunFlow {
         }
         inFlightLabel = nil
         retryNote = nil
-        await apply(result, kind: kind)
+        await apply(result, intent: intent)
     }
 
     public func replayPendingOnce() async {
@@ -307,7 +316,7 @@ public final class RunFlow {
         pendingNotice = nil
         guard let result else { return }
         if pod == nil { pod = try? await client.get(PodStatus.self, "v1", "pod") }
-        await apply(result, kind: entry.intent.kind)
+        await apply(result, intent: entry.intent)
     }
 
     // MARK: spends (Task 6)
@@ -338,13 +347,13 @@ public final class RunFlow {
         retryNote = nil
         message = nil
         needsRecheck = false
-        pendingKind = intent.kind
+        pendingIntent = intent
         let result = await gate.perform(intent, label: label) { [weak self] attempt, reason in
             Task { @MainActor in self?.noteRetry(attempt, reason) }
         }
         inFlightLabel = nil
         retryNote = nil
-        await apply(result, kind: intent.kind)
+        await apply(result, intent: intent)
     }
 
     private func noteRetry(_ attempt: Int, _ reason: SpendRetryReason) {
@@ -354,7 +363,8 @@ public final class RunFlow {
             : "No answer — retry \(attempt) of 2 with the same request"
     }
 
-    func apply(_ result: SpendResult, kind: SpendKind) async {
+    func apply(_ result: SpendResult, intent: SpendIntent) async {
+        let kind = intent.kind
         switch result {
         case let .accepted(runID, _):
             needsRecheck = false
@@ -368,7 +378,7 @@ public final class RunFlow {
             }
         case let .refused(status, code, text, panelToken):
             needsRecheck = false
-            await applyRefusal(status: status, code: code, text: text, panelToken: panelToken, kind: kind)
+            await applyRefusal(status: status, code: code, text: text, panelToken: panelToken, intent: intent)
         case .outcomeUnknown:
             needsRecheck = false
             phase = .outcomeUnknown
@@ -378,7 +388,7 @@ public final class RunFlow {
             message = "The bot stayed busy after \(attempts) attempts. Nothing was recorded — tap again when ready."
         case let .unreachable(detail):
             needsRecheck = true
-            pendingKind = kind
+            pendingIntent = intent
             message = "No answer from the VPS (\(detail)). The request is saved — Check again resends it without spending twice."
         case let .expired(label, createdAt):
             needsRecheck = false
@@ -389,12 +399,19 @@ public final class RunFlow {
         }
     }
 
+    /// The provider for `choice_required` comes from the confirmed intent,
+    /// never `selectedProvider` — it may have moved on since the tap that
+    /// caused this refusal. A missing panel is reloaded so a price can be
+    /// shown before Reuse/Re-run are tappable (`choose` refuses without one).
     func applyRefusal(status: Int, code: String, text: String, panelToken: String?,
-                      kind: SpendKind) async {
+                      intent: SpendIntent) async {
         message = APIError.server(status: status, code: code, message: text).userMessage
-        switch (code, kind) {
+        switch (code, intent.kind) {
         case ("choice_required", .confirm):
-            if let panelToken { phase = .choiceRequired(panelToken: panelToken, provider: selectedProvider) }
+            if let panelToken, case let .confirm(_, provider, _, _, _) = intent {
+                phase = .choiceRequired(panelToken: panelToken, provider: provider)
+                if panel == nil { await loadPanel(force: false) }
+            }
         case ("stale_panel", .confirm):
             // Never an automatic re-confirm: re-read, show the new price, wait.
             phase = .rentPanel

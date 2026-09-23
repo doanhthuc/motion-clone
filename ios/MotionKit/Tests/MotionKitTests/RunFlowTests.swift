@@ -320,5 +320,61 @@ extension URLProtocolTests {
         #expect(flow.phase == .started(runID: "tg-1000"))
         #expect(flow.pendingNotice == nil)
     }
+
+    @Test func chooserKeepsTheConfirmedProvider() async {
+        let gate = FakeSpendGate([
+            .refused(status: 409, code: "choice_required", message: "try-on already ran", panelToken: "55.6"),
+            .accepted(runID: "tg-1000", outcome: "started"),
+        ])
+        let flow = make(Routes(), gate: gate)
+        await flow.start(.newJob)
+        await flow.continueToRent()
+        flow.selectedProvider = .vast
+        await flow.confirm()
+        #expect(flow.phase == .choiceRequired(panelToken: "55.6", provider: .vast))
+        // The picker moved on while the confirm was outstanding — must not
+        // steer the chooser, which must still act on the confirmed provider.
+        flow.selectedProvider = .runpod
+        await flow.choose(.reuse)
+        let intents = await gate.intents
+        #expect(intents.count == 2)
+        #expect(intents[1] == .confirm(runID: "tg-1000", provider: .vast, panelToken: "55.6",
+                                       gpu: nil, tryon: .reuse))
+        #expect(flow.phase == .started(runID: "tg-1000"))
+    }
+
+    @Test func replayedChoiceRequiredLoadsPanelAndUsesEntryProvider() async {
+        let entry = SpendLedgerEntry(key: "OLD", intent: .confirm(runID: "tg-1000", provider: .vast,
+                                                                  panelToken: "t", gpu: nil, tryon: nil),
+                                     label: "Confirm · Vast · ~$1.05", createdAt: .now)
+        let gate = FakeSpendGate([.accepted(runID: "tg-1000", outcome: "started")], pending: entry,
+                                 replay: .refused(status: 409, code: "choice_required",
+                                                  message: "try-on already ran", panelToken: "55.6"))
+        let flow = make(Routes(), gate: gate)
+        await flow.replayPendingOnce()
+        #expect(flow.phase == .choiceRequired(panelToken: "55.6", provider: .vast))
+        #expect(flow.panel != nil)
+        await flow.choose(.rerun)
+        #expect(await gate.intents == [.confirm(runID: "tg-1000", provider: .vast, panelToken: "55.6",
+                                                gpu: nil, tryon: .rerun)])
+        #expect(flow.phase == .started(runID: "tg-1000"))
+    }
+
+    @Test func chooserRefusesWithoutAPrice() async {
+        let routes = Routes()
+        routes.setPanels([Fixtures.rentPanelSoldOut])
+        let entry = SpendLedgerEntry(key: "OLD", intent: .confirm(runID: "tg-1000", provider: .runpod,
+                                                                  panelToken: "t", gpu: nil, tryon: nil),
+                                     label: "Confirm · RTX 5090 · ~$1.39", createdAt: .now)
+        let gate = FakeSpendGate(pending: entry,
+                                 replay: .refused(status: 409, code: "choice_required",
+                                                  message: "try-on already ran", panelToken: "55.6"))
+        let flow = make(routes, gate: gate)
+        await flow.replayPendingOnce()
+        #expect(flow.phase == .choiceRequired(panelToken: "55.6", provider: .runpod))
+        await flow.choose(.reuse)
+        #expect(await gate.intents.isEmpty)
+        #expect(flow.message == "Couldn't price this confirm — pull to refresh the rent panel, then choose again.")
+    }
 }
 }
