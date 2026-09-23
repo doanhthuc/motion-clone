@@ -92,7 +92,7 @@ has no owner).
 | `rentPanel` | the user continues or skipped preview | RunPod row (GPU, datacenter, stock, $/h); Vast row, disabled with its `blockers` when `can_spend` is false; `jobs`; `estimate_min`; **Confirm · ~$X.XX quote** |
 | `choiceRequired` | confirm answered `choice_required` | **Reuse try-on (no quota)** and **Re-run try-on** — each a new tap, new key |
 | `started` | `202` | Hands off to the existing `RunDetailView` for the run id |
-| `outcomeUnknown` | `409 outcome_unknown` | "Couldn't tell whether this went through — check Pod", switch to the Pod tab and refresh it |
+| `outcomeUnknown` | `409 outcome_unknown` | "Couldn't tell whether this went through — check the pod", switch to the Runs tab (its pod strip; the Pod tab arrives in Phase 5) and refresh the pod |
 
 - **Entry points.** New Job gains **Continue to run →**, enabled when the draft is validated and
   runnable; `NewJobView` itself still holds no spend button. The Runs hero card of a `phase_a` run
@@ -106,13 +106,14 @@ has no owner).
 
 ## 5. Money: `SpendGate` and the idempotency ledger
 
-**Intent.** `SpendIntent` cases: `.phaseA`, `.regen(runId, index, runToken, guidance: Set<Guidance>)`,
+**Intent.** `SpendIntent` cases: `.phaseA`, `.regen(runId, index, runToken, guidance: [Guidance])`,
 `.confirm(runId, provider, panelToken, gpu, tryon: TryonChoice?)`, `.resume(runId, provider, runToken,
-gpu)`. Each case produces its path and JSON body; `Guidance` encodes only the three wire values.
+gpu)`. Each case produces its path and JSON body; `Guidance` encodes only the three wire values, sent in
+`Guidance.allCases` order so one selection always yields one body.
 
 **Ledger.** `IdempotencyLedger` holds **at most one** entry `{key, intent, label, createdAt}` —
-`label` is what the user tapped, e.g. "Confirm · RTX 5090 · ~$1.40". Written to a temp file and
-renamed, then the file is synced, before the request leaves. One run slot means one in-flight spend:
+`label` is what the user tapped, e.g. "Confirm · RTX 5090 · ~$1.40". Written to a temp file, synced,
+then renamed over the journal, before the request leaves. One run slot means one in-flight spend:
 `perform` refuses with `.spendInFlight` while an entry exists, and `RunFlow` exposes that as "every
 spend button disabled, the in-flight label shown with a spinner".
 
@@ -133,8 +134,8 @@ spend button disabled, the in-flight label shown with a spinner".
      never `perform`.
 
 **Launch replay.** `replayPending()` runs once, the first time the scene becomes active. An entry
-younger than **20 h** is resent once with its key under "Checking the earlier Confirm…", and the
-result is handled as above. An entry **20 h or older is never resent** — the server's 24 h prune would
+younger than **20 h** is resent once with its key under "Checking the earlier Confirm…" — a single
+attempt, no retry loop — and the result is handled as above. An entry **20 h or older is never resent** — the server's 24 h prune would
 turn it into a fresh spend — and is discarded with "An earlier Confirm from 14:02 couldn't be
 verified. Check Runs and Pod before trying again."
 
@@ -143,8 +144,9 @@ panelToken?)`, `.outcomeUnknown`, `.busy(attempts)`, `.unreachable`, `.expired`.
 to §4's phases. `stale_panel` on confirm re-reads the rent panel and waits for a new tap; on regen it
 re-reads `/tryon`. Nothing ever calls `perform` automatically.
 
-`APIError.server` gains an optional extras payload so `choice_required`'s `panel_token` survives
-decoding; existing call sites ignore it.
+`SpendGate` decodes the error envelope itself (including `choice_required`'s top-level
+`panel_token`), so `APIError` is unchanged. Transport goes through one new `APIClient.spendPost`
+that returns the raw status and body, or a transport failure, and never throws.
 
 ## 6. Reads and models
 
@@ -159,12 +161,14 @@ decoding; existing call sites ignore it.
   running or any preview is `pending`/`running` — the `RunDetailStore` pattern.
 - **Rent panel** read on entering `rentPanel`; pull-to-refresh uses `?force=1`. Every read replaces
   the held `panelToken`.
-- **Images** via `APIClient.data`, cached per `(index, run_token)`; a regenerate rewrites the manifest,
-  changing the token and invalidating the cache.
+- **Images** via `APIClient.data`, cached per `(index, imageGeneration)`. `imageGeneration` increments
+  whenever `/tryon` goes from `phase_a_running: true` to `false`. The `run_token` is not a usable cache
+  key: `_regen_tryon` re-runs through `start_phase_a(resume=True)` and leaves the manifest (whose mtime
+  is the token) untouched.
 - **Versions** probed lazily when the strip opens: `versions/1, 2, …` until `404`, capped at 10 (the
   API returns no count).
 - **Keep** = `POST /v1/tryon-library {run_id, index}` through plain `APIClient.post` — a free file
-  copy, not a spend. Shows "Saved" for that `(index, run_token)`.
+  copy, not a spend. Shows "Saved" for that `(index, imageGeneration)`.
 - **`make ios-contract`** adds GET `/runs/{id}/tryon` and `/runs/{id}/rent-panel` (no `force`, cached
   stock; 120 s timeout because the Vast quote can be slow). Both free; nothing stored.
 
@@ -189,7 +193,9 @@ decoding; existing call sites ignore it.
 fake in the UI-test build, so a stray tap cannot reach the VPS. The test opens the run flow from a
 seeded draft and asserts the rent panel renders a quote and a spend button, which it does not tap.
 
-**`make ios-refusal-smoke`** — new, opt-in, never part of other gates. Through the real `SpendGate`
+**`make ios-refusal-smoke`** — new, opt-in, never part of other gates; implemented as
+`motion-contract --refusal-smoke` so nothing under `scripts/**` changes (a push there redeploys the
+bot). Through the real `SpendGate`
 against the live API: `confirm` with a bogus `panel_token` → `409 stale_panel`; `regen` with a bogus
 `run_token` → `409 stale_panel`; `resume` with a bogus `run_token` → `409 stale_run`. It asserts
 `GET /v1/pod` has no lease before and after. Each refusal is a token check that runs before any
