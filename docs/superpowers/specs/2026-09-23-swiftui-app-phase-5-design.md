@@ -1,6 +1,6 @@
 # Motion iPhone app — Phase 5 pod and cost design
 
-Date: 2026-09-23 · Status: implemented; `make ios-ui-test` (Phase 5 in full) and `make ios-refusal-smoke` (idle kill and bogus migrate refused) passed live 2026-09-23, zero spend; a real kill, GPU change and migration not yet exercised
+Date: 2026-09-23 · Status: implemented; `make ios-ui-test` (Phase 5 in full) and `make ios-refusal-smoke` (idle kill and bogus migrate refused) passed live 2026-09-23, zero spend; a real GPU change and kill ran once through the app's MotionKit code ($0.012, progress handoff §"Real spend test"); a real migration not exercised
 
 This spec refines Phase 5 of `docs/superpowers/specs/2026-09-22-swiftui-app-design.md` (§3 "Pod &
 cost", §4 kill and migrate). Phases 1–4 are shipped (`docs/superpowers/swiftui-app-progress.md`).
