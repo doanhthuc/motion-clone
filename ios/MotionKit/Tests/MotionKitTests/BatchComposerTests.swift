@@ -15,6 +15,7 @@ extension URLProtocolTests {
         private var failPatchFor: String?
         private var basketNextPatchFor: String?
         private var dropBatchArmed = false
+        private var characterOnNextRead: String?
         /// Immutable and set at init: every other field is read under `lock`
         /// from the stub handler, and a `var` written from a test body would be
         /// the one field raced outside it.
@@ -32,6 +33,10 @@ extension URLProtocolTests {
         func basketNextPatch(for outfit: String) { lock.withLock { basketNextPatchFor = outfit } }
         /// Another surface emptied the basket after our last read.
         func dropBatchOnNextRead() { lock.withLock { dropBatchArmed = true } }
+        /// Another surface changed a shared slot after our last read.
+        func changeCharacterOnNextRead(to materialID: String) {
+            lock.withLock { characterOnNextRead = materialID }
+        }
 
         func answer(_ r: URLRequest) -> (Int, [String: String], Data) {
             lock.withLock {
@@ -42,6 +47,10 @@ extension URLProtocolTests {
                     if dropBatchArmed {
                         dropBatchArmed = false
                         batch.removeAll()
+                    }
+                    if let character = characterOnNextRead {
+                        characterOnNextRead = nil
+                        shared["character"] = character
                     }
                     return TestSupport.json(json())
                 case ("PATCH", "/v1/draft"):
@@ -237,6 +246,33 @@ extension URLProtocolTests {
 
         #expect(writePaths() == ["PATCH /v1/draft", "POST /v1/draft/add-to-batch", "PATCH /v1/draft"])
         #expect(draft.draft?.batch.count == 1)
+        #expect(composer.failure == nil && composer.lastAdded == 1)
+    }
+
+    /// The other unsafe direction of the spec §4 re-read: a shared slot changed
+    /// elsewhere *while the run is in flight*. `refreshSeeds()` cannot correct
+    /// the seeds then — it refuses on `isRunning` — so the re-read is the only
+    /// moment they can be re-picked against the slots the PATCH is sent with.
+    /// The stale seed names a try-on saved from the old character, and Phase A
+    /// skips the provider and seeds the job from it.
+    @Test func runRepicksSeedsAgainstTheSharedSlotsItReRead() async {
+        let server = FakeDraftServer(library: #"""
+        {"entries":[{"id":"stale","owner":"app","material_ids":{"character":"app/me.png","outfit":"app/o1.png"},"provider":"gemini","saved_at":1}]}
+        """#)
+        let (composer, draft) = await make(server)
+        composer.toggle(outfitID: "app/o1.png")
+        // Pinned so the test cannot pass by never having had a match to lose.
+        #expect(composer.outfits.map(\.seedID) == ["stale"])
+        server.changeCharacterOnNextRead(to: "app/someone-else.png")
+
+        await composer.run()
+
+        #expect(draft.draft?.filledSlots["character"] == "app/someone-else.png")
+        #expect(writePaths() == ["PATCH /v1/draft", "POST /v1/draft/add-to-batch", "PATCH /v1/draft"])
+        let w = writes()
+        // Nothing in the library matches the new character, so the seed is
+        // cleared and Phase A makes a fresh try-on. `"stale"` here is the defect.
+        #expect(w[0].2?["tryon_seed"] is NSNull)
         #expect(composer.failure == nil && composer.lastAdded == 1)
     }
 

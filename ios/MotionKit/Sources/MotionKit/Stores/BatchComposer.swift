@@ -105,6 +105,20 @@ public final class BatchComposer {
     /// image that does not match its own materials.
     public func refreshSeeds() {
         guard !isRunning else { return }
+        repickSeeds()
+    }
+
+    /// The re-pick without the `isRunning` guard, for `run()`: a shared slot
+    /// edited by another surface (Telegram bot, phone API, another tab) lands
+    /// server-side while a build is in flight, and the guard above is what
+    /// stops the observers from correcting it then. Without this, `run()` sends
+    /// the seed it picked against the pre-refresh pair, and Phase A copies that
+    /// image over the stage output without ever calling the provider
+    /// (`runner.py:670-685`) — a wrong video with nothing on screen to say so.
+    /// When the fresh slots match nothing the seed becomes nil and the step
+    /// clears it, so Phase A makes a new try-on: one provider call instead of a
+    /// silently wrong one.
+    private func repickSeeds() {
         outfits = outfits.map { CrossOutfit(outfitID: $0.outfitID, seedID: matches(for: $0.outfitID).first?.id) }
         progress = nil
     }
@@ -135,8 +149,23 @@ public final class BatchComposer {
         // success. Offline needs no handling here: `refresh()` keeps the last
         // good draft and the first PATCH below then fails loudly through
         // `stop(at:)`, with the transport's or the server's own message.
+        let sharedBefore = sharedSlots
         await draft.refresh()
         guard let current = draft.draft else { return }
+        // Re-pick after the re-read and before planning, and only when the
+        // re-read changed the shared slots. The order is the point: the seeds
+        // then come from the server's current slots, and `pending(in:)` compares
+        // each outfit against the basket carrying its *new* seed, so an outfit
+        // whose seed changed is not skipped as already basketed. The condition
+        // matters too — an unconditional re-pick would replace the seed chosen
+        // in an outfit row's "Saved image" picker with the newest automatic
+        // match on *every* build, not only after a concurrent edit. Not before
+        // the `guard`, either: `matches(for:)` reads the store's draft, so on
+        // the nil-draft bail-out it would match nothing and wipe every seed for
+        // a run that never happened. A provider or pipeline change needs no
+        // re-pick — `matches(slots:)` ignores both, and the server refuses a
+        // seed beside a non-local provider loudly (`drafts.py:435-439`).
+        if sharedSlots != sharedBefore { repickSeeds() }
         let steps = pending(in: current)
         progress = Progress(done: outfits.count - steps.count, total: outfits.count)
         for outfit in steps {
@@ -150,7 +179,8 @@ public final class BatchComposer {
             if !(await draft.addToBatch()) {
                 // `draft.error` is the store's, not ours: this reads the refusal
                 // addToBatch just recorded, and staying nil afterwards depends on
-                // DraftStore.refresh() clearing `error` on success (Task 2).
+                // the refresh below installing the server's draft through
+                // accept(), which clears `error` (`DraftStore.swift:70`, `:222`).
                 guard case .server(status: 422, code: "duplicate", message: _) = draft.error else {
                     return stop(at: outfit)
                 }
