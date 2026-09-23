@@ -113,6 +113,14 @@ public final class RunFlow {
             self.error = apiError(error)
             return
         }
+        // A fresh load may be re-entering a stale in-memory instance (the
+        // view was closed while Phase A/regen finished elsewhere) — always
+        // invalidate the image/version caches so `image(index:)` never hands
+        // back bytes from before this read. `isKept` is keyed by generation
+        // too, so it resets for free.
+        imageGeneration += 1
+        images = [:]
+        versions = [:]
         if tryon?.phaseARunning == true {
             phase = .phaseARunning
         } else if entry == .existing, !(tryon?.previews.isEmpty ?? true) {
@@ -134,13 +142,7 @@ public final class RunFlow {
 
     public func refreshTryon() async {
         guard let runID else { return }
-        // Deliberately excludes `phase == .phaseARunning`: `apply` sets that
-        // optimistically right before this call, and an immediate refresh can
-        // still return the pre-spend snapshot (the manifest write hasn't
-        // landed yet) — using the optimistic phase here would misread that
-        // stale "done" snapshot as "just finished" and bounce back to
-        // `.previews` a beat early.
-        let wasRunning = tryon?.phaseARunning == true
+        let wasRunning = tryon?.phaseARunning == true || phase == .phaseARunning
         do {
             let fresh = try await client.get(TryonPreviews.self, "v1", "runs", runID, "tryon")
             tryon = fresh

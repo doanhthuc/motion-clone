@@ -108,10 +108,23 @@ extension URLProtocolTests {
         let gate = FakeSpendGate([.accepted(runID: "tg-1000", outcome: "started")])
         let flow = make(routes, gate: gate)
         await flow.start(.existing)
+        routes.tryon = Fixtures.tryonRunning
         await flow.regenerate(index: "0", guidance: [.matchLighting, .keepFace])
         #expect(await gate.intents == [.regen(runID: "tg-1000", index: "0", runToken: "1790000000123.4",
                                               guidance: [.keepFace, .matchLighting])])
         #expect(flow.phase == .phaseARunning)
+    }
+
+    @Test func acceptedSpendAlreadyFinishedLandsInPreviews() async {
+        let routes = Routes()
+        routes.tryon = Fixtures.tryonDone
+        let gate = FakeSpendGate([.accepted(runID: "tg-1000", outcome: "started")])
+        let flow = make(routes, gate: gate)
+        await flow.start(.existing)
+        let before = flow.imageGeneration
+        await flow.regenerate(index: "0", guidance: [])
+        #expect(flow.phase == .previews)
+        #expect(flow.imageGeneration == before + 1)
     }
 
     @Test func regenerateStaleRefreshesTryonAndShowsServerText() async {
@@ -146,6 +159,20 @@ extension URLProtocolTests {
         await flow.start(.existing)
         await flow.loadVersions(index: "0")
         #expect(flow.versions["0"] == [Data("v1".utf8), Data("v2".utf8)])
+    }
+
+    @Test func reenteringStartInvalidatesImageCache() async {
+        let routes = Routes()
+        routes.tryon = Fixtures.tryonDone
+        let flow = make(routes)
+        await flow.start(.existing)
+        let before = flow.imageGeneration
+        _ = await flow.image(index: "0")
+        await flow.start(.existing)
+        #expect(flow.imageGeneration == before + 1)
+        _ = await flow.image(index: "0")
+        let hits = StubURLProtocol.requests.filter { $0.url?.path == "/v1/runs/tg-1000/tryon/0" }
+        #expect(hits.count == 2)
     }
 
     @Test func spendInFlightDisablesAndClears() async {
