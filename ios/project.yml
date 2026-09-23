@@ -41,3 +41,24 @@ targets:
         CF_ACCESS_CLIENT_ID: $(CF_ACCESS_CLIENT_ID)
         CF_ACCESS_CLIENT_SECRET: $(CF_ACCESS_CLIENT_SECRET)
         CONTROL_API_TOKEN: $(CONTROL_API_TOKEN)
+  MotionAppUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: MotionAppUITests
+    dependencies:
+      - target: MotionApp
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: xyz.doanhthuc.motion.uitests
+        SWIFT_VERSION: "6.0"
+        GENERATE_INFOPLIST_FILE: YES
+schemes:
+  MotionApp:
+    build:
+      targets:
+        MotionApp: all
+        MotionAppUITests: [test]
+    test:
+      targets:
+        - MotionAppUITests

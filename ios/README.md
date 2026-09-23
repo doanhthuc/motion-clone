@@ -15,6 +15,7 @@ SwiftUI client for the control-plane API on `motion-vps`
     brew install xcodegen          # once
     make ios-secrets               # .env → ios/Secrets.xcconfig (gitignored)
     make ios-test ios-build        # free gates
+    make ios-ui-test               # auto-boot a simulator and run the free Phase 3 smoke
     make ios-audio-test            # Silent Mode playback check; needs a booted simulator
     make ios-contract              # decode the live API with the app's models (GET only)
     open ios/MotionApp.xcodeproj   # pick your iPhone, Run
@@ -68,9 +69,12 @@ The Phase 3 UI intentionally contains no Phase A, Run, rent, pod, confirm, resum
 spend-capable action. Its mutations use only the free draft endpoints; its reads use the free pipeline,
 draft, material, and authenticated-thumbnail routes. Later phases introduce spend actions.
 
-### Phase 3 simulator/iPhone smoke (pending)
+### Phase 3 simulator smoke
 
-This free manual smoke, including the physical-phone portion, remains deferred and unrun.
+`make ios-ui-test` automatically selects an available iPhone Simulator, boots it when needed, runs
+the free live smoke below, clears the VPS draft even when the test fails, and shuts down a simulator
+that it booted. Set `IOS_SIMULATOR_ID=<UDID>` to target a specific simulator. A physical iPhone is
+optional coverage, not a prerequisite for this flow.
 
 1. Open New Job and switch between two pipelines; confirm incompatible slots disappear with a notice.
 2. Assign image and video materials and verify incompatible kinds are absent from each picker.

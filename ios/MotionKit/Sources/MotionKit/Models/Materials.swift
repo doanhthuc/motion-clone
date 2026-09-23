@@ -58,6 +58,21 @@ public struct MaterialProbe: Decodable, Sendable, Equatable {
     public let bitrateKbps: Int?
     public let sizeBytes: Int64
     public let warning: String
+
+    private enum CodingKeys: String, CodingKey {
+        case kind, width, height, durationS, bitrateKbps, sizeBytes, warning
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        kind = try values.decode(String.self, forKey: .kind)
+        width = try values.decodeIfPresent(Int.self, forKey: .width)
+        height = try values.decodeIfPresent(Int.self, forKey: .height)
+        durationS = try values.decodeIfPresent(Double.self, forKey: .durationS)
+        bitrateKbps = try values.decodeIfPresent(Int.self, forKey: .bitrateKbps)
+        sizeBytes = try values.decode(Int64.self, forKey: .sizeBytes)
+        warning = try values.decodeIfPresent(String.self, forKey: .warning) ?? ""
+    }
 }
 
 public struct UploadStatus: Decodable, Sendable, Equatable {

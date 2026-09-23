@@ -92,6 +92,22 @@ import Testing
         #expect(draft.jobs == 1 && draft.estimateMin == nil)
     }
 
+    @Test func draftProbeDecodesWhenNestedWarningIsOmitted() throws {
+        let payload = #"""
+        {"owner":"app","pipeline":"tryon-motion-enhance","provider":"gemini","generation":5,
+         "slots":{"outfit":{"material_id":"app/dress.png","name":"dress.png","exists":true,
+           "probe":{"kind":"image","width":1024,"height":1536,"duration_s":null,
+           "bitrate_kbps":null,"size_bytes":900},"warning":""}},
+         "required":["character","driver","outfit"],"optional":["mask"],
+         "missing":["character","driver"],"validated":null,"batch":[],
+         "jobs":0,"estimate_min":null}
+        """#
+
+        let draft = try decoder.decode(Draft.self, from: Data(payload.utf8))
+
+        #expect(draft.slots["outfit"]?.probe.warning == "")
+    }
+
     @Test func roleKindsFilterOnlyCompatibleMaterials() throws {
         let image = Material(id: "app/a.png", owner: "app", name: "a.png",
                              bytes: 1, updatedAt: 1, kind: .image)

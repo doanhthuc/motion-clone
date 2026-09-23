@@ -67,6 +67,7 @@ make check-batch-params                           # scripts/batch-params.json vs
 make check-vast-models                            # scripts/batchlib/vast_models.py vs PIPELINES/catalog
 make batch-coverage [FULL=1]
 make ios-test                                     # MotionKit logic (swift test, no simulator)
+make ios-ui-test                                  # Auto-boot simulator; live Phase 3 UI smoke; no GPU
 make ios-audio-test                               # Silent Mode playback regression (booted simulator)
 make ios-build                                    # app compiles for the simulator (runs ios-gen)
 make ios-contract                                 # live phone API decodes with the app's models (GET only)
