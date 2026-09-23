@@ -1,6 +1,6 @@
 # Motion SwiftUI App — Development Progress and Handoff
 
-Last updated: 2026-09-23
+Last updated: 2026-09-24
 
 This is the current implementation handoff for the native iPhone app. Read it before planning or
 changing another SwiftUI phase. The approved product contract remains
@@ -10,15 +10,24 @@ what actually shipped, what was verified, and the next safe boundary.
 ## Current baseline
 
 - Repository: `/Users/thucpham/Desktop/motion-clone`
-- Branch: `main`
-- Latest implementation: `7a8c0e2` (merge of PR #66, `feat/swiftui-phase-5`), merged 2026-09-23.
-  Phase 4 was PR #65 (`2945481`).
+- Branch: `feat/swiftui-phase-6` (unmerged). The last **merged** implementation is `7a8c0e2` (merge of
+  PR #66, `feat/swiftui-phase-5`), merged 2026-09-23; Phase 4 was PR #65 (`2945481`). Phase 6 has no
+  merge commit or PR number yet — fill those in after the merge.
+- `main` is 2 commits ahead of `origin/main` (`4052b97` Phase 6 spec, `5eaa652` Phase 6 plan), both
+  unpushed. Push `main` before opening the Phase 6 PR, or the PR will carry those two doc commits.
 - PR #66 changed only `ios/**`, `docs/**`, `Makefile`, `CLAUDE.md` and `AGENTS.md` — nothing under
-  `scripts/**` — so it did not trigger the deploy-bot workflow.
-- PR #65 did not touch `scripts/**` either. The VPS bot still runs the `affcf46` deploy (GitHub Actions run
-  `35813558396`, `motion-bot` active, control API on `127.0.0.1:8787`).
-- Control-plane API slices 1–6 are live. Phases 4 and 5 added no route or field.
-- Phases 1–5 are implemented. Phase 6 has not started.
+  `scripts/**` — so it did not trigger the deploy-bot workflow. PR #65 did not touch `scripts/**`
+  either. The VPS bot still runs the `affcf46` deploy (GitHub Actions run `35813558396`, `motion-bot`
+  active, control API on `127.0.0.1:8787`).
+- Phase 6 is the first phase to touch `scripts/**`: Task 1 adds a read-only `tryon_seed` field to
+  `GET /v1/draft` (`scripts/control/drafts.py` `_view`, lines 331 and 334). It is on the branch, not
+  deployed — merging to `main` auto-deploys `motion-bot`, so check the VPS for a drain, Phase A, pod
+  lease and migration first. The app decodes the field as optional, so it works against the server
+  before and after that deploy.
+- Control-plane API slices 1–6 are live. Phases 4 and 5 added no route or field; Phase 6 adds one
+  read-only field and no route.
+- Phases 1–6 are implemented in code. Phase 6's two live gates (`ios-contract`, `ios-ui-test`) are
+  pending the controller run.
 
 ## Phase status
 
@@ -29,7 +38,7 @@ what actually shipped, what was verified, and the next safe boundary.
 | 3 — single New Job | Complete | Catalog-driven pipeline/provider picker, compatible material pickers, server-authoritative draft mutations, validation, add/drop basket entries, stale/error reconciliation | Automated live simulator smoke passes; physical phone is optional coverage |
 | 4 — run flow | Complete in code | `SpendGate`/idempotency ledger, Phase A + try-on previews, regenerate with the closed guidance vocabulary, Keep, the rent panel (RunPod + Vast, out-of-stock), confirm (with the reuse/rerun chooser) and resume, all through `RunFlow`; `make ios-test` (158 tests), `make ios-build`, `make ios-contract` (adds `/tryon` and `/rent-panel`), `make ios-ui-test` (adds `Phase4SmokeTests`, zero-spend via `-UITestRecordingSpendGate`) and `scrub-secrets.sh --check` all pass | `make ios-refusal-smoke` passed live on 2026-09-23 (three bogus-token spends refused with 409, no lease before or after). No live Phase A / regen / confirm / resume has run — no pod has been rented for Phase 4 |
 | 5 — pod and cost | Complete in code | Pod tab: lease card with a quoted cost, kill (fresh key per tap, outside `SpendGate`, followed to `last_kill`), the "pod may still be billing" banner (`destroy_unverified`/`error`, cleared only by acknowledgement or a later successful kill), GPU choice on the Pod tab and the rent panel (re-reads the panel), RunPod balance and on-tap Vast credit, the migration (ask → typed, expiring confirmation → `SpendIntent.migrate` through `SpendGate`), an unanswered migrate on every tab; `make ios-test` (211 tests), `ios-build`, `ios-contract` (adds `gpu/stock`, `balance`), `ios-ui-test` (adds `Phase5SmokeTests`) pass | With no pod leased (2026-09-23): `make ios-ui-test` ran `Phase5SmokeTests` in full and `make ios-refusal-smoke` passed all seven steps. A real Phase A → GPU change → confirm → kill ran once through the app's MotionKit code ($0.012, see §"Real spend test"). No real migration has run |
-| 6 — batch/library | Not started | Nothing yet | Cross build UI, batch progress, saved try-ons and guided regenerate |
+| 6 — batch/library | Complete in code | Cross build (Batch mode) with resumable re-planning and per-outfit seeds, the seed badge and its "no longer exists" variant, drop after Phase A with the re-validate and stale-panel clearing, `canConfirm`'s `!isDropping` guard, the batch progress list, saved try-ons (browse/use/delete) on the Material tab, and the server's read-only `tryon_seed` field; `make ios-build` exit 0, the UI-test target compiled (`build-for-testing`), `swift test` 244 tests in 23 suites, `scrub-secrets.sh --check` exit 0 | `make ios-contract` (the 14th route, `GET /v1/tryon-library`) and `make ios-ui-test` (`Phase6SmokeTests`) are pending the controller run. No real batch has run |
 
 ## What is implemented now
 
@@ -68,29 +77,81 @@ what actually shipped, what was verified, and the next safe boundary.
   state instead of accepting arbitrary media.
 - Basket rows use stable server digests and require destructive confirmation before Drop.
 
+### Phase 6 batch and library
+
+- `BatchComposer` (MotionKit) drives a cross build: the edited job's slots are shared, and each chosen
+  outfit becomes one basket job through `PATCH {slots.outfit, tryon_seed}` + `add-to-batch`. `run()`
+  re-reads the draft and re-plans, so a resumed build skips outfits already basketed and never adds a
+  duplicate (`422 duplicate` counts as done); every step names its seed explicitly, so no outfit
+  inherits the previous one's. Free — no `SpendGate`, no Idempotency-Key. The button is disabled while
+  a build is in flight, and `lastAdded` counts the selection.
+- `NewJobView` gained a **Single | Batch** segmented control (`newjob.mode`). Batch renders
+  `BatchComposerSection`: shared slots, an outfit multi-select capped at 12 (`batch.pickOutfits` →
+  `outfit.pick.<id>`), a per-outfit "Use saved try-on" toggle (`batch.seed.<outfitID>`, on by default
+  when the library has a match), and the run button (`batch.run`). The seed observers sit above the
+  Single|Batch split, so a mode switch cannot strand a seed picked against the old slots.
+- `TryonLibraryStore` backs the Material tab's **Materials | Saved try-ons** split (`MaterialTabView`):
+  browse the grid, **Use in job** (one `PATCH` through `DraftStore.apply`, then switch to the New Job
+  tab in Single mode), and delete after a confirmation naming the jobs that would lose their image.
+  `matches(slots:)` is exact equality over every non-driver role.
+- The edited job's seed shows a badge in Single mode, with a "The saved try-on no longer exists"
+  variant when its library entry was deleted; a basket entry shows a "Saved try-on" tag.
+- Drop after Phase A (`RunFlow`): a batch of ≥ 2 jobs offers "Drop from batch" (`tryon.drop.<index>`)
+  per preview card, which re-validates the draft and re-reads the previews and rent panel; `canConfirm`
+  is guarded by `!isDropping`. Run detail shows a per-job batch progress list. The server's draft view
+  reports a read-only `tryon_seed` on the edited job and each basket entry.
+
 ## Current file map
 
 ```text
 ios/
   MotionKit/Sources/MotionKit/
     API/                    APIClient, APIError, credentials
-    Models/                 runs, pod, outputs, materials, drafts, run flow (previews, rent panel)
+    Models/                 runs, pod, outputs, materials, drafts (slots, batch, seed, DraftPatch),
+                            run flow (previews, rent panel), try-on library
     Money/                  SpendIntent, Guidance, IdempotencyLedger, SpendResult, SpendGate
     Secrets/                Keychain storage and first-launch seeding
     Stores/                 Runs, detail, outputs, pod (kill, banner), GPU, balance, materials, draft,
-                            RunFlow, MigrateFlow
+                            RunFlow, MigrateFlow, TryonLibraryStore, BatchComposer
     Upload/                 chunk planning, checkpoint journal, uploader
   MotionKit/Tests/MotionKitTests/
-                            211 logic/contract tests in 21 suites
+                            244 logic/contract tests in 23 suites
   MotionApp/
-    Runs/ Outputs/ Materials/ NewJob/ Settings/ RunFlow/ Pod/
+    Runs/ Outputs/ Settings/ RunFlow/ Pod/
                             thin SwiftUI consumers of stores
-  MotionAppUITests/         live Phase 3 + zero-spend Phase 4 and Phase 5 simulator smoke
+    Materials/              MaterialsView, MaterialTabView (Materials | Saved try-ons), SavedTryonsView
+    NewJob/                 NewJobView (Single | Batch), BatchComposerSection, SlotRow, pickers
+  MotionAppUITests/         live Phase 3 + zero-spend Phase 4, 5 and 6 simulator smoke
   project.yml               XcodeGen source; generated project is ignored
   Secrets.xcconfig          generated and ignored; never commit
 ```
 
 ## Verified gates at the handoff
+
+### Phase 6 (2026-09-24, branch `feat/swiftui-phase-6`, unmerged)
+
+What actually ran, on the worktree:
+
+- `make ios-build` — exit 0. This compiles `MotionApp` only: the scheme builds `MotionAppUITests` for
+  the `test` action, not the `build` action, so `ios-build` does not cover the UI-test target.
+- `xcodebuild -scheme MotionApp -destination 'generic/platform=iOS Simulator' build-for-testing` —
+  exit 0, and `Phase6SmokeTests.o` plus `MotionAppUITests.xctest` were produced. This is what proves
+  the new UI-test file compiles. No simulator was booted.
+- `cd ios/MotionKit && swift test` — 244 tests in 23 suites, exit 0. Unchanged from the Task 1–9
+  baseline; this task added no MotionKit test.
+- `motions-studio/setup/scrub-secrets.sh --check` — exit 0.
+
+Pending the controller run, **not** passed here:
+
+- `make ios-contract` — the 14th route (`GET /v1/tryon-library`) decoding against the live server;
+  expected 14/14. It contacts the VPS, so it is the controller's to run.
+- `make ios-ui-test` — `Phase6SmokeTests`, live and zero-spend on a booted simulator. It must run
+  outside the command sandbox (simulator control is killed inside it).
+
+No real batch has run. A 2-outfit batch with one seeded job — proving Phase A calls the provider once
+for the unseeded outfit and reuses the saved image for the seeded one — is the proposed spend test; it
+needs its own approval and a quoted price, and its cost comes from the balance delta and then
+`runpodctl billing`.
 
 ### Phase 5 (2026-09-23, merged as `7a8c0e2`)
 
@@ -168,10 +229,23 @@ tapping the UI on a phone.
 ## Known incomplete work
 
 - Phase 2's physical-phone smoke with a real interrupted upload larger than 32 MiB has not run.
-- Phase 6 app models, stores and screens (cross build, batch progress, saved try-ons) do not exist yet.
+- Phase 6 is complete in code on `feat/swiftui-phase-6`, but its two live gates — `make ios-contract`
+  (the 14th route) and `make ios-ui-test` (`Phase6SmokeTests`) — are pending the controller run; they
+  contact the VPS and boot a simulator, so they did not run here. No real batch has run: a 2-outfit
+  batch with one seeded job is the proposed spend test and needs its own approval and quoted price.
+- A one-job draft has no drop affordance by design — "Drop from batch" needs ≥ 2 jobs (Phase 6 spec
+  §5). **Clear**, on the New Job tab in Single mode, is the only way to remove the last job.
+- Follow-up (cannot be fixed on this branch): `ios/MotionKit/Tests/MotionKitTests/Fixtures.pipelines`
+  names `tryon-motion-enhance`'s optional role `mask`, while the live catalog says `background`;
+  `mask` occurs nowhere in `scripts/**` as a role. `Fixtures.swift` cannot be edited here because two
+  suites do exact `.replacingOccurrences` surgery on `Fixtures.draft`'s text, so a change can silently
+  break another suite's assertions.
+- Follow-up (needs its own VPS deploy gate): the server's invalid-validation message reaches the phone
+  verbatim as `make batch-validate failed: …` — developer-facing copy on a consumer screen. Fixing it
+  is a `scripts/**` change.
 - The real Phase A → GPU change → confirm → kill path ran once through the app's MotionKit code
   (§"Real spend test"); it has not been driven by tapping the UI. No real migration has run.
-- No GPU or pod was rented for Phases 1–4. Do not reinterpret simulator or fake-server coverage as a
+- No GPU or pod was rented for Phases 1–6. Do not reinterpret simulator or fake-server coverage as a
   real spend-path test — no live Phase A, regenerate, confirm or resume has run. The refusal smoke
   proves only that bogus-token spends are refused before anything is called.
 - `ios/Secrets.xcconfig`, personal media, screenshots with personal names, upload checkpoints and live
@@ -179,10 +253,20 @@ tapping the UI on a phone.
 
 ## Next work
 
-One thing is open:
+No phase remains — Phases 1–6 are implemented in code. Open items, none of them a phase:
 
-1. **Phase 6 — batch and library.** Create and approve a focused Phase 6 design first (parent design
-   §5 row 6: cross build, bulk try-on, batch progress, saved try-ons, guided regenerate).
+1. **Run the pending live gates, then merge** (controller). `make ios-contract` (expect 14/14) and
+   `make ios-ui-test` (`Phase6SmokeTests`) both contact the VPS / boot a simulator, so they did not run
+   here. `main` is 2 commits ahead of `origin/main` (`4052b97` spec, `5eaa652` plan), both unpushed —
+   push `main` first or the Phase 6 PR will carry them. Task 1 touches `scripts/**`, so before merging
+   check the VPS for a drain, Phase A, pod lease and migration (the merge auto-deploys `motion-bot`).
+2. **Optional spend test.** A 2-outfit batch with one seeded job, proving Phase A calls the provider
+   once for the unseeded outfit and reuses the saved image for the seeded one. Needs its own approval
+   and a quoted price; cost from the balance delta then `runpodctl billing`; `make gpu-destroy` after.
+3. **Parent spec's deferred items** (`2026-09-22-swiftui-app-design.md` §1): pair (1:1) mode and
+   stock-watch notifications. Both need a later API slice, not app work.
+4. **Two Phase 6 follow-ups** (see "Known incomplete work"): the `Fixtures.pipelines` `mask` vs
+   `background` mismatch, and the server's developer-facing validation message on the phone.
 
 Required safety behavior carries over unchanged from Phase 4: one UUID key per tap and never mint a new
 one to retry an earlier spend intent; disable the active button and show its quote while in flight;

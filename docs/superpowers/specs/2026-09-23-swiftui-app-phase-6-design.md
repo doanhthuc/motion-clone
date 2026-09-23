@@ -1,6 +1,14 @@
 # Motion iPhone app — Phase 6 batch and library design
 
-Date: 2026-09-23 · Status: approved design, not implemented
+Date: 2026-09-23 · Status: implemented on the unmerged branch `feat/swiftui-phase-6`
+
+Gates that ran on the worktree (2026-09-24): `make ios-build` exit 0; the UI-test target compiled
+(`xcodebuild build-for-testing` exit 0, `Phase6SmokeTests.o` produced, no simulator booted);
+`cd ios/MotionKit && swift test` 244 tests in 23 suites; `scrub-secrets.sh --check` exit 0. Pending the
+controller run, **not** passed here: `make ios-contract` (the 14th route, `GET /v1/tryon-library`,
+expected 14/14) and `make ios-ui-test` (`Phase6SmokeTests`, live and zero-spend). No real batch has run
+— a 2-outfit batch with one seeded job is the proposed spend test (§8) and needs its own approval and
+quoted price.
 
 This spec refines Phase 6 of `docs/superpowers/specs/2026-09-22-swiftui-app-design.md` (§3 "New
 batch, Bulk try-on", "Saved try-ons", §5 row 6). Phases 1–5 are shipped
@@ -157,6 +165,17 @@ stale state.
 `TryonLibraryEntry {id, materialIDs: [String: String], provider, savedAt: Date}` (the existing
 `TryonLibraryRecord` is reused or folded in); the draft patch encodes `tryon_seed` as absent,
 explicit `null`, or an id.
+
+**Known limitation (Task 7, recorded in code).** The server merges a `PATCH /v1/draft` per role
+(`scripts/control/drafts.py:450-455`): it sets the roles the patch names and pops only a role sent as
+explicit `null`, leaving every other slot untouched. `TryonLibraryStore.use` sends the entry's
+`materialIDs` plus the seed, so when an entry lacks a non-driver role the draft already has — in
+practice `background` — that role stays on the draft while the seed points at an image made without
+it. The job is still valid; the reuse simply does not carry the leftover role into the saved image,
+and `matches(slots:)` (exact equality over every non-driver role) will not offer that entry for the
+mismatched pair. The optional role is `background`, not `mask`: `mask` is not a server role anywhere
+in `scripts/**` (the server's pipelines use `background`, `scripts/batchlib/pipelines.py:54,81`),
+which corrects the plan's ruling text.
 
 ## 7. App wiring
 

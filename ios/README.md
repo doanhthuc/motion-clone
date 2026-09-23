@@ -152,3 +152,42 @@ offers kill, GPU choice and the Network Volume migration. Design:
 - **Refusal smoke** now also sends a kill with nothing running (`409 nothing_running`) — only after a
   fresh read shows no lease, no running kill, no Phase A and no live run — and a migrate with a bogus
   `confirm_token` (`409 bad_confirm_token`).
+
+## Phase 6 batch and library
+
+The New Job tab gains a **Single | Batch** segmented control (`newjob.mode`); Single is the Phase 3
+composer, unchanged. The Material tab gains a **Materials | Saved try-ons** split (`material.mode`).
+Design: `docs/superpowers/specs/2026-09-23-swiftui-app-phase-6-design.md`.
+
+- **Cross build (Batch mode).** One character + driver (and `background` when the pipeline has it),
+  shared across the build, times up to 12 outfits (`batch.pickOutfits` → `outfit.pick.<id>`) becomes
+  one basket job per outfit. `BatchComposer.run()` re-reads the draft and re-plans, so **Continue**
+  after a partial failure skips outfits already basketed and never adds a duplicate (`422 duplicate`
+  counts as done); each step names its own `tryon_seed` (id or `null`), so no outfit inherits the
+  previous one's seed. Free — no `SpendGate`, no Idempotency-Key. The run button is `batch.run` and
+  reads "Add N jobs to batch"; a finished build shows "Added N jobs to the batch." and the basket
+  header reads "BATCH · N" (`SectionLabel` uppercases its text).
+- **Per-outfit seeds.** Each outfit row offers a "Use saved try-on" toggle (`batch.seed.<outfitID>`),
+  on by default when the library has a match for the shared slots plus that outfit; a seeded job's
+  Phase A skips the provider and reuses the saved image. The edited job's own seed shows a badge in
+  Single mode, with a "The saved try-on no longer exists" variant when its library entry was deleted.
+- **Drop after Phase A.** In the run flow, a batch of ≥ 2 jobs shows "Drop from batch"
+  (`tryon.drop.<index>`) on each preview card. Dropping re-validates the draft and re-reads the
+  previews and rent panel, so confirm rents only what is left; `canConfirm` is guarded by
+  `!isDropping`. The last remaining job has no drop affordance by design — **Clear** (Single mode on
+  the New Job tab) is the only way to remove it. Run detail shows a per-job batch progress list.
+- **Saved try-ons.** The library grid (`GET /v1/tryon-library`, images cached by id) shows each
+  entry's provider, saved date and resolved character/outfit names ("(deleted)" when a material is
+  gone). **Use in job** (`saved.use.<id>`) fills the draft through `DraftStore.apply` and switches to
+  the New Job tab in Single mode; the trash button deletes after a confirmation naming the jobs that
+  would lose their image.
+- **Server.** `GET /v1/draft` now reports a read-only `tryon_seed` on the edited job and each basket
+  entry (`scripts/control/drafts.py` `_view`). The app decodes the field as optional, so it works
+  against the server before and after that deploy. This is Phase 6's only `scripts/**` change; merging
+  it to `main` auto-deploys `motion-bot`, so check the VPS for a drain, Phase A, pod lease and
+  migration first.
+- **UI smoke.** `Phase6SmokeTests` is live and zero-spend (`-UITestRecordingSpendGate`): it builds a
+  two-outfit batch, drops one entry, opens Saved try-ons and clears the draft, then asserts the
+  recording gate saw zero spends. It skips when the draft is not empty or there are fewer than two
+  image materials to use as outfits, and never taps Preview try-on, Rent, Confirm, Kill, Migrate or a
+  GPU row. No real batch has run — that is a separate, separately approved spend test.
