@@ -256,6 +256,42 @@ extension URLProtocolTests {
         }
     }
 
+    @Test func putSendsSnakeCaseJSONAndDecodes() async throws {
+        StubURLProtocol.install { _ in TestSupport.json(#"{"gpu": "NVIDIA L40S", "name": "L40S"}"#) }
+        let chosen = try await TestSupport.client().put(
+            GpuSelection.self, body: GpuSelectionRequest(gpu: "NVIDIA L40S"), "v1", "pod", "gpu")
+        #expect(chosen == GpuSelection(gpu: "NVIDIA L40S", name: "L40S"))
+        let request = try #require(StubURLProtocol.requests.last)
+        #expect(request.httpMethod == "PUT")
+        #expect(request.url?.path == "/v1/pod/gpu")
+        #expect(request.value(forHTTPHeaderField: "Content-Type") == "application/json")
+        let body = try #require(JSONSerialization.jsonObject(with: request.httpBody ?? Data()) as? [String: String])
+        #expect(body == ["gpu": "NVIDIA L40S"])
+    }
+
+    @Test func putSurfacesTheServerRefusal() async {
+        StubURLProtocol.install { _ in
+            TestSupport.json(#"{"error": {"code": "bad_request", "message": "gpu must be one of the catalog ids"}}"#, status: 400)
+        }
+        await #expect(throws: APIError.server(status: 400, code: "bad_request",
+                                              message: "gpu must be one of the catalog ids")) {
+            _ = try await TestSupport.client().put(
+                GpuSelection.self, body: GpuSelectionRequest(gpu: "x"), "v1", "pod", "gpu")
+        }
+    }
+
+    @Test func postWithBodyAcceptsATimeout() async throws {
+        StubURLProtocol.install { _ in TestSupport.json(Fixtures.migrateAsk) }
+        let ask = try await TestSupport.client().post(
+            MigrateAsk.self, body: MigrateAskRequest(toDc: "EU-CZ-1"), timeout: 90,
+            "v1", "pod", "migrate", "ask")
+        #expect(ask.confirmToken == "tok-abc")
+        let request = try #require(StubURLProtocol.requests.last)
+        let body = try #require(JSONSerialization.jsonObject(with: request.httpBody ?? Data()) as? [String: String])
+        #expect(body == ["to_dc": "EU-CZ-1"])
+        #expect(request.value(forHTTPHeaderField: "Idempotency-Key") == nil)
+    }
+
     @Test func userMessages() {
         #expect(APIError.server(status: 401, code: "unauthorized", message: "x").userMessage
                 == "Bearer token rejected — check Settings.")
