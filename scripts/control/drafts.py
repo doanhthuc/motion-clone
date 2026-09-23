@@ -198,6 +198,16 @@ class _Draft:
 _PATCH_KEYS = frozenset({"pipeline", "provider", "slots", "tryon_seed"})
 
 
+def _seed_id(seed: Path | None) -> str | None:
+    """The try-on library id a job's seed points at, for the draft view.
+
+    TryonLibrary.save names every image `{id}{ext}`, so the stem is the id.
+    Reported even when the entry was deleted since — the phone then says the
+    saved try-on is gone instead of silently showing an ordinary job.
+    """
+    return seed.stem if seed else None
+
+
 class DraftStore:
     """One owner's draft, on disk at batch/<owner>.draft.json.
 
@@ -318,8 +328,10 @@ class DraftStore:
             "optional": sorted(optional_roles(job.pipeline)),
             "missing": self._missing(job),
             "validated": d.validated,
+            "tryon_seed": _seed_id(job.tryon_seed),
             "batch": [{"digest": job_digest(b), "run_id": run_id, "pipeline": b.pipeline,
                        "provider": b.provider,
+                       "tryon_seed": _seed_id(b.tryon_seed),
                        "slots": {r: self._material_id(p) for r, p in sorted(b.slots.items())}}
                       for b, run_id in zip(d.basket, basket_ids)],
             "jobs": len(jobs),
