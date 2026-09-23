@@ -217,10 +217,12 @@ public final class RunFlow {
         isLoadingPanel = true
         defer { isLoadingPanel = false }
         do {
+            // The bot's Vast quote can take up to 120 s (bot.py `_rent_panel_data`);
+            // Cloudflare's ~100 s origin ceiling may answer first.
             let fresh = force
                 ? try await client.get(RentPanel.self, query: [URLQueryItem(name: "force", value: "1")],
-                                       "v1", "runs", runID, "rent-panel")
-                : try await client.get(RentPanel.self, "v1", "runs", runID, "rent-panel")
+                                       timeout: 120, "v1", "runs", runID, "rent-panel")
+                : try await client.get(RentPanel.self, timeout: 120, "v1", "runs", runID, "rent-panel")
             panel = fresh
             error = nil
             if quote(for: selectedProvider) == nil {

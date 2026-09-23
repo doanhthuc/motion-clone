@@ -183,6 +183,19 @@ extension URLProtocolTests {
         #expect(request.timeoutInterval == 95)
     }
 
+    @Test func getHonorsTimeout() async throws {
+        StubURLProtocol.install { _ in TestSupport.json(Fixtures.runs) }
+
+        _ = try await TestSupport.client().get(RunsResponse.self, timeout: 120, "v1", "runs")
+        let timed = try #require(StubURLProtocol.requests.first)
+        #expect(timed.timeoutInterval == 120)
+
+        StubURLProtocol.install { _ in TestSupport.json(Fixtures.runs) }
+        _ = try await TestSupport.client().get(RunsResponse.self, "v1", "runs")
+        let plain = try #require(StubURLProtocol.requests.first)
+        #expect(plain.timeoutInterval == 30)
+    }
+
     @Test func patchConvertsCamelCaseBodyKeysToSnakeCase() async throws {
         StubURLProtocol.install { _ in TestSupport.json(Fixtures.draft) }
         _ = try await TestSupport.client().patch(

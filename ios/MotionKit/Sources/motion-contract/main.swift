@@ -102,7 +102,7 @@ if let runID = slot?.runId {
     }
     // Cached stock (no ?force=1); the Vast quote inside can be slow.
     await check("GET /v1/runs/{slot}/rent-panel") {
-        _ = try await client.get(RentPanel.self, "v1", "runs", runID, "rent-panel")
+        _ = try await client.get(RentPanel.self, timeout: 120, "v1", "runs", runID, "rent-panel")
     }
 } else {
     print("skip GET /v1/runs/{slot}/tryon and rent-panel (no run_id on /v1/pod)")

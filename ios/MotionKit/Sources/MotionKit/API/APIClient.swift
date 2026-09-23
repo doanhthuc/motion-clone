@@ -44,8 +44,10 @@ public actor APIClient {
         components.reduce(credentials.baseURL) { $0.appending(component: $1) }
     }
 
-    public func get<T: Decodable & Sendable>(_ type: T.Type, _ components: String...) async throws(APIError) -> T {
-        let (data, _) = try await send(url(components), extraHeaders: [:], okStatuses: [200])
+    public func get<T: Decodable & Sendable>(
+        _ type: T.Type, timeout: TimeInterval = 30, _ components: String...
+    ) async throws(APIError) -> T {
+        let (data, _) = try await send(url(components), timeout: timeout, extraHeaders: [:], okStatuses: [200])
         return try decode(type, data)
     }
 
@@ -136,10 +138,10 @@ public actor APIClient {
     }
 
     public func get<T: Decodable & Sendable>(
-        _ type: T.Type, query: [URLQueryItem], _ components: String...
+        _ type: T.Type, query: [URLQueryItem], timeout: TimeInterval = 30, _ components: String...
     ) async throws(APIError) -> T {
         let target = url(components).appending(queryItems: query)
-        let (data, _) = try await send(target, extraHeaders: [:], okStatuses: [200])
+        let (data, _) = try await send(target, timeout: timeout, extraHeaders: [:], okStatuses: [200])
         return try decode(type, data)
     }
 
