@@ -1,6 +1,6 @@
 # Motion iPhone app — Phase 5 pod and cost design
 
-Date: 2026-09-23 · Status: approved design, not implemented
+Date: 2026-09-23 · Status: implemented; ios-contract and ios-ui-test pass (Phase 5 migrate half skipped while a pod was leased); refusal smoke not yet run for Phase 5; a real kill, GPU change and migration not yet exercised
 
 This spec refines Phase 5 of `docs/superpowers/specs/2026-09-22-swiftui-app-design.md` (§3 "Pod &
 cost", §4 kill and migrate). Phases 1–4 are shipped (`docs/superpowers/swiftui-app-progress.md`).

@@ -71,7 +71,7 @@ make ios-ui-test                                  # Auto-boot simulator; live Ph
 make ios-audio-test                               # Silent Mode playback regression (booted simulator)
 make ios-build                                    # app compiles for the simulator (runs ios-gen)
 make ios-contract                                 # live phone API decodes with the app's models (GET only)
-make ios-refusal-smoke                         # live, zero-spend: bogus-token confirm/regen/resume must 409 (asks first)
+make ios-refusal-smoke                         # live, zero-spend: bogus-token confirm/regen/resume/migrate and an idle kill must 409 (asks first)
 motions-studio/setup/scrub-secrets.sh --check     # MUST exit 0 before every commit — repo is public
 
 # Backend unit tests (pure-python, no GPU)
