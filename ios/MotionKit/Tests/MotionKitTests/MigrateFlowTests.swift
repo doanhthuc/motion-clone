@@ -119,16 +119,30 @@ extension URLProtocolTests {
     }
 
     @Test func unreachableIsCheckedWithTheSavedKey() async {
+        let clock = Clock()
         let gate = FakeSpendGate([.unreachable(detail: "timed out"), .accepted(runID: nil, outcome: "started")])
-        let flow = await askedAndTyped(gate)
+        let flow = await askedAndTyped(gate, clock: clock)
+        #expect(flow.canMigrate(at: clock.now))
         await flow.migrate()
         #expect(flow.needsRecheck)
-        #expect(!flow.canMigrate(at: .now))
+        #expect(!flow.canMigrate(at: clock.now))
         await flow.recheck()
         #expect(await gate.rechecks == 1)
         #expect(await gate.intents.count == 1)
         #expect(flow.step == .started(toDc: "EU-CZ-1"))
         #expect(!flow.needsRecheck)
+    }
+
+    @Test func recheckRefusesAPendingNonMigrate() async {
+        let gate = FakeSpendGate([.unreachable(detail: "x")],
+                                 pending: SpendLedgerEntry(key: "K", intent: .phaseA,
+                                                            label: "Try-on preview · 1 job", createdAt: .now))
+        let flow = await askedAndTyped(gate)
+        await flow.migrate()
+        #expect(flow.needsRecheck)
+        await flow.recheck()
+        #expect(await gate.rechecks == 0)
+        #expect(flow.message?.contains("isn't a migration") == true)
     }
 
     @Test func launchReplayResolvesAPendingMigrateOnce() async {

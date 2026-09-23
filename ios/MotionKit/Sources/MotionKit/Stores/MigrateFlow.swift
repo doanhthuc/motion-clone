@@ -123,6 +123,10 @@ public final class MigrateFlow {
     public func recheck() async {
         guard needsRecheck, !isSending else { return }
         let saved = await gate.pending()
+        if let intent = saved?.intent, intent.kind != .migrate {
+            message = "The pending request isn't a migration — check it from the run flow."
+            return
+        }
         var toDc = destination ?? ""
         if case let .migrate(dc, _)? = saved?.intent { toDc = dc }
         inFlightLabel = "Checking the earlier migrate…"
