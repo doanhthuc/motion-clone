@@ -57,10 +57,15 @@ public struct IdempotencyLedger: Sendable {
             try? fm.removeItem(at: temporary)
             throw error
         }
-        if fm.fileExists(atPath: fileURL.path) {
-            _ = try fm.replaceItemAt(fileURL, withItemAt: temporary)
-        } else {
-            try fm.moveItem(at: temporary, to: fileURL)
+        do {
+            if fm.fileExists(atPath: fileURL.path) {
+                _ = try fm.replaceItemAt(fileURL, withItemAt: temporary)
+            } else {
+                try fm.moveItem(at: temporary, to: fileURL)
+            }
+        } catch {
+            try? fm.removeItem(at: temporary)
+            throw error
         }
     }
 
