@@ -96,13 +96,25 @@ public final class DraftStore {
         }
     }
 
-    public func addToBatch() async {
+    /// Slots and the try-on seed in one PATCH (Phase 6: cross build, "Use in job").
+    /// Slow timeout: slot assignment probes the material on the server.
+    @discardableResult
+    public func apply(_ patch: DraftPatch) async -> Bool {
+        await mutate(materialAssignment: !patch.slots.isEmpty) {
+            try await self.client.patch(
+                Draft.self, body: patch, timeout: Self.slowDraftTimeout, "v1", "draft")
+        }
+    }
+
+    @discardableResult
+    public func addToBatch() async -> Bool {
         await mutate {
             try await self.client.post(Draft.self, "v1", "draft", "add-to-batch")
         }
     }
 
-    public func dropFromBatch(_ digest: String) async {
+    @discardableResult
+    public func dropFromBatch(_ digest: String) async -> Bool {
         await mutate {
             try await self.client.delete(Draft.self, "v1", "draft", "batch", digest)
         }
@@ -152,13 +164,16 @@ public final class DraftStore {
         needsMaterialsRefresh = false
     }
 
+    /// Returns whether the write landed. `false` leaves `message` explaining why, so
+    /// callers that gate UI on it never have to re-derive the failure from `error`.
+    @discardableResult
     private func mutate(
         materialAssignment: Bool = false,
         _ operation: () async throws -> Draft
-    ) async {
+    ) async -> Bool {
         guard !isBusy else {
             message = "Another draft change is still in progress."
-            return
+            return false
         }
         isMutating = true
         error = nil
@@ -167,6 +182,7 @@ public final class DraftStore {
         defer { isMutating = false }
         do {
             accept(try await operation())
+            return true
         } catch {
             let api = apiError(error)
             if materialAssignment,
@@ -175,13 +191,14 @@ public final class DraftStore {
                 await refreshAfterAmbiguousWrite()
                 self.error = api
                 message = serverMessage
-                return
+                return false
             }
             if api.isOffline {
                 await refreshAfterAmbiguousWrite()
             }
             self.error = api
             message = api.userMessage
+            return false
         }
     }
 

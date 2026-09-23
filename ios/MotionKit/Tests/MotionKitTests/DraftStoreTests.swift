@@ -351,6 +351,36 @@ extension URLProtocolTests {
                 "The server answered in a shape this app doesn't know (The pipeline catalog is empty.). Update the app.")
     }
 
+    @Test func applySendsSlotsAndSeedAndReportsTheResult() async throws {
+        StubURLProtocol.install { request in
+            switch (request.httpMethod, request.url?.path) {
+            case ("GET", "/v1/pipelines"): return TestSupport.json(Fixtures.pipelines)
+            case ("PATCH", _):
+                let body = String(decoding: request.httpBody ?? Data(), as: UTF8.self)
+                return body.contains("bad")
+                    ? TestSupport.json(
+                        #"{"error":{"code":"not_local","message":"tryon_seed only applies to a local try-on provider"}}"#,
+                        status: 422)
+                    : TestSupport.json(Fixtures.draft)
+            default: return TestSupport.json(Fixtures.draft)
+            }
+        }
+        let store = DraftStore(client: TestSupport.client())
+        await store.load()
+
+        let ok = await store.apply(DraftPatch(slots: ["outfit": "app/o.png"], seed: .set("s1")))
+        #expect(ok)
+        let sent = try #require(StubURLProtocol.requests.last)
+        #expect(sent.timeoutInterval == 95)
+        let body = try #require(JSONSerialization.jsonObject(with: sent.httpBody ?? Data()) as? [String: Any])
+        #expect(body["tryon_seed"] as? String == "s1")
+        #expect((body["slots"] as? [String: Any])?["outfit"] as? String == "app/o.png")
+
+        let refused = await store.apply(DraftPatch(seed: .set("bad")))
+        #expect(!refused)
+        #expect(store.message == "tryon_seed only applies to a local try-on provider")
+    }
+
 }
 }
 

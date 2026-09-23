@@ -177,6 +177,47 @@ import Testing
         #expect(result.draft.validated == true)
         #expect(result.draft.estimateMin == 48)
     }
+
+    @Test func draftSeedIsOptionalAndDecodes() throws {
+        let old = try decoder.decode(Draft.self, from: Fixtures.data(Fixtures.draft))
+        #expect(old.tryonSeed == nil)
+        #expect(old.batch[0].tryonSeed == nil)
+        #expect(old.filledSlots == ["character": "app/model.png"])
+        #expect(old.batch[0].filledSlots == ["character": "app/model.png", "outfit": "app/dress.png"])
+
+        // `Fixtures.draft` predates Phase 6 and carries no `tryon_seed`, so the seeded
+        // shape is synthesized from it rather than adding a second near-identical fixture.
+        let seeded = Fixtures.draft
+            .replacingOccurrences(of: #""estimate_min":null}"#,
+                                  with: #""estimate_min":null,"tryon_seed":"s1"}"#)
+            .replacingOccurrences(of: #""provider":"gemini","slots":{"character""#,
+                                  with: #""provider":"gemini","tryon_seed":"s0","slots":{"character""#)
+        let draft = try decoder.decode(Draft.self, from: Fixtures.data(seeded))
+        #expect(draft.tryonSeed == "s1")
+        #expect(draft.batch[0].tryonSeed == "s0")
+    }
+
+    @Test func draftPatchEncodesThreeSeedStates() throws {
+        // `APIClient` builds this exact encoder for every write call, so what this
+        // asserts is the wire format the server receives.
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        encoder.outputFormatting = .sortedKeys
+        func text(_ p: DraftPatch) throws -> String { String(decoding: try encoder.encode(p), as: UTF8.self) }
+        #expect(try text(DraftPatch(slots: ["outfit": "app/o.png"], seed: .set("s1")))
+                == #"{"slots":{"outfit":"app\/o.png"},"tryon_seed":"s1"}"#)
+        #expect(try text(DraftPatch(slots: ["outfit": "app/o.png"], seed: .clear))
+                == #"{"slots":{"outfit":"app\/o.png"},"tryon_seed":null}"#)
+        #expect(try text(DraftPatch(slots: ["outfit": nil])) == #"{"slots":{"outfit":null}}"#)
+        #expect(try text(DraftPatch(seed: .clear)) == #"{"tryon_seed":null}"#)
+    }
+
+    @Test func libraryEntriesDecode() throws {
+        let json = #"{"entries":[{"id":"a1","owner":"app","material_ids":{"character":"app/me.png","outfit":"app/o.png"},"provider":"gemini","saved_at":1790000300.5}]}"#
+        let response = try decoder.decode(TryonLibraryResponse.self, from: Fixtures.data(json))
+        #expect(response.entries == [TryonLibraryEntry(id: "a1", materialIDs: ["character": "app/me.png", "outfit": "app/o.png"],
+                                                       provider: "gemini", savedAt: 1790000300.5)])
+    }
 }
 
 @Suite struct RunFlowModelTests {

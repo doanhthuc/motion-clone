@@ -61,3 +61,29 @@ public struct TryonLibraryRecord: Decodable, Sendable, Equatable {
     public let provider: String
     public let savedAt: Double
 }
+
+/// `GET /v1/tryon-library` → `{"entries": [...]}` (API spec §5.10).
+public struct TryonLibraryEntry: Decodable, Sendable, Equatable, Identifiable {
+    public let id: String
+    /// Every non-driver input the try-on was made from (bot.py `tryon_save_info`).
+    public let materialIDs: [String: String]
+    public let provider: String
+    public let savedAt: Double
+
+    public init(id: String, materialIDs: [String: String], provider: String, savedAt: Double) {
+        self.id = id
+        self.materialIDs = materialIDs
+        self.provider = provider
+        self.savedAt = savedAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case materialIDs = "materialIds"
+        case provider, savedAt
+    }
+}
+
+public struct TryonLibraryResponse: Decodable, Sendable, Equatable {
+    public let entries: [TryonLibraryEntry]
+}
