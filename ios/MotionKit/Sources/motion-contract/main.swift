@@ -1,8 +1,8 @@
 import Foundation
 import MotionKit
 
-// Decodes every phase-1 route of the live API with the app's own models.
-// GET only — spends nothing. Prints route names only, never bodies.
+// Decodes the live API's read routes with the app's own models. GET only —
+// spends nothing — unless --refusal-smoke is passed (see below). Prints route names only, never bodies.
 
 func readEnv(_ path: String) -> [String: String] {
     guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return [:] }
@@ -40,6 +40,46 @@ var failed = 0
     }
 }
 
+// --refusal-smoke: three spend calls with deliberately bogus tokens, through
+// the real SpendGate. Each is refused by a token check that runs before any
+// provider or pod call (bot.py AppRuns.confirm / _regen_tryon / AppPod.resume,
+// verified 2026-09-23). phase-a is never sent: it has no token to refuse on.
+if CommandLine.arguments.contains("--refusal-smoke") {
+    let ledgerRoot = FileManager.default.temporaryDirectory.appending(component: "motion-refusal-\(UUID().uuidString)")
+    let gate = SpendGate(client: client, ledger: IdempotencyLedger(root: ledgerRoot))
+    func noLease(_ when: String) async -> PodStatus? {
+        guard let pod = try? await client.get(PodStatus.self, "v1", "pod") else {
+            print("FAIL GET /v1/pod \(when)"); return nil
+        }
+        guard pod.lease == nil else {
+            print("FAIL a pod is leased \(when) — refusing to continue"); return nil
+        }
+        print("ok   no lease \(when)")
+        return pod
+    }
+    guard let pod = await noLease("before"), let runID = pod.runId else { exit(1) }
+    let bogus = "refusal-smoke-\(UUID().uuidString)"
+    let cases: [(String, SpendIntent, String)] = [
+        ("confirm stale panel_token", .confirm(runID: runID, provider: .runpod, panelToken: bogus,
+                                               gpu: pod.gpu, tryon: nil), "stale_panel"),
+        ("regen stale run_token", .regen(runID: runID, index: "0", runToken: bogus, guidance: []), "stale_panel"),
+        ("resume stale run_token", .resume(runID: runID, provider: .runpod, runToken: bogus, gpu: pod.gpu), "stale_run"),
+    ]
+    var smokeFailed = 0
+    for (name, intent, expected) in cases {
+        let result = await gate.perform(intent, label: "refusal smoke: \(name)") { _, _ in }
+        if case .refused(409, expected, _, _) = result {
+            print("ok   \(name) → 409 \(expected)")
+        } else {
+            print("FAIL \(name): \(result)")
+            smokeFailed += 1
+        }
+    }
+    if await noLease("after") == nil { smokeFailed += 1 }
+    try? FileManager.default.removeItem(at: ledgerRoot)
+    exit(smokeFailed == 0 ? 0 : 1)
+}
+
 await check("GET /v1/health") { _ = try await client.health() }
 await check("GET /v1/pipelines") {
     _ = try await client.get(PipelineCatalogResponse.self, "v1", "pipelines")
@@ -54,7 +94,19 @@ if let newestRun {
 } else {
     print("skip GET /v1/runs/{id} (no runs on the server)")
 }
-await check("GET /v1/pod") { _ = try await client.get(PodStatus.self, "v1", "pod") }
+var slot: PodStatus?
+await check("GET /v1/pod") { slot = try await client.get(PodStatus.self, "v1", "pod") }
+if let runID = slot?.runId {
+    await check("GET /v1/runs/{slot}/tryon") {
+        _ = try await client.get(TryonPreviews.self, "v1", "runs", runID, "tryon")
+    }
+    // Cached stock (no ?force=1); the Vast quote inside can be slow.
+    await check("GET /v1/runs/{slot}/rent-panel") {
+        _ = try await client.get(RentPanel.self, "v1", "runs", runID, "rent-panel")
+    }
+} else {
+    print("skip GET /v1/runs/{slot}/tryon and rent-panel (no run_id on /v1/pod)")
+}
 await check("GET /v1/materials") {
     _ = try await client.get(MaterialsResponse.self, "v1", "materials")
 }
