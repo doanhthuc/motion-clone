@@ -36,6 +36,7 @@ public final class RunFlow {
     public private(set) var imageGeneration = 0
     public private(set) var versions: [String: [Data]] = [:]
     public private(set) var isLoadingPanel = false
+    public private(set) var isDropping = false
     public var selectedProvider: SpendProvider = .runpod
     /// RootView switches to the Runs tab (pod strip) and clears it.
     public private(set) var podRequested = false
@@ -208,6 +209,81 @@ public final class RunFlow {
         } catch {
             message = error.userMessage
         }
+    }
+
+    // MARK: drop after Phase A (Phase 6 spec §5)
+
+    /// `preview.run` is the manifest run id; `GET /v1/draft`'s `batch[].run_id`
+    /// is the id the manifest gives that entry. `nil` when the draft changed.
+    public func batchEntry(for preview: TryonPreview) -> DraftBatchEntry? {
+        draft?.batch.first { $0.runID == preview.run }
+    }
+
+    public func isSeeded(_ preview: TryonPreview) -> Bool {
+        batchEntry(for: preview)?.tryonSeed != nil
+    }
+
+    /// Never while a spend is unanswered: the draft must not change under an
+    /// in-flight confirm. The last job is never dropped here (Clear does that).
+    public var canDropFromBatch: Bool {
+        canSpend && !isDropping && (draft?.batch.count ?? 0) >= 2
+            && tryon?.phaseARunning != true && (phase == .previews || phase == .rentPanel)
+    }
+
+    /// Free: drops one job from the basket, then re-validates, because every
+    /// draft change resets `validated` and confirm refuses `not_validated`.
+    /// Confirm then takes the fresh-spend branch (`_phase_a_matches_draft` is
+    /// false) and may ask reuse/rerun — reuse calls no provider again.
+    public func drop(_ preview: TryonPreview) async {
+        guard canDropFromBatch else { return }
+        isDropping = true
+        defer { isDropping = false }
+        message = nil
+        do {
+            let fresh = try await client.get(Draft.self, "v1", "draft")
+            draft = fresh
+            guard let entry = batchEntry(for: preview) else {
+                message = "The draft changed — reload before dropping."
+                return
+            }
+            // add-to-batch leaves the edited job a copy of the last entry, and
+            // the server's `jobs_for` counts that copy as one more job whenever
+            // it is complete — so deleting the entry without first making the
+            // edited job incomplete would bring the dropped job back into Run.
+            if editedJobEquals(entry, in: fresh), let role = clearRole(for: entry) {
+                draft = try await client.patch(Draft.self, body: SlotPatch(role: role, materialID: nil),
+                                               timeout: 95, "v1", "draft")
+            }
+            draft = try await client.delete(Draft.self, "v1", "draft", "batch", entry.digest)
+            // 95 s on the PATCH above and this validate: the server can probe
+            // for 60 s and validate for 90 s, so stay under Cloudflare's ~100 s
+            // origin ceiling — the bound `DraftStore.slowDraftTimeout` uses.
+            let validation = try await client.post(DraftValidationResponse.self, timeout: 95,
+                                                   "v1", "draft", "validate")
+            draft = validation.draft
+            if validation.stale {
+                message = "The draft changed during validation. Validate it again from New Job."
+            } else if !validation.valid {
+                message = "Validation failed after the drop — open New Job to fix it."
+            }
+        } catch {
+            message = apiError(error).userMessage
+            if let fresh = try? await client.get(Draft.self, "v1", "draft") { draft = fresh }
+        }
+        await refreshTryon()
+        if phase == .rentPanel { await loadPanel(force: false) }
+    }
+
+    private func editedJobEquals(_ entry: DraftBatchEntry, in draft: Draft) -> Bool {
+        draft.pipeline == entry.pipeline && draft.provider == entry.provider
+            && draft.filledSlots == entry.filledSlots && draft.tryonSeed == entry.tryonSeed
+    }
+
+    /// A pipeline without an `outfit` still needs some role cleared, or the
+    /// edited copy would stay complete and keep counting as a job.
+    private func clearRole(for entry: DraftBatchEntry) -> String? {
+        if entry.slots.keys.contains("outfit") { return "outfit" }
+        return catalog.first { $0.id == entry.pipeline }?.required.sorted().first
     }
 
     // MARK: rent panel

@@ -17,12 +17,38 @@ extension URLProtocolTests {
         func setPanels(_ p: [String]) { lock.withLock { _panels = p } }
         func nextPanel() -> String { lock.withLock { _panels.count > 1 ? _panels.removeFirst() : _panels[0] } }
 
+        static func quoted(_ value: String?) -> String { value.map { "\"\($0)\"" } ?? "null" }
+        static func draftJSON(batch: [String], outfit: String, seed: String?) -> String {
+            let probe = #"{"kind":"image","width":1,"height":1,"duration_s":null,"bitrate_kbps":null,"size_bytes":1,"warning":""}"#
+            let slots = ["character": "app/model.png", "driver": "app/dance.mp4", "outfit": outfit]
+                .sorted { $0.key < $1.key }
+                .map { "\"\($0.key)\":{\"material_id\":\"\($0.value)\",\"name\":\"x\",\"exists\":true,\"probe\":\(probe),\"warning\":\"\"}" }
+                .joined(separator: ",")
+            return #"{"owner":"app","pipeline":"tryon-motion-enhance","provider":"gemini","generation":9,"slots":{"#
+                + slots + #"},"required":["character","driver","outfit"],"optional":["mask"],"missing":[],"validated":true,"batch":["#
+                + batch.joined(separator: ",") + #"],"jobs":2,"estimate_min":84,"tryon_seed":"# + quoted(seed) + "}"
+        }
+        static func entry(_ digest: String, _ run: String, _ outfit: String, seed: String? = nil) -> String {
+            #"{"digest":"\#(digest)","run_id":"\#(run)","pipeline":"tryon-motion-enhance","provider":"gemini","slots":{"character":"app/model.png","driver":"app/dance.mp4","outfit":"\#(outfit)"},"tryon_seed":"#
+                + quoted(seed) + "}"
+        }
+        /// Two jobs; the edited job is still a copy of the second, seed included
+        /// (as add-to-batch leaves it).
+        static let draftTwoJobs = draftJSON(
+            batch: [entry("d1", "model__dress", "app/dress.png"), entry("d2", "model__blazer", "app/blazer.png", seed: "s9")],
+            outfit: "app/blazer.png", seed: "s9")
+        static let draftAfterDrop = draftJSON(
+            batch: [entry("d1", "model__dress", "app/dress.png")], outfit: "app/blazer.png", seed: "s9")
+
         func answer(_ request: URLRequest) -> (Int, [String: String], Data) {
             let path = request.url?.path ?? ""
             switch true {
             case path == "/v1/pod": return TestSupport.json(pod)
             case path == "/v1/pipelines": return TestSupport.json(Fixtures.pipelines)
             case path == "/v1/draft": return TestSupport.json(draft)
+            case path.hasPrefix("/v1/draft/batch/"): return TestSupport.json(Self.draftAfterDrop)
+            case path == "/v1/draft/validate":
+                return TestSupport.json(#"{"valid":true,"stale":false,"output":null,"draft":"# + Self.draftAfterDrop + "}")
             case path.hasSuffix("/rent-panel"): return TestSupport.json(nextPanel())
             case path.hasSuffix("/tryon"): return TestSupport.json(tryon)
             case path == "/v1/tryon-library": return TestSupport.json(Fixtures.keepRecord)
@@ -173,6 +199,77 @@ extension URLProtocolTests {
         _ = await flow.image(index: "0")
         let hits = StubURLProtocol.requests.filter { $0.url?.path == "/v1/runs/tg-1000/tryon/0" }
         #expect(hits.count == 2)
+    }
+
+    @Test func dropClearsTheEditedCopyThenDeletesAndRevalidates() async throws {
+        let routes = Routes()
+        routes.draft = Routes.draftTwoJobs
+        routes.tryon = Fixtures.tryonDone
+        let flow = make(routes)
+        await flow.start(.existing)
+        #expect(flow.phase == .previews)
+        #expect(flow.canDropFromBatch)
+        let blazer = try #require(flow.tryon?.previews.first { $0.run == "model__blazer" })
+        #expect(flow.batchEntry(for: blazer)?.digest == "d2")
+        #expect(flow.isSeeded(blazer))
+
+        await flow.drop(blazer)
+
+        let writes = StubURLProtocol.requests.filter { $0.httpMethod != "GET" }
+        #expect(writes.map { "\($0.httpMethod!) \($0.url!.path)" } ==
+                ["PATCH /v1/draft", "DELETE /v1/draft/batch/d2", "POST /v1/draft/validate"])
+        let body = try #require(JSONSerialization.jsonObject(with: writes[0].httpBody ?? Data()) as? [String: Any])
+        #expect((body["slots"] as? [String: Any])?["outfit"] is NSNull)
+        #expect(writes[2].timeoutInterval == 95)
+        #expect(flow.draft?.batch.map(\.digest) == ["d1"])
+        #expect(flow.message == nil)
+    }
+
+    @Test func dropRefusesAPreviewWithNoBasketEntry() async throws {
+        let routes = Routes()
+        routes.draft = Routes.draftTwoJobs
+        routes.tryon = #"{"run_id":"tg-1000","run_token":"1.1","phase_a_running":false,"previews":[{"index":"0","run":"ghost","status":"done","has_image":true},{"index":"1","run":"model__dress","status":"done","has_image":true}]}"#
+        let flow = make(routes)
+        await flow.start(.existing)
+        let ghost = try #require(flow.tryon?.previews.first)
+        #expect(flow.batchEntry(for: ghost) == nil)
+
+        await flow.drop(ghost)
+
+        #expect(StubURLProtocol.requests.allSatisfy { $0.httpMethod == "GET" })
+        #expect(flow.message == "The draft changed — reload before dropping.")
+    }
+
+    @Test func dropIsNotOfferedForASingleJob() async {
+        let routes = Routes()          // Fixtures.draft has one basket entry
+        routes.tryon = Fixtures.tryonDone
+        let flow = make(routes)
+        await flow.start(.existing)
+        #expect(!flow.canDropFromBatch)
+    }
+
+    /// The edited job is not a copy of the dropped entry here, so the
+    /// clear-role PATCH must stay out: firing it would blank the outfit the
+    /// user is composing to save a job they never asked about.
+    @Test func dropLeavesAnUnrelatedEditedJobAlone() async throws {
+        let routes = Routes()
+        routes.draft = Routes.draftJSON(
+            batch: [Routes.entry("d1", "model__dress", "app/dress.png"),
+                    Routes.entry("d2", "model__blazer", "app/blazer.png")],
+            outfit: "app/other.png", seed: nil)
+        routes.tryon = Fixtures.tryonDone
+        let flow = make(routes)
+        await flow.start(.existing)
+        #expect(flow.canDropFromBatch)
+        let blazer = try #require(flow.tryon?.previews.first { $0.run == "model__blazer" })
+        #expect(!flow.isSeeded(blazer))
+
+        await flow.drop(blazer)
+
+        let writes = StubURLProtocol.requests.filter { $0.httpMethod != "GET" }
+        #expect(writes.map { "\($0.httpMethod!) \($0.url!.path)" } ==
+                ["DELETE /v1/draft/batch/d2", "POST /v1/draft/validate"])
+        #expect(flow.message == nil)
     }
 
     @Test func spendInFlightDisablesAndClears() async {
