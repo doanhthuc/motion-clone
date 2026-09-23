@@ -244,6 +244,10 @@ public final class RunFlow {
             draft = fresh
             guard let entry = batchEntry(for: preview) else {
                 message = "The draft changed — reload before dropping."
+                // No `refreshTryon()` on this path, on purpose: nothing was
+                // written, so the previews are exactly as current as they were
+                // before the tap, and the fresh draft installed above is what
+                // makes the card lose its basket entry and offer "reload".
                 return
             }
             // add-to-batch leaves the edited job a copy of the last entry, and
