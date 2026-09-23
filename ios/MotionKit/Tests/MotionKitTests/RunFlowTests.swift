@@ -284,6 +284,38 @@ extension URLProtocolTests {
                                                gpu: "NVIDIA GeForce RTX 5090")])
     }
 
+    @Test func retryRentalSendsTheCurrentCardNotTheFailedOne() async {
+        let routes = Routes()
+        routes.pod = Fixtures.podFailedOtherGpu
+        let gate = FakeSpendGate([.accepted(runID: "tg-1000", outcome: "started")])
+        let flow = make(routes, gate: gate)
+        await flow.start(.existing)
+        #expect(flow.pod?.failedRental?.gpu == "NVIDIA GeForce RTX 5090")
+        await flow.retryRental()
+        #expect(await gate.intents == [.resume(runID: "tg-1000", provider: .runpod,
+                                               runToken: "1790000000123.4",
+                                               gpu: "NVIDIA RTX PRO 4500 Blackwell")])
+        #expect(await gate.labels == ["Retry rental · NVIDIA RTX PRO 4500 Blackwell"])
+    }
+
+    /// `stale_panel` on resume is the server's gpu-mismatch answer: the card
+    /// moved again, so the pod is re-read and the button names the new one.
+    @Test func stalePanelOnResumeRereadsThePod() async {
+        let routes = Routes()
+        routes.pod = Fixtures.podFailedOtherGpu
+        let gate = FakeSpendGate([.refused(status: 409, code: "stale_panel",
+                                           message: "the GPU changed — read the pod again", panelToken: nil)])
+        let flow = make(routes, gate: gate)
+        await flow.start(.existing)
+        let podReads = StubURLProtocol.requests.filter { $0.url?.path == "/v1/pod" }.count
+        routes.pod = Fixtures.podIdle           // the .env card is now the 5090
+        await flow.retryRental()
+        #expect(await gate.intents.count == 1)
+        #expect(StubURLProtocol.requests.filter { $0.url?.path == "/v1/pod" }.count == podReads + 1)
+        #expect(flow.pod?.gpu == "NVIDIA GeForce RTX 5090")
+        #expect(flow.message == "the GPU changed — read the pod again")
+    }
+
     @Test func noFailureRefusalIsShownVerbatim() async {
         let gate = FakeSpendGate([.refused(status: 409, code: "no_failure",
                                            message: "no failed rental to retry for this run", panelToken: nil)])
@@ -306,6 +338,65 @@ extension URLProtocolTests {
         #expect(await gate.rechecks == 1)
         #expect(!flow.needsRecheck)
         #expect(flow.phase == .started(runID: "tg-1000"))
+    }
+
+    @Test func unansweredSpendDisablesEverySpendUntilChecked() async {
+        let gate = FakeSpendGate([.unreachable(detail: "timed out")])
+        let flow = make(Routes(), gate: gate)
+        await flow.start(.newJob)
+        await flow.continueToRent()
+        #expect(flow.canSpend && flow.canConfirm(.runpod))
+        await flow.confirm()
+        #expect(flow.needsRecheck)
+        #expect(!flow.canSpend)
+        #expect(!flow.canConfirm(.runpod))
+    }
+
+    /// Another spend tapped while one is unanswered is refused by the gate
+    /// (`.notSent`); "Check again" and the intent it applies must survive.
+    @Test func notSentSpendKeepsThePendingRecheck() async {
+        let gate = FakeSpendGate([.unreachable(detail: "timed out"),
+                                  .notSent(reason: "“Confirm” hasn't been answered yet. Check it before spending again."),
+                                  .accepted(runID: "tg-1000", outcome: "started")])
+        let flow = make(Routes(), gate: gate)
+        await flow.start(.newJob)
+        await flow.continueToRent()
+        await flow.confirm()
+        await flow.startPhaseA()
+        #expect(flow.needsRecheck)
+        #expect(flow.message == "“Confirm” hasn't been answered yet. Check it before spending again.")
+        await flow.recheck()
+        #expect(await gate.rechecks == 1)
+        #expect(flow.phase == .started(runID: "tg-1000"))   // the confirm's result, not Phase A's
+    }
+
+    @Test func recheckAppliesTheIntentTheGateHasPending() async {
+        let routes = Routes()
+        let entry = SpendLedgerEntry(key: "KEY-1", intent: .phaseA, label: "Try-on preview · 1 job",
+                                     createdAt: .now)
+        let gate = FakeSpendGate([.unreachable(detail: "timed out"),
+                                  .accepted(runID: "tg-1000", outcome: "started")], pending: entry)
+        let flow = make(routes, gate: gate)
+        await flow.start(.newJob)
+        await flow.continueToRent()
+        await flow.confirm()                    // the flow's own pendingIntent is this confirm
+        #expect(flow.needsRecheck)
+        routes.tryon = Fixtures.tryonRunning
+        await flow.recheck()
+        #expect(flow.phase == .phaseARunning)
+        #expect(!flow.needsRecheck)
+    }
+
+    @Test func recheckWithNothingPendingClearsTheButton() async {
+        let gate = FakeSpendGate([.unreachable(detail: "timed out")])
+        let flow = make(Routes(), gate: gate)
+        await flow.start(.newJob)
+        await flow.continueToRent()
+        await flow.confirm()
+        #expect(flow.needsRecheck)
+        await flow.recheck()                    // FakeSpendGate answers .notSent, nothing pending
+        #expect(!flow.needsRecheck)
+        #expect(flow.canSpend)
     }
 
     @Test func replayRunsOncePerLaunch() async {

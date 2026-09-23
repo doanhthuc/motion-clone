@@ -62,6 +62,11 @@ public final class RunFlow {
     public var runID: String? { pod?.runId }
     public var isSpending: Bool { inFlightLabel != nil }
 
+    /// Every spend button's gate. An unanswered spend (`needsRecheck`) or the
+    /// launch replay (`pendingNotice`) must be resolved first — through
+    /// "Check again", which resends the saved key — never by a new tap.
+    public var canSpend: Bool { !isSpending && !needsRecheck && pendingNotice == nil }
+
     /// Preview try-on is the primary action only when some job would call a
     /// hosted try-on provider. A pipeline without a try-on stage never does.
     public var hasLocalTryon: Bool {
@@ -250,7 +255,7 @@ public final class RunFlow {
     }
 
     public func canConfirm(_ provider: SpendProvider) -> Bool {
-        panel != nil && quote(for: provider) != nil && !isSpending && !isLoadingPanel
+        panel != nil && quote(for: provider) != nil && canSpend && !isLoadingPanel
     }
 
     private func confirmLabel(_ provider: SpendProvider, suffix: String = "") -> String {
@@ -297,9 +302,12 @@ public final class RunFlow {
     // MARK: recheck and replay
 
     /// Resends the saved request with its saved key. Never mints a new one.
+    /// The intent comes from the gate's ledger — the request actually being
+    /// resent — and only falls back to the in-memory copy.
     public func recheck() async {
         guard needsRecheck, inFlightLabel == nil else { return }
-        guard let intent = pendingIntent else { needsRecheck = false; return }
+        let saved = await gate.pending()
+        guard let intent = saved?.intent ?? pendingIntent else { needsRecheck = false; return }
         inFlightLabel = "Checking the earlier request…"
         message = nil
         let result = await gate.recheck { [weak self] attempt, reason in
@@ -307,6 +315,15 @@ public final class RunFlow {
         }
         inFlightLabel = nil
         retryNote = nil
+        if case let .notSent(reason) = result {
+            message = reason
+            // The gate had nothing left to resend: there is nothing to check.
+            if await gate.pending() == nil {
+                needsRecheck = false
+                pendingIntent = nil
+            }
+            return
+        }
         await apply(result, intent: intent)
     }
 
@@ -349,8 +366,9 @@ public final class RunFlow {
         inFlightLabel = label
         retryNote = nil
         message = nil
-        needsRecheck = false
-        pendingIntent = intent
+        // `needsRecheck`/`pendingIntent` are left alone until the answer is
+        // known: a `.notSent` (e.g. an earlier request still pending) must not
+        // hide "Check again" or replace the intent it would apply.
         let result = await gate.perform(intent, label: label) { [weak self] attempt, reason in
             Task { @MainActor in self?.noteRetry(attempt, reason) }
         }
@@ -371,6 +389,7 @@ public final class RunFlow {
         switch result {
         case let .accepted(runID, _):
             needsRecheck = false
+            pendingIntent = nil
             switch kind {
             case .phaseA, .regen:
                 phase = .phaseARunning
@@ -381,13 +400,17 @@ public final class RunFlow {
             }
         case let .refused(status, code, text, panelToken):
             needsRecheck = false
+            pendingIntent = nil
             await applyRefusal(status: status, code: code, text: text, panelToken: panelToken, intent: intent)
         case .outcomeUnknown:
             needsRecheck = false
+            pendingIntent = nil
             phase = .outcomeUnknown
             message = "Couldn't tell whether this went through — check the pod before trying again."
             podRequested = true
         case let .busy(attempts):
+            needsRecheck = false   // the gate cleared the ledger: nothing pending
+            pendingIntent = nil
             message = "The bot stayed busy after \(attempts) attempts. Nothing was recorded — tap again when ready."
         case let .unreachable(detail):
             needsRecheck = true
@@ -395,10 +418,11 @@ public final class RunFlow {
             message = "No answer from the VPS (\(detail)). The request is saved — Check again resends it without spending twice."
         case let .expired(label, createdAt):
             needsRecheck = false
+            pendingIntent = nil
             let when = createdAt.map { $0.formatted(date: .omitted, time: .shortened) } ?? "earlier"
             message = "\(label) from \(when) couldn't be verified. Check Runs and the pod before trying again."
         case let .notSent(reason):
-            message = reason
+            message = reason   // nothing changed: keep any pending recheck as it was
         }
     }
 
@@ -421,6 +445,10 @@ public final class RunFlow {
             await loadPanel(force: false)
         case ("stale_panel", .regen), ("stale_run", .resume):
             await refreshTryon()
+        case ("stale_panel", .resume):
+            // The server's gpu-mismatch code: the .env card changed since the
+            // pod was read. Re-read it so Retry rental names the card it sends.
+            await refreshPod()
         default:
             break
         }

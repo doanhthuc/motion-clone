@@ -41,7 +41,7 @@ struct TryonPreviewCard: View {
             }
             Button("Regenerate…") { showRegenerate = true }
                 .buttonStyle(SecondaryButtonStyle())
-                .disabled(flow.isSpending)
+                .disabled(!flow.canSpend)
             if showVersions { versionStrip }
         }
         .padding(14).card()
@@ -97,7 +97,7 @@ struct TryonPreviewCard: View {
                         let chosen = guidance
                         Task { await flow.regenerate(index: preview.index, guidance: chosen) }
                     }
-                    .disabled(flow.isSpending)
+                    .disabled(!flow.canSpend)
                 }
             }
         }

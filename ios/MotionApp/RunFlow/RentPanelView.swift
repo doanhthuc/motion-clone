@@ -13,13 +13,16 @@ struct RentPanelView: View {
                     .font(Theme.mono(11)).foregroundStyle(Theme.ink2)
                 runpodRow(panel.runpod)
                 vastRow(panel.vast)
-                if let price = flow.quote(for: flow.selectedProvider), flow.canConfirm(flow.selectedProvider) {
+                if let price = flow.quote(for: flow.selectedProvider) {
+                    // Shown but disabled while any spend is unanswered, so the
+                    // price stays visible next to "Check again".
                     Button {
                         Task { await flow.confirm() }
                     } label: {
                         Text("Confirm · ~\(Format.usd(price)) quote")
                     }
                     .buttonStyle(PrimaryButtonStyle())
+                    .disabled(!flow.canConfirm(flow.selectedProvider))
                     .accessibilityIdentifier("runflow.confirm")
                     Text("A quote from the estimate, not the invoice.")
                         .font(Theme.mono(10)).foregroundStyle(Theme.ink3)

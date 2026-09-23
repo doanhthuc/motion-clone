@@ -99,11 +99,11 @@ struct RunFlowView: View {
             Button(price.map { "Reuse try-on & rent · ~\(Format.usd($0))" } ?? "Reuse try-on & rent") {
                 Task { await flow.choose(.reuse) }
             }
-            .buttonStyle(PrimaryButtonStyle()).disabled(flow.isSpending || price == nil)
+            .buttonStyle(PrimaryButtonStyle()).disabled(!flow.canSpend || price == nil)
             Button(price.map { "Re-run try-on & rent · ~\(Format.usd($0))" } ?? "Re-run try-on & rent") {
                 Task { await flow.choose(.rerun) }
             }
-            .buttonStyle(SecondaryButtonStyle()).disabled(flow.isSpending || price == nil)
+            .buttonStyle(SecondaryButtonStyle()).disabled(!flow.canSpend || price == nil)
         case let .started(runID):
             Label("Started — progress is on the run screen and in Telegram.", systemImage: "checkmark.circle.fill")
                 .font(Theme.sans(14, .semibold)).foregroundStyle(Theme.lime)
@@ -130,7 +130,7 @@ struct RunFlowView: View {
             Button("Preview try-on") { Task { await flow.startPhaseA() } }
                 .buttonStyle(PrimaryButtonStyle())
                 .accessibilityIdentifier("runflow.previewTryon")
-                .disabled(flow.isSpending)
+                .disabled(!flow.canSpend)
             Text("Spends Gemini/Qwen quota — no pod is rented.")
                 .font(Theme.mono(11)).foregroundStyle(Theme.ink3)
         }

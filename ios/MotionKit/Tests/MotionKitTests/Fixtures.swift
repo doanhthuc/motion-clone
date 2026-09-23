@@ -52,6 +52,15 @@ enum Fixtures {
                        "stock_out": true, "detail": "no stock"}}
     """#
 
+    /// The rental failed on the 5090, then the .env card moved to another GPU:
+    /// Retry rental rents `gpu`, not `failed_rental.gpu`.
+    static let podFailedOtherGpu = #"""
+    {"run_id": "tg-1000", "gpu": "NVIDIA RTX PRO 4500 Blackwell", "lease": null,
+     "migration": null, "kill_running": false, "last_kill": null,
+     "failed_rental": {"gpu": "NVIDIA GeForce RTX 5090", "datacenter": "EU-RO-1",
+                       "stock_out": true, "detail": "no stock"}}
+    """#
+
     static let outputs = #"""
     {"outputs": [
       {"batch": "2026-09-21-0900", "updated_at": 1790000000,

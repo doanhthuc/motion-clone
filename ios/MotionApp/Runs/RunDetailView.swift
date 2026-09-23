@@ -16,9 +16,21 @@ struct RunDetailView: View {
                         VStack(alignment: .leading, spacing: 8) {
                             SectionLabel(text: "Rental failed")
                             Text(failure.detail).font(Theme.sans(13)).foregroundStyle(Theme.ink1)
-                            Button("Retry rental · \(failure.gpu)") { Task { await flow.retryRental() } }
+                            // The label names the card `retryRental()` actually sends
+                            // (`pod.gpu`, the current .env card), not the one that failed.
+                            let gpu = flow.pod?.gpu ?? failure.gpu
+                            if failure.gpu != gpu {
+                                Text("Last failure was on \(failure.gpu); this retries on \(gpu).")
+                                    .font(Theme.sans(12)).foregroundStyle(Theme.amber)
+                            }
+                            Button("Retry rental · \(gpu)") { Task { await flow.retryRental() } }
                                 .buttonStyle(PrimaryButtonStyle())
-                                .disabled(flow.isSpending)
+                                .disabled(!flow.canSpend)
+                            if flow.needsRecheck {
+                                Button("Check again") { Task { await flow.recheck() } }
+                                    .buttonStyle(SecondaryButtonStyle())
+                                    .disabled(flow.isSpending)
+                            }
                             if let message = flow.message {
                                 Text(message).font(Theme.sans(12)).foregroundStyle(Theme.amber)
                             }
