@@ -1,6 +1,6 @@
 # Motion iPhone app — Phase 4 run flow design
 
-Date: 2026-09-23 · Status: implemented (zero-spend); live spend path not yet exercised; `make ios-refusal-smoke` implemented; acceptance run outstanding (awaiting user go-ahead)
+Date: 2026-09-23 · Status: implemented; `make ios-refusal-smoke` passed live 2026-09-23 (zero spend); a real spend path (Phase A, confirm) not yet exercised
 
 This spec refines Phase 4 of
 `docs/superpowers/specs/2026-09-22-swiftui-app-design.md`. Phases 1–3 are shipped

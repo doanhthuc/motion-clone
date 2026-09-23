@@ -3,6 +3,9 @@
 SwiftUI client for the control-plane API on `motion-vps`
 (`docs/superpowers/specs/2026-09-22-swiftui-app-design.md`). Talks only to the VPS tunnel, never to a pod.
 
+Current shipped phases, verification evidence, known gaps and the next implementation boundary are in
+[`docs/superpowers/swiftui-app-progress.md`](../docs/superpowers/swiftui-app-progress.md).
+
 ## Layout
 
 - `MotionKit/` — Swift package: models, `APIClient`, Keychain vault, stores. No SwiftUI.
@@ -15,13 +18,17 @@ SwiftUI client for the control-plane API on `motion-vps`
     brew install xcodegen          # once
     make ios-secrets               # .env → ios/Secrets.xcconfig (gitignored)
     make ios-test ios-build        # free gates
-    make ios-ui-test               # auto-boot a simulator and run the free Phase 3 smoke
+    make ios-ui-test               # auto-boot a simulator; free Phase 3 + zero-spend Phase 4 smoke
     make ios-audio-test            # Silent Mode playback check; needs a booted simulator
     make ios-contract              # decode the live API with the app's models (GET only)
+    make ios-refusal-smoke         # live, zero-spend: bogus-token confirm/regen/resume must 409 (asks first)
     open ios/MotionApp.xcodeproj   # pick your iPhone, Run
 
 Set `IOS_DEVELOPMENT_TEAM=<your personal team id>` in `.env` so a regenerated project keeps
 signing; otherwise pick the team once under Signing & Capabilities.
+
+`make ios-ui-test` drives simulator control (`simctl`/`xcodebuild test`), which is killed when run
+inside this agent's command sandbox — run it with the sandbox disabled, or from a plain terminal.
 
 ## Free provisioning
 
@@ -82,3 +89,33 @@ optional coverage, not a prerequisite for this flow.
 4. Complete a job, add it to the basket, remove it by its digest-backed row, and add it again.
 5. Validate; confirm Ready and an estimate appear, then edit one slot and confirm Ready disappears.
 6. Confirm no Phase A, Run, rent, or pod action exists in the Phase 3 UI.
+
+## Phase 4 run flow
+
+The run flow (`RunFlow` store, `MotionApp/RunFlow/`) takes a validated try-on draft through Phase A,
+per-job try-on preview and regeneration, the rent panel, and confirm/resume — the app's first money
+boundary. Every spend call (`phase-a`, `regen`, `confirm`, `resume`) goes through `SpendGate`, the only
+sender of an `Idempotency-Key`.
+
+- **Idempotency ledger.** `SpendGate` persists at most one pending entry at
+  `Application Support/Motion/Spend/pending-spend.json` before a spend request leaves the phone, and
+  clears it only on a definitive answer. A dropped connection or an app kill mid-spend resends the same
+  key on the next launch instead of minting a new one.
+- **The 20 h rule.** On launch, a ledger entry younger than 20 hours is resent once, with its original
+  key, under "Checking the earlier Confirm…". An entry 20 hours or older is never resent — the server
+  prunes idempotency records after 24 h, so a late replay would count as a fresh spend — and is
+  discarded with a message pointing at Runs and Pod instead.
+- **`-UITestRecordingSpendGate`.** This launch argument swaps `SpendGate` for a recording fake in the
+  UI-test build, so a stray tap in a UI test cannot reach the VPS. `Phase4SmokeTests` uses it to drive
+  the flow up to a priced Confirm (or the sold-out state) without ever tapping a spend button.
+- **Settings save is refused while a spend is in flight** — one run slot means one in-flight spend, and
+  `SpendGate.perform` refuses a second concurrent call outright.
+- **The rent-panel read uses a 120 s timeout** (`GET /v1/runs/{id}/rent-panel`), longer than other reads,
+  because the Vast quote it carries can be slow to price.
+- **The try-on chooser** (`choice_required`) uses the provider of the confirm that was actually sent (never the
+  current picker selection) and shows its price; each choice is a new tap with a new key.
+- **Live spend is never part of any gate.** `make ios-test`, `make ios-build`, `make ios-contract`, and
+  `make ios-ui-test` are all zero-spend. `make ios-refusal-smoke` is also zero-spend — it sends a bogus
+  `panel_token`/`run_token` through the real `SpendGate` against the live API and asserts each call is
+  refused (`409 stale_panel` / `409 stale_run`) with no pod lease before or after — but it is a live call
+  to the VPS and is opt-in: run it only after explicitly deciding to, never automatically.

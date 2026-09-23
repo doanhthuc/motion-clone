@@ -12,7 +12,8 @@ deployed to different machines:
 - `motions-studio/` — the whole backend (Express API + Postgres + MinIO + ComfyUI + Python worker).
   Needs an NVIDIA GPU ≥24GB VRAM, so it runs on a **rented GPU pod** (RunPod), never on the dev machine.
 - `ios/` — the native iPhone app (SwiftUI + the `MotionKit` package). Talks only to the control-plane
-  API on `motion-vps`, never to a pod. `ios/README.md` covers build and install.
+  API on `motion-vps`, never to a pod. `ios/README.md` covers build and install. Before continuing a
+  SwiftUI phase, read `docs/superpowers/swiftui-app-progress.md` for the current handoff.
 - Root `Makefile` + `scripts/` — pod lifecycle, gates, and the batch runner. This layer is repo-specific
   glue and is where most infra work happens.
 
@@ -70,6 +71,7 @@ make ios-ui-test                                  # Auto-boot simulator; live Ph
 make ios-audio-test                               # Silent Mode playback regression (booted simulator)
 make ios-build                                    # app compiles for the simulator (runs ios-gen)
 make ios-contract                                 # live phone API decodes with the app's models (GET only)
+make ios-refusal-smoke                         # live, zero-spend: bogus-token confirm/regen/resume must 409 (asks first)
 motions-studio/setup/scrub-secrets.sh --check     # MUST exit 0 before every commit — repo is public
 
 # Backend unit tests (pure-python, no GPU)
