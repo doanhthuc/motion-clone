@@ -43,6 +43,11 @@ public final class TryonLibraryStore {
     }
 
     /// An entry's image never changes, so it is cached by id.
+    ///
+    /// `nil` deliberately covers both "this entry has no image" and "the phone
+    /// couldn't reach the server": a library tile draws the same placeholder
+    /// either way, and a thumbnail is never worth an error banner. Keep it one
+    /// path — `MaterialsStore.thumbnail(for:)` collapses them for the same reason.
     public func image(id: String) async -> Data? {
         if let cached = images[id] { return cached }
         guard let data = try? await client.data("v1", "tryon-library", id, "image") else { return nil }
