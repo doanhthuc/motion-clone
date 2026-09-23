@@ -4,6 +4,7 @@ import MotionKit
 struct RunsView: View {
     let runs: RunsStore
     let pod: PodStore
+    let flow: RunFlow
 
     var body: some View {
         ScrollView {

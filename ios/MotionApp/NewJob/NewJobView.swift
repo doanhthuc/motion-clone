@@ -5,6 +5,7 @@ import SwiftUI
 struct NewJobView: View {
     let store: DraftStore
     let materials: MaterialsStore
+    let flow: RunFlow
     @State private var selectedRole: String?
     @State private var dropCandidate: DraftBatchEntry?
 
