@@ -127,6 +127,76 @@ extension URLProtocolTests {
         #expect(try h.ledger.load() == nil)
     }
 
+    static let internal500 = TestSupport.json(#"{"error":{"code":"internal","message":"internal error"}}"#, status: 500)
+    static let upstream502 = TestSupport.json(#"{"error":{"code":"upstream_unavailable","message":"RunPod did not answer"}}"#, status: 502)
+    static let draft422 = TestSupport.json(#"{"error":{"code":"draft_invalid","message":"the draft is missing a driver"}}"#, status: 422)
+
+    /// `server.py` answers an unhandled exception with `500 internal` after
+    /// `idem.begin` wrote `pending`, so the resend finds the pending record.
+    @Test func jsonServerErrorIsResentAndFindsOutcomeUnknown() async throws {
+        let h = Self.harness()
+        let script = Script([Self.internal500, Self.unknown])
+        StubURLProtocol.install { _ in script.next() }
+        let result = await h.gate.perform(.phaseA, label: "Preview") { _, _ in }
+        #expect(result == .outcomeUnknown)
+        #expect(Self.keys == ["KEY-1", "KEY-1"])
+        #expect(h.sleeps.value == [.seconds(2)])
+        #expect(try h.ledger.load() == nil)
+    }
+
+    @Test func repeatedJsonServerErrorIsTheStoredAnswer() async throws {
+        let h = Self.harness()
+        StubURLProtocol.install { _ in Self.upstream502 }
+        let result = await h.gate.perform(.phaseA, label: "Preview") { _, _ in }
+        #expect(result == .refused(status: 502, code: "upstream_unavailable",
+                                   message: "RunPod did not answer", panelToken: nil))
+        #expect(StubURLProtocol.requests.count == 2)
+        #expect(Self.keys == ["KEY-1", "KEY-1"])
+        #expect(try h.ledger.load() == nil)
+    }
+
+    @Test func json422IsDefinitiveAfterOneRequest() async throws {
+        let h = Self.harness()
+        StubURLProtocol.install { _ in Self.draft422 }
+        let result = await h.gate.perform(.phaseA, label: "Preview") { _, _ in }
+        #expect(result == .refused(status: 422, code: "draft_invalid",
+                                   message: "the draft is missing a driver", panelToken: nil))
+        #expect(StubURLProtocol.requests.count == 1)
+        #expect(try h.ledger.load() == nil)
+    }
+
+    @Test func jsonServerErrorThenAcceptedKeepsTheKey() async throws {
+        let h = Self.harness()
+        let script = Script([Self.internal500, Self.accepted])
+        StubURLProtocol.install { _ in script.next() }
+        let result = await h.gate.perform(.phaseA, label: "Preview") { _, _ in }
+        #expect(result == .accepted(runID: "tg-1000", outcome: "started"))
+        #expect(Self.keys == ["KEY-1", "KEY-1"])
+        #expect(h.minted.value == 1)
+        #expect(try h.ledger.load() == nil)
+    }
+
+    @Test func differingJsonServerErrorsEndUnreachableWithTheLedgerKept() async throws {
+        let h = Self.harness()
+        let script = Script([Self.internal500, Self.upstream502, Self.dropped])
+        StubURLProtocol.install { _ in script.next() }
+        let result = await h.gate.perform(.phaseA, label: "Preview") { _, _ in }
+        guard case .unreachable = result else { Issue.record("got \(result)"); return }
+        #expect(StubURLProtocol.requests.count == 3)
+        #expect(try h.ledger.load()?.key == "KEY-1")
+    }
+
+    @Test func replayTreatsAJsonServerErrorAsUnreachable() async throws {
+        let h = Self.harness()
+        try h.ledger.save(SpendLedgerEntry(key: "OLD", intent: .phaseA, label: "Preview",
+                                           createdAt: Date(timeIntervalSince1970: 1_790_000_000 - 60)))
+        StubURLProtocol.install { _ in Self.internal500 }
+        let result = await h.gate.replayPending()
+        guard case .unreachable = result else { Issue.record("got \(String(describing: result))"); return }
+        #expect(Self.keys == ["OLD"])
+        #expect(try h.ledger.load()?.key == "OLD")
+    }
+
     @Test func stalePanelIsDefinitiveAndSentOnce() async {
         let h = Self.harness()
         StubURLProtocol.install { _ in Self.stale }

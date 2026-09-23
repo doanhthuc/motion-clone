@@ -10,6 +10,11 @@ import Foundation
 ///   is resent with the same key; the entry stays until a definitive answer;
 /// - `503 bot_busy` means the server recorded nothing: same key, 5 s apart,
 ///   at most 3 retries;
+/// - a JSON 5xx (other than `bot_busy`) is not yet an answer: `server.py`
+///   turns an unhandled exception into `500 internal` AFTER `idem.begin`
+///   wrote `pending`, so a pod may be half-rented. It is resent with the same
+///   key on the unreachable schedule; only the SAME status and code coming
+///   back for that key is the server's stored answer, and definitive;
 /// - `409 outcome_unknown` is final — resending would only repeat it.
 public actor SpendGate: SpendSending {
     /// The server prunes idempotency records after 24 h, after which a replay
@@ -114,13 +119,24 @@ public actor SpendGate: SpendSending {
                           onRetry: SpendRetryHandler) async -> SpendResult {
         var busyRetries = 0
         var unreachableRetries = 0
+        // The last JSON 5xx seen for this key. The same status and code again
+        // means the server stored it (`idem.finish`), so it is the answer.
+        var lastServerError: (status: Int, code: String)?
         while true {
             let raw = await client.spendPost(entry.intent.path, body: entry.intent.body(),
                                              idempotencyKey: entry.key)
+            let detail: String
             switch Self.classify(raw, intent: entry.intent) {
             case .definitive(let result):
                 try? ledger.clear()
                 return result
+            case let .serverError(status, code, result):
+                if let last = lastServerError, last.status == status, last.code == code {
+                    try? ledger.clear()
+                    return result
+                }
+                lastServerError = (status, code)
+                detail = "HTTP \(status) \(code), not yet confirmed as the server's answer"
             case .busy:
                 guard retrying, busyRetries < Self.busyRetries else {
                     try? ledger.clear()   // nothing was recorded server-side
@@ -132,21 +148,25 @@ public actor SpendGate: SpendSending {
                     try? ledger.clear()
                     return .busy(attempts: busyRetries)
                 }
-            case .ambiguous(let detail):
-                guard retrying, unreachableRetries < Self.unreachableDelays.count else {
-                    return .unreachable(detail: detail)
-                }
-                let delay = Self.unreachableDelays[unreachableRetries]
-                unreachableRetries += 1
-                onRetry(unreachableRetries, .unreachable)
-                do { try await sleep(delay) } catch { return .unreachable(detail: detail) }
+                continue
+            case .ambiguous(let text):
+                detail = text
             }
+            guard retrying, unreachableRetries < Self.unreachableDelays.count else {
+                return .unreachable(detail: detail)
+            }
+            let delay = Self.unreachableDelays[unreachableRetries]
+            unreachableRetries += 1
+            onRetry(unreachableRetries, .unreachable)
+            do { try await sleep(delay) } catch { return .unreachable(detail: detail) }
         }
     }
 
     enum Classified: Equatable {
         case definitive(SpendResult)
         case busy
+        /// A JSON error envelope with a 5xx: definitive only once repeated.
+        case serverError(status: Int, code: String, result: SpendResult)
         case ambiguous(String)
     }
 
@@ -169,9 +189,13 @@ public actor SpendGate: SpendSending {
             if let envelope = try? MotionJSON.decoder.decode(Envelope.self, from: body) {
                 if status == 503 && envelope.error.code == "bot_busy" { return .busy }
                 if envelope.error.code == "outcome_unknown" { return .definitive(.outcomeUnknown) }
-                return .definitive(.refused(status: status, code: envelope.error.code,
-                                            message: envelope.error.message,
-                                            panelToken: envelope.panelToken))
+                let refused = SpendResult.refused(status: status, code: envelope.error.code,
+                                                  message: envelope.error.message,
+                                                  panelToken: envelope.panelToken)
+                if status >= 500 {
+                    return .serverError(status: status, code: envelope.error.code, result: refused)
+                }
+                return .definitive(refused)
             }
             // No API envelope: Cloudflare (or another proxy) answered. A 5xx
             // there (502/504/524) may mean the origin is still working, so it
