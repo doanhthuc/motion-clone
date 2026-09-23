@@ -97,9 +97,13 @@ struct LeaseCard: View {
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 8) {
                     PulseDot()
-                    // The .env GPU names a RunPod card; a Vast lease has its own.
-                    Text(lease.provider == "runpod" ? "RunPod · \(gpu)" : lease.provider)
+                    Text(lease.provider == "runpod" ? "RunPod" : lease.provider)
                         .font(Theme.sans(15, .semibold)).foregroundStyle(Theme.ink)
+                }
+                // `.env`'s GPU is what the next rental uses; a change made
+                // mid-lease doesn't move the leased card, so it isn't named as it.
+                if lease.provider == "runpod" {
+                    Text("next rental: \(gpu)").font(Theme.mono(11)).foregroundStyle(Theme.ink2)
                 }
                 Text(Format.clock(elapsed)).font(Theme.mono(36, .semibold)).foregroundStyle(Theme.ink)
                 if let cost = CostEstimate.usd(elapsed: elapsed, ratePerHour: lease.quotedUsdPerHr) {
