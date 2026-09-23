@@ -53,8 +53,9 @@ final class Phase3SmokeTests: XCTestCase {
 
         // The Pod tab (Phase 5) is a tab-bar item, not a New Job action.
         for forbidden in ["Phase A", "Run", "Rent", "Pod"] {
-            let onScreen = app.buttons.matching(identifier: forbidden).count
-                - app.tabBars.buttons.matching(identifier: forbidden).count
+            let named = NSPredicate(format: "label == %@ OR identifier == %@", forbidden, forbidden)
+            let onScreen = app.buttons.matching(named).count
+                - app.tabBars.buttons.matching(named).count
             XCTAssertEqual(onScreen, 0, "The New Job screen must not expose \(forbidden)")
         }
 
