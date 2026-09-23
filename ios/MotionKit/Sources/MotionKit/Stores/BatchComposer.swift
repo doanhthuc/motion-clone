@@ -74,12 +74,17 @@ public final class BatchComposer {
         } else if outfits.count < Self.maxOutfits {
             outfits.append(CrossOutfit(outfitID: outfitID, seedID: matches(for: outfitID).first?.id))
         }
+        // Both describe a run that no longer matches this selection: `progress`
+        // survives a run on purpose (spec §4 wants k/N at the stop), but a
+        // selection edited afterwards would render "1/3" against four rows.
+        progress = nil
         lastAdded = nil
     }
 
     public func setSeed(_ seedID: String?, for outfitID: String) {
         guard !isRunning, let index = outfits.firstIndex(where: { $0.outfitID == outfitID }) else { return }
         outfits[index].seedID = seedID
+        progress = nil
     }
 
     public func matches(for outfitID: String) -> [TryonLibraryEntry] {
@@ -87,9 +92,13 @@ public final class BatchComposer {
     }
 
     /// After the shared slots change, earlier matches name other materials.
+    /// A manually chosen seed is re-picked too, deliberately: it was saved from
+    /// the *old* character/outfit pair, so keeping it would seed a job with an
+    /// image that does not match its own materials.
     public func refreshSeeds() {
         guard !isRunning else { return }
         outfits = outfits.map { CrossOutfit(outfitID: $0.outfitID, seedID: matches(for: $0.outfitID).first?.id) }
+        progress = nil
     }
 
     /// Outfits not yet in the basket as exactly this job.
@@ -105,11 +114,21 @@ public final class BatchComposer {
     }
 
     public func run() async {
-        guard canRun, let current = draft.draft else { return }
+        guard canRun else { return }
+        // Set before the refresh await, so a second run() cannot slip in while
+        // the re-read is in flight and both plan from the same stale draft.
         isRunning = true
         failure = nil
         lastAdded = nil
         defer { isRunning = false }
+        // Spec §4: Continue re-reads the draft and re-plans. Planning from the
+        // cached copy alone would skip an outfit another surface dropped from
+        // the basket since our last read — a silent under-add reported as
+        // success. Offline needs no handling here: `refresh()` keeps the last
+        // good draft and the first PATCH below then fails loudly through
+        // `stop(at:)`, with the transport's or the server's own message.
+        await draft.refresh()
+        guard let current = draft.draft else { return }
         let steps = pending(in: current)
         progress = Progress(done: outfits.count - steps.count, total: outfits.count)
         for outfit in steps {
@@ -121,6 +140,9 @@ public final class BatchComposer {
                 return stop(at: outfit)
             }
             if !(await draft.addToBatch()) {
+                // `draft.error` is the store's, not ours: this reads the refusal
+                // addToBatch just recorded, and staying nil afterwards depends on
+                // DraftStore.refresh() clearing `error` on success (Task 2).
                 guard case .server(status: 422, code: "duplicate", message: _) = draft.error else {
                     return stop(at: outfit)
                 }
