@@ -185,6 +185,9 @@ if let runID = slot?.runId {
 await check("GET /v1/materials") {
     _ = try await client.get(MaterialsResponse.self, "v1", "materials")
 }
+await check("GET /v1/tryon-library") {
+    _ = try await client.get(TryonLibraryResponse.self, "v1", "tryon-library")
+}
 var newestVideo: (batch: String, file: String)?
 await check("GET /v1/outputs") {
     let batches = try await client.get(OutputsResponse.self, "v1", "outputs").outputs

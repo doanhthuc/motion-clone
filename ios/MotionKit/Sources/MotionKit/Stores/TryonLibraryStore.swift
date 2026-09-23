@@ -2,8 +2,12 @@ import Foundation
 import Observation
 
 /// Saved try-ons (API spec §5.10): list, image, delete, and "Use in job" —
-/// one `PATCH {slots, tryon_seed}` through `DraftStore`, so the image always
-/// matches the materials it was made from (Phase 6 spec §6).
+/// one `PATCH {slots, tryon_seed}` through `DraftStore` (Phase 6 spec §6).
+///
+/// The image matches the materials the entry names, not necessarily the whole
+/// draft: the server merges slots per role (`scripts/control/drafts.py:451-456`),
+/// so a role the entry has no id for — the optional `background`, say — survives
+/// the patch while the seed points at an image made without it.
 @MainActor @Observable
 public final class TryonLibraryStore {
     public private(set) var entries: [TryonLibraryEntry] = []
