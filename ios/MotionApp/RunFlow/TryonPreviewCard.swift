@@ -8,11 +8,16 @@ struct TryonPreviewCard: View {
     @State private var showVersions = false
     @State private var showRegenerate = false
     @State private var guidance: Set<Guidance> = []
+    @State private var confirmDrop = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Text(preview.run).font(Theme.mono(12, .semibold)).foregroundStyle(Theme.ink1)
+                if flow.isSeeded(preview) {
+                    Text("Saved try-on").font(Theme.mono(10, .semibold)).foregroundStyle(Theme.lime)
+                        .accessibilityIdentifier("tryon.seeded.\(preview.index)")
+                }
                 Spacer()
                 StageDot(status: preview.status)
             }
@@ -42,6 +47,20 @@ struct TryonPreviewCard: View {
             Button("Regenerate…") { showRegenerate = true }
                 .buttonStyle(SecondaryButtonStyle())
                 .disabled(!flow.canSpend)
+            // `RunFlow.canDropFromBatch` requires `!isDropping`, so without the
+            // second term the control would disappear the instant a drop starts
+            // and "Dropping…" would never render. It stays on screen but inert
+            // until the store's trailing refreshes finish — `isDropping`
+            // outlives the writes on purpose.
+            if flow.canDropFromBatch || flow.isDropping {
+                Button(flow.isDropping ? "Dropping…" : "Drop from batch", role: .destructive) { confirmDrop = true }
+                    .buttonStyle(SecondaryButtonStyle())
+                    .disabled(!flow.canDropFromBatch || flow.batchEntry(for: preview) == nil)
+                    .accessibilityIdentifier("tryon.drop.\(preview.index)")
+                if flow.batchEntry(for: preview) == nil {
+                    Text("Draft changed — reload").font(Theme.mono(10)).foregroundStyle(Theme.amber)
+                }
+            }
             if showVersions { versionStrip }
         }
         .padding(14).card()
@@ -50,6 +69,17 @@ struct TryonPreviewCard: View {
             image = await flow.image(index: preview.index).flatMap(UIImage.init(data:))
         }
         .sheet(isPresented: $showRegenerate) { regenerateSheet }
+        // On the card, not on the trigger: that button lives in a conditional
+        // branch and disables itself the moment `isDropping` flips.
+        .confirmationDialog("Drop \(preview.run) from the batch?", isPresented: $confirmDrop, titleVisibility: .visible) {
+            Button("Drop", role: .destructive) {
+                confirmDrop = false
+                Task { await flow.drop(preview) }
+            }
+            Button("Cancel", role: .cancel) { confirmDrop = false }
+        } message: {
+            Text("Free — nothing is rented yet. The draft is validated again, and Confirm then rents only what is left.")
+        }
     }
 
     @ViewBuilder private var versionStrip: some View {
