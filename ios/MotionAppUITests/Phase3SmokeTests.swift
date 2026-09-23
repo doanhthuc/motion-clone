@@ -51,8 +51,11 @@ final class Phase3SmokeTests: XCTestCase {
         clearMaterial(for: "Character", in: app)
         XCTAssertTrue(app.staticTexts["Ready"].waitForNonExistence(timeout: 10))
 
+        // The Pod tab (Phase 5) is a tab-bar item, not a New Job action.
         for forbidden in ["Phase A", "Run", "Rent", "Pod"] {
-            XCTAssertFalse(app.buttons[forbidden].exists, "Phase 3 must not expose \(forbidden)")
+            let onScreen = app.buttons.matching(identifier: forbidden).count
+                - app.tabBars.buttons.matching(identifier: forbidden).count
+            XCTAssertEqual(onScreen, 0, "The New Job screen must not expose \(forbidden)")
         }
 
         clearDraft(in: app)
