@@ -1,5 +1,12 @@
 import Foundation
 
+/// A spend call's answer before any interpretation. `SpendGate` decides what
+/// is definitive and what is worth resending with the same key.
+public enum RawSpendResponse: Sendable, Equatable {
+    case http(status: Int, body: Data)
+    case transport(String)
+}
+
 public struct ByteRangeResponse: Sendable, Equatable {
     public let data: Data
     public let contentType: String?
@@ -126,6 +133,35 @@ public actor APIClient {
         let (data, _) = try await send(
             url(components), method: "DELETE", extraHeaders: [:], okStatuses: [200])
         return try decode(response, data)
+    }
+
+    public func get<T: Decodable & Sendable>(
+        _ type: T.Type, query: [URLQueryItem], _ components: String...
+    ) async throws(APIError) -> T {
+        let target = url(components).appending(queryItems: query)
+        let (data, _) = try await send(target, extraHeaders: [:], okStatuses: [200])
+        return try decode(type, data)
+    }
+
+    /// The transport for `SpendGate` only. Never throws: a dropped connection
+    /// is an answer the gate must classify (resend with the same key), not an
+    /// error to surface. 90 s stays under Cloudflare's ~100 s origin ceiling.
+    public func spendPost(_ components: [String], body: Data, idempotencyKey: String,
+                          timeout: TimeInterval = 90) async -> RawSpendResponse {
+        var request = URLRequest(url: url(components))
+        request.httpMethod = "POST"
+        request.httpBody = body
+        request.timeoutInterval = timeout
+        for (k, v) in authHeaders { request.setValue(v, forHTTPHeaderField: k) }
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(idempotencyKey, forHTTPHeaderField: "Idempotency-Key")
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard let http = response as? HTTPURLResponse else { return .transport("not an HTTP response") }
+            return .http(status: http.statusCode, body: data)
+        } catch {
+            return .transport(error.localizedDescription)
+        }
     }
 
     /// Fetches one byte range with the same Access and bearer headers as every

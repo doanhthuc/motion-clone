@@ -256,4 +256,47 @@ extension URLProtocolTests {
         #expect(APIError.transport("offline").isOffline)
     }
 }
+@Suite struct SpendTransportTests {
+    @Test func spendPostSendsKeyAuthAndJSON() async throws {
+        StubURLProtocol.install { _ in TestSupport.json(#"{"run_id":"tg-1000","outcome":"started"}"#, status: 202) }
+        let raw = await TestSupport.client().spendPost(
+            ["v1", "runs", "phase-a"], body: Data("{}".utf8), idempotencyKey: "KEY-1")
+        #expect(raw == .http(status: 202, body: Data(#"{"run_id":"tg-1000","outcome":"started"}"#.utf8)))
+        let request = try #require(StubURLProtocol.requests.first)
+        #expect(request.httpMethod == "POST")
+        #expect(request.url?.path == "/v1/runs/phase-a")
+        #expect(request.value(forHTTPHeaderField: "Idempotency-Key") == "KEY-1")
+        #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer bearer-789")
+        #expect(request.value(forHTTPHeaderField: "CF-Access-Client-Id") == "id-123")
+        #expect(request.value(forHTTPHeaderField: "Content-Type") == "application/json")
+        #expect(request.timeoutInterval == 90)
+    }
+
+    @Test func spendPostReportsTransportFailureWithoutThrowing() async {
+        StubURLProtocol.install { _ in (-1, [:], Data()) }
+        let raw = await TestSupport.client().spendPost(
+            ["v1", "runs", "phase-a"], body: Data("{}".utf8), idempotencyKey: "K")
+        guard case .transport = raw else {
+            Issue.record("expected .transport, got \(raw)")
+            return
+        }
+    }
+
+    @Test func spendPostReturnsErrorStatusesRaw() async {
+        StubURLProtocol.install { _ in TestSupport.json(Fixtures.errorConflict, status: 409) }
+        let raw = await TestSupport.client().spendPost(
+            ["v1", "runs", "x", "confirm"], body: Data("{}".utf8), idempotencyKey: "K")
+        #expect(raw == .http(status: 409, body: Data(Fixtures.errorConflict.utf8)))
+    }
+
+    @Test func getWithQueryAppendsItems() async throws {
+        StubURLProtocol.install { _ in TestSupport.json(#"{"ok":true}"#) }
+        struct OK: Decodable, Sendable { let ok: Bool }
+        _ = try await TestSupport.client().get(
+            OK.self, query: [URLQueryItem(name: "force", value: "1")], "v1", "runs", "tg-1", "rent-panel")
+        let url = try #require(StubURLProtocol.requests.first?.url)
+        #expect(url.path == "/v1/runs/tg-1/rent-panel")
+        #expect(url.query == "force=1")
+    }
+}
 }

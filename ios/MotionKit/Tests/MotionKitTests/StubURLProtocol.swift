@@ -44,6 +44,12 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
         }
         let h = Self.lock.withLock { Self.recorded.append(captured); return Self.handler }
         let (status, headers, body) = h(captured)
+        // A negative status simulates a dropped connection / timeout: no
+        // HTTP response at all, which is what a spend retry must survive.
+        if status < 0 {
+            client?.urlProtocol(self, didFailWithError: URLError(.timedOut))
+            return
+        }
         let response = HTTPURLResponse(url: request.url!, statusCode: status,
                                        httpVersion: "HTTP/1.1", headerFields: headers)!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
