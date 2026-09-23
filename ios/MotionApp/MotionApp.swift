@@ -11,7 +11,13 @@ struct MotionApp: App {
     }
 }
 
-enum AppTab: Hashable { case runs, materials, newJob, outputs }
+enum AppTab: Hashable { case runs, materials, newJob, outputs, pod }
+
+/// Opens the migrate sheet (RootView presents it over every tab).
+struct MigrateRequest: Identifiable, Equatable {
+    let id = UUID()
+    let destination: String?
+}
 
 /// Owns the vault and one set of stores per set of credentials. Saving new
 /// credentials in Settings calls `reconnect()`, which rebuilds the stores.
@@ -25,6 +31,14 @@ final class AppModel {
     private(set) var draft: DraftStore?
     private(set) var outputs: OutputsStore?
     private(set) var runFlow: RunFlow?
+    private(set) var gpu: GpuStore?
+    private(set) var balance: BalanceStore?
+    private(set) var migrate: MigrateFlow?
+    var migrateSheet: MigrateRequest?
+    /// UI-test builds only: how many spend taps the recording gate swallowed.
+    private(set) var recordedSpends = 0
+    private var spendGate: (any SpendSending)?
+    static let isUITestRecording = ProcessInfo.processInfo.arguments.contains("-UITestRecordingSpendGate")
     var selectedTab: AppTab = .runs
     private var materialResumeTask: Task<Void, Never>?
     private var replayTask: Task<Void, Never>?
@@ -34,29 +48,37 @@ final class AppModel {
         reconnect()
     }
 
-    /// Refuses to rebuild while a spend is outstanding on the current
-    /// `RunFlow` — replacing it would strand that spend's result (e.g. a
-    /// `409 outcome_unknown` → `podRequested`) on an unobserved instance.
+    /// Refuses to rebuild while a spend or migrate is outstanding — replacing
+    /// the store would strand its result on an unobserved instance.
     @discardableResult
     func reconnect() -> Bool {
         if runFlow?.isSpending == true || runFlow?.pendingNotice != nil { return false }
+        if migrate?.isSending == true || migrate?.pendingNotice != nil { return false }
         materialResumeTask?.cancel()
         materialResumeTask = nil
         guard let credentials = vault.load() else {
             client = nil; runs = nil; pod = nil; materials = nil; draft = nil; outputs = nil; runFlow = nil
+            gpu = nil; balance = nil; migrate = nil; spendGate = nil
             return true
         }
         let client = APIClient(credentials: credentials)
         self.client = client
         runs = RunsStore(client: client)
-        pod = PodStore(client: client)
+        let pod = PodStore(client: client)
+        self.pod = pod
         materials = MaterialsStore(client: client)
         draft = DraftStore(client: client)
         outputs = OutputsStore(client: client)
-        let gate: any SpendSending = ProcessInfo.processInfo.arguments.contains("-UITestRecordingSpendGate")
-            ? RecordingSpendGate()
+        gpu = GpuStore(client: client, pod: pod)
+        balance = BalanceStore(client: client)
+        let gate: any SpendSending = Self.isUITestRecording
+            ? RecordingSpendGate { [weak self] count in
+                Task { @MainActor in self?.recordedSpends = count }
+            }
             : SpendGate(client: client)
+        spendGate = gate
         runFlow = RunFlow(client: client, gate: gate)
+        migrate = MigrateFlow(client: client, gate: gate, pod: pod)
         replayTask = nil
         replayPendingSpend()
         resumeMaterialsUpload()
@@ -71,10 +93,16 @@ final class AppModel {
         }
     }
 
-    /// Once per launch (RunFlow guards it): resend an interrupted spend with
-    /// its original key, or report it as too old to verify.
+    /// Once per launch (each flow guards it): resend an interrupted spend with
+    /// its original key. The one ledger entry belongs to whichever flow sent it.
     func replayPendingSpend() {
-        guard replayTask == nil, let runFlow else { return }
-        replayTask = Task { await runFlow.replayPendingOnce() }
+        guard replayTask == nil, let runFlow, let migrate, let spendGate else { return }
+        replayTask = Task {
+            if await spendGate.pending()?.intent.kind == .migrate {
+                await migrate.replayPendingOnce()
+            } else {
+                await runFlow.replayPendingOnce()
+            }
+        }
     }
 }
