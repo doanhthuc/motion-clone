@@ -40,8 +40,18 @@ struct RunDetailView: View {
                     }
                     if d.id == pod.pod?.runId, pod.showsKill(runStatus: d.status), let runID = pod.pod?.runId {
                         KillButton(pod: pod, runID: runID, hasLease: pod.pod?.lease != nil)
+                        if d.jobs.count > 1 {
+                            Text("Kill stops every remaining job in this batch.")
+                                .font(Theme.sans(12)).foregroundStyle(Theme.ink3)
+                        }
                     }
-                    ForEach(d.jobs) { job in JobTimeline(job: job, showTitle: d.jobs.count > 1) }
+                    // A 12-job batch inlined stage-by-stage is a wall of rows; the
+                    // collapsed list puts the job that failed at the top instead.
+                    if d.jobs.count > 1 {
+                        BatchProgressList(jobs: d.jobs)
+                    } else {
+                        ForEach(d.jobs) { job in JobTimeline(job: job, showTitle: false) }
+                    }
                     if !d.outputs.isEmpty {
                         SectionLabel(text: "Outputs")
                         ForEach(d.outputs, id: \.self) { name in
@@ -184,5 +194,41 @@ struct StageDot: View {
             }
         }
         .frame(width: 26, height: 26)
+    }
+}
+
+struct BatchProgressList: View {
+    let jobs: [JobProgress]
+    @State private var expanded: Set<String> = []
+
+    var body: some View {
+        let summary = BatchSummary(jobs)
+        VStack(alignment: .leading, spacing: 10) {
+            SectionLabel(text: "Batch · \(summary.done)/\(summary.total) done")
+            Text("\(summary.running) running · \(summary.failed) failed")
+                .font(Theme.mono(11)).foregroundStyle(summary.failed > 0 ? Theme.red : Theme.ink2)
+                .accessibilityIdentifier("batch.summary")
+            ForEach(summary.ordered) { job in
+                VStack(alignment: .leading, spacing: 10) {
+                    Button {
+                        if expanded.contains(job.id) { expanded.remove(job.id) } else { expanded.insert(job.id) }
+                    } label: {
+                        HStack(spacing: 10) {
+                            StageDot(status: job.status)
+                            Text(job.id).font(Theme.mono(12, .semibold)).foregroundStyle(Theme.ink1).lineLimit(1)
+                            Spacer(minLength: 0)
+                            if job.finishedSec > 0 {
+                                Text(Format.clock(job.finishedSec)).font(Theme.mono(11)).foregroundStyle(Theme.ink2)
+                            }
+                            Image(systemName: expanded.contains(job.id) ? "chevron.up" : "chevron.down")
+                                .foregroundStyle(Theme.ink3)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    if expanded.contains(job.id) { JobTimeline(job: job, showTitle: false) }
+                }
+                .padding(12).card()
+            }
+        }
     }
 }

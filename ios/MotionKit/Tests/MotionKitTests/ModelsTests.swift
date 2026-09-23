@@ -33,6 +33,21 @@ import Testing
         #expect(d.lease?.quotedUsdPerHr == nil)
     }
 
+    @Test func batchSummaryCountsAndPutsTroubleFirst() throws {
+        let json = #"""
+        [{"id":"a","status":"done","stages":[{"name":"tryon","status":"done","elapsed_sec":6},{"name":"motion","status":"done","elapsed_sec":60}]},
+         {"id":"b","status":"running","stages":[{"name":"tryon","status":"done","elapsed_sec":7},{"name":"motion","status":"running","elapsed_sec":null}]},
+         {"id":"c","status":"error","stages":[{"name":"tryon","status":"error","elapsed_sec":null}]},
+         {"id":"d","status":"pending","stages":[]}]
+        """#
+        let jobs = try decoder.decode([JobProgress].self, from: Fixtures.data(json))
+        let summary = BatchSummary(jobs)
+        #expect((summary.total, summary.done, summary.running, summary.failed) == (4, 1, 1, 1))
+        #expect(summary.ordered.map(\.id) == ["c", "b", "a", "d"])
+        #expect(jobs[0].finishedSec == 66)
+        #expect(jobs[1].finishedSec == 7)
+    }
+
     @Test func decodesPod() throws {
         let live = try decoder.decode(PodStatus.self, from: Fixtures.data(Fixtures.podLive))
         #expect(live.lease?.runId == "tg-1000")
