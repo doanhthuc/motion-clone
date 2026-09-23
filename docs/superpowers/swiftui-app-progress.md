@@ -11,11 +11,11 @@ what actually shipped, what was verified, and the next safe boundary.
 
 - Repository: `/Users/thucpham/Desktop/motion-clone`
 - Branch: `main`
-- Latest merged implementation: `2945481` (merge of PR #65, `feat/swiftui-phase-4`), merged 2026-09-23.
-- Phase 5 is implemented on branch `feat/swiftui-phase-5` (spec `652b184`, plan `b6ff0e0`, code through
-  `18cafca`); it changes only `ios/**`, `docs/**`, `Makefile`, `CLAUDE.md` and `AGENTS.md`.
-- PR #65 changed only `ios/**`, `docs/**` and `Makefile` — nothing under `scripts/**` — so it did not
-  trigger the deploy-bot workflow. The VPS bot still runs the `affcf46` deploy (GitHub Actions run
+- Latest implementation: `7a8c0e2` (merge of PR #66, `feat/swiftui-phase-5`), merged 2026-09-23.
+  Phase 4 was PR #65 (`2945481`).
+- PR #66 changed only `ios/**`, `docs/**`, `Makefile`, `CLAUDE.md` and `AGENTS.md` — nothing under
+  `scripts/**` — so it did not trigger the deploy-bot workflow.
+- PR #65 did not touch `scripts/**` either. The VPS bot still runs the `affcf46` deploy (GitHub Actions run
   `35813558396`, `motion-bot` active, control API on `127.0.0.1:8787`).
 - Control-plane API slices 1–6 are live. Phases 4 and 5 added no route or field.
 - Phases 1–5 are implemented. Phase 6 has not started.
@@ -92,7 +92,7 @@ ios/
 
 ## Verified gates at the handoff
 
-### Phase 5 (2026-09-23, branch `feat/swiftui-phase-5`)
+### Phase 5 (2026-09-23, merged as `7a8c0e2`)
 
 - `make ios-test` — 211 tests in 21 suites.
 - `make ios-build` — succeeded.
