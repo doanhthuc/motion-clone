@@ -412,10 +412,12 @@ extension URLProtocolTests {
         let routes = Routes()
         routes.draft = Routes.draftTwoJobs
         routes.tryon = Fixtures.tryonDone
+        routes.setPanels([Fixtures.rentPanel, Fixtures.rentPanelFresh])
         let flow = make(routes)
         await flow.start(.existing)
         await flow.continueToRent()
         #expect(flow.phase == .rentPanel)
+        #expect(flow.panel?.panelToken == "1790000000123.4.9")
         let blazer = try #require(flow.tryon?.previews.first { $0.run == "model__blazer" })
         let panelReads = StubURLProtocol.requests.filter { $0.url?.path.hasSuffix("/rent-panel") == true }.count
 
@@ -424,6 +426,9 @@ extension URLProtocolTests {
         #expect(StubURLProtocol.requests.filter {
             $0.url?.path.hasSuffix("/rent-panel") == true
         }.count == panelReads + 1)
+        // Not just that the GET happened — that its answer was installed, so
+        // the quote on screen is the one that priced the surviving job.
+        #expect(flow.panel?.panelToken == "1790000000999.1.10")
         #expect(flow.phase == .rentPanel)
         #expect(flow.draft?.batch.map(\.digest) == ["d1"])
     }

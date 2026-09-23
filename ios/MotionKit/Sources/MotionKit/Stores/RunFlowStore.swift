@@ -274,6 +274,14 @@ public final class RunFlow {
             message = apiError(error).userMessage
             if let fresh = try? await client.get(Draft.self, "v1", "draft") { draft = fresh }
         }
+        // This panel priced the job that just went away. `canConfirm` is
+        // `panel != nil && quote(for:) != nil && canSpend && !isLoadingPanel`,
+        // and `isLoadingPanel` is still false while `refreshTryon()` awaits
+        // below — so without this line Confirm stays tappable at a price for a
+        // job that no longer exists. The server would refuse it (409
+        // `stale_panel`), but the quote on screen must be the quote that will
+        // be charged. Same reason `reloadPanelAfterGpuChange()` clears first.
+        if phase == .rentPanel { panel = nil }
         await refreshTryon()
         if phase == .rentPanel { await loadPanel(force: false) }
     }
