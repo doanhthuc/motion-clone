@@ -70,7 +70,11 @@ struct SettingsView: View {
             saveError = "Couldn't write the Keychain: \(error)"
             return
         }
-        model.reconnect()
+        guard model.reconnect() else {
+            testOK = false
+            testResult = "A spend request is still in flight — save again once it's answered."
+            return
+        }
         do {
             let latency = try await APIClient(credentials: credentials).health()
             testOK = true

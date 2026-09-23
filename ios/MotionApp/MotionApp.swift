@@ -34,12 +34,17 @@ final class AppModel {
         reconnect()
     }
 
-    func reconnect() {
+    /// Refuses to rebuild while a spend is outstanding on the current
+    /// `RunFlow` — replacing it would strand that spend's result (e.g. a
+    /// `409 outcome_unknown` → `podRequested`) on an unobserved instance.
+    @discardableResult
+    func reconnect() -> Bool {
+        if runFlow?.isSpending == true || runFlow?.pendingNotice != nil { return false }
         materialResumeTask?.cancel()
         materialResumeTask = nil
         guard let credentials = vault.load() else {
             client = nil; runs = nil; pod = nil; materials = nil; draft = nil; outputs = nil; runFlow = nil
-            return
+            return true
         }
         let client = APIClient(credentials: credentials)
         self.client = client
@@ -52,7 +57,10 @@ final class AppModel {
             ? RecordingSpendGate()
             : SpendGate(client: client)
         runFlow = RunFlow(client: client, gate: gate)
+        replayTask = nil
+        replayPendingSpend()
         resumeMaterialsUpload()
+        return true
     }
 
     func resumeMaterialsUpload() {
