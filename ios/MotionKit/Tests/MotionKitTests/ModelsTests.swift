@@ -77,4 +77,37 @@ import Testing
         #expect(complete.probe.durationS == 12.5)
         #expect(complete.probe.warning == "Video is larger than recommended.")
     }
+
+    @Test func pipelineAndDraftModelsDecode() throws {
+        let catalog = try MotionJSON.decoder.decode(
+            PipelineCatalogResponse.self, from: Fixtures.data(Fixtures.pipelines))
+        #expect(catalog.pipelines[1].providers.map(\.id) == ["gemini", "qwen-max"])
+        #expect(catalog.pipelines[1].roles["mask"] == .unknown)
+
+        let draft = try MotionJSON.decoder.decode(Draft.self, from: Fixtures.data(Fixtures.draft))
+        #expect(draft.generation == 4)
+        #expect(draft.validated == nil)
+        #expect(draft.slots["character"]?.probe.kind == "image")
+        #expect(draft.batch.first?.digest == "abc123def0")
+        #expect(draft.jobs == 1 && draft.estimateMin == nil)
+    }
+
+    @Test func roleKindsFilterOnlyCompatibleMaterials() throws {
+        let image = Material(id: "app/a.png", owner: "app", name: "a.png",
+                             bytes: 1, updatedAt: 1, kind: .image)
+        let video = Material(id: "app/a.mp4", owner: "app", name: "a.mp4",
+                             bytes: 1, updatedAt: 1, kind: .video)
+        #expect(PipelineRoleKind.image.accepts(image))
+        #expect(!PipelineRoleKind.image.accepts(video))
+        #expect(PipelineRoleKind.video.accepts(video))
+        #expect(!PipelineRoleKind.unknown.accepts(image))
+    }
+
+    @Test func validationResponseKeepsNestedAuthoritativeDraft() throws {
+        let result = try MotionJSON.decoder.decode(
+            DraftValidationResponse.self, from: Fixtures.data(Fixtures.validatedDraft))
+        #expect(result.valid && !result.stale)
+        #expect(result.draft.validated == true)
+        #expect(result.draft.estimateMin == 48)
+    }
 }

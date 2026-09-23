@@ -82,6 +82,43 @@ enum Fixtures {
      "bitrate_kbps":4200,"size_bytes":33554449,"warning":"Video is larger than recommended."}}
     """#
 
+    static let pipelines = #"""
+    {"pipelines":[
+      {"id":"motion-enhance","stages":["motion","enhance"],
+       "required":["character","driver"],"optional":[],
+       "roles":{"character":"image","driver":"video"},"providers":[]},
+      {"id":"tryon-motion-enhance","stages":["tryon","motion","enhance"],
+       "required":["character","driver","outfit"],"optional":["mask"],
+       "roles":{"character":"image","driver":"video","outfit":"image","mask":"future_kind"},
+       "providers":[{"id":"gemini","label":"Gemini"},{"id":"qwen-max","label":"Qwen Max"}]}
+    ]}
+    """#
+
+    static let draft = #"""
+    {"owner":"app","pipeline":"tryon-motion-enhance","provider":"gemini","generation":4,
+     "slots":{"character":{"material_id":"app/model.png","name":"model.png","exists":true,
+       "probe":{"kind":"image","width":1024,"height":1536,"duration_s":null,
+       "bitrate_kbps":null,"size_bytes":900,"warning":""},"warning":""}},
+     "required":["character","driver","outfit"],"optional":["mask"],
+     "missing":["driver","outfit"],"validated":null,
+     "batch":[{"digest":"abc123def0","run_id":"model__dress","pipeline":"tryon-motion-enhance",
+       "provider":"gemini","slots":{"character":"app/model.png","outfit":"app/dress.png","driver":null}}],
+     "jobs":1,"estimate_min":null}
+    """#
+
+    static let validatedDraft = #"""
+    {"valid":true,"stale":false,"draft":{"owner":"app","pipeline":"motion-enhance",
+     "provider":"gemini","generation":8,
+     "slots":{"character":{"material_id":"app/model.png","name":"model.png","exists":true,
+       "probe":{"kind":"image","width":1024,"height":1536,"duration_s":null,
+       "bitrate_kbps":null,"size_bytes":900,"warning":""},"warning":""},
+       "driver":{"material_id":"app/driver.mp4","name":"driver.mp4","exists":true,
+       "probe":{"kind":"video","width":1080,"height":1920,"duration_s":12.5,
+       "bitrate_kbps":4200,"size_bytes":33554449,"warning":""},"warning":""}},
+     "required":["character","driver"],"optional":[],"missing":[],
+     "validated":true,"batch":[],"jobs":1,"estimate_min":48}}
+    """#
+
     static let errorConflict = #"{"error": {"code": "stale_panel", "message": "the panel changed"}}"#
 
     static let cloudflareHTML = "<!DOCTYPE html><html><head><title>Access denied | Error 1010</title></head></html>"

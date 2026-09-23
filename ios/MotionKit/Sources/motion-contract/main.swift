@@ -41,6 +41,12 @@ var failed = 0
 }
 
 await check("GET /v1/health") { _ = try await client.health() }
+await check("GET /v1/pipelines") {
+    _ = try await client.get(PipelineCatalogResponse.self, "v1", "pipelines")
+}
+await check("GET /v1/draft") {
+    _ = try await client.get(Draft.self, "v1", "draft")
+}
 var newestRun: String?
 await check("GET /v1/runs") { newestRun = try await client.get(RunsResponse.self, "v1", "runs").runs.first?.id }
 if let newestRun {

@@ -44,7 +44,10 @@ ends; the current material-list API does not return old warnings after a cold la
 
 This flow uses only the VPS material/upload routes and never rents a GPU pod.
 
-### Phase 2 phone smoke
+### Phase 2 phone smoke (pending)
+
+This physical-phone smoke remains deferred and unrun. Run it only with personal test media; do not
+commit selected media, screenshots containing personal names, or upload checkpoint contents.
 
 1. Open Material and confirm existing global items and thumbnails load.
 2. Add a small image from Photos, then delete its app-owned card.
@@ -52,4 +55,26 @@ This flow uses only the VPS material/upload routes and never rents a GPU pod.
    app, reopen it, and confirm the upload resumes instead of restarting.
 4. Confirm the completed video thumbnail and any amber warning, then verify Runs and Output still load.
 
-Do not commit selected media, screenshots containing personal names, or upload checkpoint contents.
+## New Job
+
+The central New Job tab is a catalog-driven, server-authoritative single-job composer. It loads
+pipelines and roles from the VPS, filters each role's material picker by the required image or video
+kind, and replaces its draft after every server mutation. Switching pipelines can remove incompatible
+slots; the app shows the server's notice. A complete editor can be added to the basket, and a basket
+row is removed by its stable digest rather than its position. Validation is free: Ready and any estimate
+come from the server, and the next draft edit clears Ready.
+
+The Phase 3 UI intentionally contains no Phase A, Run, rent, pod, confirm, resume, or other
+spend-capable action. Its mutations use only the free draft endpoints; its reads use the free pipeline,
+draft, material, and authenticated-thumbnail routes. Later phases introduce spend actions.
+
+### Phase 3 simulator/iPhone smoke (pending)
+
+This free manual smoke, including the physical-phone portion, remains deferred and unrun.
+
+1. Open New Job and switch between two pipelines; confirm incompatible slots disappear with a notice.
+2. Assign image and video materials and verify incompatible kinds are absent from each picker.
+3. Clear a required slot; confirm Add is disabled and the role is named missing.
+4. Complete a job, add it to the basket, remove it by its digest-backed row, and add it again.
+5. Validate; confirm Ready and an estimate appear, then edit one slot and confirm Ready disappears.
+6. Confirm no Phase A, Run, rent, or pod action exists in the Phase 3 UI.

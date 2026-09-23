@@ -20,6 +20,7 @@ final class AppModel {
     private(set) var runs: RunsStore?
     private(set) var pod: PodStore?
     private(set) var materials: MaterialsStore?
+    private(set) var draft: DraftStore?
     private(set) var outputs: OutputsStore?
     private var materialResumeTask: Task<Void, Never>?
 
@@ -32,7 +33,7 @@ final class AppModel {
         materialResumeTask?.cancel()
         materialResumeTask = nil
         guard let credentials = vault.load() else {
-            client = nil; runs = nil; pod = nil; materials = nil; outputs = nil
+            client = nil; runs = nil; pod = nil; materials = nil; draft = nil; outputs = nil
             return
         }
         let client = APIClient(credentials: credentials)
@@ -40,6 +41,7 @@ final class AppModel {
         runs = RunsStore(client: client)
         pod = PodStore(client: client)
         materials = MaterialsStore(client: client)
+        draft = DraftStore(client: client)
         outputs = OutputsStore(client: client)
         resumeMaterialsUpload()
     }
