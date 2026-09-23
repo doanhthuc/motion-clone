@@ -6,6 +6,9 @@ struct NewJobView: View {
     let store: DraftStore
     let materials: MaterialsStore
     let flow: RunFlow
+    let composer: BatchComposer
+    let library: TryonLibraryStore
+    @Environment(AppModel.self) private var model
     @State private var selectedRole: String?
     @State private var dropCandidate: DraftBatchEntry?
 
@@ -23,6 +26,7 @@ struct NewJobView: View {
         }
         .background(Theme.bg)
         .task { await store.load() }
+        .task { await library.load() }
         .refreshable { await store.refresh() }
         .onChange(of: store.needsMaterialsRefresh) { _, needsRefresh in
             guard needsRefresh else { return }
@@ -65,17 +69,31 @@ struct NewJobView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 header(draft)
+                Picker("Mode", selection: Binding(get: { model.newJobMode }, set: { model.newJobMode = $0 })) {
+                    Text("Single").tag(NewJobMode.single)
+                    Text("Batch").tag(NewJobMode.batch)
+                }
+                .pickerStyle(.segmented)
+                .accessibilityIdentifier("newjob.mode")
+                .disabled(store.isBusy || composer.isRunning)
                 banners
                 PipelinePicker(
                     pipeline: pipeline,
-                    pipelines: store.catalog,
+                    pipelines: model.newJobMode == .batch ? store.catalog.filter(BatchComposer.supports) : store.catalog,
                     selectedProvider: draft.provider,
-                    disabled: store.isBusy,
+                    disabled: store.isBusy || composer.isRunning,
                     onPipelineSelected: { id in await store.selectPipeline(id) },
                     onProviderSelected: { id in await store.selectProvider(id) })
-                slots(draft: draft, pipeline: pipeline)
-                readiness(draft)
-                editorActions(draft)
+                if model.newJobMode == .batch {
+                    BatchComposerSection(store: store, composer: composer, library: library,
+                                         materials: materials, pipeline: pipeline,
+                                         onPickRole: { selectedRole = $0 })
+                } else {
+                    slots(draft: draft, pipeline: pipeline)
+                    seedBadge(draft)
+                    readiness(draft)
+                    editorActions(draft)
+                }
                 batch(draft)
                 validation(draft)
             }
@@ -188,7 +206,7 @@ struct NewJobView: View {
             .frame(maxWidth: .infinity)
             .padding(.vertical, 12)
             .background(Theme.lime, in: .rect(cornerRadius: 12))
-            .disabled(!draft.missing.isEmpty || store.isBusy)
+            .disabled(!draft.missing.isEmpty || store.isBusy || composer.isRunning)
 
             Button("Clear", role: .destructive) {
                 Task { await store.clear() }
@@ -198,7 +216,26 @@ struct NewJobView: View {
             .padding(.horizontal, 16)
             .padding(.vertical, 12)
             .background(Theme.redDim, in: .rect(cornerRadius: 12))
-            .disabled(store.isBusy)
+            .disabled(store.isBusy || composer.isRunning)
+        }
+    }
+
+    /// The edited job's own seed. `!library.loaded` counts as "still exists":
+    /// an unfetched library cannot say a seed is gone, only that it is unseen.
+    @ViewBuilder private func seedBadge(_ draft: Draft) -> some View {
+        if let seed = draft.tryonSeed {
+            HStack(spacing: 8) {
+                Image(systemName: "photo.badge.checkmark").foregroundStyle(Theme.lime)
+                Text(library.entries.contains { $0.id == seed } || !library.loaded
+                     ? "Uses a saved try-on — Phase A skips the provider for this job"
+                     : "The saved try-on no longer exists")
+                    .font(Theme.sans(13)).foregroundStyle(Theme.ink1)
+                Spacer(minLength: 0)
+                Button("Remove") { Task { await store.apply(DraftPatch(seed: .clear)) } }
+                    .font(Theme.sans(12, .semibold)).foregroundStyle(Theme.red)
+                    .disabled(store.isBusy)
+            }
+            .padding(12).card(border: Theme.limeLine)
         }
     }
 
@@ -224,6 +261,9 @@ struct NewJobView: View {
                                 .font(Theme.mono(9))
                                 .foregroundStyle(Theme.ink3)
                                 .lineLimit(2)
+                            if entry.tryonSeed != nil {
+                                Text("Saved try-on").font(Theme.mono(9, .semibold)).foregroundStyle(Theme.lime)
+                            }
                         }
                         Spacer(minLength: 0)
                         Button("Drop", role: .destructive) { dropCandidate = entry }
@@ -315,7 +355,7 @@ struct NewJobView: View {
 }
 
 @MainActor
-private struct SlotMaterialRow: View {
+struct SlotMaterialRow: View {
     let role: String
     let required: Bool
     let kind: PipelineRoleKind

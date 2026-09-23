@@ -65,8 +65,9 @@ public final class BatchComposer {
     /// `isRefreshing`, so without that third term a `load()` in flight would leave `canRun`
     /// true and `run()`'s own refresh would return at once on its `guard !isRefreshing`
     /// (`DraftStore.swift:62`) — planning from the cached draft, which is the silent
-    /// under-add the re-read exists to prevent. Task 8 binds the run button to `!canRun`,
-    /// so this also keeps the button inert during a load instead of looking tappable.
+    /// under-add the re-read exists to prevent. The batch run button is
+    /// `.disabled(!canRun)`, so this term is also what keeps it inert during a load
+    /// instead of looking tappable.
     public var canRun: Bool {
         !isRunning && !draft.isBusy && !draft.isRefreshing
             && missingShared.isEmpty && !outfits.isEmpty
