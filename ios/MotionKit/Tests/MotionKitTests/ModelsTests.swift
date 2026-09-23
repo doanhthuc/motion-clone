@@ -197,9 +197,34 @@ import Testing
         #expect(draft.batch[0].tryonSeed == "s0")
     }
 
+    @Test func unfilledDraftSlotsAreDroppedFromFilledSlots() throws {
+        // `Fixtures.draft` fills its only slot, so it cannot tell `compactMapValues(\.materialID)`
+        // from `mapValues { $0.materialID ?? "" }`. Task 3 matches library entries by dictionary
+        // equality over `filledSlots`, where an empty-string role would never match — so the
+        // nil-drop needs a payload that actually carries a null material id.
+        let payload = #"""
+        {"owner":"app","pipeline":"tryon-motion-enhance","provider":"gemini","generation":4,
+         "slots":{"character":{"material_id":"app/model.png","name":"model.png","exists":true,
+           "probe":{"kind":"image","width":1024,"height":1536,"duration_s":null,
+           "bitrate_kbps":null,"size_bytes":900},"warning":""},
+          "outfit":{"material_id":null,"name":"dress.png","exists":true,
+           "probe":{"kind":"image","width":1024,"height":1536,"duration_s":null,
+           "bitrate_kbps":null,"size_bytes":900},"warning":""}},
+         "required":["character","driver","outfit"],"optional":["mask"],
+         "missing":["driver","outfit"],"validated":null,
+         "batch":[],"jobs":0,"estimate_min":null}
+        """#
+
+        let draft = try decoder.decode(Draft.self, from: Data(payload.utf8))
+
+        #expect(draft.slots.count == 2)
+        #expect(draft.slots["outfit"]?.materialID == nil)
+        #expect(draft.filledSlots == ["character": "app/model.png"])
+    }
+
     @Test func draftPatchEncodesThreeSeedStates() throws {
-        // `APIClient` builds this exact encoder for every write call, so what this
-        // asserts is the wire format the server receives.
+        // `APIClient` uses the same key-encoding strategy on every write call; `.sortedKeys` is
+        // added here only to make the expected bytes deterministic.
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
         encoder.outputFormatting = .sortedKeys

@@ -71,6 +71,18 @@ exists". Read-only: no behaviour changes. One unit test in `scripts/tests/` cove
 drain, Phase A, pod lease and migration. The app decodes the field as optional, so it works against
 the server before and after the deploy.
 
+**Known collision this does not fix.** `drafts.py` raises `DraftError("not_found", …)` for two
+different causes — `no such material: {id}` from `_resolve`, and `no such try-on library entry: {id}`
+from `patch` — so both reach the app as `404 not_found` with no way to discriminate. The app treats a
+404 during a slot-carrying `PATCH /v1/draft` as "a material went stale, reload materials"
+(`DraftStore.needsMaterialsRefresh`), and every cross build sends `tryon_seed` *together with*
+`slots.outfit`, so a seed whose library entry was deleted since surfaces as a spurious
+materials-refresh nudge. Nothing is corrupted: the server writes nothing before raising, the
+authoritative draft is re-fetched, and the correct server message still reaches `store.message`. The
+real fix is a distinct server code (`seed_not_found`), deliberately not taken here — this branch is
+allowed exactly one `scripts/**` change and it had to be the seed reporting above. Recorded so
+`DraftStore.apply`'s comment reads as a known limit, not an oversight.
+
 ## 4. New batch (cross build)
 
 **UI.** The `+` tab gains a segmented control **Single | Batch** at the top; Single is today's

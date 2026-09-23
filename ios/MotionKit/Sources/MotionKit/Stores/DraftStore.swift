@@ -97,7 +97,11 @@ public final class DraftStore {
     }
 
     /// Slots and the try-on seed in one PATCH (Phase 6: cross build, "Use in job").
-    /// Slow timeout: slot assignment probes the material on the server.
+    /// The 95 s timeout is unconditional, so a seed-only patch that probes nothing pays it too.
+    /// A 404 here also trips `needsMaterialsRefresh` when the *seed* is what went missing: the
+    /// server answers one `not_found` code for both "no such material" and "no such try-on library
+    /// entry", so the client cannot tell them apart. Read that flag as "something this patch named
+    /// is gone", never as proof a material went stale — `message` still says which one.
     @discardableResult
     public func apply(_ patch: DraftPatch) async -> Bool {
         await mutate(materialAssignment: !patch.slots.isEmpty) {
