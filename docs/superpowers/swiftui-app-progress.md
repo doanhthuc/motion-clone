@@ -96,9 +96,11 @@ what actually shipped, what was verified, and the next safe boundary.
   `matches(slots:)` is exact equality over every non-driver role.
 - The edited job's seed shows a badge in Single mode, with a "The saved try-on no longer exists"
   variant when its library entry was deleted; a basket entry shows a "Saved try-on" tag.
-- Drop after Phase A (`RunFlow`): a batch of ≥ 2 jobs offers "Drop from batch" (`tryon.drop.<index>`)
-  per preview card, which re-validates the draft and re-reads the previews and rent panel; `canConfirm`
-  is guarded by `!isDropping`. Run detail shows a per-job batch progress list. The server's draft view
+- Drop after Phase A (`RunFlow`): a basket of ≥ 2 entries offers "Drop from batch"
+  (`tryon.drop.<index>`) per preview card — gated by `canDropFromBatch` (`RunFlowStore.swift:228-230`:
+  `draft.batch.count >= 2`, not `draft.jobs`, plus Phase A not running and the previews/rent-panel
+  phase) — which re-validates the draft and re-reads the previews and rent panel; `canConfirm` is
+  guarded by `!isDropping`. Run detail shows a per-job batch progress list. The server's draft view
   reports a read-only `tryon_seed` on the edited job and each basket entry.
 
 ## Current file map
@@ -152,7 +154,14 @@ Pending the controller run, **not** passed here:
   guaranteed to be `.button`. If XCUITest does not surface a toolbar `Menu`'s accessibility label, that
   single assertion false-alarms while the toolbar still works — widen the query, do not delete the
   assertion (it is the only check that Task 7's `MaterialTabView` wrapper did not break toolbar
-  propagation). Every other asserted string is precedent-backed by a shipped screen.
+  propagation). Every other asserted string is precedent-backed by a shipped screen. Material
+  preconditions: the ≥2-image outfit count is guarded and skips, but the smoke also needs ≥1 compatible
+  image (Character) and ≥1 compatible **video** (Driver — `role_kind` maps `driver` to `video`,
+  `scripts/control/drafts.py:159`); a missing Character or Driver material hard-fails inside
+  `Phase4Draft.chooseMaterial` ("A compatible material must exist for Driver",
+  `Phase4SmokeTests.swift:84`) rather than skipping. That is an environment gap (restore test material),
+  not a code regression — Phase 3/4 pass live against the same three roles, so the library normally has
+  them.
 
 No real batch has run. A 2-outfit batch with one seeded job — proving Phase A calls the provider once
 for the unseeded outfit and reuses the saved image for the seeded one — is the proposed spend test; it
@@ -239,8 +248,12 @@ tapping the UI on a phone.
   (the 14th route) and `make ios-ui-test` (`Phase6SmokeTests`) — are pending the controller run; they
   contact the VPS and boot a simulator, so they did not run here. No real batch has run: a 2-outfit
   batch with one seeded job is the proposed spend test and needs its own approval and quoted price.
-- A one-job draft has no drop affordance by design — "Drop from batch" needs ≥ 2 jobs (Phase 6 spec
-  §5). **Clear**, on the New Job tab in Single mode, is the only way to remove the last job.
+- A draft whose basket has fewer than 2 entries has no drop affordance by design — `canDropFromBatch`
+  needs `draft.batch.count >= 2` (basket entries, not `draft.jobs`), Phase A not running
+  (`tryon?.phaseARunning != true`) and the previews/rent-panel phase (`RunFlowStore.swift:228-230`). So
+  a run of 2 jobs built from 1 basket entry plus a complete edited job (`draft.jobs == 2`,
+  `batch.count == 1`) shows no Drop at all. **Clear**, on the New Job tab in Single mode, is the only
+  way to remove the last basket entry.
 - Batch mode renders no `Clear` button and no readiness line: Task 8's plan put `editorActions(draft)`
   (the only `Clear`, `NewJobView.swift:231`) and `readiness(draft)` (`:208`) in the Single arm of
   `NewJobView.editor` alone, so clearing the draft from Batch mode means switching to Single first.
@@ -249,12 +262,16 @@ tapping the UI on a phone.
   switch `newjob.mode` → Single before every `clear(in:)`, which is the evidence it is not theoretical.
 - Follow-up (cannot be fixed on this branch): `ios/MotionKit/Tests/MotionKitTests/Fixtures.pipelines`
   names `tryon-motion-enhance`'s optional role `mask`, while the live catalog says `background`;
-  `mask` occurs nowhere in `scripts/**` as a role. `Fixtures.swift` cannot be edited here because two
-  suites do exact `.replacingOccurrences` surgery on `Fixtures.draft`'s text, so a change can silently
-  break another suite's assertions.
-- Follow-up (needs its own VPS deploy gate): the server's invalid-validation message reaches the phone
-  verbatim as `make batch-validate failed: …` — developer-facing copy on a consumer screen. Fixing it
-  is a `scripts/**` change.
+  `mask` occurs nowhere in `scripts/**` as a role. `Fixtures.swift` cannot be edited here because three
+  suites do exact `.replacingOccurrences` surgery on `Fixtures.draft`'s text (`ModelsTests.swift:230`,
+  `TryonLibraryStoreTests.swift:27`, `DraftStoreTests.swift:399`), so a change can silently break
+  another suite's assertions.
+- Follow-up (needs its own VPS deploy gate): a failed validation reaches the phone as the server's
+  `DraftError("invalid", …)` message verbatim — `APIError.userMessage`'s `default` branch returns it
+  unchanged (`APIError.swift:35`). That message is usually the validator's raw stdout+stderr
+  (path-stripped and truncated, `scripts/control/drafts.py:535,544-548`); only when that output is empty
+  does it fall back to the literal `make batch-validate failed` (`drafts.py:566`, no colon). Either way
+  it is developer-facing copy on a consumer screen. Fixing it is a `scripts/**` change.
 - Open question (money safety, deliberately not fixed on this branch): `isDropping` gates only Confirm.
   `RunFlow.spend(_:label:)` guards on `inFlightLabel == nil` (`RunFlowStore.swift:484-485`), and a drop
   is a free draft mutation that never sets `inFlightLabel`, so `canSpend` (`:69`, which has no

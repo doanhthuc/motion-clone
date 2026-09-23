@@ -171,11 +171,15 @@ Design: `docs/superpowers/specs/2026-09-23-swiftui-app-phase-6-design.md`.
   on by default when the library has a match for the shared slots plus that outfit; a seeded job's
   Phase A skips the provider and reuses the saved image. The edited job's own seed shows a badge in
   Single mode, with a "The saved try-on no longer exists" variant when its library entry was deleted.
-- **Drop after Phase A.** In the run flow, a batch of ≥ 2 jobs shows "Drop from batch"
-  (`tryon.drop.<index>`) on each preview card. Dropping re-validates the draft and re-reads the
-  previews and rent panel, so confirm rents only what is left; `canConfirm` is guarded by
-  `!isDropping`. The last remaining job has no drop affordance by design — **Clear** (Single mode on
-  the New Job tab) is the only way to remove it. Run detail shows a per-job batch progress list.
+- **Drop after Phase A.** In the run flow, "Drop from batch" (`tryon.drop.<index>`) shows on each
+  preview card when `canDropFromBatch` holds (`RunFlowStore.swift:228-230`): the **basket has ≥ 2
+  entries** (`draft.batch.count`, not `draft.jobs`), Phase A is not running
+  (`tryon?.phaseARunning != true`), the flow is in the previews or rent-panel phase, no spend is
+  unanswered (`canSpend`) and no drop is already in flight (`!isDropping`). Dropping re-validates the
+  draft and re-reads the previews and rent panel, so confirm rents only what is left; `canConfirm` is
+  guarded by `!isDropping`. The last remaining basket entry has no drop affordance by design —
+  **Clear** (Single mode on the New Job tab) is the only way to remove it. Run detail shows a per-job
+  batch progress list.
 - **Saved try-ons.** The library grid (`GET /v1/tryon-library`, images cached by id) shows each
   entry's provider, saved date and resolved character/outfit names ("(deleted)" when a material is
   gone). **Use in job** (`saved.use.<id>`) fills the draft through `DraftStore.apply` and switches to
