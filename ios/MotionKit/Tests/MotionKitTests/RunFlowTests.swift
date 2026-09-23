@@ -478,6 +478,36 @@ extension URLProtocolTests {
         #expect(flow.phase == .phaseARunning)
     }
 
+    @Test func aPendingMigrateIsLeftToMigrateFlow() async {
+        let entry = SpendLedgerEntry(key: "K1", intent: .migrate(toDc: "EU-CZ-1", confirmToken: "t"),
+                                     label: "Migrate volume to EU-CZ-1", createdAt: .now)
+        let gate = FakeSpendGate(pending: entry, replay: .accepted(runID: nil, outcome: "started"))
+        let flow = make(Routes(), gate: gate)
+        await flow.replayPendingOnce()
+        #expect(await gate.replays == 0)
+        #expect(flow.pendingNotice == nil)
+        #expect(flow.phase == .loading)
+    }
+
+    @Test func gpuChangeClearsTheQuoteAndRereadsThePanel() async {
+        let routes = Routes()
+        routes.setPanels([Fixtures.rentPanel, Fixtures.rentPanelFresh])
+        let gate = FakeSpendGate([.accepted(runID: "tg-1000", outcome: "started")])
+        let flow = make(routes, gate: gate)
+        await flow.start(.newJob)
+        await flow.continueToRent()
+        #expect(flow.panel?.panelToken == "1790000000123.4.9")
+        await flow.reloadPanelAfterGpuChange()
+        #expect(flow.panel?.panelToken == "1790000000999.1.10")
+        #expect(await gate.intents.isEmpty)          // a GPU change never confirms by itself
+        await flow.confirm()
+        guard case let .confirm(_, _, token, _, _)? = await gate.intents.first else {
+            Issue.record("no confirm was sent")
+            return
+        }
+        #expect(token == "1790000000999.1.10")
+    }
+
     @Test func chooserRefusesWithoutAPrice() async {
         let routes = Routes()
         routes.setPanels([Fixtures.rentPanelSoldOut])

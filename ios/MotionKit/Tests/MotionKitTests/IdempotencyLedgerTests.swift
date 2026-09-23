@@ -40,6 +40,15 @@ import Testing
         try l.clear()   // idempotent
     }
 
+    @Test func migrateEntryRoundTrips() throws {
+        let l = ledger()
+        let migrate = SpendLedgerEntry(key: "K9", intent: .migrate(toDc: "EU-CZ-1", confirmToken: "tok-abc"),
+                                       label: "Migrate volume to EU-CZ-1",
+                                       createdAt: Date(timeIntervalSince1970: 1_790_000_000))
+        try l.save(migrate)
+        #expect(try l.load() == migrate)
+    }
+
     @Test func corruptJournalThrows() throws {
         let l = ledger()
         try FileManager.default.createDirectory(at: l.root, withIntermediateDirectories: true)

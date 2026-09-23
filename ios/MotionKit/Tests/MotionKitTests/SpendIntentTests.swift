@@ -49,6 +49,17 @@ import Testing
         #expect(body["provider"] as? String == "runpod")
     }
 
+    @Test func migrateCarriesDestinationAndTokenAndNoRun() throws {
+        let intent = SpendIntent.migrate(toDc: "EU-CZ-1", confirmToken: "tok-abc")
+        #expect(intent.path == ["v1", "pod", "migrate"])
+        #expect(intent.kind == .migrate)
+        #expect(intent.runID == nil)
+        let body = try object(intent)
+        #expect(body["to_dc"] as? String == "EU-CZ-1")
+        #expect(body["confirm_token"] as? String == "tok-abc")
+        #expect(body.keys.count == 2)
+    }
+
     @Test func intentRoundTripsThroughCodable() throws {
         let intent = SpendIntent.confirm(runID: "tg-1000", provider: .runpod, panelToken: "t",
                                          gpu: "g", tryon: .rerun)

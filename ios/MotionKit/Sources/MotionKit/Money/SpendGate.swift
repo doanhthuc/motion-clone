@@ -1,6 +1,6 @@
 import Foundation
 
-/// The only sender of `phase-a`, `regen`, `confirm` and `resume`.
+/// The only sender of `phase-a`, `regen`, `confirm`, `resume` and `migrate`.
 ///
 /// Every rule that keeps one tap from becoming two spends lives here
 /// (parent design §4, API spec §5.5/§5.8):
