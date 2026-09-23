@@ -39,6 +39,8 @@ public final class RunFlow {
     public var selectedProvider: SpendProvider = .runpod
     /// RootView switches to the Runs tab (pod strip) and clears it.
     public private(set) var podRequested = false
+    /// "Checking the earlier Confirm…" while the launch replay is outstanding.
+    public private(set) var pendingNotice: String?
 
     private let client: APIClient
     private let gate: any SpendSending
@@ -202,6 +204,112 @@ public final class RunFlow {
         }
     }
 
+    // MARK: rent panel
+
+    public func continueToRent() async {
+        phase = .rentPanel
+        await loadPanel(force: false)
+    }
+
+    /// `force` = pull-to-refresh: fresh stock instead of the bot's cache.
+    public func loadPanel(force: Bool) async {
+        guard let runID else { return }
+        isLoadingPanel = true
+        defer { isLoadingPanel = false }
+        do {
+            let fresh = force
+                ? try await client.get(RentPanel.self, query: [URLQueryItem(name: "force", value: "1")],
+                                       "v1", "runs", runID, "rent-panel")
+                : try await client.get(RentPanel.self, "v1", "runs", runID, "rent-panel")
+            panel = fresh
+            error = nil
+            if quote(for: selectedProvider) == nil {
+                selectedProvider = quote(for: .runpod) != nil ? .runpod
+                    : quote(for: .vast) != nil ? .vast : .runpod
+            }
+        } catch {
+            self.error = error
+        }
+    }
+
+    /// No quote → no spend button for that row.
+    public func quote(for provider: SpendProvider) -> Double? {
+        guard let panel else { return nil }
+        switch provider {
+        case .runpod:
+            guard !panel.runpod.soldOut else { return nil }
+            return CostEstimate.quote(estimateMin: panel.estimateMin, usdPerHr: panel.runpod.usdPerHr)
+        case .vast:
+            guard panel.vast.canSpend else { return nil }
+            return panel.vast.sessionUsd
+                ?? CostEstimate.quote(estimateMin: panel.estimateMin, usdPerHr: panel.vast.usdPerHr)
+        }
+    }
+
+    public func canConfirm(_ provider: SpendProvider) -> Bool {
+        panel != nil && quote(for: provider) != nil && !isSpending && !isLoadingPanel
+    }
+
+    private func confirmLabel(_ provider: SpendProvider, suffix: String = "") -> String {
+        let where_ = provider == .runpod ? (panel?.runpod.gpu ?? "RunPod") : "Vast"
+        let price = quote(for: provider).map { " · ~\(Format.usd($0)) quote" } ?? ""
+        return "Confirm\(suffix) · \(where_)\(price)"
+    }
+
+    public func confirm() async {
+        guard let runID, let panel, canConfirm(selectedProvider) else { return }
+        let provider = selectedProvider
+        await spend(.confirm(runID: runID, provider: provider, panelToken: panel.panelToken,
+                             gpu: provider == .runpod ? panel.runpod.gpu : nil, tryon: nil),
+                    label: confirmLabel(provider))
+    }
+
+    /// The reuse/rerun answer to `choice_required` — its own tap, its own key.
+    public func choose(_ choice: TryonChoice) async {
+        guard let runID, case let .choiceRequired(token, provider) = phase else { return }
+        await spend(.confirm(runID: runID, provider: provider, panelToken: token,
+                             gpu: provider == .runpod ? panel?.runpod.gpu : nil, tryon: choice),
+                    label: confirmLabel(provider, suffix: choice == .reuse ? " (reuse try-on)" : " (re-run try-on)"))
+    }
+
+    // MARK: resume
+
+    public func retryRental() async {
+        guard canRetryRental, let runID, let gpu = pod?.gpu else { return }
+        await refreshTryon()      // resume needs the CURRENT run_token
+        guard let token = tryon?.runToken else { return }
+        await spend(.resume(runID: runID, provider: .runpod, runToken: token, gpu: gpu),
+                    label: "Retry rental · \(gpu)")
+    }
+
+    // MARK: recheck and replay
+
+    /// Resends the saved request with its saved key. Never mints a new one.
+    public func recheck() async {
+        guard needsRecheck, inFlightLabel == nil else { return }
+        let kind = pendingKind ?? .confirm
+        inFlightLabel = "Checking the earlier request…"
+        message = nil
+        let result = await gate.recheck { [weak self] attempt, reason in
+            Task { @MainActor in self?.noteRetry(attempt, reason) }
+        }
+        inFlightLabel = nil
+        retryNote = nil
+        await apply(result, kind: kind)
+    }
+
+    public func replayPendingOnce() async {
+        guard !didReplay else { return }
+        didReplay = true
+        guard let entry = await gate.pending() else { return }
+        pendingNotice = "Checking the earlier \(entry.label)…"
+        let result = await gate.replayPending()
+        pendingNotice = nil
+        guard let result else { return }
+        if pod == nil { pod = try? await client.get(PodStatus.self, "v1", "pod") }
+        await apply(result, kind: entry.intent.kind)
+    }
+
     // MARK: spends (Task 6)
 
     public func startPhaseA() async {
@@ -281,12 +389,21 @@ public final class RunFlow {
         }
     }
 
-    /// Filled in by Task 7 (stale panel, choice_required, stale_run). For
-    /// now: the server's text verbatim for 409/422, the mapped text otherwise.
     func applyRefusal(status: Int, code: String, text: String, panelToken: String?,
                       kind: SpendKind) async {
         message = APIError.server(status: status, code: code, message: text).userMessage
-        if code == "stale_panel", kind == .regen { await refreshTryon() }
+        switch (code, kind) {
+        case ("choice_required", .confirm):
+            if let panelToken { phase = .choiceRequired(panelToken: panelToken, provider: selectedProvider) }
+        case ("stale_panel", .confirm):
+            // Never an automatic re-confirm: re-read, show the new price, wait.
+            phase = .rentPanel
+            await loadPanel(force: false)
+        case ("stale_panel", .regen), ("stale_run", .resume):
+            await refreshTryon()
+        default:
+            break
+        }
     }
 
     private func apiError(_ error: any Error) -> APIError {

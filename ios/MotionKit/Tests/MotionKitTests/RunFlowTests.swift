@@ -184,5 +184,141 @@ extension URLProtocolTests {
         #expect(!flow.isSpending)
         #expect(flow.message?.contains("busy") == true)
     }
+
+    @Test func rentPanelSelectsRunpodAndQuotes() async {
+        let flow = make(Routes())
+        await flow.start(.newJob)
+        await flow.continueToRent()
+        #expect(flow.phase == .rentPanel)
+        #expect(flow.selectedProvider == .runpod)
+        #expect(flow.quote(for: .runpod) == 84.0 / 60 * 0.99)
+        #expect(flow.quote(for: .vast) == 1.05)       // Vast: its own session estimate
+        #expect(flow.canConfirm(.runpod))
+    }
+
+    @Test func soldOutAndBlockedVastOfferNoSpendButton() async {
+        let routes = Routes()
+        routes.setPanels([Fixtures.rentPanelSoldOut])
+        let flow = make(routes)
+        await flow.start(.newJob)
+        await flow.continueToRent()
+        #expect(flow.quote(for: .runpod) == nil)
+        #expect(flow.quote(for: .vast) == nil)
+        #expect(!flow.canConfirm(.runpod) && !flow.canConfirm(.vast))
+    }
+
+    @Test func confirmSendsPanelTokenAndGpu() async {
+        let gate = FakeSpendGate([.accepted(runID: "tg-1000", outcome: "started")])
+        let flow = make(Routes(), gate: gate)
+        await flow.start(.newJob)
+        await flow.continueToRent()
+        await flow.confirm()
+        #expect(await gate.intents == [.confirm(runID: "tg-1000", provider: .runpod,
+                                                panelToken: "1790000000123.4.9",
+                                                gpu: "NVIDIA GeForce RTX 5090", tryon: nil)])
+        #expect(await gate.labels.first?.contains("$1.39") == true)
+        #expect(flow.phase == .started(runID: "tg-1000"))
+    }
+
+    @Test func stalePanelRereadsAndNeverConfirmsAgain() async {
+        let routes = Routes()
+        routes.setPanels([Fixtures.rentPanel, Fixtures.rentPanelFresh])
+        let gate = FakeSpendGate([.refused(status: 409, code: "stale_panel",
+                                           message: "the job changed since the panel was read — read it again",
+                                           panelToken: nil)])
+        let flow = make(routes, gate: gate)
+        await flow.start(.newJob)
+        await flow.continueToRent()
+        await flow.confirm()
+        #expect(await gate.intents.count == 1)
+        #expect(flow.phase == .rentPanel)
+        #expect(flow.panel?.panelToken == "1790000000999.1.10")
+        #expect(StubURLProtocol.requests.filter { $0.url?.path.hasSuffix("/rent-panel") == true }.count == 2)
+        #expect(flow.message == "the job changed since the panel was read — read it again")
+    }
+
+    @Test func choiceRequiredOffersTwoFreshTaps() async {
+        let gate = FakeSpendGate([
+            .refused(status: 409, code: "choice_required", message: "try-on already ran", panelToken: "55.6"),
+            .accepted(runID: "tg-1000", outcome: "started"),
+        ])
+        let flow = make(Routes(), gate: gate)
+        await flow.start(.newJob)
+        await flow.continueToRent()
+        await flow.confirm()
+        #expect(flow.phase == .choiceRequired(panelToken: "55.6", provider: .runpod))
+        await flow.choose(.reuse)
+        let intents = await gate.intents
+        #expect(intents.count == 2)
+        #expect(intents[1] == .confirm(runID: "tg-1000", provider: .runpod, panelToken: "55.6",
+                                       gpu: "NVIDIA GeForce RTX 5090", tryon: .reuse))
+        #expect(flow.phase == .started(runID: "tg-1000"))
+    }
+
+    @Test func outcomeUnknownRequestsThePod() async {
+        let gate = FakeSpendGate([.outcomeUnknown])
+        let flow = make(Routes(), gate: gate)
+        await flow.start(.newJob)
+        await flow.continueToRent()
+        await flow.confirm()
+        #expect(flow.phase == .outcomeUnknown)
+        #expect(flow.podRequested)
+        flow.acknowledgePodRequest()
+        #expect(!flow.podRequested)
+    }
+
+    @Test func retryRentalOnlyWithAFailedRentalAndUsesRunToken() async {
+        let live = Routes()
+        live.pod = Fixtures.podLive
+        let liveFlow = make(live)
+        await liveFlow.start(.existing)
+        #expect(!liveFlow.canRetryRental)
+
+        let gate = FakeSpendGate([.accepted(runID: "tg-1000", outcome: "started")])
+        let flow = make(Routes(), gate: gate)       // podIdle carries failed_rental
+        await flow.start(.existing)
+        #expect(flow.canRetryRental)
+        await flow.retryRental()
+        #expect(await gate.intents == [.resume(runID: "tg-1000", provider: .runpod,
+                                               runToken: "1790000000123.4",
+                                               gpu: "NVIDIA GeForce RTX 5090")])
+    }
+
+    @Test func noFailureRefusalIsShownVerbatim() async {
+        let gate = FakeSpendGate([.refused(status: 409, code: "no_failure",
+                                           message: "no failed rental to retry for this run", panelToken: nil)])
+        let flow = make(Routes(), gate: gate)
+        await flow.start(.existing)
+        await flow.retryRental()
+        #expect(flow.message == "no failed rental to retry for this run")
+    }
+
+    @Test func unreachableOffersRecheckWhichNeverPerforms() async {
+        let gate = FakeSpendGate([.unreachable(detail: "timed out"),
+                                  .accepted(runID: "tg-1000", outcome: "started")])
+        let flow = make(Routes(), gate: gate)
+        await flow.start(.newJob)
+        await flow.continueToRent()
+        await flow.confirm()
+        #expect(flow.needsRecheck)
+        await flow.recheck()
+        #expect(await gate.intents.count == 1)
+        #expect(await gate.rechecks == 1)
+        #expect(!flow.needsRecheck)
+        #expect(flow.phase == .started(runID: "tg-1000"))
+    }
+
+    @Test func replayRunsOncePerLaunch() async {
+        let entry = SpendLedgerEntry(key: "OLD", intent: .confirm(runID: "tg-1000", provider: .runpod,
+                                                                  panelToken: "t", gpu: nil, tryon: nil),
+                                     label: "Confirm · RTX 5090 · ~$1.39", createdAt: .now)
+        let gate = FakeSpendGate(pending: entry, replay: .accepted(runID: "tg-1000", outcome: "started"))
+        let flow = make(Routes(), gate: gate)
+        await flow.replayPendingOnce()
+        await flow.replayPendingOnce()
+        #expect(await gate.replays == 1)
+        #expect(flow.phase == .started(runID: "tg-1000"))
+        #expect(flow.pendingNotice == nil)
+    }
 }
 }
