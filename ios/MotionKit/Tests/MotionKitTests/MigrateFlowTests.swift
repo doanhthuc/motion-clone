@@ -133,6 +133,17 @@ extension URLProtocolTests {
         #expect(!flow.needsRecheck)
     }
 
+    @Test func askIsRefusedWhileAMigrateIsUnanswered() async {
+        let gate = FakeSpendGate([.unreachable(detail: "timed out")])
+        let flow = await askedAndTyped(gate)
+        await flow.migrate()
+        #expect(flow.needsRecheck)
+        await flow.ask(toDc: "US-TX-3")
+        let asks = StubURLProtocol.requests.filter { $0.url?.path == "/v1/pod/migrate/ask" }
+        #expect(asks.count == 1)
+        #expect(flow.needsRecheck)
+    }
+
     @Test func recheckRefusesAPendingNonMigrate() async {
         let gate = FakeSpendGate([.unreachable(detail: "x")],
                                  pending: SpendLedgerEntry(key: "K", intent: .phaseA,

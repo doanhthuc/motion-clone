@@ -85,8 +85,10 @@ public final class MigrateFlow {
         deadline = nil
     }
 
+    /// Refused like `begin` while a migrate is unanswered: a fresh token
+    /// would replace the confirm step that Check again belongs to.
     public func ask(toDc: String) async {
-        guard !isSending else { return }
+        guard !isSending, !needsRecheck, pendingNotice == nil else { return }
         if case .asking = step { return }
         destination = toDc
         step = .asking(toDc: toDc)
