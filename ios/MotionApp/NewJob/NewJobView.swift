@@ -5,6 +5,7 @@ import SwiftUI
 struct NewJobView: View {
     let store: DraftStore
     let materials: MaterialsStore
+    let flow: RunFlow
     @State private var selectedRole: String?
     @State private var dropCandidate: DraftBatchEntry?
 
@@ -282,6 +283,19 @@ struct NewJobView: View {
                     .background(Theme.lime, in: .rect(cornerRadius: 12))
             }
             .disabled(draft.jobs == 0 || store.isBusy)
+
+            if store.isReady {
+                NavigationLink {
+                    RunFlowView(flow: flow, entry: .newJob)
+                } label: {
+                    Text("Continue to run →")
+                        .font(Theme.sans(14, .semibold)).foregroundStyle(Theme.ink1)
+                        .frame(maxWidth: .infinity).padding(.vertical, 13)
+                        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Theme.limeLine))
+                }
+                .accessibilityIdentifier("newjob.continueToRun")
+                .disabled(store.isBusy)
+            }
         }
     }
 

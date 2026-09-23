@@ -4,6 +4,7 @@ import MotionKit
 struct RunsView: View {
     let runs: RunsStore
     let pod: PodStore
+    let flow: RunFlow
 
     var body: some View {
         ScrollView {
@@ -15,7 +16,12 @@ struct RunsView: View {
                 if let p = pod.pod, let lease = p.lease { PodStrip(gpu: p.gpu, lease: lease) }
                 if runs.loaded && runs.runs.isEmpty { EmptyRuns() }
                 if let live = runs.live {
-                    NavigationLink(value: live.id) { LiveRunCard(run: live) }.buttonStyle(.plain)
+                    if live.status == .phaseA {
+                        NavigationLink { RunFlowView(flow: flow, entry: .existing) } label: { LiveRunCard(run: live) }
+                            .buttonStyle(.plain)
+                    } else {
+                        NavigationLink(value: live.id) { LiveRunCard(run: live) }.buttonStyle(.plain)
+                    }
                 }
                 if !runs.recent.isEmpty {
                     SectionLabel(text: "Recent").padding(.top, 2)
@@ -28,7 +34,7 @@ struct RunsView: View {
         }
         .background(Theme.bg)
         .navigationDestination(for: String.self) { id in
-            if let client = runsClient { RunDetailView(store: RunDetailStore(client: client, runID: id)) }
+            if let client = runsClient { RunDetailView(store: RunDetailStore(client: client, runID: id), flow: flow) }
         }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {

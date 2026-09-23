@@ -127,3 +127,36 @@ import Testing
         #expect(result.draft.estimateMin == 48)
     }
 }
+
+@Suite struct RunFlowModelTests {
+    @Test func tryonPreviewsDecode() throws {
+        let t = try MotionJSON.decoder.decode(TryonPreviews.self, from: Fixtures.data(Fixtures.tryonRunning))
+        #expect(t.runId == "tg-1000" && t.runToken == "1790000000123.4" && t.phaseARunning)
+        #expect(t.previews.map(\.id) == ["0", "1"])
+        #expect(t.previews[0].status == .running && !t.previews[0].hasImage)
+    }
+
+    @Test func rentPanelDecodes() throws {
+        let p = try MotionJSON.decoder.decode(RentPanel.self, from: Fixtures.data(Fixtures.rentPanel))
+        #expect(p.panelToken == "1790000000123.4.9" && p.afterPhaseA && p.jobs == 2 && p.estimateMin == 84)
+        #expect(p.runpod.usdPerHr == 0.99 && !p.runpod.soldOut && p.runpod.datacenter == "EU-RO-1")
+        #expect(p.vast.canSpend && p.vast.sessionUsd == 1.05)
+    }
+
+    @Test func soldOutPanelDecodesNulls() throws {
+        let p = try MotionJSON.decoder.decode(RentPanel.self, from: Fixtures.data(Fixtures.rentPanelSoldOut))
+        #expect(p.runpod.soldOut && p.runpod.usdPerHr == nil && p.runpod.stock == nil)
+        #expect(!p.vast.canSpend && p.vast.blockers.count == 1)
+    }
+
+    @Test func keepRecordDecodes() throws {
+        let r = try MotionJSON.decoder.decode(TryonLibraryRecord.self, from: Fixtures.data(Fixtures.keepRecord))
+        #expect(r.id == "a1b2c3" && r.provider == "gemini")
+    }
+
+    @Test func quoteIsMinutesTimesRate() {
+        #expect(CostEstimate.quote(estimateMin: 84, usdPerHr: 0.99) == 84.0 / 60 * 0.99)
+        #expect(CostEstimate.quote(estimateMin: 84, usdPerHr: nil) == nil)
+        #expect(CostEstimate.quote(estimateMin: 0, usdPerHr: 0.99) == 0)
+    }
+}

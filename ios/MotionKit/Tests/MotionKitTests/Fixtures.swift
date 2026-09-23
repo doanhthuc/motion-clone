@@ -52,6 +52,15 @@ enum Fixtures {
                        "stock_out": true, "detail": "no stock"}}
     """#
 
+    /// The rental failed on the 5090, then the .env card moved to another GPU:
+    /// Retry rental rents `gpu`, not `failed_rental.gpu`.
+    static let podFailedOtherGpu = #"""
+    {"run_id": "tg-1000", "gpu": "NVIDIA RTX PRO 4500 Blackwell", "lease": null,
+     "migration": null, "kill_running": false, "last_kill": null,
+     "failed_rental": {"gpu": "NVIDIA GeForce RTX 5090", "datacenter": "EU-RO-1",
+                       "stock_out": true, "detail": "no stock"}}
+    """#
+
     static let outputs = #"""
     {"outputs": [
       {"batch": "2026-09-21-0900", "updated_at": 1790000000,
@@ -122,6 +131,50 @@ enum Fixtures {
     static let errorConflict = #"{"error": {"code": "stale_panel", "message": "the panel changed"}}"#
 
     static let cloudflareHTML = "<!DOCTYPE html><html><head><title>Access denied | Error 1010</title></head></html>"
+
+    static let tryonIdle = #"{"run_id":"tg-1000","run_token":"1790000000123.4","phase_a_running":false,"previews":[]}"#
+
+    static let tryonRunning = #"""
+    {"run_id":"tg-1000","run_token":"1790000000123.4","phase_a_running":true,
+     "previews":[{"index":"0","run":"model__dress","status":"running","has_image":false},
+                 {"index":"1","run":"model__blazer","status":"pending","has_image":false}]}
+    """#
+
+    static let tryonDone = #"""
+    {"run_id":"tg-1000","run_token":"1790000000123.4","phase_a_running":false,
+     "previews":[{"index":"0","run":"model__dress","status":"done","has_image":true},
+                 {"index":"1","run":"model__blazer","status":"error","has_image":false}]}
+    """#
+
+    static let rentPanel = #"""
+    {"runpod":{"gpu":"NVIDIA GeForce RTX 5090","datacenter":"EU-RO-1","stock":"High",
+               "usd_per_hr":0.99,"sold_out":false},
+     "vast":{"enabled":true,"usd_per_hr":0.62,"session_usd":1.05,"blockers":[],"can_spend":true},
+     "run_id":"tg-1000","panel_token":"1790000000123.4.9","after_phase_a":true,
+     "jobs":2,"estimate_min":84}
+    """#
+
+    static let rentPanelFresh = #"""
+    {"runpod":{"gpu":"NVIDIA GeForce RTX 5090","datacenter":"EU-RO-1","stock":"Medium",
+               "usd_per_hr":0.99,"sold_out":false},
+     "vast":{"enabled":true,"usd_per_hr":0.62,"session_usd":1.05,"blockers":[],"can_spend":true},
+     "run_id":"tg-1000","panel_token":"1790000000999.1.10","after_phase_a":false,
+     "jobs":2,"estimate_min":84}
+    """#
+
+    static let rentPanelSoldOut = #"""
+    {"runpod":{"gpu":"NVIDIA GeForce RTX 5090","datacenter":"EU-RO-1","stock":null,
+               "usd_per_hr":null,"sold_out":true},
+     "vast":{"enabled":false,"usd_per_hr":null,"session_usd":null,
+             "blockers":["Vast is disabled — set VAST_ENABLED=1"],"can_spend":false},
+     "run_id":"tg-1000","panel_token":"1790000000123.4.9","after_phase_a":false,
+     "jobs":1,"estimate_min":42}
+    """#
+
+    static let keepRecord = #"""
+    {"id":"a1b2c3","owner":"app","material_ids":{"character":"app/model.png","outfit":"app/dress.png"},
+     "provider":"gemini","saved_at":1790000300.5}
+    """#
 
     static func data(_ s: String) -> Data { Data(s.utf8) }
 }
