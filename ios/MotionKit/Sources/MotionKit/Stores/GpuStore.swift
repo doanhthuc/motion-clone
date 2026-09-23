@@ -14,6 +14,11 @@ public final class GpuStore {
 
     private let client: APIClient
     private let pod: PodStore
+    /// Successful selects so far, and the latest one's answer. A load that
+    /// was already in flight when a select landed carries the server's older
+    /// choice; it must not put the old checkmark back.
+    private var selections = 0
+    private var lastSelected: String?
 
     public init(client: APIClient, pod: PodStore) {
         self.client = client
@@ -27,11 +32,13 @@ public final class GpuStore {
     public func load(force: Bool = false) async {
         isLoading = true
         defer { isLoading = false }
+        let selectionsBefore = selections
         do {
-            let fresh = force
+            var fresh = force
                 ? try await client.get(GpuStock.self, query: [URLQueryItem(name: "force", value: "1")],
                                        timeout: 60, "v1", "gpu", "stock")
                 : try await client.get(GpuStock.self, timeout: 60, "v1", "gpu", "stock")
+            if selections != selectionsBefore, let lastSelected { fresh.selected = lastSelected }
             stock = fresh
             error = nil
         } catch {
@@ -56,6 +63,8 @@ public final class GpuStore {
             let chosen = try await client.put(GpuSelection.self, body: GpuSelectionRequest(gpu: gpu),
                                               "v1", "pod", "gpu")
             stock?.selected = chosen.gpu
+            selections += 1
+            lastSelected = chosen.gpu
             await pod.refresh()
             return true
         } catch {
