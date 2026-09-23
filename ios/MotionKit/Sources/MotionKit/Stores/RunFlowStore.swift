@@ -248,6 +248,10 @@ public final class RunFlow {
                 // written, so the previews are exactly as current as they were
                 // before the tap, and the fresh draft installed above is what
                 // makes the card lose its basket entry and offer "reload".
+                // The panel still goes, by the one rule stated at the end of
+                // this function: that fresh draft just proved the basket the
+                // quote on screen priced no longer exists.
+                if phase == .rentPanel { panel = nil }
                 return
             }
             // add-to-batch leaves the edited job a copy of the last entry, and
@@ -268,19 +272,26 @@ public final class RunFlow {
             if validation.stale {
                 message = "The draft changed during validation. Validate it again from New Job."
             } else if !validation.valid {
+                // Defence, not a live path: today's server never answers this
+                // route 200 with `valid: false`. An invalid non-stale
+                // validation raises `DraftError("invalid")` (drafts.py:566),
+                // which server.py:47 maps to 422, so it lands in the `catch`
+                // below instead. Kept because `DraftValidationResponse` still
+                // permits the shape — don't delete it as dead code.
                 message = "Validation failed after the drop — open New Job to fix it."
             }
         } catch {
             message = apiError(error).userMessage
             if let fresh = try? await client.get(Draft.self, "v1", "draft") { draft = fresh }
         }
-        // This panel priced the job that just went away. `canConfirm` is
-        // `panel != nil && quote(for:) != nil && canSpend && !isLoadingPanel`,
-        // and `isLoadingPanel` is still false while `refreshTryon()` awaits
-        // below — so without this line Confirm stays tappable at a price for a
-        // job that no longer exists. The server would refuse it (409
-        // `stale_panel`), but the quote on screen must be the quote that will
-        // be charged. Same reason `reloadPanelAfterGpuChange()` clears first.
+        // One rule for both exits of this function — the bail-out above clears
+        // too. The quote on screen must be the quote that will be charged, and
+        // this panel priced the job that just went away. `canConfirm`'s
+        // `!isDropping` already keeps the button off the glass while a drop
+        // runs, but the price text is rendered straight from `quote(for:)`, so
+        // this is what stops a stale number being *shown* during the
+        // `refreshTryon()` below. `reloadPanelAfterGpuChange()` clears before
+        // re-reading for the same reason; don't drop this line as redundant.
         if phase == .rentPanel { panel = nil }
         await refreshTryon()
         if phase == .rentPanel { await loadPanel(force: false) }
@@ -342,8 +353,16 @@ public final class RunFlow {
         }
     }
 
+    /// `!isDropping` is not redundant with the `panel = nil` a drop performs
+    /// after its writes: the server's `panel_token` is
+    /// `f"{_run_token}.{generation}"` (bot.py:6895-6901) and `generation` only
+    /// moves once a drop's first write lands, so until then the cached token is
+    /// still accepted and the `stale_panel` refusal (bot.py:7012) never fires.
+    /// That window is the fresh `GET` plus a `PATCH` whose server-side probe can
+    /// take 60 s, and a Confirm accepted inside it rents and runs the pre-drop
+    /// basket — the job the user tapped Drop on.
     public func canConfirm(_ provider: SpendProvider) -> Bool {
-        panel != nil && quote(for: provider) != nil && canSpend && !isLoadingPanel
+        panel != nil && quote(for: provider) != nil && canSpend && !isLoadingPanel && !isDropping
     }
 
     /// After `PUT /v1/pod/gpu`: the old quote and `panel_token` priced another

@@ -43,16 +43,25 @@ extension URLProtocolTests {
             outfit: "app/blazer.png", seed: "s9")
         static let draftAfterDrop = draftJSON(
             batch: [entry("d1", "model__dress", "app/dress.png")], outfit: "app/blazer.png", seed: "s9")
+        /// The DELETE's answer. A draft change resets `validated` to null and
+        /// bumps the generation (drafts.py:276), so this differs from the
+        /// verdict that follows it — which is what makes `drop`'s
+        /// `draft = validation.draft` observable instead of a no-op.
+        static let draftAfterDelete = draftAfterDrop.replacingOccurrences(
+            of: #"validated":true"#, with: #"validated":null"#)
 
         /// `POST /v1/draft/validate`. The draft in the verdict is the post-drop
         /// one, so a drop that reaches this route always sees its entry gone.
-        /// A stale verdict can carry `valid: false` (drafts.py:561); a
-        /// non-stale invalid one never arrives here at all — the server raises
-        /// `DraftError("invalid")`, which `_DOMAIN_STATUS` maps to 422, so use
-        /// `validateStatus` for that case.
+        /// `d.validated = ok` only runs when the verdict is not stale
+        /// (drafts.py:552-556), so a stale verdict still carries the null the
+        /// draft change left behind. A stale verdict can carry `valid: false`
+        /// (drafts.py:561); a non-stale invalid one never arrives here at all —
+        /// the server raises `DraftError("invalid")` (drafts.py:566), which
+        /// `_DOMAIN_STATUS` maps to 422, so use `validateStatus` for that case.
         static func validation(valid: Bool, stale: Bool) -> String {
-            #"{"valid":"# + (valid ? "true" : "false") + #","stale":"# + (stale ? "true" : "false")
-                + #","output":null,"draft":"# + draftAfterDrop + "}"
+            let body = (valid && !stale) ? draftAfterDrop : draftAfterDelete
+            return #"{"valid":"# + (valid ? "true" : "false") + #","stale":"# + (stale ? "true" : "false")
+                + #","output":null,"draft":"# + body + "}"
         }
         static func probeJSON(_ kind: String) -> String {
             #"{"kind":"\#(kind)","width":1,"height":1,"duration_s":null,"bitrate_kbps":null,"size_bytes":1,"warning":""}"#
@@ -79,7 +88,7 @@ extension URLProtocolTests {
             case path == "/v1/pod": return TestSupport.json(pod)
             case path == "/v1/pipelines": return TestSupport.json(Fixtures.pipelines)
             case path == "/v1/draft": return TestSupport.json(draft)
-            case path.hasPrefix("/v1/draft/batch/"): return TestSupport.json(Self.draftAfterDrop)
+            case path.hasPrefix("/v1/draft/batch/"): return TestSupport.json(Self.draftAfterDelete)
             case path == "/v1/draft/validate": return TestSupport.json(validate, status: validateStatus)
             case path.hasSuffix("/rent-panel"): return TestSupport.json(nextPanel())
             case path.hasSuffix("/tryon"): return TestSupport.json(tryon)
@@ -252,8 +261,20 @@ extension URLProtocolTests {
                 ["PATCH /v1/draft", "DELETE /v1/draft/batch/d2", "POST /v1/draft/validate"])
         let body = try #require(JSONSerialization.jsonObject(with: writes[0].httpBody ?? Data()) as? [String: Any])
         #expect((body["slots"] as? [String: Any])?["outfit"] is NSNull)
+        #expect(writes[0].timeoutInterval == 95)   // the PATCH's probe can take 60 s
         #expect(writes[2].timeoutInterval == 95)
         #expect(flow.draft?.batch.map(\.digest) == ["d1"])
+        // The verdict's draft, not the DELETE's: a draft change resets
+        // `validated` to null (drafts.py:276) and only the validate that
+        // follows sets it again, so this pins `draft = validation.draft`.
+        #expect(flow.draft?.validated == true)
+        #expect(!flow.isDropping)
+        // Dropping from `.previews` must never touch the rent panel — it is not
+        // a navigation, and a panel installed here would price nothing real.
+        #expect(flow.panel == nil)
+        #expect(StubURLProtocol.requests.filter {
+            $0.url?.path.hasSuffix("/rent-panel") == true
+        }.count == 0)
         #expect(flow.message == nil)
     }
 
@@ -324,6 +345,9 @@ extension URLProtocolTests {
         #expect(writes.map { "\($0.httpMethod!) \($0.url!.path)" } ==
                 ["PATCH /v1/draft", "DELETE /v1/draft/batch/d2", "POST /v1/draft/validate"])
         #expect(flow.draft?.batch.map(\.digest) == ["d1"])
+        // A stale verdict never runs `d.validated = ok` (drafts.py:552-556), so
+        // the draft keeps the null the delete left behind — Confirm stays off.
+        #expect(flow.draft?.validated == nil)
     }
 
     /// The defensive half of the pair: a 200 verdict that says `valid: false`
@@ -431,6 +455,85 @@ extension URLProtocolTests {
         #expect(flow.panel?.panelToken == "1790000000999.1.10")
         #expect(flow.phase == .rentPanel)
         #expect(flow.draft?.batch.map(\.digest) == ["d1"])
+        #expect(!flow.isDropping)     // a stuck flag would disable Drop for good
+    }
+
+    /// The money guard. Until a drop's first write lands, the draft's
+    /// `generation` is unchanged and the server's `panel_token` is exactly
+    /// `_run_token.generation` (bot.py:6895-6901), so the cached token is still
+    /// accepted and `stale_panel` (bot.py:7012) does not fire. A Confirm tapped
+    /// inside that window — the fresh `GET` plus a `PATCH` whose server-side
+    /// probe can take 60 s — would rent and run the pre-drop basket.
+    @Test func confirmIsRefusedWhileADropIsInFlight() async throws {
+        let routes = Routes()
+        routes.draft = Routes.draftTwoJobs
+        routes.tryon = Fixtures.tryonDone
+        let flow = make(routes)
+        await flow.start(.existing)
+        await flow.continueToRent()
+        #expect(flow.canConfirm(.runpod))
+        let blazer = try #require(flow.tryon?.previews.first { $0.run == "model__blazer" })
+
+        async let dropTask: Void = flow.drop(blazer)
+        // Same spin the spend tests use. `drop` sets `isDropping` before its
+        // first await, so the first yield that sees it is the earliest
+        // observable point — still before any write landed. Bounded so a
+        // scheduling surprise fails loudly instead of hanging.
+        var observed = false
+        for _ in 0..<1000 {
+            if flow.isDropping { observed = true; break }
+            await Task.yield()
+        }
+        #expect(observed)               // never vacuous: a drop really was in flight
+        #expect(flow.panel != nil)      // and observed before the drop cleared it
+        #expect(!flow.canConfirm(.runpod))
+
+        await dropTask
+        #expect(!flow.isDropping)
+        #expect(flow.canConfirm(.runpod))   // the guard is temporary, not sticky
+    }
+
+    /// `canSpend` is the money-safety term the spec singles out: the draft must
+    /// never change under an unanswered spend. Every other term of
+    /// `canDropFromBatch` still holds in this state, so the last assertion can
+    /// only fail because of `canSpend`.
+    @Test func dropIsNotOfferedWhileASpendIsUnanswered() async {
+        let routes = Routes()
+        routes.draft = Routes.draftTwoJobs
+        routes.tryon = Fixtures.tryonDone
+        let gate = FakeSpendGate([.unreachable(detail: "timed out")])
+        let flow = make(routes, gate: gate)
+        await flow.start(.existing)
+        await flow.regenerate(index: "0", guidance: [])
+        #expect(flow.phase == .previews)
+        #expect(flow.draft?.batch.count == 2)
+        #expect(flow.tryon?.phaseARunning == false)
+        #expect(!flow.isDropping)
+        #expect(!flow.canSpend)
+        #expect(!flow.canDropFromBatch)
+    }
+
+    /// The bail-out writes nothing, but the fresh draft it just read proved the
+    /// basket the panel priced is gone — so the quote goes with it, by the same
+    /// rule as a successful drop.
+    @Test func dropBailOutOnTheRentPanelClearsTheStaleQuote() async throws {
+        let routes = Routes()
+        routes.draft = Routes.draftTwoJobs
+        routes.tryon = #"{"run_id":"tg-1000","run_token":"1.1","phase_a_running":false,"previews":[{"index":"0","run":"ghost","status":"done","has_image":true},{"index":"1","run":"model__dress","status":"done","has_image":true}]}"#
+        let flow = make(routes)
+        await flow.start(.existing)
+        await flow.continueToRent()
+        #expect(flow.phase == .rentPanel)
+        #expect(flow.panel != nil)
+        let ghost = try #require(flow.tryon?.previews.first)
+
+        await flow.drop(ghost)
+
+        #expect(flow.message == "The draft changed — reload before dropping.")
+        #expect(flow.panel == nil)
+        #expect(flow.phase == .rentPanel)     // dropping never navigates
+        #expect(StubURLProtocol.requests.allSatisfy { $0.httpMethod == "GET" })
+        #expect(!flow.isDropping)
     }
 
     @Test func spendInFlightDisablesAndClears() async {
