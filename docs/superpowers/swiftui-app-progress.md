@@ -28,7 +28,7 @@ what actually shipped, what was verified, and the next safe boundary.
 | 2 — materials and uploads | Complete in code | Material list and thumbnails, Photos/Files import, chunked foreground upload, persisted checkpoints, resume of missing chunks, delete ownership/error handling | Physical-phone interruption test for a video larger than 32 MiB is still pending |
 | 3 — single New Job | Complete | Catalog-driven pipeline/provider picker, compatible material pickers, server-authoritative draft mutations, validation, add/drop basket entries, stale/error reconciliation | Automated live simulator smoke passes; physical phone is optional coverage |
 | 4 — run flow | Complete in code | `SpendGate`/idempotency ledger, Phase A + try-on previews, regenerate with the closed guidance vocabulary, Keep, the rent panel (RunPod + Vast, out-of-stock), confirm (with the reuse/rerun chooser) and resume, all through `RunFlow`; `make ios-test` (158 tests), `make ios-build`, `make ios-contract` (adds `/tryon` and `/rent-panel`), `make ios-ui-test` (adds `Phase4SmokeTests`, zero-spend via `-UITestRecordingSpendGate`) and `scrub-secrets.sh --check` all pass | `make ios-refusal-smoke` passed live on 2026-09-23 (three bogus-token spends refused with 409, no lease before or after). No live Phase A / regen / confirm / resume has run — no pod has been rented for Phase 4 |
-| 5 — pod and cost | Complete in code | Pod tab: lease card with a quoted cost, kill (fresh key per tap, outside `SpendGate`, followed to `last_kill`), the "pod may still be billing" banner (`destroy_unverified`/`error`, cleared only by acknowledgement or a later successful kill), GPU choice on the Pod tab and the rent panel (re-reads the panel), RunPod balance and on-tap Vast credit, the migration (ask → typed, expiring confirmation → `SpendIntent.migrate` through `SpendGate`), an unanswered migrate on every tab; `make ios-test` (211 tests), `ios-build`, `ios-contract` (adds `gpu/stock`, `balance`), `ios-ui-test` (adds `Phase5SmokeTests`) pass | Phase 5's migrate UI smoke half was skipped on 2026-09-23 because a real pod was leased; `make ios-refusal-smoke` with the new kill/migrate cases has not run; no real kill, GPU change or migration has run from the app |
+| 5 — pod and cost | Complete in code | Pod tab: lease card with a quoted cost, kill (fresh key per tap, outside `SpendGate`, followed to `last_kill`), the "pod may still be billing" banner (`destroy_unverified`/`error`, cleared only by acknowledgement or a later successful kill), GPU choice on the Pod tab and the rent panel (re-reads the panel), RunPod balance and on-tap Vast credit, the migration (ask → typed, expiring confirmation → `SpendIntent.migrate` through `SpendGate`), an unanswered migrate on every tab; `make ios-test` (211 tests), `ios-build`, `ios-contract` (adds `gpu/stock`, `balance`), `ios-ui-test` (adds `Phase5SmokeTests`) pass | With no pod leased (2026-09-23): `make ios-ui-test` ran `Phase5SmokeTests` in full (migrate ask → locked confirm, zero recorded spends) and `make ios-refusal-smoke` passed all seven steps incl. idle kill → `409 nothing_running` and bogus migrate → `409 bad_confirm_token`. No real kill, GPU change or migration has run from the app |
 | 6 — batch/library | Not started | Nothing yet | Cross build UI, batch progress, saved try-ons and guided regenerate |
 
 ## What is implemented now
@@ -98,13 +98,17 @@ ios/
 - `make ios-build` — succeeded.
 - `make ios-contract` — 13 live GET contracts, adding `GET /v1/gpu/stock` (cached) and `GET /v1/balance`
   (no Vast), with `PodStatus.migration` decoded.
-- `make ios-ui-test` (sandbox disabled) — `Phase3SmokeTests` and `Phase4SmokeTests` passed.
+- `make ios-ui-test` (sandbox disabled) — first run: `Phase3SmokeTests` and `Phase4SmokeTests` passed;
   `Phase5SmokeTests` asserted the balance card and five GPU rows, then skipped the migrate half at its
-  no-lease guard: a real RunPod lease (`tg-1959705051`, provisioned ~16:59 +07, not started by the
-  agent) was live. The Phase 3 smoke's "must not expose Pod" check now ignores the tab-bar item.
+  no-lease guard because a real RunPod lease (`tg-1959705051`, provisioned ~16:59 +07, started by the
+  user, not the agent) was live. After the user stopped that pod, a re-run passed all three suites with
+  `Phase5SmokeTests` in full: a live `migrate/ask`, the warning shown, Migrate locked with the field
+  empty, and zero recorded spends. The Phase 3 smoke's "must not expose Pod" check ignores the tab-bar
+  item.
 - `scrub-secrets.sh --check` — passed.
-- Not run: `make ios-refusal-smoke` with the new idle-kill and bogus-migrate cases (needs approval and
-  no lease).
+- `make ios-refusal-smoke` — run live with the user's approval, no lease: no lease before; confirm →
+  `409 stale_panel`; regen → `409 stale_panel`; resume → `409 stale_run`; idle kill → `409
+  nothing_running`; bogus migrate → `409 bad_confirm_token`; no lease after. Zero spend.
 
 ### Phase 4
 
@@ -143,9 +147,8 @@ If that precondition is missing, restore test material; do not weaken the kind-f
 
 - Phase 2's physical-phone smoke with a real interrupted upload larger than 32 MiB has not run.
 - Phase 6 app models, stores and screens (cross build, batch progress, saved try-ons) do not exist yet.
-- Phase 5 was verified with fakes, stubs, the simulator and live GETs only. No kill, GPU change or
-  migration has been sent from the app to the live server; the Phase 5 migrate half of the UI smoke and
-  the new refusal-smoke cases have not run with no lease.
+- Phase 5 was verified with fakes, stubs, the simulator, live GETs, a live `migrate/ask` and refused
+  writes only. No real kill, GPU change or migration has been sent from the app.
 - No GPU or pod was rented for Phases 1–4. Do not reinterpret simulator or fake-server coverage as a
   real spend-path test — no live Phase A, regenerate, confirm or resume has run. The refusal smoke
   proves only that bogus-token spends are refused before anything is called.
@@ -154,16 +157,13 @@ If that precondition is missing, restore test material; do not weaken the kind-f
 
 ## Next work
 
-Three things are open, in order:
+Two things are open, in order:
 
-1. **Phase 5 zero-spend evidence with no pod leased.** When nothing is rented, run `make ios-ui-test`
-   (the Phase 5 migrate half then runs to the locked confirm button) and, after asking the user,
-   `make ios-refusal-smoke` (idle kill → `409 nothing_running`, bogus migrate → `409 bad_confirm_token`).
-2. **The one real spend test, now with the app's own kill.** Only with a quoted cost and a separate
+1. **The one real spend test, now with the app's own kill.** Only with a quoted cost and a separate
    explicit go-ahead: Phase A → confirm → **Kill from the Pod tab** → verify the pod is gone
    (`runpodctl get pod`) → cost from `runpodctl billing`, never `currentSpendPerHr`. It has not run.
    A real migration is never part of this test (it deletes the source volume) unless the user asks.
-3. **Phase 6 — batch and library.** Create and approve a focused Phase 6 design first (parent design
+2. **Phase 6 — batch and library.** Create and approve a focused Phase 6 design first (parent design
    §5 row 6: cross build, bulk try-on, batch progress, saved try-ons, guided regenerate).
 
 Required safety behavior carries over unchanged from Phase 4: one UUID key per tap and never mint a new
