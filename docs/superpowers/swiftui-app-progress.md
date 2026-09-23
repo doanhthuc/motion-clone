@@ -146,7 +146,13 @@ Pending the controller run, **not** passed here:
 - `make ios-contract` — the 14th route (`GET /v1/tryon-library`) decoding against the live server;
   expected 14/14. It contacts the VPS, so it is the controller's to run.
 - `make ios-ui-test` — `Phase6SmokeTests`, live and zero-spend on a booted simulator. It must run
-  outside the command sandbox (simulator control is killed inside it).
+  outside the command sandbox (simulator control is killed inside it). One assertion has no passing
+  precedent: the Materials toolbar check queries `"Add material"` (`MaterialsView.swift:96`, in
+  `.toolbar` at `:51`) type-agnostically, because a SwiftUI `Menu`'s XCUITest element type is not
+  guaranteed to be `.button`. If XCUITest does not surface a toolbar `Menu`'s accessibility label, that
+  single assertion false-alarms while the toolbar still works — widen the query, do not delete the
+  assertion (it is the only check that Task 7's `MaterialTabView` wrapper did not break toolbar
+  propagation). Every other asserted string is precedent-backed by a shipped screen.
 
 No real batch has run. A 2-outfit batch with one seeded job — proving Phase A calls the provider once
 for the unseeded outfit and reuses the saved image for the seeded one — is the proposed spend test; it
@@ -235,6 +241,12 @@ tapping the UI on a phone.
   batch with one seeded job is the proposed spend test and needs its own approval and quoted price.
 - A one-job draft has no drop affordance by design — "Drop from batch" needs ≥ 2 jobs (Phase 6 spec
   §5). **Clear**, on the New Job tab in Single mode, is the only way to remove the last job.
+- Batch mode renders no `Clear` button and no readiness line: Task 8's plan put `editorActions(draft)`
+  (the only `Clear`, `NewJobView.swift:231`) and `readiness(draft)` (`:208`) in the Single arm of
+  `NewJobView.editor` alone, so clearing the draft from Batch mode means switching to Single first.
+  Individual basket entries can still be dropped in Batch mode, and `Validate` renders in both.
+  Plan-mandated and discoverable via the mode switch, but a real papercut — `Phase6SmokeTests` has to
+  switch `newjob.mode` → Single before every `clear(in:)`, which is the evidence it is not theoretical.
 - Follow-up (cannot be fixed on this branch): `ios/MotionKit/Tests/MotionKitTests/Fixtures.pipelines`
   names `tryon-motion-enhance`'s optional role `mask`, while the live catalog says `background`;
   `mask` occurs nowhere in `scripts/**` as a role. `Fixtures.swift` cannot be edited here because two
@@ -243,6 +255,26 @@ tapping the UI on a phone.
 - Follow-up (needs its own VPS deploy gate): the server's invalid-validation message reaches the phone
   verbatim as `make batch-validate failed: …` — developer-facing copy on a consumer screen. Fixing it
   is a `scripts/**` change.
+- Open question (money safety, deliberately not fixed on this branch): `isDropping` gates only Confirm.
+  `RunFlow.spend(_:label:)` guards on `inFlightLabel == nil` (`RunFlowStore.swift:484-485`), and a drop
+  is a free draft mutation that never sets `inFlightLabel`, so `canSpend` (`:69`, which has no
+  `!isDropping`) stays true while a drop is in flight. `canConfirm` gained `!isDropping` (`:365`) in
+  Task 5's fix round precisely because a Confirm tapped mid-drop would present a `panel_token` the
+  server still accepts — the token is `f"{_run_token(chat_id)}.{generation}"`
+  (`scripts/tgbot/bot.py:6895-6902`) and `generation` does not move until the drop's first write lands.
+  Confirm is therefore closed, but **`regenerate` (`:472`), resume (`retryRental()`, `:411`),
+  `choose(_:)` (`:398`) and `MigrateFlow.migrate()` (`MigrateFlow.swift:109`) are not `isDropping`-gated.**
+  Widening `canSpend` to carry `!isDropping` reaches `canDropFromBatch` itself (`:229`) and the
+  pending-notice/migrate machinery, so the blast radius is past this branch. Recorded as an open
+  question with that reasoning, not a bug to fix here.
+- Constraint on a future change (not a bug): `BatchComposer.run()` re-picks per-outfit seeds only when
+  the draft it re-reads changed `sharedSlots`, because an unconditional re-pick would override the
+  shipped "Saved image" picker on every build. That is safe today only because `outfits` is populated
+  solely from `BatchComposerSection`, and `NewJobView` is retained by `TabView`/`NavigationStack` once
+  shown, so its hoisted `.onChange(of: composer.sharedSlots)` / `.onChange(of: library.loaded)`
+  observers outlive tab switches and pushes. If the composer is ever moved behind a genuinely
+  unmounting screen, the re-pick trigger must be widened — or compare the draft's `generation` instead
+  of the slots.
 - The real Phase A → GPU change → confirm → kill path ran once through the app's MotionKit code
   (§"Real spend test"); it has not been driven by tapping the UI. No real migration has run.
 - No GPU or pod was rented for Phases 1–6. Do not reinterpret simulator or fake-server coverage as a
@@ -276,14 +308,21 @@ with any live call needing its own separate approval and quoted cost. Before any
 `scripts/**`, check the VPS for a drain, Phase A, pod lease and migration — pure `ios/**` changes do not
 auto-deploy the bot.
 
-## Recommended Claude kickoff
+## Recommended kickoff for the next effort
 
-1. Verify `git status`, branch and current SHA; preserve unrelated changes.
-2. Read `AGENTS.md`, this handoff, the parent SwiftUI design and the control-plane API design §5.9–§5.10.
-3. Inspect the shipped `RunFlow`/`SpendGate`/`MigrateFlow`/`PodStore` stores and tests for state and
-   error-handling conventions — Phase 6 reuses the same money layer.
-4. Draft the Phase 6 design with explicit spend/no-spend acceptance criteria and wait for approval.
-5. Execute task-by-task TDD. Keep views free of direct `APIClient` calls.
-6. Report live validation separately from mocked/simulator validation; never claim a spend path was
-   tested unless it actually ran with prior user authorization.
+No phase remains (see "Next work"), so this is the start of whatever comes next — running the pending
+live gates and merging, the optional spend test, a deferred parent-spec item, or a Phase 6 follow-up.
+
+1. Verify `git status`, the branch and the current SHA; preserve unrelated changes. Phase 6 lives on the
+   unmerged `feat/swiftui-phase-6`, and `main` is 2 unpushed commits ahead of `origin/main`
+   (`4052b97` spec, `5eaa652` plan) — push `main` before opening the Phase 6 PR.
+2. Read `AGENTS.md`, this handoff, the parent SwiftUI design and the Phase 6 design. For anything
+   touching the money layer, inspect the shipped `RunFlow`/`SpendGate`/`MigrateFlow`/`PodStore` stores
+   and tests for state and error-handling conventions first.
+3. Before any push that touches `scripts/**` — Phase 6's read-only `tryon_seed` field is one — check the
+   VPS for a drain, Phase A, pod lease and migration; the merge auto-deploys `motion-bot`. Pure `ios/**`
+   changes do not.
+4. Keep views free of direct `APIClient` calls; execute task-by-task TDD.
+5. Report live validation separately from mocked/simulator validation; never claim a spend path was
+   tested unless it actually ran with prior user authorization and a quoted cost.
 
