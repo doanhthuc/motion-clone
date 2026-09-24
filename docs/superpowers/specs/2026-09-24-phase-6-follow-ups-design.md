@@ -356,10 +356,14 @@ in the Single arm alone (`NewJobView.swift:108-115`, `:202`, `:219`). Clearing t
 mode means switching to Single first, which is not theoretical: `Phase6SmokeTests` has to do exactly
 that twice.
 
-The `Clear` button is extracted from `editorActions` into its own `clearAction(_ draft: Draft)` and
+The `Clear` button is extracted from `editorActions` into its own `clearAction` computed property and
 rendered in **both** arms, with the identical style, the identical `"Clear"` label and `role:
 .destructive`, and the identical `.disabled(store.isBusy || composer.isRunning)`. `editorActions`
-keeps calling it, so there is one implementation and the two arms cannot drift.
+keeps calling it, so there is one implementation and the two arms cannot drift. A computed property,
+not a method taking `draft`: the button needs nothing from the draft, and an unused parameter is one
+the next reader has to reason about. This spec's first draft wrote `clearAction(_ draft: Draft)`; the
+plan corrected it, the implementation followed the plan, and the disagreement was reported rather than
+resolved silently.
 
 **`readiness(draft)` stays Single-only**, with a comment saying why: it reports `draft.required` and
 `draft.missing` for the *edited job*, and the Batch arm does not render the edited job — it renders
