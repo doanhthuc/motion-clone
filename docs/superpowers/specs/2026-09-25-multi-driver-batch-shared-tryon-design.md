@@ -1,6 +1,6 @@
 # Multi-driver batch, and one try-on per look
 
-Date: 2026-09-25 · Status: implemented on feat/multi-driver-batch, not yet merged
+Date: 2026-09-25 · Status: merged 2026-09-25 as PR #70 (`737c15c`) and deployed
 
 The parent SwiftUI spec (`2026-09-22-swiftui-app-design.md` §1) deferred "pair (1:1) mode". Asked
 what pair was for, the user described a different shape: **one character, many outfits and many
@@ -43,6 +43,9 @@ file.
 | `make check-job-types`, `make check-batch-params` | both pass at `81f4de4` | 2026-09-25 | Claude (controller) |
 | `make ios-ui-test` | 5/5 passed, `skippedTests: 0`, at `b955460`, including `testMultiDriverCrossBuild` (2 outfits × 2 drivers from free draft mutations, zero recorded spends); xcresult `Test-MotionApp-2026.09.25_03-41-39` | 2026-09-25 | Claude (controller) |
 | `motions-studio/setup/scrub-secrets.sh --check` | exit 0 before every commit on the branch | 2026-09-25 | Claude |
+| VPS pre-merge check (drain / Phase A / lease / migration) | clean: `GPU_INSTANCE_ID` empty, no `drain.py`/`batch_run.py`, journals untouched since 2026-09-24 13:30 UTC, `volume-migrate.log` last written 2026-09-16; `runpodctl pod list` empty | 2026-09-25 | Claude (controller) |
+| `deploy-bot` workflow run | success, run 36057372321; VPS at `737c15c`, `motion-bot` active | 2026-09-25 | Claude (controller) |
+| `make ios-contract` (live, post-deploy) | 14/14 against `737c15c`. The draft had no grouped run, so this proves the wire shape still decodes, not that `shared_from`/`shares` are populated | 2026-09-25 | Claude (controller) |
 
 ## 1. The share key (runner)
 

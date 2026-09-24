@@ -37,7 +37,7 @@ what actually shipped, what was verified, and the next safe boundary.
   zero spends recorded, 2026-09-24). See "Gate record" below — that table is the single place a gate
   result is written down.
 
-## Multi-driver batch (2026-09-25)
+## Multi-driver batch (2026-09-25, PR #70 → `737c15c`, deployed)
 
 Spec: [`specs/2026-09-25-multi-driver-batch-shared-tryon-design.md`](specs/2026-09-25-multi-driver-batch-shared-tryon-design.md);
 plan: [`plans/2026-09-25-multi-driver-batch-shared-tryon.md`](plans/2026-09-25-multi-driver-batch-shared-tryon.md).
