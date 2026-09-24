@@ -7053,9 +7053,24 @@ class AppRuns:
                 # generation 0 → 1 → 2. `clear()` "keeps counting" in the sense
                 # of not resetting, not in the sense of standing still.
                 #
-                # Still one value read under one lock acquisition: BOT_LOCK is
-                # held for this whole block, so nothing outside it can move the
-                # counter between the clear and this read.
+                # What `_locked()` does and does not guarantee here. It is
+                # `_bot_locked()` (:6904-6908), so no other confirm, resume or
+                # panel read can interleave — but the draft's own writers take
+                # `control.LOCK`, not BOT_LOCK, and `clear()` above and
+                # `runnable()` below are two separate acquisitions, so the pair
+                # is not one atomic unit. `validate()` cannot exploit the gap:
+                # its verdict save never bumps the generation (drafts.py:555)
+                # and is skipped as stale once a clear has moved it
+                # (drafts.py:552). The four `_changed` mutators — patch,
+                # add_to_batch, drop_from_batch, clear — can, and `_route_draft`
+                # takes no BOT_LOCK (httpapi/server.py:405-414), so a second
+                # request from the same phone landing in that gap is stamped as
+                # though it had been confirmed. That fails OPEN, not closed: the
+                # gate then allows a resume against a draft that moved. Accepted
+                # rather than overlooked — the gap is two adjacent statements
+                # inside one handler, the draft store has one app owner, and the
+                # `panel_token()` compare at :7012 has had exactly this shape
+                # since before the stamp existed.
                 _save_confirm_stamp(self.chat_id, self.drafts.runnable()[2])
                 response = (202, {"run_id": self.run_id, "outcome": out.code})
             else:
@@ -7359,7 +7374,7 @@ def _resume_generation_refusal(chat_id: int, drafts: DraftStore) -> str | None:
     one (`_changed`, drafts.py:275-279) rather than resetting it, and the
     writer stamps after the clear (AppRuns.confirm's `if out:`), so the
     confirm's own clear is already accounted for; `validate()` does not bump it
-    (drafts.py:554), so a re-validate does not trip this either — and the
+    (drafts.py:555), so a re-validate does not trip this either — and the
     counter only rises, so a stale stamp can never match again by accident.
     """
     confirmed = _load_confirm_stamp(chat_id)

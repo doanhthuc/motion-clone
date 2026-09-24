@@ -550,7 +550,21 @@ class TestAppRunsConfirm(_AppRunsFixture):
         Asserted through the real reader half, not by re-deriving its rule, so
         this fails if either side moves. The generation starts non-zero on
         purpose: from 0 a reset and a no-op are the same number and neither
-        would be caught."""
+        would be caught.
+
+        The two `before + 1` assertions are what carry that weight, and they
+        are deliberately redundant with the reader-based one below them: because
+        the stamp is read AFTER the clear, a `clear()` that reset the counter
+        to 0 would leave stamp and draft agreeing at 0, the draft would still
+        be empty, and `_resume_generation_refusal` would still answer None.
+        Measured 2026-09-24 under exactly that mutation: the emptiness and the
+        reader assertions both PASS, and only the two anchored to `before` fail
+        (0 != 8). So only those pin the "counter only rises, so a stale stamp
+        can never match again by accident" property that
+        `_resume_generation_refusal`'s docstring relies on. The cost is that a
+        legitimate future `clear()` that preserved the generation would fail
+        here, in a test named for the retry; that is the point — it forces the
+        change to be made with this invariant in view."""
         self._seed_draft()
         d = self.store._load()
         d.generation = 7          # a draft the user has edited several times
