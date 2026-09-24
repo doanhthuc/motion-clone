@@ -22,13 +22,14 @@ extension URLProtocolTests {
         func nextPanel() -> String { lock.withLock { _panels.count > 1 ? _panels.removeFirst() : _panels[0] } }
 
         static func quoted(_ value: String?) -> String { value.map { "\"\($0)\"" } ?? "null" }
-        static func draftJSON(batch: [String], outfit: String, seed: String?) -> String {
+        static func draftJSON(batch: [String], outfit: String, seed: String?, generation: Int = 9) -> String {
             let probe = #"{"kind":"image","width":1,"height":1,"duration_s":null,"bitrate_kbps":null,"size_bytes":1,"warning":""}"#
             let slots = ["character": "app/model.png", "driver": "app/dance.mp4", "outfit": outfit]
                 .sorted { $0.key < $1.key }
                 .map { "\"\($0.key)\":{\"material_id\":\"\($0.value)\",\"name\":\"x\",\"exists\":true,\"probe\":\(probe),\"warning\":\"\"}" }
                 .joined(separator: ",")
-            return #"{"owner":"app","pipeline":"tryon-motion-enhance","provider":"gemini","generation":9,"slots":{"#
+            return #"{"owner":"app","pipeline":"tryon-motion-enhance","provider":"gemini","generation":"#
+                + String(generation) + #","slots":{"#
                 + slots + #"},"required":["character","driver","outfit"],"optional":["mask"],"missing":[],"validated":true,"batch":["#
                 + batch.joined(separator: ",") + #"],"jobs":2,"estimate_min":84,"tryon_seed":"# + quoted(seed) + "}"
         }
@@ -41,12 +42,20 @@ extension URLProtocolTests {
         static let draftTwoJobs = draftJSON(
             batch: [entry("d1", "model__dress", "app/dress.png"), entry("d2", "model__blazer", "app/blazer.png", seed: "s9")],
             outfit: "app/blazer.png", seed: "s9")
+        /// Generation 10, not 9: `_changed()` bumps it on every draft mutation
+        /// (drafts.py:275-279), so the drop really does move it. `RunFlow`'s
+        /// retry latch reads the field, and a fixture that never moved it would
+        /// make that latch untestable through `drop`.
         static let draftAfterDrop = draftJSON(
-            batch: [entry("d1", "model__dress", "app/dress.png")], outfit: "app/blazer.png", seed: "s9")
-        /// The DELETE's answer. A draft change resets `validated` to null and
-        /// bumps the generation (drafts.py:276), so this differs from the
-        /// verdict that follows it — which is what makes `drop`'s
-        /// `draft = validation.draft` observable instead of a no-op.
+            batch: [entry("d1", "model__dress", "app/dress.png")], outfit: "app/blazer.png", seed: "s9",
+            generation: 10)
+        /// The DELETE's answer. `_changed()` resets `validated` to null and
+        /// bumps `generation` in the same write (drafts.py:275-279), so this is
+        /// the post-drop generation with no verdict on it; the validate that
+        /// follows sets `validated` again without moving `generation`
+        /// (drafts.py:552-556, "a verdict is not a change"). The null is what
+        /// makes `drop`'s `draft = validation.draft` observable instead of a
+        /// no-op.
         static let draftAfterDelete = draftAfterDrop.replacingOccurrences(
             of: #"validated":true"#, with: #"validated":null"#)
 
@@ -460,7 +469,7 @@ extension URLProtocolTests {
 
     /// The money guard. Until a drop's first write lands, the draft's
     /// `generation` is unchanged and the server's `panel_token` is exactly
-    /// `_run_token.generation` (bot.py:6895-6901), so the cached token is still
+    /// `_run_token.generation` (bot.py:6895-6902), so the cached token is still
     /// accepted and `stale_panel` (bot.py:7012) does not fire. A Confirm tapped
     /// inside that window — the fresh `GET` plus a `PATCH` whose server-side
     /// probe can take 60 s — would rent and run the pre-drop basket.
@@ -491,6 +500,109 @@ extension URLProtocolTests {
         await dropTask
         #expect(!flow.isDropping)
         #expect(flow.canConfirm(.runpod))   // the guard is temporary, not sticky
+    }
+
+    /// The other half of the same money guard, and the system-level property
+    /// Phase 6 introduced: a **free** draft mutation invalidates a **paid**
+    /// retry. `resume` re-rents the manifest on disk and deliberately never
+    /// reads the draft (bot.py:7394-7395), and `_run_token` is the manifest's
+    /// `mtime_ns` (bot.py:1493-1506), which moves only when a manifest is
+    /// *rewritten* — a drop does not rewrite one. So without the generation
+    /// latch, Confirm → rental fails → re-enter → Drop → Retry rental rents a
+    /// pod that still runs the job the user just dropped. `confirmIsRefused…`
+    /// above covers the drop *in flight*; this covers the drop that succeeded.
+    @Test func aDropAfterAConfirmWithdrawsTheRentalRetry() async throws {
+        let routes = Routes()
+        routes.draft = Routes.draftTwoJobs
+        routes.tryon = Fixtures.tryonDone
+        let gate = FakeSpendGate([.accepted(runID: "tg-1000", outcome: "started")])
+        let flow = make(routes, gate: gate)
+        await flow.start(.existing)
+        await flow.continueToRent()
+        await flow.confirm()
+        // The accepted confirm is what latches: the server gates it on a token
+        // carrying the draft's generation, so acceptance proves the manifest it
+        // wrote matches generation 9.
+        #expect(flow.confirmedGeneration == 9)
+
+        // The rental failed (`Fixtures.podIdle` carries `failed_rental` and no
+        // lease); re-entering the flow is what offers Drop again.
+        await flow.start(.existing)
+        #expect(flow.phase == .previews)
+        #expect(flow.canDropFromBatch)
+        #expect(flow.canRetryRental)            // draft unchanged since the confirm
+        #expect(flow.retryRentalBlockReason == nil)
+        let blazer = try #require(flow.tryon?.previews.first { $0.run == "model__blazer" })
+
+        await flow.drop(blazer)
+
+        #expect(flow.draft?.generation == 10)
+        #expect(!flow.canRetryRental)
+        #expect(flow.retryRentalBlockReason != nil)
+        await flow.retryRental()
+        // The confirm only — no `.resume` was ever handed to the gate.
+        #expect(await gate.intents.count == 1)
+        #expect(await gate.intents.allSatisfy { $0.kind == .confirm })
+    }
+
+    /// The retry stays available when nothing moved the draft, and when no
+    /// confirm was accepted in this store's lifetime — the latter is the state
+    /// after an app relaunch, and refusing there would break the legitimate
+    /// retry flow the whole card exists for.
+    @Test func rentalRetrySurvivesAnUnchangedDraftAndARelaunch() async throws {
+        let routes = Routes()
+        routes.draft = Routes.draftTwoJobs
+        routes.tryon = Fixtures.tryonDone
+        let gate = FakeSpendGate([.accepted(runID: "tg-1000", outcome: "started"),
+                                  .accepted(runID: "tg-1000", outcome: "started")])
+        let flow = make(routes, gate: gate)
+        // No confirm: `confirmedGeneration` is nil, as after a relaunch.
+        await flow.start(.existing)
+        #expect(flow.confirmedGeneration == nil)
+        #expect(flow.canRetryRental)
+
+        await flow.continueToRent()
+        await flow.confirm()
+        #expect(flow.confirmedGeneration == 9)
+        await flow.start(.existing)             // re-reads the same generation 9
+        #expect(flow.canRetryRental)
+        #expect(flow.retryRentalBlockReason == nil)
+        await flow.retryRental()
+        #expect(await gate.intents.count == 2)
+        #expect(await gate.intents.last?.kind == .resume)
+        // A resume must not move the latch: the server ignores the draft there.
+        #expect(flow.confirmedGeneration == 9)
+    }
+
+    /// `spend` is the single funnel for all four spend entry points, so its
+    /// `!isDropping` guard reaches the ones `canConfirm` cannot — `regenerate`,
+    /// `retryRental` and `choose(_:)` — and any entry point added later.
+    /// Probed through `regenerate`, the one whose own preconditions still hold
+    /// mid-drop.
+    @Test func everySpendIsRefusedWhileADropIsInFlight() async throws {
+        let routes = Routes()
+        routes.draft = Routes.draftTwoJobs
+        routes.tryon = Fixtures.tryonDone
+        let gate = FakeSpendGate([.accepted(runID: "tg-1000", outcome: "started")])
+        let flow = make(routes, gate: gate)
+        await flow.start(.existing)
+        let blazer = try #require(flow.tryon?.previews.first { $0.run == "model__blazer" })
+
+        async let dropTask: Void = flow.drop(blazer)
+        var observed = false
+        for _ in 0..<1000 {
+            if flow.isDropping { observed = true; break }
+            await Task.yield()
+        }
+        #expect(observed)               // never vacuous: a drop really was in flight
+
+        await flow.regenerate(index: "0", guidance: [])
+        #expect(flow.message == "A batch drop is still in flight — wait for it before spending.")
+        #expect(await gate.intents.isEmpty)
+
+        await dropTask
+        #expect(!flow.isDropping)
+        #expect(await gate.intents.isEmpty)     // the refused spend never queued
     }
 
     /// `canSpend` is the money-safety term the spec singles out: the draft must

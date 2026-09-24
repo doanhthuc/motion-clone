@@ -6,6 +6,7 @@ struct MaterialTabView: View {
     let materials: MaterialsStore
     let library: TryonLibraryStore
     let draft: DraftStore
+    let composer: BatchComposer
     @State private var showSaved = false
 
     var body: some View {
@@ -18,7 +19,8 @@ struct MaterialTabView: View {
             .accessibilityIdentifier("material.mode")
             .padding(.horizontal, 20).padding(.vertical, 8)
             if showSaved {
-                SavedTryonsView(library: library, materials: materials, draft: draft)
+                SavedTryonsView(library: library, materials: materials, draft: draft,
+                                composer: composer)
             } else {
                 MaterialsView(store: materials)
             }

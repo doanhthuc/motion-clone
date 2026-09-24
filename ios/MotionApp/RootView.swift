@@ -19,7 +19,8 @@ struct RootView: View {
                     }
                     Tab("Material", systemImage: "square.grid.2x2", value: AppTab.materials) {
                         NavigationStack {
-                            MaterialTabView(materials: materials, library: library, draft: draft)
+                            MaterialTabView(materials: materials, library: library, draft: draft,
+                                            composer: composer)
                         }
                     }
                     Tab("New Job", systemImage: "plus.circle.fill", value: AppTab.newJob) {

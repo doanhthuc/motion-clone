@@ -5,6 +5,7 @@ struct SavedTryonsView: View {
     let library: TryonLibraryStore
     let materials: MaterialsStore
     let draft: DraftStore
+    let composer: BatchComposer
     @Environment(AppModel.self) private var model
     @State private var deleteCandidate: TryonLibraryEntry?
 
@@ -30,6 +31,7 @@ struct SavedTryonsView: View {
                     LazyVGrid(columns: columns, spacing: 12) {
                         ForEach(library.entries) { entry in
                             SavedTryonTile(entry: entry, library: library, materials: materials,
+                                           disabled: draft.isBusy || composer.isRunning,
                                            onUse: { use(entry) }, onDelete: { deleteCandidate = entry })
                         }
                     }
@@ -75,6 +77,18 @@ private struct SavedTryonTile: View {
     let entry: TryonLibraryEntry
     let library: TryonLibraryStore
     let materials: MaterialsStore
+    /// Both buttons, not just "Use in job". This is the one screen that writes
+    /// the draft from a different tab, and a cross build takes minutes — each
+    /// step is a `PATCH` whose server-side probe can take ~60 s. A "Use in job"
+    /// landing between two steps is merged per role by the server
+    /// (`scripts/control/drafts.py:450-455`), so the entry's character stays on
+    /// the draft while the next step PATCHes only the outfit and seed: the next
+    /// basket job is built from a character the build never chose, with a seed
+    /// picked for the original one, and Phase A then skips the provider and
+    /// copies a mismatched image (`scripts/batchlib/runner.py:670-685`). Delete
+    /// needs it too — a double tap sends two DELETEs and the second surfaces
+    /// "That saved try-on was already deleted."
+    let disabled: Bool
     let onUse: () -> Void
     let onDelete: () -> Void
     @State private var image: UIImage?
@@ -102,9 +116,11 @@ private struct SavedTryonTile: View {
                 Button("Use in job", action: onUse)
                     .font(Theme.sans(12, .semibold)).foregroundStyle(Theme.lime)
                     .accessibilityIdentifier("saved.use.\(entry.id)")
+                    .disabled(disabled)
                 Spacer()
                 Button(role: .destructive, action: onDelete) { Image(systemName: "trash") }
                     .foregroundStyle(Theme.red)
+                    .disabled(disabled)
             }
         }
         .padding(10).card()
