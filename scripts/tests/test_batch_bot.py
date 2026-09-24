@@ -4774,8 +4774,11 @@ class TestProvisionFailureRecovery(unittest.TestCase):
             "  - id: runA\n    pipeline: tryon-motion-enhance\n"
             "    inputs: {character: /tmp/c.png, outfit: /tmp/o.png, driver: /tmp/d.mp4}\n"
             "    tryon: { provider: gemini }\n"
+            # runB wears a different outfit on purpose: the same look would make
+            # it runA's follower (tryon_share_groups), and this hand-written
+            # journal has no shared_from/source_sha256 for it.
             "  - id: runB\n    pipeline: tryon-motion-enhance\n"
-            "    inputs: {character: /tmp/c.png, outfit: /tmp/o.png, driver: /tmp/d.mp4}\n"
+            "    inputs: {character: /tmp/c.png, outfit: /tmp/o2.png, driver: /tmp/d.mp4}\n"
             "    tryon: { provider: gemini }\n", encoding="utf-8")
         params = effective_stage_params("tryon", {"provider": "gemini"})
         batch_dir = bot.ROOT / "out" / "2026-09-16-0900"
