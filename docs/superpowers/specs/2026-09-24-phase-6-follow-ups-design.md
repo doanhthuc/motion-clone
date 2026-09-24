@@ -1,6 +1,6 @@
 # Phase 6 follow-ups — a server-side resume latch and four app fixes
 
-Date: 2026-09-24 · Status: implemented on `feat/phase-6-follow-ups`, gates not yet swept, not merged · Branch: `feat/phase-6-follow-ups` (one branch, one PR)
+Date: 2026-09-24 · Status: implemented on `feat/phase-6-follow-ups`, all free and live gates swept, final whole-branch review says ready to merge — awaiting the VPS pre-merge check, the merge and the deploy · Branch: `feat/phase-6-follow-ups` (one branch, one PR)
 
 Line-number citations of `scripts/tgbot/bot.py` in §2 and §3 are as of `fd8464b`, before implementation.
 Tasks 1 and 2 added 123 net lines to that file, every one of them at original line 7040 or later, so
@@ -29,13 +29,13 @@ live one.
 
 | Gate | Result | Date | Ran by |
 |---|---|---|---|
-| `make batch-test` | _not yet run_ | | |
-| `cd ios/MotionKit && swift test` | _not yet run_ | | |
-| `make ios-build` | _not yet run_ | | |
-| `xcodebuild … build-for-testing` | _not yet run_ | | |
-| `motions-studio/setup/scrub-secrets.sh --check` | _not yet run_ | | |
-| `make ios-contract` (live) | _not yet run_ | | |
-| `make ios-ui-test` (live, outside the sandbox) | _not yet run_ | | |
+| `make batch-test` | **exit 0**, `Ran 2146 tests in 231.645s`, `OK (skipped=1)`. 2130 at the branch base; +6 from Tasks 1-2, +1 from the final wave's `OSError` test. `test_batch_control_invariants` separately `Ran 9 tests`, `OK` — no new `start_drain` call site | 2026-09-24 | final wave, at `9491ace` |
+| `cd ios/MotionKit && swift test` | **exit 0**, `✔ Test run with 252 tests in 23 suites passed`, 0 warnings, 0 skipped. 249 at the branch base; +1 Task 3, +2 Task 4, −1 from the final wave deleting `aDropAfterAConfirmWithdrawsTheRentalRetry` with the client latch | 2026-09-24 | final wave, at `9491ace` |
+| `make ios-build` | **exit 0**. The only gate that compiles `MotionApp`, so the only one that could catch the `RunFlow?`-into-`RunFlow` construction error the plan specified in Task 4 | 2026-09-24 | final wave, at `9491ace` |
+| `xcodebuild … build-for-testing` | **exit 0**, `** TEST BUILD SUCCEEDED **`, `SwiftCompile … Phase6SmokeTests.swift (in target 'MotionAppUITests')`, 0 errors, only the pre-existing `appintentsmetadataprocessor` warning. No simulator booted | 2026-09-24 | final wave, at `9491ace` |
+| `motions-studio/setup/scrub-secrets.sh --check` | **exit 0**, re-run before every one of the branch's 40 commits and once more over the whole tree at the end | 2026-09-24 | every task, then the controller |
+| `make ios-contract` (live) | **exit 0, 14/14 ok** against the VPS at `ec5b199`. Fourteen and not fifteen: this branch adds no route. Against the **pre-deploy** server, so it is the "new app, old server" half of §3's deploy-order property. The reviewer's watch item — does the live catalog say `background` or `mask` — cannot be answered by this gate, because decoding succeeds for any role name, so the controller fetched `/v1/pipelines` directly: **`mask` appears nowhere in the response**; all three `tryon-*` pipelines carry `optional=['background']` with kind `image`, and all six carry `character` in `required`. §6's fixture rename therefore matches the live catalog, not merely `scripts/**` | 2026-09-24 | controller, live against the VPS |
+| `make ios-ui-test` (live, outside the sandbox) | **exit 0**, bundle `Test-MotionApp-2026.09.24_23-20-52-+0700.xcresult`, `result: Passed`, `totalTestCount: 4`, `passedTests: 4`, `failedTests: 0`, **`skippedTests: 0`**, on an already-booted iPhone 18 Pro (`43B83B81-13CD-4383-BB43-4D8AEBEA6582`). Read with `xcrun xcresulttool get test-results summary` and `… tests`, because `-quiet` prints no per-test output and a skip is otherwise invisible. `Phase6SmokeTests.testCrossBuildDropAndLibrary` **Passed**, so neither `XCTSkip` guard fired and `clearFromBatch` really tapped the Batch-mode Clear and both its assertions held — the slot value returning to `Missing required` and the header reaching `0 jobs`. That is Task 7's only behavioural proof, and §7's live half. Its closing `uitest.recordedSpends == "0"` assertion is inside that test, so a Pass is the zero-spend proof. The `TG_PIPELINE` config dependency §7 records did not fire: the `Character` row existed. The `XCTSkip`-versus-recorded-failure question the plan's Task 9 checklist raises is **moot for this run**, since nothing skipped — it stays open | 2026-09-24 | controller, live against the VPS |
 | VPS pre-merge check (drain / Phase A / lease / migration) | _not yet run_ | | |
 | `deploy-bot` workflow run | _not yet run_ | | |
 | `make ios-contract` (post-deploy, live) | _not yet run_ | | |
