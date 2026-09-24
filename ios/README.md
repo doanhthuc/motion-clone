@@ -184,14 +184,16 @@ Design: `docs/superpowers/specs/2026-09-23-swiftui-app-phase-6-design.md`.
   mode) is the only way to remove it. Run detail shows a per-job batch progress list.
 - **Retry rental is latched to the draft that was confirmed.** `resume` re-rents the manifest on disk
   and reads only the draft's `generation`, never its contents, so the generation is the one thing that
-  can tell it the draft moved. `RunFlow` records `draft.generation` when a confirm is accepted and
-  `canRetryRental` refuses once the draft moves — otherwise a drop after a failed rental would rent a
-  pod still running the dropped job. The run detail card stays up and says why
-  (`retryRentalBlockReason`). The server is the authority, and it survives a relaunch: an accepted
+  can tell it the draft moved. The latch is the server's, and it survives a relaunch: an accepted
   confirm stamps the draft's `generation` (`batch/tg-<chat_id>.confirmed-generation.json`, written for
-  app-initiated confirms only) and `resume` refuses `409 stale_run` when the draft has moved since. The
-  in-memory latch is the pre-tap copy — it says why before the tap and costs nothing — and it fails open
-  after a relaunch, which is the case the stamp covers.
+  app-initiated confirms only) and `resume` refuses `409 stale_run` when the draft has moved since.
+  Without it, a drop after a failed rental would rent a pod still running the dropped job — `_run_token`
+  is the manifest's `mtime_ns`, and a draft edit rewrites no manifest, so nothing else can see one. The
+  refusal reaches the run detail card verbatim, and the app re-reads the run. An in-memory copy of the
+  generation used to gate `canRetryRental` too; removed 2026-09-24, because it held the *pre-clear*
+  generation while the stamp holds the *post-clear* one, so any re-read between an accepted confirm and
+  a Retry tap withheld a retry the server would have granted — and its "Confirm again" recovery was
+  impossible, the confirm's own clear having emptied the draft.
 - **Saved try-ons.** The library grid (`GET /v1/tryon-library`, images cached by id) shows each
   entry's provider, saved date and resolved character/outfit names ("(deleted)" when a material is
   gone). **Use in job** (`saved.use.<id>`) fills the draft through `DraftStore.apply` and switches to

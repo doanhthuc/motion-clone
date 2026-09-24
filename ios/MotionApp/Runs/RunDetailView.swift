@@ -14,7 +14,7 @@ struct RunDetailView: View {
                 if let d = store.detail {
                     StatusHero(detail: d, stale: store.isStale, lastSuccess: store.lastSuccess)
                     if d.id == flow.runID,
-                       flow.canRetryRental || flow.retryRentalBlockReason != nil,
+                       flow.canRetryRental,
                        let failure = flow.pod?.failedRental {
                         VStack(alignment: .leading, spacing: 8) {
                             SectionLabel(text: "Rental failed")
@@ -24,8 +24,7 @@ struct RunDetailView: View {
                             let gpu = flow.pod?.gpu ?? failure.gpu
                             if flow.canRetryRental {
                                 // The note belongs to the branch that offers the
-                                // retry: it promises "this retries on <gpu>", and the
-                                // `else` branch below withholds the retry and says why.
+                                // retry: it promises "this retries on <gpu>".
                                 if failure.gpu != gpu {
                                     Text("Last failure was on \(failure.gpu); this retries on \(gpu).")
                                         .font(Theme.sans(12)).foregroundStyle(Theme.amber)
@@ -33,11 +32,6 @@ struct RunDetailView: View {
                                 Button("Retry rental · \(gpu)") { Task { await flow.retryRental() } }
                                     .buttonStyle(PrimaryButtonStyle())
                                     .disabled(!flow.canSpend)
-                            } else if let blocked = flow.retryRentalBlockReason {
-                                // The card stays and says why: a resume re-rents the
-                                // manifest on disk, so a draft edited since the confirm
-                                // must be confirmed again, not silently re-run.
-                                Text(blocked).font(Theme.sans(12)).foregroundStyle(Theme.amber)
                             }
                             if flow.needsRecheck {
                                 Button("Check again") { Task { await flow.recheck() } }

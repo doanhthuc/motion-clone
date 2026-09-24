@@ -7309,9 +7309,11 @@ def _load_kill_result(chat_id: int) -> dict | None:
     return raw if isinstance(raw, dict) else None
 
 
-# The refusal sentence, one literal: the app's pre-tap copy in
-# RunFlow.retryRentalBlockReason says the same thing, and a test on each side
-# asserts this string rather than a paraphrase of it.
+# The refusal sentence, one literal: the app shows it verbatim (a 409 reaches
+# the screen through APIError.userMessage's `default`), and a test on each side
+# asserts this string rather than a paraphrase of it — Python against this
+# constant, Swift against a copy of the literal, so a wording change here turns
+# `swift test` red as well as `make batch-test`.
 RESUME_STALE_GENERATION = ("the draft changed since this rental was confirmed — "
                            "Confirm again to rent what is in the draft now")
 
@@ -7325,8 +7327,9 @@ def _confirm_stamp_path(chat_id: int) -> Path:
     draft edit rewrites nothing. That is why `panel_token` joins the generation
     for `confirm` — and why `resume`, which re-rents the manifest on disk and
     deliberately never reads the draft, had no equivalent. Without this stamp
-    the only latch was `RunFlow.confirmedGeneration` in the app's memory, which
-    an app relaunch loses (2026-09-24 follow-ups spec §3).
+    the only latch was an in-memory copy of the confirmed generation on the
+    phone, which an app relaunch loses; this stamp is what survives one, and is
+    why that copy is now gone (2026-09-24 follow-ups spec §3).
     """
     return ROOT / "batch" / f"tg-{chat_id}.confirmed-generation.json"
 

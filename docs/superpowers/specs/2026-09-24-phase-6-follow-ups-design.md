@@ -186,19 +186,32 @@ sentence reaches the screen unchanged.
 **Fail open when there is no stamp.** A Telegram-initiated confirm writes no stamp, and `_do_confirm`
 must not write one: it is shared with the Telegram flow, where the app's draft is not what the user
 reviewed, so certifying its generation would be a lie. The latch therefore covers app-initiated
-confirms only. That is precisely the population the client-side latch covers today, so this is the
+confirms only. That is precisely the population the client-side latch covered, so this is the
 same coverage moved to where a relaunch cannot lose it — not a regression, and not a claim to more.
 
 A corrupt draft file resets the generation to 0 (`drafts.py:265`) while the stamp keeps its larger
 number, so the resume is refused. Fail-closed on a draft this box can no longer read is the right
 direction for a money call, and the recovery is the one the message already names.
 
-**App side: no change is required for correctness**, so both deploy orders work — the property Phase
-6's `tryon_seed` field had. `RunFlow.confirmedGeneration`, `canRetryRental` and
-`retryRentalBlockReason` all stay: they turn a refused tap into a message shown *before* the tap,
-which is better UX and free. Its wording aligns with the server's sentence so one rule has one
-sentence, and the comment at `RunFlowStore.swift:96-104` gains a line naming the server as the
-authority and this file as the pre-tap copy.
+**App side: no change was required for correctness**, so both deploy orders work — the property Phase
+6's `tryon_seed` field had. This spec's first draft nevertheless kept `RunFlow.confirmedGeneration`,
+the generation term in `canRetryRental` and `retryRentalBlockReason` as a pre-tap copy of the rule, on
+the argument that a message shown *before* the tap is better UX and free.
+
+**It was not free, and the final whole-branch review had it removed (I1, ruled 2026-09-24).** The
+client copy was taken from the app's *pre-clear* generation `G`, while the stamp records the
+*post-clear* `G+1`, because `clear()` counts the generation up rather than resetting it
+(`drafts.py:275-279`). Each side was self-consistent alone, so nothing in either language's suite could
+see the gap: any `RunFlow.start()` between an accepted confirm and a Retry tap re-read `/v1/draft`, saw
+`G+1`, and withheld a retry the server would have granted — with a sentence telling the user to Confirm
+again, which the confirm's own cleared draft makes impossible. The only escape was a relaunch, the one
+thing this item exists to make unnecessary. It failed closed and pre-existed on `main`, but this branch
+is what made the client latch redundant for safety, so this branch is where it went.
+
+All three are gone. `canRetryRental` checks the pod and the run only; a refusal reaches the screen
+verbatim through `message`, which `RunDetailView` renders on the same failure card the button sits on;
+and `applyRefusal`'s `("stale_run", .resume)` case re-reads the run. One rule, one mechanism, one
+sentence — the server's.
 
 **Blast radius.** The Telegram recovery buttons (`_CB_RECOVER_RETRY`, `_CB_RECOVER_SWITCH`,
 `_CB_PHASE_A_SPEND`) call `_do_resume` directly and never enter `AppPod.resume`, so they are
@@ -436,10 +449,13 @@ Plus a `_save`/`_load` round-trip pair mirroring the existing kill-result tests,
 `replayPendingOnce` unaffected by a drop. `APIClientTests.userMessages()` (`:295`): the 422
 `invalid` headline; `detailMessage` non-nil for it and nil for every other error; `detailMessage` nil
 when the server's text is blank; `missing_slots` still verbatim. `DraftStoreTests`: update `:249`,
-add the `detailMessage` assertion. `RunFlowTests`: the relaunch case — a fresh `RunFlow` with
-`confirmedGeneration == nil` sends the resume, receives `409 stale_run`, surfaces the server's
-sentence and calls `refreshTryon()`. That is the regression test for the bug §3 exists to fix, and it
-is the one that fails today.
+add the `detailMessage` assertion. `RunFlowTests`: the relaunch case — a fresh `RunFlow`, holding
+nothing in memory about what was confirmed, sends the resume, receives `409 stale_run`, surfaces the
+server's sentence and calls `refreshTryon()`. That is the regression test for the bug §3 exists to fix,
+and it is the one that fails today. The final wave added its partner: the confirm's-own-clear case, in
+which an accepted confirm moves the stubbed draft to `generation + 1` and empties it exactly as
+`clear()` does, and `canRetryRental` must stay true through it — the assertion that pins I1's removal of
+the client latch, and the one a stateless stub silently could not make.
 
 `Fixtures`/`ModelsTests`/`RunFlowTests`/`BatchComposerTests`: the §6 rename, with the suite count
 unchanged at 249 before this branch's own additions.
