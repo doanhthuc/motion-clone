@@ -418,10 +418,13 @@ No phase remains — Phases 1–6 are implemented in code. Open items, none of t
    stock-watch notifications. Both need a later API slice, not app work.
 4. **Phase 6 follow-ups**: four of the five closed 2026-09-24 by PR #68 — the server-side resume
    latch (the money one), the `MigrateFlow.migrate()` `isDropping` residual, the developer-facing
-   validation copy on the phone, and the `Fixtures.pipelines` `mask` vs `background` mismatch. **Still
-   open:** the `app/` owner coupling `matches(slots:)` depends on, and the `not_found` collision between
-   a stale material and a deleted library entry (both in the follow-ups spec's §1 and §10). Smaller
-   items recorded in that spec and in the plan's handoff checklist: `MigrateSheet` shows no reason while
+   validation copy on the phone, and the `Fixtures.pipelines` `mask` vs `background` mismatch. The
+   fifth pair — the `app/` owner coupling and the `not_found` collision between a stale material and a
+   deleted library entry — closed 2026-09-25 by PR #69 (`seed_not_found`, 404; spec
+   `2026-09-25-seed-not-found-and-owner-coupling-design.md`). It left one small follow-up:
+   `TryonLibraryStore.use` keeps an entry that answered `seed_not_found` in its list, so a second tap
+   shows the same refusal — pre-existing, now distinguishable, could `forget` it the way `delete`'s
+   404 already does. Smaller items recorded in that spec and in the plan's handoff checklist: `MigrateSheet` shows no reason while
    a drop merely disables its button; `RunDetailView.swift`'s now-redundant inner `canRetryRental`; the
    Swift post-confirm fixture having no cross-language pin on `clear()`'s shape; and the stamp write's
    fail-open race. The five uncovered `batch/` state paths were closed the same day (`ac9ab3a`), after a

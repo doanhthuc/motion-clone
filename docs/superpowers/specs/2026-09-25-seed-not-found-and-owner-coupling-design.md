@@ -1,6 +1,6 @@
 # A distinct `seed_not_found` code, and one owner constant
 
-Date: 2026-09-25 · Status: implemented on branch `seed-not-found-owner-constant`, not yet merged · One branch, one PR
+Date: 2026-09-25 · Status: merged 2026-09-25 as PR #69 (`e826935`) and deployed
 
 Two items the Phase 6 follow-ups branch recorded as open and deliberately did not
 take, because that branch allowed itself exactly one `scripts/**` change and it had
@@ -20,9 +20,9 @@ elsewhere in this file.
 | `make ios-build` | exit 0 at `7c97e50`; no tracked files changed by `xcodegen` | 2026-09-25 | Claude (controller) |
 | `motions-studio/setup/scrub-secrets.sh --check` | exit 0 at `7c97e50` | 2026-09-25 | Claude (controller) |
 | `make ios-contract` (live, pre-deploy) | 14/14 against the pre-merge server. The tool does not assert on error codes, so this proves no regression in the wire shapes, not the new `seed_not_found` code | 2026-09-25 | Claude (controller) |
-| VPS pre-merge check (drain / Phase A / lease / migration) | _not yet run_ | | |
-| `deploy-bot` workflow run | _not yet run_ | | |
-| `make ios-contract` (live, post-deploy) | _not yet run_ | | |
+| VPS pre-merge check (drain / Phase A / lease / migration) | clean: no `GPU_INSTANCE_ID`, no `drain.py`/`batch_run.py`, journals untouched since 09-24; the 09-24 handoff's failed `gpu-destroy` cross-checked on RunPod — zero pods | 2026-09-25 | Claude (controller) |
+| `deploy-bot` workflow run | success, run 36041022957 (15 s); VPS at `e826935`, `motion-bot` active | 2026-09-25 | Claude (controller) |
+| `make ios-contract` (live, post-deploy) | 14/14 against `e826935`; same caveat as the pre-deploy row — error codes are not asserted | 2026-09-25 | Claude (controller) |
 
 `make ios-ui-test` is **not** in this list on purpose. Neither change is reachable
 from the zero-spend smoke: it never deletes a library entry that a draft still
