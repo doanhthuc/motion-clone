@@ -426,3 +426,23 @@ in both deploy orders.
   future non-app client would still receive the raw text.
 - §4's reverse direction (a drop starting during a migration) is left open, with the reason stated
   there.
+- **The stamp write is not atomic with the confirm's `clear()`, and the residual race fails open.**
+  `confirm` holds `_bot_locked()`, but `DraftStore` writers take `control.LOCK` instead, and
+  `scripts/httpapi/server.py` contains **zero** BOT_LOCK references — so a phone `PATCH /v1/draft`
+  running concurrently with a confirm takes no lock this code holds. `_changed` is the only place
+  `generation += 1` happens (`drafts.py:277`) and it has four callers — `patch` (`:458`),
+  `add_to_batch` (`:474`), `drop_from_batch` (`:483`) and `clear` (`:490`) — all reachable without
+  BOT_LOCK. `clear()` and the stamp's `runnable()` read are two *separate* `control.LOCK` acquisitions,
+  so a concurrent mutation can land between them and the stamp then records the post-mutation
+  generation, letting a later `resume` through against a draft edited after the confirm.
+
+  Left open deliberately. The window is two adjacent statements with no I/O between them beyond the
+  writes already there; firing it needs a *second* concurrent client, because the phone serialises its
+  own spends (`RunFlow.spend` sets `isBusy`, which drives `canSpend`); and the pre-existing
+  `panel_token()` compare has the identical shape, so closing only this one would buy a guarantee the
+  confirm path as a whole does not have. It is closable if that judgment is ever revisited: `clear()`
+  already returns the generation it persisted, inside its own single `control.LOCK` acquisition
+  (`_view`, `drafts.py:322`), so capturing that value in both accepted branches instead of re-reading
+  would remove the window entirely — at the cost of the one-read-one-write-one-place shape that makes
+  the writer auditable. Recorded 2026-09-24 during Task 2's fix round, after the review understated
+  the exposure as one non-bumping writer and the implementer measured four bumping ones.
