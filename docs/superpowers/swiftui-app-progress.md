@@ -46,7 +46,7 @@ what actually shipped, what was verified, and the next safe boundary.
 | 3 — single New Job | Complete | Catalog-driven pipeline/provider picker, compatible material pickers, server-authoritative draft mutations, validation, add/drop basket entries, stale/error reconciliation | Automated live simulator smoke passes; physical phone is optional coverage |
 | 4 — run flow | Complete in code | `SpendGate`/idempotency ledger, Phase A + try-on previews, regenerate with the closed guidance vocabulary, Keep, the rent panel (RunPod + Vast, out-of-stock), confirm (with the reuse/rerun chooser) and resume, all through `RunFlow`; `make ios-test` (158 tests), `make ios-build`, `make ios-contract` (adds `/tryon` and `/rent-panel`), `make ios-ui-test` (adds `Phase4SmokeTests`, zero-spend via `-UITestRecordingSpendGate`) and `scrub-secrets.sh --check` all pass | `make ios-refusal-smoke` passed live on 2026-09-23 (three bogus-token spends refused with 409, no lease before or after). No live Phase A / regen / confirm / resume has run — no pod has been rented for Phase 4 |
 | 5 — pod and cost | Complete in code | Pod tab: lease card with a quoted cost, kill (fresh key per tap, outside `SpendGate`, followed to `last_kill`), the "pod may still be billing" banner (`destroy_unverified`/`error`, cleared only by acknowledgement or a later successful kill), GPU choice on the Pod tab and the rent panel (re-reads the panel), RunPod balance and on-tap Vast credit, the migration (ask → typed, expiring confirmation → `SpendIntent.migrate` through `SpendGate`), an unanswered migrate on every tab; `make ios-test` (211 tests), `ios-build`, `ios-contract` (adds `gpu/stock`, `balance`), `ios-ui-test` (adds `Phase5SmokeTests`) pass | With no pod leased (2026-09-23): `make ios-ui-test` ran `Phase5SmokeTests` in full and `make ios-refusal-smoke` passed all seven steps. A real Phase A → GPU change → confirm → kill ran once through the app's MotionKit code ($0.012, see §"Real spend test"). No real migration has run |
-| 6 — batch/library | Complete in code | Cross build (Batch mode) with resumable re-planning and per-outfit seeds, the seed badge and its "no longer exists" variant, drop after Phase A with the re-validate and stale-panel clearing, the `!isDropping` guard on every `RunFlow` spend (`MigrateFlow.migrate()` bypasses it), the rental-retry generation latch, the batch progress list, saved try-ons (browse/use/delete) on the Material tab, and the server's read-only `tryon_seed` field. Gates: see "Gate record" below | `make ios-contract` ran live 2026-09-24 (14/14, including the new `GET /v1/tryon-library`), and `make ios-ui-test` passed live the same day (4/4 including `Phase6SmokeTests`, `skipped: 0`, zero recorded spends). **No real batch has run**: the smoke builds its two-outfit batch out of free draft mutations, never rents a pod, never calls Phase A and never reaches a confirm. A 2-outfit batch with one seeded job is still the proposed spend test |
+| 6 — batch/library | Complete in code | Cross build (Batch mode) with resumable re-planning and per-outfit seeds, the seed badge and its "no longer exists" variant, drop after Phase A with the re-validate and stale-panel clearing, the `!isDropping` guard on every `RunFlow` spend, the rental-retry generation latch, the batch progress list, saved try-ons (browse/use/delete) on the Material tab, and the server's read-only `tryon_seed` field. Gates: see "Gate record" below | `make ios-contract` ran live 2026-09-24 (14/14, including the new `GET /v1/tryon-library`), and `make ios-ui-test` passed live the same day (4/4 including `Phase6SmokeTests`, `skipped: 0`, zero recorded spends). **No real batch has run**: the smoke builds its two-outfit batch out of free draft mutations, never rents a pod, never calls Phase A and never reaches a confirm. A 2-outfit batch with one seeded job is still the proposed spend test |
 
 ## What is implemented now
 
@@ -112,12 +112,25 @@ what actually shipped, what was verified, and the next safe boundary.
   not `draft.jobs`. Dropping re-validates the draft and re-reads the previews and rent panel. Every
   `RunFlow` spend is refused while a drop is in flight, because the guard sits in `RunFlow.spend` —
   the single funnel all four entry points go through — and not only in `canConfirm`.
-  `MigrateFlow.migrate()` bypasses it. Run detail shows a per-job batch progress list. The server's
-  draft view reports a read-only `tryon_seed` on the edited job and each basket entry.
-- **A failed rental can only be retried against the draft that was confirmed.** `RunFlow` latches
-  `draft.generation` when a `.confirm` is accepted and `canRetryRental` refuses once the draft moves,
-  because `resume` re-rents the manifest on disk and deliberately never reads the draft. The run
-  detail card stays visible and says why (`retryRentalBlockReason`) instead of losing its button.
+  Run detail shows a per-job batch progress list. The server's draft view reports a read-only
+  `tryon_seed` on the edited job and each basket entry. Since the Phase 6 follow-ups, `MigrateFlow`
+  carries the same guard itself — it calls `gate.perform` directly and so never went through
+  `RunFlow.spend` — with the drop check *ahead* of `canMigrate`, because the reverse order makes the
+  choke point unreachable and the refusal silent. `recheck()` and `replayPendingOnce()` stay unguarded
+  on purpose: they resolve an already-sent request.
+- **A failed rental can only be retried against the draft that was confirmed — and the latch is the
+  server's.** `resume` re-rents the manifest on disk and its gate **compares** only the draft's
+  `generation`; nothing else in the draft feeds the decision. An accepted `confirm` stamps that
+  generation to `batch/tg-<chat_id>.confirmed-generation.json` and `resume` refuses `409 stale_run`
+  when the draft has moved since, so the guard survives an app relaunch. The stamp is read *after* the
+  confirm's own `clear()`, because `clear()` increments the generation — reading before it would refuse
+  every legitimate retry. Fails open when no stamp exists: a Telegram-initiated confirm writes none, and
+  `_do_confirm` must not write one because the app draft is not what a Telegram user reviewed.
+  **The in-memory latch Phase 6 added was removed** (2026-09-24): it held the *pre-clear* generation
+  against the server's *post-clear* stamp, so a draft re-read between an accepted confirm and a Retry
+  tap withheld a retry the server would have granted, with a message naming a recovery the cleared draft
+  made impossible. `retryRentalBlockReason` and `confirmedGeneration` no longer exist; the refusal
+  reaches the run detail card verbatim and the card stays up, because `applyRefusal` never mutates `pod`.
 - **Invariant worth checking, not just stating: every control that writes the draft is gated on
   `composer.isRunning`.** A cross build takes minutes and each step is a `PATCH` whose server-side
   probe can take ~60 s, so a draft write from another tab landing between two steps is merged per role
@@ -309,25 +322,35 @@ tapping the UI on a phone.
   `RunFlow.canDropFromBatch`, and the counter-intuitive part is that it counts **basket entries**
   (`draft.batch.count`), not `draft.jobs`. So a run of 2 jobs built from 1 basket entry plus a
   complete edited job (`draft.jobs == 2`, `batch.count == 1`) shows no Drop at all. **Clear**, on the
-  New Job tab in Single mode, is the only way to remove the last basket entry.
-- Batch mode renders no `Clear` button and no readiness line: Task 8's plan put `editorActions(draft)`
-  (the only `Clear`, `NewJobView.swift:231`) and `readiness(draft)` (`:208`) in the Single arm of
-  `NewJobView.editor` alone, so clearing the draft from Batch mode means switching to Single first.
-  Individual basket entries can still be dropped in Batch mode, and `Validate` renders in both.
-  Plan-mandated and discoverable via the mode switch, but a real papercut — `Phase6SmokeTests` has to
-  switch `newjob.mode` → Single before every `clear(in:)`, which is the evidence it is not theoretical.
-- Follow-up (cannot be fixed on this branch): `ios/MotionKit/Tests/MotionKitTests/Fixtures.pipelines`
-  names `tryon-motion-enhance`'s optional role `mask`, while the live catalog says `background`;
-  `mask` occurs nowhere in `scripts/**` as a role. `Fixtures.swift` cannot be edited here because three
-  suites do exact `.replacingOccurrences` surgery on `Fixtures.draft`'s text (`ModelsTests.swift:230`,
-  `TryonLibraryStoreTests.swift:27`, `DraftStoreTests.swift:399`), so a change can silently break
-  another suite's assertions.
-- Follow-up (needs its own VPS deploy gate): a failed validation reaches the phone as the server's
-  `DraftError("invalid", …)` message verbatim — `APIError.userMessage`'s `default` branch returns it
-  unchanged (`APIError.swift:35`). That message is usually the validator's raw stdout+stderr
-  (path-stripped and truncated, `scripts/control/drafts.py:535,544-548`); only when that output is empty
-  does it fall back to the literal `make batch-validate failed` (`drafts.py:566`, no colon). Either way
-  it is developer-facing copy on a consumer screen. Fixing it is a `scripts/**` change.
+  New Job tab in either mode, is the only way to remove the last basket entry.
+- Closed 2026-09-24 (PR #68): Batch mode has a `Clear`. It was extracted from `editorActions` into one
+  shared `clearAction` rendered in both arms, so the two cannot drift, and `Phase6SmokeTests` no longer
+  switches `newjob.mode` → Single before clearing. `readiness` stays Single-only on purpose: it reports
+  the *edited job*'s required and missing roles, and the Batch arm does not render the edited job — it
+  renders shared slots plus an outfit multi-select, so a "2 of 3 assigned" line there would describe a
+  job the user is not looking at. Batch mode's own readiness is `BatchComposer.canRun`, which the run
+  button's disabled state already shows. The papercut was real, and the evidence that it was real is the
+  two mode switches the smoke used to need; the smoke now clears from Batch directly and asserts the
+  header's `0 jobs` plus the `Character` slot returning to `Missing required`, because `Clear` on the
+  skip path is the only thing that proves the draft was left empty.
+- Closed 2026-09-24 (PR #68): `Fixtures.pipelines` names the optional role `background`, as the catalog
+  does. The recorded blocker did not fire — there are **nine** `.replacingOccurrences` call sites across
+  the test directory (not the six this entry implied, and not the three files it names), and none of
+  their anchors contains `mask`. The ninth is the one that mattered: `RunFlowTests.swift:59-60` builds
+  `draftAfterDelete` from `Routes.draftJSON`'s output, which is the function the rename edited, so a
+  dropped `"validated":true` would have made `draftAfterDelete` silently equal `draftAfterDrop`. The
+  role's *kind* stays the unrecognised `"future_kind"` on purpose — `ModelsTests`' unknown-kind assertion
+  is about the kind, not the name — even though the live catalog reports `"image"` for it.
+- Closed 2026-09-24 (PR #68), and **client-side, so it needed no deploy gate** — the entry above assumed
+  a `scripts/**` change and that assumption was wrong. `APIError.userMessage` now headlines `422 invalid`
+  and a new `detailMessage` keeps the server's raw text for a collapsed `DisclosureGroup` in
+  `ErrorBanner`, `nil` when the text is blank. The server's copy is untouched, which is the point: it is
+  right for Telegram, where the reader has the validator's output above it. This also fixed a fourth
+  variant the entry never listed — `bot.py:6051` returns `Outcome(False, "invalid", "")`, an **empty**
+  message, because `_render_and_validate` already sent the real reason to Telegram. That rendered a red
+  banner with no text in it. `RunFlow.drop()`'s catch shows the headline with no disclosure, correctly:
+  it assigns `apiError(error).userMessage` to a `String`, so the `APIError` is discarded at the
+  assignment.
 - Closed on this branch (money safety): `isDropping` used to gate only Confirm. The guard now sits in
   `RunFlow.spend(_:label:)` — the single funnel `confirm`, `regenerate`, `retryRental` and `choose(_:)`
   all go through — so all four are refused while a drop is in flight, and any spend entry point added
@@ -338,16 +361,19 @@ tapping the UI on a phone.
   between, so the guard cannot deadlock the drop; and `recheck()` / `replayPendingOnce()` call
   `gate.recheck` / `gate.replayPending` directly and never pass through `spend`, so the pending-notice
   machinery is untouched. Both were re-verified in the code, not taken on trust.
-  **Residual:** `MigrateFlow.migrate()` calls `gate.perform` directly, not `RunFlow.spend`, so it is
-  still not `isDropping`-gated. A migration is a volume move, not a draft read, so the exposure is not
-  the same shape; gating it belongs with `MigrateFlow`, not here.
-- Follow-up (needs its own `scripts/**` change and VPS deploy gate): the rental-retry generation latch
-  is client-side, so it lives in the `RunFlow` store and an **app relaunch loses it**, re-opening the
-  window it closes. The durable fix is server-side — give `resume` an optional `generation` and refuse
-  `stale_run` when it does not match, mirroring what `panel_token` already does for `confirm`
-  (`scripts/tgbot/bot.py:6895-6902`). `resume` currently ignores the draft by explicit design
-  (`bot.py:7394-7395`), so this is a deliberate change to that contract, not a bug fix, and it needs
-  the bot's own review.
+  **The residual named here is closed** (2026-09-24, PR #68): `MigrateFlow` now takes a `RunFlow` and
+  guards `!runFlow.isDropping` at both levels. The exposure turned out to be the same shape after all —
+  a drop's two 95 s client timeouts are a window the most destructive call in the API could be launched
+  inside.
+- Closed 2026-09-24 (PR #68) — **but not the way this entry proposed, and the difference matters.** The
+  proposal above was to give `resume` an optional client-sent `generation`. That approach was designed,
+  written up and **rejected**: the client's number is exactly what an app relaunch loses, so sending it
+  would rebuild the bug instead of fixing it, and it would leave every already-installed build
+  unprotected. What shipped is the opposite — the *server* persists the generation when a confirm is
+  accepted and reads the draft's current value itself, so the client sends nothing and no app change is
+  needed for correctness. Do not implement the version described above. Full reasoning, the two rejected
+  approaches and the recorded limits are in
+  `docs/superpowers/specs/2026-09-24-phase-6-follow-ups-design.md` §3 and §10.
 - Follow-up (a latent server-side coupling Phase 6 is the first to depend on): `tryon_save_info`
   hardcodes `f"app/{path.name}"` (`scripts/tgbot/bot.py:7204`), while `scripts/control/materials.py:224`
   builds `f"{owner}/{path.name}"` and `_material_id` returns `"/".join(rel.parts)`
@@ -391,11 +417,15 @@ No phase remains — Phases 1–6 are implemented in code. Open items, none of t
    and a quoted price; cost from the balance delta then `runpodctl billing`; `make gpu-destroy` after.
 3. **Parent spec's deferred items** (`2026-09-22-swiftui-app-design.md` §1): pair (1:1) mode and
    stock-watch notifications. Both need a later API slice, not app work.
-4. **Phase 6 follow-ups** (see "Known incomplete work"): the server-side `generation` check on `resume`
-   that would make the rental-retry latch survive an app relaunch — this is the money one; the
-   `Fixtures.pipelines` `mask` vs `background` mismatch; the server's developer-facing validation
-   message on the phone; the `MigrateFlow.migrate()` `isDropping` residual; and the `app/` owner
-   coupling `matches(slots:)` depends on.
+4. **Phase 6 follow-ups**: four of the five closed 2026-09-24 by PR #68 — the server-side resume
+   latch (the money one), the `MigrateFlow.migrate()` `isDropping` residual, the developer-facing
+   validation copy on the phone, and the `Fixtures.pipelines` `mask` vs `background` mismatch. **Still
+   open:** the `app/` owner coupling `matches(slots:)` depends on, and the `not_found` collision between
+   a stale material and a deleted library entry (both in the follow-ups spec's §1 and §10). Smaller
+   items recorded in that spec and in the plan's handoff checklist: `MigrateSheet` shows no reason while
+   a drop merely disables its button; `RunDetailView.swift`'s now-redundant inner `canRetryRental`; the
+   Swift post-confirm fixture having no cross-language pin on `clear()`'s shape; the stamp write's
+   fail-open race; and five `batch/` state paths `.gitignore` still does not cover.
 
 Required safety behavior carries over unchanged from Phase 4: one UUID key per tap and never mint a new
 one to retry an earlier spend intent; disable the active button and show its quote while in flight;

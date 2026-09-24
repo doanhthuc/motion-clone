@@ -87,6 +87,25 @@ batch/*.ledger.json
 # siblings from the atomic write are already caught by `batch/*.tmp`.
 batch/*.last-kill.json
 batch/*.confirmed-generation.json
+# Three more per-chat records with the same shape and the same hazard, found
+# 2026-09-24 while verifying the PR #68 deploy: `git status` on the VPS showed
+# tg-<chat_id>.gpusubs.json and tg-<chat_id>.handoff.json untracked, in a public
+# repo, with a Telegram chat id in the filename. `.gpusubs.json` is
+# bot.py:4338; `.handoff.json` is batchlib_ext/handoff.py:30 and inherits the
+# chat id from the manifest name rather than a literal, which is why grepping
+# for `tg-{chat_id}` does not find it. `.provision-failed.json`
+# (batchlib_ext/provision_failure.py:16) is transient — clear_provision_failure
+# consumes it — but it exists exactly when a rental has failed, which is when
+# someone is most likely to be poking at the tree. `migrate-resume.json` and the
+# `idempotency/` directory carry no chat id (idempotency keys are sha256-hashed
+# at control/idempotency.py:34) but are machine state all the same. Enumerated
+# by listing every `batch/` path the code constructs and running
+# `git check-ignore` on each, rather than by reading this file's patterns.
+batch/*.gpusubs.json
+batch/*.handoff.json
+batch/*.provision-failed.json
+batch/migrate-resume.json
+batch/idempotency/
 
 # IDE junk — repo public, config cá nhân không vào đây (cùng lý do .DS_Store)
 .idea/
