@@ -1588,4 +1588,21 @@ Not tasks — these need a human decision or shared-state access, and the execut
 5. **Post-deploy `make ios-contract`.** 14/14, and confirm a resume refusal still decodes. Record it as a separate gate row from the pre-deploy run.
 6. **Amend `docs/superpowers/swiftui-app-progress.md`.** Replace the four follow-up entries this closes with what shipped; the `MigrateFlow` residual loses its "Residual" qualifier; the Batch-mode `Clear` papercut entry goes; "Next work" is rewritten; the gate record gains this branch's rows. The `Phase6SmokeTests` "switch to Single before clearing" evidence in §"Notes on the `make ios-ui-test` run" is now historical — re-word it, do not delete it, because it was the proof the papercut was real. Two items stay open and must remain recorded: the `not_found` collision (spec §1) and the `app/` owner coupling (spec §10).
 
-   **Correct the handoff's description of what was built, do not just mark it done.** `swiftui-app-progress.md:344-348` proposes "give `resume` an optional `generation` and refuse `stale_run` when it does not match" — that is approach **A2**, which spec §3 explicitly *rejected*, because the client's number is exactly what an app relaunch loses, so it rebuilds the bug instead of fixing it. What shipped is the opposite: the server persists the generation at the accepted confirm and reads the draft's current value itself, so the client sends nothing. Rewriting that entry as "done" without saying so would leave a rejected design sitting in the durable handoff as the recorded shape of the fix, where the next person could implement it and reintroduce the relaunch hole. Also note `:394` repeats the item in the "Next work" list.
+   **Correct the handoff's description of what was built, do not just mark it done.** `swiftui-app-progress.md:344-348` proposes "give `resume` an optional `generation` and refuse `stale_run` when it does not match" — that is approach **A2**, which spec §3 explicitly *rejected*, because the client's number is exactly what an app relaunch loses, so it rebuilds the bug instead of fixing it. What shipped is the opposite: the server persists the generation at the accepted confirm and reads the draft's current value itself, so the client sends nothing. Rewriting that entry as "done" without saying so would leave a rejected design sitting in the durable handoff as the recorded shape of the fix, where the next person could implement it and reintroduce the relaunch hole.
+
+   Task 8's implementer swept the whole file rather than relying on the (broken) verification grep, and
+   tabled **seven** stale lines carrying three distinct claims. Locate each by content, not by number —
+   the handoff is a living doc and these were recorded at `1eb0867`:
+
+   | Line | Claim it makes that is now false |
+   |---|---|
+   | `:49` | the `MigrateFlow` bypass |
+   | `:115` | the `MigrateFlow` bypass |
+   | `:315` | the Batch-mode `Clear` papercut |
+   | `:317` | the Batch-mode `Clear` papercut |
+   | `:341` | the client-only latch |
+   | `:344-346` | the client-only latch, **and the rejected approach A2** |
+   | `:395` | the client-only latch, repeated in the "Next work" list |
+
+   Replace all seven with what shipped. The `:344-346` entry is the one that must be *rewritten* rather
+   than deleted, for the reason given above.
