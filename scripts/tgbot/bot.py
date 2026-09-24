@@ -7275,6 +7275,73 @@ def _load_kill_result(chat_id: int) -> dict | None:
     return raw if isinstance(raw, dict) else None
 
 
+# The refusal sentence, one literal: the app's pre-tap copy in
+# RunFlow.retryRentalBlockReason says the same thing, and a test on each side
+# asserts this string rather than a paraphrase of it.
+RESUME_STALE_GENERATION = ("the draft changed since this rental was confirmed — "
+                           "Confirm again to rent what is in the draft now")
+
+
+def _confirm_stamp_path(chat_id: int) -> Path:
+    """Where the generation an app confirm was accepted at survives a bot
+    restart, for `resume` to compare the draft against.
+
+    `_run_token` alone cannot do this job: it is the manifest's mtime_ns
+    (`_manifest_token`), which moves only when a manifest is *rewritten*, and a
+    draft edit rewrites nothing. That is why `panel_token` joins the generation
+    for `confirm` — and why `resume`, which re-rents the manifest on disk and
+    deliberately never reads the draft, had no equivalent. Without this stamp
+    the only latch was `RunFlow.confirmedGeneration` in the app's memory, which
+    an app relaunch loses (2026-09-24 follow-ups spec §3).
+    """
+    return ROOT / "batch" / f"tg-{chat_id}.confirmed-generation.json"
+
+
+def _save_confirm_stamp(chat_id: int, generation: int) -> None:
+    path = _confirm_stamp_path(chat_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps({"generation": generation}), encoding="utf-8")
+    tmp.replace(path)   # atomic: a reader never sees a half-written stamp
+
+
+def _load_confirm_stamp(chat_id: int) -> int | None:
+    """None means "no stamp to honour" — including a corrupt file, for
+    `_load_kill_result`'s reason: a bad answer here must not take the route
+    down, and the caller fails open (see _resume_generation_refusal)."""
+    try:
+        raw = json.loads(_confirm_stamp_path(chat_id).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    generation = raw.get("generation") if isinstance(raw, dict) else None
+    return generation if isinstance(generation, int) else None
+
+
+def _resume_generation_refusal(chat_id: int, drafts: DraftStore) -> str | None:
+    """Why `resume` must not re-rent, or None when it may.
+
+    Fails OPEN when there is no stamp: a Telegram-initiated confirm writes
+    none, and `_do_confirm` must not write one because it is shared with the
+    Telegram flow, where the app's draft is not what the user reviewed. So this
+    covers app-initiated confirms only — the same population the app's own
+    in-memory latch covered, moved where a relaunch cannot lose it.
+
+    Comparing generations rather than draft contents is what makes this work at
+    all: `confirm` clears the draft on acceptance (both branches), so a
+    content comparison like `_phase_a_matches_draft` would answer False always
+    and Retry rental would never fire. `clear()` preserves the generation
+    (drafts.py:485-489) and `validate()` does not bump it (drafts.py:555), so
+    neither the confirm's own clear nor a re-validate trips this — and the
+    counter only rises, so a stale stamp can never match again by accident.
+    """
+    confirmed = _load_confirm_stamp(chat_id)
+    if confirmed is None:
+        return None
+    if drafts.runnable()[2] == confirmed:
+        return None
+    return RESUME_STALE_GENERATION
+
+
 class AppPod:
     """The pod-side calls the phone can make (spec §5.9): stop what is
     running, and retry a rental that already failed once.
@@ -7285,8 +7352,8 @@ class AppPod:
     while a real outcome still posts to the Telegram chat that owns the slot.
     """
 
-    def __init__(self, tg: Tg, chat_id: int, idem: IdempotencyStore):
-        self.tg, self.chat_id, self.idem = tg, chat_id, idem
+    def __init__(self, tg: Tg, chat_id: int, drafts: DraftStore, idem: IdempotencyStore):
+        self.tg, self.chat_id, self.drafts, self.idem = tg, chat_id, drafts, idem
         # The kill's answer, for GET /v1/pod to poll: the request itself only
         # ever gets a 202 (see kill()). Loaded from disk, not always None: a
         # bot restart rebuilds this instance from scratch (systemd
@@ -7387,12 +7454,20 @@ class AppPod:
         """Retry a rental that already failed — `_do_resume`, the same body
         the recovery buttons reach.
 
-        Two gates the Telegram buttons get for free from being drawn only
-        under a failure card: an outstanding `provision-failed.json` (without
-        it, "resume" on a finished batch rents a pod to do nothing) and the
-        run's current token (the manifest must not have changed since the
-        phone read it). The app's draft is deliberately left alone — a resume
-        is about a manifest that was confirmed long ago.
+        Three gates. Two are the ones the Telegram buttons get for free from
+        being drawn only under a failure card: an outstanding
+        `provision-failed.json` (without it, "resume" on a finished batch rents
+        a pod to do nothing) and the run's current token (the manifest must not
+        have changed since the phone read it). The third is the confirm stamp —
+        the draft must not have changed since the confirm that wrote this
+        manifest, which no Telegram button needs because Telegram's recovery
+        buttons are redrawn on every manifest write and so cannot go stale the
+        way a phone screen left open can. Fails open when no app confirm ever
+        wrote one; see _resume_generation_refusal.
+
+        The app's draft is deliberately left alone — a resume is about a
+        manifest that was confirmed long ago. Reading its generation is not
+        reading the draft's contents.
         """
         if run_id != self.run_id:
             return 404, _run_error("not_found", "no such run")
@@ -7413,6 +7488,11 @@ class AppPod:
             if body.get("run_token") != _run_token(self.chat_id):
                 out = Outcome(False, "stale_run",
                               "the run changed since it was read — read it again")
+            elif (stale := _resume_generation_refusal(self.chat_id, self.drafts)) is not None:
+                # The second of two staleness rules, kept adjacent to the first
+                # so they read as one idea: `run_token` catches a rewritten
+                # manifest, this catches a draft that moved without one.
+                out = Outcome(False, "stale_run", stale)
             elif read_provision_failure(provision_failure_path(manifest_path)) is None:
                 out = Outcome(False, "no_failure",
                               "no failed rental to retry for this run")
@@ -7786,7 +7866,7 @@ def _start_control_api(tg: Tg, chat_id: int):
         # One AppPod for the life of the process, sharing AppRuns's store: the
         # migrate confirm token is held on the instance, so building one per
         # request would void every token before the phone could use it.
-        server.app_pod = AppPod(tg, chat_id, idem)
+        server.app_pod = AppPod(tg, chat_id, server.drafts, idem)
         start_in_thread(server)
     except (OSError, ValueError, RuntimeError) as exc:
         # RuntimeError: the OS refused to create the daemon thread (e.g. a
