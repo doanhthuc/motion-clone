@@ -2,13 +2,28 @@
 
 Date: 2026-09-23 · Status: implemented on the unmerged branch `feat/swiftui-phase-6`
 
-Gates that ran on the worktree (2026-09-24): `make ios-build` exit 0; the UI-test target compiled
-(`xcodebuild build-for-testing` exit 0, `Phase6SmokeTests.o` produced, no simulator booted);
-`cd ios/MotionKit && swift test` 244 tests in 23 suites; `scrub-secrets.sh --check` exit 0. Pending the
-controller run, **not** passed here: `make ios-contract` (the 14th route, `GET /v1/tryon-library`,
-expected 14/14) and `make ios-ui-test` (`Phase6SmokeTests`, live and zero-spend). No real batch has run
-— a 2-outfit batch with one seeded job is the proposed spend test (§8) and needs its own approval and
-quoted price.
+### Gate record
+
+Append-only: add a row, do not restate a result in prose elsewhere. "Ran by" distinguishes the
+implementer's worktree gates from the controller's live ones.
+
+| Gate | Result | Date | Ran by |
+|---|---|---|---|
+| `make ios-build` | exit 0 (compiles `MotionApp` only) | 2026-09-24 | implementer, then the final fix wave |
+| `xcodebuild … build-for-testing` | exit 0, `Phase6SmokeTests.o` produced, no simulator booted | 2026-09-24 | implementer, then the final fix wave |
+| `cd ios/MotionKit && swift test` | 249 tests in 23 suites, exit 0 | 2026-09-24 | final fix wave (244 before it) |
+| `motions-studio/setup/scrub-secrets.sh --check` | exit 0 | 2026-09-24 | implementer, then the final fix wave |
+| `make ios-contract` | **14/14 ok, exit 0**, live against the VPS | 2026-09-24 | controller |
+| `make batch-test` | exit 0, `OK (skipped=1)` | 2026-09-24 | controller |
+| `make ios-ui-test` | **pending — has not run**; `Phase6SmokeTests` has never executed | — | — |
+
+The `ios-contract` run is also the live proof of the deploy-order property §3 claims but could not
+evidence until now: the server had *not* been deployed with §3's `tryon_seed` field, and
+`GET /v1/draft` still decoded, because the app reads the field as optional. The same run covers the
+14th route, `GET /v1/tryon-library` decoding `TryonLibraryResponse`.
+
+No real batch has run — a 2-outfit batch with one seeded job is the proposed spend test (§8) and needs
+its own approval and quoted price.
 
 This spec refines Phase 6 of `docs/superpowers/specs/2026-09-22-swiftui-app-design.md` (§3 "New
 batch, Bulk try-on", "Saved try-ons", §5 row 6). Phases 1–5 are shipped
@@ -122,8 +137,10 @@ screen, unchanged. Batch:
 
 On each `TryonPreviewCard` in `RunFlowView`:
 
-- **"Drop from batch"** appears when the batch has ≥ 2 jobs and Phase A is not running. Hidden for
-  the last remaining job (Clear covers that).
+- **"Drop from batch"** appears when the **basket has ≥ 2 entries** (`draft.batch.count`, *not*
+  `draft.jobs`) and Phase A is not running — gated by `RunFlow.canDropFromBatch`, which is the
+  authority for the full condition. Hidden for the last remaining entry (Clear covers that), so a run
+  of 2 jobs built from 1 basket entry plus a complete edited job shows no Drop at all.
 - The digest comes from `preview.run == DraftBatchEntry.runID` in a fresh `GET /v1/draft`. No match
   → the button is disabled with "Draft changed — reload".
 - Disabled while an outstanding spend is unanswered (`flow.canSpend == false`), so the draft never
