@@ -337,6 +337,60 @@ extension URLProtocolTests {
         #expect(!store.needsMaterialsRefresh)
     }
 
+    @Test func deletedSeedDoesNotRefreshMaterialsOrRereadTheDraft() async {
+        StubURLProtocol.install { request in
+            request.url?.path == "/v1/pipelines"
+                ? TestSupport.json(Fixtures.pipelines)
+                : TestSupport.json(Fixtures.draft)
+        }
+        let store = DraftStore(client: TestSupport.client())
+        await store.load()
+        StubURLProtocol.install { request in
+            if request.httpMethod == "PATCH" {
+                return TestSupport.json(
+                    #"{"error":{"code":"seed_not_found","message":"no such try-on library entry: s1"}}"#,
+                    status: 404)
+            }
+            return TestSupport.json(draftResponse(generation: 6))
+        }
+
+        let ok = await store.apply(DraftPatch(slots: ["outfit": "app/o.png"], seed: .set("s1")))
+
+        #expect(!ok)
+        #expect(!store.needsMaterialsRefresh)
+        // The server resolves the seed above its lock and writes nothing, so
+        // there is no ambiguity to re-read: the PATCH is the only request.
+        #expect(StubURLProtocol.requests.map(\.httpMethod) == ["PATCH"])
+        #expect(store.draft?.generation == 4)
+        #expect(store.message == "That saved try-on no longer exists.")
+    }
+
+    @Test func goneMaterialOnTheSameSeedPatchStillRefreshesMaterials() async {
+        StubURLProtocol.install { request in
+            request.url?.path == "/v1/pipelines"
+                ? TestSupport.json(Fixtures.pipelines)
+                : TestSupport.json(Fixtures.draft)
+        }
+        let store = DraftStore(client: TestSupport.client())
+        await store.load()
+        StubURLProtocol.install { request in
+            if request.httpMethod == "PATCH" {
+                return TestSupport.json(
+                    #"{"error":{"code":"not_found","message":"no such material: app/o.png"}}"#,
+                    status: 404)
+            }
+            return TestSupport.json(draftResponse(generation: 6))
+        }
+
+        let ok = await store.apply(DraftPatch(slots: ["outfit": "app/o.png"], seed: .set("s1")))
+
+        #expect(!ok)
+        #expect(store.needsMaterialsRefresh)
+        #expect(StubURLProtocol.requests.map(\.httpMethod) == ["PATCH", "GET"])
+        #expect(store.draft?.generation == 6)
+        #expect(store.message == "no such material: app/o.png")
+    }
+
     @Test func catalogContractErrorKeepsTheReturnedDraft() async {
         StubURLProtocol.install { request in
             if request.url?.path == "/v1/pipelines" {

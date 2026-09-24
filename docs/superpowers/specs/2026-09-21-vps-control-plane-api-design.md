@@ -225,11 +225,16 @@ A mobile client retries. A duplicated `confirm` must never become a second pod.
 | Code | When |
 |---|---|
 | `401` | Missing or wrong bearer token |
-| `404` | Unknown id, or a path outside its root |
+| `404` | Unknown id, or a path outside its root. A draft PATCH whose `tryon_seed` names a deleted library entry is `404 seed_not_found`, distinct from a gone material's `404 not_found` |
 | `409` | World-state refusal: migration in progress, a run already live, Phase A still running, stale `panel_token`, material in use |
 | `502` | `runpodctl` (or another upstream) could not answer a read the app asked for — never for a spend or a kill |
 | `422` | Draft refusal: missing slots, validation failed, unanswered files |
 | `500` | Unexpected exception — logged, and **never** propagated into the bot's poll loop |
+
+*Amended 2026-09-25:* domain error codes map to statuses through `_DOMAIN_STATUS` in
+`scripts/httpapi/server.py`, and **an unmapped code becomes `400`** — so a new code needs a table
+entry, not just a raise. `seed_not_found` was added this way; see
+`2026-09-25-seed-not-found-and-owner-coupling-design.md`.
 
 ### 5.7 Progress on the phone
 

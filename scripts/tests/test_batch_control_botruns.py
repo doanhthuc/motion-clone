@@ -15,6 +15,7 @@ from batchlib.manifest import load_manifest, load_state, save_state, state_path_
 from batchlib_ext.gpu_stock import Stock
 from batchlib_ext.handoff import mailbox_path
 import control.drafts as drafts
+from control import materials
 from control.idempotency import IdempotencyStore
 from control.tryon_library import TryonLibrary
 from control.runs import Outcome
@@ -1198,6 +1199,31 @@ class TestTryonVersionImage(_AppRunsFixture):
         # run_id in the URL must 404, never a real (wrong-context) image.
         self._seed_tryon_run_with_version()
         self.assertIsNone(self.runs.tryon_version_image("not-the-run-id", "0", "1"))
+
+
+class TestTryonSaveInfoMaterialIds(_AppRunsFixture):
+    """tryon_save_info builds a saved try-on's material_ids by hand, without
+    stat-ing (a past run's inputs may be gone). Pinned against material_item —
+    a second, independent builder of the same id — so the two cannot drift.
+    Patching APP_OWNER and checking both moved would pass vacuously: both
+    sides read the same constant."""
+
+    def test_material_ids_match_material_item(self):
+        job = self._tryon_job()
+        manifest = self._write_live_manifest(job)
+        run = manifest.runs[0]
+        image = self.root / "out" / "batch1" / "runs" / run.id / "01-tryon.png"
+        image.parent.mkdir(parents=True, exist_ok=True)
+        image.write_bytes(b"img")
+        self._write_journal(run.id, tryon={"status": "done", "file": str(image)})
+
+        info = self.runs.tryon_save_info("0")
+        self.assertIsNotNone(info)
+        _image, material_ids, _provider = info
+        expected = {role: materials.material_item(materials.APP_OWNER, path)["id"]
+                    for role, path in run.inputs.items() if role != "driver"}
+        self.assertTrue(expected)
+        self.assertEqual(material_ids, expected)
 
 
 class TestNoAbsolutePaths(_AppRunsFixture):

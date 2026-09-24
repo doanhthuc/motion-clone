@@ -20,6 +20,7 @@ import control.runs as runs
 import tgbot.run as run_mod
 import httpapi.files as files_module
 from httpapi.files import parse_range
+import httpapi.server as server_module
 from httpapi.server import ApiError, _Handler, make_server, start_in_thread
 from tgbot.ingest import Probe
 
@@ -760,6 +761,7 @@ class TestDraftRoutes(HttpWriteBase):
             ("PATCH", "/v1/draft", {"pipeline": "nope"}, 422, "unknown_pipeline"),
             ("PATCH", "/v1/draft", {"slots": {"driver": "app/me.png"}}, 422, "wrong_kind"),
             ("PATCH", "/v1/draft", {"slots": {"character": "app/none.png"}}, 404, "not_found"),
+            ("PATCH", "/v1/draft", {"tryon_seed": "nope"}, 404, "seed_not_found"),
             ("PATCH", "/v1/draft", {"hat": 1}, 400, "bad_request"),
             ("POST", "/v1/draft/add-to-batch", None, 422, "missing_slots"),
             ("DELETE", "/v1/draft/batch/0000000000", None, 404, "not_found"),
@@ -769,6 +771,11 @@ class TestDraftRoutes(HttpWriteBase):
             with self.subTest(method=method, path=path, body=body):
                 status, got = self.request(method, path, body)
                 self.assertEqual((status, got["error"]["code"]), (want_status, want_code))
+
+    def test_seed_not_found_is_mapped_to_404(self):
+        # An unmapped DraftError code falls through to _DOMAIN_STATUS.get(code, 400),
+        # so a missing table entry would silently turn this 404 into a 400.
+        self.assertEqual(server_module._DOMAIN_STATUS["seed_not_found"], 404)
 
     def test_draft_etag_is_stable_between_polls(self):
         resp, _ = self.send("GET", "/v1/draft")

@@ -60,6 +60,10 @@ deleted library entry (needs a distinct server code and its own review); the `ap
 stock-watch); and any live spend. **No pod is rented and no try-on provider is called by anything in
 this spec.**
 
+*Amended 2026-09-25:* the `not_found` collision and the `app/` owner coupling were both closed on
+their own branch — see `2026-09-25-seed-not-found-and-owner-coupling-design.md`. The paragraph
+above stays because it records why this branch could not take them.
+
 ## 2. What the server does today (read 2026-09-24)
 
 Four facts constrain §3, and each was read rather than assumed. Two of them contradict the obvious

@@ -44,6 +44,10 @@ _DOMAIN_STATUS = {"bad_request": 400, "forbidden": 403, "not_found": 404, "in_us
                   # try-on does not run locally: a semantic no, like its
                   # siblings above — without this it fell through to 400.
                   "not_local": 422,
+                  # DraftStore.patch's tryon_seed naming a library entry that was
+                  # deleted: 404 like not_found, but its own code so the phone
+                  # does not mistake it for a stale material and reload them.
+                  "seed_not_found": 404,
                   "duplicate": 422, "nothing_to_validate": 422, "invalid": 422}
 MAX_JSON_BODY = 64 * 1024
 # A body this size or smaller is read and thrown away to keep the connection
