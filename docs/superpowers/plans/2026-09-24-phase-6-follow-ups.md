@@ -1343,9 +1343,12 @@ Co-Authored-By: Qwen Code <noreply@qwen.com>"
 
 **Files:**
 - Modify: `docs/superpowers/specs/2026-09-21-vps-control-plane-api-design.md` — §5.9's "`resume` is for a failed rental only" bullet (`:285-291`)
-- Modify: `docs/superpowers/specs/2026-09-24-phase-6-follow-ups-design.md` — the gate record
+- Modify: `docs/superpowers/specs/2026-09-24-phase-6-follow-ups-design.md` — the Status line, and one new line about citation drift
+- Modify: `ios/README.md` — the "Retry rental is latched to the draft that was confirmed" bullet (`:185-190`)
 
 **Interfaces:** none. Docs only.
+
+`ios/README.md` was added to this task by controller ruling after Task 3's review found it: no task in the original plan owned that file, so the branch would have merged with the README describing the shipped fix as future work. Do not edit `docs/superpowers/swiftui-app-progress.md` — Global Constraints reserve it for after the merge.
 
 - [ ] **Step 1: Amend §5.9 in place**
 
@@ -1394,13 +1397,48 @@ Date: 2026-09-24 · Status: implemented on `feat/phase-6-follow-ups`, gates not 
 
 Leave the gate-record table alone. Task 9 fills it — the gates have not run yet at this point, and writing a result before the command that produces it is how a false claim gets into a durable doc. Task 9 Step 6 also flips this Status line to its final wording.
 
-- [ ] **Step 3: Commit**
+Then add one line to the spec, immediately under its Status line at the top of the file:
+
+```markdown
+Line-number citations of `scripts/tgbot/bot.py` in §2 and §3 are as of `fd8464b`, before implementation. Tasks 1 and 2 inserted roughly 120 lines into that file, nearly all above `:7040`, so every citation pointing below it has drifted — `:7413` for the `run_token` check and `_kill_result_path` at `:7247-7274` among them. Read by symbol name (`AppPod.resume`, `_kill_result_path`); the names did not move. Code comments are held to a stricter standard and were corrected as each task touched them.
+```
+
+- [ ] **Step 3: Correct `ios/README.md`**
+
+The bullet at `ios/README.md:185-190` currently ends:
+
+```markdown
+  (`retryRentalBlockReason`). The latch is in memory, so an app relaunch clears it; the durable fix is
+  a server-side `generation` check on `resume`.
+```
+
+That describes this branch's headline change as future work. Replace those two lines with what shipped:
+
+```markdown
+  (`retryRentalBlockReason`). Since 2026-09-24 the durable half is server-side: an accepted confirm
+  stamps the draft's `generation` (`tg-<chat>.confirmed-generation.json`) and `resume` refuses
+  `409 stale_run` when the draft has moved, so a relaunch no longer clears the guard. The in-memory
+  latch stays as the pre-tap copy — it says why before the tap and costs nothing. It fails open after a
+  relaunch, and the server is what covers that case.
+```
+
+Check the surrounding bullet's tense and style before writing, and keep the README's own voice — it is a shipped-feature reference, not a changelog, so state what is true now rather than narrating the change. Do not touch any other bullet in that file.
+
+Then verify nothing else in the tracked tree still calls this future work:
+
+Run: `cd "$REPO" && grep -rn "durable fix is a server-side\|in memory, so an app relaunch" --include=*.md . | grep -v "^./.superpowers"`
+
+Expected: only `docs/superpowers/swiftui-app-progress.md`, which Global Constraints reserve for after the merge. Any other hit is a doc this plan never inventoried — report it rather than fixing it silently.
+
+- [ ] **Step 4: Commit**
 
 ```bash
 cd "$REPO"
 motions-studio/setup/scrub-secrets.sh --check
-git add docs/superpowers/specs/2026-09-21-vps-control-plane-api-design.md docs/superpowers/specs/2026-09-24-phase-6-follow-ups-design.md
+git add docs/superpowers/specs/2026-09-21-vps-control-plane-api-design.md docs/superpowers/specs/2026-09-24-phase-6-follow-ups-design.md ios/README.md
 git commit -m "docs(api): resume's third gate, the confirm stamp" -m "Amended in place, as each slice has. No route and no field changed, which is why both deploy orders are safe and the route table at 5.2 does not move.
+
+ios/README.md described the server-side latch as future work; it shipped on this branch. Added by controller ruling after Task 3's review found that no task owned the file.
 
 Co-Authored-By: Qwen Code <noreply@qwen.com>"
 ```
