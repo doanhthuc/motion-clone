@@ -252,9 +252,11 @@ def _resume_generation_refusal(chat_id: int, drafts: DraftStore) -> str | None:
     Comparing generations rather than draft contents is what makes this work at
     all: `confirm` clears the draft on acceptance (both branches), so a
     content comparison like `_phase_a_matches_draft` would answer False always
-    and Retry rental would never fire. `clear()` preserves the generation
-    (drafts.py:485-489) and `validate()` does not bump it (drafts.py:555), so
-    neither the confirm's own clear nor a re-validate trips this — and the
+    and Retry rental would never fire. `clear()` counts the generation UP by
+    one (`_changed`, drafts.py:275-279) rather than resetting it, and the
+    writer stamps after the clear (AppRuns.confirm's `if out:`), so the
+    confirm's own clear is already accounted for; `validate()` does not bump it
+    (drafts.py:555), so a re-validate does not trip this either — and the
     counter only rises, so a stale stamp can never match again by accident.
     """
     confirmed = _load_confirm_stamp(chat_id)
@@ -347,6 +349,21 @@ Co-Authored-By: Qwen Code <noreply@qwen.com>"
 
 ### Task 2: Server — an accepted confirm writes the stamp
 
+> **CORRECTION, found during this task's implementation (2026-09-24).** Step 3 below instructs the
+> implementer to read the generation near the top of the locked block, on the stated ground that
+> "`clear()` preserves the generation, so reading it anywhere inside that block gives the same
+> number." **That ground is false.** `clear()` (`drafts.py:485-490`) seeds `_fresh` with the current
+> number and then returns through `_changed`, which does `generation += 1` — it increments. Measured:
+> two clears on a fresh store give 0 → 1 → 2. Following Step 3 literally stamps `G` while the confirm
+> leaves the draft at `G+1`, so `_resume_generation_refusal` refuses **every** legitimate app Retry
+> rental. Fail-closed, so never a wrong spend, but the feature would be silently dead for every user.
+>
+> **The correct placement is inside the `if out:` block, after both `clear()` calls** — still one
+> read, one write, one place, still under `BOT_LOCK`. That is what shipped. Spec §2 and §3 carry the
+> corrected fact and the reasoning; Task 1's `_resume_generation_refusal` docstring repeated the false
+> claim and was corrected in the same commit. The trap-catcher test in Step 1 below is corrected in
+> place, because it is the one a re-runner would copy.
+
 **Files:**
 - Modify: `scripts/tgbot/bot.py` — `AppRuns.confirm` (`:6998-7048`)
 - Test: `scripts/tests/test_batch_control_botruns.py` — append to the `AppRuns.confirm` test class
@@ -388,20 +405,30 @@ Append to the `AppRuns.confirm` test class in `scripts/tests/test_batch_control_
         do_resume.assert_called_once()
         self.assertEqual(bot._load_confirm_stamp(ME), before)
 
-    def test_the_confirms_own_clear_leaves_the_generation_so_a_retry_is_allowed(self):
-        """The trap in spec §2, pinned. `confirm` clears the draft on acceptance
-        (bot.py:7029 and :7039), so if `clear()` ever started resetting the
-        generation the stamp would mismatch immediately and Retry rental would
-        break for every user — with every other gate still green. `clear()`
-        preserves it today (drafts.py:485-489)."""
+    def test_the_confirms_own_clear_leaves_the_stamp_matching_the_draft_so_a_retry_is_allowed(self):
+        """The trap in spec §2, pinned from both sides. `confirm` clears the
+        draft on acceptance (bot.py:7029 and :7039) and `clear()` INCREMENTS the
+        generation (drafts.py:485-490, via `_changed`) — so the stamp matches
+        only if it is read after the clears. Seeded from 7, never from 0: from 0
+        a reset and a no-op are the same number and this would pass under a
+        broken `clear()` too. Asserted through the real predicate rather than as
+        a bare number comparison, so a future change to either half fails here
+        instead of silently breaking Retry rental for every user."""
         self._seed_draft()
-        before = self.store.runnable()[2]
+        d = self.store._load()
+        d.generation = 7
+        self.store._save(d)
+        # `_body()` reads `panel_token()`, which carries the generation — so it
+        # must be evaluated after the seeding above, not before it.
         with mock.patch("tgbot.bot._do_confirm",
                         return_value=Outcome(True, "started")):
             self.assertEqual(self.runs.confirm(self.runs.run_id, self._body(), "k3")[0], 202)
         self.assertEqual(self.store.runnable()[0], [])    # the draft really is empty
-        self.assertEqual(self.store.runnable()[2], before)  # ...and the counter did not move
-        self.assertEqual(bot._load_confirm_stamp(ME), before)
+        self.assertEqual(self.store.runnable()[2], 8)     # ...and clear() counted it up
+        self.assertEqual(bot._load_confirm_stamp(ME), 8)  # the stamp followed it
+        # The assertion that matters: through the predicate `resume` actually
+        # uses, not a number comparison that could hold while the gate refuses.
+        self.assertIsNone(bot._resume_generation_refusal(ME, self.store))
 
     def test_a_refused_confirm_stamps_nothing(self):
         self._seed_draft()
@@ -460,34 +487,33 @@ Expected: FAIL — `AssertionError: None != 4` on the stamp assertions (nothing 
 
 - [ ] **Step 3: Write the stamp into `AppRuns.confirm`**
 
-In `AppRuns.confirm`, immediately after the `busy` early-return inside the `with self._locked() as busy:` block (`:7009-7012`), read the generation once:
-
-```python
-            if busy is not None:
-                self.idem.forget("confirm", key)
-                return busy
-            # Read once, under the lock. This is the generation the accepted
-            # `panel_token` certified — `panel_token()` is
-            # f"{_run_token}.{generation}" (:6895-6903) and the comparison below
-            # has just proved the caller holds that exact string. Nothing in
-            # this block can change it: the only draft mutation here is clear(),
-            # which preserves the counter (drafts.py:485-489).
-            generation = self.drafts.runnable()[2]
-```
-
-Then in the existing `if out:` that builds the response (`:7040`), stamp before building it:
+In `AppRuns.confirm`, at the existing `if out:` that builds the 202 response (`:7040`) — **after** both `self.drafts.clear()` calls — read the generation and stamp it in one place:
 
 ```python
             if out:
                 # Accepted, so this is the generation the user agreed to spend
-                # on — the value `resume` compares the draft against later. Both
-                # accepted branches clear the draft above and neither is reached
-                # on a refusal, so one write here covers both and nothing else.
-                _save_confirm_stamp(self.chat_id, generation)
+                # on — the value `resume` compares the draft against later.
+                # Both accepted branches clear the draft above and neither is
+                # reached on a refusal, so one read and one write here covers
+                # both and nothing else.
+                #
+                # Read HERE, after the clears, and not before them: `clear()`
+                # routes through `_changed`, which does `generation += 1`
+                # (drafts.py:275-279), so a pre-clear read stamps G while the
+                # confirm leaves the draft at G+1 — `_resume_generation_refusal`
+                # would then refuse every app Retry rental that ever existed.
+                # Measured 2026-09-24: two clears on a fresh store give
+                # generation 0 → 1 → 2. `clear()` "keeps counting" in the sense
+                # of not resetting, not in the sense of standing still.
+                #
+                # Still one value read under one lock acquisition: BOT_LOCK is
+                # held for this whole block, so nothing outside it can move the
+                # counter between the clear and this read.
+                _save_confirm_stamp(self.chat_id, self.drafts.runnable()[2])
                 response = (202, {"run_id": self.run_id, "outcome": out.code})
 ```
 
-Do not add a second `_save_confirm_stamp` call next to either `self.drafts.clear()`; one write at the single acceptance point is the whole reason this is safe to read later.
+Do not add a second `_save_confirm_stamp` call next to either `self.drafts.clear()`, and do not hoist the read above them; one read and one write at the single acceptance point, after the clears, is the whole reason this is safe to read later.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -503,7 +529,7 @@ motions-studio/setup/scrub-secrets.sh --check
 git add scripts/tgbot/bot.py scripts/tests/test_batch_control_botruns.py scripts/tests/test_batch_control_botpod.py
 git commit -m "Confirm: stamp the draft generation it was accepted at" -m "The writer for resume's new gate. One write at the single acceptance point covers both accepted branches and nothing else, so a refused confirm stamps nothing.
 
-Pinned separately: confirm clears the draft on acceptance, and clear() preserves the generation. If that ever changes, Retry rental breaks for every user while every other gate stays green.
+Pinned separately: confirm clears the draft on acceptance, and clear() counts the generation UP - so the stamp is read after the clears and a test asserts the two halves still agree through the real predicate. Break either and Retry rental dies for every user while every other gate stays green.
 
 Co-Authored-By: Qwen Code <noreply@qwen.com>"
 ```

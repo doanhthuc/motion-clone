@@ -59,18 +59,30 @@ design.
   `_phase_a_matches_draft()` returns `False` unconditionally — its first test is `if validated is not
   True: return False` (`bot.py:6945-6946`), and `clear()` leaves a `_fresh()` draft whose `validated`
   is `None`. Reusing that predicate inside `resume` would permanently break Retry rental.
-- **But `clear()` preserves the generation.** `drafts.py:485-489` builds
-  `self._fresh(generation=self._load().generation)`, with the comment "The generation keeps
-  counting". So clearing the draft does *not* move `generation`.
-- **`validate()` does not move it either.** `drafts.py:555` saves the verdict with the comment "a
-  verdict is not a change: generation stays". Only `_changed()` bumps it (`drafts.py:277`).
+- **`clear()` increments the generation by exactly one. It does not reset it, and it does not stand
+  still.** `drafts.py:485-490` seeds `self._fresh(generation=self._load().generation)` and then
+  returns through `_changed(d)`, which does `d.generation += 1` (`drafts.py:275-279`). The comment's
+  "The generation keeps counting" means *is not reset to 0*, not *does not move*. Measured
+  2026-09-24: two clears on a fresh store give 0 → 1 → 2.
+
+  **The first draft of this spec stated this fact backwards**, claiming `clear()` preserved the
+  generation. The error came from reading lines 485, 487 and 489 out of a grep and never reading line
+  490, which is the `return self._changed(d)`. It was load-bearing rather than cosmetic: it is what
+  made "read the generation anywhere inside the locked block" look safe, and following that literally
+  stamps `G` while the confirm leaves the draft at `G+1`, so `_resume_generation_refusal` would have
+  refused every legitimate app Retry rental that ever existed. Task 2's implementer caught it by
+  measurement and deviated from the plan; §3 carries the correction.
+- **`validate()` does not move it.** `drafts.py:555` saves the verdict with `self._save(d)` and the
+  comment "a verdict is not a change: generation stays". Only `_changed()` bumps it
+  (`drafts.py:275-279`). Re-verified after the error above, not assumed.
 - **`generation` is monotonic**, and the one way it goes *down* is a corrupt draft file: `_load`'s
   `except` branch moves the file aside as `….<uuid>.bad` and returns `self._fresh()` at
   `drafts.py:265`, i.e. generation 0.
 
 Together these make "the generation at the accepted confirm, compared to the generation now" a sound
-server-side rule: it survives the confirm's own clear, it is not tripped by a re-validate, and it
-cannot be satisfied by accident later, because the counter only ever rises.
+server-side rule — **provided the stamp is taken after the confirm's own `clear()`**. That ordering,
+not any property of `clear()`, is what makes the clear survivable. The rule is not tripped by a
+re-validate, and it cannot be satisfied by accident later, because the counter only ever rises.
 
 Also read: `AppPod.__init__` is `(tg, chat_id, idem)` — it has no `DraftStore`, unlike `AppRuns`
 (`bot.py:6889`). It is built at `bot.py:7789` from the same scope that already holds `server.drafts`
@@ -110,12 +122,18 @@ exactly:
 `batch/` is already gitignored machine state, and the file is per chat like every other
 `tg-<chat_id>.*` record.
 
-**Write.** Inside `AppRuns.confirm`'s existing `with self._locked() as busy:` block, read the
-generation once (`self.drafts.runnable()[2]`) and save it on `if out:` — the same condition that
-already guards both `self.drafts.clear()` calls, so the stamp is written for the resume branch and
-the fresh-spend branch alike and for nothing else. Reading it anywhere inside that block gives the
-same number: `BOT_LOCK` is held, and the only draft mutation in the block is `clear()`, which
-preserves it (§2). A refused confirm — `stale_panel`, `not_validated`, `nothing_to_run`,
+**Write.** Inside `AppRuns.confirm`'s existing `with self._locked() as busy:` block, at the single
+`if out:` that builds the 202 response — the same condition that already guards both
+`self.drafts.clear()` calls — read the generation (`self.drafts.runnable()[2]`) and save it. One
+read, one write, one place, so the stamp is written for the resume branch and the fresh-spend branch
+alike and for nothing else.
+
+**The read must come after the clears, not before them.** `clear()` increments (§2), so a pre-clear
+read stamps `G` while the confirm leaves the draft at `G+1`, and `_resume_generation_refusal` would
+then refuse *every* legitimate app Retry rental. That is fail-closed — never a wrong spend — but the
+feature would be silently dead for every user, and nothing else in the gate would notice. `BOT_LOCK`
+is held for the whole block, so nothing outside it can move the counter between the clear and the
+read. A refused confirm — `stale_panel`, `not_validated`, `nothing_to_run`,
 `bot_busy`, `gpu_mismatch`, `choice_required` — writes nothing, because nothing was agreed to.
 
 The stamp is never deleted and never rewritten on a successful resume. It means "the generation the
@@ -339,9 +357,13 @@ In `test_batch_control_botruns.py`:
 
 - both accepted confirm branches write the stamp;
 - a refused confirm (`stale_panel`, `not_validated`, `bot_busy`) writes nothing;
-- **the confirm's own `clear()` leaves the generation unchanged, so an immediate retry is allowed.**
-  This is the test that would catch the §2 trap; without it, a future "clear should reset the
-  generation" change silently breaks Retry rental and every other gate stays green.
+- **the confirm's own `clear()` leaves the stamp matching the draft, so an immediate retry is
+  allowed.** Asserted through the real `_resume_generation_refusal` rather than as a bare number
+  comparison, and seeded from a non-zero generation so that a reset and a no-op are distinguishable.
+  This is the test that catches the §2 trap from either side: a future change to what `clear()` does
+  to the counter, or a future move of the read back above the clears, both silently break Retry
+  rental while every other gate stays green. The trap is not hypothetical — this spec fell into it
+  once already, and only an implementer's measurement caught it.
 
 Plus a `_save`/`_load` round-trip pair mirroring the existing kill-result tests, including
 `_load` returning `None` for a corrupt file.
