@@ -1,6 +1,6 @@
 # A distinct `seed_not_found` code, and one owner constant
 
-Date: 2026-09-25 · Status: design approved in chat, not yet implemented · Branch: to be created (one branch, one PR)
+Date: 2026-09-25 · Status: implemented on branch `seed-not-found-owner-constant`, not yet merged · One branch, one PR
 
 Two items the Phase 6 follow-ups branch recorded as open and deliberately did not
 take, because that branch allowed itself exactly one `scripts/**` change and it had
@@ -15,11 +15,11 @@ elsewhere in this file.
 
 | Gate | Result | Date | Ran by |
 |---|---|---|---|
-| `make batch-test` | _not yet run_ | | |
-| `cd ios/MotionKit && swift test` | _not yet run_ | | |
-| `make ios-build` | _not yet run_ | | |
-| `motions-studio/setup/scrub-secrets.sh --check` | _not yet run_ | | |
-| `make ios-contract` (live, pre-deploy) | _not yet run_ | | |
+| `make batch-test` | 2150 tests OK (skipped=1) at `7c97e50` | 2026-09-25 | Claude (controller) |
+| `cd ios/MotionKit && swift test` | 254 tests in 23 suites passed at `7c97e50` | 2026-09-25 | Claude (controller) |
+| `make ios-build` | exit 0 at `7c97e50`; no tracked files changed by `xcodegen` | 2026-09-25 | Claude (controller) |
+| `motions-studio/setup/scrub-secrets.sh --check` | exit 0 at `7c97e50` | 2026-09-25 | Claude (controller) |
+| `make ios-contract` (live, pre-deploy) | 14/14 against the pre-merge server. The tool does not assert on error codes, so this proves no regression in the wire shapes, not the new `seed_not_found` code | 2026-09-25 | Claude (controller) |
 | VPS pre-merge check (drain / Phase A / lease / migration) | _not yet run_ | | |
 | `deploy-bot` workflow run | _not yet run_ | | |
 | `make ios-contract` (live, post-deploy) | _not yet run_ | | |
