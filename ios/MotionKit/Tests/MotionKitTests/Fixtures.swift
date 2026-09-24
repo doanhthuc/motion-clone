@@ -150,14 +150,24 @@ enum Fixtures {
      "bitrate_kbps":4200,"size_bytes":33554449,"warning":"Video is larger than recommended."}}
     """#
 
+    /// The optional role is `background`, matching the live catalog and the
+    /// server's own pipelines (`scripts/batchlib/pipelines.py:54,81`, surfaced to
+    /// the phone by `scripts/control/drafts.py:174`). It was `mask` until
+    /// 2026-09-24, a name that occurs nowhere in `scripts/**` as a role — a
+    /// fixture that disagrees with the catalog cannot catch a role-handling
+    /// regression, which is the only reason it exists. Its *kind* stays the
+    /// unrecognised `"future_kind"` on purpose, even though the live catalog
+    /// reports `"image"` for it: `ModelsTests.pipelineAndDraftModelsDecode`
+    /// asserts `roles["background"] == .unknown`, which is about the kind, not
+    /// the name. Renaming the key must not "fix" the kind along with it.
     static let pipelines = #"""
     {"pipelines":[
       {"id":"motion-enhance","stages":["motion","enhance"],
        "required":["character","driver"],"optional":[],
        "roles":{"character":"image","driver":"video"},"providers":[]},
       {"id":"tryon-motion-enhance","stages":["tryon","motion","enhance"],
-       "required":["character","driver","outfit"],"optional":["mask"],
-       "roles":{"character":"image","driver":"video","outfit":"image","mask":"future_kind"},
+       "required":["character","driver","outfit"],"optional":["background"],
+       "roles":{"character":"image","driver":"video","outfit":"image","background":"future_kind"},
        "providers":[{"id":"gemini","label":"Gemini"},{"id":"qwen-max","label":"Qwen Max"}]}
     ]}
     """#
@@ -167,7 +177,7 @@ enum Fixtures {
      "slots":{"character":{"material_id":"app/model.png","name":"model.png","exists":true,
        "probe":{"kind":"image","width":1024,"height":1536,"duration_s":null,
        "bitrate_kbps":null,"size_bytes":900,"warning":""},"warning":""}},
-     "required":["character","driver","outfit"],"optional":["mask"],
+     "required":["character","driver","outfit"],"optional":["background"],
      "missing":["driver","outfit"],"validated":null,
      "batch":[{"digest":"abc123def0","run_id":"model__dress","pipeline":"tryon-motion-enhance",
        "provider":"gemini","slots":{"character":"app/model.png","outfit":"app/dress.png","driver":null}}],

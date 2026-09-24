@@ -30,7 +30,7 @@ extension URLProtocolTests {
                 .joined(separator: ",")
             return #"{"owner":"app","pipeline":"tryon-motion-enhance","provider":"gemini","generation":"#
                 + String(generation) + #","slots":{"#
-                + slots + #"},"required":["character","driver","outfit"],"optional":["mask"],"missing":[],"validated":true,"batch":["#
+                + slots + #"},"required":["character","driver","outfit"],"optional":["background"],"missing":[],"validated":true,"batch":["#
                 + batch.joined(separator: ",") + #"],"jobs":2,"estimate_min":84,"tryon_seed":"# + quoted(seed) + "}"
         }
         static func entry(_ digest: String, _ run: String, _ outfit: String, seed: String? = nil) -> String {
