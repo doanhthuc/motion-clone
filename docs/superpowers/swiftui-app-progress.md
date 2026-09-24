@@ -10,20 +10,26 @@ what actually shipped, what was verified, and the next safe boundary.
 ## Current baseline
 
 - Repository: `/Users/thucpham/Desktop/motion-clone`
-- Branch: `feat/swiftui-phase-6` (unmerged). The last **merged** implementation is `7a8c0e2` (merge of
-  PR #66, `feat/swiftui-phase-5`), merged 2026-09-23; Phase 4 was PR #65 (`2945481`). Phase 6 has no
-  merge commit or PR number yet — fill those in after the merge.
-- `main` is 2 commits ahead of `origin/main` (`4052b97` Phase 6 spec, `5eaa652` Phase 6 plan), both
-  unpushed. Push `main` before opening the Phase 6 PR, or the PR will carry those two doc commits.
+- Branch: merged. Phase 6 is **PR #67** (Phase 5 was PR #66 → `7a8c0e2`, Phase 4 PR #65 → `2945481`).
+  It first landed as merge commit `8518e13`, and `main` was then rewritten on request into a single
+  squash commit **`f65fc63`**. `git diff f65fc63 8518e13` is empty — the two trees are byte-identical, so
+  only the history shape changed. `8518e13` is no longer reachable from `main`; the 34 granular commits
+  and their review provenance remain viewable on PR #67.
+- `main` and `origin/main` are in sync at `f65fc63`. The Phase 6 spec (`4052b97`) and plan (`5eaa652`)
+  were pushed ahead of the branch, docs-only, which did not trigger the deploy workflow — its path filter
+  is `scripts/**` plus the workflow file itself.
 - PR #66 changed only `ios/**`, `docs/**`, `Makefile`, `CLAUDE.md` and `AGENTS.md` — nothing under
-  `scripts/**` — so it did not trigger the deploy-bot workflow. PR #65 did not touch `scripts/**`
-  either. The VPS bot still runs the `affcf46` deploy (GitHub Actions run `35813558396`, `motion-bot`
-  active, control API on `127.0.0.1:8787`).
+  `scripts/**` — so it did not trigger the deploy-bot workflow; PR #65 did not touch `scripts/**` either.
+  **PR #67 did, and deployed twice**: GitHub Actions run `35950453694` for `8518e13` and run
+  `35951269293` for the squash rewrite, both `completed success`. The VPS is on **`f65fc63`**,
+  `motion-bot` active since 2026-09-24 03:23:59 UTC, control API on `127.0.0.1:8787`.
+  `scripts/vps/deploy-bot.sh` runs `git reset --hard origin/main`, not a fast-forward, which is why it
+  followed the rewritten history with no manual intervention on the box.
 - Phase 6 is the first phase to touch `scripts/**`: Task 1 adds a read-only `tryon_seed` field to
-  `GET /v1/draft` (`scripts/control/drafts.py` `_view`, lines 331 and 334). It is on the branch, not
-  deployed — merging to `main` auto-deploys `motion-bot`, so check the VPS for a drain, Phase A, pod
-  lease and migration first. The app decodes the field as optional, so it works against the server
-  before and after that deploy.
+  `GET /v1/draft` (`scripts/control/drafts.py`, in `_view`). **Deployed and verified live**: the key is
+  present in the response (`null` on an empty draft), no absolute path leaks, and `make ios-contract` is
+  14/14 against the redeployed server. The app decodes the field as optional, which is why
+  `make ios-contract` also passed 14/14 *before* the deploy — either order of deploy works.
 - Control-plane API slices 1–6 are live. Phases 4 and 5 added no route or field; Phase 6 adds one
   read-only field and no route.
 - Phases 1–6 are implemented in code, and every gate in Phase 6's record has run: `make ios-contract`
@@ -146,7 +152,7 @@ ios/
 
 ## Verified gates at the handoff
 
-### Phase 6 (2026-09-24, branch `feat/swiftui-phase-6`, unmerged)
+### Phase 6 (2026-09-24, PR #67, merged to `main` as `f65fc63`)
 
 #### Gate record
 
@@ -402,12 +408,10 @@ auto-deploy the bot.
 ## Recommended kickoff for the next effort
 
 No phase remains (see "Next work") and no Phase 6 gate is outstanding, so this is the start of
-whatever comes next — merging Phase 6, the optional spend test, a deferred parent-spec item, or a
-Phase 6 follow-up.
+whatever comes next — the optional spend test, a deferred parent-spec item, or a Phase 6 follow-up.
 
-1. Verify `git status`, the branch and the current SHA; preserve unrelated changes. Phase 6 lives on the
-   unmerged `feat/swiftui-phase-6`, and `main` is 2 unpushed commits ahead of `origin/main`
-   (`4052b97` spec, `5eaa652` plan) — push `main` before opening the Phase 6 PR.
+1. Verify `git status`, the branch and the current SHA; preserve unrelated changes. Phase 6 is merged:
+   `main` is `f65fc63` (PR #67) and in sync with `origin/main`.
 2. Read `AGENTS.md`, this handoff, the parent SwiftUI design and the Phase 6 design. For anything
    touching the money layer, inspect the shipped `RunFlow`/`SpendGate`/`MigrateFlow`/`PodStore` stores
    and tests for state and error-handling conventions first.

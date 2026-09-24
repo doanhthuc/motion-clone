@@ -1,6 +1,6 @@
 # Motion iPhone app — Phase 6 batch and library design
 
-Date: 2026-09-23 · Status: implemented on the unmerged branch `feat/swiftui-phase-6`; `make ios-contract` (14/14, including `GET /v1/tryon-library`) and `make ios-ui-test` (`Phase6SmokeTests`, 4/4, zero spends recorded) passed live 2026-09-24; no real batch has run
+Date: 2026-09-23 · Status: implemented and merged — PR #67, on `main` as `f65fc63` (squashed on request; the branch first landed as merge commit `8518e13`, and `git diff f65fc63 8518e13` is empty, so only the history shape changed). §3's field is deployed to the VPS; see the gate record for what ran and when; no real batch has run
 
 ### Gate record
 
@@ -16,9 +16,10 @@ implementer's worktree gates from the controller's live ones.
 | `make ios-contract` | **14/14 ok, exit 0**, live against the VPS | 2026-09-24 | controller |
 | `make batch-test` | exit 0, `OK (skipped=1)` | 2026-09-24 | controller |
 | `make ios-ui-test` | **exit 0**, `result: Passed`, `totalTestCount: 4`, `passed: 4`, `failed: 0`, **`skipped: 0`** — §8's `Phase6SmokeTests.testCrossBuildDropAndLibrary` Passed, so neither of its two `XCTSkip` guards (non-empty draft, fewer than two outfit images) fired; the Phase 3, 4 and 5 smokes Passed alongside it. Zero spends recorded (`-UITestRecordingSpendGate`; the closing `uitest.recordedSpends == "0"` assertion passed). Bundle `Test-MotionApp-2026.09.24_09-22-03-+0700.xcresult`, read with `xcrun xcresulttool get test-results summary` / `… tests` | 2026-09-24 | controller, live against the VPS on an already-booted iPhone 18 Pro simulator (`43B83B81-13CD-4383-BB43-4D8AEBEA6582`) |
+| `make ios-contract` (post-deploy) | **14/14 ok, exit 0**, live against the VPS after PR #67 deployed. `GET /v1/draft` now carries `tryon_seed` (`null` on an empty draft) and leaks no absolute path; the VPS is on `f65fc63` with `motion-bot` active since 03:23:59 UTC | 2026-09-24 | controller |
 
-The `ios-contract` run is also the live proof of the deploy-order property §3 claims but could not
-evidence until now: the server had *not* been deployed with §3's `tryon_seed` field, and
+The **pre-deploy** `ios-contract` run is also the live proof of the deploy-order property §3 claims but
+could not evidence until then: the server had *not* been deployed with §3's `tryon_seed` field, and
 `GET /v1/draft` still decoded, because the app reads the field as optional. The same run covers the
 14th route, `GET /v1/tryon-library` decoding `TryonLibraryResponse`.
 
