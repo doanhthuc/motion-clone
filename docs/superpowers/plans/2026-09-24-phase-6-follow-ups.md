@@ -1188,11 +1188,11 @@ Expected: `✔ Test run with 253 tests in 23 suites passed.` — the **same coun
 
 - [ ] **Step 5: Verify Review Focus 5 — that no `.replacingOccurrences` anchor silently no-op'd**
 
-Spec §6 read all eight anchors and none contains `mask`, so none should have moved. Prove it rather than trust the reading:
+Spec §6 read all nine anchors and none contains `mask`, so none should have moved. Prove it rather than trust the reading — and grep the **whole** test directory, not a brace list of three files. This step originally scoped itself to `{ModelsTests,TryonLibraryStoreTests,DraftStoreTests}.swift` and so excluded `RunFlowTests.swift`, which is the one file whose anchor operates on a string this task edits:
 
-Run: `cd "$REPO" && grep -n 'replacingOccurrences' ios/MotionKit/Tests/MotionKitTests/{ModelsTests,TryonLibraryStoreTests,DraftStoreTests}.swift`
+Run: `cd "$REPO" && grep -rn 'replacingOccurrences' ios/MotionKit/Tests/MotionKitTests/`
 
-Expected: eight anchors — `"driver":null}}]`, `"jobs":1,"estimate_min":null}`, `"generation":4`, `"estimate_min":null}` (twice), `"provider":"gemini","slots":{"character"`, and `"stale":false` (twice, at `DraftStoreTests.swift:131,152`, on `Fixtures.validatedDraft`). Then confirm the suite that would fail loudly if one had broken still runs:
+Expected: nine call sites plus one doc comment mentioning the method (`TryonLibraryStoreTests.swift:22`), so ten matching lines. The nine anchors are `"estimate_min":null}` (`ModelsTests.swift:231`), `"provider":"gemini","slots":{"character"` (`:233`), `"driver":null}}]` and `"jobs":1,"estimate_min":null}` (`TryonLibraryStoreTests.swift:29-31`, `:32-34`), `"stale":false` twice (`DraftStoreTests.swift:131-132`, `:152-153`), `"generation":4` (`:401-402`), `"estimate_min":null}` (`:405-407`), and `"validated":true` (`RunFlowTests.swift:59-60`). None contains `mask`. The last one is the only anchor whose target this task edits, so it is the one that could have no-op'd. Then confirm the suite that would fail loudly if one had broken still runs:
 
 Run: `cd "$REPO/ios/MotionKit" && swift test --filter 'usersListsBasketRunsBeforeTheEditedJob|draftSeedIsOptionalAndDecodes' 2>&1 | tail -10`
 

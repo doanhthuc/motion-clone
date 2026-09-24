@@ -329,16 +329,20 @@ quoted string rather than by number.
 unknown role *kind* decodes as `.unknown`. The role's name was never the subject.
 
 **The recorded blocker does not fire.** Phase 6 could not edit `Fixtures.swift` because three suites
-do exact `.replacingOccurrences` surgery on `Fixtures.draft`'s text. All eight anchors were read and
-none contains `mask`. This spec's first draft listed six; the two it missed are
-`DraftStoreTests.swift:131,152`, anchor `"stale":false`, which target `Fixtures.validatedDraft` — a
-fixture this change does not edit:
+do exact `.replacingOccurrences` surgery on a fixture's text. There are **nine** call sites and none
+of their anchors contains `mask`. This spec's first draft listed six, then eight; the ninth is the one
+that matters most, because it operates on a string this change edits — `RunFlowTests.swift:59-60`
+builds `draftAfterDelete` from `Routes.draftJSON`'s output, and `draftJSON` is the function whose
+`"optional"` array was renamed. Had that edit dropped `"validated":true`, `draftAfterDelete` would have
+silently equalled `draftAfterDrop` and the downstream `validated`-null assertions would have passed
+vacuously. It did not, but a completeness check scoped to three files would never have noticed:
 
 | Suite | Anchors |
 |---|---|
 | `TryonLibraryStoreTests.swift:29,32` | `"driver":null}}]` · `"jobs":1,"estimate_min":null}` |
 | `DraftStoreTests.swift:399,403` | `"generation":4` · `"estimate_min":null}` |
 | `DraftStoreTests.swift:131,152` | `"stale":false` (twice, on `Fixtures.validatedDraft`) |
+| `RunFlowTests.swift:59-60` | `"validated":true` (on `Routes.draftJSON`'s output — **the string this change edits**) |
 | `ModelsTests.swift:231,233` | `"estimate_min":null}` · `"provider":"gemini","slots":{"character"` |
 
 No behaviour depends on the name either: `BatchComposer.supports` filters on pipelines whose
