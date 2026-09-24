@@ -13,9 +13,14 @@ final class Phase6SmokeTests: XCTestCase {
     /// `Phase4Draft.clear(in:)` still cannot be reused from here: its
     /// post-condition is the readiness line ("0 of 3 required slots assigned"),
     /// which is Single-only and stays Single-only. Both post-conditions below
-    /// read elements the Batch arm does render — a shared slot row
+    /// read elements the Batch arm renders — a shared slot row
     /// (`BatchComposerSection.sharedRoles`) and the header's job count
-    /// (`NewJobView.header`).
+    /// (`NewJobView.header`) — but only the job count is unconditional. The
+    /// slot row is drawn only in the `else` of `if !BatchComposer.supports(pipeline)`,
+    /// so under a catalog that pairs no character with an outfit the row is
+    /// absent for a configuration reason and Clear still worked; `supports` is
+    /// `required ∪ optional` containing both roles, and the default pipeline
+    /// comes from `TG_PIPELINE`.
     @MainActor
     private func clearFromBatch(_ app: XCUIApplication) {
         let clear = Phase4Draft.revealButton("Clear", in: app)
@@ -42,7 +47,9 @@ final class Phase6SmokeTests: XCTestCase {
         // element's `accessibilityValue` and Single-only besides.
         XCTAssertTrue(Phase4Draft.waitUntil(timeout: 10) {
             (app.buttons["Character"].value as? String) == "Missing required"
-        }, "Batch mode's Clear must unassign the shared slots, not just empty the basket")
+        }, "Batch mode's Clear must unassign the shared slots, not just empty the basket"
+            + " — if the row is absent instead, the server's default pipeline is not"
+            + " batch-supported (check TG_PIPELINE)")
         XCTAssertTrue(app.staticTexts["0 jobs"].waitForExistence(timeout: 10),
                       "Batch mode's Clear emptied the draft")
     }

@@ -254,10 +254,12 @@ Message: `"A batch drop is still in flight — wait for it before moving the vol
 sentence shape `RunFlow.spend` uses, with the migration's own noun.
 
 The window this closes is the client's own timeouts, not the server's budgets: a drop spends up to
-**95 s** on the slot `PATCH` and **95 s** on the validate (`RunFlowStore.swift:308`, `:314`,
-`timeout: 95`). The 90 s figure the first draft of this spec quoted is the *server's* validate budget
-(`RunFlowStore.swift:311-312`: "the server can probe for 60 s and validate for 90 s, so stay under
-Cloudflare's ~100 s"). The two are different numbers and conflating them understates the window.
+**95 s** on the slot `PATCH` and **95 s** on the validate (`RunFlow.drop`'s two `timeout: 95` calls,
+`RunFlowStore.swift:301`, `:307`). The 90 s figure the first draft of this spec quoted is the
+*server's* validate budget (`RunFlowStore.swift:304-305`: "the server can probe for 60 s and validate
+for 90 s, so stay under Cloudflare's ~100 s"). The two are different numbers and conflating them
+understates the window. All three citations shifted −7 when the final wave deleted the client latch
+above them in the same file, which is why each is now named by symbol as well as by number.
 
 `recheck()` and `replayPendingOnce()` stay unguarded, on purpose: they resolve a request that was
 already sent, exactly as `RunFlow`'s equivalents do, and blocking them would strand a pending
@@ -318,12 +320,12 @@ gate.
 oversight: there the validation failure is a side effect of the drop, and the drop's own copy already
 tells the user to open New Job. But the mechanism is *not* that the path bypasses `APIError` — this
 spec's first draft said the catch "sets `message` from a `String`, not an `APIError`", which is wrong.
-`RunFlowStore.swift:329` is `message = apiError(error).userMessage`, so the drop path routes through
-`userMessage` and does receive the headline; it gets no disclosure because `message` is a `String`
-field, so there is no `APIError` left to hand to `ErrorBanner`. The distinction mattered: because the
-path does route through `userMessage`, `RunFlowTests.swift:403` pinned the old verbatim behaviour and
-broke, making `RunFlowTests.swift` a fifth file in this task. Corrected 2026-09-24 during
-implementation.
+`RunFlow.drop`'s catch (`RunFlowStore.swift:322`) is `message = apiError(error).userMessage`, so the
+drop path routes through `userMessage` and does receive the headline; it gets no disclosure because
+`message` is a `String` field, so there is no `APIError` left to hand to `ErrorBanner`. The
+distinction mattered: because the path does route through `userMessage`, `RunFlowTests.swift:403`
+pinned the old verbatim behaviour and broke, making `RunFlowTests.swift` a fifth file in this task.
+Corrected 2026-09-24 during implementation.
 
 ### The existing test this breaks
 

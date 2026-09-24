@@ -152,14 +152,17 @@ enum Fixtures {
 
     /// The optional role is `background`, matching the live catalog and the
     /// server's own pipelines (`scripts/batchlib/pipelines.py:54,81`, surfaced to
-    /// the phone by `scripts/control/drafts.py:174`). It was `mask` until
+    /// the phone by `scripts/control/drafts.py:175`). It was `mask` until
     /// 2026-09-24, a name that occurs nowhere in `scripts/**` as a role — a
     /// fixture that disagrees with the catalog cannot catch a role-handling
     /// regression, which is the only reason it exists. Its *kind* stays the
     /// unrecognised `"future_kind"` on purpose, even though the live catalog
-    /// reports `"image"` for it: `ModelsTests.pipelineAndDraftModelsDecode`
-    /// asserts `roles["background"] == .unknown`, which is about the kind, not
-    /// the name. Renaming the key must not "fix" the kind along with it.
+    /// reports `"image"` for it — `role_kind` answers `"video"` only for a role
+    /// in `VIDEO_ROLES`, which is exactly `{"driver"}`, so `background` falls
+    /// through to `"image"` (`scripts/control/drafts.py:64,159-160`) — and
+    /// `ModelsTests.pipelineAndDraftModelsDecode` asserts
+    /// `roles["background"] == .unknown`, which is about the kind, not the
+    /// name. Renaming the key must not "fix" the kind along with it.
     static let pipelines = #"""
     {"pipelines":[
       {"id":"motion-enhance","stages":["motion","enhance"],

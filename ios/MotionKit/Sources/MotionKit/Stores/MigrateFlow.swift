@@ -42,8 +42,12 @@ public final class MigrateFlow {
     /// server can probe for 60 s and validate for 90 s (timeouts read in
     /// `RunFlow.drop`, 2026-09-24). The PATCH is a worst-case leg, not an
     /// unconditional one — it runs only on the `editedJobEquals` branch — but
-    /// the validate always runs, and a migration launched inside either deletes
-    /// a volume while the draft is moving under it.
+    /// the validate always runs once the drop reaches the delete, and a
+    /// migration launched inside either deletes a volume while the draft is
+    /// moving under it. That qualification is the load-bearing half of this
+    /// 95 s + 95 s window: `RunFlow.drop` returns early when `batchEntry(for:)`
+    /// finds nothing, before the PATCH and before the validate, so a drop whose
+    /// draft moved first carries no long leg at all.
     private let runFlow: RunFlow
     private let now: @Sendable () -> Date
     private var deadline: Date?

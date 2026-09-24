@@ -427,11 +427,13 @@ extension URLProtocolTests {
     /// What the server actually answers an invalid non-stale validation with:
     /// 422 `invalid` (drafts.py:566 → server.py:47 `_DOMAIN_STATUS`). Since
     /// 2026-09-24 that code headlines instead of showing the server's text
-    /// (spec §5), and `drop`'s catch assigns `apiError(error).userMessage` to a
-    /// `String`, so the raw text has nowhere to travel — headline only, with no
-    /// `detailMessage` and therefore no disclosure. The three `/v1/draft` GETs
-    /// are `start`, the drop's fresh read and the `catch`'s re-read, so this
-    /// also pins that a failed drop still refreshes the draft.
+    /// (spec §5). The `APIError` this path builds *does* carry a
+    /// `detailMessage` — the fixture below scripts a non-blank message — but
+    /// `drop`'s catch assigns `apiError(error).userMessage` to a `String` field,
+    /// so the `APIError` — and its `detailMessage` — is discarded at the
+    /// assignment, and there is nothing left to disclose. The three
+    /// `/v1/draft` GETs are `start`, the drop's fresh read and the `catch`'s
+    /// re-read, so this also pins that a failed drop still refreshes the draft.
     @Test func dropHeadlinesARefusedValidationAndStillRefreshesTheDraft() async throws {
         let routes = Routes()
         routes.draft = Routes.draftTwoJobs

@@ -17,8 +17,9 @@ public enum APIError: Error, Sendable, Equatable {
 
     /// What the phone shows. 409 carries the server's own text — the same
     /// wording Telegram shows for the same refusal. A 422 does too, except
-    /// `invalid`, whose text is never written for a reader on any path: that
-    /// one gets a headline here and keeps its text in `detailMessage`.
+    /// `invalid`, whose text is never written for a reader on the phone, on any
+    /// path: that one gets a headline here and keeps its text in
+    /// `detailMessage`.
     public var userMessage: String {
         switch self {
         case .accessDenied:
@@ -33,7 +34,8 @@ public enum APIError: Error, Sendable, Equatable {
             case 404: return "Not found — it may have been removed from Telegram."
             case 422 where code == "invalid":
                 // The server's text for this one code is never written for a
-                // reader: see `detailMessage`.
+                // reader on the phone: see `detailMessage`, which lists its four
+                // forms and names the Telegram reader one of them is for.
                 return "This draft didn't pass validation, so it can't run yet."
             case 502: return "RunPod/Vast didn't answer. Try again."
             case 503: return "The bot is busy. Try again in a moment."
