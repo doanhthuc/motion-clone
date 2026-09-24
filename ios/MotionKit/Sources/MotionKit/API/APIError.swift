@@ -31,6 +31,8 @@ public enum APIError: Error, Sendable, Equatable {
         case .server(let status, let code, let message):
             switch status {
             case 401: return "Bearer token rejected — check Settings."
+            case 404 where code == "seed_not_found":
+                return "That saved try-on no longer exists."
             case 404: return "Not found — it may have been removed from Telegram."
             case 422 where code == "invalid":
                 // The server's text for this one code is never written for a

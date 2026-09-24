@@ -338,6 +338,13 @@ extension URLProtocolTests {
         #expect(APIError.transport("offline").detailMessage == nil)
         #expect(APIError.decoding("shape").detailMessage == nil)
         #expect(APIError.accessDenied(status: 403).detailMessage == nil)
+        // A deleted try-on library seed has its own code and its own sentence;
+        // every other 404 keeps the material one.
+        #expect(APIError.server(status: 404, code: "seed_not_found",
+                                message: "no such try-on library entry: s1").userMessage
+                == "That saved try-on no longer exists.")
+        #expect(APIError.server(status: 404, code: "not_found", message: "x").userMessage
+                == "Not found — it may have been removed from Telegram.")
     }
 }
 @Suite struct SpendTransportTests {
