@@ -285,6 +285,18 @@ refuses while `migration_running()` (`bot.py:5561-5566`) — and widening `canDr
 the pending-notice machinery Phase 6 deliberately kept out of `spend`. The handoff asked for this
 direction only.
 
+**A third direction, also recorded and also not fixed.** `AppModel.reconnect()` refuses to rebuild the
+stores during a spend or a pending migrate (`MotionApp.swift:65-66` guards on `isSpending` and
+`pendingNotice`) but **not** during a drop, so a credential save inside a drop window installs a fresh
+`RunFlow` with `isDropping == false` while the server is still dropping. This window is *not*
+server-backstopped the way the paragraph above implies for the reverse direction: `_migrate_blocked`
+checks the lease, whether a run is live, and `migration_running()` — none of which is "a draft drop is
+in flight". Reaching it needs a Settings credential save inside a window of at most ~190 s, and an
+already-presented `MigrateSheet` holds a snapshot (`let flow`, `let spendBlocked`) so it would not see
+the new pairing anyway. Pre-existing in shape and identical for `RunFlow.spend`'s own guard. Found by
+the final whole-branch review; recorded here rather than in §10 because it belongs with the asymmetry it
+completes.
+
 ## 5. Item 3 — validation copy on the phone
 
 ### What actually reaches the screen today
