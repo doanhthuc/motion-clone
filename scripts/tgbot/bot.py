@@ -7256,8 +7256,8 @@ class AppRuns:
         # "driver" is the video the motion transfer runs against, not
         # material the try-on image is made of — VIDEO_ROLES in
         # control/drafts.py draws the same line.
-        material_ids = {role: f"app/{path.name}" for role, path in run.inputs.items()
-                        if role != "driver"}
+        material_ids = {role: f"{materials.APP_OWNER}/{path.name}"
+                        for role, path in run.inputs.items() if role != "driver"}
         # Not job.py's DEFAULT_PROVIDER ("qwen", self-host — needs the pod):
         # _tryon_entries only ever finds runs a LOCAL try-on stage produced
         # (_local_tryon_stage), so params_manifest always names gemini or
