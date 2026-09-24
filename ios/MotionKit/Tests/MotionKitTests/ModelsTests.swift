@@ -294,6 +294,27 @@ import Testing
         #expect(t.previews[0].status == .running && !t.previews[0].hasImage)
     }
 
+    /// Phase 6 shared try-on fields are additive — a fixture that predates
+    /// them (`Fixtures.tryonRunning`) must still decode, with both nil.
+    @Test func tryonPreviewWithoutSharedKeysDecodesNil() throws {
+        let t = try MotionJSON.decoder.decode(TryonPreviews.self, from: Fixtures.data(Fixtures.tryonRunning))
+        #expect(t.previews[0].sharedFrom == nil)
+        #expect(t.previews[0].shares == nil)
+    }
+
+    @Test func tryonPreviewWithSharedKeysDecode() throws {
+        let json = #"""
+        {"run_id":"tg-1000","run_token":"1.1","phase_a_running":false,
+         "previews":[{"index":"0","run":"o1d1","status":"done","has_image":true,
+                      "shared_from":null,"shares":["1"]},
+                     {"index":"1","run":"o1d2","status":"done","has_image":true,
+                      "shared_from":"0","shares":[]}]}
+        """#
+        let t = try MotionJSON.decoder.decode(TryonPreviews.self, from: Fixtures.data(json))
+        #expect(t.previews[0].sharedFrom == nil && t.previews[0].shares == ["1"])
+        #expect(t.previews[1].sharedFrom == "0" && t.previews[1].shares == [])
+    }
+
     @Test func rentPanelDecodes() throws {
         let p = try MotionJSON.decoder.decode(RentPanel.self, from: Fixtures.data(Fixtures.rentPanel))
         #expect(p.panelToken == "1790000000123.4.9" && p.afterPhaseA && p.jobs == 2 && p.estimateMin == 84)

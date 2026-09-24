@@ -7,6 +7,12 @@ public struct TryonPreview: Decodable, Sendable, Equatable, Identifiable {
     public let run: String
     public let status: StageStatus
     public let hasImage: Bool
+    /// Phase 6 shared try-on (additive, so an older server still decodes):
+    /// the leader's index, or nil for a leader or an ungrouped preview.
+    public let sharedFrom: String?
+    /// The leader's followers' indices; `[]` when this preview has none —
+    /// either it is a follower itself, or it leads nobody.
+    public let shares: [String]?
     public var id: String { index }
 }
 

@@ -173,15 +173,19 @@ Design: `docs/superpowers/specs/2026-09-23-swiftui-app-phase-6-design.md`.
   on by default when the library has a match for the shared slots plus that outfit; a seeded job's
   Phase A skips the provider and reuses the saved image. The edited job's own seed shows a badge in
   Single mode, with a "The saved try-on no longer exists" variant when its library entry was deleted.
-- **Drop after Phase A.** In the run flow, "Drop from batch" (`tryon.drop.<index>`) shows on each
-  preview card when `RunFlow.canDropFromBatch` holds — that symbol is the authority for the condition,
-  and the one counter-intuitive fact is that it counts **basket entries** (`draft.batch.count`), not
-  `draft.jobs`. Dropping re-validates the draft and re-reads the previews and rent panel, so confirm
-  rents only what is left. Every `RunFlow` spend is refused while a drop is in flight: the guard sits
-  in `RunFlow.spend`, the single funnel all four entry points share, so a new one inherits it.
-  (`MigrateFlow.migrate()` calls the spend gate directly, so it carries that guard itself.) The last
-  remaining basket entry has no drop affordance by design — **Clear** (on the New Job tab, in either
-  mode) is the only way to remove it. Run detail shows a per-job batch progress list.
+- **One card per look, group drop.** The previews screen renders `RunFlow.cards` — one card per
+  leader (a preview whose `sharedFrom` is nil) — with a "Used by K videos" label when `shares` is
+  non-empty; a group's followers render inside their leader's card, not as their own. "Drop from
+  batch" (`tryon.drop.<index>`) shows on each card when `RunFlow.canDropFromBatch(_:)` holds — that
+  symbol is the authority for the condition, and the one counter-intuitive fact is that it counts
+  **basket entries** (`draft.batch.count`), not `draft.jobs`, and must leave at least one behind after
+  dropping every member of `RunFlow.members(of:)`. Dropping deletes every member of the group, then
+  re-validates once, and re-reads the previews and rent panel, so confirm rents only what is left.
+  Every `RunFlow` spend is refused while a drop is in flight: the guard sits in `RunFlow.spend`, the
+  single funnel all four entry points share, so a new one inherits it. (`MigrateFlow.migrate()` calls
+  the spend gate directly, so it carries that guard itself.) A basket that is entirely one group has no
+  drop affordance by design — **Clear** (on the New Job tab, in either mode) is the only way to remove
+  it. Run detail shows a per-job batch progress list.
 - **Retry rental is latched to the draft that was confirmed.** `resume` re-rents the manifest on disk
   and its gate compares only the draft's `generation` — nothing else in the draft feeds the decision —
   so the generation is the one thing that can tell it the draft moved. The latch is the server's, and it
