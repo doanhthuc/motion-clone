@@ -10,7 +10,8 @@ from batchlib.pipelines import PIPELINES, effective_stage_params
 from batchlib.runner import (LocalPhaseResult, batch_id_now, has_local_tryon,
                               local_tryon_reusable, needs_pod,
                               preserved_local_tryon, prepare_batch, run_batch, run_local_phase,
-                              run_one, stage_dest, write_index)
+                              run_one, stage_dest, tryon_share_groups, tryon_share_key,
+                              write_index)
 
 SETTINGS = Settings(domain="x.test", api_key="mk_test", instance_id="i-1")
 
@@ -109,6 +110,55 @@ MANIFEST_NAM_RUN_GEMINI = "runs:\n" + "".join(
       driver: drv.mp4
     tryon: {{ provider: gemini }}
 """ for i in range(1, 6))
+
+
+# One character, two outfits x two drivers, provider gemini — the shape the design doc's
+# example uses (§1): runA/runB share outfit.jpg with different drivers (same look, expect
+# one shared key); runC/runD are outfit2.jpg (a different look, expect a different key).
+MANIFEST_SHARE_TRYON = """
+runs:
+  - id: runA
+    pipeline: tryon-motion-enhance
+    inputs:
+      character: char.jpg
+      outfit: outfit.jpg
+      driver: drv.mp4
+    tryon: { provider: gemini }
+  - id: runB
+    pipeline: tryon-motion-enhance
+    inputs:
+      character: char.jpg
+      outfit: outfit.jpg
+      driver: drv2.mp4
+    tryon: { provider: gemini }
+  - id: runC
+    pipeline: tryon-motion-enhance
+    inputs:
+      character: char.jpg
+      outfit: outfit2.jpg
+      driver: drv.mp4
+    tryon: { provider: gemini }
+  - id: runD
+    pipeline: tryon-motion-enhance
+    inputs:
+      character: char.jpg
+      outfit: outfit2.jpg
+      driver: drv2.mp4
+    tryon: { provider: gemini }
+"""
+
+
+def _fixture_share(tmp: Path, text: str = MANIFEST_SHARE_TRYON) -> Path:
+    (tmp / "char.jpg").write_bytes(b"x")
+    (tmp / "outfit.jpg").write_bytes(b"x")
+    (tmp / "outfit2.jpg").write_bytes(b"x")
+    (tmp / "drv.mp4").write_bytes(b"x")
+    (tmp / "drv2.mp4").write_bytes(b"x")
+    (tmp / "bg.png").write_bytes(b"x")
+    (tmp / "bg2.png").write_bytes(b"x")
+    p = tmp / "b.yaml"
+    p.write_text(text, encoding="utf-8")
+    return p
 
 
 def _fixture(tmp: Path, text: str = MANIFEST) -> Path:
@@ -1711,6 +1761,111 @@ class TestPreservedLocalTryon(unittest.TestCase):
             manifest = load_manifest(_fixture(tmp, MANIFEST_MOT_RUN))
             self.assertEqual(preserved_local_tryon(manifest, {"runs": {}}, tmp / "out"),
                              (0, 0))
+
+
+class ShareTryonKeyTests(unittest.TestCase):
+    def test_same_look_different_driver_shares_a_key(self):
+        # The whole point (design doc §1): an ordinary try-on's inputs don't include the
+        # driver, so N drivers over one outfit must collapse to one provider call.
+        with tempfile.TemporaryDirectory() as d:
+            manifest = load_manifest(_fixture_share(Path(d)))
+            by_id = {run.id: run for run in manifest.runs}
+            key_a = tryon_share_key(by_id["runA"], "tryon")
+            key_b = tryon_share_key(by_id["runB"], "tryon")
+            self.assertIsNotNone(key_a)
+            self.assertEqual(key_a, key_b)
+
+            groups = tryon_share_groups(manifest)
+            self.assertEqual(groups["runA"], "runA")
+            self.assertEqual(groups["runB"], "runA")
+            # A different outfit is a different look, so it must not join runA's group.
+            self.assertNotEqual(groups["runC"], "runA")
+
+    def test_camera_aware_stage_keys_on_the_driver(self):
+        # camera-tryon locks cameraAware=True (pipelines.py), which is the ONE case where
+        # local_tryon.py reads the driver for the guide frame — so two drivers here must
+        # NOT share a key, unlike the plain "tryon" stage above.
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            text = MANIFEST_SHARE_TRYON.replace(
+                "    tryon: { provider: gemini }", "    camera-tryon: { provider: gemini }")
+            with mock.patch.dict(PIPELINES, {"tryon-motion-enhance": ["camera-tryon"]}):
+                manifest = load_manifest(_fixture_share(tmp, text))
+                by_id = {run.id: run for run in manifest.runs}
+                key_a = tryon_share_key(by_id["runA"], "camera-tryon")
+                key_b = tryon_share_key(by_id["runB"], "camera-tryon")
+                self.assertIsNotNone(key_a)
+                self.assertNotEqual(key_a, key_b)
+
+    def test_background_splits_a_group(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            text = MANIFEST_SHARE_TRYON.replace(
+                "      driver: drv.mp4\n    tryon: { provider: gemini }\n  - id: runB",
+                "      driver: drv.mp4\n      background: bg.png\n"
+                "    tryon: { provider: gemini }\n  - id: runB", 1).replace(
+                "      driver: drv2.mp4\n    tryon: { provider: gemini }\n  - id: runC",
+                "      driver: drv2.mp4\n      background: bg2.png\n"
+                "    tryon: { provider: gemini }\n  - id: runC", 1)
+            manifest = load_manifest(_fixture_share(tmp, text))
+            by_id = {run.id: run for run in manifest.runs}
+            key_a = tryon_share_key(by_id["runA"], "tryon")
+            key_b = tryon_share_key(by_id["runB"], "tryon")
+            self.assertIsNotNone(key_a)
+            self.assertIsNotNone(key_b)
+            self.assertNotEqual(key_a, key_b)
+
+    def test_params_split_a_group(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            manifest = load_manifest(_fixture_share(tmp))
+            by_id = {run.id: run for run in manifest.runs}
+            base = tryon_share_key(by_id["runA"], "tryon")
+
+            provider_text = MANIFEST_SHARE_TRYON.replace(
+                "      outfit: outfit.jpg\n      driver: drv2.mp4\n    tryon: { provider: gemini }",
+                "      outfit: outfit.jpg\n      driver: drv2.mp4\n    tryon: { provider: qwen-max }",
+                1)
+            provider_manifest = load_manifest(_fixture_share(tmp, provider_text))
+            provider_key = tryon_share_key(
+                {r.id: r for r in provider_manifest.runs}["runB"], "tryon")
+            self.assertNotEqual(base, provider_key)
+
+            garment_text = MANIFEST_SHARE_TRYON.replace(
+                "    tryon: { provider: gemini }\n  - id: runB",
+                "    tryon: { provider: gemini, garment_type: dress }\n  - id: runB", 1)
+            garment_manifest = load_manifest(_fixture_share(tmp, garment_text))
+            garment_key = tryon_share_key(
+                {r.id: r for r in garment_manifest.runs}["runA"], "tryon")
+            self.assertNotEqual(base, garment_key)
+
+    def test_seeded_runs_are_never_grouped(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            seed = tmp / "seed.png"
+            seed.write_bytes(b"seed-bytes")
+            text = MANIFEST_SHARE_TRYON.replace(
+                "    tryon: { provider: gemini }\n  - id: runB",
+                f"    tryon: {{ provider: gemini, seedImage: {seed} }}\n  - id: runB", 1)
+            manifest = load_manifest(_fixture_share(tmp, text))
+            by_id = {run.id: run for run in manifest.runs}
+            self.assertIsNone(tryon_share_key(by_id["runA"], "tryon"))
+
+            groups = tryon_share_groups(manifest)
+            self.assertEqual(groups["runA"], "runA")
+
+    def test_non_local_runs_are_absent(self):
+        # "qwen" (bare, no -max) is not in local_tryon.LOCAL_PROVIDERS, so
+        # _local_tryon_stage names no local stage for it and the run has nothing to share.
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            text = MANIFEST_SHARE_TRYON.replace(
+                "    tryon: { provider: gemini }\n  - id: runB",
+                "    tryon: { provider: qwen }\n  - id: runB", 1)
+            manifest = load_manifest(_fixture_share(tmp, text))
+            groups = tryon_share_groups(manifest)
+            self.assertNotIn("runA", groups)
+            self.assertIn("runB", groups)
 
 
 if __name__ == "__main__":

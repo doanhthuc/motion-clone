@@ -404,6 +404,55 @@ def _local_tryon_stage(run: Run) -> str | None:
     return None
 
 
+_TRUTHY = ("1", "true", "yes", "on")
+
+
+def tryon_share_key(run: Run, stage_name: str) -> tuple | None:
+    """What makes two runs' Phase A try-ons the same image (spec §1).
+
+    The driver is an input only for a camera-aware stage (local_tryon.py reads
+    it for the guide frame and nowhere else), so an ordinary try-on of one
+    look is identical across drivers — calling the provider once per driver
+    paid N×M for N images, and the M copies of one outfit came out visibly
+    different. A seeded run is never grouped: it copies its own saved image
+    and calls nothing.
+    """
+    params = effective_stage_params(stage_name, run.stage_params.get(stage_name))
+    if params.get("seedImage"):
+        return None
+    camera_aware = str(params.get("cameraAware") or "").lower().strip() in _TRUTHY
+    inputs = run.inputs
+
+    def _p(role: str) -> str | None:
+        path = inputs.get(role)
+        return str(path) if path is not None else None
+
+    return (_p("character"), _p("outfit"), _p("background"),
+            _p("driver") if camera_aware else None,
+            json.dumps(params, sort_keys=True, default=str))
+
+
+def tryon_share_groups(manifest: Manifest) -> dict[str, str]:
+    """run id -> the id of the run whose try-on it reuses (itself for a leader).
+
+    The leader is the first run of its group in manifest order, so the answer
+    is stable across calls. Only runs _local_tryon_stage names appear — that
+    function is the one answer to "is this stage local at all".
+    """
+    leaders: dict[tuple, str] = {}
+    groups: dict[str, str] = {}
+    for run in manifest.runs:
+        stage_name = _local_tryon_stage(run)
+        if stage_name is None:
+            continue
+        key = tryon_share_key(run, stage_name)
+        if key is None:
+            groups[run.id] = run.id
+            continue
+        groups[run.id] = leaders.setdefault(key, run.id)
+    return groups
+
+
 def local_tryon_reusable(run: Run, stage_name: str, recorded: dict, dest: Path) -> bool:
     """True when a try-on already on disk may stand in for THIS run's request.
 
