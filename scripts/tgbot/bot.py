@@ -7071,7 +7071,28 @@ class AppRuns:
                 # inside one handler, the draft store has one app owner, and the
                 # `panel_token()` compare at :7012 has had exactly this shape
                 # since before the stamp existed.
-                _save_confirm_stamp(self.chat_id, self.drafts.runnable()[2])
+                try:
+                    _save_confirm_stamp(self.chat_id, self.drafts.runnable()[2])
+                except OSError as exc:
+                    # Fail OPEN, and this is the one place in this handler where
+                    # failing open is the safer direction. By this line the
+                    # confirm is already accepted and `_do_confirm` has already
+                    # called `start_drain`, so the money is committed and a pod
+                    # is being rented. An OSError escaping here would skip
+                    # `self.idem.finish` below and reach httpapi/server.py's
+                    # catch-all, answering `500 internal` for a spend that
+                    # happened — and SpendGate does not take a first 5xx as the
+                    # server's answer (`.serverError`, "definitive only once
+                    # repeated"), so the phone would sit re-checking a rental
+                    # that is already running. Losing the stamp costs only the
+                    # latch: `_resume_generation_refusal` fails open when there
+                    # is no stamp, which is the documented posture for a
+                    # Telegram confirm, so a later resume is allowed rather than
+                    # refused. No double-spend either way — the retry reuses the
+                    # same idempotency key and `idem.begin` short-circuits it —
+                    # but the 500 would cost the user's knowledge of the spend,
+                    # and that is the more expensive loss.
+                    log(f"confirm stamp for chat {self.chat_id} not written: {exc!r}")
                 response = (202, {"run_id": self.run_id, "outcome": out.code})
             else:
                 response = (status_for(out), _run_error(out.code, out.message))

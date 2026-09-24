@@ -598,6 +598,40 @@ class TestAppRunsConfirm(_AppRunsFixture):
         do_confirm.assert_not_called()
         self.assertIsNone(bot._load_confirm_stamp(ME))
 
+    def test_an_unwritable_stamp_still_reports_the_spend_it_already_made(self):
+        """The stamp write sits between an accepted, money-committed confirm and
+        its 202. An OSError escaping there skips `idem.finish` and reaches
+        httpapi/server.py's catch-all, which answers `500 internal` for a spend
+        that already called `start_drain` — the user is told nothing about a pod
+        that is being rented, and SpendGate will not take a first 5xx as the
+        server's answer, so the phone re-checks a rental that is already running.
+        Failing open costs only the latch, which is what
+        `_resume_generation_refusal` already does when no stamp exists.
+
+        The real `_do_confirm` runs here (only `start_drain` is patched, by the
+        fixture), so the spend really happens and the assertion is that it is
+        *reported*, not avoided. The replay is the load-bearing half: it is what
+        proves `idem.finish` recorded the 202 rather than leaving the key
+        pending, which is the `409 outcome_unknown` that
+        `test_crash_midway_leaves_the_key_pending` pins for a raised spend."""
+        self._seed_draft(validated=True)
+        body = self._body()          # read once; the replay must not need a fresh one
+        with mock.patch("tgbot.bot._save_confirm_stamp",
+                        side_effect=OSError(28, "No space left on device")):
+            first = self.runs.confirm(self.runs.run_id, body, "k6")
+            second = self.runs.confirm(self.runs.run_id, body, "k6")
+        self.assertEqual(first[0], 202)
+        self.assertEqual(first[1]["outcome"], "started")
+        self.assertEqual(second, first)          # recorded, not left pending
+        self.patches["start_drain"].assert_called_once()
+        # The latch is the only thing lost, and it is lost loudly rather than
+        # silently: no stamp, so a later resume fails open instead of refusing
+        # against a number nobody wrote.
+        self.assertIsNone(bot._load_confirm_stamp(ME))
+        self.assertIsNone(bot._resume_generation_refusal(ME, self.store))
+        self.assertTrue(any("confirm stamp" in str(call)
+                            for call in self.patches["log"].call_args_list))
+
 
 class TestConfirmAfterADroppedBatchJob(_Fixture):
     """§5.10: dropping a job from the draft's basket after Phase A already ran

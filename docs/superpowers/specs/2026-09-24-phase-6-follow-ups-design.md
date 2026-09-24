@@ -213,9 +213,22 @@ verbatim through `message`, which `RunDetailView` renders on the same failure ca
 and `applyRefusal`'s `("stale_run", .resume)` case re-reads the run. One rule, one mechanism, one
 sentence — the server's.
 
-**Blast radius.** The Telegram recovery buttons (`_CB_RECOVER_RETRY`, `_CB_RECOVER_SWITCH`,
-`_CB_PHASE_A_SPEND`) call `_do_resume` directly and never enter `AppPod.resume`, so they are
-untouched. `test_batch_control_invariants.py` is unaffected: no new `start_drain` call site appears.
+**Blast radius.** There are **four** direct `_do_resume` callers outside `AppPod.resume` and
+`AppRuns.confirm`, not the three this section first named, and none of them enters `AppPod.resume`, so
+none is touched. Three are Telegram recovery buttons, reached only from `_handle_callback`:
+`_CB_PHASE_A_SPEND`, `_CB_RECOVER_RETRY` and `_CB_RECOVER_SWITCH`.
+
+The fourth is the unattended post-migration auto-resume in `tick_migration_progress`, which fires when
+a migration reports "done" — no user tap, and none of `AppPod.resume`'s three gates. It is the only
+re-rent in the codebase with no human in the loop at fire time, which is why the enumeration has to
+name it instead of folding it into "the Telegram buttons". It is still not app-reachable: the
+`_migrate_resume_marker()` file it reads has exactly one production writer, inside the
+`_CB_RECOVER_MIGRATE` handler, and `tick_migration_progress`'s own docstring says so ("that button is
+the only writer of that file"); the only other reference unlinks it. So the phone's
+`POST /v1/pod/migrate` — Task 4's `MigrateFlow` — never arms it. Verified 2026-09-24 by reading every
+`_migrate_resume_marker` reference rather than trusting the count.
+
+`test_batch_control_invariants.py` is unaffected: no new `start_drain` call site appears.
 `httpapi/server.py:292-296` passes the body through unchanged.
 
 ## 4. Item 2 — `MigrateFlow.migrate()` and the drop guard
@@ -327,6 +340,17 @@ distinction mattered: because the path does route through `userMessage`, `RunFlo
 pinned the old verbatim behaviour and broke, making `RunFlowTests.swift` a fifth file in this task.
 Corrected 2026-09-24 during implementation.
 
+A **third** surface folds the headline into a `String`, and this section's first draft enumerated only
+the two above: `BatchComposer.stop(at:)` and its outfit-clear failure both build their message as
+`draft.message ?? draft.error?.userMessage ?? "unknown error"`, so a `422 invalid` reaching either
+renders "Stopped at 2/5 — app/dress.png: This draft didn't pass validation, so it can't run yet." and
+the validator's own text is gone with no disclosure anywhere. Narrow today, and the narrowness is why
+it was missed rather than a reason to leave it out: `DraftError("invalid")` is raised in exactly one
+place, inside `validate()` (`drafts.py:566`), and the only two draft operations `BatchComposer`
+performs are a slot `PATCH` and `addToBatch`. Recorded so the enumeration of `userMessage`'s
+`String`-typed consumers is complete — not because a third disclosure is owed, since the composer's
+failure string is already an explanation with the offending outfit named in it.
+
 ### The existing test this breaks
 
 `DraftStoreTests.swift:249` asserts `store.message == "Driver video is unreadable."` for a
@@ -423,7 +447,16 @@ is still correct.
 - stamp equals the current generation → `202 started`, `start_drain` called;
 - stamp differs → `409 stale_run`, the new sentence, `start_drain` **not** called;
 - no stamp → allowed, `start_drain` called (the fail-open, asserted rather than assumed);
-- a corrupt stamp file → allowed, no exception (the fail-quiet load);
+- a corrupt stamp file → allowed, no exception (the fail-quiet load). **Narrowed rather than closed,
+  and the narrowing is recorded here on purpose (final review M7):** the corrupt-stamp cases are
+  exercised at the loader — `test_stamp_round_trips_and_a_corrupt_one_is_none`
+  (`test_batch_control_botpod.py:555-564`) writes non-JSON, a `generation` that is the *string* `"7"`,
+  and `true` — not through `resume`. That is transitively adequate: `_resume_generation_refusal`
+  returns `None` for any `None` load, and `test_resume_allowed_when_there_is_no_stamp` pins
+  `None` → `202` through the route. The untested delta is therefore only "a corrupt file cannot raise
+  inside `resume`", which the loader's `except (OSError, ValueError)` and its `isinstance(raw, dict)`
+  guard already close between them. No test added; if `_load_confirm_stamp` ever grows a path that
+  raises, this is the bullet that says why nothing caught it.
 - the stamp check runs *before* `_gpu_mismatch` and `_do_resume`, so a refused resume leaves the
   provision-failure file in place for a later, valid retry.
 
