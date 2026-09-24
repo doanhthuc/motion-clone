@@ -914,7 +914,7 @@ This is also what makes the two stores provably hold the **same instance**. Two 
 
 Run: `cd "$REPO/ios/MotionKit" && swift test 2>&1 | tail -12`
 
-Expected: `✔ Test run with 252 tests in 23 suites passed.` (250 after Task 3).
+Expected: `✔ Test run with 252 tests in 23 suites passed.` (250 after Task 3; the fix round then added a third test, so Task 4 ends at 253 and every later task's baseline is 253.)
 
 - [ ] **Step 5: Build the app, which is the only check that the wiring compiles**
 
@@ -1094,7 +1094,7 @@ struct ErrorBanner: View {
 
 Run: `cd "$REPO/ios/MotionKit" && swift test 2>&1 | tail -12`
 
-Expected: `✔ Test run with 252 tests in 23 suites passed.` (no new suites; `userMessages` grew in place).
+Expected: `✔ Test run with 253 tests in 23 suites passed.` (no new suites; `userMessages` grew in place).
 
 Run: `cd "$REPO" && make ios-build 2>&1 | tail -12; echo "EXIT=$?"`
 
@@ -1161,7 +1161,7 @@ Add a comment above `static let pipelines` recording why the name matters, so th
     /// role — a fixture that disagrees with the catalog cannot catch a
     /// role-handling regression, which is the only reason it exists. Its *kind*
     /// stays the unrecognised `"future_kind"`: `ModelsTests`'
-    /// `unknownRoleKindDecodesAsUnknown` is about the kind, not the name.
+    /// `pipelineAndDraftModelsDecode`'s unknown-kind assertion is about the kind, not the name.
 ```
 
 - [ ] **Step 3: Rename in the three test files**
@@ -1184,15 +1184,15 @@ Add a comment above `static let pipelines` recording why the name matters, so th
 
 Run: `cd "$REPO/ios/MotionKit" && swift test 2>&1 | tail -12`
 
-Expected: `✔ Test run with 252 tests in 23 suites passed.` — the **same count as before this task**. A rename that changes the count means a test stopped compiling into the run or an anchor silently no-op'd.
+Expected: `✔ Test run with 253 tests in 23 suites passed.` — the **same count as before this task**. A rename that changes the count means a test stopped compiling into the run or an anchor silently no-op'd.
 
 - [ ] **Step 5: Verify Review Focus 5 — that no `.replacingOccurrences` anchor silently no-op'd**
 
-Spec §6 read all six anchors and none contains `mask`, so none should have moved. Prove it rather than trust the reading:
+Spec §6 read all eight anchors and none contains `mask`, so none should have moved. Prove it rather than trust the reading:
 
 Run: `cd "$REPO" && grep -n 'replacingOccurrences' ios/MotionKit/Tests/MotionKitTests/{ModelsTests,TryonLibraryStoreTests,DraftStoreTests}.swift`
 
-Expected: the six anchors are exactly `"driver":null}}]`, `"jobs":1,"estimate_min":null}`, `"generation":4`, `"estimate_min":null}` (twice), `"provider":"gemini","slots":{"character"`. Then confirm the suite that would fail loudly if one had broken still runs:
+Expected: eight anchors — `"driver":null}}]`, `"jobs":1,"estimate_min":null}`, `"generation":4`, `"estimate_min":null}` (twice), `"provider":"gemini","slots":{"character"`, and `"stale":false` (twice, at `DraftStoreTests.swift:131,152`, on `Fixtures.validatedDraft`). Then confirm the suite that would fail loudly if one had broken still runs:
 
 Run: `cd "$REPO/ios/MotionKit" && swift test --filter 'usersListsBasketRunsBeforeTheEditedJob|draftSeedIsOptionalAndDecodes' 2>&1 | tail -10`
 
@@ -1504,7 +1504,7 @@ Expected: `OK`. This is the static check that the money calls are still reachabl
 
 Run: `cd "$REPO/ios/MotionKit" && swift test 2>&1 | tail -12; echo "EXIT=$?"`
 
-Expected: `EXIT=0`, `✔ Test run with 252 tests in 23 suites passed.`
+Expected: `EXIT=0`, `✔ Test run with 253 tests in 23 suites passed.`
 
 Run: `cd "$REPO" && make ios-build > /tmp/p6fu-build.log 2>&1; echo "EXIT=$?"; tail -5 /tmp/p6fu-build.log`
 

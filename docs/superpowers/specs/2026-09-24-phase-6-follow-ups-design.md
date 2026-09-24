@@ -318,21 +318,27 @@ human, and it must stay verbatim.
 `background` (`scripts/batchlib/pipelines.py:54,81`). Phase 6 §6 already corrected the plan's ruling
 text on this; the fixture is what is left.
 
-Seven sites: `Fixtures.swift:159,160,170`; `ModelsTests.swift:176,192,254`;
-`RunFlowTests.swift:33`; `BatchComposerTests.swift:102`.
+Eight lines across seven sites: `Fixtures.swift:159,160,170` — 159 and 160 are inside one
+`tryon-motion-enhance` object, so they are a single substitution block; `ModelsTests.swift:176,192,254`;
+`RunFlowTests.swift:33`; `BatchComposerTests.swift:102`. This spec's first draft said "Seven sites" and
+then enumerated eight. The line numbers are also pre-Task-3 and pre-Task-5, so find each site by its
+quoted string rather than by number.
 
 `roles["background"]` keeps the kind `"future_kind"`, so `ModelsTests.swift:176`
-(`catalog.pipelines[1].roles[…] == .unknown`) still tests what it was written to test — that an
+(`catalog.pipelines[1].roles["background"] == .unknown`, inside `pipelineAndDraftModelsDecode`) still tests what it was written to test — that an
 unknown role *kind* decodes as `.unknown`. The role's name was never the subject.
 
 **The recorded blocker does not fire.** Phase 6 could not edit `Fixtures.swift` because three suites
-do exact `.replacingOccurrences` surgery on `Fixtures.draft`'s text. All six anchors were read and
-none contains `mask`:
+do exact `.replacingOccurrences` surgery on `Fixtures.draft`'s text. All eight anchors were read and
+none contains `mask`. This spec's first draft listed six; the two it missed are
+`DraftStoreTests.swift:131,152`, anchor `"stale":false`, which target `Fixtures.validatedDraft` — a
+fixture this change does not edit:
 
 | Suite | Anchors |
 |---|---|
 | `TryonLibraryStoreTests.swift:29,32` | `"driver":null}}]` · `"jobs":1,"estimate_min":null}` |
 | `DraftStoreTests.swift:399,403` | `"generation":4` · `"estimate_min":null}` |
+| `DraftStoreTests.swift:131,152` | `"stale":false` (twice, on `Fixtures.validatedDraft`) |
 | `ModelsTests.swift:231,233` | `"estimate_min":null}` · `"provider":"gemini","slots":{"character"` |
 
 No behaviour depends on the name either: `BatchComposer.supports` filters on pipelines whose
