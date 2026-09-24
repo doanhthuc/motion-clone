@@ -665,13 +665,34 @@ Co-Authored-By: Qwen Code <noreply@qwen.com>"
 
 ### Task 4: App — the `MigrateFlow` drop guard
 
+> **CORRECTION, found during this task's implementation (2026-09-24).** Four things below are wrong
+> and the shipped code deviates from all four. Spec §4 carries the corrected reasoning.
+>
+> 1. **Step 3's guard order makes its own choke point dead code.** It puts `guard canMigrate(…)` first
+>    and the drop guard second, while also adding `!runFlow.isDropping` to `canMigrate`. Both are
+>    `@MainActor` with no `await` between them, so during a drop `canMigrate` is false, the first guard
+>    returns silently, and the second is unreachable — the refusal never reaches the user. Implemented
+>    verbatim, this task's own test failed with `migrate.message → nil`. **The drop guard goes first.**
+>    `RunFlow.spend`'s equivalent is not dead in the same shape because `regenerate`, `retryRental` and
+>    `choose` skip `canConfirm`; `migrate()` is `MigrateFlow`'s only entry point, so the Phase 6 pattern
+>    does not transfer by analogy.
+> 2. **Step 3's `MotionApp.swift:94` line does not compile.** `self.runFlow` is `RunFlow?`
+>    (`MotionApp.swift:37`), so it cannot be passed where a `RunFlow` is required. It needs a local
+>    `let`, mirroring the file's own `let pod = …; self.pod = pod` convention — which also proves
+>    `AppModel` and `MigrateFlow` hold the *same instance*. Only `make ios-build` catches this, because
+>    `swift test` never compiles `MotionApp`.
+> 3. **`RunFlow.isDropping` is at `RunFlowStore.swift:39`, not `:44`.**
+> 4. **The "~95 s PATCH + ~90 s validate" figures conflate two different numbers.** Both client
+>    timeouts are **95 s** (`RunFlowStore.swift:308`, `:314`); 90 s is the *server's* validate budget
+>    (`:311-312`). Quoting the server's number understates the client-side window.
+
 **Files:**
 - Modify: `ios/MotionKit/Sources/MotionKit/Stores/MigrateFlow.swift:36-48` (init), `:63-68` (`canMigrate`), `:113-127` (`migrate`)
 - Modify: `ios/MotionApp/MotionApp.swift:94`
 - Test: `ios/MotionKit/Tests/MotionKitTests/MigrateFlowTests.swift:7-20` (`Routes`), `:29-34` (`make`), append two tests
 
 **Interfaces:**
-- Consumes: `RunFlow.isDropping: Bool` (already `public private(set)`, `RunFlowStore.swift:44`). Nothing new is exposed.
+- Consumes: `RunFlow.isDropping: Bool` (already `public private(set)`, `RunFlowStore.swift:39`). Nothing new is exposed.
 - Produces: `MigrateFlow.init(client: APIClient, gate: any SpendSending, pod: PodStore, runFlow: RunFlow, now: @escaping @Sendable () -> Date)` — a **required** parameter, inserted before `now`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -815,8 +836,9 @@ In `MigrateFlow.swift`, add the property next to the other `private let`s (`:38-
     private let pod: PodStore
     /// Read for `isDropping` only. `RunFlow.spend` guards its own four entry
     /// points; `migrate()` calls `gate.perform` directly and so needs the same
-    /// guard here, or a drop's ~95 s PATCH + ~90 s validate is a window the
-    /// most destructive call in the API can be launched inside.
+    /// guard here, or a drop's two 95 s client timeouts — the slot PATCH and
+    /// the validate (RunFlowStore.swift:308, :314) — are a window the most
+    /// destructive call in the API can be launched inside.
     private let runFlow: RunFlow
     private let now: @Sendable () -> Date
     private var deadline: Date?
@@ -843,33 +865,43 @@ In `MigrateFlow.swift`, add the property next to the other `private let`s (`:38-
     }
 ```
 
-And `migrate()` gains the choke-point guard, mirroring `RunFlow.spend`'s — both levels, because a button-level guard alone is what Phase 6 found insufficient:
+And `migrate()` gains the choke-point guard — **ahead of** the `canMigrate` guard, not behind it. Both levels exist because a button-level guard alone is what Phase 6 found insufficient, but the order is load-bearing: `canMigrate` now carries the same term, both guards are `@MainActor` with no `await` between them, so checking the drop second would make it unreachable and the refusal silent.
 
 ```swift
     public func migrate() async {
-        guard canMigrate(at: now()), let ask = currentAsk else { return }
-        // The choke point, not only `canMigrate`: same split as `RunFlow.spend`,
-        // so a caller that skips the button check still cannot launch the one
-        // call that deletes a volume while the draft is moving under it.
-        // `recheck()` and `replayPendingOnce()` deliberately do NOT come through
-        // here — they resolve a request already sent, and blocking them would
-        // strand a pending migration behind an unrelated drop.
+        // Ahead of `canMigrate`, deliberately. `canMigrate` carries the same
+        // `!runFlow.isDropping` term and both guards are `@MainActor` with no
+        // `await` between them, so checking the drop second would make this
+        // guard unreachable and the refusal silent — a dead guard reads as
+        // coverage it does not provide. Kept as the choke point regardless,
+        // mirroring `RunFlow.spend`: a caller that skips the button check still
+        // cannot launch the one call that deletes a volume while the draft is
+        // moving under it. `recheck()` and `replayPendingOnce()` deliberately do
+        // NOT come through here — they resolve a request already sent, and
+        // blocking them would strand a pending migration behind an unrelated
+        // drop.
         guard !runFlow.isDropping else {
             message = "A batch drop is still in flight — wait for it before moving the volume."
             return
         }
+        guard canMigrate(at: now()), let ask = currentAsk else { return }
         let label = "Migrate volume to \(ask.toDc)"
 ```
 
 Leave `recheck()` and `replayPendingOnce()` untouched.
 
-In `ios/MotionApp/MotionApp.swift:94`:
+In `ios/MotionApp/MotionApp.swift`, the construction needs a local `let` because `self.runFlow` is `RunFlow?` (`:37`) and `MigrateFlow` takes it non-optional — mirroring the file's own `let pod = …; self.pod = pod` convention:
 
 ```swift
+        // A local `let`, like `pod` and `draft` above: `self.runFlow` is a
+        // `RunFlow?`, and `MigrateFlow` takes the dependency non-optional so an
+        // absent one cannot silently no-op its drop guard.
+        let runFlow = RunFlow(client: client, gate: gate)
+        self.runFlow = runFlow
         migrate = MigrateFlow(client: client, gate: gate, pod: pod, runFlow: runFlow)
 ```
 
-`runFlow` is assigned on the line above (`:93`), so the order already works. Both are rebuilt together on `reconnect()`, and the `guard let credentials = vault.load() else { … }` teardown at `:70-72` nils both, so no dangling pairing.
+This is also what makes the two stores provably hold the **same instance**. Two separate `RunFlow` objects would make the guard inert while every test still passed, because the tests build their own pairing. Both are rebuilt together on `reconnect()`, and the `guard let credentials = vault.load() else { … }` teardown nils both, so no dangling pairing.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -889,9 +921,9 @@ Expected: `EXIT=0`. `swift test` never compiles `MotionApp`, so a wrong argument
 cd "$REPO"
 motions-studio/setup/scrub-secrets.sh --check
 git add ios/MotionKit/Sources/MotionKit/Stores/MigrateFlow.swift ios/MotionKit/Tests/MotionKitTests/MigrateFlowTests.swift ios/MotionApp/MotionApp.swift
-git commit -m "MigrateFlow: refuse a migration while a batch drop is in flight" -m "Phase 6 guarded RunFlow.spend, the single funnel its four spends share. migrate() calls gate.perform directly, so it was the fifth entry point and the only unguarded one - a drop's ~95s PATCH plus ~90s validate was a window the most destructive call in the API could be launched inside.
+git commit -m "MigrateFlow: refuse a migration while a batch drop is in flight" -m "Phase 6 guarded RunFlow.spend, the single funnel its four spends share. migrate() calls gate.perform directly, so it was the fifth entry point and the only unguarded one - a drop's two 95s client timeouts were a window the most destructive call in the API could be launched inside.
 
-Guarded at both levels, as Phase 6 guards confirm. recheck() and replayPendingOnce() stay unguarded on purpose: they resolve a request already sent, and blocking them would strand a pending migration behind an unrelated drop.
+Guarded at both levels, as Phase 6 guards confirm, with the drop guard ahead of canMigrate: canMigrate carries the same term, so checking it first would make the choke point unreachable and the refusal silent. recheck() and replayPendingOnce() stay unguarded on purpose: they resolve a request already sent, and blocking them would strand a pending migration behind an unrelated drop.
 
 Co-Authored-By: Qwen Code <noreply@qwen.com>"
 ```

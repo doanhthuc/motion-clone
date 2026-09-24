@@ -200,16 +200,37 @@ Phase 6 put `guard !isDropping` in `RunFlow.spend(_:label:)`, the single funnel 
 `MigrateFlow.init` gains a required `runFlow: RunFlow`. `MotionApp.swift:93-94` already builds
 `runFlow` immediately before `migrate`, so the wiring is one argument; `MigrateFlowTests.swift:33` is
 the single factory to update. Required, not defaulted — an optional dependency that silently no-ops
-when absent is how a guard rots.
+when absent is how a guard rots. **But `AppModel.runFlow` is `RunFlow?`** (`MotionApp.swift:37`, nil'd
+on credential teardown), so the construction cannot pass it directly: it needs a local `let`, mirroring
+the file's own `let pod = …; self.pod = pod` convention, so that `AppModel` and `MigrateFlow` provably
+hold the *same instance*. Two instances would make the guard inert while every test still passed,
+because the tests build their own pairing.
 
-The guard goes in both places, mirroring the Phase 6 pattern:
+The guard goes in both places, mirroring the Phase 6 pattern — **and the order inside `migrate()` is
+load-bearing**:
 
-- `canMigrate(at:)` gains `!runFlow.isDropping`, so the button is off the glass; and
-- `migrate()` gains `guard !runFlow.isDropping else { message = …; return }` before it builds the
-  label, so the choke point holds even if a caller skips `canMigrate`.
+- `canMigrate(at:)` gains `!runFlow.isDropping`, so the button is off the glass. With the drop guard
+  first in `migrate()`, this term exists purely for the UI's button state.
+- `migrate()` gains `guard !runFlow.isDropping else { message = …; return }` **ahead of** the
+  `canMigrate` guard, not behind it. Both are `@MainActor` with no `await` between them, so if
+  `canMigrate` carries the same term and is checked first, it returns false during a drop, the first
+  guard returns silently, and the choke point is unreachable — a dead guard that reads as coverage it
+  does not provide, and a refusal the user never sees. Measured during implementation: the
+  behind-`canMigrate` order fails the task's own test with `migrate.message → nil`.
+
+`RunFlow.spend`'s equivalent is not dead in the same shape because `regenerate`, `retryRental` and
+`choose` all skip `canConfirm` and reach `spend` directly; `migrate()` is `MigrateFlow`'s only entry
+point, so the Phase 6 pattern does not transfer by analogy. Corrected 2026-09-24 during
+implementation; the first draft of this spec specified the unreachable order.
 
 Message: `"A batch drop is still in flight — wait for it before moving the volume."` — the same
 sentence shape `RunFlow.spend` uses, with the migration's own noun.
+
+The window this closes is the client's own timeouts, not the server's budgets: a drop spends up to
+**95 s** on the slot `PATCH` and **95 s** on the validate (`RunFlowStore.swift:308`, `:314`,
+`timeout: 95`). The 90 s figure the first draft of this spec quoted is the *server's* validate budget
+(`RunFlowStore.swift:311-312`: "the server can probe for 60 s and validate for 90 s, so stay under
+Cloudflare's ~100 s"). The two are different numbers and conflating them understates the window.
 
 `recheck()` and `replayPendingOnce()` stay unguarded, on purpose: they resolve a request that was
 already sent, exactly as `RunFlow`'s equivalents do, and blocking them would strand a pending
