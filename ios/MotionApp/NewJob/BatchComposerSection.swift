@@ -31,7 +31,7 @@ struct BatchComposerSection: View {
                                     slot: store.draft?.slots[role], materials: materials,
                                     disabled: store.isBusy || composer.isRunning) { onPickRole(role) }
                 }
-                SectionLabel(text: "Outfits · \(composer.outfits.count)/\(BatchComposer.maxOutfits)")
+                SectionLabel(text: "Outfits · \(composer.outfits.count)/\(BatchComposer.maxJobs)")
                 ForEach(composer.outfits) { outfit in outfitRow(outfit) }
                 Button("Choose outfits…") { pickingOutfits = true }
                     .buttonStyle(SecondaryButtonStyle())
@@ -166,7 +166,7 @@ private struct OutfitThumbnail: View {
     }
 }
 
-/// Multi-select of outfit materials, capped by `BatchComposer.maxOutfits`.
+/// Multi-select of outfit materials, capped by `BatchComposer.maxJobs`.
 @MainActor
 private struct OutfitMultiPicker: View {
     let composer: BatchComposer
@@ -188,7 +188,7 @@ private struct OutfitMultiPicker: View {
                             .foregroundStyle(chosen ? Theme.lime : Theme.ink3)
                     }
                 }
-                .disabled(!chosen && composer.outfits.count >= BatchComposer.maxOutfits)
+                .disabled(!chosen && composer.outfits.count >= BatchComposer.maxJobs)
                 .accessibilityIdentifier("outfit.pick.\(material.id)")
             }
             .navigationTitle("Choose outfits")

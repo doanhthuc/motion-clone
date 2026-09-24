@@ -20,12 +20,23 @@ extension URLProtocolTests {
         /// from the stub handler, and a `var` written from a test body would be
         /// the one field raced outside it.
         private let library: String
+        /// The draft's pipeline and the catalog served beside it, fixed at init
+        /// for the same reason as `library`.
+        private let pipeline: String
+        private let catalog: String
 
-        init(library: String = #"{"entries":[]}"#) { self.library = library }
+        init(library: String = #"{"entries":[]}"#, pipeline: String = "tryon-motion-enhance") {
+            self.library = library
+            self.pipeline = pipeline
+            self.catalog = pipeline == "tryon-motion-enhance" ? Fixtures.pipelines : BatchComposerTests.cameraCatalog
+        }
 
         func failNextPatch(for outfit: String) { lock.withLock { failPatchFor = outfit } }
         func preload(outfit: String, seed: String?) {
             lock.withLock { batch.append((shared.merging(["outfit": outfit]) { $1 }, seed)) }
+        }
+        func preload(outfit: String, driver: String, seed: String?) {
+            lock.withLock { batch.append((shared.merging(["outfit": outfit, "driver": driver]) { $1 }, seed)) }
         }
         /// Another surface baskets this outfit while we are patching it, so the
         /// add-to-batch that follows sees an exact copy — the only way a
@@ -41,7 +52,7 @@ extension URLProtocolTests {
         func answer(_ r: URLRequest) -> (Int, [String: String], Data) {
             lock.withLock {
                 switch (r.httpMethod ?? "GET", r.url?.path ?? "") {
-                case ("GET", "/v1/pipelines"): return TestSupport.json(Fixtures.pipelines)
+                case ("GET", "/v1/pipelines"): return TestSupport.json(catalog)
                 case ("GET", "/v1/tryon-library"): return TestSupport.json(library)
                 case ("GET", "/v1/draft"):
                     if dropBatchArmed {
@@ -62,6 +73,11 @@ extension URLProtocolTests {
                             return TestSupport.json(#"{"error":{"code":"unprobeable","message":"could not read o2"}}"#, status: 422)
                         }
                         outfit = value
+                    }
+                    // A driver slot is shared state, like the character: a nil
+                    // value empties it, exactly as drafts.py's PATCH does.
+                    if let slots = body["slots"] as? [String: Any], slots.keys.contains("driver") {
+                        shared["driver"] = slots["driver"] as? String
                     }
                     if body.keys.contains("tryon_seed") { seed = body["tryon_seed"] as? String }
                     if let racing = basketNextPatchFor, racing == outfit {
@@ -95,10 +111,10 @@ extension URLProtocolTests {
                 ["material_id": id, "name": id, "exists": true, "probe": probe, "warning": ""] }
             let missing = ["character", "driver", "outfit"].filter { current[$0] == nil }
             let entries: [[String: Any]] = batch.enumerated().map { i, entry in
-                ["digest": "d\(i)", "run_id": "run\(i)", "pipeline": "tryon-motion-enhance", "provider": "gemini",
+                ["digest": "d\(i)", "run_id": "run\(i)", "pipeline": pipeline, "provider": "gemini",
                  "slots": entry.slots, "tryon_seed": entry.seed ?? NSNull()] }
             let draft: [String: Any] = [
-                "owner": "app", "pipeline": "tryon-motion-enhance", "provider": "gemini", "generation": batch.count,
+                "owner": "app", "pipeline": pipeline, "provider": "gemini", "generation": batch.count,
                 "slots": slots, "required": ["character", "driver", "outfit"], "optional": ["background"],
                 "missing": missing, "validated": NSNull(), "batch": entries, "jobs": batch.count,
                 "estimate_min": NSNull(), "tryon_seed": seed ?? NSNull()]
@@ -310,7 +326,7 @@ extension URLProtocolTests {
         #expect(composer.outfits.map(\.seedID) == ["new", nil])
         #expect(composer.matches(for: "app/o1.png").map(\.id) == ["new", "old"])
         for i in 3...20 { composer.toggle(outfitID: "app/x\(i).png") }
-        #expect(composer.outfits.count == BatchComposer.maxOutfits)
+        #expect(composer.outfits.count == BatchComposer.maxJobs)
         composer.toggle(outfitID: "app/o1.png")
         #expect(!composer.outfits.contains { $0.outfitID == "app/o1.png" })
     }
@@ -320,6 +336,212 @@ extension URLProtocolTests {
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         let catalog = try decoder.decode(PipelineCatalogResponse.self, from: Fixtures.data(Fixtures.pipelines))
         #expect(catalog.pipelines.filter(BatchComposer.supports).map(\.id) == ["tryon-motion-enhance"])
+    }
+    /// `Fixtures.pipelines` plus the camera-aware pipeline, whose try-on stage
+    /// (`camera-tryon`) is guided by the driver and so cannot be shared across
+    /// drivers (`scripts/batchlib/pipelines.py:77-85,155`). Kept out of
+    /// `Fixtures.pipelines` so the catalog-wide assertions elsewhere stay put.
+    nonisolated static let cameraCatalog = #"""
+    {"pipelines":[
+      {"id":"tryon-motion-enhance","stages":["tryon","motion","enhance"],
+       "required":["character","driver","outfit"],"optional":["background"],
+       "roles":{"character":"image","driver":"video","outfit":"image","background":"image"},
+       "providers":[{"id":"gemini","label":"Gemini"}]},
+      {"id":"tryon-camera-motion-enhance","stages":["camera-tryon","camera-motion","enhance"],
+       "required":["character","driver","outfit"],"optional":["background"],
+       "roles":{"character":"image","driver":"video","outfit":"image","background":"image"},
+       "providers":[{"id":"gemini","label":"Gemini"}]}
+    ]}
+    """#
+
+    private func slots(_ w: (String, String, [String: Any]?)) -> [String: Any]? { w.2?["slots"] as? [String: Any] }
+
+    @Test func twoOutfitsTwoDriversAreFourPatchAddPairsThenBothSlotsAreCleared() async {
+        let server = FakeDraftServer()
+        let (composer, draft) = await make(server)
+        composer.toggle(outfitID: "app/o1.png")
+        composer.toggle(outfitID: "app/o2.png")
+        composer.toggle(driverID: "app/d1.mp4")
+        composer.toggle(driverID: "app/d2.mp4")
+        #expect(composer.jobCount == 4)
+        #expect(composer.canRun)
+
+        await composer.run()
+
+        let w = writes()
+        #expect(w.map { "\($0.0) \($0.1)" } == Array(repeating: ["PATCH /v1/draft", "POST /v1/draft/add-to-batch"], count: 4).flatMap { $0 }
+                + ["PATCH /v1/draft"])
+        // Outfit-major: every driver of o1 before o2.
+        let pairs = stride(from: 0, to: 8, by: 2).map { i in
+            "\(slots(w[i])?["outfit"] as? String ?? "?")+\(slots(w[i])?["driver"] as? String ?? "?")" }
+        #expect(pairs == ["app/o1.png+app/d1.mp4", "app/o1.png+app/d2.mp4",
+                          "app/o2.png+app/d1.mp4", "app/o2.png+app/d2.mp4"])
+        // Every step still names its seed.
+        #expect((0..<4).allSatisfy { w[$0 * 2].2?.keys.contains("tryon_seed") == true })
+        // The final PATCH clears both multi-selected slots and leaves the seed alone.
+        #expect(slots(w[8])?["outfit"] is NSNull)
+        #expect(slots(w[8])?["driver"] is NSNull)
+        #expect(w[8].2?.keys.contains("tryon_seed") == false)
+        #expect(draft.draft?.batch.count == 4)
+        #expect(composer.failure == nil && composer.lastAdded == 4)
+        #expect(composer.outfits.isEmpty && composer.drivers.isEmpty && composer.progress == nil)
+    }
+
+    @Test func noDriversSelectedKeepsTodaysBehaviour() async {
+        let server = FakeDraftServer()
+        let (composer, draft) = await make(server)
+        for o in ["app/o1.png", "app/o2.png", "app/o3.png"] { composer.toggle(outfitID: o) }
+        #expect(composer.sharedSlots["driver"] == "app/dance.mp4")
+        #expect(composer.jobCount == 3)
+
+        await composer.run()
+
+        let w = writes()
+        #expect(w.map { "\($0.0) \($0.1)" } == [
+            "PATCH /v1/draft", "POST /v1/draft/add-to-batch",
+            "PATCH /v1/draft", "POST /v1/draft/add-to-batch",
+            "PATCH /v1/draft", "POST /v1/draft/add-to-batch",
+            "PATCH /v1/draft"])
+        // No step and no clear touches the driver: it is a shared slot here.
+        #expect(w.allSatisfy { slots($0)?.keys.contains("driver") != true })
+        #expect(slots(w[6])?.keys.sorted() == ["outfit"])
+        #expect(draft.draft?.filledSlots["driver"] == "app/dance.mp4")
+        #expect(composer.lastAdded == 3)
+    }
+
+    @Test func continueSkipsPairsAlreadyInTheBasket() async {
+        let server = FakeDraftServer()
+        server.preload(outfit: "app/o1.png", driver: "app/d1.mp4", seed: nil)
+        let (composer, draft) = await make(server)
+        composer.toggle(outfitID: "app/o1.png")
+        composer.toggle(outfitID: "app/o2.png")
+        composer.toggle(driverID: "app/d1.mp4")
+        composer.toggle(driverID: "app/d2.mp4")
+
+        await composer.run()
+
+        let adds = writes().filter { $0.1 == "/v1/draft/add-to-batch" }
+        #expect(adds.count == 3)
+        #expect(draft.draft?.batch.count == 4)
+        #expect(composer.failure == nil && composer.lastAdded == 3)
+    }
+
+    @Test func aStoppedPairNamesBothMaterialsAndCountsJobs() async {
+        let server = FakeDraftServer()
+        let (composer, _) = await make(server)
+        composer.toggle(outfitID: "app/o1.png")
+        composer.toggle(outfitID: "app/o2.png")
+        composer.toggle(driverID: "app/d1.mp4")
+        composer.toggle(driverID: "app/d2.mp4")
+        server.failNextPatch(for: "app/o2.png")
+
+        await composer.run()
+
+        #expect(composer.progress == .init(done: 2, total: 4))
+        #expect(composer.failure?.contains("app/o2.png") == true)
+        #expect(composer.failure?.contains("app/d1.mp4") == true)
+        #expect(composer.drivers.count == 2)
+    }
+
+    @Test func aDriverThatWouldExceedTwelveJobsIsRefusedWithAReason() async {
+        let server = FakeDraftServer()
+        let (composer, _) = await make(server)
+        for i in 1...6 { composer.toggle(outfitID: "app/o\(i).png") }
+        composer.toggle(driverID: "app/d1.mp4")
+        composer.toggle(driverID: "app/d2.mp4")
+        #expect(composer.jobCount == 12)
+        #expect(composer.capReason == nil)
+
+        composer.toggle(driverID: "app/d3.mp4")
+        #expect(composer.drivers.count == 2)
+        #expect(composer.capReason != nil)
+
+        composer.toggle(outfitID: "app/o5.png")
+        composer.toggle(outfitID: "app/o6.png")
+        composer.toggle(driverID: "app/d3.mp4")
+        #expect(composer.drivers == ["app/d1.mp4", "app/d2.mp4", "app/d3.mp4"])
+        #expect(composer.jobCount == 12)
+        #expect(composer.capReason == nil)
+    }
+
+    @Test func anOutfitThatWouldExceedTwelveJobsIsRefused() async {
+        let server = FakeDraftServer()
+        let (composer, _) = await make(server)
+        for i in 1...3 { composer.toggle(driverID: "app/d\(i).mp4") }
+        for i in 1...4 { composer.toggle(outfitID: "app/o\(i).png") }
+        #expect(composer.jobCount == 12)
+
+        composer.toggle(outfitID: "app/o5.png")
+        #expect(composer.outfits.count == 4)
+        #expect(composer.capReason != nil)
+
+        composer.toggle(driverID: "app/d3.mp4")          // a removal is always allowed
+        #expect(composer.capReason == nil)
+        composer.toggle(outfitID: "app/o5.png")          // 5 × 2 = 10
+        #expect(composer.outfits.count == 5)
+        #expect(composer.capReason == nil)
+    }
+
+    @Test func seedsAreSharedAcrossDriversOfOneOutfit() async {
+        let server = FakeDraftServer(library: #"""
+        {"entries":[{"id":"s1","owner":"app","material_ids":{"character":"app/me.png","outfit":"app/o1.png"},"provider":"gemini","saved_at":1}]}
+        """#)
+        let (composer, _) = await make(server)
+        composer.toggle(outfitID: "app/o1.png")
+        composer.toggle(outfitID: "app/o2.png")
+        composer.toggle(driverID: "app/d1.mp4")
+        composer.toggle(driverID: "app/d2.mp4")
+        #expect(composer.outfits.map(\.seedID) == ["s1", nil])
+
+        await composer.run()
+
+        let patches = writes().filter { $0.0 == "PATCH" && slots($0)?["driver"] is String }
+        let o1 = patches.filter { slots($0)?["outfit"] as? String == "app/o1.png" }
+        let o2 = patches.filter { slots($0)?["outfit"] as? String == "app/o2.png" }
+        #expect(o1.count == 2 && o2.count == 2)
+        #expect(o1.allSatisfy { $0.2?["tryon_seed"] as? String == "s1" })
+        #expect(o2.allSatisfy { $0.2?["tryon_seed"] is NSNull })
+    }
+
+    @Test func tryonCountIsOnePerUnseededOutfit() async {
+        let library = #"""
+        {"entries":[{"id":"s1","owner":"app","material_ids":{"character":"app/me.png","outfit":"app/o1.png"},"provider":"gemini","saved_at":1}]}
+        """#
+        for (pipeline, cameraAware, tryons) in [("tryon-motion-enhance", false, 2), ("tryon-camera-motion-enhance", true, 4)] {
+            let server = FakeDraftServer(library: library, pipeline: pipeline)
+            let (composer, draft) = await make(server)
+            #expect(draft.selectedPipeline?.id == pipeline)
+            for i in 1...3 { composer.toggle(outfitID: "app/o\(i).png") }
+            composer.toggle(driverID: "app/d1.mp4")
+            composer.toggle(driverID: "app/d2.mp4")
+            #expect(composer.outfits.compactMap(\.seedID) == ["s1"])
+            #expect(composer.cameraAwareTryon == cameraAware)
+            #expect(composer.jobCount == 6)
+            #expect(composer.tryonCount == tryons)
+        }
+    }
+
+    @Test func missingSharedExcludesTheDriverOnlyWhenDriversAreSelected() async {
+        let server = FakeDraftServer()
+        let (composer, draft) = await make(server)
+        #expect(await draft.apply(DraftPatch(slots: ["driver": nil])))
+        #expect(composer.missingShared == ["driver"])
+        composer.toggle(outfitID: "app/o1.png")
+        #expect(!composer.canRun)
+
+        composer.toggle(driverID: "app/d1.mp4")
+        #expect(composer.missingShared.isEmpty)
+        #expect(composer.sharedSlots["driver"] == nil)
+        #expect(composer.canRun)
+    }
+
+    @Test func onlyPipelinesWithADriverRoleTakeDrivers() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let catalog = try decoder.decode(PipelineCatalogResponse.self, from: Fixtures.data(Self.cameraCatalog))
+        #expect(catalog.pipelines.allSatisfy(BatchComposer.supportsDrivers))
+        let fixture = try decoder.decode(PipelineCatalogResponse.self, from: Fixtures.data(Fixtures.pipelines))
+        #expect(fixture.pipelines.filter(BatchComposer.supportsDrivers).map(\.id) == ["motion-enhance", "tryon-motion-enhance"])
     }
 }
 }

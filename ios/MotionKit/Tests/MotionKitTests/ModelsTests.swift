@@ -54,7 +54,7 @@ import Testing
     }
 
     @Test func batchSummaryCountsEachStatusSeparately() throws {
-        // 12 jobs — `BatchComposer.maxOutfits` — with a distinct count for every
+        // 12 jobs — `BatchComposer.maxJobs` — with a distinct count for every
         // present status (done 5, pending 4, running 2, error 1) and no `.unknown`,
         // so repointing any counter at any other status changes an asserted number.
         // A fixture with one job per status cannot tell `done` from `failed`.
