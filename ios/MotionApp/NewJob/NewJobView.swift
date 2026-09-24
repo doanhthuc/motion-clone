@@ -108,6 +108,7 @@ struct NewJobView: View {
                     BatchComposerSection(store: store, composer: composer,
                                          materials: materials, pipeline: pipeline,
                                          onPickRole: { selectedRole = $0 })
+                    clearAction
                 } else {
                     slots(draft: draft, pipeline: pipeline)
                     seedBadge(draft)
@@ -199,6 +200,12 @@ struct NewJobView: View {
         }
     }
 
+    /// Single mode only, deliberately. This reports the *edited job*'s required
+    /// and missing roles, and the Batch arm does not render the edited job — it
+    /// renders shared slots plus an outfit multi-select. A "2 of 3 required
+    /// slots assigned" line under a cross-build form would describe a job the
+    /// user is not looking at. Batch mode's own readiness is `BatchComposer`'s
+    /// `canRun`, which the run button's disabled state already shows.
     private func readiness(_ draft: Draft) -> some View {
         let assigned = draft.required.count - draft.missing.count
         let ready = draft.missing.isEmpty
@@ -228,16 +235,29 @@ struct NewJobView: View {
             .background(Theme.lime, in: .rect(cornerRadius: 12))
             .disabled(!draft.missing.isEmpty || store.isBusy || composer.isRunning)
 
-            Button("Clear", role: .destructive) {
-                Task { await store.clear() }
-            }
-            .font(Theme.sans(14, .semibold))
-            .foregroundStyle(Theme.red)
-            .padding(.horizontal, 16)
-            .padding(.vertical, 12)
-            .background(Theme.redDim, in: .rect(cornerRadius: 12))
-            .disabled(store.isBusy || composer.isRunning)
+            clearAction
         }
+    }
+
+    /// One implementation for both arms, so they cannot drift. Batch mode had
+    /// no Clear at all until 2026-09-24: `editorActions` — the only Clear — sat
+    /// in the Single arm of `editor`'s if/else alone, so emptying the draft from
+    /// Batch meant switching to Single first. That was not theoretical;
+    /// `Phase6SmokeTests` had to do exactly it, twice.
+    ///
+    /// No accessibility identifier: the smokes find this by its `"Clear"` label
+    /// (`Phase4Draft.revealButton`), as they did before, and an identifier
+    /// nothing queries is noise.
+    private var clearAction: some View {
+        Button("Clear", role: .destructive) {
+            Task { await store.clear() }
+        }
+        .font(Theme.sans(14, .semibold))
+        .foregroundStyle(Theme.red)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .background(Theme.redDim, in: .rect(cornerRadius: 12))
+        .disabled(store.isBusy || composer.isRunning)
     }
 
     /// The edited job's own seed. `!library.loaded` counts as "still exists":
