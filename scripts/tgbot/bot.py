@@ -7325,11 +7325,12 @@ def _confirm_stamp_path(chat_id: int) -> Path:
     `_run_token` alone cannot do this job: it is the manifest's mtime_ns
     (`_manifest_token`), which moves only when a manifest is *rewritten*, and a
     draft edit rewrites nothing. That is why `panel_token` joins the generation
-    for `confirm` — and why `resume`, which re-rents the manifest on disk and
-    deliberately never reads the draft, had no equivalent. Without this stamp
-    the only latch was an in-memory copy of the confirmed generation on the
-    phone, which an app relaunch loses; this stamp is what survives one, and is
-    why that copy is now gone (2026-09-24 follow-ups spec §3).
+    for `confirm` — and why `resume`, which re-rents the manifest on disk and,
+    before this stamp, consulted nothing but the manifest's own `mtime_ns`, had
+    no equivalent. Without this stamp the only latch was an in-memory copy of
+    the confirmed generation on the phone, which an app relaunch loses; this
+    stamp is what survives one, and is why that copy is now gone (2026-09-24
+    follow-ups spec §3).
     """
     return ROOT / "batch" / f"tg-{chat_id}.confirmed-generation.json"
 
@@ -7511,9 +7512,9 @@ class AppPod:
         way a phone screen left open can. Fails open when no app confirm ever
         wrote one; see _resume_generation_refusal.
 
-        The app's draft is deliberately left alone — a resume is about a
-        manifest that was confirmed long ago. Reading its generation is not
-        reading the draft's contents.
+        The draft's *contents* never feed the decision — only its `generation`
+        is compared, and a draft this box cannot parse is quarantined as
+        `….<uuid>.bad` and refused (spec §5.9).
         """
         if run_id != self.run_id:
             return 404, _run_error("not_found", "no such run")

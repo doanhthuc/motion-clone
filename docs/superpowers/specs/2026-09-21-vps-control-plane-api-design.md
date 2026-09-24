@@ -293,7 +293,13 @@ holds the models, Postgres and MinIO**. Both sit behind the slice-4 machinery (`
   see one; this is the gap `panel_token` already closes for `confirm` by joining `.generation`.
   **Fails open when no stamp exists** — a Telegram-initiated confirm writes none, and `_do_confirm`
   must not write one, because it is shared with the Telegram flow where the app's draft is not what
-  the user reviewed. So the latch covers app-initiated confirms only. No route and no request or
+  the user reviewed. So the latch covers app-initiated confirms only. **Fails closed on a draft this
+  box cannot parse**, which is the case a phone-side reader cannot diagnose from the screen: `_load`
+  quarantines the file as `<name>.<uuid>.bad` — moved aside, never deleted, since it is the only copy
+  of what the user composed, and a unique suffix so a second corrupt file cannot overwrite the first —
+  and returns generation 0, so the stamp can no longer match and `resume` answers the same
+  `409 stale_run`. Nothing in the draft *appears* to have changed, because the draft the app last read
+  is no longer the file on disk; the refusal is the only observable. No route and no request or
   response field changed, so §5.3's table does not move, and that is why both deploy orders are safe:
   an old app build is protected by the server, and a new build works against an old server. `provider`
   is required, as on `confirm`. `gpu`, when sent, must equal `.env`'s `GPU` or the answer is

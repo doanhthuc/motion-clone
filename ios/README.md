@@ -183,10 +183,11 @@ Design: `docs/superpowers/specs/2026-09-23-swiftui-app-phase-6-design.md`.
   remaining basket entry has no drop affordance by design — **Clear** (on the New Job tab, in either
   mode) is the only way to remove it. Run detail shows a per-job batch progress list.
 - **Retry rental is latched to the draft that was confirmed.** `resume` re-rents the manifest on disk
-  and reads only the draft's `generation`, never its contents, so the generation is the one thing that
-  can tell it the draft moved. The latch is the server's, and it survives a relaunch: an accepted
-  confirm stamps the draft's `generation` (`batch/tg-<chat_id>.confirmed-generation.json`, written for
-  app-initiated confirms only) and `resume` refuses `409 stale_run` when the draft has moved since.
+  and its gate compares only the draft's `generation` — nothing else in the draft feeds the decision —
+  so the generation is the one thing that can tell it the draft moved. The latch is the server's, and it
+  survives a relaunch: an accepted confirm stamps the draft's `generation`
+  (`batch/tg-<chat_id>.confirmed-generation.json`, written for app-initiated confirms only) and
+  `resume` refuses `409 stale_run` when the draft has moved since.
   Without it, a drop after a failed rental would rent a pod still running the dropped job — `_run_token`
   is the manifest's `mtime_ns`, and a draft edit rewrites no manifest, so nothing else can see one. The
   refusal reaches the run detail card verbatim, and the app re-reads the run. An in-memory copy of the
