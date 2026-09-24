@@ -286,17 +286,19 @@ holds the models, Postgres and MinIO**. Both sit behind the slice-4 machinery (`
   run (the condition Telegram's recovery buttons are drawn under — without it, resuming a finished
   batch would rent a pod to do nothing), the run's current `run_token`, and — since 2026-09-24 — an
   unchanged draft. `confirm` stamps the app draft's `generation` when it is accepted
-  (`batch/tg-<chat_id>.confirmed-generation.json`, `_kill_result_path`'s convention), and `resume`
-  refuses `409 stale_run` when the draft has moved since, because it re-rents the manifest on disk and
-  a draft edit rewrites no manifest. `_run_token` is the manifest's `mtime_ns`, so it cannot see one;
-  this is the gap `panel_token` already closes for `confirm` by joining `.generation`. **Fails open
-  when no stamp exists** — a Telegram-initiated confirm writes none, and `_do_confirm` must not write
-  one, because it is shared with the Telegram flow where the app's draft is not what the user
-  reviewed. So the latch covers app-initiated confirms only. No route and no request or response field
-  changed, so §5.3's table does not move, and that is why both deploy orders are safe: an old app build
-  is protected by the server, and a new build works against an old server. `provider` is required, as
-  on `confirm`. `gpu`, when sent, must equal `.env`'s `GPU` or the answer is `409 stale_panel`; the
-  same optional `gpu` is now checked on `confirm` — the price the app showed was for one GPU.
+  (`batch/tg-<chat_id>.confirmed-generation.json`, `_kill_result_path`'s convention) — read after the
+  confirm's own `clear()` of that draft (§5.8), so the clear does not itself trip the gate — and
+  `resume` refuses `409 stale_run` when the draft has moved since, because it re-rents the manifest on
+  disk and a draft edit rewrites no manifest. `_run_token` is the manifest's `mtime_ns`, so it cannot
+  see one; this is the gap `panel_token` already closes for `confirm` by joining `.generation`.
+  **Fails open when no stamp exists** — a Telegram-initiated confirm writes none, and `_do_confirm`
+  must not write one, because it is shared with the Telegram flow where the app's draft is not what
+  the user reviewed. So the latch covers app-initiated confirms only. No route and no request or
+  response field changed, so §5.3's table does not move, and that is why both deploy orders are safe:
+  an old app build is protected by the server, and a new build works against an old server. `provider`
+  is required, as on `confirm`. `gpu`, when sent, must equal `.env`'s `GPU` or the answer is
+  `409 stale_panel`; the same optional `gpu` is now checked on `confirm` — the price the app showed was
+  for one GPU.
 - **`GET /v1/balance` keeps the Vast credit opt-in.** `vast_credit()` is a ~30 s subprocess; the RunPod
   balance is one `runpodctl` call. `GET /v1/pod` is therefore free of both.
 - **Migration is guarded more tightly than Telegram.** `ask` refuses (`409`) while a migration is

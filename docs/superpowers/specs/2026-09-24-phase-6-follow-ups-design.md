@@ -3,12 +3,15 @@
 Date: 2026-09-24 · Status: implemented on `feat/phase-6-follow-ups`, gates not yet swept, not merged · Branch: `feat/phase-6-follow-ups` (one branch, one PR)
 
 Line-number citations of `scripts/tgbot/bot.py` in §2 and §3 are as of `fd8464b`, before implementation.
-Tasks 1 and 2 added 123 net lines to that file, every one of them at original line 7040 or later —
-`git diff fd8464b HEAD -- scripts/tgbot/bot.py`'s first hunk is the pure insertion
-`@@ -7038,6 +7038,40 @@` — so every citation pointing past that line has drifted, `:7413` for the
-`run_token` check and `_kill_result_path` at `:7247-7274` among them. Citations earlier in the file
-were re-read on 2026-09-24 and did not move: `:7029` and `:7039` for the two accepted-branch `clear()`
-calls, `:6945-6946` for `_phase_a_matches_draft`'s first test, `:7009-7012` for the `bot_busy` early
+Tasks 1 and 2 added 123 net lines to that file, every one of them at original line 7040 or later, so
+every citation pointing past that line has drifted — `:7413` for the `run_token` check and the
+kill-result helpers at `:7247-7275` among them. Reproduce the count with
+`git diff fd8464b 952b532 -- scripts/tgbot/bot.py` → `132  9`, first hunk the pure insertion
+`@@ -7038,6 +7038,40 @@`. Pinned to a SHA rather than to `HEAD` because a moving reference decays,
+which is what this note is about; `952b532` was this branch's tip on 2026-09-24 and `bot.py` last
+changed in `af05d93`, so any later tip prints the same numbers. Citations earlier in the file were
+re-read on 2026-09-24 and did not move: `:7029` and `:7039` for the two accepted-branch `clear()`
+calls, `:6945-6946` for `_phase_a_matches_draft`'s first test, `:7009-7011` for the `bot_busy` early
 return. Read a drifted site by symbol name (`AppPod.resume`, `_kill_result_path`); the names did not
 move. Code comments are held to a stricter standard and were corrected as each task touched them —
 `_changed` at `drafts.py:275-279` and the validate save at `drafts.py:555` still point where they say.
@@ -98,7 +101,7 @@ re-validate, and it cannot be satisfied by accident later, because the counter o
 Also read: `AppPod.__init__` is `(tg, chat_id, idem)` — it has no `DraftStore`, unlike `AppRuns`
 (`bot.py:6889`). It is built at `bot.py:7789` from the same scope that already holds `server.drafts`
 (used one line earlier, at `:7785`, for `AppRuns`). `_kill_result_path` / `_save_kill_result` /
-`_load_kill_result` (`bot.py:7247-7274`) are the existing convention for "small per-chat JSON that
+`_load_kill_result` (`bot.py:7247-7275`) are the existing convention for "small per-chat JSON that
 must survive a bot restart": `ROOT / "batch" / f"tg-{chat_id}.<name>.json"`, atomic `tmp.replace`,
 and a load that fails quiet to `None`.
 
@@ -413,7 +416,7 @@ In `test_batch_control_botruns.py`:
 
 - both accepted confirm branches write the stamp;
 - a refused confirm writes nothing. Tested for `stale_panel` and `not_validated`. **`bot_busy` is not
-  tested, by ruling:** its early return (`bot.py:7009-7012`, after `self.idem.forget(…)`) is three
+  tested, by ruling:** its early return (`bot.py:7009-7011`, after `self.idem.forget(…)`) is three
   lines above the write and never reaches `if out:`, so it cannot stamp; arranging a `_bot_locked()`
   timeout in a test costs more than that coverage is worth. Verified structurally during Task 2's
   review rather than left assumed;

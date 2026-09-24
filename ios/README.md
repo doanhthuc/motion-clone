@@ -183,7 +183,8 @@ Design: `docs/superpowers/specs/2026-09-23-swiftui-app-phase-6-design.md`.
   remaining basket entry has no drop affordance by design — **Clear** (on the New Job tab, in either
   mode) is the only way to remove it. Run detail shows a per-job batch progress list.
 - **Retry rental is latched to the draft that was confirmed.** `resume` re-rents the manifest on disk
-  and never reads the draft, so `RunFlow` records `draft.generation` when a confirm is accepted and
+  and reads only the draft's `generation`, never its contents, so the generation is the one thing that
+  can tell it the draft moved. `RunFlow` records `draft.generation` when a confirm is accepted and
   `canRetryRental` refuses once the draft moves — otherwise a drop after a failed rental would rent a
   pod still running the dropped job. The run detail card stays up and says why
   (`retryRentalBlockReason`). The server is the authority, and it survives a relaunch: an accepted
