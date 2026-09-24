@@ -12,6 +12,7 @@
 
 ## Global Constraints
 
+- **Every command runs from the root of the checkout you are working in.** Set `REPO=$(git rev-parse --show-toplevel)` once per shell before the first command that uses `"$REPO"`. This branch is implemented in a git worktree, so a hardcoded absolute path would run the gate against the *main* checkout and report another tree's result as this branch's. Added after Task 1: the plan originally hardcoded the main checkout's path in all 37 command sites, and the implementer had to override it by hand.
 - Write in English: code, comments, commit messages. Much of the existing repo is Vietnamese; that is legacy, not a pattern to copy.
 - No `# #region ALD <DD/MM/YYYY> - …` markers. Explain **why**, with the number that was measured and the date.
 - Four-space indent in Python **and in Swift** (verified 2026-09-23: 63 four-space lines vs 0 two-space in `DraftStore.swift`).
@@ -188,7 +189,7 @@ Add a new test class immediately after `TestAppPodResume`'s existing methods (ke
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cd /Users/thucpham/Desktop/motion-clone && python3 -m unittest scripts.tests.test_batch_control_botpod -v 2>&1 | tail -30`
+Run: `cd "$REPO" && python3 -m unittest scripts.tests.test_batch_control_botpod -v 2>&1 | tail -30`
 
 Expected: FAIL — `AttributeError: module 'tgbot.bot' has no attribute '_load_confirm_stamp'`, and every `bot.AppPod(self.tg, ME, self.store, self.idem)` call failing with `TypeError: AppPod.__init__() takes 4 positional arguments but 5 were given`.
 
@@ -321,18 +322,18 @@ Finally, the construction site at `:7789`:
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `cd /Users/thucpham/Desktop/motion-clone && python3 -m unittest scripts.tests.test_batch_control_botpod 2>&1 | tail -15`
+Run: `cd "$REPO" && python3 -m unittest scripts.tests.test_batch_control_botpod 2>&1 | tail -15`
 
 Expected: `OK`. Then the whole suite and the invariants, which pin where the money calls may be started from:
 
-Run: `cd /Users/thucpham/Desktop/motion-clone && make batch-test 2>&1 | tail -15`
+Run: `cd "$REPO" && make batch-test 2>&1 | tail -15`
 
 Expected: `OK` (possibly `OK (skipped=1)`). `test_batch_control_invariants` must stay green — this task adds no `start_drain` call site.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/thucpham/Desktop/motion-clone
+cd "$REPO"
 motions-studio/setup/scrub-secrets.sh --check
 git add scripts/tgbot/bot.py scripts/tests/test_batch_control_botpod.py
 git commit -m "Retry rental: refuse a resume whose draft moved since the confirm" -m "resume re-rents the manifest on disk and never reads the draft, and _run_token only moves when a manifest is rewritten - so a free draft edit left Retry rental offering to rent a pod that still ran the job the user had just dropped. The app's in-memory latch closed that, and an app relaunch lost it.
@@ -453,7 +454,7 @@ And the end-to-end half, in `TestAppPodResume` in `scripts/tests/test_batch_cont
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cd /Users/thucpham/Desktop/motion-clone && python3 -m unittest scripts.tests.test_batch_control_botruns scripts.tests.test_batch_control_botpod 2>&1 | tail -25`
+Run: `cd "$REPO" && python3 -m unittest scripts.tests.test_batch_control_botruns scripts.tests.test_batch_control_botpod 2>&1 | tail -25`
 
 Expected: FAIL — `AssertionError: None != 4` on the stamp assertions (nothing writes one yet), and `test_a_confirm_then_a_moved_draft_refuses_the_retry` failing with `409 != 202` on the *first* resume (no stamp) or `202 != 409` on the second, depending on how far it gets.
 
@@ -490,14 +491,14 @@ Do not add a second `_save_confirm_stamp` call next to either `self.drafts.clear
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cd /Users/thucpham/Desktop/motion-clone && make batch-test 2>&1 | tail -15`
+Run: `cd "$REPO" && make batch-test 2>&1 | tail -15`
 
 Expected: `OK`. If `test_an_accepted_resume_branch_confirm_stamps_the_generation` fails with `stale_panel` instead of reaching `_do_resume`, the manifest `_seed_journal` wrote does not match the draft's job fingerprints — compare against `test_confirm_after_phase_a_resumes` (`:437`), which sets the same three preconditions and passes.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /Users/thucpham/Desktop/motion-clone
+cd "$REPO"
 motions-studio/setup/scrub-secrets.sh --check
 git add scripts/tgbot/bot.py scripts/tests/test_batch_control_botruns.py scripts/tests/test_batch_control_botpod.py
 git commit -m "Confirm: stamp the draft generation it was accepted at" -m "The writer for resume's new gate. One write at the single acceptance point covers both accepted branches and nothing else, so a refused confirm stamps nothing.
@@ -565,7 +566,7 @@ Append to `RunFlowTests` in `ios/MotionKit/Tests/MotionKitTests/RunFlowTests.swi
 
 - [ ] **Step 2: Run the test to verify it fails or passes for the right reason**
 
-Run: `cd /Users/thucpham/Desktop/motion-clone/ios/MotionKit && swift test --filter RunFlowTests 2>&1 | tail -20`
+Run: `cd "$REPO/ios/MotionKit" && swift test --filter RunFlowTests 2>&1 | tail -20`
 
 This test is expected to **pass already** — `applyRefusal`'s `("stale_run", .resume)` case shipped in Phase 4. That is the correct outcome and not a wasted test: it is the app-side half of a two-sided contract that no test pinned before, and it is what stops a future refactor of `applyRefusal` from silently dropping the case. Record in the commit message that it passed on arrival.
 
@@ -608,14 +609,14 @@ with
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cd /Users/thucpham/Desktop/motion-clone/ios/MotionKit && swift test 2>&1 | tail -12`
+Run: `cd "$REPO/ios/MotionKit" && swift test 2>&1 | tail -12`
 
 Expected: `✔ Test run with 250 tests in 23 suites passed.` (249 before this task). The wording change breaks no test: the three existing `retryRentalBlockReason` assertions (`RunFlowTests.swift:534,541,569`) all compare against `nil`, and none asserts the old sentence.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /Users/thucpham/Desktop/motion-clone
+cd "$REPO"
 motions-studio/setup/scrub-secrets.sh --check
 git add ios/MotionKit/Sources/MotionKit/Stores/RunFlowStore.swift ios/MotionKit/Tests/MotionKitTests/RunFlowTests.swift
 git commit -m "RunFlow: pin the relaunch half of the stale-resume contract" -m "The new test passed on arrival - applyRefusal has handled (stale_run, .resume) since Phase 4. It is here because nothing pinned the app side of a contract that now has a server side, and a refactor of applyRefusal could drop the case silently.
@@ -765,7 +766,7 @@ Then append the two tests:
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cd /Users/thucpham/Desktop/motion-clone/ios/MotionKit && swift test --filter MigrateFlowTests 2>&1 | tail -20`
+Run: `cd "$REPO/ios/MotionKit" && swift test --filter MigrateFlowTests 2>&1 | tail -20`
 
 Expected: FAIL to compile — `extra argument 'runFlow' in call` / `missing argument for parameter 'runFlow'`, because `MigrateFlow.init` does not take it yet.
 
@@ -837,20 +838,20 @@ In `ios/MotionApp/MotionApp.swift:94`:
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cd /Users/thucpham/Desktop/motion-clone/ios/MotionKit && swift test 2>&1 | tail -12`
+Run: `cd "$REPO/ios/MotionKit" && swift test 2>&1 | tail -12`
 
 Expected: `✔ Test run with 252 tests in 23 suites passed.` (250 after Task 3).
 
 - [ ] **Step 5: Build the app, which is the only check that the wiring compiles**
 
-Run: `cd /Users/thucpham/Desktop/motion-clone && make ios-build 2>&1 | tail -12; echo "EXIT=$?"`
+Run: `cd "$REPO" && make ios-build 2>&1 | tail -12; echo "EXIT=$?"`
 
 Expected: `EXIT=0`. `swift test` never compiles `MotionApp`, so a wrong argument at `MotionApp.swift:94` is invisible until this step.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/thucpham/Desktop/motion-clone
+cd "$REPO"
 motions-studio/setup/scrub-secrets.sh --check
 git add ios/MotionKit/Sources/MotionKit/Stores/MigrateFlow.swift ios/MotionKit/Tests/MotionKitTests/MigrateFlowTests.swift ios/MotionApp/MotionApp.swift
 git commit -m "MigrateFlow: refuse a migration while a batch drop is in flight" -m "Phase 6 guarded RunFlow.spend, the single funnel its four spends share. migrate() calls gate.perform directly, so it was the fifth entry point and the only unguarded one - a drop's ~95s PATCH plus ~90s validate was a window the most destructive call in the API could be launched inside.
@@ -928,7 +929,7 @@ In `DraftStoreTests.swift`, the assertion at `:249` breaks — update it and add
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cd /Users/thucpham/Desktop/motion-clone/ios/MotionKit && swift test --filter 'APIClientTests|DraftStoreTests' 2>&1 | tail -25`
+Run: `cd "$REPO/ios/MotionKit" && swift test --filter 'APIClientTests|DraftStoreTests' 2>&1 | tail -25`
 
 Expected: FAIL — `detailMessage` does not exist (compile error), and once it does, `userMessage` still returns the raw text so the headline assertions fail.
 
@@ -1017,18 +1018,18 @@ struct ErrorBanner: View {
 
 - [ ] **Step 5: Run the tests and the build**
 
-Run: `cd /Users/thucpham/Desktop/motion-clone/ios/MotionKit && swift test 2>&1 | tail -12`
+Run: `cd "$REPO/ios/MotionKit" && swift test 2>&1 | tail -12`
 
 Expected: `✔ Test run with 252 tests in 23 suites passed.` (no new suites; `userMessages` grew in place).
 
-Run: `cd /Users/thucpham/Desktop/motion-clone && make ios-build 2>&1 | tail -12; echo "EXIT=$?"`
+Run: `cd "$REPO" && make ios-build 2>&1 | tail -12; echo "EXIT=$?"`
 
 Expected: `EXIT=0`. This is the only gate that compiles `ErrorBanner`.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/thucpham/Desktop/motion-clone
+cd "$REPO"
 motions-studio/setup/scrub-secrets.sh --check
 git add ios/MotionKit/Sources/MotionKit/API/APIError.swift ios/MotionKit/Tests/MotionKitTests/APIClientTests.swift ios/MotionKit/Tests/MotionKitTests/DraftStoreTests.swift ios/MotionApp/Components/StatusViews.swift
 git commit -m "APIError: lead a failed validation with a headline, not the validator's stdout" -m "A 422 invalid reaches the phone as one of four developer-facing strings: the validator's raw stdout+stderr, the literal 'make batch-validate failed', Telegram copy telling the reader to send files again into a chat they are not in, or - bot.py:6051 - an empty string, because _render_and_validate already sent the real reason to Telegram. That last one rendered a red banner with no text in it.
@@ -1054,7 +1055,7 @@ Co-Authored-By: Qwen Code <noreply@qwen.com>"
 
 - [ ] **Step 1: Confirm the seven sites and nothing else**
 
-Run: `cd /Users/thucpham/Desktop/motion-clone && grep -rn '"mask"\|\[mask\]\|:mask\|mask"' ios/ --include=*.swift`
+Run: `cd "$REPO" && grep -rn '"mask"\|\[mask\]\|:mask\|mask"' ios/ --include=*.swift`
 
 Expected: exactly the seven sites listed above (two in `Fixtures.pipelines`, one in `Fixtures.draft`, three in `ModelsTests`, one each in `RunFlowTests` and `BatchComposerTests`), plus no hits under `ios/MotionKit/Sources/` or `ios/MotionApp/`. Any hit in shipped code means this task's premise is wrong — stop and re-read spec §6.
 
@@ -1107,7 +1108,7 @@ Add a comment above `static let pipelines` recording why the name matters, so th
 
 - [ ] **Step 4: Run the tests**
 
-Run: `cd /Users/thucpham/Desktop/motion-clone/ios/MotionKit && swift test 2>&1 | tail -12`
+Run: `cd "$REPO/ios/MotionKit" && swift test 2>&1 | tail -12`
 
 Expected: `✔ Test run with 252 tests in 23 suites passed.` — the **same count as before this task**. A rename that changes the count means a test stopped compiling into the run or an anchor silently no-op'd.
 
@@ -1115,18 +1116,18 @@ Expected: `✔ Test run with 252 tests in 23 suites passed.` — the **same coun
 
 Spec §6 read all six anchors and none contains `mask`, so none should have moved. Prove it rather than trust the reading:
 
-Run: `cd /Users/thucpham/Desktop/motion-clone && grep -n 'replacingOccurrences' ios/MotionKit/Tests/MotionKitTests/{ModelsTests,TryonLibraryStoreTests,DraftStoreTests}.swift`
+Run: `cd "$REPO" && grep -n 'replacingOccurrences' ios/MotionKit/Tests/MotionKitTests/{ModelsTests,TryonLibraryStoreTests,DraftStoreTests}.swift`
 
 Expected: the six anchors are exactly `"driver":null}}]`, `"jobs":1,"estimate_min":null}`, `"generation":4`, `"estimate_min":null}` (twice), `"provider":"gemini","slots":{"character"`. Then confirm the suite that would fail loudly if one had broken still runs:
 
-Run: `cd /Users/thucpham/Desktop/motion-clone/ios/MotionKit && swift test --filter 'usersListsBasketRunsBeforeTheEditedJob|draftSeedIsOptionalAndDecodes' 2>&1 | tail -10`
+Run: `cd "$REPO/ios/MotionKit" && swift test --filter 'usersListsBasketRunsBeforeTheEditedJob|draftSeedIsOptionalAndDecodes' 2>&1 | tail -10`
 
 Expected: both pass. `TryonLibraryStoreTests.swift:22-26` documents that this is the intended failure mode — "If an anchor ever stops matching the replacement no-ops, and `usersListsBasketRunsBeforeTheEditedJob` then fails loudly instead of passing vacuously."
 
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/thucpham/Desktop/motion-clone
+cd "$REPO"
 motions-studio/setup/scrub-secrets.sh --check
 git add ios/MotionKit/Tests/MotionKitTests/Fixtures.swift ios/MotionKit/Tests/MotionKitTests/ModelsTests.swift ios/MotionKit/Tests/MotionKitTests/RunFlowTests.swift ios/MotionKit/Tests/MotionKitTests/BatchComposerTests.swift
 git commit -m "Fixtures: name the optional role background, as the catalog does" -m "mask occurs nowhere in scripts/** as a role - the server's pipelines use background (batchlib/pipelines.py:54,81). A fixture that disagrees with the live catalog cannot catch a role-handling regression, which is the only reason it exists.
@@ -1276,11 +1277,11 @@ Do **not** touch `Phase3SmokeTests.swift:67,119-120`. Those run in Single mode, 
 
 - [ ] **Step 5: Build, and prove the UI-test target still compiles**
 
-Run: `cd /Users/thucpham/Desktop/motion-clone && make ios-build 2>&1 | tail -12; echo "EXIT=$?"`
+Run: `cd "$REPO" && make ios-build 2>&1 | tail -12; echo "EXIT=$?"`
 
 Expected: `EXIT=0`. This compiles `MotionApp` only — the scheme builds `MotionAppUITests` for the `test` action, not `build`.
 
-Run: `cd /Users/thucpham/Desktop/motion-clone && make ios-gen && xcodebuild -project ios/MotionApp.xcodeproj -scheme MotionApp -destination 'generic/platform=iOS Simulator' build-for-testing > /tmp/p6fu-bft.log 2>&1; echo "EXIT=$?"; tail -5 /tmp/p6fu-bft.log`
+Run: `cd "$REPO" && make ios-gen && xcodebuild -project ios/MotionApp.xcodeproj -scheme MotionApp -destination 'generic/platform=iOS Simulator' build-for-testing > /tmp/p6fu-bft.log 2>&1; echo "EXIT=$?"; tail -5 /tmp/p6fu-bft.log`
 
 Expected: `EXIT=0`, and `grep -c "Phase6SmokeTests" /tmp/p6fu-bft.log` is non-zero — the object file being compiled is what proves the UI-test target was part of this action. No simulator is booted: `generic/platform=iOS Simulator` is a compile-only destination.
 
@@ -1289,7 +1290,7 @@ Expected: `EXIT=0`, and `grep -c "Phase6SmokeTests" /tmp/p6fu-bft.log` is non-ze
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/thucpham/Desktop/motion-clone
+cd "$REPO"
 motions-studio/setup/scrub-secrets.sh --check
 git add ios/MotionApp/NewJob/NewJobView.swift ios/MotionAppUITests/Phase6SmokeTests.swift
 git commit -m "New Job: a Clear in Batch mode" -m "editorActions - the only Clear - sat in the Single arm of editor's if/else alone, so emptying the draft from Batch meant switching to Single first. Phase6SmokeTests had to do exactly that twice, which is the evidence it was a real papercut and not a hypothetical one.
@@ -1361,7 +1362,7 @@ Leave the gate-record table alone. Task 9 fills it — the gates have not run ye
 - [ ] **Step 3: Commit**
 
 ```bash
-cd /Users/thucpham/Desktop/motion-clone
+cd "$REPO"
 motions-studio/setup/scrub-secrets.sh --check
 git add docs/superpowers/specs/2026-09-21-vps-control-plane-api-design.md docs/superpowers/specs/2026-09-24-phase-6-follow-ups-design.md
 git commit -m "docs(api): resume's third gate, the confirm stamp" -m "Amended in place, as each slice has. No route and no field changed, which is why both deploy orders are safe and the route table at 5.2 does not move.
@@ -1379,37 +1380,37 @@ Co-Authored-By: Qwen Code <noreply@qwen.com>"
 
 - [ ] **Step 1: The free Python gates**
 
-Run: `cd /Users/thucpham/Desktop/motion-clone && make batch-test 2>&1 | tail -10; echo "EXIT=$?"`
+Run: `cd "$REPO" && make batch-test 2>&1 | tail -10; echo "EXIT=$?"`
 
 Expected: `EXIT=0`, `OK` or `OK (skipped=1)`.
 
-Run: `cd /Users/thucpham/Desktop/motion-clone && python3 -m unittest scripts.tests.test_batch_control_invariants 2>&1 | tail -8`
+Run: `cd "$REPO" && python3 -m unittest scripts.tests.test_batch_control_invariants 2>&1 | tail -8`
 
 Expected: `OK`. This is the static check that the money calls are still reachable from exactly the pinned call sites; Tasks 1 and 2 added a gate, not a call site, so it must be unaffected. If it fails, something moved `start_drain` — stop and diagnose, do not edit the expectation.
 
 - [ ] **Step 2: The free Swift gates**
 
-Run: `cd /Users/thucpham/Desktop/motion-clone/ios/MotionKit && swift test 2>&1 | tail -12; echo "EXIT=$?"`
+Run: `cd "$REPO/ios/MotionKit" && swift test 2>&1 | tail -12; echo "EXIT=$?"`
 
 Expected: `EXIT=0`, `✔ Test run with 252 tests in 23 suites passed.`
 
-Run: `cd /Users/thucpham/Desktop/motion-clone && make ios-build > /tmp/p6fu-build.log 2>&1; echo "EXIT=$?"; tail -5 /tmp/p6fu-build.log`
+Run: `cd "$REPO" && make ios-build > /tmp/p6fu-build.log 2>&1; echo "EXIT=$?"; tail -5 /tmp/p6fu-build.log`
 
 Expected: `EXIT=0`. Checked explicitly, not through a pipe — `make … | tail` reports `tail`'s status.
 
 - [ ] **Step 3: The secrets gate**
 
-Run: `cd /Users/thucpham/Desktop/motion-clone && motions-studio/setup/scrub-secrets.sh --check > /dev/null 2>&1; echo "EXIT=$?"`
+Run: `cd "$REPO" && motions-studio/setup/scrub-secrets.sh --check > /dev/null 2>&1; echo "EXIT=$?"`
 
 Expected: `EXIT=0`. Must pass before every commit, and once more here over the whole tree.
 
-Run: `cd /Users/thucpham/Desktop/motion-clone && git status --short`
+Run: `cd "$REPO" && git status --short`
 
 Expected: empty. If `ios/Secrets.xcconfig`, `.env` or `ios/MotionApp.xcodeproj` appears, it was staged by mistake — unstage it and find out which task did that before continuing.
 
 - [ ] **Step 4: The live contract gate**
 
-Run: `cd /Users/thucpham/Desktop/motion-clone && make ios-contract > /tmp/p6fu-contract.log 2>&1; echo "EXIT=$?"; tail -20 /tmp/p6fu-contract.log`
+Run: `cd "$REPO" && make ios-contract > /tmp/p6fu-contract.log 2>&1; echo "EXIT=$?"; tail -20 /tmp/p6fu-contract.log`
 
 Expected: `EXIT=0`, 14/14 ok. This is a live read-only run against the VPS — GETs only, no spend. It must be 14/14 and not 15: this branch adds no route. If a route fails to decode, the server has drifted, not this branch.
 
@@ -1419,11 +1420,11 @@ Note what this run proves. The VPS is still on the **pre-merge** server, so this
 
 This must run with the command sandbox disabled — simulator control is killed inside it. It sends live reads and free draft mutations only, launches with `-UITestRecordingSpendGate`, and asserts zero recorded spends. **It must not send Phase A, confirm, kill, migrate or resume.**
 
-Run: `cd /Users/thucpham/Desktop/motion-clone && make ios-ui-test > /tmp/p6fu-ui.log 2>&1; echo "MAKE_EXIT=$?"`
+Run: `cd "$REPO" && make ios-ui-test > /tmp/p6fu-ui.log 2>&1; echo "MAKE_EXIT=$?"`
 
 Expected: `MAKE_EXIT=0`. Then read the bundle — `-quiet` prints no per-test output, so a skipped case is invisible in the log:
 
-Run: `cd /Users/thucpham/Desktop/motion-clone && BUNDLE=$(ls -td ~/Library/Developer/Xcode/DerivedData/MotionApp-*/Logs/Test/*.xcresult 2>/dev/null | head -1); echo "$BUNDLE"; xcrun xcresulttool get test-results summary --path "$BUNDLE" 2>/dev/null | head -30`
+Run: `cd "$REPO" && BUNDLE=$(ls -td ~/Library/Developer/Xcode/DerivedData/MotionApp-*/Logs/Test/*.xcresult 2>/dev/null | head -1); echo "$BUNDLE"; xcrun xcresulttool get test-results summary --path "$BUNDLE" 2>/dev/null | head -30`
 
 Expected: `result: Passed`, `totalTestCount: 4`, `passed: 4`, `failed: 0`, **`skipped: 0`**. A non-zero `skipped` means `Phase6SmokeTests` hit a precondition guard — most likely fewer than two image materials, or a missing Character/Driver material, which hard-fails rather than skips. That is an environment gap: restore test material, do not weaken the assertion.
 
@@ -1444,7 +1445,7 @@ Do not restate a result in prose elsewhere in the file — the table is the sing
 Flip the Status line to `implemented on \`feat/phase-6-follow-ups\`, free and live gates swept, awaiting the VPS check and merge`.
 
 ```bash
-cd /Users/thucpham/Desktop/motion-clone
+cd "$REPO"
 motions-studio/setup/scrub-secrets.sh --check
 git add docs/superpowers/specs/2026-09-24-phase-6-follow-ups-design.md
 git commit -m "docs(ios): record the phase 6 follow-up gates" -m "Numbers and the xcresult bundle name, so each result is traceable to an artifact rather than resting on the word passed.
