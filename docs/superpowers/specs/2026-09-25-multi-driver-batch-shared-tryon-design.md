@@ -37,6 +37,12 @@ file.
 
 | Gate | Result | Date | Ran by |
 |---|---|---|---|
+| `make batch-test` | 2180 tests OK (skipped=1) at `bf1d5b8` | 2026-09-25 | Claude (final-fix implementer) |
+| `cd ios/MotionKit && swift test` | 274 tests passed at `312dc9a` | 2026-09-25 | Claude (final-fix implementer) |
+| `make ios-build` | exit 0 at `312dc9a` | 2026-09-25 | Claude (final-fix implementer) |
+| `make check-job-types`, `make check-batch-params` | both pass at `81f4de4` | 2026-09-25 | Claude (controller) |
+| `make ios-ui-test` | 5/5 passed, `skippedTests: 0`, at `b955460`, including `testMultiDriverCrossBuild` (2 outfits × 2 drivers from free draft mutations, zero recorded spends); xcresult `Test-MotionApp-2026.09.25_03-41-39` | 2026-09-25 | Claude (controller) |
+| `motions-studio/setup/scrub-secrets.sh --check` | exit 0 before every commit on the branch | 2026-09-25 | Claude |
 
 ## 1. The share key (runner)
 

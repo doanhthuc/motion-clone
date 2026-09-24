@@ -1,6 +1,6 @@
 # Motion SwiftUI App — Development Progress and Handoff
 
-Last updated: 2026-09-24
+Last updated: 2026-09-25
 
 This is the current implementation handoff for the native iPhone app. Read it before planning or
 changing another SwiftUI phase. The approved product contract remains
@@ -36,6 +36,29 @@ what actually shipped, what was verified, and the next safe boundary.
   (14/14, live against the VPS, 2026-09-24) and `make ios-ui-test` (`Phase6SmokeTests`, 4/4 passed,
   zero spends recorded, 2026-09-24). See "Gate record" below — that table is the single place a gate
   result is written down.
+
+## Multi-driver batch (2026-09-25)
+
+Spec: [`specs/2026-09-25-multi-driver-batch-shared-tryon-design.md`](specs/2026-09-25-multi-driver-batch-shared-tryon-design.md);
+plan: [`plans/2026-09-25-multi-driver-batch-shared-tryon.md`](plans/2026-09-25-multi-driver-batch-shared-tryon.md).
+The spec's gate record is the single place its gate results are written down.
+
+- **What it replaces.** The parent spec's deferred "pair (1:1) mode". The user asked for a different
+  shape: one character, many outfits *and* many drivers. Batch mode now crosses N outfits × M drivers
+  (`batch.pickDrivers`), capped at **12 jobs in total** (`BatchComposer.maxJobs`), not 12 outfits.
+- **The money half is server-side.** Phase A used to make one try-on per job, so 4 outfits × 3 drivers
+  cost 12 provider calls for 4 distinct images, and the three videos of one outfit showed three
+  different renders. `runner.tryon_share_groups` now groups runs whose try-on inputs are identical
+  (the driver counts only for a camera-aware stage). The leader calls the provider, and followers
+  copy its image. A follower never calls the provider, in Phase A or on the pod: the Phase B guard was
+  added after the final review found that a leader failing in Phase A let every follower resubmit its
+  try-on on the GPU.
+- **The app shows one preview card per look.** "Drop from batch" on a card drops every job that uses
+  that image. The summary line counts videos and try-ons before Phase A. For a pod provider (`qwen`)
+  the try-on count equals the job count, because no sharing happens there.
+- **Not yet proven by a real run:** no Phase A has run over a real 2 × 2 batch. The proposed spend
+  test is 2 outfits × 2 drivers, expecting 2 provider calls, and it needs its own approval and a
+  quoted price.
 
 ## Phase status
 
@@ -414,8 +437,12 @@ No phase remains — Phases 1–6 are implemented in code. Open items, none of t
 2. **Optional spend test.** A 2-outfit batch with one seeded job, proving Phase A calls the provider
    once for the unseeded outfit and reuses the saved image for the seeded one. Needs its own approval
    and a quoted price; cost from the balance delta then `runpodctl billing`; `make gpu-destroy` after.
-3. **Parent spec's deferred items** (`2026-09-22-swiftui-app-design.md` §1): pair (1:1) mode and
-   stock-watch notifications. Both need a later API slice, not app work.
+3. **Parent spec's deferred items** (`2026-09-22-swiftui-app-design.md` §1): pair (1:1) mode was
+   replaced by the multi-driver batch (see §"Multi-driver batch", 2026-09-25). Stock-watch
+   notifications are still open. The Telegram bot already has a one-shot `/subscribe`
+   (`bot.py` `_tick_gpu_subs`). Free provisioning rules out push notifications, so the app side would
+   be routes to manage subscriptions, with delivery still going through Telegram. It needs its own
+   spec.
 4. **Phase 6 follow-ups**: four of the five closed 2026-09-24 by PR #68 — the server-side resume
    latch (the money one), the `MigrateFlow.migrate()` `isDropping` residual, the developer-facing
    validation copy on the phone, and the `Fixtures.pipelines` `mask` vs `background` mismatch. The
