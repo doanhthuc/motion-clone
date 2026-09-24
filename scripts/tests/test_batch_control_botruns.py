@@ -507,6 +507,131 @@ class TestAppRunsConfirm(_AppRunsFixture):
         self.assertEqual(resp["error"]["code"], "bad_request")
         self.patches["start_drain"].assert_not_called()
 
+    # -- the confirm stamp (2026-09-24 follow-ups spec §3) ------------------
+
+    def test_an_accepted_fresh_confirm_stamps_the_generation(self):
+        self._seed_draft()
+        with mock.patch("tgbot.bot._do_confirm",
+                        return_value=Outcome(True, "started")) as do_confirm:
+            status, _body = self.runs.confirm(self.runs.run_id, self._body(), "k1")
+        self.assertEqual(status, 202)
+        do_confirm.assert_called_once()
+        # The draft's generation NOW, not the one the panel token certified:
+        # `clear()` counts the generation up (`_changed`, drafts.py:275-279)
+        # and `resume` compares the stamp against the draft as it stands, so
+        # the stamp has to be written in that same frame.
+        self.assertEqual(bot._load_confirm_stamp(ME), self.store.runnable()[2])
+
+    def test_an_accepted_resume_branch_confirm_stamps_the_generation(self):
+        """The other accepted branch (bot.py:7017-7029). It reaches `_do_resume`
+        rather than `_do_confirm`, and it clears the draft too, so it must stamp
+        as well — otherwise a rental confirmed straight after Phase A has no
+        latch at all."""
+        job = self._seed_draft()
+        self._seed_journal(job)
+        bot._PHASE_A_OFFERED[ME] = bot._run_token(ME)
+        with mock.patch("tgbot.bot._do_resume",
+                        return_value=Outcome(True, "started")) as do_resume:
+            status, _body = self.runs.confirm(self.runs.run_id, self._body(), "k2")
+        self.assertEqual(status, 202)
+        do_resume.assert_called_once()
+        self.assertEqual(bot._load_confirm_stamp(ME), self.store.runnable()[2])
+
+    def test_the_confirms_own_clear_leaves_the_stamp_matching_the_draft_so_a_retry_is_allowed(self):
+        """The trap in spec §2, pinned. `confirm` clears the draft on
+        acceptance (bot.py:7029 and :7039) and `clear()` counts the generation
+        UP by one (`_changed`, drafts.py:275-279) — it does not reset it and it
+        does not stand still. So the stamp has to be written after the clear:
+        written before it, the stamp is one behind the draft the confirm left
+        on disk, `_resume_generation_refusal` answers "moved" for a draft
+        nobody touched, and Retry rental breaks for every user while every
+        other gate stays green.
+
+        Asserted through the real reader half, not by re-deriving its rule, so
+        this fails if either side moves. The generation starts non-zero on
+        purpose: from 0 a reset and a no-op are the same number and neither
+        would be caught.
+
+        The two `before + 1` assertions are what carry that weight, and they
+        are deliberately redundant with the reader-based one below them: because
+        the stamp is read AFTER the clear, a `clear()` that reset the counter
+        to 0 would leave stamp and draft agreeing at 0, the draft would still
+        be empty, and `_resume_generation_refusal` would still answer None.
+        Measured 2026-09-24 under exactly that mutation: the emptiness and the
+        reader assertions both PASS, and only the two anchored to `before` fail
+        (0 != 8). So only those pin the "counter only rises, so a stale stamp
+        can never match again by accident" property that
+        `_resume_generation_refusal`'s docstring relies on. The cost is that a
+        legitimate future `clear()` that preserved the generation would fail
+        here, in a test named for the retry; that is the point — it forces the
+        change to be made with this invariant in view."""
+        self._seed_draft()
+        d = self.store._load()
+        d.generation = 7          # a draft the user has edited several times
+        self.store._save(d)
+        before = self.store.runnable()[2]
+        self.assertEqual(before, 7)
+        with mock.patch("tgbot.bot._do_confirm",
+                        return_value=Outcome(True, "started")):
+            self.assertEqual(self.runs.confirm(self.runs.run_id, self._body(), "k3")[0], 202)
+        self.assertEqual(self.store.runnable()[0], [])        # the draft really is empty
+        self.assertEqual(self.store.runnable()[2], before + 1)  # ...and counted up, not reset
+        self.assertEqual(bot._load_confirm_stamp(ME), before + 1)
+        self.assertIsNone(bot._resume_generation_refusal(ME, self.store))
+
+    def test_a_refused_confirm_stamps_nothing(self):
+        self._seed_draft()
+        body = self._body()
+        body["panel_token"] = "not-the-token"
+        status, resp = self.runs.confirm(self.runs.run_id, body, "k4")
+        self.assertEqual(status, 409)
+        self.assertEqual(resp["error"]["code"], "stale_panel")
+        self.patches["start_drain"].assert_not_called()
+        self.assertIsNone(bot._load_confirm_stamp(ME))
+
+    def test_a_not_validated_confirm_stamps_nothing(self):
+        self._seed_draft(validated=False)
+        with mock.patch("tgbot.bot._do_confirm") as do_confirm:
+            status, resp = self.runs.confirm(self.runs.run_id, self._body(), "k5")
+        self.assertEqual(status, 422)
+        self.assertEqual(resp["error"]["code"], "not_validated")
+        do_confirm.assert_not_called()
+        self.assertIsNone(bot._load_confirm_stamp(ME))
+
+    def test_an_unwritable_stamp_still_reports_the_spend_it_already_made(self):
+        """The stamp write sits between an accepted, money-committed confirm and
+        its 202. An OSError escaping there skips `idem.finish` and reaches
+        httpapi/server.py's catch-all, which answers `500 internal` for a spend
+        that already called `start_drain` — the user is told nothing about a pod
+        that is being rented, and SpendGate will not take a first 5xx as the
+        server's answer, so the phone re-checks a rental that is already running.
+        Failing open costs only the latch, which is what
+        `_resume_generation_refusal` already does when no stamp exists.
+
+        The real `_do_confirm` runs here (only `start_drain` is patched, by the
+        fixture), so the spend really happens and the assertion is that it is
+        *reported*, not avoided. The replay is the load-bearing half: it is what
+        proves `idem.finish` recorded the 202 rather than leaving the key
+        pending, which is the `409 outcome_unknown` that
+        `test_crash_midway_leaves_the_key_pending` pins for a raised spend."""
+        self._seed_draft(validated=True)
+        body = self._body()          # read once; the replay must not need a fresh one
+        with mock.patch("tgbot.bot._save_confirm_stamp",
+                        side_effect=OSError(28, "No space left on device")):
+            first = self.runs.confirm(self.runs.run_id, body, "k6")
+            second = self.runs.confirm(self.runs.run_id, body, "k6")
+        self.assertEqual(first[0], 202)
+        self.assertEqual(first[1]["outcome"], "started")
+        self.assertEqual(second, first)          # recorded, not left pending
+        self.patches["start_drain"].assert_called_once()
+        # The latch is the only thing lost, and it is lost loudly rather than
+        # silently: no stamp, so a later resume fails open instead of refusing
+        # against a number nobody wrote.
+        self.assertIsNone(bot._load_confirm_stamp(ME))
+        self.assertIsNone(bot._resume_generation_refusal(ME, self.store))
+        self.assertTrue(any("confirm stamp" in str(call)
+                            for call in self.patches["log"].call_args_list))
+
 
 class TestConfirmAfterADroppedBatchJob(_Fixture):
     """§5.10: dropping a job from the draft's basket after Phase A already ran

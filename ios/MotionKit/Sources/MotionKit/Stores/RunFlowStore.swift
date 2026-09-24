@@ -50,12 +50,6 @@ public final class RunFlow {
     private var keptKeys: Set<String> = []
     private var pendingIntent: SpendIntent?
     private var didReplay = false
-    /// The draft's `generation` when the last confirm was accepted — i.e. when
-    /// the server wrote the manifest `resume` re-rents. Deliberately in memory
-    /// only: `nil` means "nothing was confirmed during this store's lifetime",
-    /// which is the state after an app relaunch, and refusing there would break
-    /// the legitimate retry-after-relaunch flow.
-    private(set) var confirmedGeneration: Int?
 
     public init(client: APIClient, gate: any SpendSending,
                 sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }) {
@@ -87,30 +81,37 @@ public final class RunFlow {
     }
 
     /// Only offered when the server says a rental failed, nothing is leased,
-    /// and the draft has not moved since the confirm that wrote the manifest.
+    /// and there is a run to retry.
     ///
-    /// The third term is the money guard. `resume` re-rents the manifest on
-    /// disk and deliberately never reads the draft (bot.py:7394-7395), and
-    /// `_run_token` is the manifest's `mtime_ns` (bot.py:1493-1506), which moves
-    /// only when a manifest is *rewritten* — a draft edit does not rewrite one.
-    /// That is why `panel_token` joins `.generation` (bot.py:6895-6902) and
-    /// `resume` has no equivalent: without this latch, a Confirm whose rental
-    /// failed followed by a free "Drop from batch" leaves Retry rental offering
-    /// to rent a pod that still runs the job the user just dropped.
+    /// The draft is deliberately not consulted here. "A resume must not re-rent
+    /// a manifest whose draft has moved" is a money rule, and it lives on the
+    /// server, where it survives an app relaunch: an accepted `confirm` stamps
+    /// the draft's `generation` to disk and `AppPod.resume` refuses
+    /// `409 stale_run` when the draft has moved since
+    /// (`_resume_generation_refusal`). A refusal reaches the screen verbatim
+    /// through `message` — `RunDetailView` renders it on this same card — and
+    /// `applyRefusal`'s `("stale_run", .resume)` case re-reads the run.
+    ///
+    /// Why the server needs a stamp and cannot reuse the token it already has:
+    /// `_run_token` is the manifest's `mtime_ns` (`_manifest_token`), which
+    /// moves only when a manifest is *rewritten*, and a draft edit rewrites
+    /// nothing. That is why `panel_token` joins `.generation` for `confirm`.
+    /// `resume` re-rents the manifest on disk and had no equivalent, so before
+    /// the stamp a Confirm whose rental failed, followed by a free "Drop from
+    /// batch", left Retry rental offering to rent a pod that still runs the job
+    /// the user just dropped.
+    ///
+    /// An in-memory copy of the confirmed generation used to gate this property
+    /// as well. Removed 2026-09-24: it held the app's *pre-clear* generation
+    /// while the server stamps the *post-clear* one — `clear()` counts the
+    /// generation up (`_changed`, `drafts.py`) — so any `start()` between an
+    /// accepted confirm and a Retry tap re-read the draft, saw the bumped value,
+    /// and withheld a retry the server would have granted. Its message told the
+    /// user to Confirm again, which the confirm's own cleared draft makes
+    /// impossible, so the only escape was a relaunch. The server gate is the
+    /// one mechanism now; a second, weaker copy of it was not free.
     public var canRetryRental: Bool {
         pod?.failedRental != nil && pod?.lease == nil && runID != nil
-            && retryRentalBlockReason == nil
-    }
-
-    /// Why Retry rental is withheld although a rental really did fail — `nil`
-    /// when it is offered, or when there is nothing to retry. `RunDetailView`
-    /// renders this in place of the button so the failure card says why instead
-    /// of going quiet.
-    public var retryRentalBlockReason: String? {
-        guard pod?.failedRental != nil, pod?.lease == nil, runID != nil,
-              let confirmedGeneration else { return nil }
-        guard confirmedGeneration != draft?.generation else { return nil }
-        return "The draft changed since this rental failed — Confirm again to rent what is left."
     }
 
     public var needsTryonPolling: Bool {
@@ -563,22 +564,6 @@ public final class RunFlow {
         case let .accepted(runID, _):
             needsRecheck = false
             pendingIntent = nil
-            // Only `.confirm` moves the latch, and only on acceptance:
-            // `confirm` is the one spend the server gates on a token derived
-            // from the draft's own generation (`panel_token` is
-            // `_run_token.generation`, bot.py:6895-6902, refused as
-            // `stale_panel` at bot.py:7012), so an accepted confirm proves the
-            // manifest now matches the draft this store is holding — whether it
-            // got there by `_do_confirm` rewriting the manifest from the draft
-            // or by the `_phase_a_matches_draft` resume branch, which requires
-            // the two to be equal already (bot.py:7017-7029). `.phaseA` writes
-            // the same manifest (bot.py:5846-5848, "same manifest write") but
-            // carries no panel token, so its acceptance proves nothing about
-            // this copy's freshness and latching on it could record a stale
-            // generation. `.resume` deliberately ignores the draft
-            // (bot.py:7394-7395), `.regen` touches one image, `.migrate` is
-            // never sent here.
-            if kind == .confirm { confirmedGeneration = draft?.generation }
             switch kind {
             case .phaseA, .regen:
                 phase = .phaseARunning

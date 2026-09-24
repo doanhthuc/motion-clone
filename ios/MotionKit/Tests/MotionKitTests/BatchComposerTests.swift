@@ -99,7 +99,7 @@ extension URLProtocolTests {
                  "slots": entry.slots, "tryon_seed": entry.seed ?? NSNull()] }
             let draft: [String: Any] = [
                 "owner": "app", "pipeline": "tryon-motion-enhance", "provider": "gemini", "generation": batch.count,
-                "slots": slots, "required": ["character", "driver", "outfit"], "optional": ["mask"],
+                "slots": slots, "required": ["character", "driver", "outfit"], "optional": ["background"],
                 "missing": missing, "validated": NSNull(), "batch": entries, "jobs": batch.count,
                 "estimate_min": NSNull(), "tryon_seed": seed ?? NSNull()]
             return String(decoding: try! JSONSerialization.data(withJSONObject: draft), as: UTF8.self)

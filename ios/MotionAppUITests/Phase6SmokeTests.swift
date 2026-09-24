@@ -9,6 +9,51 @@ import XCTest
 /// spend button is recorded on the phone and never sent; the recorded counter
 /// is asserted zero at the end.
 final class Phase6SmokeTests: XCTestCase {
+    /// Batch mode has had its own Clear since 2026-09-24, but
+    /// `Phase4Draft.clear(in:)` still cannot be reused from here: its
+    /// post-condition is the readiness line ("0 of 3 required slots assigned"),
+    /// which is Single-only and stays Single-only. Both post-conditions below
+    /// read elements the Batch arm renders — a shared slot row
+    /// (`BatchComposerSection.sharedRoles`) and the header's job count
+    /// (`NewJobView.header`) — but only the job count is unconditional. The
+    /// slot row is drawn only in the `else` of `if !BatchComposer.supports(pipeline)`,
+    /// so under a catalog that pairs no character with an outfit the row is
+    /// absent for a configuration reason and Clear still worked; `supports` is
+    /// `required ∪ optional` containing both roles, and the default pipeline
+    /// comes from `TG_PIPELINE`.
+    @MainActor
+    private func clearFromBatch(_ app: XCUIApplication) {
+        let clear = Phase4Draft.revealButton("Clear", in: app)
+        // `revealButton` only waits for `isHittable`. Clear is
+        // `.disabled(store.isBusy || composer.isRunning)`, and a tap on a
+        // disabled SwiftUI control is a silent no-op — so wait for `isEnabled`
+        // separately, or the draft stays full and the assertions below are the
+        // only thing that notices.
+        XCTAssertTrue(Phase4Draft.waitUntil(timeout: 10) { clear.isEnabled },
+                      "Clear must re-enable before it is tapped")
+        clear.tap()
+        // The load-bearing half. Do not delete it as redundant just because
+        // "0 jobs" below already passes: `_jobs` counts the basket plus the
+        // edited job only once that job is *complete*
+        // (`scripts/control/drafts.py:294-307`, `:337`), so on the
+        // fewer-than-two-outfits skip path the header read "0 jobs" *before* the
+        // tap too — nothing basketed, and Outfit never assigned. A Clear that
+        // silently no-op'd would leave Character and Driver assigned and still
+        // read "0 jobs" here, and the damage would surface one run later as a
+        // permanent silent skip (that path's `XCTSkip`), not as a failure.
+        // "Missing required" is `SlotRow.stateText` for an empty required role —
+        // the exact inverse of `Phase4Draft.chooseMaterial`'s post-condition.
+        // Not `readiness`'s "Missing required materials", which is a different
+        // element's `accessibilityValue` and Single-only besides.
+        XCTAssertTrue(Phase4Draft.waitUntil(timeout: 10) {
+            (app.buttons["Character"].value as? String) == "Missing required"
+        }, "Batch mode's Clear must unassign the shared slots, not just empty the basket"
+            + " — if the row is absent instead, the server's default pipeline is not"
+            + " batch-supported (check TG_PIPELINE)")
+        XCTAssertTrue(app.staticTexts["0 jobs"].waitForExistence(timeout: 10),
+                      "Batch mode's Clear emptied the draft")
+    }
+
     @MainActor
     func testCrossBuildDropAndLibrary() throws {
         let app = XCUIApplication()
@@ -22,7 +67,7 @@ final class Phase6SmokeTests: XCTestCase {
         // (`:294-307`) counts the basket plus the edited job only once it is
         // *complete* — so "0 jobs" alone would let the smoke proceed on a draft
         // with a slot already assigned, then overwrite and clear it. Requiring the
-        // readiness line too (`NewJobView.swift:208`, rendered in Single mode)
+        // readiness line too (`NewJobView.readiness`, rendered in Single mode)
         // proves no required slot is filled. Together: nothing basketed, no
         // required slot assigned. A real draft is never overwritten and, on this
         // path, never cleared. Either pipeline's empty count is accepted (tryon = 3
@@ -53,19 +98,10 @@ final class Phase6SmokeTests: XCTestCase {
         let picks = app.buttons.matching(
             NSPredicate(format: "identifier BEGINSWITH %@", "outfit.pick."))
         guard Phase4Draft.waitUntil(timeout: 15, condition: { picks.count >= 2 }) else {
-            // Character and Driver were assigned above, so clean up. Clear lives
-            // in Single mode only — Batch renders neither the readiness line nor
-            // `editorActions` (`NewJobView.editor`'s if/else) — so switch back
-            // before clearing. The mode picker is `.disabled(store.isBusy ||
-            // composer.isRunning)` (`NewJobView.swift:98`) and a tap on a disabled
-            // SwiftUI control is a silent no-op, so wait for it to re-enable once
-            // the slot PATCHes settle.
+            // Character and Driver were assigned above, so clean up. Batch mode
+            // has its own Clear, so this no longer switches to Single first.
             app.buttons["Done"].tap()
-            XCTAssertTrue(Phase4Draft.waitUntil(timeout: 10) {
-                app.segmentedControls["newjob.mode"].buttons["Single"].isEnabled
-            }, "the mode picker must re-enable before switching back to Single")
-            app.segmentedControls["newjob.mode"].buttons["Single"].tap()
-            Phase4Draft.clear(in: app)
+            clearFromBatch(app)
             throw XCTSkip("Fewer than two image materials to use as outfits.")
         }
         picks.element(boundBy: 0).tap()
@@ -101,16 +137,10 @@ final class Phase6SmokeTests: XCTestCase {
         app.sheets["Drop this batch entry?"].buttons["Drop"].tap()
         XCTAssertTrue(app.staticTexts["BATCH · 1"].waitForExistence(timeout: 15))
 
-        // Leave the live draft empty, as the Phase 3–5 smokes do. Clear is in
-        // Single mode only, so switch back before clearing — and wait for the mode
-        // picker to re-enable first, because the drop's DELETE + trailing refresh
-        // can still hold `store.isBusy` true and a tap on a disabled SwiftUI
-        // control is a silent no-op (`NewJobView.swift:98`).
-        XCTAssertTrue(Phase4Draft.waitUntil(timeout: 10) {
-            app.segmentedControls["newjob.mode"].buttons["Single"].isEnabled
-        }, "the mode picker must re-enable before switching back to Single")
-        app.segmentedControls["newjob.mode"].buttons["Single"].tap()
-        Phase4Draft.clear(in: app)
+        // Leave the live draft empty, as the Phase 3-5 smokes do. Batch mode
+        // clears directly now; the drop's DELETE and trailing refresh can still
+        // hold `store.isBusy` true, which `clearFromBatch` waits out.
+        clearFromBatch(app)
 
         app.tabBars.buttons["Material"].tap()
         // Phase 6 nested MaterialsView inside MaterialTabView, one level deeper

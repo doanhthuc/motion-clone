@@ -179,15 +179,22 @@ Design: `docs/superpowers/specs/2026-09-23-swiftui-app-phase-6-design.md`.
   `draft.jobs`. Dropping re-validates the draft and re-reads the previews and rent panel, so confirm
   rents only what is left. Every `RunFlow` spend is refused while a drop is in flight: the guard sits
   in `RunFlow.spend`, the single funnel all four entry points share, so a new one inherits it.
-  (`MigrateFlow.migrate()` calls the spend gate directly and is not covered by it.) The last
-  remaining basket entry has no drop affordance by design — **Clear** (Single mode on the New Job tab)
-  is the only way to remove it. Run detail shows a per-job batch progress list.
+  (`MigrateFlow.migrate()` calls the spend gate directly, so it carries that guard itself.) The last
+  remaining basket entry has no drop affordance by design — **Clear** (on the New Job tab, in either
+  mode) is the only way to remove it. Run detail shows a per-job batch progress list.
 - **Retry rental is latched to the draft that was confirmed.** `resume` re-rents the manifest on disk
-  and never reads the draft, so `RunFlow` records `draft.generation` when a confirm is accepted and
-  `canRetryRental` refuses once the draft moves — otherwise a drop after a failed rental would rent a
-  pod still running the dropped job. The run detail card stays up and says why
-  (`retryRentalBlockReason`). The latch is in memory, so an app relaunch clears it; the durable fix is
-  a server-side `generation` check on `resume`.
+  and its gate compares only the draft's `generation` — nothing else in the draft feeds the decision —
+  so the generation is the one thing that can tell it the draft moved. The latch is the server's, and it
+  survives a relaunch: an accepted confirm stamps the draft's `generation`
+  (`batch/tg-<chat_id>.confirmed-generation.json`, written for app-initiated confirms only) and
+  `resume` refuses `409 stale_run` when the draft has moved since.
+  Without it, a drop after a failed rental would rent a pod still running the dropped job — `_run_token`
+  is the manifest's `mtime_ns`, and a draft edit rewrites no manifest, so nothing else can see one. The
+  refusal reaches the run detail card verbatim, and the app re-reads the run. An in-memory copy of the
+  generation used to gate `canRetryRental` too; removed 2026-09-24, because it held the *pre-clear*
+  generation while the stamp holds the *post-clear* one, so any re-read between an accepted confirm and
+  a Retry tap withheld a retry the server would have granted — and its "Confirm again" recovery was
+  impossible, the confirm's own clear having emptied the draft.
 - **Saved try-ons.** The library grid (`GET /v1/tryon-library`, images cached by id) shows each
   entry's provider, saved date and resolved character/outfit names ("(deleted)" when a material is
   gone). **Use in job** (`saved.use.<id>`) fills the draft through `DraftStore.apply` and switches to

@@ -24,8 +24,10 @@ from batchlib_ext.lease import Lease, read_lease, write_lease
 from batchlib_ext.migrate_lease import MigrateLease, write_migrate_lease
 from batchlib_ext.provision_failure import (ProvisionFailure, provision_failure_path,
                                             write_provision_failure)
+import control.drafts as drafts
 from control.idempotency import IdempotencyStore
 from control.runs import Outcome
+from control.tryon_library import TryonLibrary
 import tgbot.bot as bot
 import tgbot.run as run_mod
 from tgbot.job import write_manifest
@@ -67,7 +69,18 @@ class _PodFixture(_Fixture):
         self.patches["run_mod.phase_a_running"] = patcher.start()
         self.addCleanup(patcher.stop)
         self.idem = IdempotencyStore(self.root / "batch" / "idempotency")
-        self.pod = bot.AppPod(self.tg, ME, self.idem)
+        # `AppPod.resume` reads the draft's generation to compare against the
+        # confirm stamp, so the fixture needs a real store over the same temp
+        # batch/ — the same construction `_AppRunsFixture` uses. Not faked: a
+        # stub generation would let the fail-closed case pass for the wrong
+        # reason.
+        staging = self.root / "batch" / "tg-staging"
+        staging.mkdir(parents=True, exist_ok=True)
+        self.store = drafts.DraftStore(
+            self.root / "batch", staging, "app",
+            default_pipeline="motion-enhance", default_provider="gemini",
+            tryon_library=TryonLibrary(self.root / "batch" / "tryon-library", "app"))
+        self.pod = bot.AppPod(self.tg, ME, self.store, self.idem)
 
     def tearDown(self):
         thread = getattr(self.pod, "_kill_thread", None)
@@ -384,7 +397,7 @@ class TestKillSurvivesARestart(_PodFixture):
 
         # A fresh instance, as a restarted process would build — same chat,
         # no state shared except what's on disk.
-        restarted = bot.AppPod(self.tg, ME, self.idem)
+        restarted = bot.AppPod(self.tg, ME, self.store, self.idem)
         self.assertEqual(restarted.last_kill, original)
         # Only the OUTCOME is restored; whether a kill is running right now
         # in THIS process is not — a restart cannot know that, and claiming
@@ -392,12 +405,12 @@ class TestKillSurvivesARestart(_PodFixture):
         self.assertIsNone(restarted._kill_thread)
 
     def test_no_prior_kill_is_none_not_a_crash(self):
-        self.assertIsNone(bot.AppPod(self.tg, ME, self.idem).last_kill)
+        self.assertIsNone(bot.AppPod(self.tg, ME, self.store, self.idem).last_kill)
 
     def test_a_corrupt_record_is_none_not_a_crash(self):
         bot._kill_result_path(ME).parent.mkdir(parents=True, exist_ok=True)
         bot._kill_result_path(ME).write_text("not json", encoding="utf-8")
-        self.assertIsNone(bot.AppPod(self.tg, ME, self.idem).last_kill)
+        self.assertIsNone(bot.AppPod(self.tg, ME, self.store, self.idem).last_kill)
 
     def test_save_ignores_none_and_write_is_atomic(self):
         # kill()'s early "nothing running" exit and the crash path both set
@@ -536,6 +549,186 @@ class TestAppPodResume(_PodFixture):
         # Forgotten, not recorded: the same key may simply be retried.
         status, _body = self.pod.resume(self.pod.run_id, self._body(), "k1")
         self.assertEqual(status, 202)
+
+    # -- the confirm stamp (2026-09-24 follow-ups spec §3) ------------------
+
+    def test_stamp_round_trips_and_a_corrupt_one_is_none(self):
+        self.assertIsNone(bot._load_confirm_stamp(ME))       # never written
+        bot._save_confirm_stamp(ME, 7)
+        self.assertEqual(bot._load_confirm_stamp(ME), 7)
+        bot._confirm_stamp_path(ME).write_text("not json", encoding="utf-8")
+        self.assertIsNone(bot._load_confirm_stamp(ME))       # fail quiet
+        bot._confirm_stamp_path(ME).write_text('{"generation":"7"}', encoding="utf-8")
+        self.assertIsNone(bot._load_confirm_stamp(ME))       # not an int
+        bot._confirm_stamp_path(ME).write_text('{"generation":true}', encoding="utf-8")
+        self.assertIsNone(bot._load_confirm_stamp(ME))       # bool is not an int
+
+    def test_resume_refuses_when_the_draft_moved_since_the_confirm(self):
+        self._seed_failure()
+        bot._save_confirm_stamp(ME, 4)
+        d = self.store._load()
+        d.generation = 5          # a drop, a PATCH, an add-to-batch — anything
+        self.store._save(d)
+        status, body = self.pod.resume(self.pod.run_id, self._body(), "k1")
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["code"], "stale_run")
+        self.assertEqual(body["error"]["message"], bot.RESUME_STALE_GENERATION)
+        self.patches["start_drain"].assert_not_called()
+        # The failure record survives a refusal, so a later valid retry still
+        # has something to retry.
+        self.assertTrue(provision_failure_path(self._live()).exists())
+
+    def test_resume_allowed_when_the_stamp_matches(self):
+        self._seed_failure()
+        generation = self.store.runnable()[2]
+        bot._save_confirm_stamp(ME, generation)
+        status, body = self.pod.resume(self.pod.run_id, self._body(), "k1")
+        self.assertEqual((status, body), (202, {"run_id": self.pod.run_id,
+                                                "outcome": "started"}))
+        self.patches["start_drain"].assert_called_once()
+
+    def test_resume_allowed_when_there_is_no_stamp(self):
+        """Fail open, deliberately: a Telegram-initiated confirm writes no
+        stamp, and `_do_confirm` must not write one because it is shared with
+        the Telegram flow where the app's draft is not what the user reviewed.
+        Refusing here would break retrying a Telegram rental from the phone."""
+        self._seed_failure()
+        self.assertIsNone(bot._load_confirm_stamp(ME))
+        d = self.store._load()
+        d.generation = 99
+        self.store._save(d)
+        self.assertEqual(self.pod.resume(self.pod.run_id, self._body(), "k1")[0], 202)
+        self.patches["start_drain"].assert_called_once()
+
+    def test_a_leftover_stamp_allows_a_resume_the_draft_has_not_moved(self):
+        """Review Focus 1. The stamp is per chat and never deleted, so an app
+        confirm from days ago is still on disk when the phone retries a rental
+        the user has since confirmed from Telegram. Telegram keeps its own draft
+        in `_STATE`/`_LAST_VALIDATE`, a separate store from the app's
+        DraftStore, so moving the Telegram side cannot move the app draft's
+        generation: the stamp still matches and the retry is legitimate.
+
+        Both halves are asserted, because the property is the *separation* —
+        Telegram state really moved while the app generation really did not."""
+        self._seed_failure()
+        generation = self.store.runnable()[2]
+        bot._save_confirm_stamp(ME, generation)
+        job = self._telegram_draft()          # sets bot._STATE[ME] and _LAST_VALIDATE[ME]
+        self.assertIs(bot._STATE[ME], job)                    # Telegram side moved
+        self.assertTrue(bot._LAST_VALIDATE[ME])
+        self.assertEqual(self.store.runnable()[2], generation)  # app side did not
+        self.assertEqual(self.pod.resume(self.pod.run_id, self._body(), "k1")[0], 202)
+        self.patches["start_drain"].assert_called_once()
+
+    def test_a_corrupt_draft_refuses_the_resume(self):
+        """Review Focus 2. `_load`'s except branch moves a corrupt draft aside
+        and returns generation 0 (drafts.py:265), so the stamp no longer
+        matches. Fail closed: this is a money call about a draft this box can
+        no longer read."""
+        self._seed_failure()
+        bot._save_confirm_stamp(ME, 5)
+        self.store.path.write_text("{not json", encoding="utf-8")
+        status, body = self.pod.resume(self.pod.run_id, self._body(), "k1")
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["code"], "stale_run")
+        # The message, not just the code: the `run_token` gate emits the same
+        # `stale_run`, so without this a refusal from the wrong gate passes.
+        self.assertEqual(body["error"]["message"], bot.RESUME_STALE_GENERATION)
+        self.patches["start_drain"].assert_not_called()
+
+    # -- the gate's position in resume's chain, both directions --------------
+
+    def test_a_bad_run_token_refuses_before_the_stamp_check(self):
+        """The check ABOVE the stamp gate. Both refusals are `409 stale_run`, so
+        only the sentence tells them apart, and they advise different
+        recoveries: a moved manifest means re-read the run, a moved draft means
+        Confirm again. The token is the more concrete fact — what the phone is
+        holding is not what is on disk — so it answers first."""
+        self._seed_failure()
+        bot._save_confirm_stamp(ME, 4)
+        d = self.store._load()
+        d.generation = 5
+        self.store._save(d)
+        status, body = self.pod.resume(
+            self.pod.run_id, self._body(run_token="0"), "k1")
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["code"], "stale_run")
+        self.assertEqual(body["error"]["message"],
+                         "the run changed since it was read — read it again")
+        self.assertNotEqual(body["error"]["message"], bot.RESUME_STALE_GENERATION)
+        self.patches["start_drain"].assert_not_called()
+
+    def test_a_moved_draft_refuses_even_with_no_provision_failure(self):
+        """The check BELOW the stamp gate — the half a seeded failure cannot
+        show. Every other stamp refusal calls `_seed_failure()`, so
+        `read_provision_failure` is non-None and the gate answers the same
+        whether it sits above that branch or below it. Here there is
+        deliberately no failure file, so a gate demoted below it would answer
+        `no_failure` and the phone's Retry screen — left open after the failure
+        was already cleared — would never tell the user to Confirm again.
+        Unreachable unless the gate sits above `read_provision_failure`."""
+        bot._save_confirm_stamp(ME, 4)
+        d = self.store._load()
+        d.generation = 5
+        self.store._save(d)
+        # Pinned, not assumed: this test only means what it says while no
+        # failure file exists, so a future `_seed_failure()` in setUp would have
+        # to trip this rather than silently neuter it.
+        self.assertFalse(provision_failure_path(self._live()).exists())
+        status, body = self.pod.resume(self.pod.run_id, self._body(), "k1")
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["code"], "stale_run")   # not no_failure
+        self.assertEqual(body["error"]["message"], bot.RESUME_STALE_GENERATION)
+        self.patches["start_drain"].assert_not_called()
+
+    def test_the_stamp_check_runs_before_the_gpu_check(self):
+        """Ordering: both are 409 staleness, and the draft one is the more
+        fundamental refusal. A gpu mismatch must not mask it, or the user is
+        told to re-read the pod when re-confirming is what is needed.
+
+        The .env write and the mismatched gpu are the same pair
+        `test_resume_with_a_different_gpu_is_stale_panel_and_spends_nothing`
+        uses, so the gpu check genuinely would have fired had it been reached —
+        without that, this test would pass for the wrong reason."""
+        (self.root / ".env").write_text("GPU=NVIDIA GeForce RTX 4090\n", encoding="utf-8")
+        self._seed_failure()
+        bot._save_confirm_stamp(ME, 4)
+        d = self.store._load()
+        d.generation = 5
+        self.store._save(d)
+        status, body = self.pod.resume(
+            self.pod.run_id, self._body(gpu="NVIDIA GeForce RTX 5090"), "k1")
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["code"], "stale_run")     # not stale_panel
+        self.patches["start_drain"].assert_not_called()
+
+    def test_a_confirm_then_a_moved_draft_refuses_the_retry(self):
+        """Confirm (stamp written) → the draft moves → resume refused. The
+        stamp is written by AppRuns and read by AppPod, so this is the only
+        test that exercises both halves against one real DraftStore."""
+        runs = bot.AppRuns(self.tg, ME, self.store, self.idem)
+        job = self._job("app")
+        d = self.store._load()
+        d.job, d.validated = job, True
+        self.store._save(d)
+        body = {"provider": "runpod", "tryon": None, "panel_token": runs.panel_token()}
+        with mock.patch("tgbot.bot._do_confirm",
+                        return_value=Outcome(True, "started")):
+            self.assertEqual(runs.confirm(runs.run_id, body, "k-confirm")[0], 202)
+
+        self._seed_failure()
+        self.assertEqual(self.pod.resume(self.pod.run_id, self._body(), "k-ok")[0], 202)
+
+        # A free draft mutation — the drop Phase 6 added, or any PATCH.
+        d = self.store._load()
+        d.generation += 1
+        self.store._save(d)
+        status, resp = self.pod.resume(self.pod.run_id, self._body(), "k-stale")
+        self.assertEqual(status, 409)
+        self.assertEqual(resp["error"]["code"], "stale_run")
+        self.assertEqual(resp["error"]["message"], bot.RESUME_STALE_GENERATION)
+        # Once, from the accepted resume above — the refused one rented nothing.
+        self.patches["start_drain"].assert_called_once()
 
 
 P5090 = "NVIDIA GeForce RTX 5090"

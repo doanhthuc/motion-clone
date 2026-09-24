@@ -245,7 +245,9 @@ extension URLProtocolTests {
         #expect(!store.isReady)
         #expect(store.error == .server(
             status: 422, code: "invalid", message: "Driver video is unreadable."))
-        #expect(store.message == "Driver video is unreadable.")
+        // `error` keeps the raw text; only its rendering moved (spec §5).
+        #expect(store.message == "This draft didn't pass validation, so it can't run yet.")
+        #expect(store.error?.detailMessage == "Driver video is unreadable.")
     }
 
     @Test func transportFailureReconcilesBeforeValidationCompletes() async {

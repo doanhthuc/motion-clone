@@ -30,7 +30,7 @@ extension URLProtocolTests {
                 .joined(separator: ",")
             return #"{"owner":"app","pipeline":"tryon-motion-enhance","provider":"gemini","generation":"#
                 + String(generation) + #","slots":{"#
-                + slots + #"},"required":["character","driver","outfit"],"optional":["mask"],"missing":[],"validated":true,"batch":["#
+                + slots + #"},"required":["character","driver","outfit"],"optional":["background"],"missing":[],"validated":true,"batch":["#
                 + batch.joined(separator: ",") + #"],"jobs":2,"estimate_min":84,"tryon_seed":"# + quoted(seed) + "}"
         }
         static func entry(_ digest: String, _ run: String, _ outfit: String, seed: String? = nil) -> String {
@@ -43,9 +43,11 @@ extension URLProtocolTests {
             batch: [entry("d1", "model__dress", "app/dress.png"), entry("d2", "model__blazer", "app/blazer.png", seed: "s9")],
             outfit: "app/blazer.png", seed: "s9")
         /// Generation 10, not 9: `_changed()` bumps it on every draft mutation
-        /// (drafts.py:275-279), so the drop really does move it. `RunFlow`'s
-        /// retry latch reads the field, and a fixture that never moved it would
-        /// make that latch untestable through `drop`.
+        /// (drafts.py:275-279), so the drop really does move it. That is what
+        /// makes `dropOnTheRentPanelRereadsThePanelWithoutAdvancing`'s
+        /// `panel_token` assertion end in `.10` — a check that the re-read
+        /// panel priced the *post-drop* generation, not a fixture that happened
+        /// to stay put.
         static let draftAfterDrop = draftJSON(
             batch: [entry("d1", "model__dress", "app/dress.png")], outfit: "app/blazer.png", seed: "s9",
             generation: 10)
@@ -58,6 +60,46 @@ extension URLProtocolTests {
         /// no-op.
         static let draftAfterDelete = draftAfterDrop.replacingOccurrences(
             of: #"validated":true"#, with: #"validated":null"#)
+
+        /// What `GET /v1/draft` returns after an **accepted confirm**. The
+        /// server clears the app's draft on both accepted branches
+        /// (`AppRuns.confirm`), and `clear()` seeds `_fresh()` — no slots, no
+        /// basket — then routes through `_changed`, which nulls `validated` and
+        /// counts `generation` UP by one rather than resetting it
+        /// (drafts.py:275-279, `:485-490`). So the post-confirm draft is empty
+        /// at `generation + 1`, *not* empty at the generation the confirm was
+        /// tapped at. `estimate_min` goes null with `validated`: `_view` prices
+        /// a draft only when `validated is True` (drafts.py:338).
+        static func draftAfterConfirm(generation: Int) -> String {
+            #"{"owner":"app","pipeline":"tryon-motion-enhance","provider":"gemini","generation":"#
+                + String(generation)
+                + #","slots":{},"required":["character","driver","outfit"],"optional":["background"],"missing":["character","driver","outfit"],"validated":null,"batch":[],"jobs":0,"estimate_min":null}"#
+        }
+
+        /// The `generation` a draft fixture carries, read rather than assumed —
+        /// `clear()` counts up from whatever is on disk, so the stub must too.
+        static func generation(of draftJSON: String) -> Int {
+            guard let object = try? JSONSerialization.jsonObject(with: Data(draftJSON.utf8)),
+                  let body = object as? [String: Any],
+                  let generation = body["generation"] as? Int else { return 0 }
+            return generation
+        }
+
+        /// Advance the stub the way the server does when it accepts a confirm.
+        ///
+        /// `FakeSpendGate` never touches the network, so a scripted `.accepted`
+        /// produces no `POST` for `answer(_:)` to observe: the test has to move
+        /// the fixture itself, at the point it scripts the acceptance. Not doing
+        /// this is what left `rentalRetrySurvivesTheConfirmsOwnClearAndARelaunch`
+        /// asserting against a draft that could not move (final review I1) — the
+        /// stub answered generation 9 forever, which agreed with the app's
+        /// pre-clear copy and disagreed with the server's post-clear stamp, and
+        /// neither language's suite could see the disagreement.
+        func confirmAccepted() {
+            lock.withLock {
+                _draft = Self.draftAfterConfirm(generation: Self.generation(of: _draft) + 1)
+            }
+        }
 
         /// `POST /v1/draft/validate`. The draft in the verdict is the post-drop
         /// one, so a drop that reaches this route always sees its entry gone.
@@ -383,12 +425,16 @@ extension URLProtocolTests {
     }
 
     /// What the server actually answers an invalid non-stale validation with:
-    /// 422 `invalid` (drafts.py:565 → server.py `_DOMAIN_STATUS`). 422 is not in
-    /// `APIError.userMessage`'s explicit list, so its text reaches the screen
-    /// verbatim — spec §5's "leaves the server's message on screen". The three
+    /// 422 `invalid` (drafts.py:566 → server.py:47 `_DOMAIN_STATUS`). Since
+    /// 2026-09-24 that code headlines instead of showing the server's text
+    /// (spec §5). The `APIError` this path builds *does* carry a
+    /// `detailMessage` — the fixture below scripts a non-blank message — but
+    /// `drop`'s catch assigns `apiError(error).userMessage` to a `String` field,
+    /// so the `APIError` — and its `detailMessage` — is discarded at the
+    /// assignment, and there is nothing left to disclose. The three
     /// `/v1/draft` GETs are `start`, the drop's fresh read and the `catch`'s
     /// re-read, so this also pins that a failed drop still refreshes the draft.
-    @Test func dropShowsTheServerMessageWhenValidationIsRefused() async throws {
+    @Test func dropHeadlinesARefusedValidationAndStillRefreshesTheDraft() async throws {
         let routes = Routes()
         routes.draft = Routes.draftTwoJobs
         routes.tryon = Fixtures.tryonDone
@@ -400,7 +446,7 @@ extension URLProtocolTests {
 
         await flow.drop(blazer)
 
-        #expect(flow.message == "make batch-validate failed: job 2 has no driver")
+        #expect(flow.message == "This draft didn't pass validation, so it can't run yet.")
         let writes = StubURLProtocol.requests.filter { $0.httpMethod != "GET" }
         #expect(writes.map { "\($0.httpMethod!) \($0.url!.path)" } ==
                 ["PATCH /v1/draft", "DELETE /v1/draft/batch/d2", "POST /v1/draft/validate"])
@@ -502,76 +548,106 @@ extension URLProtocolTests {
         #expect(flow.canConfirm(.runpod))   // the guard is temporary, not sticky
     }
 
-    /// The other half of the same money guard, and the system-level property
-    /// Phase 6 introduced: a **free** draft mutation invalidates a **paid**
-    /// retry. `resume` re-rents the manifest on disk and deliberately never
-    /// reads the draft (bot.py:7394-7395), and `_run_token` is the manifest's
-    /// `mtime_ns` (bot.py:1493-1506), which moves only when a manifest is
-    /// *rewritten* — a drop does not rewrite one. So without the generation
-    /// latch, Confirm → rental fails → re-enter → Drop → Retry rental rents a
-    /// pod that still runs the job the user just dropped. `confirmIsRefused…`
-    /// above covers the drop *in flight*; this covers the drop that succeeded.
-    @Test func aDropAfterAConfirmWithdrawsTheRentalRetry() async throws {
-        let routes = Routes()
-        routes.draft = Routes.draftTwoJobs
-        routes.tryon = Fixtures.tryonDone
-        let gate = FakeSpendGate([.accepted(runID: "tg-1000", outcome: "started")])
+    /// The regression this branch exists for. The rule that a resume must not
+    /// re-rent a draft that moved is the server's, held in a stamp on disk, so
+    /// a relaunch — which loses every in-memory copy of what was confirmed — is
+    /// exactly the case it has to cover (2026-09-24 follow-ups spec §3). The
+    /// app's job on that path is to offer the tap, surface the refusal verbatim
+    /// and re-read the run, not to swallow it and leave the button offering the
+    /// same tap again.
+    ///
+    /// The message literal is `RESUME_STALE_GENERATION` in bot.py. Asserting it
+    /// here rather than a paraphrase is what keeps the two sides honest: the
+    /// server's own tests all compare against the constant, so this literal is
+    /// the only byte-level pin on the wording anywhere in either codebase. One
+    /// line, not a concatenation, so a grep for the sentence finds it.
+    @Test func aRelaunchSurfacesTheServersStaleResumeRefusal() async throws {
+        let stale = "the draft changed since this rental was confirmed — Confirm again to rent what is in the draft now"
+        let routes = Routes()                       // podIdle carries failed_rental
+        let gate = FakeSpendGate([.refused(status: 409, code: "stale_run",
+                                           message: stale, panelToken: nil)])
         let flow = make(routes, gate: gate)
         await flow.start(.existing)
-        await flow.continueToRent()
-        await flow.confirm()
-        // The accepted confirm is what latches: the server gates it on a token
-        // carrying the draft's generation, so acceptance proves the manifest it
-        // wrote matches generation 9.
-        #expect(flow.confirmedGeneration == 9)
 
-        // The rental failed (`Fixtures.podIdle` carries `failed_rental` and no
-        // lease); re-entering the flow is what offers Drop again.
-        await flow.start(.existing)
-        #expect(flow.phase == .previews)
-        #expect(flow.canDropFromBatch)
-        #expect(flow.canRetryRental)            // draft unchanged since the confirm
-        #expect(flow.retryRentalBlockReason == nil)
-        let blazer = try #require(flow.tryon?.previews.first { $0.run == "model__blazer" })
+        // A relaunch, exactly: no confirm happened during this store's
+        // lifetime, so nothing in memory records what was agreed to. The button
+        // must still be offered — deciding whether the rental may be re-rented
+        // is the server's call, and the only way it can make it is if the tap
+        // reaches it.
+        #expect(flow.canRetryRental)
 
-        await flow.drop(blazer)
-
-        #expect(flow.draft?.generation == 10)
-        #expect(!flow.canRetryRental)
-        #expect(flow.retryRentalBlockReason != nil)
+        let tryonReads = StubURLProtocol.requests.filter {
+            ($0.url?.path ?? "").hasSuffix("/tryon")
+        }.count
         await flow.retryRental()
-        // The confirm only — no `.resume` was ever handed to the gate.
-        #expect(await gate.intents.count == 1)
-        #expect(await gate.intents.allSatisfy { $0.kind == .confirm })
+
+        #expect(await gate.intents.count == 1)      // the tap really was sent
+        #expect(await gate.intents.first?.kind == .resume)
+        #expect(flow.message == stale)              // verbatim, not swallowed
+        #expect(!flow.needsRecheck)                 // a refusal is definitive
+        // A floor of two reads, and the number is the assertion: one
+        // `retryRental()` makes two `/tryon` GETs. `retryRental` reads the run
+        // itself for the CURRENT run_token before it sends, then `applyRefusal`'s
+        // `("stale_run", .resume)` case reads it again — that second read is the
+        // recovery, and it is what this test is about. A bare "the count went
+        // up" would pass with the case deleted, because the pre-send read alone
+        // moves it; a delta of 1 fails `>= 2`. A floor rather than `== 2` so an
+        // unrelated extra read-only GET (caching the run_token, say) does not
+        // turn this red with a failure that names the recovery read.
+        #expect(StubURLProtocol.requests.filter {
+            ($0.url?.path ?? "").hasSuffix("/tryon")
+        }.count >= tryonReads + 2)
     }
 
-    /// The retry stays available when nothing moved the draft, and when no
-    /// confirm was accepted in this store's lifetime — the latter is the state
-    /// after an app relaunch, and refusing there would break the legitimate
-    /// retry flow the whole card exists for.
-    @Test func rentalRetrySurvivesAnUnchangedDraftAndARelaunch() async throws {
+    /// The property the removed client latch got wrong (final review I1), pinned
+    /// against the state the server actually leaves behind. An accepted confirm
+    /// *clears* the app's draft, and `clear()` counts the generation UP rather
+    /// than resetting it (`_changed`, drafts.py:275-279), so the re-read a
+    /// relaunch or a re-entry performs returns `generation + 1` with an empty
+    /// basket — not the generation the confirm was tapped at. `canRetryRental`
+    /// must stay true through that move, because the server stamps the
+    /// *post-clear* value and so already accounts for its own clear. A client
+    /// copy of the generation, compared against this re-read, withheld a retry
+    /// the server would have granted and told the user to Confirm again — which
+    /// the cleared draft makes impossible, so the only escape was a relaunch.
+    ///
+    /// No drop here, on purpose: the clear empties the basket, so there is
+    /// nothing left to drop, and the generation move a drop used to model now
+    /// comes from the clear itself. The other half — a draft that moved *after*
+    /// the confirm, refused by the server and surfaced verbatim with a re-read —
+    /// is `aRelaunchSurfacesTheServersStaleResumeRefusal`; between them the two
+    /// cover the offer and the refusal, which is why the drop-after-confirm case
+    /// they replaced is not separately tested.
+    @Test func rentalRetrySurvivesTheConfirmsOwnClearAndARelaunch() async throws {
         let routes = Routes()
         routes.draft = Routes.draftTwoJobs
         routes.tryon = Fixtures.tryonDone
         let gate = FakeSpendGate([.accepted(runID: "tg-1000", outcome: "started"),
                                   .accepted(runID: "tg-1000", outcome: "started")])
         let flow = make(routes, gate: gate)
-        // No confirm: `confirmedGeneration` is nil, as after a relaunch.
         await flow.start(.existing)
-        #expect(flow.confirmedGeneration == nil)
+        #expect(flow.draft?.generation == 9)
         #expect(flow.canRetryRental)
 
         await flow.continueToRent()
         await flow.confirm()
-        #expect(flow.confirmedGeneration == 9)
-        await flow.start(.existing)             // re-reads the same generation 9
+        #expect(await gate.intents.first?.kind == .confirm)
+        // The server's own transition, at the instant it accepts: draft cleared,
+        // generation counted up to 10 — and 10 is the value it stamped, because
+        // the stamp is read after the clear.
+        routes.confirmAccepted()
+
+        await flow.start(.existing)             // a relaunch's re-read, exactly
+        #expect(flow.draft?.generation == 10)   // the stamped generation, not 9
+        #expect(flow.draft?.batch.isEmpty == true)
+        #expect(flow.draft?.validated == nil)
+        // The property under test: the confirm's own clear does not withdraw the
+        // retry. Under the old client latch this was false.
         #expect(flow.canRetryRental)
-        #expect(flow.retryRentalBlockReason == nil)
+
         await flow.retryRental()
         #expect(await gate.intents.count == 2)
         #expect(await gate.intents.last?.kind == .resume)
-        // A resume must not move the latch: the server ignores the draft there.
-        #expect(flow.confirmedGeneration == 9)
     }
 
     /// `spend` is the single funnel for all four spend entry points, so its

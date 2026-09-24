@@ -173,7 +173,7 @@ import Testing
         let catalog = try MotionJSON.decoder.decode(
             PipelineCatalogResponse.self, from: Fixtures.data(Fixtures.pipelines))
         #expect(catalog.pipelines[1].providers.map(\.id) == ["gemini", "qwen-max"])
-        #expect(catalog.pipelines[1].roles["mask"] == .unknown)
+        #expect(catalog.pipelines[1].roles["background"] == .unknown)
 
         let draft = try MotionJSON.decoder.decode(Draft.self, from: Fixtures.data(Fixtures.draft))
         #expect(draft.generation == 4)
@@ -189,7 +189,7 @@ import Testing
          "slots":{"outfit":{"material_id":"app/dress.png","name":"dress.png","exists":true,
            "probe":{"kind":"image","width":1024,"height":1536,"duration_s":null,
            "bitrate_kbps":null,"size_bytes":900},"warning":""}},
-         "required":["character","driver","outfit"],"optional":["mask"],
+         "required":["character","driver","outfit"],"optional":["background"],
          "missing":["character","driver"],"validated":null,"batch":[],
          "jobs":0,"estimate_min":null}
         """#
@@ -251,7 +251,7 @@ import Testing
           "outfit":{"material_id":null,"name":"dress.png","exists":true,
            "probe":{"kind":"image","width":1024,"height":1536,"duration_s":null,
            "bitrate_kbps":null,"size_bytes":900},"warning":""}},
-         "required":["character","driver","outfit"],"optional":["mask"],
+         "required":["character","driver","outfit"],"optional":["background"],
          "missing":["driver","outfit"],"validated":null,
          "batch":[],"jobs":0,"estimate_min":null}
         """#
