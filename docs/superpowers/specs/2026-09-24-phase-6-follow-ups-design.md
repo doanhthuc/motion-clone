@@ -278,15 +278,25 @@ gate.
   `bot.py:6051`'s empty message produces no empty disclosure.
 - `ErrorBanner` (`StatusViews.swift:34-51`) wraps its existing `HStack` in a `VStack` and renders the
   detail in a `DisclosureGroup` labelled "Details" when `detailMessage != nil`. `nil` for every other
-  error, so the other five `ErrorBanner` call sites are pixel-identical and the Retry button keeps its
-  place.
+  error, so **every other `ErrorBanner` call site renders exactly as it did** and the Retry button keeps
+  its place. There are eleven of them (`GpuPickerView`, `PodView` ×2, `MigrateSheet`, `RunFlowView`,
+  `NewJobView` ×2, `OutputPlayerView`, `OutputsView`, `RunsView`, `RunDetailView`), measured
+  2026-09-24 — this spec's first draft said six, which is the kind of count that should not be written
+  down at all, since the property is what matters and the number only drifts.
 
 `ErrorBanner` is the primary surface: `DraftStore` keeps a validation failure in `store.error`
 (`DraftStoreTests.swift:246-247`), and `NewJobView.banners` renders it at `:157`.
 
-`RunFlow.drop()`'s catch sets `message` from a `String`, not an `APIError`, so that path shows the
-headline only, with no disclosure. That is correct rather than an oversight: there the validation
-failure is a side effect of the drop, and the drop's own copy already tells the user to open New Job.
+`RunFlow.drop()`'s catch shows the **headline with no disclosure**, and that is correct rather than an
+oversight: there the validation failure is a side effect of the drop, and the drop's own copy already
+tells the user to open New Job. But the mechanism is *not* that the path bypasses `APIError` — this
+spec's first draft said the catch "sets `message` from a `String`, not an `APIError`", which is wrong.
+`RunFlowStore.swift:329` is `message = apiError(error).userMessage`, so the drop path routes through
+`userMessage` and does receive the headline; it gets no disclosure because `message` is a `String`
+field, so there is no `APIError` left to hand to `ErrorBanner`. The distinction mattered: because the
+path does route through `userMessage`, `RunFlowTests.swift:403` pinned the old verbatim behaviour and
+broke, making `RunFlowTests.swift` a fifth file in this task. Corrected 2026-09-24 during
+implementation.
 
 ### The existing test this breaks
 
