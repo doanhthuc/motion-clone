@@ -37,7 +37,7 @@ from batchlib.pipelines import (PIPELINES, effective_stage_params,
                                optional_roles, required_roles)
 from batchlib.vast_models import models_for_manifest
 from batchlib.runner import (_local_tryon_stage, has_local_tryon,
-                             preserved_local_tryon, stage_dest)
+                             preserved_local_tryon, stage_dest, tryon_share_groups)
 # Not `from batchlib_ext...` or `scripts/batchlib/...` — drain.py itself lives
 # at scripts/drain.py, a plain top-level module, same as batch_run.py. scripts/
 # is already on sys.path (the insert above), so this is the plan's own "import
@@ -2952,6 +2952,18 @@ def _deliver_tryon_previews(tg: Tg, chat_id: int, manifest_path: Path,
     on-disk progress file tick_progress already rewrites every tick, so this
     survives both a poll finding nothing new and a bot restart mid-render —
     same reasoning as _progress_path's own docstring.
+
+    One photo per share group (spec §3), not one per run: `tryon_share_groups`
+    is computed fresh from the manifest, the same leader/follower split
+    `AppRuns.tryon` uses, never a journal entry's own stale `shared_from`. A
+    follower is skipped in the main loop and never gets its own send — its
+    image is byte-identical to its leader's, so a second document would just
+    be noise. The leader's caption names the group so the 🔄/Keep buttons
+    (which carry the leader's own index) are legible as "this affects N
+    runs". A follower that has not finished its own copy yet does not block
+    the leader's send: the leader's image is the content the caption is
+    about, and the follower copy is cheap enough that its own status is not
+    worth waiting on here.
     """
     try:
         manifest = load_manifest(manifest_path)
@@ -2968,9 +2980,12 @@ def _deliver_tryon_previews(tg: Tg, chat_id: int, manifest_path: Path,
     regen_ok = (payload.get("phase") == "local"
                 and manifest_path.resolve() == _job_manifest_path(chat_id).resolve())
     token = _run_token(chat_id) if regen_ok else ""
+    groups = tryon_share_groups(manifest)
     for index, run in enumerate(manifest.runs):
         if run.id in sent:
             continue
+        if groups.get(run.id, run.id) != run.id:
+            continue   # a follower: covered by its leader's send below
         stage_name = _tryon_stage(run.pipeline)
         if stage_name is None:
             continue
@@ -2991,21 +3006,28 @@ def _deliver_tryon_previews(tg: Tg, chat_id: int, manifest_path: Path,
         tg.send_chat_action(chat_id, "upload_document")
         version = len(_tryon_versions(image)) + 1
         label = f"{run.id} · v{version}" if version > 1 else run.id
+        followers = [other for other, leader in groups.items()
+                    if leader == run.id and other != run.id]
+        group_note = ""
+        if followers:
+            member_ids = [run.id] + followers
+            group_note = f" · used by {len(member_ids)} runs: {', '.join(member_ids)}"
         # caption is plain text — send_document has no parse_mode (unlike
         # send_message/edit_message), so no HTML here.
         if regen_ok:
             tg.send_document(
                 chat_id, image,
                 caption=f"🖼 try-on ({provider}) · {label} — not right? "
-                        "Regenerate it before renting the GPU",
+                        f"Regenerate it before renting the GPU{group_note}",
                 buttons=[[("🔄 Regenerate this image",
                            f"{_CB_TRYON_REGEN}{index}:{token}")]])
         else:
             tg.send_document(
                 chat_id, image,
                 caption=f"🖼 try-on ({provider}) · {label} — "
-                        "pipeline continues on the pod")
+                        f"pipeline continues on the pod{group_note}")
         sent.add(run.id)
+        sent.update(followers)
         changed = True
     if changed:
         payload["sent_tryon"] = sorted(sent)
@@ -7172,18 +7194,36 @@ class AppRuns:
     def tryon(self, run_id: str) -> tuple[int, dict]:
         """The phone's try-on previews for this chat's manifest — the same
         journal `_deliver_tryon_previews` reads, without the Telegram send:
-        the app fetches the image itself, over `tryon_image`."""
+        the app fetches the image itself, over `tryon_image`.
+
+        `shared_from`/`shares` are additive (spec §3): the leader/follower
+        split always comes from `tryon_share_groups`, computed fresh here
+        from the manifest, never from a journal entry's own `shared_from` —
+        a promoted leader (its old leader dropped) keeps a stale one."""
         if run_id != self.run_id:
             return 404, _run_error("not_found", "no such run")
         with self._locked() as busy:
             if busy is not None:
                 return busy
+            entries = self._tryon_entries()
+            index_of = {run.id: index for index, run, _stage, _entry in entries}
+            try:
+                manifest = load_manifest(_job_manifest_path(self.chat_id))
+            except (ManifestError, OSError):
+                groups: dict[str, str] = {}
+            else:
+                groups = tryon_share_groups(manifest)
             previews = []
-            for index, run, _stage, entry in self._tryon_entries():
+            for index, run, _stage, entry in entries:
                 status = entry.get("status") or "pending"
                 has_image = status == "done" and Path(entry.get("file") or "").is_file()
+                leader = groups.get(run.id, run.id)
+                shared_from = None if leader == run.id else index_of.get(leader)
+                shares = [index_of[other] for other, other_leader in groups.items()
+                         if other_leader == run.id and other != run.id]
                 previews.append({"index": index, "run": run.id, "status": status,
-                                 "has_image": has_image})
+                                 "has_image": has_image, "shared_from": shared_from,
+                                 "shares": shares})
             response = (200, {"run_id": self.run_id, "run_token": _run_token(self.chat_id),
                               "phase_a_running": phase_a_running(
                                   _job_manifest_path(self.chat_id)),

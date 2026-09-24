@@ -7124,6 +7124,46 @@ class TestTryonRegen(unittest.TestCase):
         self.assertEqual(len(self.tg.documents), 2)
         self.assertEqual(self.tg.document_buttons, [None, None])
 
+    def test_phase_a_previews_send_one_photo_per_share_group(self):
+        # 2 outfits x 2 drivers, one gemini call per outfit (task-3-brief):
+        # the runner's tryon_share_groups groups the two drivers of each
+        # outfit, o1d1/o2d1 leading, because `tryon` (unlike `camera-tryon`,
+        # which this class's own setUp uses) is never camera-aware, so the
+        # driver plays no part in the share key.
+        run_block = ("  - id: {rid}\n"
+                     "    pipeline: tryon-motion-enhance\n"
+                     "    inputs: {{character: /tmp/c.png, outfit: /tmp/{outfit}.png, "
+                     "driver: /tmp/{rid}.mp4}}\n"
+                     "    tryon: {{ provider: gemini }}\n")
+        run_ids = ["o1d1", "o1d2", "o2d1", "o2d2"]
+        outfits = {"o1d1": "o1", "o1d2": "o1", "o2d1": "o2", "o2d2": "o2"}
+        text = "runs:\n" + "".join(run_block.format(rid=rid, outfit=outfits[rid])
+                                   for rid in run_ids)
+        self.manifest.write_text(text, encoding="utf-8")
+        loaded = load_manifest(self.manifest)
+        state = {"batch": "2026-09-25-1000", "runs": {}}
+        for run in loaded.runs:
+            dest = stage_dest(run, self.root / "out" / "2026-09-25-1000" / "runs" / run.id,
+                              "tryon")
+            dest.parent.mkdir(parents=True)
+            dest.write_bytes(f"img-{run.id}".encode())
+            state["runs"][run.id] = {"status": "pending", "stages": {"tryon": {
+                "status": "done", "file": str(dest), "phase": "local",
+                "params_manifest": effective_stage_params(
+                    "tryon", run.stage_params.get("tryon"))}}}
+        state_path_for(self.manifest).write_text(json.dumps(state), encoding="utf-8")
+
+        payload = {"phase": "local", "sent_tryon": []}
+        bot._deliver_tryon_previews(self.tg, ME, self.manifest, payload)
+
+        self.assertEqual(len(self.tg.documents), 2)
+        for _path, caption in self.tg.documents:
+            self.assertIn("used by 2 runs", caption)
+        token = bot._run_token(ME)
+        data = [rows[0][0][1] for rows in self.tg.document_buttons]
+        self.assertEqual(data, [f"rg:0:{token}", f"rg:2:{token}"])
+        self.assertEqual(set(payload["sent_tryon"]), set(run_ids))
+
     # -- the tap ----------------------------------------------------------
 
     def test_regenerate_redoes_only_that_image_and_keeps_the_old_one(self):

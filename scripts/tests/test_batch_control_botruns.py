@@ -1005,7 +1005,8 @@ class TestTryonPreviews(_AppRunsFixture):
         self.assertEqual(body["run_token"], bot._run_token(ME))
         self.assertFalse(body["phase_a_running"])
         self.assertEqual(body["previews"],
-                         [{"index": "0", "run": run_id, "status": "done", "has_image": True}])
+                         [{"index": "0", "run": run_id, "status": "done", "has_image": True,
+                           "shared_from": None, "shares": []}])
 
         got = self.runs.tryon_image(self.runs.run_id, "0")
         self.assertEqual(got, image.resolve())
@@ -1016,6 +1017,59 @@ class TestTryonPreviews(_AppRunsFixture):
         outside.write_bytes(b"img")
         self._write_journal(run_id, tryon={"status": "done", "file": str(outside)})
         self.assertIsNone(self.runs.tryon_image(self.runs.run_id, "0"))
+
+    def _grouped_jobs(self) -> list[Job]:
+        """2 outfits x 2 drivers, one character, same provider — the runner's
+        tryon_share_key (character, outfit, background, params; driver is
+        excluded because this pipeline's `tryon` stage is not camera-aware)
+        groups the two drivers of each outfit, o1d1/o2d1 leading."""
+        character = self.root / "grp-character.png"
+        character.write_bytes(b"c")
+        jobs = []
+        for outfit_n in (1, 2):
+            outfit = self.root / f"grp-outfit{outfit_n}.png"
+            outfit.write_bytes(b"o")
+            for driver_n in (1, 2):
+                driver = self.root / f"grp-driver{outfit_n}-{driver_n}.mp4"
+                driver.write_bytes(b"d")
+                jobs.append(Job(
+                    slots={"character": character, "driver": driver, "outfit": outfit},
+                    probes={"character": Probe(kind="image", width=1024, height=1024,
+                                               duration_s=0.0, bitrate_kbps=0,
+                                               size_bytes=800_000),
+                            "driver": Probe(kind="video", width=1080, height=1920,
+                                            duration_s=5.0, bitrate_kbps=3000,
+                                            size_bytes=1_500_000),
+                            "outfit": Probe(kind="image", width=1024, height=1024,
+                                            duration_s=0.0, bitrate_kbps=0,
+                                            size_bytes=800_000)},
+                    pipeline="tryon-motion-enhance", provider="gemini"))
+        return jobs
+
+    def test_tryon_previews_carry_the_share_group(self):
+        jobs = self._grouped_jobs()
+        write_manifest(jobs, self._live(), now=time.strftime("%Y-%m-%d %H:%M:%S"))
+        manifest = load_manifest(self._live())
+        run_ids = [run.id for run in manifest.runs]
+        self.assertEqual(len(run_ids), 4)
+
+        runs_state = {}
+        for n, run in enumerate(manifest.runs):
+            image = self.root / "out" / "batch1" / "runs" / run.id / "01-tryon.png"
+            image.parent.mkdir(parents=True, exist_ok=True)
+            image.write_bytes(f"img{n}".encode())
+            runs_state[run.id] = {"status": "running",
+                                  "stages": {"tryon": {"status": "done", "file": str(image)}}}
+        state_path_for(self._live()).write_text(
+            json.dumps({"batch": "batch1", "runs": runs_state}), encoding="utf-8")
+
+        status, body = self.runs.tryon(self.runs.run_id)
+        self.assertEqual(status, 200)
+        previews = body["previews"]
+        self.assertEqual([p["index"] for p in previews], ["0", "1", "2", "3"])
+        self.assertEqual([p["run"] for p in previews], run_ids)
+        self.assertEqual([p["shared_from"] for p in previews], [None, "0", None, "2"])
+        self.assertEqual([p["shares"] for p in previews], [["1"], [], ["3"], []])
 
     def test_tryon_wrong_run_id_is_404(self):
         status, body = self.runs.tryon("not-the-run-id")
