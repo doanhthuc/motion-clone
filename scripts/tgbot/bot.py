@@ -7167,7 +7167,7 @@ class AppRuns:
                     jobs=jobs, estimate_min=estimate_min)
         return 200, data
 
-    def _tryon_entries(self) -> list[tuple[str, "Run", str, dict]]:
+    def _tryon_entries(self, manifest: "Manifest | None" = None) -> list[tuple[str, "Run", str, dict]]:
         """(index, run, stage_name, journal entry) for every run in this
         chat's manifest whose try-on Phase A can do locally, in the order
         `_deliver_tryon_previews` walks them. `index` is the run's own
@@ -7175,12 +7175,19 @@ class AppRuns:
         `_regen_tryon` takes — not a position in this filtered list, so a
         button minted from one previews list still resolves against the
         manifest `_regen_tryon` reads.
+
+        `manifest` lets a caller that already loaded it under the same lock
+        hold (`tryon()`, which also needs it for `tryon_share_groups`) pass
+        it straight in instead of this method loading it a second time.
+        Every other caller omits it and gets the load this method has
+        always done.
         """
         manifest_path = _job_manifest_path(self.chat_id)
-        try:
-            manifest = load_manifest(manifest_path)
-        except (ManifestError, OSError):
-            return []
+        if manifest is None:
+            try:
+                manifest = load_manifest(manifest_path)
+            except (ManifestError, OSError):
+                return []
         runs_state = load_state(state_path_for(manifest_path)).get("runs") or {}
         found = []
         for index, run in enumerate(manifest.runs):
@@ -7205,14 +7212,18 @@ class AppRuns:
         with self._locked() as busy:
             if busy is not None:
                 return busy
-            entries = self._tryon_entries()
-            index_of = {run.id: index for index, run, _stage, _entry in entries}
+            # One load, shared between the entries and the share groups —
+            # not `_tryon_entries()` then a second `load_manifest` call, which
+            # briefly read the manifest twice under the same lock hold.
             try:
                 manifest = load_manifest(_job_manifest_path(self.chat_id))
             except (ManifestError, OSError):
+                entries: list = []
                 groups: dict[str, str] = {}
             else:
+                entries = self._tryon_entries(manifest)
                 groups = tryon_share_groups(manifest)
+            index_of = {run.id: index for index, run, _stage, _entry in entries}
             previews = []
             for index, run, _stage, entry in entries:
                 status = entry.get("status") or "pending"
