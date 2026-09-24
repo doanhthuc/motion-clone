@@ -13,20 +13,32 @@ struct RunDetailView: View {
                 if let error = store.error, store.detail == nil { ErrorBanner(error: error) { await store.refresh() } }
                 if let d = store.detail {
                     StatusHero(detail: d, stale: store.isStale, lastSuccess: store.lastSuccess)
-                    if d.id == flow.runID, flow.canRetryRental, let failure = flow.pod?.failedRental {
+                    if d.id == flow.runID,
+                       flow.canRetryRental || flow.retryRentalBlockReason != nil,
+                       let failure = flow.pod?.failedRental {
                         VStack(alignment: .leading, spacing: 8) {
                             SectionLabel(text: "Rental failed")
                             Text(failure.detail).font(Theme.sans(13)).foregroundStyle(Theme.ink1)
                             // The label names the card `retryRental()` actually sends
                             // (`pod.gpu`, the current .env card), not the one that failed.
                             let gpu = flow.pod?.gpu ?? failure.gpu
-                            if failure.gpu != gpu {
-                                Text("Last failure was on \(failure.gpu); this retries on \(gpu).")
-                                    .font(Theme.sans(12)).foregroundStyle(Theme.amber)
+                            if flow.canRetryRental {
+                                // The note belongs to the branch that offers the
+                                // retry: it promises "this retries on <gpu>", and the
+                                // `else` branch below withholds the retry and says why.
+                                if failure.gpu != gpu {
+                                    Text("Last failure was on \(failure.gpu); this retries on \(gpu).")
+                                        .font(Theme.sans(12)).foregroundStyle(Theme.amber)
+                                }
+                                Button("Retry rental · \(gpu)") { Task { await flow.retryRental() } }
+                                    .buttonStyle(PrimaryButtonStyle())
+                                    .disabled(!flow.canSpend)
+                            } else if let blocked = flow.retryRentalBlockReason {
+                                // The card stays and says why: a resume re-rents the
+                                // manifest on disk, so a draft edited since the confirm
+                                // must be confirmed again, not silently re-run.
+                                Text(blocked).font(Theme.sans(12)).foregroundStyle(Theme.amber)
                             }
-                            Button("Retry rental · \(gpu)") { Task { await flow.retryRental() } }
-                                .buttonStyle(PrimaryButtonStyle())
-                                .disabled(!flow.canSpend)
                             if flow.needsRecheck {
                                 Button("Check again") { Task { await flow.recheck() } }
                                     .buttonStyle(SecondaryButtonStyle())
@@ -40,8 +52,18 @@ struct RunDetailView: View {
                     }
                     if d.id == pod.pod?.runId, pod.showsKill(runStatus: d.status), let runID = pod.pod?.runId {
                         KillButton(pod: pod, runID: runID, hasLease: pod.pod?.lease != nil)
+                        if d.jobs.count > 1 {
+                            Text("Kill stops every remaining job in this batch.")
+                                .font(Theme.sans(12)).foregroundStyle(Theme.ink3)
+                        }
                     }
-                    ForEach(d.jobs) { job in JobTimeline(job: job, showTitle: d.jobs.count > 1) }
+                    // A 12-job batch inlined stage-by-stage is a wall of rows; the
+                    // collapsed list puts the job that failed at the top instead.
+                    if d.jobs.count > 1 {
+                        BatchProgressList(jobs: d.jobs)
+                    } else {
+                        ForEach(d.jobs) { job in JobTimeline(job: job) }
+                    }
                     if !d.outputs.isEmpty {
                         SectionLabel(text: "Outputs")
                         ForEach(d.outputs, id: \.self) { name in
@@ -124,15 +146,13 @@ struct StatusHero: View {
     }
 }
 
+/// The stages of one job. Callers print the job id when it is worth showing —
+/// `BatchProgressList`'s row header does; the single-job path does not.
 struct JobTimeline: View {
     let job: JobProgress
-    let showTitle: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if showTitle {
-                Text(job.id).font(Theme.mono(12, .semibold)).foregroundStyle(Theme.ink1).padding(.bottom, 10)
-            }
             ForEach(Array(job.stages.enumerated()), id: \.offset) { index, stage in
                 HStack(alignment: .top, spacing: 14) {
                     VStack(spacing: 0) {
@@ -184,5 +204,47 @@ struct StageDot: View {
             }
         }
         .frame(width: 26, height: 26)
+    }
+}
+
+struct BatchProgressList: View {
+    let jobs: [JobProgress]
+    @State private var expanded: Set<String> = []
+
+    var body: some View {
+        let summary = BatchSummary(jobs)
+        VStack(alignment: .leading, spacing: 10) {
+            SectionLabel(text: "Batch · \(summary.done)/\(summary.total) done")
+            Text("\(summary.running) running · \(summary.failed) failed")
+                .font(Theme.mono(11)).foregroundStyle(summary.failed > 0 ? Theme.red : Theme.ink2)
+                .accessibilityIdentifier("batch.summary")
+            ForEach(summary.ordered) { job in
+                VStack(alignment: .leading, spacing: 10) {
+                    Button {
+                        if expanded.contains(job.id) { expanded.remove(job.id) } else { expanded.insert(job.id) }
+                    } label: {
+                        HStack(spacing: 10) {
+                            StageDot(status: job.status)
+                            Text(job.id).font(Theme.mono(12, .semibold)).foregroundStyle(Theme.ink1).lineLimit(1)
+                            Spacer(minLength: 0)
+                            if job.finishedSec > 0 {
+                                Text(Format.clock(job.finishedSec)).font(Theme.mono(11)).foregroundStyle(Theme.ink2)
+                            }
+                            // Decorative once the Button announces its own state.
+                            Image(systemName: expanded.contains(job.id) ? "chevron.up" : "chevron.down")
+                                .foregroundStyle(Theme.ink3)
+                                .accessibilityHidden(true)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityValue(expanded.contains(job.id) ? "expanded" : "collapsed")
+                    // Make the whole row width tappable, not just the glyphs — the
+                    // Spacer between the id and the clock is otherwise dead space.
+                    .contentShape(Rectangle())
+                    if expanded.contains(job.id) { JobTimeline(job: job) }
+                }
+                .padding(12).card()
+            }
+        }
     }
 }

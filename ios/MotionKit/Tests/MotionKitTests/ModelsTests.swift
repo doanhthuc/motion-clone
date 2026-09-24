@@ -33,6 +33,46 @@ import Testing
         #expect(d.lease?.quotedUsdPerHr == nil)
     }
 
+    @Test func batchSummaryCountsAndPutsTroubleFirst() throws {
+        let json = #"""
+        [{"id":"a","status":"done","stages":[{"name":"tryon","status":"done","elapsed_sec":6},{"name":"motion","status":"done","elapsed_sec":60}]},
+         {"id":"b","status":"running","stages":[{"name":"tryon","status":"done","elapsed_sec":7},{"name":"motion","status":"running","elapsed_sec":null}]},
+         {"id":"c","status":"error","stages":[{"name":"tryon","status":"error","elapsed_sec":12}]},
+         {"id":"d","status":"pending","stages":[]}]
+        """#
+        let jobs = try decoder.decode([JobProgress].self, from: Fixtures.data(json))
+        let summary = BatchSummary(jobs)
+        #expect((summary.total, summary.done, summary.running, summary.failed) == (4, 1, 1, 1))
+        #expect(summary.ordered.map(\.id) == ["c", "b", "a", "d"])
+        #expect(jobs[0].finishedSec == 66)
+        #expect(jobs[1].finishedSec == 7)
+        // A failed stage keeps its elapsed on the wire — `scripts/batchlib/runner.py:220-221`
+        // stamps `status="error"` and `elapsed_sec` together (`:237` for `done`), and
+        // `scripts/control/runs.py:96` only yields `null` for a stage still running — so a
+        // failed job's row shows its pre-failure seconds rather than nothing.
+        #expect(jobs[2].finishedSec == 12)
+    }
+
+    @Test func batchSummaryCountsEachStatusSeparately() throws {
+        // 12 jobs — `BatchComposer.maxOutfits` — with a distinct count for every
+        // present status (done 5, pending 4, running 2, error 1) and no `.unknown`,
+        // so repointing any counter at any other status changes an asserted number.
+        // A fixture with one job per status cannot tell `done` from `failed`.
+        // `stages` stays empty because no counter reads it; the wire shape of a
+        // stage's elapsed is pinned by `batchSummaryCountsAndPutsTroubleFirst`.
+        let json = #"""
+        [{"id":"j1","status":"done","stages":[]},{"id":"j2","status":"pending","stages":[]},
+         {"id":"j3","status":"done","stages":[]},{"id":"j4","status":"running","stages":[]},
+         {"id":"j5","status":"pending","stages":[]},{"id":"j6","status":"done","stages":[]},
+         {"id":"j7","status":"error","stages":[]},{"id":"j8","status":"pending","stages":[]},
+         {"id":"j9","status":"done","stages":[]},{"id":"j10","status":"running","stages":[]},
+         {"id":"j11","status":"pending","stages":[]},{"id":"j12","status":"done","stages":[]}]
+        """#
+        let jobs = try decoder.decode([JobProgress].self, from: Fixtures.data(json))
+        let summary = BatchSummary(jobs)
+        #expect((summary.total, summary.done, summary.running, summary.failed) == (12, 5, 2, 1))
+    }
+
     @Test func decodesPod() throws {
         let live = try decoder.decode(PodStatus.self, from: Fixtures.data(Fixtures.podLive))
         #expect(live.lease?.runId == "tg-1000")
@@ -176,6 +216,73 @@ import Testing
         #expect(result.valid && !result.stale)
         #expect(result.draft.validated == true)
         #expect(result.draft.estimateMin == 48)
+    }
+
+    @Test func draftSeedIsOptionalAndDecodes() throws {
+        let old = try decoder.decode(Draft.self, from: Fixtures.data(Fixtures.draft))
+        #expect(old.tryonSeed == nil)
+        #expect(old.batch[0].tryonSeed == nil)
+        #expect(old.filledSlots == ["character": "app/model.png"])
+        #expect(old.batch[0].filledSlots == ["character": "app/model.png", "outfit": "app/dress.png"])
+
+        // `Fixtures.draft` predates Phase 6 and carries no `tryon_seed`, so the seeded
+        // shape is synthesized from it rather than adding a second near-identical fixture.
+        let seeded = Fixtures.draft
+            .replacingOccurrences(of: #""estimate_min":null}"#,
+                                  with: #""estimate_min":null,"tryon_seed":"s1"}"#)
+            .replacingOccurrences(of: #""provider":"gemini","slots":{"character""#,
+                                  with: #""provider":"gemini","tryon_seed":"s0","slots":{"character""#)
+        let draft = try decoder.decode(Draft.self, from: Fixtures.data(seeded))
+        #expect(draft.tryonSeed == "s1")
+        #expect(draft.batch[0].tryonSeed == "s0")
+    }
+
+    @Test func unfilledDraftSlotsAreDroppedFromFilledSlots() throws {
+        // `Fixtures.draft` fills its only slot, so it cannot tell `compactMapValues(\.materialID)`
+        // from `mapValues { $0.materialID ?? "" }`. `TryonLibraryStore.matches(slots:)` matches
+        // library entries by dictionary equality over `filledSlots`, where an empty-string role
+        // would never match — so the nil-drop needs a payload that actually carries a null
+        // material id.
+        let payload = #"""
+        {"owner":"app","pipeline":"tryon-motion-enhance","provider":"gemini","generation":4,
+         "slots":{"character":{"material_id":"app/model.png","name":"model.png","exists":true,
+           "probe":{"kind":"image","width":1024,"height":1536,"duration_s":null,
+           "bitrate_kbps":null,"size_bytes":900},"warning":""},
+          "outfit":{"material_id":null,"name":"dress.png","exists":true,
+           "probe":{"kind":"image","width":1024,"height":1536,"duration_s":null,
+           "bitrate_kbps":null,"size_bytes":900},"warning":""}},
+         "required":["character","driver","outfit"],"optional":["mask"],
+         "missing":["driver","outfit"],"validated":null,
+         "batch":[],"jobs":0,"estimate_min":null}
+        """#
+
+        let draft = try decoder.decode(Draft.self, from: Data(payload.utf8))
+
+        #expect(draft.slots.count == 2)
+        #expect(draft.slots["outfit"]?.materialID == nil)
+        #expect(draft.filledSlots == ["character": "app/model.png"])
+    }
+
+    @Test func draftPatchEncodesThreeSeedStates() throws {
+        // `APIClient` uses the same key-encoding strategy on every write call; `.sortedKeys` is
+        // added here only to make the expected bytes deterministic.
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        encoder.outputFormatting = .sortedKeys
+        func text(_ p: DraftPatch) throws -> String { String(decoding: try encoder.encode(p), as: UTF8.self) }
+        #expect(try text(DraftPatch(slots: ["outfit": "app/o.png"], seed: .set("s1")))
+                == #"{"slots":{"outfit":"app\/o.png"},"tryon_seed":"s1"}"#)
+        #expect(try text(DraftPatch(slots: ["outfit": "app/o.png"], seed: .clear))
+                == #"{"slots":{"outfit":"app\/o.png"},"tryon_seed":null}"#)
+        #expect(try text(DraftPatch(slots: ["outfit": nil])) == #"{"slots":{"outfit":null}}"#)
+        #expect(try text(DraftPatch(seed: .clear)) == #"{"tryon_seed":null}"#)
+    }
+
+    @Test func libraryEntriesDecode() throws {
+        let json = #"{"entries":[{"id":"a1","owner":"app","material_ids":{"character":"app/me.png","outfit":"app/o.png"},"provider":"gemini","saved_at":1790000300.5}]}"#
+        let response = try decoder.decode(TryonLibraryResponse.self, from: Fixtures.data(json))
+        #expect(response.entries == [TryonLibraryEntry(id: "a1", materialIDs: ["character": "app/me.png", "outfit": "app/o.png"],
+                                                       provider: "gemini", savedAt: 1790000300.5)])
     }
 }
 

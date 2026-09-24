@@ -78,3 +78,36 @@ public struct RunDetail: Decodable, Sendable, Equatable, Identifiable {
     public let lease: RunLease?
     public let outputs: [String]
 }
+
+extension JobProgress {
+    /// Seconds spent in finished stages; a running stage reports `null`.
+    public var finishedSec: Double { stages.compactMap(\.elapsedSec).reduce(0, +) }
+}
+
+/// The batch progress header and row order (Phase 6 spec §5): failed and
+/// running jobs first, so trouble is on screen without scrolling 12 rows.
+public struct BatchSummary: Equatable, Sendable {
+    public let total: Int
+    public let done: Int
+    public let running: Int
+    public let failed: Int
+    public let ordered: [JobProgress]
+
+    public init(_ jobs: [JobProgress]) {
+        total = jobs.count
+        done = jobs.filter { $0.status == .done }.count
+        running = jobs.filter { $0.status == .running }.count
+        failed = jobs.filter { $0.status == .error }.count
+        func rank(_ job: JobProgress) -> Int {
+            switch job.status { case .error: 0; case .running: 1; default: 2 }
+        }
+        // Equal-ranked jobs keep manifest order. `sorted(by:)` already guarantees
+        // a stable sort; the explicit offset keeps that intent readable here and
+        // survives a swap to a non-stable algorithm. The list re-renders whenever a
+        // poll returns changed data — `RunDetailStore.refresh` assigns `detail` only
+        // on a non-304 — so a reshuffle would be user-visible.
+        ordered = jobs.enumerated()
+            .sorted { (rank($0.element), $0.offset) < (rank($1.element), $1.offset) }
+            .map(\.element)
+    }
+}

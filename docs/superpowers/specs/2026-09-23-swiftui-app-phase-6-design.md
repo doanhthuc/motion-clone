@@ -1,6 +1,49 @@
 # Motion iPhone app — Phase 6 batch and library design
 
-Date: 2026-09-23 · Status: approved design, not implemented
+Date: 2026-09-23 · Status: implemented on the unmerged branch `feat/swiftui-phase-6`; `make ios-contract` (14/14, including `GET /v1/tryon-library`) and `make ios-ui-test` (`Phase6SmokeTests`, 4/4, zero spends recorded) passed live 2026-09-24; no real batch has run
+
+### Gate record
+
+Append-only: add a row, do not restate a result in prose elsewhere. "Ran by" distinguishes the
+implementer's worktree gates from the controller's live ones.
+
+| Gate | Result | Date | Ran by |
+|---|---|---|---|
+| `make ios-build` | exit 0 (compiles `MotionApp` only) | 2026-09-24 | implementer, then the final fix wave |
+| `xcodebuild … build-for-testing` | exit 0, `Phase6SmokeTests.o` produced, no simulator booted | 2026-09-24 | implementer, then the final fix wave |
+| `cd ios/MotionKit && swift test` | 249 tests in 23 suites, exit 0 | 2026-09-24 | final fix wave (244 before it) |
+| `motions-studio/setup/scrub-secrets.sh --check` | exit 0 | 2026-09-24 | implementer, then the final fix wave |
+| `make ios-contract` | **14/14 ok, exit 0**, live against the VPS | 2026-09-24 | controller |
+| `make batch-test` | exit 0, `OK (skipped=1)` | 2026-09-24 | controller |
+| `make ios-ui-test` | **exit 0**, `result: Passed`, `totalTestCount: 4`, `passed: 4`, `failed: 0`, **`skipped: 0`** — §8's `Phase6SmokeTests.testCrossBuildDropAndLibrary` Passed, so neither of its two `XCTSkip` guards (non-empty draft, fewer than two outfit images) fired; the Phase 3, 4 and 5 smokes Passed alongside it. Zero spends recorded (`-UITestRecordingSpendGate`; the closing `uitest.recordedSpends == "0"` assertion passed). Bundle `Test-MotionApp-2026.09.24_09-22-03-+0700.xcresult`, read with `xcrun xcresulttool get test-results summary` / `… tests` | 2026-09-24 | controller, live against the VPS on an already-booted iPhone 18 Pro simulator (`43B83B81-13CD-4383-BB43-4D8AEBEA6582`) |
+
+The `ios-contract` run is also the live proof of the deploy-order property §3 claims but could not
+evidence until now: the server had *not* been deployed with §3's `tryon_seed` field, and
+`GET /v1/draft` still decoded, because the app reads the field as optional. The same run covers the
+14th route, `GET /v1/tryon-library` decoding `TryonLibraryResponse`.
+
+The `ios-ui-test` run settles two properties this spec reasoned about but could not observe:
+
+- **§6's Material tab wrapper did not break toolbar propagation.** The `"Add material"` assertion
+  (`MaterialsView.addMenu`'s accessibility label, installed by its `.toolbar` `ToolbarItem`) passed
+  against a live run. It was the one assertion with no passing precedent — it queries the label
+  type-agnostically because a SwiftUI `Menu`'s XCUITest element type is not guaranteed to be `.button`,
+  so the feared failure was a false alarm rather than a real break. It did not fire. The standing
+  instruction, **widen the query rather than delete the assertion**, stays for any future failure, but
+  is no longer needed for this assertion, which is now precedent-backed.
+- **The two mode-picker `isEnabled` waits are safe, and their effectiveness is still unsettled.** The
+  smoke waits for `newjob.mode`'s "Single" segment to be `isEnabled` before switching back to Single,
+  on both the outfit-count `XCTSkip` path and the final clear, because §4's mode `Picker` is
+  `.disabled(store.isBusy || composer.isRunning)` and a tap on a disabled SwiftUI control is a silent
+  no-op. A passing run proves those waits neither hung nor false-failed. It does **not** prove XCUITest
+  propagates a SwiftUI `Picker`'s `.disabled` to its synthesized segment buttons — if it does not, each
+  wait returns true immediately and is inert rather than harmful. Do not record them as proven
+  effective; observing the difference needs a deliberately-disabled picker.
+
+No real batch has run, and `ios-ui-test` is not one: the smoke builds its two-outfit batch out of
+*free* draft mutations (`PATCH` + add-to-batch, no `SpendGate`, no Idempotency-Key), drops an entry and
+clears — it never rents a pod, never calls Phase A and never reaches a confirm. A 2-outfit batch with
+one seeded job is the proposed spend test (§8) and needs its own approval and quoted price.
 
 This spec refines Phase 6 of `docs/superpowers/specs/2026-09-22-swiftui-app-design.md` (§3 "New
 batch, Bulk try-on", "Saved try-ons", §5 row 6). Phases 1–5 are shipped
@@ -71,6 +114,18 @@ exists". Read-only: no behaviour changes. One unit test in `scripts/tests/` cove
 drain, Phase A, pod lease and migration. The app decodes the field as optional, so it works against
 the server before and after the deploy.
 
+**Known collision this does not fix.** `drafts.py` raises `DraftError("not_found", …)` for two
+different causes — `no such material: {id}` from `_resolve`, and `no such try-on library entry: {id}`
+from `patch` — so both reach the app as `404 not_found` with no way to discriminate. The app treats a
+404 during a slot-carrying `PATCH /v1/draft` as "a material went stale, reload materials"
+(`DraftStore.needsMaterialsRefresh`), and every cross build sends `tryon_seed` *together with*
+`slots.outfit`, so a seed whose library entry was deleted since surfaces as a spurious
+materials-refresh nudge. Nothing is corrupted: the server writes nothing before raising, the
+authoritative draft is re-fetched, and the correct server message still reaches `store.message`. The
+real fix is a distinct server code (`seed_not_found`), deliberately not taken here — this branch is
+allowed exactly one `scripts/**` change and it had to be the seed reporting above. Recorded so
+`DraftStore.apply`'s comment reads as a known limit, not an oversight.
+
 ## 4. New batch (cross build)
 
 **UI.** The `+` tab gains a segmented control **Single | Batch** at the top; Single is today's
@@ -102,8 +157,10 @@ screen, unchanged. Batch:
 
 On each `TryonPreviewCard` in `RunFlowView`:
 
-- **"Drop from batch"** appears when the batch has ≥ 2 jobs and Phase A is not running. Hidden for
-  the last remaining job (Clear covers that).
+- **"Drop from batch"** appears when the **basket has ≥ 2 entries** (`draft.batch.count`, *not*
+  `draft.jobs`) and Phase A is not running — gated by `RunFlow.canDropFromBatch`, which is the
+  authority for the full condition. Hidden for the last remaining entry (Clear covers that), so a run
+  of 2 jobs built from 1 basket entry plus a complete edited job shows no Drop at all.
 - The digest comes from `preview.run == DraftBatchEntry.runID` in a fresh `GET /v1/draft`. No match
   → the button is disabled with "Draft changed — reload".
 - Disabled while an outstanding spend is unanswered (`flow.canSpend == false`), so the draft never
@@ -145,6 +202,17 @@ stale state.
 `TryonLibraryEntry {id, materialIDs: [String: String], provider, savedAt: Date}` (the existing
 `TryonLibraryRecord` is reused or folded in); the draft patch encodes `tryon_seed` as absent,
 explicit `null`, or an id.
+
+**Known limitation (Task 7, recorded in code).** The server merges a `PATCH /v1/draft` per role
+(`scripts/control/drafts.py:450-455`): it sets the roles the patch names and pops only a role sent as
+explicit `null`, leaving every other slot untouched. `TryonLibraryStore.use` sends the entry's
+`materialIDs` plus the seed, so when an entry lacks a non-driver role the draft already has — in
+practice `background` — that role stays on the draft while the seed points at an image made without
+it. The job is still valid; the reuse simply does not carry the leftover role into the saved image,
+and `matches(slots:)` (exact equality over every non-driver role) will not offer that entry for the
+mismatched pair. The optional role is `background`, not `mask`: `mask` is not a server role anywhere
+in `scripts/**` (the server's pipelines use `background`, `scripts/batchlib/pipelines.py:54,81`),
+which corrects the plan's ruling text.
 
 ## 7. App wiring
 

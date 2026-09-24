@@ -36,6 +36,7 @@ public final class RunFlow {
     public private(set) var imageGeneration = 0
     public private(set) var versions: [String: [Data]] = [:]
     public private(set) var isLoadingPanel = false
+    public private(set) var isDropping = false
     public var selectedProvider: SpendProvider = .runpod
     /// RootView switches to the Runs tab (pod strip) and clears it.
     public private(set) var podRequested = false
@@ -49,6 +50,12 @@ public final class RunFlow {
     private var keptKeys: Set<String> = []
     private var pendingIntent: SpendIntent?
     private var didReplay = false
+    /// The draft's `generation` when the last confirm was accepted — i.e. when
+    /// the server wrote the manifest `resume` re-rents. Deliberately in memory
+    /// only: `nil` means "nothing was confirmed during this store's lifetime",
+    /// which is the state after an app relaunch, and refusing there would break
+    /// the legitimate retry-after-relaunch flow.
+    private(set) var confirmedGeneration: Int?
 
     public init(client: APIClient, gate: any SpendSending,
                 sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }) {
@@ -79,9 +86,31 @@ public final class RunFlow {
         return current || draft.batch.contains { local($0.pipeline, $0.provider) }
     }
 
-    /// Only offered when the server says a rental failed and nothing is leased.
+    /// Only offered when the server says a rental failed, nothing is leased,
+    /// and the draft has not moved since the confirm that wrote the manifest.
+    ///
+    /// The third term is the money guard. `resume` re-rents the manifest on
+    /// disk and deliberately never reads the draft (bot.py:7394-7395), and
+    /// `_run_token` is the manifest's `mtime_ns` (bot.py:1493-1506), which moves
+    /// only when a manifest is *rewritten* — a draft edit does not rewrite one.
+    /// That is why `panel_token` joins `.generation` (bot.py:6895-6902) and
+    /// `resume` has no equivalent: without this latch, a Confirm whose rental
+    /// failed followed by a free "Drop from batch" leaves Retry rental offering
+    /// to rent a pod that still runs the job the user just dropped.
     public var canRetryRental: Bool {
         pod?.failedRental != nil && pod?.lease == nil && runID != nil
+            && retryRentalBlockReason == nil
+    }
+
+    /// Why Retry rental is withheld although a rental really did fail — `nil`
+    /// when it is offered, or when there is nothing to retry. `RunDetailView`
+    /// renders this in place of the button so the failure card says why instead
+    /// of going quiet.
+    public var retryRentalBlockReason: String? {
+        guard pod?.failedRental != nil, pod?.lease == nil, runID != nil,
+              let confirmedGeneration else { return nil }
+        guard confirmedGeneration != draft?.generation else { return nil }
+        return "The draft changed since this rental failed — Confirm again to rent what is left."
     }
 
     public var needsTryonPolling: Bool {
@@ -210,6 +239,113 @@ public final class RunFlow {
         }
     }
 
+    // MARK: drop after Phase A (Phase 6 spec §5)
+
+    /// `preview.run` is the manifest run id; `GET /v1/draft`'s `batch[].run_id`
+    /// is the id the manifest gives that entry. `nil` when the draft changed.
+    public func batchEntry(for preview: TryonPreview) -> DraftBatchEntry? {
+        draft?.batch.first { $0.runID == preview.run }
+    }
+
+    public func isSeeded(_ preview: TryonPreview) -> Bool {
+        batchEntry(for: preview)?.tryonSeed != nil
+    }
+
+    /// Never while a spend is unanswered: the draft must not change under an
+    /// in-flight confirm. The last job is never dropped here (Clear does that).
+    public var canDropFromBatch: Bool {
+        canSpend && !isDropping && (draft?.batch.count ?? 0) >= 2
+            && tryon?.phaseARunning != true && (phase == .previews || phase == .rentPanel)
+    }
+
+    /// Free: drops one job from the basket, then re-validates, because every
+    /// draft change resets `validated` and confirm refuses `not_validated`.
+    /// Confirm then takes the fresh-spend branch (`_phase_a_matches_draft` is
+    /// false) and may ask reuse/rerun — reuse calls no provider again.
+    public func drop(_ preview: TryonPreview) async {
+        guard canDropFromBatch else { return }
+        isDropping = true
+        defer { isDropping = false }
+        message = nil
+        do {
+            let fresh = try await client.get(Draft.self, "v1", "draft")
+            draft = fresh
+            guard let entry = batchEntry(for: preview) else {
+                message = "The draft changed — reload before dropping."
+                // No `refreshTryon()` on this path, on purpose: nothing was
+                // written, so the previews are exactly as current as they were
+                // before the tap, and the fresh draft installed above is what
+                // makes the card lose its basket entry and offer "reload".
+                // The panel still goes, by the one rule stated at the end of
+                // this function: that fresh draft just proved the basket the
+                // quote on screen priced no longer exists.
+                //
+                // Asymmetric with the successful path, deliberately: this
+                // returns before the trailing `loadPanel(force: false)`, so on
+                // `.rentPanel` the screen keeps `panel == nil` and
+                // `RentPanelView` reads "Nothing can be rented right now."
+                // until a pull-to-refresh. Re-reading here could replace the
+                // more actionable message above with a panel error, and the
+                // recovery is one gesture (`RunFlowView` calls
+                // `loadPanel(force: true)`).
+                if phase == .rentPanel { panel = nil }
+                return
+            }
+            // add-to-batch leaves the edited job a copy of the last entry, and
+            // the server's `jobs_for` counts that copy as one more job whenever
+            // it is complete — so deleting the entry without first making the
+            // edited job incomplete would bring the dropped job back into Run.
+            if editedJobEquals(entry, in: fresh), let role = clearRole(for: entry) {
+                draft = try await client.patch(Draft.self, body: SlotPatch(role: role, materialID: nil),
+                                               timeout: 95, "v1", "draft")
+            }
+            draft = try await client.delete(Draft.self, "v1", "draft", "batch", entry.digest)
+            // 95 s on the PATCH above and this validate: the server can probe
+            // for 60 s and validate for 90 s, so stay under Cloudflare's ~100 s
+            // origin ceiling — the bound `DraftStore.slowDraftTimeout` uses.
+            let validation = try await client.post(DraftValidationResponse.self, timeout: 95,
+                                                   "v1", "draft", "validate")
+            draft = validation.draft
+            if validation.stale {
+                message = "The draft changed during validation. Validate it again from New Job."
+            } else if !validation.valid {
+                // Defence, not a live path: today's server never answers this
+                // route 200 with `valid: false`. An invalid non-stale
+                // validation raises `DraftError("invalid")` (drafts.py:566),
+                // which server.py:47 maps to 422, so it lands in the `catch`
+                // below instead. Kept because `DraftValidationResponse` still
+                // permits the shape — don't delete it as dead code.
+                message = "Validation failed after the drop — open New Job to fix it."
+            }
+        } catch {
+            message = apiError(error).userMessage
+            if let fresh = try? await client.get(Draft.self, "v1", "draft") { draft = fresh }
+        }
+        // One rule for both exits of this function — the bail-out above clears
+        // too. The quote on screen must be the quote that will be charged, and
+        // this panel priced the job that just went away. `canConfirm`'s
+        // `!isDropping` already keeps the button off the glass while a drop
+        // runs, but the price text is rendered straight from `quote(for:)`, so
+        // this is what stops a stale number being *shown* during the
+        // `refreshTryon()` below. `reloadPanelAfterGpuChange()` clears before
+        // re-reading for the same reason; don't drop this line as redundant.
+        if phase == .rentPanel { panel = nil }
+        await refreshTryon()
+        if phase == .rentPanel { await loadPanel(force: false) }
+    }
+
+    private func editedJobEquals(_ entry: DraftBatchEntry, in draft: Draft) -> Bool {
+        draft.pipeline == entry.pipeline && draft.provider == entry.provider
+            && draft.filledSlots == entry.filledSlots && draft.tryonSeed == entry.tryonSeed
+    }
+
+    /// A pipeline without an `outfit` still needs some role cleared, or the
+    /// edited copy would stay complete and keep counting as a job.
+    private func clearRole(for entry: DraftBatchEntry) -> String? {
+        if entry.slots.keys.contains("outfit") { return "outfit" }
+        return catalog.first { $0.id == entry.pipeline }?.required.sorted().first
+    }
+
     // MARK: rent panel
 
     public func continueToRent() async {
@@ -254,8 +390,16 @@ public final class RunFlow {
         }
     }
 
+    /// `!isDropping` is not redundant with the `panel = nil` a drop performs
+    /// after its writes: the server's `panel_token` is
+    /// `f"{_run_token}.{generation}"` (bot.py:6895-6902) and `generation` only
+    /// moves once a drop's first write lands, so until then the cached token is
+    /// still accepted and the `stale_panel` refusal (bot.py:7012) never fires.
+    /// That window is the fresh `GET` plus a `PATCH` whose server-side probe can
+    /// take 60 s, and a Confirm accepted inside it rents and runs the pre-drop
+    /// basket — the job the user tapped Drop on.
     public func canConfirm(_ provider: SpendProvider) -> Bool {
-        panel != nil && quote(for: provider) != nil && canSpend && !isLoadingPanel
+        panel != nil && quote(for: provider) != nil && canSpend && !isLoadingPanel && !isDropping
     }
 
     /// After `PUT /v1/pod/gpu`: the old quote and `panel_token` priced another
@@ -379,6 +523,19 @@ public final class RunFlow {
             message = "Another spend request is still in flight."
             return
         }
+        // The choke point, not `canSpend`: a drop is a free draft mutation that
+        // never sets `inFlightLabel`, so guarding here covers all four spend
+        // entry points (confirm, regenerate, retryRental, choose) and any added
+        // later, while widening `canSpend` would also reach `canDropFromBatch`
+        // and deadlock the drop itself. `canConfirm`'s own `!isDropping` stays
+        // as the button-level guard. This cannot strand the pending-notice
+        // machinery: `recheck()` and `replayPendingOnce()` call
+        // `gate.recheck`/`gate.replayPending` directly and never come through
+        // here.
+        guard !isDropping else {
+            message = "A batch drop is still in flight — wait for it before spending."
+            return
+        }
         inFlightLabel = label
         retryNote = nil
         message = nil
@@ -406,6 +563,22 @@ public final class RunFlow {
         case let .accepted(runID, _):
             needsRecheck = false
             pendingIntent = nil
+            // Only `.confirm` moves the latch, and only on acceptance:
+            // `confirm` is the one spend the server gates on a token derived
+            // from the draft's own generation (`panel_token` is
+            // `_run_token.generation`, bot.py:6895-6902, refused as
+            // `stale_panel` at bot.py:7012), so an accepted confirm proves the
+            // manifest now matches the draft this store is holding — whether it
+            // got there by `_do_confirm` rewriting the manifest from the draft
+            // or by the `_phase_a_matches_draft` resume branch, which requires
+            // the two to be equal already (bot.py:7017-7029). `.phaseA` writes
+            // the same manifest (bot.py:5846-5848, "same manifest write") but
+            // carries no panel token, so its acceptance proves nothing about
+            // this copy's freshness and latching on it could record a stale
+            // generation. `.resume` deliberately ignores the draft
+            // (bot.py:7394-7395), `.regen` touches one image, `.migrate` is
+            // never sent here.
+            if kind == .confirm { confirmedGeneration = draft?.generation }
             switch kind {
             case .phaseA, .regen:
                 phase = .phaseARunning

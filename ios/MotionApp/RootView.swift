@@ -11,16 +11,23 @@ struct RootView: View {
             if let runs = model.runs, let pod = model.pod,
                let materials = model.materials, let draft = model.draft,
                let outputs = model.outputs, let flow = model.runFlow,
-               let gpu = model.gpu, let balance = model.balance, let migrate = model.migrate {
+               let gpu = model.gpu, let balance = model.balance, let migrate = model.migrate,
+               let library = model.tryonLibrary, let composer = model.batchComposer {
                 TabView(selection: $model.selectedTab) {
                     Tab("Runs", systemImage: "waveform.path.ecg", value: AppTab.runs) {
                         NavigationStack { RunsView(runs: runs, pod: pod, flow: flow) }
                     }
                     Tab("Material", systemImage: "square.grid.2x2", value: AppTab.materials) {
-                        NavigationStack { MaterialsView(store: materials) }
+                        NavigationStack {
+                            MaterialTabView(materials: materials, library: library, draft: draft,
+                                            composer: composer)
+                        }
                     }
                     Tab("New Job", systemImage: "plus.circle.fill", value: AppTab.newJob) {
-                        NavigationStack { NewJobView(store: draft, materials: materials, flow: flow) }
+                        NavigationStack {
+                            NewJobView(store: draft, materials: materials, flow: flow,
+                                       composer: composer, library: library)
+                        }
                     }
                     Tab("Output", systemImage: "play.rectangle", value: AppTab.outputs) {
                         NavigationStack { OutputsView(store: outputs) }

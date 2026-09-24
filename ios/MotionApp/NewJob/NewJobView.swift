@@ -6,13 +6,16 @@ struct NewJobView: View {
     let store: DraftStore
     let materials: MaterialsStore
     let flow: RunFlow
+    let composer: BatchComposer
+    let library: TryonLibraryStore
+    @Environment(AppModel.self) private var model
     @State private var selectedRole: String?
     @State private var dropCandidate: DraftBatchEntry?
 
     var body: some View {
         Group {
             if let draft = store.draft, let pipeline = store.selectedPipeline {
-                composer(draft: draft, pipeline: pipeline)
+                editor(draft: draft, pipeline: pipeline)
             } else if let error = store.error {
                 initialLoadFailure(error)
             } else if store.isRefreshing {
@@ -23,6 +26,7 @@ struct NewJobView: View {
         }
         .background(Theme.bg)
         .task { await store.load() }
+        .task { await library.load() }
         .refreshable { await store.refresh() }
         .onChange(of: store.needsMaterialsRefresh) { _, needsRefresh in
             guard needsRefresh else { return }
@@ -31,6 +35,20 @@ struct NewJobView: View {
                 store.acknowledgeMaterialsRefresh()
                 closePickerIfSelectionDisappeared()
             }
+        }
+        // Both seed observers sit above the Single|Batch split so they outlive the
+        // Batch arm: Single mode edits the same draft slots through
+        // `slots(draft:pipeline:)`, and an arm removed while they changed never
+        // re-picks. The seed chosen for the old character/outfit pair would then be
+        // PATCHed for the new one, and Phase A skips the provider and seeds the job
+        // from an image made from different materials. `library.loaded` is observed
+        // too because `matches(for:)` is empty against an unfetched library, so an
+        // outfit chosen before `load()` returns would keep no seed at all; no manual
+        // pick can be lost by that, since the seed toggle is disabled while
+        // `matches` is empty.
+        .onChange(of: composer.sharedSlots) { _, _ in composer.refreshSeeds() }
+        .onChange(of: library.loaded) { _, loaded in
+            if loaded { composer.refreshSeeds() }
         }
         .confirmationDialog(
             "Drop this batch entry?",
@@ -61,21 +79,41 @@ struct NewJobView: View {
         .padding(.horizontal, 20)
     }
 
-    private func composer(draft: Draft, pipeline: Pipeline) -> some View {
-        ScrollView {
+    private func editor(draft: Draft, pipeline: Pipeline) -> some View {
+        let isBatch = model.newJobMode == .batch
+        // Cross build needs a character + outfit pair, so Batch mode offers only the
+        // pipelines that have one. When none qualify there is nothing to choose, so
+        // the picker is disabled instead of opening an empty menu behind a label
+        // that still names the pipeline the user is on.
+        let batchCatalog = store.catalog.filter(BatchComposer.supports)
+        return ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 header(draft)
+                Picker("Mode", selection: Binding(get: { model.newJobMode }, set: { model.newJobMode = $0 })) {
+                    Text("Single").tag(NewJobMode.single)
+                    Text("Batch").tag(NewJobMode.batch)
+                }
+                .pickerStyle(.segmented)
+                .accessibilityIdentifier("newjob.mode")
+                .disabled(store.isBusy || composer.isRunning)
                 banners
                 PipelinePicker(
                     pipeline: pipeline,
-                    pipelines: store.catalog,
+                    pipelines: isBatch ? batchCatalog : store.catalog,
                     selectedProvider: draft.provider,
-                    disabled: store.isBusy,
+                    disabled: store.isBusy || composer.isRunning || (isBatch && batchCatalog.isEmpty),
                     onPipelineSelected: { id in await store.selectPipeline(id) },
                     onProviderSelected: { id in await store.selectProvider(id) })
-                slots(draft: draft, pipeline: pipeline)
-                readiness(draft)
-                editorActions(draft)
+                if isBatch {
+                    BatchComposerSection(store: store, composer: composer,
+                                         materials: materials, pipeline: pipeline,
+                                         onPickRole: { selectedRole = $0 })
+                } else {
+                    slots(draft: draft, pipeline: pipeline)
+                    seedBadge(draft)
+                    readiness(draft)
+                    editorActions(draft)
+                }
                 batch(draft)
                 validation(draft)
             }
@@ -188,7 +226,7 @@ struct NewJobView: View {
             .frame(maxWidth: .infinity)
             .padding(.vertical, 12)
             .background(Theme.lime, in: .rect(cornerRadius: 12))
-            .disabled(!draft.missing.isEmpty || store.isBusy)
+            .disabled(!draft.missing.isEmpty || store.isBusy || composer.isRunning)
 
             Button("Clear", role: .destructive) {
                 Task { await store.clear() }
@@ -198,7 +236,26 @@ struct NewJobView: View {
             .padding(.horizontal, 16)
             .padding(.vertical, 12)
             .background(Theme.redDim, in: .rect(cornerRadius: 12))
-            .disabled(store.isBusy)
+            .disabled(store.isBusy || composer.isRunning)
+        }
+    }
+
+    /// The edited job's own seed. `!library.loaded` counts as "still exists":
+    /// an unfetched library cannot say a seed is gone, only that it is unseen.
+    @ViewBuilder private func seedBadge(_ draft: Draft) -> some View {
+        if let seed = draft.tryonSeed {
+            HStack(spacing: 8) {
+                Image(systemName: "photo.badge.checkmark").foregroundStyle(Theme.lime)
+                Text(library.entries.contains { $0.id == seed } || !library.loaded
+                     ? "Uses a saved try-on — Phase A skips the provider for this job"
+                     : "The saved try-on no longer exists")
+                    .font(Theme.sans(13)).foregroundStyle(Theme.ink1)
+                Spacer(minLength: 0)
+                Button("Remove") { Task { await store.apply(DraftPatch(seed: .clear)) } }
+                    .font(Theme.sans(12, .semibold)).foregroundStyle(Theme.red)
+                    .disabled(store.isBusy)
+            }
+            .padding(12).card(border: Theme.limeLine)
         }
     }
 
@@ -224,12 +281,15 @@ struct NewJobView: View {
                                 .font(Theme.mono(9))
                                 .foregroundStyle(Theme.ink3)
                                 .lineLimit(2)
+                            if entry.tryonSeed != nil {
+                                Text("Saved try-on").font(Theme.mono(9, .semibold)).foregroundStyle(Theme.lime)
+                            }
                         }
                         Spacer(minLength: 0)
                         Button("Drop", role: .destructive) { dropCandidate = entry }
                             .font(Theme.sans(12, .semibold))
                             .foregroundStyle(Theme.red)
-                            .disabled(store.isBusy)
+                            .disabled(store.isBusy || composer.isRunning)
                     }
                     .padding(12)
                     .card()
@@ -282,7 +342,7 @@ struct NewJobView: View {
                     .padding(.vertical, 13)
                     .background(Theme.lime, in: .rect(cornerRadius: 12))
             }
-            .disabled(draft.jobs == 0 || store.isBusy)
+            .disabled(draft.jobs == 0 || store.isBusy || composer.isRunning)
 
             if store.isReady {
                 NavigationLink {
@@ -315,7 +375,7 @@ struct NewJobView: View {
 }
 
 @MainActor
-private struct SlotMaterialRow: View {
+struct SlotMaterialRow: View {
     let role: String
     let required: Bool
     let kind: PipelineRoleKind

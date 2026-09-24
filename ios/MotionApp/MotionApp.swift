@@ -13,6 +13,10 @@ struct MotionApp: App {
 
 enum AppTab: Hashable { case runs, materials, newJob, outputs, pod }
 
+/// How many jobs the draft stands for: `.single` is the one job being edited,
+/// `.batch` is a cross build of many.
+enum NewJobMode: Hashable { case single, batch }
+
 /// Opens the migrate sheet (RootView presents it over every tab).
 struct MigrateRequest: Identifiable, Equatable {
     let id = UUID()
@@ -34,12 +38,17 @@ final class AppModel {
     private(set) var gpu: GpuStore?
     private(set) var balance: BalanceStore?
     private(set) var migrate: MigrateFlow?
+    private(set) var tryonLibrary: TryonLibraryStore?
+    private(set) var batchComposer: BatchComposer?
     var migrateSheet: MigrateRequest?
     /// UI-test builds only: how many spend taps the recording gate swallowed.
     private(set) var recordedSpends = 0
     private var spendGate: (any SpendSending)?
     static let isUITestRecording = ProcessInfo.processInfo.arguments.contains("-UITestRecordingSpendGate")
     var selectedTab: AppTab = .runs
+    /// Views write this directly: adopting a saved try-on sets `.single` and
+    /// moves to the New Job tab.
+    var newJobMode: NewJobMode = .single
     private var materialResumeTask: Task<Void, Never>?
     private var replayTask: Task<Void, Never>?
 
@@ -58,7 +67,7 @@ final class AppModel {
         materialResumeTask = nil
         guard let credentials = vault.load() else {
             client = nil; runs = nil; pod = nil; materials = nil; draft = nil; outputs = nil; runFlow = nil
-            gpu = nil; balance = nil; migrate = nil; spendGate = nil
+            gpu = nil; balance = nil; migrate = nil; tryonLibrary = nil; batchComposer = nil; spendGate = nil
             return true
         }
         let client = APIClient(credentials: credentials)
@@ -67,7 +76,11 @@ final class AppModel {
         let pod = PodStore(client: client)
         self.pod = pod
         materials = MaterialsStore(client: client)
-        draft = DraftStore(client: client)
+        let draft = DraftStore(client: client)
+        self.draft = draft
+        let library = TryonLibraryStore(client: client, draft: draft)
+        tryonLibrary = library
+        batchComposer = BatchComposer(draft: draft, library: library)
         outputs = OutputsStore(client: client)
         gpu = GpuStore(client: client, pod: pod)
         balance = BalanceStore(client: client)

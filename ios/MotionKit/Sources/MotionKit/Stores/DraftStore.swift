@@ -96,13 +96,35 @@ public final class DraftStore {
         }
     }
 
-    public func addToBatch() async {
+    /// Slots and the try-on seed in one PATCH (Phase 6: cross build, "Use in job").
+    /// The 95 s timeout is unconditional, so a seed-only patch that probes nothing pays it too.
+    /// A 404 here also trips `needsMaterialsRefresh` when the *seed* is what went missing, but only
+    /// on a patch that carries slots too — `mutate` sets the flag solely under
+    /// `materialAssignment`, which this passes as `!patch.slots.isEmpty`. That covers every seed the
+    /// app actually *sets* (`TryonLibraryStore.use` and `BatchComposer.run` both send `tryon_seed`
+    /// together with `slots.outfit`). The one shipped seed-only patch is `NewJobView`'s `.clear`,
+    /// and it cannot 404 on a seed: the server resolves a library entry only for a truthy id
+    /// (`scripts/control/drafts.py:386-389`). The server answers one `not_found` code for both "no
+    /// such material" and "no such try-on library entry", so the client cannot tell them apart. Read
+    /// that flag as "something this patch named is gone", never as proof a material went stale —
+    /// `message` still says which one.
+    @discardableResult
+    public func apply(_ patch: DraftPatch) async -> Bool {
+        await mutate(materialAssignment: !patch.slots.isEmpty) {
+            try await self.client.patch(
+                Draft.self, body: patch, timeout: Self.slowDraftTimeout, "v1", "draft")
+        }
+    }
+
+    @discardableResult
+    public func addToBatch() async -> Bool {
         await mutate {
             try await self.client.post(Draft.self, "v1", "draft", "add-to-batch")
         }
     }
 
-    public func dropFromBatch(_ digest: String) async {
+    @discardableResult
+    public func dropFromBatch(_ digest: String) async -> Bool {
         await mutate {
             try await self.client.delete(Draft.self, "v1", "draft", "batch", digest)
         }
@@ -152,13 +174,16 @@ public final class DraftStore {
         needsMaterialsRefresh = false
     }
 
+    /// Returns whether the write landed. `false` leaves `message` explaining why, so
+    /// callers that gate UI on it never have to re-derive the failure from `error`.
+    @discardableResult
     private func mutate(
         materialAssignment: Bool = false,
         _ operation: () async throws -> Draft
-    ) async {
+    ) async -> Bool {
         guard !isBusy else {
             message = "Another draft change is still in progress."
-            return
+            return false
         }
         isMutating = true
         error = nil
@@ -167,6 +192,7 @@ public final class DraftStore {
         defer { isMutating = false }
         do {
             accept(try await operation())
+            return true
         } catch {
             let api = apiError(error)
             if materialAssignment,
@@ -175,13 +201,14 @@ public final class DraftStore {
                 await refreshAfterAmbiguousWrite()
                 self.error = api
                 message = serverMessage
-                return
+                return false
             }
             if api.isOffline {
                 await refreshAfterAmbiguousWrite()
             }
             self.error = api
             message = api.userMessage
+            return false
         }
     }
 

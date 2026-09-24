@@ -195,6 +195,30 @@ class TestView(StoreCase):
         self.assertEqual(v["pipeline"], "tryon-motion-enhance")
         self.assertEqual(len(list(self.store.path.parent.glob("app.draft.json.*bad"))), 1)
 
+    def test_fresh_view_has_no_seed(self):
+        self.assertIsNone(self.store.view()["tryon_seed"])
+
+    def test_view_reports_the_seed_as_a_library_id(self):
+        # The phone shows a "saved try-on" badge from this and must not guess
+        # it locally (Phase 6 spec §3). The id, never a path.
+        self.fill()
+        entry_id = self.saved_seed()
+        v = self.store.patch({"tryon_seed": entry_id})
+        self.assertEqual(v["tryon_seed"], entry_id)
+        v = self.store.add_to_batch()
+        self.assertEqual(v["batch"][0]["tryon_seed"], entry_id)
+        v = self.store.patch({"tryon_seed": None})
+        self.assertIsNone(v["tryon_seed"])
+        self.assertEqual(v["batch"][0]["tryon_seed"], entry_id)
+        self.assertNotIn(str(self.tmp), json.dumps(v))
+
+    def test_a_deleted_entry_still_reports_its_id(self):
+        self.fill()
+        entry_id = self.saved_seed()
+        self.store.patch({"tryon_seed": entry_id})
+        self.library.delete(entry_id)
+        self.assertEqual(self.store.view()["tryon_seed"], entry_id)
+
 
 class TestPatch(StoreCase):
     def test_fill_all_slots(self):
