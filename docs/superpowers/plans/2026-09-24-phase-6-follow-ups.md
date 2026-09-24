@@ -1546,7 +1546,12 @@ Run: `xcrun xcresulttool get test-results tests --path "$BUNDLE" 2>/dev/null | g
 
 Expected: `Phase6SmokeTests.testCrossBuildDropAndLibrary` listed as Passed. Its closing `uitest.recordedSpends == "0"` assertion is inside that test, so a Pass is the zero-spend proof.
 
-This run is also the only live evidence that Task 7's Batch-mode Clear works: `clearFromBatch` taps it and asserts `"0 jobs"`. If it passed, the button is real.
+This run is also the only live evidence that Task 7's Batch-mode Clear works: `clearFromBatch` taps it and asserts both the header's `"0 jobs"` and that `Character`'s slot value returns to `"Missing required"`. If it passed, the button is real and it actually emptied the draft — the slot assertion is the load-bearing one, because `"0 jobs"` is already true on the skip path before the tap (`drafts.py:294-307` counts an incomplete edited job as zero).
+
+Two things this run must settle that no free gate can:
+
+- **If the skip path fires, confirm the cleanup assertions would still be heard.** `clearFromBatch` is non-throwing and its `XCTAssertTrue`s record failures without stopping execution, then `throw XCTSkip` follows immediately. Whether XCTest reports that combination as `failed` or `skipped` was not establishable by reading — Task 7's review raised it and the controller could not settle it either. If the run reports `skipped: 0`, the question is moot for this run; record that. If it skips, record which way XCTest resolved it, because a skip that masks a failed cleanup assertion means the next run silently fails its precondition instead of reporting the real cause.
+- **Look at the Batch-mode Clear's placement in the screenshots.** It is leading-aligned and content-sized inside the Batch arm's `VStack`, while Single's sits trailing inside `editorActions`'s `HStack` because the sibling "Add to batch" carries `.frame(maxWidth: .infinity)`. Same button, same modifiers, different horizontal position between modes. Deferred here rather than guessed at. If it looks unbalanced, the fix belongs at the call site (`NewJobView.swift:111`) and **not** on the shared `clearAction` property — the one-implementation invariant is worth more than the alignment.
 
 - [ ] **Step 6: Record every result**
 
