@@ -179,9 +179,9 @@ Design: `docs/superpowers/specs/2026-09-23-swiftui-app-phase-6-design.md`.
   `draft.jobs`. Dropping re-validates the draft and re-reads the previews and rent panel, so confirm
   rents only what is left. Every `RunFlow` spend is refused while a drop is in flight: the guard sits
   in `RunFlow.spend`, the single funnel all four entry points share, so a new one inherits it.
-  (`MigrateFlow.migrate()` calls the spend gate directly and is not covered by it.) The last
-  remaining basket entry has no drop affordance by design — **Clear** (Single mode on the New Job tab)
-  is the only way to remove it. Run detail shows a per-job batch progress list.
+  (`MigrateFlow.migrate()` calls the spend gate directly, so it carries that guard itself.) The last
+  remaining basket entry has no drop affordance by design — **Clear** (on the New Job tab, in either
+  mode) is the only way to remove it. Run detail shows a per-job batch progress list.
 - **Retry rental is latched to the draft that was confirmed.** `resume` re-rents the manifest on disk
   and never reads the draft, so `RunFlow` records `draft.generation` when a confirm is accepted and
   `canRetryRental` refuses once the draft moves — otherwise a drop after a failed rental would rent a
