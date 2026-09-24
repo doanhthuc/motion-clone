@@ -7603,6 +7603,30 @@ class TestSharedTryonGroupActions(unittest.TestCase):
         self.assertEqual(payload["regen"]["run"], leader)
         self.assertEqual(sorted(payload["sent_tryon"]), sorted(self.ids[1:]))
 
+    def test_a_failed_regeneration_restores_the_followers_too(self):
+        # The leader's file is moved aside before the call, so when the call
+        # fails the runner's follower pass records every follower as
+        # "shared try-on from … failed" (runner.py) although their files were
+        # never touched. Restoring the leader alone left them in error.
+        self._all_done()
+        before = self._read_state()
+        self._tap(f"{bot._CB_TRYON_REGEN}1:{bot._run_token(ME)}")
+        leader = self.ids[0]
+        state = self._read_state()
+        state["runs"][leader]["status"] = "error"
+        state["runs"][leader]["error"] = "429 quota exhausted"
+        state["runs"][leader]["stages"]["tryon"] = {"status": "error"}
+        for run_id in self.ids[1:3]:
+            state["runs"][run_id]["status"] = "error"
+            state["runs"][run_id]["error"] = f"shared try-on from {leader} failed"
+            state["runs"][run_id]["stages"]["tryon"] = {"status": "error"}
+        self._write_state(state)
+        payload = json.loads(bot._progress_path(ME).read_text(encoding="utf-8"))
+        bot._settle_regen(self.tg, ME, self.manifest, payload)
+        self.assertEqual(self.dest[leader].read_bytes(), b"img-o1")
+        self.assertEqual(self._read_state()["runs"], before["runs"])
+        self.assertTrue(any("back in place" in m for m in self.tg.messages))
+
     def test_guidance_on_a_follower_lands_on_the_leader(self):
         # A follower never reads regen_guidance (the runner reads it only on
         # the leader's pass), so it must be journalled on the leader.

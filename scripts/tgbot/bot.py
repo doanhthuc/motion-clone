@@ -3154,7 +3154,8 @@ def _regen_tryon(tg: Tg, chat_id: int, index: str, token: str, *,
     # popped: followers pick up the new image by source_sha256
     # (runner.follower_reusable); popping them too would make _settle_regen's
     # single-entry restore incomplete.
-    leader_id = tryon_share_groups(manifest).get(run.id, run.id)
+    groups = tryon_share_groups(manifest)
+    leader_id = groups.get(run.id, run.id)
     if leader_id != run.id:
         index = str(next(i for i, r in enumerate(manifest.runs) if r.id == leader_id))
         run = manifest.runs[int(index)]
@@ -3206,10 +3207,28 @@ def _regen_tryon(tg: Tg, chat_id: int, index: str, token: str, *,
         backup = dest.with_name(
             f"{dest.stem}.v{len(_tryon_versions(dest)) + 1}{dest.suffix}")
         dest.replace(backup)
+    runs_state = state.get("runs") or {}
+    # The followers' journal as it stands now. If the new call fails, the
+    # runner's follower pass finds no leader image and records each follower
+    # as "shared try-on from … failed", although its own file is untouched;
+    # _settle_regen puts these back along with the leader's backup, after
+    # which their source_sha256 matches the leader's file again.
+    followers = {}
+    for other in manifest.runs:
+        other_stage = _local_tryon_stage(other)
+        if other.id == run.id or other_stage is None \
+                or groups.get(other.id) != run.id:
+            continue
+        other_entry = runs_state.get(other.id) or {}
+        followers[other.id] = {
+            "stage": other_stage,
+            "entry": (other_entry.get("stages") or {}).get(other_stage),
+            "run_status": other_entry.get("status"),
+            "run_error": other_entry.get("error")}
     regen = {"run": run.id, "stage": stage_name, "dest": str(dest),
              "backup": str(backup) if backup else None,
              "entry": recorded, "run_status": entry.get("status"),
-             "run_error": entry.get("error")}
+             "run_error": entry.get("error"), "followers": followers}
     stages.pop(stage_name, None)
     if guidance_params:
         # Persisted through the journal, not the manifest: start_phase_a's
@@ -3225,7 +3244,6 @@ def _regen_tryon(tg: Tg, chat_id: int, index: str, token: str, *,
     # only the new one. A run whose try-on failed earlier is left out on
     # purpose: resume retries it too, and if it succeeds now it deserves its
     # first preview.
-    runs_state = state.get("runs") or {}
     seed = []
     for other in manifest.runs:
         other_stage = _local_tryon_stage(other)
@@ -3431,6 +3449,20 @@ def _settle_regen(tg: Tg, chat_id: int, manifest_path: Path,
             entry["error"] = regen["run_error"]
         else:
             entry.pop("error", None)
+        runs_state = state.setdefault("runs", {})
+        for follower_id, saved in (regen.get("followers") or {}).items():
+            f_entry = runs_state.setdefault(follower_id, {"status": "pending",
+                                                          "stages": {}})
+            f_stages = f_entry.setdefault("stages", {})
+            if saved.get("entry") is None:
+                f_stages.pop(saved["stage"], None)
+            else:
+                f_stages[saved["stage"]] = saved["entry"]
+            f_entry["status"] = saved.get("run_status") or f_entry.get("status")
+            if saved.get("run_error"):
+                f_entry["error"] = saved["run_error"]
+            else:
+                f_entry.pop("error", None)
         save_state(state_file, state)
         kept = ("The previous image is back in place, and it is what the GPU "
                 "run will use. Tap 🔄 on it to try again.")
