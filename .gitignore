@@ -74,6 +74,19 @@ batch/*.tmp
 batch/.validate/
 # /wipe's per-chat message-id ledger — tracks the user's own chat history
 batch/*.ledger.json
+# Per-chat records tgbot/bot.py writes beside the manifest as
+# `tg-<chat_id>.<name>.json`: the last kill's outcome (_kill_result_path, so
+# GET /v1/pod can answer across a restart) and the draft generation an app
+# confirm was accepted at (_confirm_stamp_path, so resume can refuse a draft
+# that moved since). Both are machine state and both embed the user's Telegram
+# chat id — exactly what a public repo must not grow by accident — and on the
+# VPS this path is inside the repo working tree, so they would otherwise show
+# up in `git status`, one `git add .` away from a public commit. NOT covered by
+# `batch/*.last.json` above: that glob needs a literal ".last.json" and these
+# suffixes are ".last-kill.json" and ".confirmed-generation.json". Their `.tmp`
+# siblings from the atomic write are already caught by `batch/*.tmp`.
+batch/*.last-kill.json
+batch/*.confirmed-generation.json
 
 # IDE junk — repo public, config cá nhân không vào đây (cùng lý do .DS_Store)
 .idea/
