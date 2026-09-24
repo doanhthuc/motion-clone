@@ -125,6 +125,17 @@ public final class BatchComposer {
         return (draft.draft?.filledSlots ?? [:]).filter { !crossed.contains($0.key) }
     }
 
+    /// What the per-outfit seeds depend on: every filled slot except the
+    /// outfit and the driver, because `TryonLibraryStore.matches(slots:)`
+    /// ignores the driver. This, not `sharedSlots`, is what a seed re-pick
+    /// must watch: `sharedSlots` gains or loses `driver` whenever the first
+    /// driver is toggled on or the last one off, and re-picking then would
+    /// overwrite a seed chosen in the "Saved image" picker (an explicit nil
+    /// included) over a change that cannot alter any match.
+    public var seedKey: [String: String] {
+        (draft.draft?.filledSlots ?? [:]).filter { $0.key != Self.outfitRole && $0.key != Self.driverRole }
+    }
+
     /// Required roles still empty, the crossed roles excluded (the lists fill them).
     public var missingShared: [String] {
         let crossed = crossedRoles
@@ -153,7 +164,7 @@ public final class BatchComposer {
         if let index = outfits.firstIndex(where: { $0.outfitID == outfitID }) {
             outfits.remove(at: index)
         } else {
-            guard (outfits.count + 1) * max(drivers.count, 1) <= Self.maxJobs else { return refuse() }
+            guard fits(outfits: outfits.count + 1, drivers: drivers.count) else { return refuse() }
             outfits.append(CrossOutfit(outfitID: outfitID, seedID: matches(for: outfitID).first?.id))
         }
         selectionChanged()
@@ -164,16 +175,27 @@ public final class BatchComposer {
         if let index = drivers.firstIndex(of: driverID) {
             drivers.remove(at: index)
         } else {
-            guard outfits.count * (drivers.count + 1) <= Self.maxJobs else { return refuse() }
+            guard fits(outfits: outfits.count, drivers: drivers.count + 1) else { return refuse() }
             drivers.append(driverID)
         }
         selectionChanged()
     }
 
+    /// Each dimension counts as at least 1, even while empty. Otherwise 13
+    /// drivers could be picked with no outfits, and then every outfit toggle
+    /// would be refused — a selection stuck until drivers are removed.
+    private func fits(outfits: Int, drivers: Int) -> Bool {
+        max(outfits, 1) * max(drivers, 1) <= Self.maxJobs
+    }
+
     /// A refused toggle changes nothing, so it leaves `progress` and
-    /// `lastAdded` alone: they still describe the selection on screen.
+    /// `lastAdded` alone: they still describe the selection on screen. The
+    /// counts use the same floor of 1 as `fits`, so the reason never reads
+    /// "× 0 drivers" or "is already 0".
     private func refuse() {
-        capReason = "At most \(Self.maxJobs) videos per batch — \(outfits.count) outfits × \(drivers.count) drivers is already \(jobCount)."
+        let o = max(outfits.count, 1), d = max(drivers.count, 1)
+        capReason = "At most \(Self.maxJobs) videos per batch — \(o) outfit\(o == 1 ? "" : "s") × "
+            + "\(d) driver\(d == 1 ? "" : "s") is already \(o * d)."
     }
 
     private func selectionChanged() {
@@ -252,11 +274,12 @@ public final class BatchComposer {
         // success. Offline needs no handling here: `refresh()` keeps the last
         // good draft and the first PATCH below then fails loudly through
         // `stop(at:)`, with the transport's or the server's own message.
-        let sharedBefore = sharedSlots
+        let seedKeyBefore = seedKey
         await draft.refresh()
         guard let current = draft.draft else { return }
         // Re-pick after the re-read and before planning, and only when the
-        // re-read changed the shared slots. The order is the point: the seeds
+        // re-read changed `seedKey` (the slots a match reads; a driver the
+        // re-read moved cannot change one). The order is the point: the seeds
         // then come from the server's current slots, and `pending(in:)` compares
         // each outfit against the basket carrying its *new* seed, so an outfit
         // whose seed changed is not skipped as already basketed. The condition
@@ -268,7 +291,7 @@ public final class BatchComposer {
         // a run that never happened. A provider or pipeline change needs no
         // re-pick — `matches(slots:)` ignores both, and the server refuses a
         // seed beside a non-local provider loudly (`drafts.py:435-439`).
-        if sharedSlots != sharedBefore { repickSeeds() }
+        if seedKey != seedKeyBefore { repickSeeds() }
         let steps = pending(in: current)
         progress = Progress(done: jobCount - steps.count, total: jobCount)
         for step in steps {

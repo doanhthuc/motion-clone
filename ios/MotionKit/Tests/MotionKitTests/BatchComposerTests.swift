@@ -543,5 +543,51 @@ extension URLProtocolTests {
         let fixture = try decoder.decode(PipelineCatalogResponse.self, from: Fixtures.data(Fixtures.pipelines))
         #expect(fixture.pipelines.filter(BatchComposer.supportsDrivers).map(\.id) == ["motion-enhance", "tryon-motion-enhance"])
     }
+    /// `NewJobView` re-picks every seed when `seedKey` changes. Toggling the
+    /// first driver on (or the last off) moves `driver` in or out of
+    /// `sharedSlots`, but the library ignores the driver, so the key — and a
+    /// seed chosen by hand, an explicit nil included — must not move.
+    @Test func togglingDriversLeavesTheSeedKeyAndManualSeedsAlone() async {
+        let server = FakeDraftServer(library: #"""
+        {"entries":[{"id":"s1","owner":"app","material_ids":{"character":"app/me.png","outfit":"app/o1.png"},"provider":"gemini","saved_at":1}]}
+        """#)
+        let (composer, _) = await make(server)
+        composer.toggle(outfitID: "app/o1.png")
+        #expect(composer.outfits.map(\.seedID) == ["s1"])
+        composer.setSeed(nil, for: "app/o1.png")
+        let key = composer.seedKey
+        #expect(key == ["character": "app/me.png"])
+
+        composer.toggle(driverID: "app/d1.mp4")
+        #expect(composer.seedKey == key)
+        #expect(composer.outfits.map(\.seedID) == [nil])
+
+        composer.toggle(driverID: "app/d1.mp4")
+        #expect(composer.seedKey == key)
+        #expect(composer.outfits.map(\.seedID) == [nil])
+    }
+
+    @Test func aThirteenthDriverIsRefusedWithNoOutfits() async {
+        let server = FakeDraftServer()
+        let (composer, _) = await make(server)
+        for i in 1...12 { composer.toggle(driverID: "app/d\(i).mp4") }
+        #expect(composer.drivers.count == 12)
+        #expect(composer.capReason == nil)
+
+        composer.toggle(driverID: "app/d13.mp4")
+        #expect(composer.drivers.count == 12)
+        #expect(composer.capReason == "At most 12 videos per batch — 1 outfit × 12 drivers is already 12.")
+        // One outfit still fits: 1 × 12.
+        composer.toggle(outfitID: "app/o1.png")
+        #expect(composer.outfits.count == 1 && composer.capReason == nil)
+    }
+
+    @Test func theCapReasonNeverCountsZeroDrivers() async {
+        let server = FakeDraftServer()
+        let (composer, _) = await make(server)
+        for i in 1...13 { composer.toggle(outfitID: "app/o\(i).png") }
+        #expect(composer.outfits.count == 12)
+        #expect(composer.capReason == "At most 12 videos per batch — 12 outfits × 1 driver is already 12.")
+    }
 }
 }
