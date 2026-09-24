@@ -72,7 +72,11 @@ struct RunFlowView: View {
             }
         case .previews:
             SectionLabel(text: "Try-on previews")
-            ForEach(flow.tryon?.previews ?? []) { preview in
+            // One card per look (Phase 6 shared try-on): `flow.cards` is the
+            // leaders only, so a group's followers render inside their
+            // leader's card via the "Used by K videos" label, not as their
+            // own cards.
+            ForEach(flow.cards) { preview in
                 TryonPreviewCard(flow: flow, preview: preview)
             }
             Button("Continue to rent") { Task { await flow.continueToRent() } }

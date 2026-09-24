@@ -10,7 +10,8 @@ from batchlib.pipelines import PIPELINES, effective_stage_params
 from batchlib.runner import (LocalPhaseResult, batch_id_now, has_local_tryon,
                               local_tryon_reusable, needs_pod,
                               preserved_local_tryon, prepare_batch, run_batch, run_local_phase,
-                              run_one, stage_dest, write_index)
+                              run_one, stage_dest, tryon_share_groups, tryon_share_key,
+                              write_index)
 
 SETTINGS = Settings(domain="x.test", api_key="mk_test", instance_id="i-1")
 
@@ -81,6 +82,8 @@ MANIFEST_TRYON_GEMINI_CLEAN_ONLY_SNAKE = MANIFEST_TRYON_GEMINI_CLEANONLY.replace
     "cleanOnly", "clean_only")
 
 
+# Distinct outfits on purpose: two runs with the same look now share one try-on
+# (tryon_share_groups), and these fixtures test independent runs in the pool.
 MANIFEST_HAI_RUN_GEMINI = """
 runs:
   - id: runA
@@ -94,7 +97,7 @@ runs:
     pipeline: tryon-motion-enhance
     inputs:
       character: char.jpg
-      outfit: outfit.jpg
+      outfit: outfit2.jpg
       driver: drv.mp4
     tryon: { provider: gemini }
 """
@@ -105,10 +108,59 @@ MANIFEST_NAM_RUN_GEMINI = "runs:\n" + "".join(
     pipeline: tryon-motion-enhance
     inputs:
       character: char.jpg
-      outfit: outfit.jpg
+      outfit: outfit{i}.jpg
       driver: drv.mp4
     tryon: {{ provider: gemini }}
 """ for i in range(1, 6))
+
+
+# One character, two outfits x two drivers, provider gemini — the shape the design doc's
+# example uses (§1): runA/runB share outfit.jpg with different drivers (same look, expect
+# one shared key); runC/runD are outfit2.jpg (a different look, expect a different key).
+MANIFEST_SHARE_TRYON = """
+runs:
+  - id: runA
+    pipeline: tryon-motion-enhance
+    inputs:
+      character: char.jpg
+      outfit: outfit.jpg
+      driver: drv.mp4
+    tryon: { provider: gemini }
+  - id: runB
+    pipeline: tryon-motion-enhance
+    inputs:
+      character: char.jpg
+      outfit: outfit.jpg
+      driver: drv2.mp4
+    tryon: { provider: gemini }
+  - id: runC
+    pipeline: tryon-motion-enhance
+    inputs:
+      character: char.jpg
+      outfit: outfit2.jpg
+      driver: drv.mp4
+    tryon: { provider: gemini }
+  - id: runD
+    pipeline: tryon-motion-enhance
+    inputs:
+      character: char.jpg
+      outfit: outfit2.jpg
+      driver: drv2.mp4
+    tryon: { provider: gemini }
+"""
+
+
+def _fixture_share(tmp: Path, text: str = MANIFEST_SHARE_TRYON) -> Path:
+    (tmp / "char.jpg").write_bytes(b"x")
+    (tmp / "outfit.jpg").write_bytes(b"x")
+    (tmp / "outfit2.jpg").write_bytes(b"x")
+    (tmp / "drv.mp4").write_bytes(b"x")
+    (tmp / "drv2.mp4").write_bytes(b"x")
+    (tmp / "bg.png").write_bytes(b"x")
+    (tmp / "bg2.png").write_bytes(b"x")
+    p = tmp / "b.yaml"
+    p.write_text(text, encoding="utf-8")
+    return p
 
 
 def _fixture(tmp: Path, text: str = MANIFEST) -> Path:
@@ -122,6 +174,8 @@ def _fixture(tmp: Path, text: str = MANIFEST) -> Path:
 def _fixture_tryon(tmp: Path, text: str) -> Path:
     (tmp / "char.jpg").write_bytes(b"x")
     (tmp / "outfit.jpg").write_bytes(b"x")
+    for i in range(1, 6):   # the distinct looks MANIFEST_HAI/NAM_RUN_GEMINI use
+        (tmp / f"outfit{i}.jpg").write_bytes(b"x")
     (tmp / "drv.mp4").write_bytes(b"x")
     p = tmp / "b.yaml"
     p.write_text(text, encoding="utf-8")
@@ -1711,6 +1765,424 @@ class TestPreservedLocalTryon(unittest.TestCase):
             manifest = load_manifest(_fixture(tmp, MANIFEST_MOT_RUN))
             self.assertEqual(preserved_local_tryon(manifest, {"runs": {}}, tmp / "out"),
                              (0, 0))
+
+
+class ShareTryonKeyTests(unittest.TestCase):
+    def test_same_look_different_driver_shares_a_key(self):
+        # The whole point (design doc §1): an ordinary try-on's inputs don't include the
+        # driver, so N drivers over one outfit must collapse to one provider call.
+        with tempfile.TemporaryDirectory() as d:
+            manifest = load_manifest(_fixture_share(Path(d)))
+            by_id = {run.id: run for run in manifest.runs}
+            key_a = tryon_share_key(by_id["runA"], "tryon")
+            key_b = tryon_share_key(by_id["runB"], "tryon")
+            self.assertIsNotNone(key_a)
+            self.assertEqual(key_a, key_b)
+
+            groups = tryon_share_groups(manifest)
+            self.assertEqual(groups["runA"], "runA")
+            self.assertEqual(groups["runB"], "runA")
+            # A different outfit is a different look, so it must not join runA's group.
+            self.assertNotEqual(groups["runC"], "runA")
+
+    def test_camera_aware_stage_keys_on_the_driver(self):
+        # camera-tryon locks cameraAware=True (pipelines.py), which is the ONE case where
+        # local_tryon.py reads the driver for the guide frame — so two drivers here must
+        # NOT share a key, unlike the plain "tryon" stage above.
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            text = MANIFEST_SHARE_TRYON.replace(
+                "    tryon: { provider: gemini }", "    camera-tryon: { provider: gemini }")
+            with mock.patch.dict(PIPELINES, {"tryon-motion-enhance": ["camera-tryon"]}):
+                manifest = load_manifest(_fixture_share(tmp, text))
+                by_id = {run.id: run for run in manifest.runs}
+                key_a = tryon_share_key(by_id["runA"], "camera-tryon")
+                key_b = tryon_share_key(by_id["runB"], "camera-tryon")
+                self.assertIsNotNone(key_a)
+                self.assertNotEqual(key_a, key_b)
+
+    def test_background_splits_a_group(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            text = MANIFEST_SHARE_TRYON.replace(
+                "      driver: drv.mp4\n    tryon: { provider: gemini }\n  - id: runB",
+                "      driver: drv.mp4\n      background: bg.png\n"
+                "    tryon: { provider: gemini }\n  - id: runB", 1).replace(
+                "      driver: drv2.mp4\n    tryon: { provider: gemini }\n  - id: runC",
+                "      driver: drv2.mp4\n      background: bg2.png\n"
+                "    tryon: { provider: gemini }\n  - id: runC", 1)
+            manifest = load_manifest(_fixture_share(tmp, text))
+            by_id = {run.id: run for run in manifest.runs}
+            key_a = tryon_share_key(by_id["runA"], "tryon")
+            key_b = tryon_share_key(by_id["runB"], "tryon")
+            self.assertIsNotNone(key_a)
+            self.assertIsNotNone(key_b)
+            self.assertNotEqual(key_a, key_b)
+
+    def test_params_split_a_group(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            manifest = load_manifest(_fixture_share(tmp))
+            by_id = {run.id: run for run in manifest.runs}
+            base = tryon_share_key(by_id["runA"], "tryon")
+
+            provider_text = MANIFEST_SHARE_TRYON.replace(
+                "      outfit: outfit.jpg\n      driver: drv2.mp4\n    tryon: { provider: gemini }",
+                "      outfit: outfit.jpg\n      driver: drv2.mp4\n    tryon: { provider: qwen-max }",
+                1)
+            provider_manifest = load_manifest(_fixture_share(tmp, provider_text))
+            provider_key = tryon_share_key(
+                {r.id: r for r in provider_manifest.runs}["runB"], "tryon")
+            self.assertNotEqual(base, provider_key)
+
+            garment_text = MANIFEST_SHARE_TRYON.replace(
+                "    tryon: { provider: gemini }\n  - id: runB",
+                "    tryon: { provider: gemini, garment_type: dress }\n  - id: runB", 1)
+            garment_manifest = load_manifest(_fixture_share(tmp, garment_text))
+            garment_key = tryon_share_key(
+                {r.id: r for r in garment_manifest.runs}["runA"], "tryon")
+            self.assertNotEqual(base, garment_key)
+
+    def test_seeded_runs_are_never_grouped(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            seed = tmp / "seed.png"
+            seed.write_bytes(b"seed-bytes")
+            text = MANIFEST_SHARE_TRYON.replace(
+                "    tryon: { provider: gemini }\n  - id: runB",
+                f"    tryon: {{ provider: gemini, seedImage: {seed} }}\n  - id: runB", 1)
+            manifest = load_manifest(_fixture_share(tmp, text))
+            by_id = {run.id: run for run in manifest.runs}
+            self.assertIsNone(tryon_share_key(by_id["runA"], "tryon"))
+
+            groups = tryon_share_groups(manifest)
+            self.assertEqual(groups["runA"], "runA")
+
+    def test_non_local_runs_are_absent(self):
+        # "qwen" (bare, no -max) is not in local_tryon.LOCAL_PROVIDERS, so
+        # _local_tryon_stage names no local stage for it and the run has nothing to share.
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            text = MANIFEST_SHARE_TRYON.replace(
+                "    tryon: { provider: gemini }\n  - id: runB",
+                "    tryon: { provider: qwen }\n  - id: runB", 1)
+            manifest = load_manifest(_fixture_share(tmp, text))
+            groups = tryon_share_groups(manifest)
+            self.assertNotIn("runA", groups)
+            self.assertIn("runB", groups)
+
+
+def _grid_manifest(outfits: list[str], drivers: list[str], *, stage: str = "tryon",
+                   extra: dict[str, str] | None = None, skip: set[str] = frozenset()) -> str:
+    """One character, outfits x drivers, outfit-major so each outfit's first
+    driver is its group's leader. `extra` adds params to one outfit's stage."""
+    extra = extra or {}
+    out = ["runs:"]
+    for oi, outfit in enumerate(outfits, start=1):
+        for di, driver in enumerate(drivers, start=1):
+            run_id = f"o{oi}d{di}"
+            if run_id in skip:
+                continue
+            params = "provider: gemini" + (f", {extra[outfit]}" if outfit in extra else "")
+            out.append(f"""  - id: {run_id}
+    pipeline: tryon-motion-enhance
+    inputs:
+      character: char.jpg
+      outfit: {outfit}
+      driver: {driver}
+    {stage}: {{ {params} }}""")
+    return "\n".join(out) + "\n"
+
+
+class _SharedTryonFixture(unittest.TestCase):
+    """A 1-character grid on disk plus a counting fake provider, shared by the
+    Phase A and Phase B sharing tests. Holds no tests of its own."""
+
+    OUTFITS = ["outfit1.jpg", "outfit2.jpg", "outfit3.jpg"]
+    DRIVERS = ["drv1.mp4", "drv2.mp4"]
+    BATCH = "2026-09-25-0900"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        for name in ["char.jpg", *self.OUTFITS, "drv1.mp4", "drv2.mp4", "drv3.mp4"]:
+            (self.tmp / name).write_bytes(b"x")
+        self.calls: list[str] = []
+        self.serial = 0
+        self.fail_outfit: str | None = None
+        self._calls_lock = threading.Lock()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def fake(self, run, params, settings_, out_path):
+        # `serial` never resets (unlike `calls`, which tests clear between
+        # runs), so a rerun's image can never repeat an earlier run's bytes.
+        with self._calls_lock:
+            self.calls.append(run.id)
+            self.serial += 1
+            n = self.serial
+        if run.inputs["outfit"].name == self.fail_outfit:
+            raise JobError(f"provider refused {run.id}")
+        out_path.write_bytes(f"img-{run.inputs['outfit'].name}-{n}".encode())
+        return 1, out_path.stat().st_size
+
+    def manifest(self, text: str):
+        p = self.tmp / "b.yaml"
+        p.write_text(text, encoding="utf-8")
+        return load_manifest(p)
+
+    def run_phase(self, manifest, **kwargs):
+        kwargs.setdefault("resume", False)
+        with mock.patch("batchlib.runner.run_local_tryon", self.fake):
+            return run_local_phase(settings=GEMINI_SETTINGS, manifest=manifest,
+                                   out_root=self.tmp / "out", batch_id=self.BATCH,
+                                   log=lambda _m: None, **kwargs)
+
+    def file_of(self, run_id: str, stage: str = "tryon") -> Path:
+        ext = ".png"
+        return self.tmp / "out" / self.BATCH / "runs" / run_id / f"01-{stage}{ext}"
+
+    @staticmethod
+    def sha(path: Path) -> str:
+        import hashlib
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+class SharedTryonPhaseATests(_SharedTryonFixture):
+    """Phase A calls the provider once per look and copies it to every driver (spec §2)."""
+
+    def test_three_outfits_two_drivers_call_three_times(self):
+        manifest = self.manifest(_grid_manifest(self.OUTFITS, self.DRIVERS))
+        result = self.run_phase(manifest)
+        self.assertEqual(len(self.calls), 3)
+        self.assertEqual(sorted(result.done), ["o1d1", "o2d1", "o3d1"])
+        self.assertEqual(result.failed, {})
+        for o in (1, 2, 3):
+            leader, follower = f"o{o}d1", f"o{o}d2"
+            self.assertEqual(self.file_of(follower).read_bytes(),
+                             self.file_of(leader).read_bytes())
+            entry = result.state["runs"][follower]["stages"]["tryon"]
+            self.assertEqual(entry["status"], "done")
+            self.assertEqual(entry["shared_from"], leader)
+            self.assertEqual(entry["source_sha256"], self.sha(self.file_of(leader)))
+            self.assertEqual(entry["elapsed_sec"], 0)
+            self.assertEqual(entry["phase"], "local")
+            self.assertEqual(Path(entry["file"]), self.file_of(follower))
+            self.assertEqual(entry["params_sent"], entry["params_manifest"])
+            self.assertNotIn("shared_from", result.state["runs"][leader]["stages"]["tryon"])
+        # The copy reached disk, not just memory.
+        on_disk = load_state(result.state_file)["runs"]["o2d2"]["stages"]["tryon"]
+        self.assertEqual(on_disk["shared_from"], "o2d1")
+
+    def test_camera_aware_one_outfit_two_drivers_calls_twice(self):
+        text = _grid_manifest(self.OUTFITS[:1], self.DRIVERS, stage="camera-tryon")
+        with mock.patch.dict(PIPELINES, {"tryon-motion-enhance": ["camera-tryon"]}):
+            result = self.run_phase(self.manifest(text))
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(sorted(result.done), ["o1d1", "o1d2"])
+        for run_id in ("o1d1", "o1d2"):
+            self.assertNotIn("shared_from",
+                             result.state["runs"][run_id]["stages"]["camera-tryon"])
+
+    def test_failed_leader_fails_its_followers_without_calling(self):
+        self.fail_outfit = "outfit2.jpg"
+        result = self.run_phase(self.manifest(_grid_manifest(self.OUTFITS, self.DRIVERS)))
+        self.assertEqual(len(self.calls), 3)
+        self.assertEqual(sorted(result.done), ["o1d1", "o3d1"])
+        self.assertEqual(set(result.failed), {"o2d1", "o2d2"})
+        self.assertIn("shared try-on from o2d1 failed", result.failed["o2d2"])
+        run = result.state["runs"]["o2d2"]
+        self.assertEqual(run["status"], "error")
+        self.assertIn("shared try-on from o2d1 failed", run["error"])
+        self.assertEqual(run["stages"]["tryon"]["status"], "error")
+        self.assertFalse(self.file_of("o2d2").exists())
+        self.assertIn("shared try-on from o2d1 failed",
+                      (self.file_of("o2d2").parent / "run.log").read_text())
+        # The other groups are unaffected.
+        self.assertEqual(result.state["runs"]["o3d2"]["stages"]["tryon"]["status"], "done")
+
+    def test_fail_fast_still_settles_every_follower(self):
+        self.fail_outfit = "outfit1.jpg"
+        result = self.run_phase(self.manifest(_grid_manifest(self.OUTFITS, self.DRIVERS)),
+                                fail_fast=True, pool_size=1)
+        # Leader o1d1 failed first with a pool of one, so no other leader started…
+        self.assertEqual(self.calls, ["o1d1"])
+        # …and every follower still got a verdict instead of staying "pending".
+        for follower in ("o1d2", "o2d2", "o3d2"):
+            self.assertEqual(result.state["runs"][follower]["status"], "error")
+            self.assertIn(follower, result.failed)
+
+    def test_resume_calls_nothing(self):
+        manifest = self.manifest(_grid_manifest(self.OUTFITS, self.DRIVERS))
+        self.run_phase(manifest)
+        self.calls.clear()
+        result = self.run_phase(manifest, resume=True)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(result.done, [])
+        self.assertEqual(result.failed, {})
+
+    def test_regenerated_leader_recopies_followers(self):
+        manifest = self.manifest(_grid_manifest(self.OUTFITS, self.DRIVERS))
+        first = self.run_phase(manifest)
+        old = self.file_of("o1d2").read_bytes()
+        state = load_state(first.state_file)
+        state["runs"]["o1d1"]["stages"].pop("tryon")   # what _regen_tryon does
+        save_state(first.state_file, state)
+        self.calls.clear()
+        result = self.run_phase(manifest, resume=True)
+        self.assertEqual(self.calls, ["o1d1"])
+        new = self.file_of("o1d1").read_bytes()
+        self.assertNotEqual(new, old)
+        self.assertEqual(self.file_of("o1d2").read_bytes(), new)
+        self.assertEqual(result.state["runs"]["o1d2"]["stages"]["tryon"]["source_sha256"],
+                         self.sha(self.file_of("o1d1")))
+
+    def test_leader_file_deleted_reruns_once_and_recopies(self):
+        manifest = self.manifest(_grid_manifest(self.OUTFITS, self.DRIVERS))
+        self.run_phase(manifest)
+        old = self.file_of("o2d2").read_bytes()
+        self.file_of("o2d1").unlink()
+        self.calls.clear()
+        self.run_phase(manifest, resume=True)
+        self.assertEqual(self.calls, ["o2d1"])
+        new = self.file_of("o2d1").read_bytes()
+        self.assertNotEqual(new, old)
+        self.assertEqual(self.file_of("o2d2").read_bytes(), new)
+
+    def test_dropping_the_leader_promotes_without_calling(self):
+        drivers = ["drv1.mp4", "drv2.mp4", "drv3.mp4"]
+        self.run_phase(self.manifest(_grid_manifest(self.OUTFITS[:1], drivers)))
+        self.assertEqual(len(self.calls), 1)
+        self.calls.clear()
+        dropped = self.manifest(_grid_manifest(self.OUTFITS[:1], drivers, skip={"o1d1"}))
+        result = self.run_phase(dropped, resume=True)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(result.failed, {})
+        entry = result.state["runs"]["o1d3"]["stages"]["tryon"]
+        self.assertEqual(entry["status"], "done")
+        self.assertEqual(entry["shared_from"], "o1d2")
+        self.assertEqual(entry["source_sha256"], self.sha(self.file_of("o1d2")))
+        self.assertEqual(self.file_of("o1d3").read_bytes(), self.file_of("o1d2").read_bytes())
+
+    def test_mixed_seeded_and_unseeded(self):
+        seed = self.tmp / "seed.png"
+        seed.write_bytes(b"seed-bytes")
+        text = _grid_manifest(self.OUTFITS[:2], self.DRIVERS,
+                              extra={"outfit1.jpg": f"seedImage: {seed}"})
+        result = self.run_phase(self.manifest(text))
+        self.assertEqual(self.calls, ["o2d1"])
+        for run_id in ("o1d1", "o1d2"):
+            self.assertEqual(self.file_of(run_id).read_bytes(), b"seed-bytes")
+            self.assertNotIn("shared_from", result.state["runs"][run_id]["stages"]["tryon"])
+        self.assertEqual(self.file_of("o2d2").read_bytes(), self.file_of("o2d1").read_bytes())
+        self.assertEqual(result.state["runs"]["o2d2"]["stages"]["tryon"]["shared_from"], "o2d1")
+
+    def test_force_calls_once_per_group_and_recopies(self):
+        manifest = self.manifest(_grid_manifest(self.OUTFITS, self.DRIVERS))
+        self.run_phase(manifest)
+        self.calls.clear()
+        self.run_phase(manifest, resume=True, force=True)
+        self.assertEqual(len(self.calls), 3)
+        for o in (1, 2, 3):
+            self.assertEqual(self.file_of(f"o{o}d2").read_bytes(),
+                             self.file_of(f"o{o}d1").read_bytes())
+
+    def test_preserved_local_tryon_counts_followers(self):
+        manifest = self.manifest(_grid_manifest(self.OUTFITS, self.DRIVERS))
+        result = self.run_phase(manifest)
+        self.assertEqual(preserved_local_tryon(manifest, result.state, self.tmp / "out"), (6, 6))
+        # A follower whose leader's image changed is not preserved: a resume recopies it.
+        self.file_of("o1d1").write_bytes(b"regenerated")
+        self.assertEqual(preserved_local_tryon(manifest, result.state, self.tmp / "out"), (5, 6))
+
+    def test_a_failed_follower_copy_is_an_error_not_a_crash(self):
+        # A full disk or a vanished run dir must not take the whole phase down
+        # with it: every other run's verdict still has to reach the journal.
+        manifest = self.manifest(_grid_manifest(self.OUTFITS[:1], self.DRIVERS))
+        with mock.patch("batchlib.runner.shutil.copy2", side_effect=OSError("disk full")):
+            result = self.run_phase(manifest)
+        self.assertEqual(result.done, ["o1d1"])
+        self.assertIn("disk full", result.failed["o1d2"])
+        run = result.state["runs"]["o1d2"]
+        self.assertEqual(run["status"], "error")
+        self.assertEqual(run["stages"]["tryon"]["status"], "error")
+        self.assertEqual(load_state(result.state_file)["runs"]["o1d2"]["status"], "error")
+
+
+class SharedTryonPhaseBTests(_SharedTryonFixture):
+    """A follower's try-on never reaches the pod either (spec §2's rule, Phase B half).
+
+    Phase A exits "needs pod" even when a try-on failed, and run_one resubmits
+    every stage not marked done. Without this rule one failed look with M
+    drivers became M+1 provider-backed try-ons on the GPU.
+    """
+
+    def run_pod(self, manifest, phase_a, pod: FakePod):
+        with mock.patch("batchlib.runner.submit_job", pod.submit), \
+             mock.patch("batchlib.runner.poll_job", pod.poll), \
+             mock.patch("batchlib.runner.download_output", pod.download):
+            return run_batch(settings=GEMINI_SETTINGS, manifest=manifest,
+                             out_root=self.tmp / "out", batch_id=self.BATCH, resume=False,
+                             log=lambda _m: None,
+                             prepared=(phase_a.out_dir, phase_a.state, phase_a.state_file))
+
+    @staticmethod
+    def tryon_submissions(pod: FakePod) -> int:
+        return sum(1 for job_type, _p, _f in pod.submitted if job_type == "tryon")
+
+    def test_pod_redoes_the_leader_once_and_followers_copy_it(self):
+        self.fail_outfit = "outfit1.jpg"
+        manifest = self.manifest(_grid_manifest(self.OUTFITS[:1], ["drv1.mp4", "drv2.mp4",
+                                                                  "drv3.mp4"]))
+        phase_a = self.run_phase(manifest)
+        self.assertEqual(set(phase_a.failed), {"o1d1", "o1d2", "o1d3"})
+        pod = FakePod()
+        result = self.run_pod(manifest, phase_a, pod)
+        self.assertEqual(self.tryon_submissions(pod), 1)
+        self.assertEqual(sorted(result.done), ["o1d1", "o1d2", "o1d3"])
+        leader_bytes = self.file_of("o1d1").read_bytes()
+        for follower in ("o1d2", "o1d3"):
+            self.assertEqual(self.file_of(follower).read_bytes(), leader_bytes)
+            entry = load_state(phase_a.state_file)["runs"][follower]
+            stage = entry["stages"]["tryon"]
+            self.assertEqual(stage["status"], "done")
+            self.assertEqual(stage["shared_from"], "o1d1")
+            self.assertEqual(stage["source_sha256"], self.sha(self.file_of("o1d1")))
+            self.assertEqual(stage["phase"], "local")
+            self.assertEqual(stage["elapsed_sec"], 0)
+            self.assertEqual(entry["status"], "done")
+            self.assertNotIn("error", entry)
+
+    def test_leader_failing_on_the_pod_fails_followers_without_submitting(self):
+        self.fail_outfit = "outfit1.jpg"
+        manifest = self.manifest(_grid_manifest(self.OUTFITS[:1], ["drv1.mp4", "drv2.mp4",
+                                                                  "drv3.mp4"]))
+        phase_a = self.run_phase(manifest)
+        pod = FakePod(fail_on={"job-1"})
+        result = self.run_pod(manifest, phase_a, pod)
+        self.assertEqual(len(pod.submitted), 1)
+        self.assertEqual(set(result.failed), {"o1d1", "o1d2", "o1d3"})
+        state = load_state(phase_a.state_file)
+        for follower in ("o1d2", "o1d3"):
+            self.assertIn("shared try-on from o1d1 failed", result.failed[follower])
+            self.assertEqual(state["runs"][follower]["status"], "error")
+            self.assertEqual(state["runs"][follower]["stages"]["tryon"]["status"], "error")
+            self.assertNotIn("job_id", state["runs"][follower]["stages"]["tryon"])
+            self.assertFalse(self.file_of(follower).exists())
+
+    def test_an_ungrouped_failed_tryon_is_still_resubmitted(self):
+        # Leaders and single-run looks keep today's behaviour: the pod may redo
+        # a try-on the local provider failed.
+        self.fail_outfit = "outfit1.jpg"
+        manifest = self.manifest(_grid_manifest(self.OUTFITS[:2], ["drv1.mp4"]))
+        phase_a = self.run_phase(manifest)
+        self.assertEqual(set(phase_a.failed), {"o1d1"})
+        pod = FakePod()
+        result = self.run_pod(manifest, phase_a, pod)
+        self.assertEqual(self.tryon_submissions(pod), 1)
+        self.assertEqual(pod.submitted[0][2]["product"], "outfit1.jpg")
+        self.assertEqual(sorted(result.done), ["o1d1", "o2d1"])
 
 
 if __name__ == "__main__":

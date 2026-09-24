@@ -252,6 +252,23 @@ public final class RunFlow {
         batchEntry(for: preview)?.tryonSeed != nil
     }
 
+    /// One card per look (Phase 6 shared try-on, spec §4): the previews whose
+    /// `sharedFrom` is nil — a leader, or an ordinary ungrouped preview.
+    public var cards: [TryonPreview] {
+        tryon?.previews.filter { $0.sharedFrom == nil } ?? []
+    }
+
+    /// `preview`'s group: the leader plus every preview whose `sharedFrom`
+    /// equals the leader's index. Works whether `preview` is the leader
+    /// itself or one of its followers. An ungrouped preview (both fields nil)
+    /// is its own one-member group — the pre-Task-5 shape.
+    public func members(of preview: TryonPreview) -> [TryonPreview] {
+        guard let previews = tryon?.previews else { return [preview] }
+        let leaderIndex = preview.sharedFrom ?? preview.index
+        guard let leader = previews.first(where: { $0.index == leaderIndex }) else { return [preview] }
+        return [leader] + previews.filter { $0.sharedFrom == leader.index }
+    }
+
     /// Never while a spend is unanswered: the draft must not change under an
     /// in-flight confirm. The last job is never dropped here (Clear does that).
     public var canDropFromBatch: Bool {
@@ -259,48 +276,71 @@ public final class RunFlow {
             && tryon?.phaseARunning != true && (phase == .previews || phase == .rentPanel)
     }
 
-    /// Free: drops one job from the basket, then re-validates, because every
-    /// draft change resets `validated` and confirm refuses `not_validated`.
-    /// Confirm then takes the fresh-spend branch (`_phase_a_matches_draft` is
-    /// false) and may ask reuse/rerun — reuse calls no provider again.
+    /// The group-aware gate: everything `canDropFromBatch` requires, plus at
+    /// least one basket entry must survive removing every member of
+    /// `preview`'s group. A shared look's whole group can be the entire
+    /// basket (e.g. one outfit x N drivers with nothing else queued), and
+    /// dropping it would leave nothing to run — Clear, not Drop, is for that.
+    public func canDropFromBatch(_ preview: TryonPreview) -> Bool {
+        canDropFromBatch && (draft?.batch.count ?? 0) - members(of: preview).count >= 1
+    }
+
+    /// Free: drops every member of `preview`'s group from the basket, then
+    /// re-validates once, because every draft change resets `validated` and
+    /// confirm refuses `not_validated`. Confirm then takes the fresh-spend
+    /// branch (`_phase_a_matches_draft` is false) and may ask reuse/rerun —
+    /// reuse calls no provider again. The rejected thing is a look, and every
+    /// video of that look shows it, so a group drop removes all of them.
     public func drop(_ preview: TryonPreview) async {
-        guard canDropFromBatch else { return }
+        guard canDropFromBatch(preview) else { return }
         isDropping = true
         defer { isDropping = false }
         message = nil
         do {
             let fresh = try await client.get(Draft.self, "v1", "draft")
             draft = fresh
-            guard let entry = batchEntry(for: preview) else {
-                message = "The draft changed — reload before dropping."
-                // No `refreshTryon()` on this path, on purpose: nothing was
-                // written, so the previews are exactly as current as they were
-                // before the tap, and the fresh draft installed above is what
-                // makes the card lose its basket entry and offer "reload".
-                // The panel still goes, by the one rule stated at the end of
-                // this function: that fresh draft just proved the basket the
-                // quote on screen priced no longer exists.
-                //
-                // Asymmetric with the successful path, deliberately: this
-                // returns before the trailing `loadPanel(force: false)`, so on
-                // `.rentPanel` the screen keeps `panel == nil` and
-                // `RentPanelView` reads "Nothing can be rented right now."
-                // until a pull-to-refresh. Re-reading here could replace the
-                // more actionable message above with a panel error, and the
-                // recovery is one gesture (`RunFlowView` calls
-                // `loadPanel(force: true)`).
-                if phase == .rentPanel { panel = nil }
-                return
+            // Resolve every member's basket entry against this one snapshot,
+            // before any write in this call — a later member's lookup must
+            // not be tripped up by an earlier member's own delete response.
+            var entries: [DraftBatchEntry] = []
+            for member in members(of: preview) {
+                guard let entry = fresh.batch.first(where: { $0.runID == member.run }) else {
+                    message = "The draft changed — reload before dropping."
+                    // No `refreshTryon()` on this path, on purpose: nothing was
+                    // written, so the previews are exactly as current as they were
+                    // before the tap, and the fresh draft installed above is what
+                    // makes the card lose its basket entry and offer "reload".
+                    // The panel still goes, by the one rule stated at the end of
+                    // this function: that fresh draft just proved the basket the
+                    // quote on screen priced no longer exists.
+                    //
+                    // Asymmetric with the successful path, deliberately: this
+                    // returns before the trailing `loadPanel(force: false)`, so on
+                    // `.rentPanel` the screen keeps `panel == nil` and
+                    // `RentPanelView` reads "Nothing can be rented right now."
+                    // until a pull-to-refresh. Re-reading here could replace the
+                    // more actionable message above with a panel error, and the
+                    // recovery is one gesture (`RunFlowView` calls
+                    // `loadPanel(force: true)`).
+                    if phase == .rentPanel { panel = nil }
+                    return
+                }
+                entries.append(entry)
             }
-            // add-to-batch leaves the edited job a copy of the last entry, and
-            // the server's `jobs_for` counts that copy as one more job whenever
-            // it is complete — so deleting the entry without first making the
-            // edited job incomplete would bring the dropped job back into Run.
-            if editedJobEquals(entry, in: fresh), let role = clearRole(for: entry) {
-                draft = try await client.patch(Draft.self, body: SlotPatch(role: role, materialID: nil),
-                                               timeout: 95, "v1", "draft")
+            for entry in entries {
+                // add-to-batch leaves the edited job a copy of the last entry, and
+                // the server's `jobs_for` counts that copy as one more job whenever
+                // it is complete — so deleting the entry without first making the
+                // edited job incomplete would bring the dropped job back into Run.
+                // Compared against `fresh`, the pre-loop snapshot, for every member:
+                // at most one entry in the whole draft can equal the edited job at
+                // a given moment, and this call's own writes must not change which.
+                if editedJobEquals(entry, in: fresh), let role = clearRole(for: entry) {
+                    draft = try await client.patch(Draft.self, body: SlotPatch(role: role, materialID: nil),
+                                                   timeout: 95, "v1", "draft")
+                }
+                draft = try await client.delete(Draft.self, "v1", "draft", "batch", entry.digest)
             }
-            draft = try await client.delete(Draft.self, "v1", "draft", "batch", entry.digest)
             // 95 s on the PATCH above and this validate: the server can probe
             // for 60 s and validate for 90 s, so stay under Cloudflare's ~100 s
             // origin ceiling — the bound `DraftStore.slowDraftTimeout` uses.

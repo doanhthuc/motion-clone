@@ -11,9 +11,35 @@ struct BatchComposerSection: View {
     let pipeline: Pipeline
     let onPickRole: (String) -> Void
     @State private var pickingOutfits = false
+    @State private var pickingDrivers = false
+
+    /// Roles the crossed pickers below fill: the outfit always, the driver too
+    /// once at least one is multi-selected (mirrors `BatchComposer.crossedRoles`,
+    /// which is private). While `drivers` is empty the driver role stays a
+    /// plain shared row, exactly as it behaved before drivers existed.
+    private var crossedRoles: Set<String> {
+        composer.drivers.isEmpty ? [BatchComposer.outfitRole] : [BatchComposer.outfitRole, BatchComposer.driverRole]
+    }
 
     private var sharedRoles: [String] {
-        (pipeline.required + pipeline.optional).filter { $0 != BatchComposer.outfitRole }
+        let crossed = crossedRoles
+        return (pipeline.required + pipeline.optional).filter { !crossed.contains($0) }
+    }
+
+    /// How many outfits fit at the current driver count — `maxJobs` divided by
+    /// the drivers already picked, floored, since `BatchComposer.fits` refuses
+    /// once outfits × drivers would exceed `maxJobs`. Shown instead of the flat
+    /// outfit count against `maxJobs` (Task 6's known follow-up: that stale
+    /// denominator read "n/12" even with 2 drivers picked, where the real
+    /// ceiling is 6).
+    private var outfitCap: Int { BatchComposer.maxJobs / max(composer.drivers.count, 1) }
+    private var driverCap: Int { BatchComposer.maxJobs / max(composer.outfits.count, 1) }
+
+    private var summaryText: String {
+        func count(_ n: Int, _ noun: String) -> String { "\(n) \(noun)\(n == 1 ? "" : "s")" }
+        return "\(count(composer.outfits.count, "outfit")) × "
+            + "\(count(max(composer.drivers.count, 1), "driver")) = "
+            + "\(count(composer.jobCount, "video")) · \(count(composer.tryonCount, "try-on"))"
     }
 
     var body: some View {
@@ -31,12 +57,31 @@ struct BatchComposerSection: View {
                                     slot: store.draft?.slots[role], materials: materials,
                                     disabled: store.isBusy || composer.isRunning) { onPickRole(role) }
                 }
-                SectionLabel(text: "Outfits · \(composer.outfits.count)/\(BatchComposer.maxOutfits)")
+                SectionLabel(text: "Outfits · \(composer.outfits.count)/\(outfitCap)")
                 ForEach(composer.outfits) { outfit in outfitRow(outfit) }
                 Button("Choose outfits…") { pickingOutfits = true }
                     .buttonStyle(SecondaryButtonStyle())
                     .accessibilityIdentifier("batch.pickOutfits")
                     .disabled(composer.isRunning)
+                if BatchComposer.supportsDrivers(pipeline) {
+                    SectionLabel(text: "Drivers · \(composer.drivers.count)/\(driverCap)")
+                    ForEach(composer.drivers, id: \.self) { driverID in driverRow(driverID) }
+                    Button("Choose drivers…") { pickingDrivers = true }
+                        .buttonStyle(SecondaryButtonStyle())
+                        .accessibilityIdentifier("batch.pickDrivers")
+                        .disabled(composer.isRunning)
+                }
+                Text(summaryText)
+                    .font(Theme.sans(13, .semibold)).foregroundStyle(Theme.ink2)
+                    .accessibilityIdentifier("batch.summary")
+                if composer.cameraAwareTryon && composer.drivers.count > 1 {
+                    Text("Camera pipelines make one try-on per driver.")
+                        .font(Theme.mono(10)).foregroundStyle(Theme.ink3)
+                }
+                if let capReason = composer.capReason {
+                    Text(capReason).font(Theme.sans(12)).foregroundStyle(Theme.amber)
+                        .accessibilityIdentifier("batch.capReason")
+                }
                 runButton
             }
         }
@@ -51,6 +96,10 @@ struct BatchComposerSection: View {
             OutfitMultiPicker(composer: composer, materials: materials,
                               kind: pipeline.roles[BatchComposer.outfitRole] ?? .image)
         }
+        .sheet(isPresented: $pickingDrivers) {
+            DriverMultiPicker(composer: composer, materials: materials,
+                              kind: pipeline.roles[BatchComposer.driverRole] ?? .video)
+        }
     }
 
     private func outfitRow(_ outfit: CrossOutfit) -> some View {
@@ -58,7 +107,7 @@ struct BatchComposerSection: View {
         let material = materials.materials.first { $0.id == outfit.outfitID }
         return VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 10) {
-                OutfitThumbnail(material: material, materials: materials)
+                MaterialThumbnail(material: material, materials: materials)
                 Text(material?.name ?? outfit.outfitID)
                     .font(Theme.sans(14, .semibold)).foregroundStyle(Theme.ink1).lineLimit(1)
                 Spacer()
@@ -93,6 +142,25 @@ struct BatchComposerSection: View {
         .accessibilityIdentifier("batch.outfit.\(outfit.outfitID)")
     }
 
+    /// Simpler than `outfitRow` on purpose: a driver carries no seed — the
+    /// server shares one try-on per outfit across its drivers (non-camera
+    /// pipelines), so seeding lives on `CrossOutfit`, not here.
+    private func driverRow(_ driverID: String) -> some View {
+        let material = materials.materials.first { $0.id == driverID }
+        return HStack(spacing: 10) {
+            MaterialThumbnail(material: material, materials: materials)
+            Text(material?.name ?? driverID)
+                .font(Theme.sans(14, .semibold)).foregroundStyle(Theme.ink1).lineLimit(1)
+            Spacer()
+            Button(role: .destructive) { composer.toggle(driverID: driverID) } label: {
+                Image(systemName: "xmark.circle")
+            }
+            .foregroundStyle(Theme.ink3).disabled(composer.isRunning)
+        }
+        .padding(12).card()
+        .accessibilityIdentifier("batch.driver.\(driverID)")
+    }
+
     @ViewBuilder private var runButton: some View {
         if let progress = composer.progress, composer.isRunning {
             HStack(spacing: 8) {
@@ -118,8 +186,11 @@ struct BatchComposerSection: View {
         // failure keeps it visible — that is the Continue a stopped run offers,
         // and a run in flight keeps it so the button does not vanish mid-build.
         if !composer.outfits.isEmpty || composer.failure != nil || composer.isRunning {
+            // `jobCount`, not `outfits.count`: with drivers multi-selected each
+            // outfit becomes several basket jobs, and the pre-drivers label
+            // would undercount by exactly the driver factor.
             Button(composer.failure == nil
-                   ? "Add \(composer.outfits.count) job\(composer.outfits.count == 1 ? "" : "s") to batch"
+                   ? "Add \(composer.jobCount) job\(composer.jobCount == 1 ? "" : "s") to batch"
                    : "Continue") {
                 Task { await composer.run() }
             }
@@ -130,10 +201,11 @@ struct BatchComposerSection: View {
     }
 }
 
-/// The outfit's own thumbnail. Its own view because a `@ViewBuilder` function
-/// cannot hold `@State`, and `SlotMaterialRow` fetches one the same way.
+/// Shared by an outfit row and a driver row. Its own view because a
+/// `@ViewBuilder` function cannot hold `@State`, and `SlotMaterialRow` fetches
+/// one the same way.
 @MainActor
-private struct OutfitThumbnail: View {
+private struct MaterialThumbnail: View {
     let material: MotionKit.Material?
     let materials: MaterialsStore
     @State private var thumbnail: Data?
@@ -166,7 +238,7 @@ private struct OutfitThumbnail: View {
     }
 }
 
-/// Multi-select of outfit materials, capped by `BatchComposer.maxOutfits`.
+/// Multi-select of outfit materials, capped by `BatchComposer.maxJobs`.
 @MainActor
 private struct OutfitMultiPicker: View {
     let composer: BatchComposer
@@ -188,10 +260,54 @@ private struct OutfitMultiPicker: View {
                             .foregroundStyle(chosen ? Theme.lime : Theme.ink3)
                     }
                 }
-                .disabled(!chosen && composer.outfits.count >= BatchComposer.maxOutfits)
+                // Not pre-disabled by a count against `maxJobs`: with drivers
+                // picked the real ceiling is `maxJobs / drivers`, which moves
+                // as drivers are toggled elsewhere, and disabling rows here
+                // against the wrong number either greys out a tap that would
+                // succeed or leaves tappable one that `toggle` must refuse
+                // anyway. `toggle(outfitID:)` is the single source of truth —
+                // a refusal sets `capReason`, rendered under the pickers.
+                .disabled(composer.isRunning)
                 .accessibilityIdentifier("outfit.pick.\(material.id)")
             }
             .navigationTitle("Choose outfits")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Done") { dismiss() } } }
+        }
+        .task { if !materials.loaded { await materials.refresh() } }
+    }
+}
+
+/// Multi-select of driver materials, mirroring `OutfitMultiPicker`. Rows are
+/// never pre-disabled by a count against `maxJobs`, for the same reason: the
+/// real ceiling moves with the outfit count, and `toggle(driverID:)` is the
+/// single source of truth for a refusal (`capReason`, rendered under the
+/// pickers).
+@MainActor
+private struct DriverMultiPicker: View {
+    let composer: BatchComposer
+    let materials: MaterialsStore
+    let kind: PipelineRoleKind
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            List(materials.materials.filter(kind.accepts)) { material in
+                let chosen = composer.drivers.contains(material.id)
+                Button {
+                    composer.toggle(driverID: material.id)
+                } label: {
+                    HStack {
+                        Text(material.name).foregroundStyle(Theme.ink1)
+                        Spacer()
+                        Image(systemName: chosen ? "checkmark.circle.fill" : "circle")
+                            .foregroundStyle(chosen ? Theme.lime : Theme.ink3)
+                    }
+                }
+                .disabled(composer.isRunning)
+                .accessibilityIdentifier("driver.pick.\(material.id)")
+            }
+            .navigationTitle("Choose drivers")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Done") { dismiss() } } }
         }

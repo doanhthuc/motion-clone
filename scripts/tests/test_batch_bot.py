@@ -4774,8 +4774,11 @@ class TestProvisionFailureRecovery(unittest.TestCase):
             "  - id: runA\n    pipeline: tryon-motion-enhance\n"
             "    inputs: {character: /tmp/c.png, outfit: /tmp/o.png, driver: /tmp/d.mp4}\n"
             "    tryon: { provider: gemini }\n"
+            # runB wears a different outfit on purpose: the same look would make
+            # it runA's follower (tryon_share_groups), and this hand-written
+            # journal has no shared_from/source_sha256 for it.
             "  - id: runB\n    pipeline: tryon-motion-enhance\n"
-            "    inputs: {character: /tmp/c.png, outfit: /tmp/o.png, driver: /tmp/d.mp4}\n"
+            "    inputs: {character: /tmp/c.png, outfit: /tmp/o2.png, driver: /tmp/d.mp4}\n"
             "    tryon: { provider: gemini }\n", encoding="utf-8")
         params = effective_stage_params("tryon", {"provider": "gemini"})
         batch_dir = bot.ROOT / "out" / "2026-09-16-0900"
@@ -7121,6 +7124,46 @@ class TestTryonRegen(unittest.TestCase):
         self.assertEqual(len(self.tg.documents), 2)
         self.assertEqual(self.tg.document_buttons, [None, None])
 
+    def test_phase_a_previews_send_one_photo_per_share_group(self):
+        # 2 outfits x 2 drivers, one gemini call per outfit (task-3-brief):
+        # the runner's tryon_share_groups groups the two drivers of each
+        # outfit, o1d1/o2d1 leading, because `tryon` (unlike `camera-tryon`,
+        # which this class's own setUp uses) is never camera-aware, so the
+        # driver plays no part in the share key.
+        run_block = ("  - id: {rid}\n"
+                     "    pipeline: tryon-motion-enhance\n"
+                     "    inputs: {{character: /tmp/c.png, outfit: /tmp/{outfit}.png, "
+                     "driver: /tmp/{rid}.mp4}}\n"
+                     "    tryon: {{ provider: gemini }}\n")
+        run_ids = ["o1d1", "o1d2", "o2d1", "o2d2"]
+        outfits = {"o1d1": "o1", "o1d2": "o1", "o2d1": "o2", "o2d2": "o2"}
+        text = "runs:\n" + "".join(run_block.format(rid=rid, outfit=outfits[rid])
+                                   for rid in run_ids)
+        self.manifest.write_text(text, encoding="utf-8")
+        loaded = load_manifest(self.manifest)
+        state = {"batch": "2026-09-25-1000", "runs": {}}
+        for run in loaded.runs:
+            dest = stage_dest(run, self.root / "out" / "2026-09-25-1000" / "runs" / run.id,
+                              "tryon")
+            dest.parent.mkdir(parents=True)
+            dest.write_bytes(f"img-{run.id}".encode())
+            state["runs"][run.id] = {"status": "pending", "stages": {"tryon": {
+                "status": "done", "file": str(dest), "phase": "local",
+                "params_manifest": effective_stage_params(
+                    "tryon", run.stage_params.get("tryon"))}}}
+        state_path_for(self.manifest).write_text(json.dumps(state), encoding="utf-8")
+
+        payload = {"phase": "local", "sent_tryon": []}
+        bot._deliver_tryon_previews(self.tg, ME, self.manifest, payload)
+
+        self.assertEqual(len(self.tg.documents), 2)
+        for _path, caption in self.tg.documents:
+            self.assertIn("used by 2 runs", caption)
+        token = bot._run_token(ME)
+        data = [rows[0][0][1] for rows in self.tg.document_buttons]
+        self.assertEqual(data, [f"rg:0:{token}", f"rg:2:{token}"])
+        self.assertEqual(set(payload["sent_tryon"]), set(run_ids))
+
     # -- the tap ----------------------------------------------------------
 
     def test_regenerate_redoes_only_that_image_and_keeps_the_old_one(self):
@@ -7432,6 +7475,207 @@ class TestTryonFailureRetry(unittest.TestCase):
         self.assertFalse(any("Regenerating" in m and "failed" in m
                              for m in self.tg.messages))
 
+
+
+class TestSharedTryonGroupActions(unittest.TestCase):
+    """Regenerate, retry and the failure report act on a shared try-on's
+    whole group (spec §3), not on the one run whose button was tapped.
+
+    Four runs: one outfit over three drivers (index 0 leads, 1 and 2 follow)
+    plus a second outfit on its own (index 3), so "the group and nothing
+    else" is testable. `tryon` is not camera-aware, so the driver plays no
+    part in runner.tryon_share_key.
+    """
+
+    def setUp(self):
+        self._orig_root = bot.ROOT
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "batch").mkdir()
+        (self.root / "out").mkdir()
+        bot.ROOT = self.root
+        reset_bot_state()
+        run_mod._PHASE_A.clear()
+        run_mod._PHASE_A_RC.clear()
+        drv = Probe(kind="video", width=1080, height=1920, duration_s=5.0,
+                    bitrate_kbps=1000, size_bytes=1000)
+        img = Probe(kind="image", width=1080, height=1920, duration_s=0.0,
+                    bitrate_kbps=0, size_bytes=1000)
+
+        def job(outfit, driver):
+            return bot.Job(slots={"character": Path("/tmp/grpchar.png"),
+                                  "outfit": Path(f"/tmp/{outfit}.png"),
+                                  "driver": Path(f"/tmp/{driver}.mp4")},
+                           probes={"character": img, "outfit": img, "driver": drv},
+                           pipeline="tryon-motion-enhance", provider="gemini")
+        bot._BASKET[ME] = [job("grpo1", "grpd1"), job("grpo1", "grpd2"),
+                           job("grpo1", "grpd3")]
+        bot._STATE[ME] = job("grpo2", "grpd4")
+        self.manifest = bot._job_manifest_path(ME)
+        write_manifest(bot._jobs_for(ME), self.manifest, now="t")
+        self.loaded = load_manifest(self.manifest)
+        self.ids = [run.id for run in self.loaded.runs]
+        self.assertEqual(len(self.ids), 4)
+        groups = bot.tryon_share_groups(self.loaded)
+        leader = self.ids[0]
+        self.assertEqual([groups[i] for i in self.ids],
+                         [leader, leader, leader, self.ids[3]])
+        self.batch = "2026-09-25-1200"
+        self.dest = {run.id: stage_dest(run, self.root / "out" / self.batch / "runs" / run.id,
+                                        "tryon")
+                     for run in self.loaded.runs}
+        for dest in self.dest.values():
+            dest.parent.mkdir(parents=True)
+        self.tg = FakeTg()
+        for patcher in (mock.patch("tgbot.bot.lease_for", return_value=None),
+                        mock.patch("tgbot.bot.qwen_max_configured", return_value=True)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        bot.ROOT = self._orig_root
+
+    def _params(self, index):
+        run = self.loaded.runs[index]
+        return effective_stage_params("tryon", run.stage_params.get("tryon"))
+
+    def _all_done(self):
+        """Every image made: the leader called the provider, followers copied it."""
+        leader = self.ids[0]
+        state = {"batch": self.batch, "runs": {}}
+        for n, run_id in enumerate(self.ids):
+            self.dest[run_id].write_bytes(b"img-o1" if n < 3 else b"img-o2")
+            rec = {"status": "done", "file": str(self.dest[run_id]), "phase": "local",
+                   "params_manifest": self._params(n)}
+            if n in (1, 2):
+                rec.update(shared_from=leader, source_sha256="sha-of-leader")
+            state["runs"][run_id] = {"status": "pending", "stages": {"tryon": rec}}
+        self._write_state(state)
+
+    def _leader_failed(self):
+        """The leader's call failed, so each follower recorded runner.py's
+        "shared try-on from … failed"; the other outfit is fine."""
+        leader = self.ids[0]
+        state = {"batch": self.batch, "runs": {
+            leader: {"status": "error",
+                     "error": 'Gemini không trả ảnh: {"finishReason": "IMAGE_SAFETY"}',
+                     "stages": {"tryon": {"status": "error"}}}}}
+        for run_id in self.ids[1:3]:
+            state["runs"][run_id] = {"status": "error",
+                                     "error": f"shared try-on from {leader} failed",
+                                     "stages": {"tryon": {"status": "error"}}}
+        self.dest[self.ids[3]].write_bytes(b"img-o2")
+        state["runs"][self.ids[3]] = {"status": "pending", "stages": {"tryon": {
+            "status": "done", "file": str(self.dest[self.ids[3]]), "phase": "local",
+            "params_manifest": self._params(3)}}}
+        self._write_state(state)
+
+    def _write_state(self, state):
+        state_path_for(self.manifest).write_text(json.dumps(state), encoding="utf-8")
+
+    def _read_state(self):
+        return json.loads(state_path_for(self.manifest).read_text(encoding="utf-8"))
+
+    def _tap(self, data):
+        with mock.patch("tgbot.bot.start_phase_a") as start:
+            bot._handle_callback(self.tg, ME, {"id": "cb", "data": data}, dry_run=False)
+        return start
+
+    def test_regenerate_on_a_follower_regenerates_its_leader(self):
+        self._all_done()
+        before = self._read_state()
+        start = self._tap(f"{bot._CB_TRYON_REGEN}1:{bot._run_token(ME)}")
+        start.assert_called_once_with(self.manifest, resume=True)
+        leader, follower = self.ids[0], self.ids[1]
+        backup = self.dest[leader].with_name(
+            f"{self.dest[leader].stem}.v1{self.dest[leader].suffix}")
+        self.assertEqual(backup.read_bytes(), b"img-o1")
+        self.assertFalse(self.dest[leader].exists())
+        state = self._read_state()
+        self.assertNotIn("tryon", state["runs"][leader]["stages"])
+        # Followers are left alone: runner.follower_reusable sees the leader's
+        # new file no longer matches source_sha256 and recopies them itself.
+        for run_id in self.ids[1:]:
+            self.assertEqual(state["runs"][run_id], before["runs"][run_id])
+            self.assertTrue(self.dest[run_id].is_file())
+        self.assertFalse(self.dest[follower].with_name(
+            f"{self.dest[follower].stem}.v1{self.dest[follower].suffix}").exists())
+        payload = json.loads(bot._progress_path(ME).read_text(encoding="utf-8"))
+        self.assertEqual(payload["regen"]["run"], leader)
+        self.assertEqual(sorted(payload["sent_tryon"]), sorted(self.ids[1:]))
+
+    def test_a_failed_regeneration_restores_the_followers_too(self):
+        # The leader's file is moved aside before the call, so when the call
+        # fails the runner's follower pass records every follower as
+        # "shared try-on from … failed" (runner.py) although their files were
+        # never touched. Restoring the leader alone left them in error.
+        self._all_done()
+        before = self._read_state()
+        self._tap(f"{bot._CB_TRYON_REGEN}1:{bot._run_token(ME)}")
+        leader = self.ids[0]
+        state = self._read_state()
+        state["runs"][leader]["status"] = "error"
+        state["runs"][leader]["error"] = "429 quota exhausted"
+        state["runs"][leader]["stages"]["tryon"] = {"status": "error"}
+        for run_id in self.ids[1:3]:
+            state["runs"][run_id]["status"] = "error"
+            state["runs"][run_id]["error"] = f"shared try-on from {leader} failed"
+            state["runs"][run_id]["stages"]["tryon"] = {"status": "error"}
+        self._write_state(state)
+        payload = json.loads(bot._progress_path(ME).read_text(encoding="utf-8"))
+        bot._settle_regen(self.tg, ME, self.manifest, payload)
+        self.assertEqual(self.dest[leader].read_bytes(), b"img-o1")
+        self.assertEqual(self._read_state()["runs"], before["runs"])
+        self.assertTrue(any("back in place" in m for m in self.tg.messages))
+
+    def test_guidance_on_a_follower_lands_on_the_leader(self):
+        # A follower never reads regen_guidance (the runner reads it only on
+        # the leader's pass), so it must be journalled on the leader.
+        self._all_done()
+        with mock.patch("tgbot.bot.start_phase_a"):
+            out = bot._regen_tryon(self.tg, ME, "2", bot._run_token(ME),
+                                   dry_run=False, guidance=["keep_face"])
+        self.assertTrue(out.ok)
+        state = self._read_state()
+        self.assertIn("regen_guidance", state["runs"][self.ids[0]])
+        self.assertNotIn("regen_guidance", state["runs"][self.ids[2]])
+
+    def test_retry_switches_the_provider_of_the_whole_group(self):
+        self._leader_failed()
+        start = self._tap(f"{bot._CB_TRYON_RETRY}0:qwen-max:{bot._run_token(ME)}")
+        start.assert_called_once_with(self.manifest, resume=True)
+        runs = load_manifest(self.manifest).runs
+        self.assertEqual([r.stage_params.get("tryon", {}).get("provider") for r in runs],
+                         ["qwen-max", "qwen-max", "qwen-max", "gemini"])
+        self.assertEqual([j.provider for j in bot._jobs_for(ME)],
+                         ["qwen-max", "qwen-max", "qwen-max", "gemini"])
+        self.assertTrue(any("3 runs switched to Qwen" in m for m in self.tg.messages),
+                        self.tg.messages)
+        # Still one group after the switch, so the provider is called once.
+        groups = bot.tryon_share_groups(load_manifest(self.manifest))
+        self.assertEqual({groups[i] for i in self.ids[:3]}, {self.ids[0]})
+
+    def test_retry_from_a_follower_index_switches_the_group_too(self):
+        self._leader_failed()
+        self._tap(f"{bot._CB_TRYON_RETRY}2:qwen-max:{bot._run_token(ME)}")
+        self.assertEqual([j.provider for j in bot._jobs_for(ME)],
+                         ["qwen-max", "qwen-max", "qwen-max", "gemini"])
+        state = self._read_state()
+        self.assertNotIn("tryon", state["runs"][self.ids[0]]["stages"])
+        self.assertEqual(state["runs"][self.ids[2]]["stages"]["tryon"]["status"], "error")
+
+    def test_one_failure_report_per_failed_leader(self):
+        self._leader_failed()
+        bot._report_failed_tryons(self.tg, ME, self.manifest)
+        found = [(m, b) for m, b in zip(self.tg.messages, self.tg.buttons)
+                 if "Try-on failed" in m]
+        self.assertEqual(len(found), 1, self.tg.messages)
+        text, buttons = found[0]
+        self.assertIn(self.ids[0], text)
+        self.assertIn(f"Also waiting on this image: {self.ids[1]}, {self.ids[2]}", text)
+        self.assertIn("safety filter", text)
+        data = [d for row in buttons for _, d, *_ in row]
+        token = bot._run_token(ME)
+        self.assertEqual(data, [f"rt:0:gemini:{token}", f"rt:0:qwen-max:{token}"])
 
 
 # ---- Vast as a second GPU provider (spec §3.5, Plan 4) --------------------------------------------

@@ -44,18 +44,22 @@ struct TryonPreviewCard: View {
                     .buttonStyle(SecondaryButtonStyle())
                 }
             }
+            if !(preview.shares?.isEmpty ?? true) {
+                Text("Used by \((preview.shares?.count ?? 0) + 1) videos")
+                    .font(Theme.mono(11)).foregroundStyle(Theme.ink2)
+            }
             Button("Regenerate…") { showRegenerate = true }
                 .buttonStyle(SecondaryButtonStyle())
                 .disabled(!flow.canSpend)
-            // `RunFlow.canDropFromBatch` requires `!isDropping`, so without the
-            // second term the control would disappear the instant a drop starts
-            // and "Dropping…" would never render. It stays on screen but inert
-            // until the store's trailing refreshes finish — `isDropping`
+            // `RunFlow.canDropFromBatch(_:)` requires `!isDropping`, so without
+            // the second term the control would disappear the instant a drop
+            // starts and "Dropping…" would never render. It stays on screen but
+            // inert until the store's trailing refreshes finish — `isDropping`
             // outlives the writes on purpose.
-            if flow.canDropFromBatch || flow.isDropping {
+            if flow.canDropFromBatch(preview) || flow.isDropping {
                 Button(flow.isDropping ? "Dropping…" : "Drop from batch", role: .destructive) { confirmDrop = true }
                     .buttonStyle(SecondaryButtonStyle())
-                    .disabled(!flow.canDropFromBatch || flow.batchEntry(for: preview) == nil)
+                    .disabled(!flow.canDropFromBatch(preview) || flow.batchEntry(for: preview) == nil)
                     .accessibilityIdentifier("tryon.drop.\(preview.index)")
                 if flow.batchEntry(for: preview) == nil {
                     Text("Draft changed — reload").font(Theme.mono(10)).foregroundStyle(Theme.amber)

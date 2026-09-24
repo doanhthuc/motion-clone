@@ -45,8 +45,10 @@ struct NewJobView: View {
         // too because `matches(for:)` is empty against an unfetched library, so an
         // outfit chosen before `load()` returns would keep no seed at all; no manual
         // pick can be lost by that, since the seed toggle is disabled while
-        // `matches` is empty.
-        .onChange(of: composer.sharedSlots) { _, _ in composer.refreshSeeds() }
+        // `matches` is empty. `seedKey`, not `sharedSlots`: toggling the first
+        // driver on or the last off moves `driver` in or out of `sharedSlots`,
+        // and re-picking then would overwrite a hand-chosen seed for nothing.
+        .onChange(of: composer.seedKey) { _, _ in composer.refreshSeeds() }
         .onChange(of: library.loaded) { _, loaded in
             if loaded { composer.refreshSeeds() }
         }

@@ -166,4 +166,83 @@ final class Phase6SmokeTests: XCTestCase {
         XCTAssertEqual(app.descendants(matching: .any)["uitest.recordedSpends"].label, "0",
                        "the recording gate saw no spend")
     }
+
+    /// Task 7 (2026-09-25 spec §4): drivers are now multi-selected too, so a
+    /// cross build is outfits × drivers. Builds 2 outfits × 2 drivers from free
+    /// draft mutations only — never Preview try-on, Rent, Confirm, Kill,
+    /// Migrate or a GPU row — and asserts zero recorded spends at the end, same
+    /// gate as `testCrossBuildDropAndLibrary`. Skips rather than proceeding
+    /// when its preconditions are missing: a non-empty draft, fewer than two
+    /// image materials to use as outfits, or fewer than two video materials to
+    /// use as drivers.
+    @MainActor
+    func testMultiDriverCrossBuild() throws {
+        let app = XCUIApplication()
+        app.launchArguments.append("-UITestRecordingSpendGate")
+        app.launch()
+        app.tabBars.buttons["New Job"].tap()
+        XCTAssertTrue(app.staticTexts["New Job"].waitForExistence(timeout: 15))
+
+        // Same precondition as `testCrossBuildDropAndLibrary` — see its comment
+        // for why both "0 jobs" and the readiness line are required together.
+        guard app.staticTexts["0 jobs"].waitForExistence(timeout: 10),
+              app.staticTexts["0 of 3 required slots assigned"].waitForExistence(timeout: 10)
+                  || app.staticTexts["0 of 2 required slots assigned"].waitForExistence(timeout: 1) else {
+            throw XCTSkip("New Job never rendered an empty draft: expected \"0 jobs\" plus "
+                + "\"0 of 3 required slots assigned\" or \"0 of 2 required slots assigned\".")
+        }
+
+        app.segmentedControls["newjob.mode"].buttons["Batch"].tap()
+        Phase4Draft.selectTryonPipeline(in: app)
+        Phase4Draft.chooseMaterial(for: "Character", in: app)
+        // Driver is deliberately left unfilled as a shared slot: picking at
+        // least one driver below moves it into `BatchComposer.crossedRoles`,
+        // which drops it out of `missingShared` (`BatchComposerSection.swift`,
+        // `BatchComposer.swift:139-143`) — the multi-select is how a
+        // multi-driver build fills that role now, not the shared row.
+
+        Phase4Draft.revealButton("batch.pickDrivers", in: app).tap()
+        let driverPicks = app.buttons.matching(
+            NSPredicate(format: "identifier BEGINSWITH %@", "driver.pick."))
+        guard Phase4Draft.waitUntil(timeout: 15, condition: { driverPicks.count >= 2 }) else {
+            app.buttons["Done"].tap()
+            clearFromBatch(app)
+            throw XCTSkip("Fewer than two video materials to use as drivers.")
+        }
+        driverPicks.element(boundBy: 0).tap()
+        driverPicks.element(boundBy: 1).tap()
+        app.buttons["Done"].tap()
+
+        Phase4Draft.revealButton("batch.pickOutfits", in: app).tap()
+        let outfitPicks = app.buttons.matching(
+            NSPredicate(format: "identifier BEGINSWITH %@", "outfit.pick."))
+        guard Phase4Draft.waitUntil(timeout: 15, condition: { outfitPicks.count >= 2 }) else {
+            app.buttons["Done"].tap()
+            clearFromBatch(app)
+            throw XCTSkip("Fewer than two image materials to use as outfits.")
+        }
+        outfitPicks.element(boundBy: 0).tap()
+        outfitPicks.element(boundBy: 1).tap()
+        app.buttons["Done"].tap()
+
+        let summary = app.staticTexts["batch.summary"]
+        XCTAssertTrue(Phase4Draft.waitUntil(timeout: 15) {
+            summary.exists && summary.label.contains("2 outfits × 2 drivers = 4 videos")
+        }, "expected \"2 outfits × 2 drivers = 4 videos\" in the summary, got: \(summary.label)")
+
+        let run = Phase4Draft.revealButton("batch.run", in: app)
+        XCTAssertTrue(Phase4Draft.waitUntil(timeout: 20) { run.isEnabled },
+                      "cross build is ready once Character is filled and 2 outfits × 2 drivers are picked")
+        run.tap()
+        // Four sequential PATCH + add-to-batch round-trips, then the
+        // outfit-and-driver-clearing PATCH; a slow draft probe can make each
+        // one linger.
+        XCTAssertTrue(app.staticTexts["Added 4 jobs to the batch."].waitForExistence(timeout: 180))
+        XCTAssertTrue(app.staticTexts["4 jobs"].waitForExistence(timeout: 15))
+
+        clearFromBatch(app)
+
+        XCTAssertEqual(app.descendants(matching: .any)["uitest.recordedSpends"].label, "0",
+                       "the recording gate saw no spend")
+    }
 }

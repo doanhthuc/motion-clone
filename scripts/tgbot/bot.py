@@ -37,7 +37,7 @@ from batchlib.pipelines import (PIPELINES, effective_stage_params,
                                optional_roles, required_roles)
 from batchlib.vast_models import models_for_manifest
 from batchlib.runner import (_local_tryon_stage, has_local_tryon,
-                             preserved_local_tryon, stage_dest)
+                             preserved_local_tryon, stage_dest, tryon_share_groups)
 # Not `from batchlib_ext...` or `scripts/batchlib/...` — drain.py itself lives
 # at scripts/drain.py, a plain top-level module, same as batch_run.py. scripts/
 # is already on sys.path (the insert above), so this is the plan's own "import
@@ -2952,6 +2952,18 @@ def _deliver_tryon_previews(tg: Tg, chat_id: int, manifest_path: Path,
     on-disk progress file tick_progress already rewrites every tick, so this
     survives both a poll finding nothing new and a bot restart mid-render —
     same reasoning as _progress_path's own docstring.
+
+    One photo per share group (spec §3), not one per run: `tryon_share_groups`
+    is computed fresh from the manifest, the same leader/follower split
+    `AppRuns.tryon` uses, never a journal entry's own stale `shared_from`. A
+    follower is skipped in the main loop and never gets its own send — its
+    image is byte-identical to its leader's, so a second document would just
+    be noise. The leader's caption names the group so the 🔄/Keep buttons
+    (which carry the leader's own index) are legible as "this affects N
+    runs". A follower that has not finished its own copy yet does not block
+    the leader's send: the leader's image is the content the caption is
+    about, and the follower copy is cheap enough that its own status is not
+    worth waiting on here.
     """
     try:
         manifest = load_manifest(manifest_path)
@@ -2968,9 +2980,12 @@ def _deliver_tryon_previews(tg: Tg, chat_id: int, manifest_path: Path,
     regen_ok = (payload.get("phase") == "local"
                 and manifest_path.resolve() == _job_manifest_path(chat_id).resolve())
     token = _run_token(chat_id) if regen_ok else ""
+    groups = tryon_share_groups(manifest)
     for index, run in enumerate(manifest.runs):
         if run.id in sent:
             continue
+        if groups.get(run.id, run.id) != run.id:
+            continue   # a follower: covered by its leader's send below
         stage_name = _tryon_stage(run.pipeline)
         if stage_name is None:
             continue
@@ -2991,21 +3006,28 @@ def _deliver_tryon_previews(tg: Tg, chat_id: int, manifest_path: Path,
         tg.send_chat_action(chat_id, "upload_document")
         version = len(_tryon_versions(image)) + 1
         label = f"{run.id} · v{version}" if version > 1 else run.id
+        followers = [other for other, leader in groups.items()
+                    if leader == run.id and other != run.id]
+        group_note = ""
+        if followers:
+            member_ids = [run.id] + followers
+            group_note = f" · used by {len(member_ids)} runs: {', '.join(member_ids)}"
         # caption is plain text — send_document has no parse_mode (unlike
         # send_message/edit_message), so no HTML here.
         if regen_ok:
             tg.send_document(
                 chat_id, image,
                 caption=f"🖼 try-on ({provider}) · {label} — not right? "
-                        "Regenerate it before renting the GPU",
+                        f"Regenerate it before renting the GPU{group_note}",
                 buttons=[[("🔄 Regenerate this image",
                            f"{_CB_TRYON_REGEN}{index}:{token}")]])
         else:
             tg.send_document(
                 chat_id, image,
                 caption=f"🖼 try-on ({provider}) · {label} — "
-                        "pipeline continues on the pod")
+                        f"pipeline continues on the pod{group_note}")
         sent.add(run.id)
+        sent.update(followers)
         changed = True
     if changed:
         payload["sent_tryon"] = sorted(sent)
@@ -3078,7 +3100,10 @@ _GUIDANCE_FLAGS = {"keep_face": "keepFace", "tighter_crop": "tighterCrop",
 
 def _regen_tryon(tg: Tg, chat_id: int, index: str, token: str, *,
                  dry_run: bool, guidance: list[str] | None = None) -> Outcome:
-    """Redo ONE run's try-on image, leaving every other run's untouched.
+    """Redo ONE try-on image, leaving every other run's untouched.
+
+    A tap on a follower of a shared try-on redoes its leader's image instead
+    (spec §3); the followers recopy the new one on the resume.
 
     Reached from the 🔄 button under a Phase A preview. The mechanism is the
     one Phase A already trusts for "skip what is done": drop this run's stage
@@ -3124,6 +3149,17 @@ def _regen_tryon(tg: Tg, chat_id: int, index: str, token: str, *,
                        "bot; send /start for the commands")
     run = manifest.runs[int(index)]
     stage_name = _local_tryon_stage(run)
+    # A follower's image is a copy of its leader's, so regenerating it means
+    # regenerating the leader. Only the leader's stage is backed up and
+    # popped: followers pick up the new image by source_sha256
+    # (runner.follower_reusable); popping them too would make _settle_regen's
+    # single-entry restore incomplete.
+    groups = tryon_share_groups(manifest)
+    leader_id = groups.get(run.id, run.id)
+    if leader_id != run.id:
+        index = str(next(i for i, r in enumerate(manifest.runs) if r.id == leader_id))
+        run = manifest.runs[int(index)]
+        stage_name = _local_tryon_stage(run)
     if stage_name is None:
         return _refuse(tg, chat_id, "not_local",
                        f"{run.id}'s try-on no longer runs over the API "
@@ -3171,10 +3207,28 @@ def _regen_tryon(tg: Tg, chat_id: int, index: str, token: str, *,
         backup = dest.with_name(
             f"{dest.stem}.v{len(_tryon_versions(dest)) + 1}{dest.suffix}")
         dest.replace(backup)
+    runs_state = state.get("runs") or {}
+    # The followers' journal as it stands now. If the new call fails, the
+    # runner's follower pass finds no leader image and records each follower
+    # as "shared try-on from … failed", although its own file is untouched;
+    # _settle_regen puts these back along with the leader's backup, after
+    # which their source_sha256 matches the leader's file again.
+    followers = {}
+    for other in manifest.runs:
+        other_stage = _local_tryon_stage(other)
+        if other.id == run.id or other_stage is None \
+                or groups.get(other.id) != run.id:
+            continue
+        other_entry = runs_state.get(other.id) or {}
+        followers[other.id] = {
+            "stage": other_stage,
+            "entry": (other_entry.get("stages") or {}).get(other_stage),
+            "run_status": other_entry.get("status"),
+            "run_error": other_entry.get("error")}
     regen = {"run": run.id, "stage": stage_name, "dest": str(dest),
              "backup": str(backup) if backup else None,
              "entry": recorded, "run_status": entry.get("status"),
-             "run_error": entry.get("error")}
+             "run_error": entry.get("error"), "followers": followers}
     stages.pop(stage_name, None)
     if guidance_params:
         # Persisted through the journal, not the manifest: start_phase_a's
@@ -3190,7 +3244,6 @@ def _regen_tryon(tg: Tg, chat_id: int, index: str, token: str, *,
     # only the new one. A run whose try-on failed earlier is left out on
     # purpose: resume retries it too, and if it succeeds now it deserves its
     # first preview.
-    runs_state = state.get("runs") or {}
     seed = []
     for other in manifest.runs:
         other_stage = _local_tryon_stage(other)
@@ -3242,7 +3295,12 @@ def _tryon_failure_reason(error: str) -> str:
 
 
 def _report_failed_tryons(tg: Tg, chat_id: int, manifest_path: Path) -> None:
-    """One message per run whose Phase A try-on failed: why, plus retry buttons.
+    """One message per failed Phase A try-on: why, plus retry buttons.
+
+    Per provider call, not per run: a follower of a shared try-on fails only
+    because its leader did (runner.py records "shared try-on from … failed"),
+    so it is named in the leader's message instead of getting its own, and
+    the buttons retry the leader, which is the one that calls the provider.
 
     Until this existed the only sign in the chat was a ❌ on the progress bar,
     and the reason sat in run.log on the VPS.
@@ -3251,9 +3309,10 @@ def _report_failed_tryons(tg: Tg, chat_id: int, manifest_path: Path) -> None:
     runs = load_state(state_path_for(manifest_path)).get("runs") or {}
     token = _run_token(chat_id)
     qwen_ok = qwen_max_configured(ROOT)
+    groups = tryon_share_groups(manifest)
     for index, run in enumerate(manifest.runs):
         stage_name = _local_tryon_stage(run)
-        if stage_name is None:
+        if stage_name is None or groups.get(run.id, run.id) != run.id:
             continue
         entry = runs.get(run.id) or {}
         if (((entry.get("stages") or {}).get(stage_name) or {})
@@ -3266,24 +3325,31 @@ def _report_failed_tryons(tg: Tg, chat_id: int, manifest_path: Path) -> None:
                    for key, label in _RETRY_PROVIDERS.items()
                    if key != "qwen-max" or qwen_ok]
         hint = "" if qwen_ok else f"\n{_esc(_QWEN_MISSING)}"
+        followers = [r.id for r in manifest.runs
+                     if r.id != run.id and groups.get(r.id) == run.id]
+        waiting = (f"\nAlso waiting on this image: {_esc(', '.join(followers))}"
+                   if followers else "")
         tg.send_message(
             chat_id,
             f"{ICON_ERROR_CE} <b>Try-on failed</b> for <code>{_esc(run.id)}</code> "
             f"({_esc(str(provider))})\n"
             f"{_tryon_failure_reason(str(entry.get('error') or 'no reason recorded'))}"
-            f"{hint}\nRetrying costs API quota only; no GPU is rented.",
+            f"{waiting}{hint}\nRetrying costs API quota only; no GPU is rented.",
             parse_mode=PARSE_HTML, buttons=[buttons])
 
 
 def _retry_tryon(tg: Tg, chat_id: int, index: str, provider: str, token: str,
                  *, dry_run: bool) -> None:
-    """Retry one failed try-on, switching that run alone to `provider` first.
+    """Retry one failed try-on, switching its share group to `provider` first.
 
     The switch goes onto the drafted Job as well as the manifest, because
     [Run] re-renders the manifest from the jobs: a manifest-only edit would be
     undone by the next render, and Phase A would call the old provider again.
-    Every other run keeps its params, so local_tryon_reusable still skips
-    their finished images. The rest is _regen_tryon, unchanged.
+    Every run in the tapped run's share group switches together: the provider
+    is part of runner.tryon_share_key, so switching the leader alone would
+    split the group and pay the old provider again for the followers. Every
+    other run keeps its params, so local_tryon_reusable still skips their
+    finished images. The rest is _regen_tryon, unchanged.
     """
     if provider not in _RETRY_PROVIDERS:
         tg.send_message(chat_id, "that button is from an older version of the "
@@ -3330,9 +3396,16 @@ def _retry_tryon(tg: Tg, chat_id: int, index: str, provider: str, token: str,
             tg.send_message(chat_id, "the drafted job no longer matches the batch "
                                      "on disk, so nothing was retried.")
             return
-        jobs[int(index)].provider = provider
+        groups = tryon_share_groups(manifest)
+        group = groups.get(run.id, run.id)
+        members = [i for i, r in enumerate(manifest.runs)
+                   if groups.get(r.id, r.id) == group]
+        for i in members:
+            jobs[i].provider = provider
         write_manifest(jobs, manifest_path, now=time.strftime("%Y-%m-%d %H:%M:%S"))
-        tg.send_message(chat_id, f"{_esc(run.id)} switched to "
+        switched = (f"{_esc(run.id)} switched" if len(members) == 1
+                    else f"{len(members)} runs switched")
+        tg.send_message(chat_id, f"{switched} to "
                                  f"{_RETRY_PROVIDERS[provider]} for this retry; "
                                  "the other runs keep their provider.")
         token = _run_token(chat_id)
@@ -3376,6 +3449,20 @@ def _settle_regen(tg: Tg, chat_id: int, manifest_path: Path,
             entry["error"] = regen["run_error"]
         else:
             entry.pop("error", None)
+        runs_state = state.setdefault("runs", {})
+        for follower_id, saved in (regen.get("followers") or {}).items():
+            f_entry = runs_state.setdefault(follower_id, {"status": "pending",
+                                                          "stages": {}})
+            f_stages = f_entry.setdefault("stages", {})
+            if saved.get("entry") is None:
+                f_stages.pop(saved["stage"], None)
+            else:
+                f_stages[saved["stage"]] = saved["entry"]
+            f_entry["status"] = saved.get("run_status") or f_entry.get("status")
+            if saved.get("run_error"):
+                f_entry["error"] = saved["run_error"]
+            else:
+                f_entry.pop("error", None)
         save_state(state_file, state)
         kept = ("The previous image is back in place, and it is what the GPU "
                 "run will use. Tap 🔄 on it to try again.")
@@ -7145,7 +7232,7 @@ class AppRuns:
                     jobs=jobs, estimate_min=estimate_min)
         return 200, data
 
-    def _tryon_entries(self) -> list[tuple[str, "Run", str, dict]]:
+    def _tryon_entries(self, manifest: "Manifest | None" = None) -> list[tuple[str, "Run", str, dict]]:
         """(index, run, stage_name, journal entry) for every run in this
         chat's manifest whose try-on Phase A can do locally, in the order
         `_deliver_tryon_previews` walks them. `index` is the run's own
@@ -7153,12 +7240,19 @@ class AppRuns:
         `_regen_tryon` takes — not a position in this filtered list, so a
         button minted from one previews list still resolves against the
         manifest `_regen_tryon` reads.
+
+        `manifest` lets a caller that already loaded it under the same lock
+        hold (`tryon()`, which also needs it for `tryon_share_groups`) pass
+        it straight in instead of this method loading it a second time.
+        Every other caller omits it and gets the load this method has
+        always done.
         """
         manifest_path = _job_manifest_path(self.chat_id)
-        try:
-            manifest = load_manifest(manifest_path)
-        except (ManifestError, OSError):
-            return []
+        if manifest is None:
+            try:
+                manifest = load_manifest(manifest_path)
+            except (ManifestError, OSError):
+                return []
         runs_state = load_state(state_path_for(manifest_path)).get("runs") or {}
         found = []
         for index, run in enumerate(manifest.runs):
@@ -7172,18 +7266,40 @@ class AppRuns:
     def tryon(self, run_id: str) -> tuple[int, dict]:
         """The phone's try-on previews for this chat's manifest — the same
         journal `_deliver_tryon_previews` reads, without the Telegram send:
-        the app fetches the image itself, over `tryon_image`."""
+        the app fetches the image itself, over `tryon_image`.
+
+        `shared_from`/`shares` are additive (spec §3): the leader/follower
+        split always comes from `tryon_share_groups`, computed fresh here
+        from the manifest, never from a journal entry's own `shared_from` —
+        a promoted leader (its old leader dropped) keeps a stale one."""
         if run_id != self.run_id:
             return 404, _run_error("not_found", "no such run")
         with self._locked() as busy:
             if busy is not None:
                 return busy
+            # One load, shared between the entries and the share groups —
+            # not `_tryon_entries()` then a second `load_manifest` call, which
+            # briefly read the manifest twice under the same lock hold.
+            try:
+                manifest = load_manifest(_job_manifest_path(self.chat_id))
+            except (ManifestError, OSError):
+                entries: list = []
+                groups: dict[str, str] = {}
+            else:
+                entries = self._tryon_entries(manifest)
+                groups = tryon_share_groups(manifest)
+            index_of = {run.id: index for index, run, _stage, _entry in entries}
             previews = []
-            for index, run, _stage, entry in self._tryon_entries():
+            for index, run, _stage, entry in entries:
                 status = entry.get("status") or "pending"
                 has_image = status == "done" and Path(entry.get("file") or "").is_file()
+                leader = groups.get(run.id, run.id)
+                shared_from = None if leader == run.id else index_of.get(leader)
+                shares = [index_of[other] for other, other_leader in groups.items()
+                         if other_leader == run.id and other != run.id]
                 previews.append({"index": index, "run": run.id, "status": status,
-                                 "has_image": has_image})
+                                 "has_image": has_image, "shared_from": shared_from,
+                                 "shares": shares})
             response = (200, {"run_id": self.run_id, "run_token": _run_token(self.chat_id),
                               "phase_a_running": phase_a_running(
                                   _job_manifest_path(self.chat_id)),

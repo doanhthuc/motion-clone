@@ -54,7 +54,7 @@ import Testing
     }
 
     @Test func batchSummaryCountsEachStatusSeparately() throws {
-        // 12 jobs — `BatchComposer.maxOutfits` — with a distinct count for every
+        // 12 jobs — `BatchComposer.maxJobs` — with a distinct count for every
         // present status (done 5, pending 4, running 2, error 1) and no `.unknown`,
         // so repointing any counter at any other status changes an asserted number.
         // A fixture with one job per status cannot tell `done` from `failed`.
@@ -292,6 +292,27 @@ import Testing
         #expect(t.runId == "tg-1000" && t.runToken == "1790000000123.4" && t.phaseARunning)
         #expect(t.previews.map(\.id) == ["0", "1"])
         #expect(t.previews[0].status == .running && !t.previews[0].hasImage)
+    }
+
+    /// Phase 6 shared try-on fields are additive — a fixture that predates
+    /// them (`Fixtures.tryonRunning`) must still decode, with both nil.
+    @Test func tryonPreviewWithoutSharedKeysDecodesNil() throws {
+        let t = try MotionJSON.decoder.decode(TryonPreviews.self, from: Fixtures.data(Fixtures.tryonRunning))
+        #expect(t.previews[0].sharedFrom == nil)
+        #expect(t.previews[0].shares == nil)
+    }
+
+    @Test func tryonPreviewWithSharedKeysDecode() throws {
+        let json = #"""
+        {"run_id":"tg-1000","run_token":"1.1","phase_a_running":false,
+         "previews":[{"index":"0","run":"o1d1","status":"done","has_image":true,
+                      "shared_from":null,"shares":["1"]},
+                     {"index":"1","run":"o1d2","status":"done","has_image":true,
+                      "shared_from":"0","shares":[]}]}
+        """#
+        let t = try MotionJSON.decoder.decode(TryonPreviews.self, from: Fixtures.data(json))
+        #expect(t.previews[0].sharedFrom == nil && t.previews[0].shares == ["1"])
+        #expect(t.previews[1].sharedFrom == "0" && t.previews[1].shares == [])
     }
 
     @Test func rentPanelDecodes() throws {

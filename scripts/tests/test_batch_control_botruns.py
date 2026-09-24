@@ -356,6 +356,35 @@ class _AppRunsFixture(_Fixture):
             encoding="utf-8")
 
 
+    def _grouped_jobs(self) -> list[Job]:
+        """2 outfits x 2 drivers, one character, same provider — the runner's
+        tryon_share_key (character, outfit, background, params; driver is
+        excluded because this pipeline's `tryon` stage is not camera-aware)
+        groups the two drivers of each outfit, o1d1/o2d1 leading."""
+        character = self.root / "grp-character.png"
+        character.write_bytes(b"c")
+        jobs = []
+        for outfit_n in (1, 2):
+            outfit = self.root / f"grp-outfit{outfit_n}.png"
+            outfit.write_bytes(b"o")
+            for driver_n in (1, 2):
+                driver = self.root / f"grp-driver{outfit_n}-{driver_n}.mp4"
+                driver.write_bytes(b"d")
+                jobs.append(Job(
+                    slots={"character": character, "driver": driver, "outfit": outfit},
+                    probes={"character": Probe(kind="image", width=1024, height=1024,
+                                               duration_s=0.0, bitrate_kbps=0,
+                                               size_bytes=800_000),
+                            "driver": Probe(kind="video", width=1080, height=1920,
+                                            duration_s=5.0, bitrate_kbps=3000,
+                                            size_bytes=1_500_000),
+                            "outfit": Probe(kind="image", width=1024, height=1024,
+                                            duration_s=0.0, bitrate_kbps=0,
+                                            size_bytes=800_000)},
+                    pipeline="tryon-motion-enhance", provider="gemini"))
+        return jobs
+
+
 class TestAppRunsPhaseA(_AppRunsFixture):
     def test_phase_a_requires_a_validated_draft(self):
         self._seed_draft(validated=False)
@@ -1005,7 +1034,8 @@ class TestTryonPreviews(_AppRunsFixture):
         self.assertEqual(body["run_token"], bot._run_token(ME))
         self.assertFalse(body["phase_a_running"])
         self.assertEqual(body["previews"],
-                         [{"index": "0", "run": run_id, "status": "done", "has_image": True}])
+                         [{"index": "0", "run": run_id, "status": "done", "has_image": True,
+                           "shared_from": None, "shares": []}])
 
         got = self.runs.tryon_image(self.runs.run_id, "0")
         self.assertEqual(got, image.resolve())
@@ -1016,6 +1046,31 @@ class TestTryonPreviews(_AppRunsFixture):
         outside.write_bytes(b"img")
         self._write_journal(run_id, tryon={"status": "done", "file": str(outside)})
         self.assertIsNone(self.runs.tryon_image(self.runs.run_id, "0"))
+
+    def test_tryon_previews_carry_the_share_group(self):
+        jobs = self._grouped_jobs()
+        write_manifest(jobs, self._live(), now=time.strftime("%Y-%m-%d %H:%M:%S"))
+        manifest = load_manifest(self._live())
+        run_ids = [run.id for run in manifest.runs]
+        self.assertEqual(len(run_ids), 4)
+
+        runs_state = {}
+        for n, run in enumerate(manifest.runs):
+            image = self.root / "out" / "batch1" / "runs" / run.id / "01-tryon.png"
+            image.parent.mkdir(parents=True, exist_ok=True)
+            image.write_bytes(f"img{n}".encode())
+            runs_state[run.id] = {"status": "running",
+                                  "stages": {"tryon": {"status": "done", "file": str(image)}}}
+        state_path_for(self._live()).write_text(
+            json.dumps({"batch": "batch1", "runs": runs_state}), encoding="utf-8")
+
+        status, body = self.runs.tryon(self.runs.run_id)
+        self.assertEqual(status, 200)
+        previews = body["previews"]
+        self.assertEqual([p["index"] for p in previews], ["0", "1", "2", "3"])
+        self.assertEqual([p["run"] for p in previews], run_ids)
+        self.assertEqual([p["shared_from"] for p in previews], [None, "0", None, "2"])
+        self.assertEqual([p["shares"] for p in previews], [["1"], [], ["3"], []])
 
     def test_tryon_wrong_run_id_is_404(self):
         status, body = self.runs.tryon("not-the-run-id")
@@ -1078,6 +1133,41 @@ class TestRegenViaAppRuns(_AppRunsFixture):
         stale = self.runs.regen(self.runs.run_id, "0", {"run_token": "not-the-token"}, "key-2")
         self.assertEqual(stale[0], 409)
         self.assertEqual(stale[1]["error"]["code"], "stale_panel")
+
+    def test_regen_on_a_follower_regenerates_its_leader(self):
+        # Index 1 shares index 0's image (_grouped_jobs): the leader's file is
+        # what the provider made, so it is the one redone; the followers
+        # recopy it by source_sha256 on the next resume (runner.follower_reusable).
+        write_manifest(self._grouped_jobs(), self._live(),
+                       now=time.strftime("%Y-%m-%d %H:%M:%S"))
+        manifest = load_manifest(self._live())
+        ids = [run.id for run in manifest.runs]
+        runs_state, images = {}, {}
+        for n, run in enumerate(manifest.runs):
+            image = self.root / "out" / "batch1" / "runs" / run.id / "01-tryon.png"
+            image.parent.mkdir(parents=True, exist_ok=True)
+            image.write_bytes(f"img{n}".encode())
+            images[run.id] = image
+            rec = {"status": "done", "file": str(image)}
+            if n in (1, 3):
+                rec.update(shared_from=ids[n - 1], source_sha256="x")
+            runs_state[run.id] = {"status": "running", "stages": {"tryon": rec}}
+        state_path_for(self._live()).write_text(
+            json.dumps({"batch": "batch1", "runs": runs_state}), encoding="utf-8")
+
+        status, _body = self.runs.regen(self.runs.run_id, "1",
+                                        {"run_token": bot._run_token(ME)}, "k-follower")
+        self.assertEqual(status, 202)
+        self.patches["start_phase_a"].assert_called_once()
+        state = load_state(state_path_for(self._live()))
+        self.assertNotIn("tryon", state["runs"][ids[0]]["stages"])
+        self.assertEqual(state["runs"][ids[1]], runs_state[ids[1]])
+        self.assertEqual(images[ids[1]].read_bytes(), b"img1")
+        self.assertFalse(images[ids[0]].exists())
+        self.assertEqual(images[ids[0]].with_name("01-tryon.v1.png").read_bytes(), b"img0")
+        _args, kwargs = self.patches["_start_progress"].call_args
+        self.assertEqual(kwargs["regen"]["run"], ids[0])
+        self.assertIn(ids[1], kwargs["sent_tryon"])
 
     def test_regen_requires_a_run_token(self):
         self._seed_tryon_run()

@@ -114,6 +114,22 @@ extension URLProtocolTests {
             return #"{"valid":"# + (valid ? "true" : "false") + #","stale":"# + (stale ? "true" : "false")
                 + #","output":null,"draft":"# + body + "}"
         }
+        /// 2 outfits x 2 drivers, one shared try-on group per outfit — the
+        /// fixture Task 5's brief specifies verbatim: indices 0..3 ordered
+        /// (o1d1,o1d2,o2d1,o2d2); 0 leads 1, 2 leads 3.
+        static let draftFourJobs = draftJSON(
+            batch: [entry("e0", "o1d1", "app/dress.png"), entry("e1", "o1d2", "app/dress.png"),
+                    entry("e2", "o2d1", "app/blazer.png"), entry("e3", "o2d2", "app/blazer.png")],
+            outfit: "app/blazer.png", seed: nil)
+        static let tryonSharedGroup = #"""
+        {"run_id":"tg-1000","run_token":"1790000000123.4","phase_a_running":false,
+         "previews":[
+           {"index":"0","run":"o1d1","status":"done","has_image":true,"shared_from":null,"shares":["1"]},
+           {"index":"1","run":"o1d2","status":"done","has_image":true,"shared_from":"0","shares":[]},
+           {"index":"2","run":"o2d1","status":"done","has_image":true,"shared_from":null,"shares":["3"]},
+           {"index":"3","run":"o2d2","status":"done","has_image":true,"shared_from":"2","shares":[]}
+         ]}
+        """#
         static func probeJSON(_ kind: String) -> String {
             #"{"kind":"\#(kind)","width":1,"height":1,"duration_s":null,"bitrate_kbps":null,"size_bytes":1,"warning":""}"#
         }
@@ -722,6 +738,83 @@ extension URLProtocolTests {
         #expect(flow.phase == .rentPanel)     // dropping never navigates
         #expect(StubURLProtocol.requests.allSatisfy { $0.httpMethod == "GET" })
         #expect(!flow.isDropping)
+    }
+
+    // MARK: shared try-on groups (Task 5)
+
+    @Test func cardsAreLeadersOnly() async throws {
+        let routes = Routes()
+        routes.draft = Routes.draftFourJobs
+        routes.tryon = Routes.tryonSharedGroup
+        let flow = make(routes)
+        await flow.start(.existing)
+        #expect(flow.cards.map(\.index) == ["0", "2"])
+    }
+
+    @Test func dropRemovesEveryMemberThenValidatesOnce() async throws {
+        let routes = Routes()
+        routes.draft = Routes.draftFourJobs
+        routes.tryon = Routes.tryonSharedGroup
+        let flow = make(routes)
+        await flow.start(.existing)
+        let leader = try #require(flow.cards.first { $0.index == "0" })
+        #expect(flow.members(of: leader).map(\.index) == ["0", "1"])
+        #expect(flow.canDropFromBatch(leader))
+
+        await flow.drop(leader)
+
+        let writes = StubURLProtocol.requests.filter { $0.httpMethod != "GET" }
+        let deletes = writes.filter { $0.httpMethod == "DELETE" }
+        #expect(deletes.count == 2)
+        #expect(Set(deletes.map { $0.url!.path }) ==
+                ["/v1/draft/batch/e0", "/v1/draft/batch/e1"])
+        #expect(writes.filter { $0.httpMethod == "POST" && $0.url?.path == "/v1/draft/validate" }.count == 1)
+        #expect(!flow.isDropping)
+    }
+
+    /// A group that is the whole basket would leave zero entries behind —
+    /// `canDropFromBatch` (the property) alone would still say yes at 2
+    /// entries, so this pins the group-aware arithmetic on top of it.
+    @Test func dropOfAGroupThatIsTheWholeBasketIsNotOffered() async throws {
+        let routes = Routes()
+        routes.draft = Routes.draftJSON(
+            batch: [Routes.entry("e0", "o1d1", "app/dress.png"),
+                    Routes.entry("e1", "o1d2", "app/dress.png")],
+            outfit: "app/blazer.png", seed: nil)
+        routes.tryon = #"""
+        {"run_id":"tg-1000","run_token":"1.1","phase_a_running":false,
+         "previews":[{"index":"0","run":"o1d1","status":"done","has_image":true,
+                      "shared_from":null,"shares":["1"]},
+                     {"index":"1","run":"o1d2","status":"done","has_image":true,
+                      "shared_from":"0","shares":[]}]}
+        """#
+        let flow = make(routes)
+        await flow.start(.existing)
+        #expect(flow.cards.count == 1)
+        let leader = try #require(flow.cards.first)
+
+        #expect(!flow.canDropFromBatch(leader))
+    }
+
+    /// Regression: a preview with no `shared_from`/`shares` (nil, exactly what
+    /// today's fixtures decode) is its own one-member group and still drops
+    /// alone, the way it did before Task 5.
+    @Test func aSingleUngroupedPreviewStillDropsAlone() async throws {
+        let routes = Routes()
+        routes.draft = Routes.draftTwoJobs
+        routes.tryon = Fixtures.tryonDone
+        let flow = make(routes)
+        await flow.start(.existing)
+        let blazer = try #require(flow.tryon?.previews.first { $0.run == "model__blazer" })
+        #expect(blazer.sharedFrom == nil)
+        #expect(flow.members(of: blazer).map(\.index) == [blazer.index])
+        #expect(flow.canDropFromBatch(blazer))
+
+        await flow.drop(blazer)
+
+        let writes = StubURLProtocol.requests.filter { $0.httpMethod != "GET" }
+        #expect(writes.map { "\($0.httpMethod!) \($0.url!.path)" } ==
+                ["PATCH /v1/draft", "DELETE /v1/draft/batch/d2", "POST /v1/draft/validate"])
     }
 
     @Test func spendInFlightDisablesAndClears() async {
