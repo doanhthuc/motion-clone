@@ -159,11 +159,18 @@ The New Job tab gains a **Single | Batch** segmented control (`newjob.mode`); Si
 composer, unchanged. The Material tab gains a **Materials | Saved try-ons** split (`material.mode`).
 Design: `docs/superpowers/specs/2026-09-23-swiftui-app-phase-6-design.md`.
 
-- **Cross build (Batch mode).** One character + driver (and `background` when the pipeline has it),
-  shared across the build, times up to 12 outfits (`batch.pickOutfits` → `outfit.pick.<id>`) becomes
-  one basket job per outfit. `BatchComposer.run()` re-reads the draft and re-plans, so **Continue**
-  after a partial failure skips outfits already basketed and never adds a duplicate (`422 duplicate`
-  counts as done); each step names its own `tryon_seed` (id or `null`), so no outfit inherits the
+- **Cross build (Batch mode).** One character (and `background` when the pipeline has it), shared
+  across the build, times the chosen outfits (`batch.pickOutfits` → `outfit.pick.<id>`) times the
+  chosen drivers (`batch.pickDrivers`), becomes one basket job per outfit × driver pair, outfit-major.
+  With no driver picked, the edited job's own driver slot is shared and the build is one job per
+  outfit, as before. The cap is 12 **jobs** in total (outfits × drivers, each side counted as at
+  least 1); a toggle past it is refused with the reason shown beside the pickers. The summary line
+  (`batch.summary`) reads e.g. "2 outfits × 2 drivers = 4 videos · 2 try-ons": with a local try-on
+  provider (`gemini`, `qwen-max`) Phase A makes one try-on per unseeded outfit and shares it across
+  that outfit's drivers (one per pair on a camera pipeline); with a pod provider such as `qwen` every
+  job does its own. Design: `docs/superpowers/specs/2026-09-25-multi-driver-batch-shared-tryon-design.md`.
+  `BatchComposer.run()` re-reads the draft and re-plans, so **Continue** after a partial failure skips
+  pairs already basketed and never adds a duplicate (`422 duplicate` counts as done); each step names its own `tryon_seed` (id or `null`), so no outfit inherits the
   previous one's seed. Free — no `SpendGate`, no Idempotency-Key. The run button is `batch.run` and
   reads "Add N jobs to batch" — it hides once a build has landed, since success clears the selection;
   a finished build shows "Added N jobs to the batch.", where N is what that run added

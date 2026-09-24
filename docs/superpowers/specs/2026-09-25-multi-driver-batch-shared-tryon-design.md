@@ -1,6 +1,6 @@
 # Multi-driver batch, and one try-on per look
 
-Date: 2026-09-25 · Status: approved in conversation, not yet implemented
+Date: 2026-09-25 · Status: implemented on feat/multi-driver-batch, not yet merged
 
 The parent SwiftUI spec (`2026-09-22-swiftui-app-design.md` §1) deferred "pair (1:1) mode". Asked
 what pair was for, the user described a different shape: **one character, many outfits and many
