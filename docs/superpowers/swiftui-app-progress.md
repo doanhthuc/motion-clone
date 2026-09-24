@@ -406,12 +406,11 @@ tapping the UI on a phone.
 
 No phase remains — Phases 1–6 are implemented in code. Open items, none of them a phase:
 
-1. **Merge** (controller). Both live gates have run — `make ios-contract` (14/14) and
-   `make ios-ui-test` (`Phase6SmokeTests`, 4/4, zero recorded spends), 2026-09-24; see the gate
-   record. Nothing in that record is outstanding. `main` is 2 commits ahead of `origin/main` (`4052b97` spec,
-   `5eaa652` plan), both unpushed — push `main` first or the Phase 6 PR will carry them. Phase 6
-   touches `scripts/**`, so before merging check the VPS for a drain, Phase A, pod lease and migration
-   (the merge auto-deploys `motion-bot`).
+1. ~~**Merge**~~ — **done, twice over.** Phase 6 merged as PR #67 (`f65fc63`, deploy run
+   `35951269293`); the Phase 6 follow-ups merged as PR #68 (`f0b7fa7`, deploy run `36029721301`,
+   2026-09-24). Both live gates ran for each, and every gate row in both specs' records is filled.
+   `main` and `origin/main` are in sync. Nothing here is outstanding; the entry is kept only so the
+   history of what was waiting does not look like it was skipped.
 2. **Optional spend test.** A 2-outfit batch with one seeded job, proving Phase A calls the provider
    once for the unseeded outfit and reuses the saved image for the seeded one. Needs its own approval
    and a quoted price; cost from the balance delta then `runpodctl billing`; `make gpu-destroy` after.
@@ -424,8 +423,10 @@ No phase remains — Phases 1–6 are implemented in code. Open items, none of t
    a stale material and a deleted library entry (both in the follow-ups spec's §1 and §10). Smaller
    items recorded in that spec and in the plan's handoff checklist: `MigrateSheet` shows no reason while
    a drop merely disables its button; `RunDetailView.swift`'s now-redundant inner `canRetryRental`; the
-   Swift post-confirm fixture having no cross-language pin on `clear()`'s shape; the stamp write's
-   fail-open race; and five `batch/` state paths `.gitignore` still does not cover.
+   Swift post-confirm fixture having no cross-language pin on `clear()`'s shape; and the stamp write's
+   fail-open race. The five uncovered `batch/` state paths were closed the same day (`ac9ab3a`), after a
+   post-deploy `git status` on the VPS showed two of them sitting untracked with a Telegram chat id in
+   the filename.
 
 Required safety behavior carries over unchanged from Phase 4: one UUID key per tap and never mint a new
 one to retry an earlier spend intent; disable the active button and show its quote while in flight;
