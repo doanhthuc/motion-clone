@@ -1,6 +1,6 @@
 # Motion iPhone app — Phase 6 batch and library design
 
-Date: 2026-09-23 · Status: implemented on the unmerged branch `feat/swiftui-phase-6`
+Date: 2026-09-23 · Status: implemented on the unmerged branch `feat/swiftui-phase-6`; `make ios-contract` (14/14, including `GET /v1/tryon-library`) and `make ios-ui-test` (`Phase6SmokeTests`, 4/4, zero spends recorded) passed live 2026-09-24; no real batch has run
 
 ### Gate record
 
@@ -15,15 +15,35 @@ implementer's worktree gates from the controller's live ones.
 | `motions-studio/setup/scrub-secrets.sh --check` | exit 0 | 2026-09-24 | implementer, then the final fix wave |
 | `make ios-contract` | **14/14 ok, exit 0**, live against the VPS | 2026-09-24 | controller |
 | `make batch-test` | exit 0, `OK (skipped=1)` | 2026-09-24 | controller |
-| `make ios-ui-test` | **pending — has not run**; `Phase6SmokeTests` has never executed | — | — |
+| `make ios-ui-test` | **exit 0**, `result: Passed`, `totalTestCount: 4`, `passed: 4`, `failed: 0`, **`skipped: 0`** — §8's `Phase6SmokeTests.testCrossBuildDropAndLibrary` Passed, so neither of its two `XCTSkip` guards (non-empty draft, fewer than two outfit images) fired; the Phase 3, 4 and 5 smokes Passed alongside it. Zero spends recorded (`-UITestRecordingSpendGate`; the closing `uitest.recordedSpends == "0"` assertion passed). Bundle `Test-MotionApp-2026.09.24_09-22-03-+0700.xcresult`, read with `xcrun xcresulttool get test-results summary` / `… tests` | 2026-09-24 | controller, live against the VPS on an already-booted iPhone 18 Pro simulator (`43B83B81-13CD-4383-BB43-4D8AEBEA6582`) |
 
 The `ios-contract` run is also the live proof of the deploy-order property §3 claims but could not
 evidence until now: the server had *not* been deployed with §3's `tryon_seed` field, and
 `GET /v1/draft` still decoded, because the app reads the field as optional. The same run covers the
 14th route, `GET /v1/tryon-library` decoding `TryonLibraryResponse`.
 
-No real batch has run — a 2-outfit batch with one seeded job is the proposed spend test (§8) and needs
-its own approval and quoted price.
+The `ios-ui-test` run settles two properties this spec reasoned about but could not observe:
+
+- **§6's Material tab wrapper did not break toolbar propagation.** The `"Add material"` assertion
+  (`MaterialsView.addMenu`'s accessibility label, installed by its `.toolbar` `ToolbarItem`) passed
+  against a live run. It was the one assertion with no passing precedent — it queries the label
+  type-agnostically because a SwiftUI `Menu`'s XCUITest element type is not guaranteed to be `.button`,
+  so the feared failure was a false alarm rather than a real break. It did not fire. The standing
+  instruction, **widen the query rather than delete the assertion**, stays for any future failure, but
+  is no longer needed for this assertion, which is now precedent-backed.
+- **The two mode-picker `isEnabled` waits are safe, and their effectiveness is still unsettled.** The
+  smoke waits for `newjob.mode`'s "Single" segment to be `isEnabled` before switching back to Single,
+  on both the outfit-count `XCTSkip` path and the final clear, because §4's mode `Picker` is
+  `.disabled(store.isBusy || composer.isRunning)` and a tap on a disabled SwiftUI control is a silent
+  no-op. A passing run proves those waits neither hung nor false-failed. It does **not** prove XCUITest
+  propagates a SwiftUI `Picker`'s `.disabled` to its synthesized segment buttons — if it does not, each
+  wait returns true immediately and is inert rather than harmful. Do not record them as proven
+  effective; observing the difference needs a deliberately-disabled picker.
+
+No real batch has run, and `ios-ui-test` is not one: the smoke builds its two-outfit batch out of
+*free* draft mutations (`PATCH` + add-to-batch, no `SpendGate`, no Idempotency-Key), drops an entry and
+clears — it never rents a pod, never calls Phase A and never reaches a confirm. A 2-outfit batch with
+one seeded job is the proposed spend test (§8) and needs its own approval and quoted price.
 
 This spec refines Phase 6 of `docs/superpowers/specs/2026-09-22-swiftui-app-design.md` (§3 "New
 batch, Bulk try-on", "Saved try-ons", §5 row 6). Phases 1–5 are shipped

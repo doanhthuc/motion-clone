@@ -26,9 +26,10 @@ what actually shipped, what was verified, and the next safe boundary.
   before and after that deploy.
 - Control-plane API slices 1–6 are live. Phases 4 and 5 added no route or field; Phase 6 adds one
   read-only field and no route.
-- Phases 1–6 are implemented in code. Phase 6's `make ios-contract` has now run (14/14, live against
-  the VPS, 2026-09-24); `make ios-ui-test` is still pending and `Phase6SmokeTests` has never
-  executed. See "Gate record" below — that table is the single place a gate result is written down.
+- Phases 1–6 are implemented in code, and every gate in Phase 6's record has run: `make ios-contract`
+  (14/14, live against the VPS, 2026-09-24) and `make ios-ui-test` (`Phase6SmokeTests`, 4/4 passed,
+  zero spends recorded, 2026-09-24). See "Gate record" below — that table is the single place a gate
+  result is written down.
 
 ## Phase status
 
@@ -39,7 +40,7 @@ what actually shipped, what was verified, and the next safe boundary.
 | 3 — single New Job | Complete | Catalog-driven pipeline/provider picker, compatible material pickers, server-authoritative draft mutations, validation, add/drop basket entries, stale/error reconciliation | Automated live simulator smoke passes; physical phone is optional coverage |
 | 4 — run flow | Complete in code | `SpendGate`/idempotency ledger, Phase A + try-on previews, regenerate with the closed guidance vocabulary, Keep, the rent panel (RunPod + Vast, out-of-stock), confirm (with the reuse/rerun chooser) and resume, all through `RunFlow`; `make ios-test` (158 tests), `make ios-build`, `make ios-contract` (adds `/tryon` and `/rent-panel`), `make ios-ui-test` (adds `Phase4SmokeTests`, zero-spend via `-UITestRecordingSpendGate`) and `scrub-secrets.sh --check` all pass | `make ios-refusal-smoke` passed live on 2026-09-23 (three bogus-token spends refused with 409, no lease before or after). No live Phase A / regen / confirm / resume has run — no pod has been rented for Phase 4 |
 | 5 — pod and cost | Complete in code | Pod tab: lease card with a quoted cost, kill (fresh key per tap, outside `SpendGate`, followed to `last_kill`), the "pod may still be billing" banner (`destroy_unverified`/`error`, cleared only by acknowledgement or a later successful kill), GPU choice on the Pod tab and the rent panel (re-reads the panel), RunPod balance and on-tap Vast credit, the migration (ask → typed, expiring confirmation → `SpendIntent.migrate` through `SpendGate`), an unanswered migrate on every tab; `make ios-test` (211 tests), `ios-build`, `ios-contract` (adds `gpu/stock`, `balance`), `ios-ui-test` (adds `Phase5SmokeTests`) pass | With no pod leased (2026-09-23): `make ios-ui-test` ran `Phase5SmokeTests` in full and `make ios-refusal-smoke` passed all seven steps. A real Phase A → GPU change → confirm → kill ran once through the app's MotionKit code ($0.012, see §"Real spend test"). No real migration has run |
-| 6 — batch/library | Complete in code | Cross build (Batch mode) with resumable re-planning and per-outfit seeds, the seed badge and its "no longer exists" variant, drop after Phase A with the re-validate and stale-panel clearing, the `!isDropping` guard on every `RunFlow` spend (`MigrateFlow.migrate()` bypasses it), the rental-retry generation latch, the batch progress list, saved try-ons (browse/use/delete) on the Material tab, and the server's read-only `tryon_seed` field. Gates: see "Gate record" below | `make ios-contract` ran live 2026-09-24 (14/14, including the new `GET /v1/tryon-library`). `make ios-ui-test` (`Phase6SmokeTests`) is **pending — it has never executed**. No real batch has run |
+| 6 — batch/library | Complete in code | Cross build (Batch mode) with resumable re-planning and per-outfit seeds, the seed badge and its "no longer exists" variant, drop after Phase A with the re-validate and stale-panel clearing, the `!isDropping` guard on every `RunFlow` spend (`MigrateFlow.migrate()` bypasses it), the rental-retry generation latch, the batch progress list, saved try-ons (browse/use/delete) on the Material tab, and the server's read-only `tryon_seed` field. Gates: see "Gate record" below | `make ios-contract` ran live 2026-09-24 (14/14, including the new `GET /v1/tryon-library`), and `make ios-ui-test` passed live the same day (4/4 including `Phase6SmokeTests`, `skipped: 0`, zero recorded spends). **No real batch has run**: the smoke builds its two-outfit batch out of free draft mutations, never rents a pod, never calls Phase A and never reaches a confirm. A 2-outfit batch with one seeded job is still the proposed spend test |
 
 ## What is implemented now
 
@@ -161,34 +162,54 @@ fake-server result is not a live one.
 | `motions-studio/setup/scrub-secrets.sh --check` | exit 0 | 2026-09-24 | implementer (Task 10), re-run by the final fix wave |
 | `make ios-contract` | **14/14 ok, exit 0**, live against the VPS, including the new `GET /v1/tryon-library` decoding `TryonLibraryResponse` | 2026-09-24 | controller |
 | `make batch-test` | exit 0, `OK (skipped=1)`. Covers the branch's only `scripts/**` change — the one that auto-deploys a live bot on merge | 2026-09-24 | controller |
-| `make ios-ui-test` | **pending — has not run.** `Phase6SmokeTests` has never executed | — | — |
+| `make ios-ui-test` | **exit 0** (checked explicitly, not inferred from a pipeline). Bundle `Test-MotionApp-2026.09.24_09-22-03-+0700.xcresult`, read with `xcrun xcresulttool get test-results summary`: `result: Passed`, `totalTestCount: 4`, `passed: 4`, `failed: 0`, **`skipped: 0`**. All four cases Passed (`… get test-results tests`): `Phase3SmokeTests.testDraftCompositionBatchDropAndValidation`, `Phase4SmokeTests.testRunFlowReachesRentPanelWithoutSpending`, `Phase5SmokeTests.testPodTabRendersAndMigrateStaysLocked`, `Phase6SmokeTests.testCrossBuildDropAndLibrary`. **Zero spends recorded** — the smoke launches with `-UITestRecordingSpendGate` and its closing `uitest.recordedSpends == "0"` assertion passed | 2026-09-24 | controller, live against the VPS on an already-booted iPhone 18 Pro simulator (`43B83B81-13CD-4383-BB43-4D8AEBEA6582`); `scripts/ios-ui-test.sh` `clear_draft` ran before and after, as it always does |
 
 The `ios-contract` run is also the live evidence for the deploy-order property this handoff and the
 spec both claim: the server had *not* been deployed with Phase 6's `tryon_seed` field, and
 `GET /v1/draft` still decoded, because the app reads the field as optional. Either deploy order works.
 
-#### Notes on the pending `make ios-ui-test`
+#### Notes on the `make ios-ui-test` run (2026-09-24)
 
-It must run outside the command sandbox (simulator control is killed inside it). One assertion has no
-passing precedent: the Materials toolbar check queries `"Add material"` (`MaterialsView.swift:96`, in
-`.toolbar` at `:51`) type-agnostically, because a SwiftUI `Menu`'s XCUITest element type is not
-guaranteed to be `.button`. If XCUITest does not surface a toolbar `Menu`'s accessibility label, that
-single assertion false-alarms while the toolbar still works — widen the query, do not delete the
-assertion (it is the only check that the `MaterialTabView` wrapper did not break toolbar propagation).
-Every other asserted string is precedent-backed by a shipped screen. Material preconditions: the
-≥2-image outfit count is guarded and skips, but the smoke also needs ≥1 compatible image (Character)
-and ≥1 compatible **video** (Driver — `role_kind` maps `driver` to `video`,
-`scripts/control/drafts.py:159`); a missing Character or Driver material hard-fails inside
-`Phase4Draft.chooseMaterial` ("A compatible material must exist for Driver",
-`Phase4SmokeTests.swift:84`) rather than skipping. That is an environment gap (restore test material),
-not a code regression — Phase 3/4 pass live against the same three roles, so the library normally has
-them. The empty-draft precondition skips for three distinct causes and now names the literals it
-expected, so a network blip does not read as a non-empty draft.
+It must run outside the command sandbox (simulator control is killed inside it). The 2026-09-24 pass
+settles two things this handoff previously reasoned about but had never observed.
 
-No real batch has run. A 2-outfit batch with one seeded job — proving Phase A calls the provider once
-for the unseeded outfit and reuses the saved image for the seeded one — is the proposed spend test; it
-needs its own approval and a quoted price, and its cost comes from the balance delta and then
-`runpodctl billing`.
+**The Materials toolbar survived Task 7's `MaterialTabView` wrapper.** The smoke's `"Add material"`
+assertion — `MaterialsView.addMenu`'s accessibility label, reached through the `.toolbar`
+`ToolbarItem` that installs it — passed against a live run. That was the one assertion with no passing
+precedent: it queries `"Add material"` type-agnostically, because a SwiftUI `Menu`'s XCUITest element
+type is not guaranteed to be `.button`, so the risk was a false alarm while the toolbar still worked.
+It did not fire, and the assertion is now precedent-backed like every other asserted string.
+**Widen the query, do not delete the assertion** — that instruction stands for any future failure of
+this check, but it is no longer needed *for* this assertion, which has passed live and so no longer
+needs defending on suspicion.
+
+**The two mode-picker `isEnabled` waits neither hung nor false-failed.** `Phase6SmokeTests` waits for
+`newjob.mode`'s "Single" segment to report `isEnabled` before switching back to Single, twice — once
+on the fewer-than-two-outfits `XCTSkip` path and once before the final `Phase4Draft.clear(in:)` —
+because the mode `Picker` in `NewJobView` carries `.disabled(store.isBusy || composer.isRunning)` and
+a tap on a disabled SwiftUI control is a silent no-op. A passing run proves those waits did not block
+and did not fail, so they are **safe**. It does **not** prove they are load-bearing, and this file must
+not say they are: if XCUITest does not propagate a SwiftUI `Picker`'s `.disabled` to its synthesized
+segment buttons, each wait returns true immediately and is inert rather than harmful. Telling the two
+apart needs a deliberately-disabled picker, which no gate builds. Whether they are effective is
+**unsettled**.
+
+Material preconditions for a re-run: the ≥2-image outfit count is guarded and skips, but the smoke also
+needs ≥1 compatible image (Character) and ≥1 compatible **video** (Driver — `role_kind` in
+`scripts/control/drafts.py` maps `driver` to `video`, per its `VIDEO_ROLES` set); a missing Character
+or Driver material hard-fails inside `Phase4Draft.chooseMaterial` ("A compatible material must exist
+for Driver") rather than skipping. That is an environment gap (restore test material), not a code
+regression — Phase 3/4 pass live against the same three roles, so the library normally has them. The
+empty-draft precondition skips for three distinct causes and names the literals it expected, so a
+network blip does not read as a non-empty draft.
+
+**No real batch has run, and this gate is not one.** `Phase6SmokeTests` builds its two-outfit batch out
+of *free* draft mutations (`PATCH` + add-to-batch — no `SpendGate`, no Idempotency-Key), then drops an
+entry and clears; it never rents a pod, never calls Phase A and never reaches a confirm, which is why
+it can assert zero recorded spends. A passing `make ios-ui-test` is therefore not batch evidence. A
+2-outfit batch with one seeded job — proving Phase A calls the provider once for the unseeded outfit
+and reuses the saved image for the seeded one — remains the proposed spend test; it needs its own
+approval and a quoted price, and its cost comes from the balance delta and then `runpodctl billing`.
 
 ### Phase 5 (2026-09-23, merged as `7a8c0e2`)
 
@@ -266,11 +287,18 @@ tapping the UI on a phone.
 ## Known incomplete work
 
 - Phase 2's physical-phone smoke with a real interrupted upload larger than 32 MiB has not run.
-- Phase 6 is complete in code on `feat/swiftui-phase-6`. `make ios-contract` has run (14/14, live,
-  2026-09-24) and so has `make batch-test`; `make ios-ui-test` (`Phase6SmokeTests`) is **still
-  pending — it has never executed**, and it boots a simulator, so it must run outside the command
-  sandbox. See the gate record above. No real batch has run: a 2-outfit batch with one seeded job is
-  the proposed spend test and needs its own approval and quoted price.
+- Phase 6 is complete in code on `feat/swiftui-phase-6`, and every gate in its record has now run:
+  `make ios-contract` (14/14), `make batch-test` and `make ios-ui-test` (`Phase6SmokeTests`, 4/4,
+  zero recorded spends), all live on 2026-09-24. See the gate record above. A re-run of
+  `make ios-ui-test` boots a simulator, so it must run outside the command sandbox. **No real batch
+  has run, and the smoke is not one** — it builds its two-outfit batch from free draft mutations and
+  never rents a pod. A 2-outfit batch with one seeded job is still the proposed spend test and needs
+  its own approval and quoted price.
+- Unsettled by that pass (not a bug, and not proven either way): whether XCUITest propagates a SwiftUI
+  `Picker`'s `.disabled` to its synthesized segment buttons. `Phase6SmokeTests`'s two `newjob.mode`
+  `isEnabled` waits passed, which proves they are safe but not load-bearing — if the property does not
+  propagate, each wait returns true immediately and is inert. Observing the difference needs a
+  deliberately-disabled picker. See §"Notes on the `make ios-ui-test` run".
 - A draft whose basket has fewer than 2 entries has no drop affordance by design — the condition is
   `RunFlow.canDropFromBatch`, and the counter-intuitive part is that it counts **basket entries**
   (`draft.batch.count`), not `draft.jobs`. So a run of 2 jobs built from 1 basket entry plus a
@@ -335,7 +363,10 @@ tapping the UI on a phone.
   (§"Real spend test"); it has not been driven by tapping the UI. No real migration has run.
 - No GPU or pod was rented for Phases 1–6. Do not reinterpret simulator or fake-server coverage as a
   real spend-path test — no live Phase A, regenerate, confirm or resume has run. The refusal smoke
-  proves only that bogus-token spends are refused before anything is called.
+  proves only that bogus-token spends are refused before anything is called. The 2026-09-24
+  `make ios-ui-test` pass (4/4) does not change this: `Phase6SmokeTests` runs under
+  `-UITestRecordingSpendGate` and asserts zero recorded spends, so it is the fourth zero-spend
+  simulator smoke, not a batch run.
 - `ios/Secrets.xcconfig`, personal media, screenshots with personal names, upload checkpoints and live
   API payloads must remain uncommitted.
 
@@ -343,9 +374,9 @@ tapping the UI on a phone.
 
 No phase remains — Phases 1–6 are implemented in code. Open items, none of them a phase:
 
-1. **Run the one remaining live gate, then merge** (controller). `make ios-contract` has run (14/14,
-   2026-09-24); `make ios-ui-test` (`Phase6SmokeTests`) has not, and it boots a simulator, so it must
-   run outside the command sandbox. `main` is 2 commits ahead of `origin/main` (`4052b97` spec,
+1. **Merge** (controller). Both live gates have run — `make ios-contract` (14/14) and
+   `make ios-ui-test` (`Phase6SmokeTests`, 4/4, zero recorded spends), 2026-09-24; see the gate
+   record. Nothing in that record is outstanding. `main` is 2 commits ahead of `origin/main` (`4052b97` spec,
    `5eaa652` plan), both unpushed — push `main` first or the Phase 6 PR will carry them. Phase 6
    touches `scripts/**`, so before merging check the VPS for a drain, Phase A, pod lease and migration
    (the merge auto-deploys `motion-bot`).
@@ -370,8 +401,9 @@ auto-deploy the bot.
 
 ## Recommended kickoff for the next effort
 
-No phase remains (see "Next work"), so this is the start of whatever comes next — running the pending
-live gates and merging, the optional spend test, a deferred parent-spec item, or a Phase 6 follow-up.
+No phase remains (see "Next work") and no Phase 6 gate is outstanding, so this is the start of
+whatever comes next — merging Phase 6, the optional spend test, a deferred parent-spec item, or a
+Phase 6 follow-up.
 
 1. Verify `git status`, the branch and the current SHA; preserve unrelated changes. Phase 6 lives on the
    unmerged `feat/swiftui-phase-6`, and `main` is 2 unpushed commits ahead of `origin/main`
