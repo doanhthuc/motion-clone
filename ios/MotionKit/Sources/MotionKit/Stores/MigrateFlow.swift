@@ -35,15 +35,23 @@ public final class MigrateFlow {
     private let client: APIClient
     private let gate: any SpendSending
     private let pod: PodStore
+    /// Read for `isDropping` only. `RunFlow.spend` guards its own four entry
+    /// points; `migrate()` calls `gate.perform` directly and so needs the same
+    /// guard here, or `RunFlow.drop`'s PATCH and validate — a 95 s client
+    /// timeout each, because the server can probe for 60 s and validate for
+    /// 90 s — are a window the most destructive call in the API can be
+    /// launched inside.
+    private let runFlow: RunFlow
     private let now: @Sendable () -> Date
     private var deadline: Date?
     private var didReplay = false
 
-    public init(client: APIClient, gate: any SpendSending, pod: PodStore,
+    public init(client: APIClient, gate: any SpendSending, pod: PodStore, runFlow: RunFlow,
                 now: @escaping @Sendable () -> Date = { Date() }) {
         self.client = client
         self.gate = gate
         self.pod = pod
+        self.runFlow = runFlow
         self.now = now
     }
 
@@ -63,6 +71,7 @@ public final class MigrateFlow {
         guard let ask = currentAsk, let deadline else { return false }
         return typed == ask.toDc && date < deadline
             && !isSending && !needsRecheck && pendingNotice == nil
+            && !runFlow.isDropping
     }
 
     /// Why a migration can't start, or nil. The server re-checks every one of
@@ -107,6 +116,21 @@ public final class MigrateFlow {
     }
 
     public func migrate() async {
+        // Ahead of `canMigrate`, deliberately. `canMigrate` carries the same
+        // `!runFlow.isDropping` term and both guards are `@MainActor` with no
+        // `await` between them, so checking the drop second would make this
+        // guard unreachable and the refusal silent — a dead guard reads as
+        // coverage it does not provide. Kept as the choke point regardless,
+        // mirroring `RunFlow.spend`: a caller that skips the button check still
+        // cannot launch the one call that deletes a volume while the draft is
+        // moving under it. `recheck()` and `replayPendingOnce()` deliberately do
+        // NOT come through here — they resolve a request already sent, and
+        // blocking them would strand a pending migration behind an unrelated
+        // drop.
+        guard !runFlow.isDropping else {
+            message = "A batch drop is still in flight — wait for it before moving the volume."
+            return
+        }
         guard canMigrate(at: now()), let ask = currentAsk else { return }
         let label = "Migrate volume to \(ask.toDc)"
         inFlightLabel = label

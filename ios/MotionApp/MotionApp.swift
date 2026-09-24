@@ -90,8 +90,12 @@ final class AppModel {
             }
             : SpendGate(client: client)
         spendGate = gate
-        runFlow = RunFlow(client: client, gate: gate)
-        migrate = MigrateFlow(client: client, gate: gate, pod: pod)
+        // A local `let`, like `pod` and `draft` above: `self.runFlow` is a
+        // `RunFlow?`, and `MigrateFlow` takes the dependency non-optional so an
+        // absent one cannot silently no-op its drop guard.
+        let runFlow = RunFlow(client: client, gate: gate)
+        self.runFlow = runFlow
+        migrate = MigrateFlow(client: client, gate: gate, pod: pod, runFlow: runFlow)
         replayTask = nil
         replayPendingSpend()
         resumeMaterialsUpload()
