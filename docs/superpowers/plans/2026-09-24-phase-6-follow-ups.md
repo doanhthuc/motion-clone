@@ -685,6 +685,13 @@ Co-Authored-By: Qwen Code <noreply@qwen.com>"
 > 4. **The "~95 s PATCH + ~90 s validate" figures conflate two different numbers.** Both client
 >    timeouts are **95 s** (`RunFlowStore.swift:308`, `:314`); 90 s is the *server's* validate budget
 >    (`:311-312`). Quoting the server's number understates the client-side window.
+> 5. **Step 1's two tests shipped stronger than written, after review.** `recheckAndReplayAreNotBlockedByADrop`
+>    claimed `replayPendingOnce()` coverage its body never exercised, so it was split into
+>    `recheckIsNotBlockedByADrop` plus a new `replayPendingOnceIsNotBlockedByADrop` with its own gate
+>    scripting; `step != .choose` became `== .started(toDc: "EU-CZ-1")`; and the money-path assertion
+>    `allSatisfy { $0.kind != .migrate }` was vacuously true on an empty intent list, so the test that
+>    never spends uses `isEmpty` and the two that deliberately spend once use `intents.count == 1` plus
+>    a `rechecks`/`replays` counter. Read the shipped tests, not the snippet below.
 
 **Files:**
 - Modify: `ios/MotionKit/Sources/MotionKit/Stores/MigrateFlow.swift:36-48` (init), `:63-68` (`canMigrate`), `:113-127` (`migrate`)
