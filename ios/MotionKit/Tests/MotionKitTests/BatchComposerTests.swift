@@ -184,9 +184,9 @@ extension URLProtocolTests {
     }
 
     /// A stopped run keeps its k/N — spec §4 wants it at the stop — but the
-    /// selection edited afterwards must not inherit it, or Task 8 renders
-    /// "1/3" beside four rows. One failed run per mutator, because the first
-    /// edit already clears what the next two would have to prove.
+    /// selection edited afterwards must not inherit it, or `BatchComposerSection`
+    /// renders "1/3" beside four rows. One failed run per mutator, because the
+    /// first edit already clears what the next two would have to prove.
     @Test func editingTheSelectionClearsAStoppedRunsProgress() async {
         let server = FakeDraftServer()
         let (composer, _) = await make(server)
@@ -229,6 +229,29 @@ extension URLProtocolTests {
         #expect(composer.failure == nil)
         #expect(composer.lastAdded == 1)
         #expect(draft.error == nil)
+    }
+
+    /// `lastAdded` is rendered as "Added N jobs to the batch." on the screen
+    /// where the user decides how much GPU to rent, so it must be what THIS run
+    /// added — the steps it executed — not the size of the selection it started
+    /// from. A Continue re-plans from the server's draft and `pending(in:)`
+    /// skips the outfits already basketed; the selection size would report 3
+    /// here for one job added.
+    @Test func lastAddedCountsTheStepsThisRunExecutedNotTheSelection() async {
+        let server = FakeDraftServer()
+        server.preload(outfit: "app/o1.png", seed: nil)   // basketed before we ever read
+        server.preload(outfit: "app/o2.png", seed: nil)
+        let (composer, draft) = await make(server)
+        #expect(draft.draft?.batch.count == 2)
+        for o in ["app/o1.png", "app/o2.png", "app/o3.png"] { composer.toggle(outfitID: o) }
+        #expect(composer.outfits.count == 3)
+
+        await composer.run()
+
+        #expect(composer.failure == nil)
+        #expect(draft.draft?.batch.count == 3)             // only o3 was added
+        #expect(writePaths() == ["PATCH /v1/draft", "POST /v1/draft/add-to-batch", "PATCH /v1/draft"])
+        #expect(composer.lastAdded == 1)
     }
 
     /// The unsafe direction of the spec §4 re-read: an entry dropped elsewhere

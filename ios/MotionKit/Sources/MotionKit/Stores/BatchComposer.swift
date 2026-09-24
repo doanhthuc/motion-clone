@@ -35,7 +35,11 @@ public final class BatchComposer {
     public private(set) var isRunning = false
     public private(set) var progress: Progress?
     public private(set) var failure: String?
-    /// How many outfits the last complete run left in the basket.
+    /// How many basket jobs the last complete run added — the steps it
+    /// executed, not the size of the selection it started from. A **Continue**
+    /// re-plans from the server's draft and `pending(in:)` skips the outfits
+    /// already basketed, so the selection size over-reports; this number is
+    /// rendered on the screen where the user decides how much GPU to rent.
     public private(set) var lastAdded: Int?
 
     private let draft: DraftStore
@@ -195,7 +199,11 @@ public final class BatchComposer {
             failure = "All outfits were added, but the outfit slot could not be cleared: "
                 + (draft.message ?? draft.error?.userMessage ?? "unknown error")
         }
-        lastAdded = outfits.count
+        // `steps`, not `outfits`: on success every planned step ran, and a
+        // failure returns early through `stop(at:)` without reaching this line.
+        // `outfits.count` would report the whole selection after a Continue
+        // that only added the outfits not already basketed.
+        lastAdded = steps.count
         outfits = []
         progress = nil
     }

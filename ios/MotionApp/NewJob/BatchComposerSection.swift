@@ -113,14 +113,20 @@ struct BatchComposerSection: View {
             Text("Fill \(composer.missingShared.joined(separator: ", ")) first.")
                 .font(Theme.sans(12)).foregroundStyle(Theme.amber)
         }
-        Button(composer.failure == nil
-               ? "Add \(composer.outfits.count) job\(composer.outfits.count == 1 ? "" : "s") to batch"
-               : "Continue") {
-            Task { await composer.run() }
+        // Hidden once a build has landed: success clears `outfits`, so the
+        // label would read "Add 0 jobs to batch" on a disabled button. A
+        // failure keeps it visible — that is the Continue a stopped run offers,
+        // and a run in flight keeps it so the button does not vanish mid-build.
+        if !composer.outfits.isEmpty || composer.failure != nil || composer.isRunning {
+            Button(composer.failure == nil
+                   ? "Add \(composer.outfits.count) job\(composer.outfits.count == 1 ? "" : "s") to batch"
+                   : "Continue") {
+                Task { await composer.run() }
+            }
+            .buttonStyle(PrimaryButtonStyle())
+            .accessibilityIdentifier("batch.run")
+            .disabled(!composer.canRun)
         }
-        .buttonStyle(PrimaryButtonStyle())
-        .accessibilityIdentifier("batch.run")
-        .disabled(!composer.canRun)
     }
 }
 
