@@ -549,7 +549,7 @@ Co-Authored-By: Qwen Code <noreply@qwen.com>"
 
 **Files:**
 - Modify: `ios/MotionKit/Sources/MotionKit/Stores/RunFlowStore.swift:96-114` (the `canRetryRental` / `retryRentalBlockReason` doc comments and the block string)
-- Test: `ios/MotionKit/Tests/MotionKitTests/RunFlowTests.swift` — append after `aDropAfterAConfirmWithdrawsTheRentalRetry` (`:545`)
+- Test: `ios/MotionKit/Tests/MotionKitTests/RunFlowTests.swift` — append after `aDropAfterAConfirmWithdrawsTheRentalRetry` (`:545`). **That test no longer exists**: the final fix wave deleted it when the client latch was removed, and also renamed `rentalRetrySurvivesAnUnchangedDraftAndARelaunch` to `rentalRetrySurvivesTheConfirmsOwnClearAndARelaunch`. This Files block is historical; grep by behaviour, not by name.
 
 **Interfaces:**
 - Consumes: the server's `RESUME_STALE_GENERATION` text from Task 1, asserted as a literal here so the two sides cannot drift silently.
@@ -1608,6 +1608,21 @@ Not tasks — these need a human decision or shared-state access, and the execut
 
    Replace all nine with what shipped. The `:344-346` entry is the one that must be *rewritten* rather
    than deleted, for the reason given above.
+
+7. **Two comment-only follow-ups the post-wave review recommended and the controller deferred**, because
+   the branch was already reviewed clean and a comment edit would mean re-running `make ios-build` and
+   `build-for-testing` for zero behavioural gain:
+   - `ios/MotionApp/Runs/RunDetailView.swift:25` — the inner `if flow.canRetryRental` is now redundant
+     with the outer condition at `:17`. **Do not dedent it blind**: a ~10-line dedent inside a SwiftUI
+     `body` is the one edit class here that can silently move a modifier onto the wrong view, and no
+     automated gate exercises the failed-rental card. Either add a one-line comment saying it is redundant
+     and kept deliberately (it is defensive if `canRetryRental` ever regains a term), or dedent it with
+     the live UI run available to check.
+   - `ios/MotionKit/Tests/MotionKitTests/RunFlowTests.swift:73-79` — the post-confirm draft fixture is a
+     hand transcription of server state with no cross-language pin. If `clear()`'s shape ever changes,
+     `scripts/tests/test_batch_control_botruns.py:540-582` goes red and Swift silently keeps testing a
+     stale fixture. One clause in the fixture's doc comment naming that Python test as the authority
+     closes it; the comment currently cites only `drafts.py` line ranges.
 
    **And the client latch no longer exists.** The final whole-branch review found that the app's
    `confirmedGeneration` held the *pre-clear* generation while the server stamped the *post-clear* one,

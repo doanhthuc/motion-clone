@@ -286,7 +286,7 @@ the pending-notice machinery Phase 6 deliberately kept out of `spend`. The hando
 direction only.
 
 **A third direction, also recorded and also not fixed.** `AppModel.reconnect()` refuses to rebuild the
-stores during a spend or a pending migrate (`MotionApp.swift:65-66` guards on `isSpending` and
+stores during a spend or a pending migrate (`MotionApp.swift:64-65` guards on `isSpending` and
 `pendingNotice`) but **not** during a drop, so a credential save inside a drop window installs a fresh
 `RunFlow` with `isDropping == false` while the server is still dropping. This window is *not*
 server-backstopped the way the paragraph above implies for the reverse direction: `_migrate_blocked`
@@ -301,7 +301,9 @@ completes.
 
 ### What actually reaches the screen today
 
-`APIError.userMessage`'s `default` branch returns a 422's server text verbatim (`APIError.swift:35`).
+`APIError.userMessage`'s `default` branch returns a 422's server text verbatim (`APIError.swift:43`;
+`:35` was `default` when this spec was written and is now the `case 422 where code == "invalid"` arm
+this branch added).
 For `code == "invalid"` that text is one of three things, and all three are wrong on a consumer
 screen:
 
@@ -348,8 +350,9 @@ spec's first draft said the catch "sets `message` from a `String`, not an `APIEr
 `RunFlow.drop`'s catch (`RunFlowStore.swift:322`) is `message = apiError(error).userMessage`, so the
 drop path routes through `userMessage` and does receive the headline; it gets no disclosure because
 `message` is a `String` field, so there is no `APIError` left to hand to `ErrorBanner`. The
-distinction mattered: because the path does route through `userMessage`, `RunFlowTests.swift:403`
+distinction mattered: because the path does route through `userMessage`, the then-`RunFlowTests.swift:403`
 pinned the old verbatim behaviour and broke, making `RunFlowTests.swift` a fifth file in this task.
+(The line has since moved; this is a historical reference to the state at Task 5, not to HEAD.)
 Corrected 2026-09-24 during implementation.
 
 A **third** surface folds the headline into a `String`, and this section's first draft enumerated only
