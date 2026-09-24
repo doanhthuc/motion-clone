@@ -3100,7 +3100,10 @@ _GUIDANCE_FLAGS = {"keep_face": "keepFace", "tighter_crop": "tighterCrop",
 
 def _regen_tryon(tg: Tg, chat_id: int, index: str, token: str, *,
                  dry_run: bool, guidance: list[str] | None = None) -> Outcome:
-    """Redo ONE run's try-on image, leaving every other run's untouched.
+    """Redo ONE try-on image, leaving every other run's untouched.
+
+    A tap on a follower of a shared try-on redoes its leader's image instead
+    (spec §3); the followers recopy the new one on the resume.
 
     Reached from the 🔄 button under a Phase A preview. The mechanism is the
     one Phase A already trusts for "skip what is done": drop this run's stage
@@ -3146,6 +3149,16 @@ def _regen_tryon(tg: Tg, chat_id: int, index: str, token: str, *,
                        "bot; send /start for the commands")
     run = manifest.runs[int(index)]
     stage_name = _local_tryon_stage(run)
+    # A follower's image is a copy of its leader's, so regenerating it means
+    # regenerating the leader. Only the leader's stage is backed up and
+    # popped: followers pick up the new image by source_sha256
+    # (runner.follower_reusable); popping them too would make _settle_regen's
+    # single-entry restore incomplete.
+    leader_id = tryon_share_groups(manifest).get(run.id, run.id)
+    if leader_id != run.id:
+        index = str(next(i for i, r in enumerate(manifest.runs) if r.id == leader_id))
+        run = manifest.runs[int(index)]
+        stage_name = _local_tryon_stage(run)
     if stage_name is None:
         return _refuse(tg, chat_id, "not_local",
                        f"{run.id}'s try-on no longer runs over the API "
@@ -3264,7 +3277,12 @@ def _tryon_failure_reason(error: str) -> str:
 
 
 def _report_failed_tryons(tg: Tg, chat_id: int, manifest_path: Path) -> None:
-    """One message per run whose Phase A try-on failed: why, plus retry buttons.
+    """One message per failed Phase A try-on: why, plus retry buttons.
+
+    Per provider call, not per run: a follower of a shared try-on fails only
+    because its leader did (runner.py records "shared try-on from … failed"),
+    so it is named in the leader's message instead of getting its own, and
+    the buttons retry the leader, which is the one that calls the provider.
 
     Until this existed the only sign in the chat was a ❌ on the progress bar,
     and the reason sat in run.log on the VPS.
@@ -3273,9 +3291,10 @@ def _report_failed_tryons(tg: Tg, chat_id: int, manifest_path: Path) -> None:
     runs = load_state(state_path_for(manifest_path)).get("runs") or {}
     token = _run_token(chat_id)
     qwen_ok = qwen_max_configured(ROOT)
+    groups = tryon_share_groups(manifest)
     for index, run in enumerate(manifest.runs):
         stage_name = _local_tryon_stage(run)
-        if stage_name is None:
+        if stage_name is None or groups.get(run.id, run.id) != run.id:
             continue
         entry = runs.get(run.id) or {}
         if (((entry.get("stages") or {}).get(stage_name) or {})
@@ -3288,24 +3307,31 @@ def _report_failed_tryons(tg: Tg, chat_id: int, manifest_path: Path) -> None:
                    for key, label in _RETRY_PROVIDERS.items()
                    if key != "qwen-max" or qwen_ok]
         hint = "" if qwen_ok else f"\n{_esc(_QWEN_MISSING)}"
+        followers = [r.id for r in manifest.runs
+                     if r.id != run.id and groups.get(r.id) == run.id]
+        waiting = (f"\nAlso waiting on this image: {_esc(', '.join(followers))}"
+                   if followers else "")
         tg.send_message(
             chat_id,
             f"{ICON_ERROR_CE} <b>Try-on failed</b> for <code>{_esc(run.id)}</code> "
             f"({_esc(str(provider))})\n"
             f"{_tryon_failure_reason(str(entry.get('error') or 'no reason recorded'))}"
-            f"{hint}\nRetrying costs API quota only; no GPU is rented.",
+            f"{waiting}{hint}\nRetrying costs API quota only; no GPU is rented.",
             parse_mode=PARSE_HTML, buttons=[buttons])
 
 
 def _retry_tryon(tg: Tg, chat_id: int, index: str, provider: str, token: str,
                  *, dry_run: bool) -> None:
-    """Retry one failed try-on, switching that run alone to `provider` first.
+    """Retry one failed try-on, switching its share group to `provider` first.
 
     The switch goes onto the drafted Job as well as the manifest, because
     [Run] re-renders the manifest from the jobs: a manifest-only edit would be
     undone by the next render, and Phase A would call the old provider again.
-    Every other run keeps its params, so local_tryon_reusable still skips
-    their finished images. The rest is _regen_tryon, unchanged.
+    Every run in the tapped run's share group switches together: the provider
+    is part of runner.tryon_share_key, so switching the leader alone would
+    split the group and pay the old provider again for the followers. Every
+    other run keeps its params, so local_tryon_reusable still skips their
+    finished images. The rest is _regen_tryon, unchanged.
     """
     if provider not in _RETRY_PROVIDERS:
         tg.send_message(chat_id, "that button is from an older version of the "
@@ -3352,9 +3378,16 @@ def _retry_tryon(tg: Tg, chat_id: int, index: str, provider: str, token: str,
             tg.send_message(chat_id, "the drafted job no longer matches the batch "
                                      "on disk, so nothing was retried.")
             return
-        jobs[int(index)].provider = provider
+        groups = tryon_share_groups(manifest)
+        group = groups.get(run.id, run.id)
+        members = [i for i, r in enumerate(manifest.runs)
+                   if groups.get(r.id, r.id) == group]
+        for i in members:
+            jobs[i].provider = provider
         write_manifest(jobs, manifest_path, now=time.strftime("%Y-%m-%d %H:%M:%S"))
-        tg.send_message(chat_id, f"{_esc(run.id)} switched to "
+        switched = (f"{_esc(run.id)} switched" if len(members) == 1
+                    else f"{len(members)} runs switched")
+        tg.send_message(chat_id, f"{switched} to "
                                  f"{_RETRY_PROVIDERS[provider]} for this retry; "
                                  "the other runs keep their provider.")
         token = _run_token(chat_id)
