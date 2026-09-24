@@ -1603,6 +1603,16 @@ Not tasks — these need a human decision or shared-state access, and the execut
    | `:341` | the client-only latch |
    | `:344-346` | the client-only latch, **and the rejected approach A2** |
    | `:395` | the client-only latch, repeated in the "Next work" list |
+   | `:118-121` | **eighth site, found by the final review.** Two claims in one bullet: the latch is described as client-only with no mention of the server stamp, and it says `resume` "deliberately never reads the draft". Separate bullet from `:115`'s `MigrateFlow` bypass, which is why the seven-line sweep missed it. |
+   | `:348` | sits just past the `:344-346` range above: "`resume` currently ignores the draft by explicit design (`bot.py:7394-7395`)" — and that citation has drifted to `:7511-7513`. |
 
-   Replace all seven with what shipped. The `:344-346` entry is the one that must be *rewritten* rather
+   Replace all nine with what shipped. The `:344-346` entry is the one that must be *rewritten* rather
    than deleted, for the reason given above.
+
+   **And the client latch no longer exists.** The final whole-branch review found that the app's
+   `confirmedGeneration` held the *pre-clear* generation while the server stamped the *post-clear* one,
+   so any draft re-read between an accepted confirm and a Retry tap withheld a retry the server would
+   have granted, with a message naming a recovery that the cleared draft made impossible. The human ruled:
+   remove the latch and let the server refuse with the identical sentence. So every handoff line that
+   describes the latch as a shipped safety mechanism must say it was removed and why, not that it was
+   supplemented.
