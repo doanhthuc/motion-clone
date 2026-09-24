@@ -1465,9 +1465,11 @@ Check the surrounding bullet's tense and style before writing, and keep the READ
 
 Then verify nothing else in the tracked tree still calls this future work:
 
-Run: `cd "$REPO" && grep -rn "durable fix is a server-side\|in memory, so an app relaunch" --include=*.md . | grep -v "^./.superpowers"`
+Run: `cd "$REPO" && grep -rn "durable fix is server-side\|durable fix is a server-side\|in memory, so an app relaunch\|is not covered by it\|Single mode on the New Job tab" --include=*.md . | grep -v "^./\.superpowers"`
 
-Expected: only `docs/superpowers/swiftui-app-progress.md`, which Global Constraints reserve for after the merge. Any other hit is a doc this plan never inventoried — report it rather than fixing it silently.
+Expected: hits only in `docs/superpowers/plans/2026-09-24-phase-6-follow-ups.md` (which quotes the README text and the grep command itself) and `docs/superpowers/swiftui-app-progress.md`, which Global Constraints reserve for after the merge. Any other hit is a doc this plan never inventoried — report it rather than fixing it silently.
+
+This pattern was corrected during Task 8. The first draft searched only for `"durable fix is a server-side"`, and the handoff words it `"durable fix is server-side"` — no article — so the grep could not find the one file it was written to find, and reported a clean sweep that was not one. A verification grep that misses its own target is worse than no grep, because it produces a false negative that looks like evidence.
 
 - [ ] **Step 4: Commit**
 
