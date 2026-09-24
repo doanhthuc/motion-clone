@@ -418,14 +418,23 @@ Append to the `AppRuns.confirm` test class in `scripts/tests/test_batch_control_
         d = self.store._load()
         d.generation = 7
         self.store._save(d)
+        before = self.store.runnable()[2]
+        self.assertEqual(before, 7)     # the seed took; a silent 0 would make
+                                        # a reset and a no-op the same number
         # `_body()` reads `panel_token()`, which carries the generation — so it
         # must be evaluated after the seeding above, not before it.
         with mock.patch("tgbot.bot._do_confirm",
                         return_value=Outcome(True, "started")):
             self.assertEqual(self.runs.confirm(self.runs.run_id, self._body(), "k3")[0], 202)
-        self.assertEqual(self.store.runnable()[0], [])    # the draft really is empty
-        self.assertEqual(self.store.runnable()[2], 8)     # ...and clear() counted it up
-        self.assertEqual(bot._load_confirm_stamp(ME), 8)  # the stamp followed it
+        self.assertEqual(self.store.runnable()[0], [])          # the draft really is empty
+        # `before + 1`, not a literal 8: this is the assertion that fails under a
+        # reset-to-0 `clear()`, so it pins that the counter only rises — the
+        # property `_resume_generation_refusal`'s docstring relies on. It is not
+        # the retry invariant itself (the predicate assertion below is), and it
+        # will also fire if `clear()` is ever legitimately changed to preserve
+        # the generation while the stamp stays consistent.
+        self.assertEqual(self.store.runnable()[2], before + 1)  # ...and counted up, not reset
+        self.assertEqual(bot._load_confirm_stamp(ME), before + 1)   # the stamp followed it
         # The assertion that matters: through the predicate `resume` actually
         # uses, not a number comparison that could hold while the gate refuses.
         self.assertIsNone(bot._resume_generation_refusal(ME, self.store))
