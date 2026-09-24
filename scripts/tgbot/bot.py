@@ -7314,7 +7314,14 @@ def _load_confirm_stamp(chat_id: int) -> int | None:
     except (OSError, ValueError):
         return None
     generation = raw.get("generation") if isinstance(raw, dict) else None
-    return generation if isinstance(generation, int) else None
+    # `and not isinstance(..., bool)` because bool subclasses int, so without it
+    # a hand-edited `{"generation": true}` would load as generation 1 and could
+    # match a real stamp. This is a money gate reading on-disk state, so it
+    # accepts only what its one writer (_save_confirm_stamp, annotated int) can
+    # produce — the same exclusion _migration_state's number() already makes.
+    if isinstance(generation, int) and not isinstance(generation, bool):
+        return generation
+    return None
 
 
 def _resume_generation_refusal(chat_id: int, drafts: DraftStore) -> str | None:

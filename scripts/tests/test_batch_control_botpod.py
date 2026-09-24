@@ -560,6 +560,8 @@ class TestAppPodResume(_PodFixture):
         self.assertIsNone(bot._load_confirm_stamp(ME))       # fail quiet
         bot._confirm_stamp_path(ME).write_text('{"generation":"7"}', encoding="utf-8")
         self.assertIsNone(bot._load_confirm_stamp(ME))       # not an int
+        bot._confirm_stamp_path(ME).write_text('{"generation":true}', encoding="utf-8")
+        self.assertIsNone(bot._load_confirm_stamp(ME))       # bool is not an int
 
     def test_resume_refuses_when_the_draft_moved_since_the_confirm(self):
         self._seed_failure()
@@ -601,12 +603,20 @@ class TestAppPodResume(_PodFixture):
     def test_a_leftover_stamp_allows_a_resume_the_draft_has_not_moved(self):
         """Review Focus 1. The stamp is per chat and never deleted, so an app
         confirm from days ago is still on disk when the phone retries a rental
-        the user has since confirmed from Telegram. Telegram never touches the
-        app draft, so the generation has not moved and the retry is legitimate."""
+        the user has since confirmed from Telegram. Telegram keeps its own draft
+        in `_STATE`/`_LAST_VALIDATE`, a separate store from the app's
+        DraftStore, so moving the Telegram side cannot move the app draft's
+        generation: the stamp still matches and the retry is legitimate.
+
+        Both halves are asserted, because the property is the *separation* —
+        Telegram state really moved while the app generation really did not."""
         self._seed_failure()
         generation = self.store.runnable()[2]
         bot._save_confirm_stamp(ME, generation)
-        bot._STATE[ME] = self._job("telegram")     # a Telegram-side draft
+        job = self._telegram_draft()          # sets bot._STATE[ME] and _LAST_VALIDATE[ME]
+        self.assertIs(bot._STATE[ME], job)                    # Telegram side moved
+        self.assertTrue(bot._LAST_VALIDATE[ME])
+        self.assertEqual(self.store.runnable()[2], generation)  # app side did not
         self.assertEqual(self.pod.resume(self.pod.run_id, self._body(), "k1")[0], 202)
         self.patches["start_drain"].assert_called_once()
 
@@ -621,6 +631,54 @@ class TestAppPodResume(_PodFixture):
         status, body = self.pod.resume(self.pod.run_id, self._body(), "k1")
         self.assertEqual(status, 409)
         self.assertEqual(body["error"]["code"], "stale_run")
+        # The message, not just the code: the `run_token` gate emits the same
+        # `stale_run`, so without this a refusal from the wrong gate passes.
+        self.assertEqual(body["error"]["message"], bot.RESUME_STALE_GENERATION)
+        self.patches["start_drain"].assert_not_called()
+
+    # -- the gate's position in resume's chain, both directions --------------
+
+    def test_a_bad_run_token_refuses_before_the_stamp_check(self):
+        """The check ABOVE the stamp gate. Both refusals are `409 stale_run`, so
+        only the sentence tells them apart, and they advise different
+        recoveries: a moved manifest means re-read the run, a moved draft means
+        Confirm again. The token is the more concrete fact — what the phone is
+        holding is not what is on disk — so it answers first."""
+        self._seed_failure()
+        bot._save_confirm_stamp(ME, 4)
+        d = self.store._load()
+        d.generation = 5
+        self.store._save(d)
+        status, body = self.pod.resume(
+            self.pod.run_id, self._body(run_token="0"), "k1")
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["code"], "stale_run")
+        self.assertEqual(body["error"]["message"],
+                         "the run changed since it was read — read it again")
+        self.assertNotEqual(body["error"]["message"], bot.RESUME_STALE_GENERATION)
+        self.patches["start_drain"].assert_not_called()
+
+    def test_a_moved_draft_refuses_even_with_no_provision_failure(self):
+        """The check BELOW the stamp gate — the half a seeded failure cannot
+        show. Every other stamp refusal calls `_seed_failure()`, so
+        `read_provision_failure` is non-None and the gate answers the same
+        whether it sits above that branch or below it. Here there is
+        deliberately no failure file, so a gate demoted below it would answer
+        `no_failure` and the phone's Retry screen — left open after the failure
+        was already cleared — would never tell the user to Confirm again.
+        Unreachable unless the gate sits above `read_provision_failure`."""
+        bot._save_confirm_stamp(ME, 4)
+        d = self.store._load()
+        d.generation = 5
+        self.store._save(d)
+        # Pinned, not assumed: this test only means what it says while no
+        # failure file exists, so a future `_seed_failure()` in setUp would have
+        # to trip this rather than silently neuter it.
+        self.assertFalse(provision_failure_path(self._live()).exists())
+        status, body = self.pod.resume(self.pod.run_id, self._body(), "k1")
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["code"], "stale_run")   # not no_failure
+        self.assertEqual(body["error"]["message"], bot.RESUME_STALE_GENERATION)
         self.patches["start_drain"].assert_not_called()
 
     def test_the_stamp_check_runs_before_the_gpu_check(self):
