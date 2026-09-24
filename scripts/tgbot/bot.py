@@ -7038,6 +7038,25 @@ class AppRuns:
                     if out:
                         self.drafts.clear()
             if out:
+                # Accepted, so this is the generation the user agreed to spend
+                # on — the value `resume` compares the draft against later.
+                # Both accepted branches clear the draft above and neither is
+                # reached on a refusal, so one read and one write here covers
+                # both and nothing else.
+                #
+                # Read HERE, after the clears, and not before them: `clear()`
+                # routes through `_changed`, which does `generation += 1`
+                # (drafts.py:275-279), so a pre-clear read stamps G while the
+                # confirm leaves the draft at G+1 — `_resume_generation_refusal`
+                # would then refuse every app Retry rental that ever existed.
+                # Measured 2026-09-24: two clears on a fresh store give
+                # generation 0 → 1 → 2. `clear()` "keeps counting" in the sense
+                # of not resetting, not in the sense of standing still.
+                #
+                # Still one value read under one lock acquisition: BOT_LOCK is
+                # held for this whole block, so nothing outside it can move the
+                # counter between the clear and this read.
+                _save_confirm_stamp(self.chat_id, self.drafts.runnable()[2])
                 response = (202, {"run_id": self.run_id, "outcome": out.code})
             else:
                 response = (status_for(out), _run_error(out.code, out.message))
@@ -7336,9 +7355,11 @@ def _resume_generation_refusal(chat_id: int, drafts: DraftStore) -> str | None:
     Comparing generations rather than draft contents is what makes this work at
     all: `confirm` clears the draft on acceptance (both branches), so a
     content comparison like `_phase_a_matches_draft` would answer False always
-    and Retry rental would never fire. `clear()` preserves the generation
-    (drafts.py:485-489) and `validate()` does not bump it (drafts.py:555), so
-    neither the confirm's own clear nor a re-validate trips this — and the
+    and Retry rental would never fire. `clear()` counts the generation UP by
+    one (`_changed`, drafts.py:275-279) rather than resetting it, and the
+    writer stamps after the clear (AppRuns.confirm's `if out:`), so the
+    confirm's own clear is already accounted for; `validate()` does not bump it
+    (drafts.py:554), so a re-validate does not trip this either — and the
     counter only rises, so a stale stamp can never match again by accident.
     """
     confirmed = _load_confirm_stamp(chat_id)

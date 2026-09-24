@@ -702,6 +702,34 @@ class TestAppPodResume(_PodFixture):
         self.assertEqual(body["error"]["code"], "stale_run")     # not stale_panel
         self.patches["start_drain"].assert_not_called()
 
+    def test_a_confirm_then_a_moved_draft_refuses_the_retry(self):
+        """Confirm (stamp written) → the draft moves → resume refused. The
+        stamp is written by AppRuns and read by AppPod, so this is the only
+        test that exercises both halves against one real DraftStore."""
+        runs = bot.AppRuns(self.tg, ME, self.store, self.idem)
+        job = self._job("app")
+        d = self.store._load()
+        d.job, d.validated = job, True
+        self.store._save(d)
+        body = {"provider": "runpod", "tryon": None, "panel_token": runs.panel_token()}
+        with mock.patch("tgbot.bot._do_confirm",
+                        return_value=Outcome(True, "started")):
+            self.assertEqual(runs.confirm(runs.run_id, body, "k-confirm")[0], 202)
+
+        self._seed_failure()
+        self.assertEqual(self.pod.resume(self.pod.run_id, self._body(), "k-ok")[0], 202)
+
+        # A free draft mutation — the drop Phase 6 added, or any PATCH.
+        d = self.store._load()
+        d.generation += 1
+        self.store._save(d)
+        status, resp = self.pod.resume(self.pod.run_id, self._body(), "k-stale")
+        self.assertEqual(status, 409)
+        self.assertEqual(resp["error"]["code"], "stale_run")
+        self.assertEqual(resp["error"]["message"], bot.RESUME_STALE_GENERATION)
+        # Once, from the accepted resume above — the refused one rented nothing.
+        self.patches["start_drain"].assert_called_once()
+
 
 P5090 = "NVIDIA GeForce RTX 5090"
 P4090 = "NVIDIA GeForce RTX 4090"
