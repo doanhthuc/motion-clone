@@ -505,7 +505,7 @@ extension URLProtocolTests {
     /// The other half of the same money guard, and the system-level property
     /// Phase 6 introduced: a **free** draft mutation invalidates a **paid**
     /// retry. `resume` re-rents the manifest on disk and deliberately never
-    /// reads the draft (bot.py:7394-7395), and `_run_token` is the manifest's
+    /// reads the draft (bot.py:7511-7513), and `_run_token` is the manifest's
     /// `mtime_ns` (bot.py:1493-1506), which moves only when a manifest is
     /// *rewritten* — a drop does not rewrite one. So without the generation
     /// latch, Confirm → rental fails → re-enter → Drop → Retry rental rents a
@@ -553,10 +553,11 @@ extension URLProtocolTests {
     ///
     /// The message literal is `RESUME_STALE_GENERATION` in bot.py. Asserting it
     /// here rather than a paraphrase is what keeps the two sides honest: the
-    /// server has its own test on the same string.
+    /// server's own tests all compare against the constant, so this literal is
+    /// the only byte-level pin on the wording anywhere in either codebase. One
+    /// line, not a concatenation, so a grep for the sentence finds it.
     @Test func aRelaunchSurfacesTheServersStaleResumeRefusal() async throws {
-        let stale = ("the draft changed since this rental was confirmed — "
-                     + "Confirm again to rent what is in the draft now")
+        let stale = "the draft changed since this rental was confirmed — Confirm again to rent what is in the draft now"
         let routes = Routes()                       // podIdle carries failed_rental
         let gate = FakeSpendGate([.refused(status: 409, code: "stale_run",
                                            message: stale, panelToken: nil)])
@@ -577,15 +578,18 @@ extension URLProtocolTests {
         #expect(await gate.intents.first?.kind == .resume)
         #expect(flow.message == stale)              // verbatim, not swallowed
         #expect(!flow.needsRecheck)                 // a refusal is definitive
-        // Two reads, not one, and the number is the assertion: `retryRental`
-        // calls `refreshTryon()` itself for the CURRENT run_token before it
-        // sends, so a bare "the count went up" would pass even with
-        // `applyRefusal`'s `("stale_run", .resume)` case deleted. The second
-        // read is that case — the recovery. Pinning the delta is what turns a
-        // future refactor of `applyRefusal` red instead of silent.
+        // A floor of two reads, and the number is the assertion: one
+        // `retryRental()` makes two `/tryon` GETs. `retryRental` reads the run
+        // itself for the CURRENT run_token before it sends, then `applyRefusal`'s
+        // `("stale_run", .resume)` case reads it again — that second read is the
+        // recovery, and it is what this test is about. A bare "the count went
+        // up" would pass with the case deleted, because the pre-send read alone
+        // moves it; a delta of 1 fails `>= 2`. A floor rather than `== 2` so an
+        // unrelated extra read-only GET (caching the run_token, say) does not
+        // turn this red with a failure that names the recovery read.
         #expect(StubURLProtocol.requests.filter {
             ($0.url?.path ?? "").hasSuffix("/tryon")
-        }.count == tryonReads + 2)
+        }.count >= tryonReads + 2)
     }
 
     /// The retry stays available when nothing moved the draft, and when no

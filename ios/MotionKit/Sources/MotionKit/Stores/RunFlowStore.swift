@@ -95,7 +95,7 @@ public final class RunFlow {
     /// `_run_token` is the manifest's `mtime_ns` (bot.py:1493-1506), which moves
     /// only when a manifest is *rewritten* — a draft edit does not rewrite one.
     /// That is why `panel_token` joins `.generation` (bot.py:6895-6902) and
-    /// `resume` has no equivalent: without this latch, a Confirm whose rental
+    /// `resume` had no equivalent: without this latch, a Confirm whose rental
     /// failed followed by a free "Drop from batch" leaves Retry rental offering
     /// to rent a pod that still runs the job the user just dropped.
     ///
@@ -584,7 +584,7 @@ public final class RunFlow {
             // carries no panel token, so its acceptance proves nothing about
             // this copy's freshness and latching on it could record a stale
             // generation. `.resume` deliberately ignores the draft
-            // (bot.py:7394-7395), `.regen` touches one image, `.migrate` is
+            // (bot.py:7511-7513), `.regen` touches one image, `.migrate` is
             // never sent here.
             if kind == .confirm { confirmedGeneration = draft?.generation }
             switch kind {
