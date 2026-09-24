@@ -356,7 +356,11 @@ is still correct.
 In `test_batch_control_botruns.py`:
 
 - both accepted confirm branches write the stamp;
-- a refused confirm (`stale_panel`, `not_validated`, `bot_busy`) writes nothing;
+- a refused confirm writes nothing. Tested for `stale_panel` and `not_validated`. **`bot_busy` is not
+  tested, by ruling:** its early return (`bot.py:7009-7012`, after `self.idem.forget(…)`) is three
+  lines above the write and never reaches `if out:`, so it cannot stamp; arranging a `_bot_locked()`
+  timeout in a test costs more than that coverage is worth. Verified structurally during Task 2's
+  review rather than left assumed;
 - **the confirm's own `clear()` leaves the stamp matching the draft, so an immediate retry is
   allowed.** Asserted through the real `_resume_generation_refusal` rather than as a bare number
   comparison, and seeded from a non-zero generation so that a reset and a no-op are distinguishable.
