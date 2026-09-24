@@ -144,7 +144,14 @@ def stage_dest(run: Run, run_dir: Path, stage_name: str) -> Path:
 
 def run_one(*, settings: Settings, run: Run, out_dir: Path, state: dict,
             state_file: Path, resume: bool,
-            log: Callable[[str], None], now: Callable[[], float] = time.time) -> Path:
+            log: Callable[[str], None], now: Callable[[], float] = time.time,
+            shared_leader: Run | None = None) -> Path:
+    """Run every stage of one run on the pod, skipping what is already done.
+
+    `shared_leader` is set when this run is a follower in tryon_share_groups:
+    its local try-on stage is then never submitted, only copied from the
+    leader (see the follower branch in the stage loop).
+    """
     run_dir = out_dir / "runs" / run.id
     run_dir.mkdir(parents=True, exist_ok=True)
     entry = state["runs"].setdefault(run.id, {"status": "pending", "stages": {}})
@@ -185,6 +192,27 @@ def run_one(*, settings: Settings, run: Run, out_dir: Path, state: dict,
         if (recorded.get("status") == "done" and dest.is_file()
                 and not _local_provenance_stale(run, stage_name, recorded)):
             log(f"    {stage_name}: bỏ qua (đã xong, {dest.name})")
+            prev_output = dest
+            continue
+
+        # A follower's shared try-on never reaches the pod (spec §2). Phase A
+        # exits "needs pod" even when a try-on failed, and before this branch
+        # the pod then redid the leader's AND every follower's try-on: M+1
+        # provider-backed jobs for one image. Runs execute in manifest order
+        # and the leader comes first, so by now its stage has either been
+        # redone here or failed; the follower copies it or fails with it.
+        if shared_leader is not None and stage_name == _local_tryon_stage(run):
+            leader_stage = _local_tryon_stage(shared_leader)
+            leader_rec = (((state["runs"].get(shared_leader.id) or {}).get("stages") or {})
+                          .get(leader_stage) or {})
+            leader_dest = stage_dest(shared_leader, out_dir / "runs" / shared_leader.id,
+                                     leader_stage)
+            journal = _LocalJournal(state=state, state_file=state_file, log=log)
+            err = journal.copy_from_leader(run, stage_name, entry, log_file, dest=dest,
+                                           params=params, leader_id=shared_leader.id,
+                                           leader_rec=leader_rec, leader_dest=leader_dest)
+            if err is not None:
+                raise JobError(err)
             prev_output = dest
             continue
 
@@ -344,6 +372,11 @@ def run_batch(*, settings: Settings, manifest: Manifest, out_root: Path,
                                                     batch_id=batch_id, resume=resume)
 
     result = BatchResult(batch_id=batch_id, out_dir=out_dir)
+    # Same grouping Phase A used, recomputed from the manifest rather than
+    # read from the journal: a follower must be recognised even when Phase A
+    # never got to journal it.
+    groups = tryon_share_groups(manifest)
+    by_id = {run.id: run for run in manifest.runs}
     for position, run in enumerate(manifest.runs, start=1):
         recorded = (state["runs"].get(run.id) or {})
         if resume and recorded.get("status") == "done":
@@ -353,8 +386,10 @@ def run_batch(*, settings: Settings, manifest: Manifest, out_root: Path,
         log(f"[{position}/{len(manifest.runs)}] {run.id} · {run.pipeline}")
         started = now()
         try:
+            leader_id = groups.get(run.id, run.id)
             run_one(settings=settings, run=run, out_dir=out_dir, state=state,
-                    state_file=state_file, resume=resume, log=log, now=now)
+                    state_file=state_file, resume=resume, log=log, now=now,
+                    shared_leader=by_id[leader_id] if leader_id != run.id else None)
             result.done.append(run.id)
         except JobError as exc:
             state["runs"][run.id]["status"] = "error"
@@ -607,6 +642,139 @@ class LocalPhaseResult:
     failed: dict[str, str] = field(default_factory=dict)
 
 
+class _LocalJournal:
+    """The journal writers for a try-on made off the pod, in one place.
+
+    Shared by run_local_phase's leader pass (_one), its follower pass, and
+    run_one's follower copy in Phase B, so a copied try-on and a real one
+    cannot drift apart in shape: local_tryon_reusable, _local_provenance_stale
+    and run_one must not be able to tell them apart on a later resume.
+
+    `lock` guards every "change state + write it to disk" pair. Phase A needs
+    it for its pool; Phase B is single-threaded and gets its own uncontended one.
+    """
+
+    def __init__(self, *, state: dict, state_file: Path, log: Callable[[str], None],
+                 lock: threading.Lock | None = None) -> None:
+        self.state = state
+        self.state_file = state_file
+        self.log = log
+        self.lock = lock or threading.Lock()
+
+    def clear_stale_error(self, run: Run, stage_name: str, entry: dict) -> None:
+        # A reused image also clears a failure only Phase A could have left:
+        # with no later stage in the journal, the pod never ran this run.
+        # Journals written before the success-path clearing below kept
+        # status "error" beside a done image (VPS, 2026-09-18), and a
+        # skip never reached that clearing.
+        later = PIPELINES[run.pipeline][PIPELINES[run.pipeline].index(stage_name) + 1:]
+        with self.lock:
+            if entry.get("status") == "error" and not any(
+                    entry["stages"].get(s) for s in later):
+                entry["status"] = "pending"
+                entry.pop("error", None)
+                save_state(self.state_file, self.state)
+
+    def record_error(self, run: Run, stage_name: str, entry: dict, log_file: Path,
+                     exc: BaseException, *, elapsed: int,
+                     params_manifest: dict) -> tuple[bool, str]:
+        # repr() dự phòng: `RuntimeError()` trần có str() rỗng, mà một journal ghi
+        # "error" với lý do rỗng còn khó đọc hơn không ghi gì.
+        loi = str(exc) or repr(exc)
+        with self.lock:
+            entry["stages"][stage_name] = {"status": "error",
+                                        "elapsed_sec": elapsed,
+                                        "params_manifest": dict(params_manifest)}
+            # Mức run, không chỉ mức chặng — đúng giao ước của run_batch. Để nguyên
+            # "pending" thì journal nói dối: run hỏng ở Pha A trông y hệt run chưa
+            # chạy. Không chặn tự chữa ở Pha B: vòng lặp của run_batch chỉ bỏ qua khi
+            # status == "done", còn run_one đặt lại "running" ngay khi vào.
+            entry["status"] = "error"
+            entry["error"] = loi
+            save_state(self.state_file, self.state)
+        # Journal VÀ run.log (spec §4), giống hệt run_one: stdout là thứ mất khi đóng
+        # terminal, mà đây là dòng cần nhất của một lô chạy không người trông.
+        _log_line(log_file, f"✗ {stage_name} (local): {loi}")
+        self.log(f"    ✗ {run.id}/{stage_name} (local): {loi}")
+        return False, loi
+
+    def record_done(self, run: Run, stage_name: str, entry: dict, log_file: Path, *,
+                    dest: Path, elapsed: int, size: int, params_sent: dict,
+                    params_manifest: dict, message: str, **extra) -> None:
+        # params_sent == params_manifest ở đây KHÔNG phải copy-paste: hai cột đó lệch nhau
+        # được là vì API nắn param trước khi ghi DB (xem docstring write_index). Pha A
+        # không đi qua API nào cả — nó gọi thẳng Gemini với đúng param của manifest, nên
+        # "xin gì" và "được gì" thật sự là một.
+        #
+        # Except when a guided regenerate is in play (§5.10, slice 6): params_sent is
+        # `params` (merged with regen_guidance), params_manifest is the pre-merge
+        # params_manifest_snapshot — see the comment above _one's `if regen_guidance:`
+        # block for why that split must never collapse back into one dict.
+        #
+        # `extra` carries the follower-only fields (shared_from, source_sha256);
+        # everything else is the one shape every Phase A result has.
+        with self.lock:
+            entry["stages"][stage_name] = {
+                "status": "done", "elapsed_sec": elapsed, "file": str(dest), "bytes": size,
+                "params_sent": dict(params_sent), "params_manifest": dict(params_manifest),
+                # Provenance, so run_one can tell a pod stage's output from a
+                # local one. Without it a /provider switch away from a local
+                # provider leaves run_one skipping a stage that now belongs to
+                # the pod, on the strength of an image a different provider
+                # made. Entries predating the stamp have no key and keep
+                # today's behaviour — see _local_provenance_stale.
+                "phase": "local", **extra}
+            # A retry that succeeds clears the run-level failure a previous
+            # attempt left behind, the same rule run_one applies (status "done"
+            # and an "error" must not coexist). Without this the journal still
+            # said "error" after the image was made (VPS, 2026-09-18,
+            # batch 2026-09-16-1706).
+            if entry.get("status") == "error":
+                entry["status"] = "pending"
+            entry.pop("error", None)
+            save_state(self.state_file, self.state)
+        # Cả hai kết cục vào run.log, không chỉ lỗi — run_one cũng ghi cả hai, và "chặng
+        # này đã chạy ở Pha A lúc mấy giờ" là nửa còn lại của câu chuyện khi đọc lại sau.
+        _log_line(log_file, message)
+        self.log(f"    {run.id}/{message}")
+
+    def copy_from_leader(self, run: Run, stage_name: str, entry: dict, log_file: Path, *,
+                         dest: Path, params: dict, leader_id: str, leader_rec: dict,
+                         leader_dest: Path) -> str | None:
+        """Copy the leader's try-on into this follower's `dest`. Returns the error
+        journalled, or None once the copy is done.
+
+        Never falls back to calling the provider, in either phase: that would
+        pay again for exactly the image that just failed, once per driver.
+        """
+        if leader_rec.get("status") != "done" or not leader_dest.is_file():
+            _, err = self.record_error(run, stage_name, entry, log_file,
+                                       JobError(f"shared try-on from {leader_id} failed"),
+                                       elapsed=0, params_manifest=params)
+            return err
+        try:
+            shutil.copy2(leader_dest, dest)
+            size = dest.stat().st_size
+            digest = _sha256(leader_dest)
+        except OSError as exc:
+            # A full disk here must not escape: in Phase A it would kill the
+            # pass and leave every later follower "pending"; the verdict goes
+            # to the journal like any other failure instead.
+            _, err = self.record_error(run, stage_name, entry, log_file,
+                                       JobError(f"shared try-on from {leader_id}: copy failed: "
+                                                f"{exc}"),
+                                       elapsed=0, params_manifest=params)
+            return err
+        # params_sent is what the provider was actually sent for this image,
+        # which is the leader's (a guided regenerate merges flags into it).
+        self.record_done(run, stage_name, entry, log_file, dest=dest, elapsed=0, size=size,
+                         params_sent=leader_rec.get("params_sent") or params,
+                         params_manifest=params,
+                         message=f"{stage_name} (local): shared from {leader_id} → {dest.name}",
+                         shared_from=leader_id, source_sha256=digest)
+        return None
+
+
 def run_local_phase(*, settings: Settings, manifest: Manifest, out_root: Path, batch_id: str,
                     resume: bool, fail_fast: bool = False, log: Callable[[str], None] = print,
                     pool_size: int = 4, force: bool = False) -> LocalPhaseResult:
@@ -672,88 +840,7 @@ def run_local_phase(*, settings: Settings, manifest: Manifest, out_root: Path, b
     # DUY NHẤT một thread đọc/ghi. Không có bất biến đó thì hai worker cùng đua trên một
     # entry và dòng này thành race thật.
     lock = threading.Lock()
-
-    # The three journal writers below are shared by the leader pass (_one) and
-    # the follower pass, so a copied try-on and a real one cannot drift apart in
-    # shape: local_tryon_reusable, _local_provenance_stale and run_one must not
-    # be able to tell them apart on a later resume.
-
-    def _clear_stale_error(run: Run, stage_name: str, entry: dict) -> None:
-        # A reused image also clears a failure only Phase A could have left:
-        # with no later stage in the journal, the pod never ran this run.
-        # Journals written before the success-path clearing below kept
-        # status "error" beside a done image (VPS, 2026-09-18), and a
-        # skip never reached that clearing.
-        later = PIPELINES[run.pipeline][PIPELINES[run.pipeline].index(stage_name) + 1:]
-        with lock:
-            if entry.get("status") == "error" and not any(
-                    entry["stages"].get(s) for s in later):
-                entry["status"] = "pending"
-                entry.pop("error", None)
-                save_state(state_file, state)
-
-    def _record_error(run: Run, stage_name: str, entry: dict, log_file: Path,
-                      exc: BaseException, *, elapsed: int,
-                      params_manifest: dict) -> tuple[bool, str]:
-        # repr() dự phòng: `RuntimeError()` trần có str() rỗng, mà một journal ghi
-        # "error" với lý do rỗng còn khó đọc hơn không ghi gì.
-        loi = str(exc) or repr(exc)
-        with lock:
-            entry["stages"][stage_name] = {"status": "error",
-                                        "elapsed_sec": elapsed,
-                                        "params_manifest": dict(params_manifest)}
-            # Mức run, không chỉ mức chặng — đúng giao ước của run_batch. Để nguyên
-            # "pending" thì journal nói dối: run hỏng ở Pha A trông y hệt run chưa
-            # chạy. Không chặn tự chữa ở Pha B: vòng lặp của run_batch chỉ bỏ qua khi
-            # status == "done", còn run_one đặt lại "running" ngay khi vào.
-            entry["status"] = "error"
-            entry["error"] = loi
-            save_state(state_file, state)
-        # Journal VÀ run.log (spec §4), giống hệt run_one: stdout là thứ mất khi đóng
-        # terminal, mà đây là dòng cần nhất của một lô chạy không người trông.
-        _log_line(log_file, f"✗ {stage_name} (local): {loi}")
-        log(f"    ✗ {run.id}/{stage_name} (local): {loi}")
-        return False, loi
-
-    def _record_done(run: Run, stage_name: str, entry: dict, log_file: Path, *,
-                     dest: Path, elapsed: int, size: int, params_sent: dict,
-                     params_manifest: dict, message: str, **extra) -> None:
-        # params_sent == params_manifest ở đây KHÔNG phải copy-paste: hai cột đó lệch nhau
-        # được là vì API nắn param trước khi ghi DB (xem docstring write_index). Pha A
-        # không đi qua API nào cả — nó gọi thẳng Gemini với đúng param của manifest, nên
-        # "xin gì" và "được gì" thật sự là một.
-        #
-        # Except when a guided regenerate is in play (§5.10, slice 6): params_sent is
-        # `params` (merged with regen_guidance), params_manifest is the pre-merge
-        # params_manifest_snapshot — see the comment above _one's `if regen_guidance:`
-        # block for why that split must never collapse back into one dict.
-        #
-        # `extra` carries the follower-only fields (shared_from, source_sha256);
-        # everything else is the one shape every Phase A result has.
-        with lock:
-            entry["stages"][stage_name] = {
-                "status": "done", "elapsed_sec": elapsed, "file": str(dest), "bytes": size,
-                "params_sent": dict(params_sent), "params_manifest": dict(params_manifest),
-                # Provenance, so run_one can tell a pod stage's output from a
-                # local one. Without it a /provider switch away from a local
-                # provider leaves run_one skipping a stage that now belongs to
-                # the pod, on the strength of an image a different provider
-                # made. Entries predating the stamp have no key and keep
-                # today's behaviour — see _local_provenance_stale.
-                "phase": "local", **extra}
-            # A retry that succeeds clears the run-level failure a previous
-            # attempt left behind, the same rule run_one applies (status "done"
-            # and an "error" must not coexist). Without this the journal still
-            # said "error" after the image was made (VPS, 2026-09-18,
-            # batch 2026-09-16-1706).
-            if entry.get("status") == "error":
-                entry["status"] = "pending"
-            entry.pop("error", None)
-            save_state(state_file, state)
-        # Cả hai kết cục vào run.log, không chỉ lỗi — run_one cũng ghi cả hai, và "chặng
-        # này đã chạy ở Pha A lúc mấy giờ" là nửa còn lại của câu chuyện khi đọc lại sau.
-        _log_line(log_file, message)
-        log(f"    {run.id}/{message}")
+    journal = _LocalJournal(state=state, state_file=state_file, log=log, lock=lock)
 
     def _one(run: Run, stage_name: str, params: dict) -> tuple[bool, str | None]:
         """Chạy một run trong thread của pool. Trả (có_chạy_mới, lỗi).
@@ -809,14 +896,14 @@ def run_local_phase(*, settings: Settings, manifest: Manifest, out_root: Path, b
         # exist at the motion stage.
         if not force and local_tryon_reusable(run, stage_name, recorded, dest):
             log(f"    {run.id}/{stage_name}: bỏ qua (đã xong local, {dest.name})")
-            _clear_stale_error(run, stage_name, entry)
+            journal.clear_stale_error(run, stage_name, entry)
             return False, None
         started = time.time()
 
         def _ghi_hong(exc: BaseException) -> tuple[bool, str]:
-            return _record_error(run, stage_name, entry, log_file, exc,
-                                 elapsed=int(time.time() - started),
-                                 params_manifest=params_manifest_snapshot)
+            return journal.record_error(run, stage_name, entry, log_file, exc,
+                                        elapsed=int(time.time() - started),
+                                        params_manifest=params_manifest_snapshot)
 
         seed_image = params.get("seedImage")
         if seed_image:
@@ -852,10 +939,11 @@ def run_local_phase(*, settings: Settings, manifest: Manifest, out_root: Path, b
                 # qua done_future.result() lên tận main() và giết CẢ Pha A vì MỘT run — các
                 # run khác mất trắng, và run này kẹt "pending" trong journal thay vì "error".
                 return _ghi_hong(exc)
-        _record_done(run, stage_name, entry, log_file, dest=dest, elapsed=elapsed, size=size,
-                     params_sent=params, params_manifest=params_manifest_snapshot,
-                     message=f"{stage_name} (local): xong {elapsed}s · {size // 1024} KB "
-                             f"→ {dest.name}")
+        journal.record_done(run, stage_name, entry, log_file, dest=dest, elapsed=elapsed,
+                            size=size, params_sent=params,
+                            params_manifest=params_manifest_snapshot,
+                            message=f"{stage_name} (local): xong {elapsed}s · "
+                                    f"{size // 1024} KB → {dest.name}")
         return True, None
 
     groups = tryon_share_groups(manifest)
@@ -915,24 +1003,12 @@ def run_local_phase(*, settings: Settings, manifest: Manifest, out_root: Path, b
         if not force and follower_reusable(run, stage_name, recorded, dest,
                                            leader_id, leader_dest):
             log(f"    {run.id}/{stage_name}: bỏ qua (shared from {leader_id}, {dest.name})")
-            _clear_stale_error(run, stage_name, entry)
+            journal.clear_stale_error(run, stage_name, entry)
             continue
-        if leader_rec.get("status") != "done" or not leader_dest.is_file():
-            # Never fall back to calling the provider: that would pay again for
-            # exactly the image that just failed, once per driver.
-            _, err = _record_error(run, stage_name, entry, log_file,
-                                   JobError(f"shared try-on from {leader_id} failed"),
-                                   elapsed=0, params_manifest=params)
+        # Not appended to result.done on success: that list counts provider calls.
+        err = journal.copy_from_leader(run, stage_name, entry, log_file, dest=dest,
+                                       params=params, leader_id=leader_id,
+                                       leader_rec=leader_rec, leader_dest=leader_dest)
+        if err is not None:
             result.failed[run.id] = err
-            continue
-        shutil.copy2(leader_dest, dest)
-        # params_sent is what the provider was actually sent for this image,
-        # which is the leader's (a guided regenerate merges flags into it).
-        # Not appended to result.done: that list counts provider calls.
-        _record_done(run, stage_name, entry, log_file, dest=dest, elapsed=0,
-                     size=dest.stat().st_size,
-                     params_sent=leader_rec.get("params_sent") or params,
-                     params_manifest=params,
-                     message=f"{stage_name} (local): shared from {leader_id} → {dest.name}",
-                     shared_from=leader_id, source_sha256=_sha256(leader_dest))
     return result

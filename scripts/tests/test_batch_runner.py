@@ -1894,8 +1894,9 @@ def _grid_manifest(outfits: list[str], drivers: list[str], *, stage: str = "tryo
     return "\n".join(out) + "\n"
 
 
-class SharedTryonPhaseATests(unittest.TestCase):
-    """Phase A calls the provider once per look and copies it to every driver (spec §2)."""
+class _SharedTryonFixture(unittest.TestCase):
+    """A 1-character grid on disk plus a counting fake provider, shared by the
+    Phase A and Phase B sharing tests. Holds no tests of its own."""
 
     OUTFITS = ["outfit1.jpg", "outfit2.jpg", "outfit3.jpg"]
     DRIVERS = ["drv1.mp4", "drv2.mp4"]
@@ -1946,6 +1947,10 @@ class SharedTryonPhaseATests(unittest.TestCase):
     def sha(path: Path) -> str:
         import hashlib
         return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+class SharedTryonPhaseATests(_SharedTryonFixture):
+    """Phase A calls the provider once per look and copies it to every driver (spec §2)."""
 
     def test_three_outfits_two_drivers_call_three_times(self):
         manifest = self.manifest(_grid_manifest(self.OUTFITS, self.DRIVERS))
@@ -2090,6 +2095,94 @@ class SharedTryonPhaseATests(unittest.TestCase):
         # A follower whose leader's image changed is not preserved: a resume recopies it.
         self.file_of("o1d1").write_bytes(b"regenerated")
         self.assertEqual(preserved_local_tryon(manifest, result.state, self.tmp / "out"), (5, 6))
+
+    def test_a_failed_follower_copy_is_an_error_not_a_crash(self):
+        # A full disk or a vanished run dir must not take the whole phase down
+        # with it: every other run's verdict still has to reach the journal.
+        manifest = self.manifest(_grid_manifest(self.OUTFITS[:1], self.DRIVERS))
+        with mock.patch("batchlib.runner.shutil.copy2", side_effect=OSError("disk full")):
+            result = self.run_phase(manifest)
+        self.assertEqual(result.done, ["o1d1"])
+        self.assertIn("disk full", result.failed["o1d2"])
+        run = result.state["runs"]["o1d2"]
+        self.assertEqual(run["status"], "error")
+        self.assertEqual(run["stages"]["tryon"]["status"], "error")
+        self.assertEqual(load_state(result.state_file)["runs"]["o1d2"]["status"], "error")
+
+
+class SharedTryonPhaseBTests(_SharedTryonFixture):
+    """A follower's try-on never reaches the pod either (spec §2's rule, Phase B half).
+
+    Phase A exits "needs pod" even when a try-on failed, and run_one resubmits
+    every stage not marked done. Without this rule one failed look with M
+    drivers became M+1 provider-backed try-ons on the GPU.
+    """
+
+    def run_pod(self, manifest, phase_a, pod: FakePod):
+        with mock.patch("batchlib.runner.submit_job", pod.submit), \
+             mock.patch("batchlib.runner.poll_job", pod.poll), \
+             mock.patch("batchlib.runner.download_output", pod.download):
+            return run_batch(settings=GEMINI_SETTINGS, manifest=manifest,
+                             out_root=self.tmp / "out", batch_id=self.BATCH, resume=False,
+                             log=lambda _m: None,
+                             prepared=(phase_a.out_dir, phase_a.state, phase_a.state_file))
+
+    @staticmethod
+    def tryon_submissions(pod: FakePod) -> int:
+        return sum(1 for job_type, _p, _f in pod.submitted if job_type == "tryon")
+
+    def test_pod_redoes_the_leader_once_and_followers_copy_it(self):
+        self.fail_outfit = "outfit1.jpg"
+        manifest = self.manifest(_grid_manifest(self.OUTFITS[:1], ["drv1.mp4", "drv2.mp4",
+                                                                  "drv3.mp4"]))
+        phase_a = self.run_phase(manifest)
+        self.assertEqual(set(phase_a.failed), {"o1d1", "o1d2", "o1d3"})
+        pod = FakePod()
+        result = self.run_pod(manifest, phase_a, pod)
+        self.assertEqual(self.tryon_submissions(pod), 1)
+        self.assertEqual(sorted(result.done), ["o1d1", "o1d2", "o1d3"])
+        leader_bytes = self.file_of("o1d1").read_bytes()
+        for follower in ("o1d2", "o1d3"):
+            self.assertEqual(self.file_of(follower).read_bytes(), leader_bytes)
+            entry = load_state(phase_a.state_file)["runs"][follower]
+            stage = entry["stages"]["tryon"]
+            self.assertEqual(stage["status"], "done")
+            self.assertEqual(stage["shared_from"], "o1d1")
+            self.assertEqual(stage["source_sha256"], self.sha(self.file_of("o1d1")))
+            self.assertEqual(stage["phase"], "local")
+            self.assertEqual(stage["elapsed_sec"], 0)
+            self.assertEqual(entry["status"], "done")
+            self.assertNotIn("error", entry)
+
+    def test_leader_failing_on_the_pod_fails_followers_without_submitting(self):
+        self.fail_outfit = "outfit1.jpg"
+        manifest = self.manifest(_grid_manifest(self.OUTFITS[:1], ["drv1.mp4", "drv2.mp4",
+                                                                  "drv3.mp4"]))
+        phase_a = self.run_phase(manifest)
+        pod = FakePod(fail_on={"job-1"})
+        result = self.run_pod(manifest, phase_a, pod)
+        self.assertEqual(len(pod.submitted), 1)
+        self.assertEqual(set(result.failed), {"o1d1", "o1d2", "o1d3"})
+        state = load_state(phase_a.state_file)
+        for follower in ("o1d2", "o1d3"):
+            self.assertIn("shared try-on from o1d1 failed", result.failed[follower])
+            self.assertEqual(state["runs"][follower]["status"], "error")
+            self.assertEqual(state["runs"][follower]["stages"]["tryon"]["status"], "error")
+            self.assertNotIn("job_id", state["runs"][follower]["stages"]["tryon"])
+            self.assertFalse(self.file_of(follower).exists())
+
+    def test_an_ungrouped_failed_tryon_is_still_resubmitted(self):
+        # Leaders and single-run looks keep today's behaviour: the pod may redo
+        # a try-on the local provider failed.
+        self.fail_outfit = "outfit1.jpg"
+        manifest = self.manifest(_grid_manifest(self.OUTFITS[:2], ["drv1.mp4"]))
+        phase_a = self.run_phase(manifest)
+        self.assertEqual(set(phase_a.failed), {"o1d1"})
+        pod = FakePod()
+        result = self.run_pod(manifest, phase_a, pod)
+        self.assertEqual(self.tryon_submissions(pod), 1)
+        self.assertEqual(pod.submitted[0][2]["product"], "outfit1.jpg")
+        self.assertEqual(sorted(result.done), ["o1d1", "o2d1"])
 
 
 if __name__ == "__main__":
