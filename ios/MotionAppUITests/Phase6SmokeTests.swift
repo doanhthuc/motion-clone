@@ -12,20 +12,37 @@ final class Phase6SmokeTests: XCTestCase {
     /// Batch mode has had its own Clear since 2026-09-24, but
     /// `Phase4Draft.clear(in:)` still cannot be reused from here: its
     /// post-condition is the readiness line ("0 of 3 required slots assigned"),
-    /// which is Single-only and stays Single-only. `"0 jobs"` is the header's
-    /// count (`NewJobView.header`), rendered in both arms, and is the same
-    /// literal this smoke's precondition already asserts.
+    /// which is Single-only and stays Single-only. Both post-conditions below
+    /// read elements the Batch arm does render — a shared slot row
+    /// (`BatchComposerSection.sharedRoles`) and the header's job count
+    /// (`NewJobView.header`).
     @MainActor
     private func clearFromBatch(_ app: XCUIApplication) {
         let clear = Phase4Draft.revealButton("Clear", in: app)
         // `revealButton` only waits for `isHittable`. Clear is
         // `.disabled(store.isBusy || composer.isRunning)`, and a tap on a
         // disabled SwiftUI control is a silent no-op — so wait for `isEnabled`
-        // separately, or the draft stays full and the assertion below is the
+        // separately, or the draft stays full and the assertions below are the
         // only thing that notices.
         XCTAssertTrue(Phase4Draft.waitUntil(timeout: 10) { clear.isEnabled },
                       "Clear must re-enable before it is tapped")
         clear.tap()
+        // The load-bearing half. Do not delete it as redundant just because
+        // "0 jobs" below already passes: `_jobs` counts the basket plus the
+        // edited job only once that job is *complete*
+        // (`scripts/control/drafts.py:294-307`, `:337`), so on the
+        // fewer-than-two-outfits skip path the header read "0 jobs" *before* the
+        // tap too — nothing basketed, and Outfit never assigned. A Clear that
+        // silently no-op'd would leave Character and Driver assigned and still
+        // read "0 jobs" here, and the damage would surface one run later as a
+        // permanent silent skip (that path's `XCTSkip`), not as a failure.
+        // "Missing required" is `SlotRow.stateText` for an empty required role —
+        // the exact inverse of `Phase4Draft.chooseMaterial`'s post-condition.
+        // Not `readiness`'s "Missing required materials", which is a different
+        // element's `accessibilityValue` and Single-only besides.
+        XCTAssertTrue(Phase4Draft.waitUntil(timeout: 10) {
+            (app.buttons["Character"].value as? String) == "Missing required"
+        }, "Batch mode's Clear must unassign the shared slots, not just empty the basket")
         XCTAssertTrue(app.staticTexts["0 jobs"].waitForExistence(timeout: 10),
                       "Batch mode's Clear emptied the draft")
     }
