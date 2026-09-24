@@ -24,10 +24,13 @@ extension URLProtocolTests {
         /// for the same reason as `library`.
         private let pipeline: String
         private let catalog: String
+        private let provider: String
 
-        init(library: String = #"{"entries":[]}"#, pipeline: String = "tryon-motion-enhance") {
+        init(library: String = #"{"entries":[]}"#, pipeline: String = "tryon-motion-enhance",
+             provider: String = "gemini") {
             self.library = library
             self.pipeline = pipeline
+            self.provider = provider
             self.catalog = pipeline == "tryon-motion-enhance" ? Fixtures.pipelines : BatchComposerTests.cameraCatalog
         }
 
@@ -111,10 +114,10 @@ extension URLProtocolTests {
                 ["material_id": id, "name": id, "exists": true, "probe": probe, "warning": ""] }
             let missing = ["character", "driver", "outfit"].filter { current[$0] == nil }
             let entries: [[String: Any]] = batch.enumerated().map { i, entry in
-                ["digest": "d\(i)", "run_id": "run\(i)", "pipeline": pipeline, "provider": "gemini",
+                ["digest": "d\(i)", "run_id": "run\(i)", "pipeline": pipeline, "provider": provider,
                  "slots": entry.slots, "tryon_seed": entry.seed ?? NSNull()] }
             let draft: [String: Any] = [
-                "owner": "app", "pipeline": pipeline, "provider": "gemini", "generation": batch.count,
+                "owner": "app", "pipeline": pipeline, "provider": provider, "generation": batch.count,
                 "slots": slots, "required": ["character", "driver", "outfit"], "optional": ["background"],
                 "missing": missing, "validated": NSNull(), "batch": entries, "jobs": batch.count,
                 "estimate_min": NSNull(), "tryon_seed": seed ?? NSNull()]
@@ -519,6 +522,30 @@ extension URLProtocolTests {
             #expect(composer.jobCount == 6)
             #expect(composer.tryonCount == tryons)
         }
+    }
+
+    /// Sharing happens only in Phase A, which runs only for the local
+    /// providers; a pod provider such as `qwen` does its own try-on inside
+    /// every job, so the summary must count one per job, seeded or not.
+    @Test func tryonCountIsOnePerJobForANonLocalProvider() async {
+        let library = #"""
+        {"entries":[{"id":"s1","owner":"app","material_ids":{"character":"app/me.png","outfit":"app/o1.png"},"provider":"gemini","saved_at":1}]}
+        """#
+        for (provider, tryons) in [("qwen", 6), ("qwen-max", 2)] {
+            let server = FakeDraftServer(library: library, provider: provider)
+            let (composer, draft) = await make(server)
+            #expect(draft.draft?.provider == provider)
+            for i in 1...3 { composer.toggle(outfitID: "app/o\(i).png") }
+            composer.toggle(driverID: "app/d1.mp4")
+            composer.toggle(driverID: "app/d2.mp4")
+            #expect(composer.jobCount == 6)
+            #expect(composer.tryonCount == tryons)
+        }
+        let server = FakeDraftServer(library: library, provider: "qwen")
+        let (composer, _) = await make(server)
+        for i in 1...3 { composer.toggle(outfitID: "app/o\(i).png") }
+        #expect(composer.tryonCount == composer.jobCount)
+        #expect(composer.tryonCount == 3)
     }
 
     @Test func missingSharedExcludesTheDriverOnlyWhenDriversAreSelected() async {

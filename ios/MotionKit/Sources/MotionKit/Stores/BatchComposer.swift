@@ -37,8 +37,8 @@ public struct CrossStep: Sendable, Equatable {
 /// every write is what it was before drivers existed. Seeds stay per outfit —
 /// `TryonLibraryStore.matches(slots:)` ignores the driver — because the server
 /// runs one try-on per outfit and shares it across that outfit's drivers
-/// (non-camera pipelines); `tryonCount` is that number, so the provider calls
-/// are visible before Phase A.
+/// (local providers, non-camera pipelines); `tryonCount` is the number of
+/// try-ons the build pays for, so the provider calls are visible before Phase A.
 @MainActor @Observable
 public final class BatchComposer {
     public struct Progress: Equatable, Sendable {
@@ -105,10 +105,15 @@ public final class BatchComposer {
     /// job per outfit, on the shared driver.
     public var jobCount: Int { outfits.count * max(drivers.count, 1) }
 
-    /// Provider calls Phase A will make: one per unseeded outfit, since a seed
-    /// skips the provider and the server shares an outfit's try-on across its
-    /// drivers — unless the try-on is camera-aware, when every pair gets its own.
+    /// Try-ons this build will pay for. With a local provider, Phase A makes
+    /// one per unseeded outfit, since a seed skips the provider and the server
+    /// shares an outfit's try-on across its drivers — unless the try-on is
+    /// camera-aware, when every pair gets its own. Sharing exists only in
+    /// Phase A, so a pod provider (e.g. `qwen`) runs its own try-on inside
+    /// every job: one per job. The local set is `RunFlow.localTryonProviders`,
+    /// not a second copy of it.
     public var tryonCount: Int {
+        guard RunFlow.localTryonProviders.contains(draft.draft?.provider ?? "") else { return jobCount }
         let unseeded = outfits.filter { $0.seedID == nil }.count
         return cameraAwareTryon ? unseeded * max(drivers.count, 1) : unseeded
     }

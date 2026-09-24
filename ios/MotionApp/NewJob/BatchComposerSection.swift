@@ -36,9 +36,10 @@ struct BatchComposerSection: View {
     private var driverCap: Int { BatchComposer.maxJobs / max(composer.outfits.count, 1) }
 
     private var summaryText: String {
-        let driverCount = max(composer.drivers.count, 1)
-        return "\(composer.outfits.count) outfits × \(driverCount) drivers = "
-            + "\(composer.jobCount) videos · \(composer.tryonCount) try-ons"
+        func count(_ n: Int, _ noun: String) -> String { "\(n) \(noun)\(n == 1 ? "" : "s")" }
+        return "\(count(composer.outfits.count, "outfit")) × "
+            + "\(count(max(composer.drivers.count, 1), "driver")) = "
+            + "\(count(composer.jobCount, "video")) · \(count(composer.tryonCount, "try-on"))"
     }
 
     var body: some View {
