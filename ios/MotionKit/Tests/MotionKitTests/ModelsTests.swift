@@ -46,9 +46,9 @@ import Testing
         #expect(summary.ordered.map(\.id) == ["c", "b", "a", "d"])
         #expect(jobs[0].finishedSec == 66)
         #expect(jobs[1].finishedSec == 7)
-        // A failed stage keeps its elapsed on the wire — `batchlib/runner.py:220-221`
+        // A failed stage keeps its elapsed on the wire — `scripts/batchlib/runner.py:220-221`
         // stamps `status="error"` and `elapsed_sec` together (`:237` for `done`), and
-        // `control/runs.py:96` only yields `null` for a stage still running — so a
+        // `scripts/control/runs.py:96` only yields `null` for a stage still running — so a
         // failed job's row shows its pre-failure seconds rather than nothing.
         #expect(jobs[2].finishedSec == 12)
     }
@@ -239,9 +239,10 @@ import Testing
 
     @Test func unfilledDraftSlotsAreDroppedFromFilledSlots() throws {
         // `Fixtures.draft` fills its only slot, so it cannot tell `compactMapValues(\.materialID)`
-        // from `mapValues { $0.materialID ?? "" }`. Task 3 matches library entries by dictionary
-        // equality over `filledSlots`, where an empty-string role would never match — so the
-        // nil-drop needs a payload that actually carries a null material id.
+        // from `mapValues { $0.materialID ?? "" }`. `TryonLibraryStore.matches(slots:)` matches
+        // library entries by dictionary equality over `filledSlots`, where an empty-string role
+        // would never match — so the nil-drop needs a payload that actually carries a null
+        // material id.
         let payload = #"""
         {"owner":"app","pipeline":"tryon-motion-enhance","provider":"gemini","generation":4,
          "slots":{"character":{"material_id":"app/model.png","name":"model.png","exists":true,

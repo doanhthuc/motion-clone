@@ -98,10 +98,16 @@ public final class DraftStore {
 
     /// Slots and the try-on seed in one PATCH (Phase 6: cross build, "Use in job").
     /// The 95 s timeout is unconditional, so a seed-only patch that probes nothing pays it too.
-    /// A 404 here also trips `needsMaterialsRefresh` when the *seed* is what went missing: the
-    /// server answers one `not_found` code for both "no such material" and "no such try-on library
-    /// entry", so the client cannot tell them apart. Read that flag as "something this patch named
-    /// is gone", never as proof a material went stale — `message` still says which one.
+    /// A 404 here also trips `needsMaterialsRefresh` when the *seed* is what went missing, but only
+    /// on a patch that carries slots too — `mutate` sets the flag solely under
+    /// `materialAssignment`, which this passes as `!patch.slots.isEmpty`. That covers every seed the
+    /// app actually *sets* (`TryonLibraryStore.use` and `BatchComposer.run` both send `tryon_seed`
+    /// together with `slots.outfit`). The one shipped seed-only patch is `NewJobView`'s `.clear`,
+    /// and it cannot 404 on a seed: the server resolves a library entry only for a truthy id
+    /// (`scripts/control/drafts.py:386-389`). The server answers one `not_found` code for both "no
+    /// such material" and "no such try-on library entry", so the client cannot tell them apart. Read
+    /// that flag as "something this patch named is gone", never as proof a material went stale —
+    /// `message` still says which one.
     @discardableResult
     public func apply(_ patch: DraftPatch) async -> Bool {
         await mutate(materialAssignment: !patch.slots.isEmpty) {

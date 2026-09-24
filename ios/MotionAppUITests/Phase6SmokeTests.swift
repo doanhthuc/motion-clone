@@ -19,7 +19,7 @@ final class Phase6SmokeTests: XCTestCase {
 
         // Precondition: an empty draft, not merely an empty basket. `draft.jobs`
         // is the server's `len(jobs)` (`scripts/control/drafts.py:337`), and `_jobs`
-        // (`:295-306`) counts the basket plus the edited job only once it is
+        // (`:294-307`) counts the basket plus the edited job only once it is
         // *complete* — so "0 jobs" alone would let the smoke proceed on a draft
         // with a slot already assigned, then overwrite and clear it. Requiring the
         // readiness line too (`NewJobView.swift:208`, rendered in Single mode)
@@ -30,7 +30,18 @@ final class Phase6SmokeTests: XCTestCase {
         guard app.staticTexts["0 jobs"].waitForExistence(timeout: 10),
               app.staticTexts["0 of 3 required slots assigned"].waitForExistence(timeout: 10)
                   || app.staticTexts["0 of 2 required slots assigned"].waitForExistence(timeout: 1) else {
-            throw XCTSkip("The draft is not empty — this smoke never overwrites a real draft.")
+            // This one reason covers three different causes, so name the
+            // literals: (a) a genuinely non-empty draft, (b) a draft or catalog
+            // load failure — `initialLoadFailure` (`NewJobView.swift:71-80`)
+            // replaces the editor, so neither line ever renders, and a network
+            // blip would otherwise send whoever reads this hunting for a
+            // phantom draft — and (c) a pipeline whose required-role count is
+            // neither 3 nor 2.
+            throw XCTSkip("New Job never rendered an empty draft: expected \"0 jobs\" plus "
+                + "\"0 of 3 required slots assigned\" or \"0 of 2 required slots assigned\". "
+                + "Either the draft is not empty (this smoke never overwrites a real one), "
+                + "or the draft/catalog load failed, or the pipeline requires a different "
+                + "number of roles.")
         }
 
         app.segmentedControls["newjob.mode"].buttons["Batch"].tap()
@@ -102,7 +113,7 @@ final class Phase6SmokeTests: XCTestCase {
         Phase4Draft.clear(in: app)
 
         app.tabBars.buttons["Material"].tap()
-        // Task 7 nested MaterialsView inside MaterialTabView, one level deeper
+        // Phase 6 nested MaterialsView inside MaterialTabView, one level deeper
         // under the NavigationStack. SwiftUI still propagates its `.toolbar`
         // item to the enclosing stack, so the import control ("Add material",
         // `MaterialsView.addMenu`) must survive the wrapper. Assert it on the
