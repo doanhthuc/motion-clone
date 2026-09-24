@@ -53,8 +53,9 @@ public final class RunFlow {
     /// The draft's `generation` when the last confirm was accepted — i.e. when
     /// the server wrote the manifest `resume` re-rents. Deliberately in memory
     /// only: `nil` means "nothing was confirmed during this store's lifetime",
-    /// which is the state after an app relaunch, and refusing there would break
-    /// the legitimate retry-after-relaunch flow.
+    /// which is the state after an app relaunch. Refusing there would break the
+    /// legitimate retry-after-relaunch flow, so this latch fails open — and the
+    /// server's confirm stamp is what actually covers the relaunch case.
     private(set) var confirmedGeneration: Int?
 
     public init(client: APIClient, gate: any SpendSending,
@@ -90,13 +91,20 @@ public final class RunFlow {
     /// and the draft has not moved since the confirm that wrote the manifest.
     ///
     /// The third term is the money guard. `resume` re-rents the manifest on
-    /// disk and deliberately never reads the draft (bot.py:7394-7395), and
+    /// disk and deliberately never reads the draft (bot.py:7511-7513), and
     /// `_run_token` is the manifest's `mtime_ns` (bot.py:1493-1506), which moves
     /// only when a manifest is *rewritten* — a draft edit does not rewrite one.
     /// That is why `panel_token` joins `.generation` (bot.py:6895-6902) and
     /// `resume` has no equivalent: without this latch, a Confirm whose rental
     /// failed followed by a free "Drop from batch" leaves Retry rental offering
     /// to rent a pod that still runs the job the user just dropped.
+    ///
+    /// Since 2026-09-24 this is the pre-tap copy of a server rule, not the
+    /// rule itself: `AppPod.resume` refuses `409 stale_run` from a confirm
+    /// stamp on disk (`_resume_generation_refusal`, bot.py), so the window this
+    /// closes stays closed across an app relaunch, which `confirmedGeneration`
+    /// alone did not. Keep both — this one says why before the tap, and costs
+    /// nothing.
     public var canRetryRental: Bool {
         pod?.failedRental != nil && pod?.lease == nil && runID != nil
             && retryRentalBlockReason == nil
@@ -110,7 +118,7 @@ public final class RunFlow {
         guard pod?.failedRental != nil, pod?.lease == nil, runID != nil,
               let confirmedGeneration else { return nil }
         guard confirmedGeneration != draft?.generation else { return nil }
-        return "The draft changed since this rental failed — Confirm again to rent what is left."
+        return "The draft changed since this rental was confirmed — Confirm again to rent what is in the draft now."
     }
 
     public var needsTryonPolling: Bool {

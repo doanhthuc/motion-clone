@@ -545,6 +545,49 @@ extension URLProtocolTests {
         #expect(await gate.intents.allSatisfy { $0.kind == .confirm })
     }
 
+    /// The regression this branch exists for. `confirmedGeneration` is in
+    /// memory, so a relaunch loses it and the client latch opens — the server's
+    /// confirm stamp is what closes it (2026-09-24 follow-ups spec §3). The
+    /// app's job on that path is to surface the refusal verbatim and re-read the
+    /// run, not to swallow it and leave the button offering the same tap again.
+    ///
+    /// The message literal is `RESUME_STALE_GENERATION` in bot.py. Asserting it
+    /// here rather than a paraphrase is what keeps the two sides honest: the
+    /// server has its own test on the same string.
+    @Test func aRelaunchSurfacesTheServersStaleResumeRefusal() async throws {
+        let stale = ("the draft changed since this rental was confirmed — "
+                     + "Confirm again to rent what is in the draft now")
+        let routes = Routes()                       // podIdle carries failed_rental
+        let gate = FakeSpendGate([.refused(status: 409, code: "stale_run",
+                                           message: stale, panelToken: nil)])
+        let flow = make(routes, gate: gate)
+        await flow.start(.existing)
+
+        // A relaunch, exactly: no confirm happened during this store's lifetime.
+        #expect(flow.confirmedGeneration == nil)
+        #expect(flow.canRetryRental)                // the client latch is open
+        #expect(flow.retryRentalBlockReason == nil)
+
+        let tryonReads = StubURLProtocol.requests.filter {
+            ($0.url?.path ?? "").hasSuffix("/tryon")
+        }.count
+        await flow.retryRental()
+
+        #expect(await gate.intents.count == 1)      // the tap really was sent
+        #expect(await gate.intents.first?.kind == .resume)
+        #expect(flow.message == stale)              // verbatim, not swallowed
+        #expect(!flow.needsRecheck)                 // a refusal is definitive
+        // Two reads, not one, and the number is the assertion: `retryRental`
+        // calls `refreshTryon()` itself for the CURRENT run_token before it
+        // sends, so a bare "the count went up" would pass even with
+        // `applyRefusal`'s `("stale_run", .resume)` case deleted. The second
+        // read is that case — the recovery. Pinning the delta is what turns a
+        // future refactor of `applyRefusal` red instead of silent.
+        #expect(StubURLProtocol.requests.filter {
+            ($0.url?.path ?? "").hasSuffix("/tryon")
+        }.count == tryonReads + 2)
+    }
+
     /// The retry stays available when nothing moved the draft, and when no
     /// confirm was accepted in this store's lifetime — the latter is the state
     /// after an app relaunch, and refusing there would break the legitimate
