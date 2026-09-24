@@ -1,6 +1,17 @@
 # Phase 6 follow-ups — a server-side resume latch and four app fixes
 
-Date: 2026-09-24 · Status: design approved in chat, not yet implemented · Branch: `feat/phase-6-follow-ups` (one branch, one PR)
+Date: 2026-09-24 · Status: implemented on `feat/phase-6-follow-ups`, gates not yet swept, not merged · Branch: `feat/phase-6-follow-ups` (one branch, one PR)
+
+Line-number citations of `scripts/tgbot/bot.py` in §2 and §3 are as of `fd8464b`, before implementation.
+Tasks 1 and 2 added 123 net lines to that file, every one of them at original line 7040 or later —
+`git diff fd8464b HEAD -- scripts/tgbot/bot.py`'s first hunk is the pure insertion
+`@@ -7038,6 +7038,40 @@` — so every citation pointing past that line has drifted, `:7413` for the
+`run_token` check and `_kill_result_path` at `:7247-7274` among them. Citations earlier in the file
+were re-read on 2026-09-24 and did not move: `:7029` and `:7039` for the two accepted-branch `clear()`
+calls, `:6945-6946` for `_phase_a_matches_draft`'s first test, `:7009-7012` for the `bot_busy` early
+return. Read a drifted site by symbol name (`AppPod.resume`, `_kill_result_path`); the names did not
+move. Code comments are held to a stricter standard and were corrected as each task touched them —
+`_changed` at `drafts.py:275-279` and the validate save at `drafts.py:555` still point where they say.
 
 These are the five items Phase 6 recorded in
 [`../swiftui-app-progress.md`](../swiftui-app-progress.md) §"Known incomplete work" and could not

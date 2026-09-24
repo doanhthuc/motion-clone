@@ -186,8 +186,11 @@ Design: `docs/superpowers/specs/2026-09-23-swiftui-app-phase-6-design.md`.
   and never reads the draft, so `RunFlow` records `draft.generation` when a confirm is accepted and
   `canRetryRental` refuses once the draft moves — otherwise a drop after a failed rental would rent a
   pod still running the dropped job. The run detail card stays up and says why
-  (`retryRentalBlockReason`). The latch is in memory, so an app relaunch clears it; the durable fix is
-  a server-side `generation` check on `resume`.
+  (`retryRentalBlockReason`). The server is the authority, and it survives a relaunch: an accepted
+  confirm stamps the draft's `generation` (`batch/tg-<chat_id>.confirmed-generation.json`, written for
+  app-initiated confirms only) and `resume` refuses `409 stale_run` when the draft has moved since. The
+  in-memory latch is the pre-tap copy — it says why before the tap and costs nothing — and it fails open
+  after a relaunch, which is the case the stamp covers.
 - **Saved try-ons.** The library grid (`GET /v1/tryon-library`, images cached by id) shows each
   entry's provider, saved date and resolved character/outfit names ("(deleted)" when a material is
   gone). **Use in job** (`saved.use.<id>`) fills the draft through `DraftStore.apply` and switches to
