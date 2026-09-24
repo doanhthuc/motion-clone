@@ -383,12 +383,14 @@ extension URLProtocolTests {
     }
 
     /// What the server actually answers an invalid non-stale validation with:
-    /// 422 `invalid` (drafts.py:565 → server.py `_DOMAIN_STATUS`). 422 is not in
-    /// `APIError.userMessage`'s explicit list, so its text reaches the screen
-    /// verbatim — spec §5's "leaves the server's message on screen". The three
-    /// `/v1/draft` GETs are `start`, the drop's fresh read and the `catch`'s
-    /// re-read, so this also pins that a failed drop still refreshes the draft.
-    @Test func dropShowsTheServerMessageWhenValidationIsRefused() async throws {
+    /// 422 `invalid` (drafts.py:566 → server.py:47 `_DOMAIN_STATUS`). Since
+    /// 2026-09-24 that code headlines instead of showing the server's text
+    /// (spec §5), and `drop`'s catch assigns `apiError(error).userMessage` to a
+    /// `String`, so the raw text has nowhere to travel — headline only, with no
+    /// `detailMessage` and therefore no disclosure. The three `/v1/draft` GETs
+    /// are `start`, the drop's fresh read and the `catch`'s re-read, so this
+    /// also pins that a failed drop still refreshes the draft.
+    @Test func dropHeadlinesARefusedValidationAndStillRefreshesTheDraft() async throws {
         let routes = Routes()
         routes.draft = Routes.draftTwoJobs
         routes.tryon = Fixtures.tryonDone
@@ -400,7 +402,7 @@ extension URLProtocolTests {
 
         await flow.drop(blazer)
 
-        #expect(flow.message == "make batch-validate failed: job 2 has no driver")
+        #expect(flow.message == "This draft didn't pass validation, so it can't run yet.")
         let writes = StubURLProtocol.requests.filter { $0.httpMethod != "GET" }
         #expect(writes.map { "\($0.httpMethod!) \($0.url!.path)" } ==
                 ["PATCH /v1/draft", "DELETE /v1/draft/batch/d2", "POST /v1/draft/validate"])

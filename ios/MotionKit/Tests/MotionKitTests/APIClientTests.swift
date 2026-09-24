@@ -303,6 +303,41 @@ extension URLProtocolTests {
         #expect(APIError.server(status: 500, code: "internal", message: "x").userMessage
                 == "Server error (internal).")
         #expect(APIError.transport("offline").isOffline)
+        // A 422 `invalid` carries the validator's raw stdout+stderr
+        // (drafts.py:535,544-548), the literal "make batch-validate failed"
+        // (drafts.py:566), Telegram-facing copy telling the reader to "send the
+        // file(s) again" (bot.py:6064), or an empty string (bot.py:6051, where
+        // _render_and_validate already sent the real reason to Telegram). All
+        // four are developer-facing, so the banner leads with a headline and
+        // the raw text moves behind a disclosure.
+        #expect(APIError.server(status: 422, code: "invalid",
+                                message: "scripts/batch_run.py: boom").userMessage
+                == "This draft didn't pass validation, so it can't run yet.")
+        #expect(APIError.server(status: 422, code: "invalid",
+                                message: "make batch-validate failed").userMessage
+                == "This draft didn't pass validation, so it can't run yet.")
+        #expect(APIError.server(status: 422, code: "invalid",
+                                message: "").userMessage
+                == "This draft didn't pass validation, so it can't run yet.")
+        // The raw text is preserved for the disclosure — except when blank, so
+        // bot.py:6051's empty message renders no empty disclosure.
+        #expect(APIError.server(status: 422, code: "invalid",
+                                message: "scripts/batch_run.py: boom").detailMessage
+                == "scripts/batch_run.py: boom")
+        #expect(APIError.server(status: 422, code: "invalid", message: "").detailMessage == nil)
+        #expect(APIError.server(status: 422, code: "invalid", message: "  \n ").detailMessage == nil)
+        // Every other error keeps its text and has no detail. `missing_slots` is
+        // the 422 whose server copy is already written for a human
+        // (DraftStoreTests.swift:196) and must stay verbatim.
+        #expect(APIError.server(status: 422, code: "missing_slots",
+                                message: "Assign driver before validating.").userMessage
+                == "Assign driver before validating.")
+        #expect(APIError.server(status: 422, code: "missing_slots",
+                                message: "Assign driver before validating.").detailMessage == nil)
+        #expect(APIError.server(status: 409, code: "stale_run", message: "x").detailMessage == nil)
+        #expect(APIError.transport("offline").detailMessage == nil)
+        #expect(APIError.decoding("shape").detailMessage == nil)
+        #expect(APIError.accessDenied(status: 403).detailMessage == nil)
     }
 }
 @Suite struct SpendTransportTests {

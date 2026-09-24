@@ -35,13 +35,33 @@ struct ErrorBanner: View {
     let error: APIError
     var retry: (() async -> Void)?
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            Image(systemName: "exclamationmark.triangle").foregroundStyle(Theme.red)
-            Text(error.userMessage).font(Theme.sans(13)).foregroundStyle(Theme.ink1)
-            Spacer(minLength: 0)
-            if let retry {
-                Button("Retry") { Task { await retry() } }
-                    .font(Theme.sans(13, .semibold)).foregroundStyle(Theme.lime)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "exclamationmark.triangle").foregroundStyle(Theme.red)
+                Text(error.userMessage).font(Theme.sans(13)).foregroundStyle(Theme.ink1)
+                Spacer(minLength: 0)
+                if let retry {
+                    Button("Retry") { Task { await retry() } }
+                        .font(Theme.sans(13, .semibold)).foregroundStyle(Theme.lime)
+                }
+            }
+            // Only a 422 `invalid` has a detail (APIError.detailMessage), so
+            // every other ErrorBanner call site renders exactly as it did
+            // before this VStack existed: one greedy child, same frame.
+            // Collapsed by default: the raw text is the validator's own output,
+            // and it is the only thing that names the real problem, so it is
+            // reachable but not in the way.
+            if let detail = error.detailMessage {
+                DisclosureGroup("Details") {
+                    Text(detail)
+                        .font(Theme.mono(11))
+                        .foregroundStyle(Theme.ink2)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .font(Theme.sans(12, .semibold))
+                .foregroundStyle(Theme.ink2)
+                .tint(Theme.lime)
             }
         }
         .padding(12)
