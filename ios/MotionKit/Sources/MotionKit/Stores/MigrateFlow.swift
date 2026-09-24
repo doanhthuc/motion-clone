@@ -37,10 +37,13 @@ public final class MigrateFlow {
     private let pod: PodStore
     /// Read for `isDropping` only. `RunFlow.spend` guards its own four entry
     /// points; `migrate()` calls `gate.perform` directly and so needs the same
-    /// guard here, or `RunFlow.drop`'s PATCH and validate — a 95 s client
-    /// timeout each, because the server can probe for 60 s and validate for
-    /// 90 s — are a window the most destructive call in the API can be
-    /// launched inside.
+    /// guard here. `RunFlow.drop` is a long window to be unguarded inside: its
+    /// PATCH and its validate carry a 95 s client timeout each, because the
+    /// server can probe for 60 s and validate for 90 s (timeouts read in
+    /// `RunFlow.drop`, 2026-09-24). The PATCH is a worst-case leg, not an
+    /// unconditional one — it runs only on the `editedJobEquals` branch — but
+    /// the validate always runs, and a migration launched inside either deletes
+    /// a volume while the draft is moving under it.
     private let runFlow: RunFlow
     private let now: @Sendable () -> Date
     private var deadline: Date?
@@ -116,10 +119,10 @@ public final class MigrateFlow {
     }
 
     public func migrate() async {
-        // Ahead of `canMigrate`, deliberately. `canMigrate` carries the same
-        // `!runFlow.isDropping` term and both guards are `@MainActor` with no
-        // `await` between them, so checking the drop second would make this
-        // guard unreachable and the refusal silent — a dead guard reads as
+        // Ahead of `canMigrate`, deliberately (2026-09-24). `canMigrate` carries
+        // the same `!runFlow.isDropping` term and both guards are `@MainActor`
+        // with no `await` between them, so checking the drop second would make
+        // this guard unreachable and the refusal silent — a dead guard reads as
         // coverage it does not provide. Kept as the choke point regardless,
         // mirroring `RunFlow.spend`: a caller that skips the button check still
         // cannot launch the one call that deletes a volume while the draft is
