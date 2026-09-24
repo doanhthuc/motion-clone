@@ -386,7 +386,7 @@ class DraftStore:
         if tryon_seed:
             seed_path = self.tryon_library.resolve_image(tryon_seed)
             if seed_path is None:
-                raise DraftError("not_found", f"no such try-on library entry: {tryon_seed}")
+                raise DraftError("seed_not_found", f"no such try-on library entry: {tryon_seed}")
         if pipeline is not None and pipeline not in PIPELINES:
             raise DraftError("unknown_pipeline", f"unknown pipeline {pipeline!r}")
         if provider is not None and provider not in PROVIDER_LABELS:

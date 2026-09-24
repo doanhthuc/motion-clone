@@ -382,12 +382,33 @@ class TestPatch(StoreCase):
         self.assertIsNone(self.store._load().job.tryon_seed)
 
     def test_tryon_seed_refusals(self):
-        self.assertRefused("not_found", self.store.patch, {"tryon_seed": "nope"})
+        # Its own code, not not_found: a deleted library entry is not a stale
+        # material, and the phone reloads its materials list on not_found.
+        self.assertRefused("seed_not_found", self.store.patch, {"tryon_seed": "nope"})
         self.assertRefused("bad_request", self.store.patch, {"tryon_seed": 3})
         # An unknown id must not half-apply the rest of the same patch.
-        self.assertRefused("not_found", self.store.patch,
+        self.assertRefused("seed_not_found", self.store.patch,
                            {"provider": "qwen-max", "tryon_seed": "nope"})
         self.assertEqual(self.store.view()["provider"], "gemini")
+
+    def test_seed_not_found_leaves_the_draft_byte_identical(self):
+        # The app skips its ambiguity re-read on this code because the seed is
+        # resolved above control.LOCK, before anything is written. Asserted
+        # here rather than trusted.
+        self.fill()
+        before = self.store.path.read_bytes()
+        self.assertRefused("seed_not_found", self.store.patch,
+                           {"slots": {"background": "app/bg.png"}, "tryon_seed": "nope"})
+        self.assertEqual(self.store.path.read_bytes(), before)
+
+    def test_a_stale_material_beside_a_valid_seed_is_still_not_found(self):
+        # The cross build sends tryon_seed together with slots.outfit. A gone
+        # material in that patch must keep saying not_found, so the phone
+        # still refreshes its materials list — narrowing pinned from this side.
+        self.fill()
+        self.assertRefused("not_found", self.store.patch,
+                           {"slots": {"outfit": "app/missing.png"},
+                            "tryon_seed": self.saved_seed()})
 
     def test_tryon_seed_needs_a_local_provider(self):
         # Money is a first-class constraint: a seed sitting beside a non-local
