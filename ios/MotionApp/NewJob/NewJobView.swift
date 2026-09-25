@@ -22,7 +22,7 @@ struct NewJobView: View {
             } else if let error = store.error {
                 initialLoadFailure(error)
             } else if store.isRefreshing {
-                ProgressView("Loading draft…")
+                LoadingBlock(title: "Loading draft…")
             } else {
                 ContentUnavailableView("New Job unavailable", systemImage: "exclamationmark.triangle")
             }

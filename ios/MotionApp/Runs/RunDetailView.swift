@@ -75,7 +75,7 @@ struct RunDetailView: View {
                     }
                 }
             } else if store.error == nil {
-                ProgressView().frame(maxWidth: .infinity).listRowBackground(Color.clear)
+                LoadingBlock().listRowBackground(Color.clear)
             }
         }
         .navigationTitle(store.detail?.batch ?? store.runID)

@@ -54,7 +54,7 @@ struct RunFlowView: View {
         switch flow.phase {
         case .loading:
             if flow.error == nil {
-                ProgressView().frame(maxWidth: .infinity).listRowBackground(Color.clear)
+                LoadingBlock().listRowBackground(Color.clear)
             }
         case .compose:
             compose

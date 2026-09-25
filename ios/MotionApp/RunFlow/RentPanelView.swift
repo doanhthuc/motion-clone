@@ -65,7 +65,7 @@ struct RentPanelView: View {
                     }
                 }
             } else if flow.isLoadingPanel {
-                ProgressView("Reading stock and prices…").frame(maxWidth: .infinity)
+                LoadingBlock(title: "Reading stock and prices…")
                     .listRowBackground(Color.clear)
             }
         }

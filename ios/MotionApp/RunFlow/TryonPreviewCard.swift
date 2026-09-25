@@ -18,7 +18,7 @@ struct TryonPreviewCard: View {
                         .clipShape(.rect(cornerRadius: Theme.Radius.small))
                         .frame(maxWidth: .infinity)
                 } else if preview.hasImage {
-                    ProgressView().frame(maxWidth: .infinity, minHeight: 200)
+                    LoadingBlock(minHeight: 200)
                 } else {
                     Text(preview.status == .error ? "Try-on failed for this job." : "No image yet.")
                         .font(.subheadline).foregroundStyle(Theme.secondary)

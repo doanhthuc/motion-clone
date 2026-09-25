@@ -85,7 +85,7 @@ struct PodView: View {
                 }
             }
         } else if pod.error == nil {
-            ProgressView().frame(maxWidth: .infinity).listRowBackground(Color.clear)
+            LoadingBlock().listRowBackground(Color.clear)
         }
     }
 }
@@ -175,7 +175,7 @@ struct BalanceSection: View {
             } else if let error = store.error {
                 ErrorBanner(error: error) { await store.load() }
             } else {
-                ProgressView().frame(maxWidth: .infinity)
+                LoadingBlock()
             }
             if let vast = store.vastLine {
                 VStack(alignment: .leading, spacing: 4) {

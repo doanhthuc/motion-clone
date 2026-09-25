@@ -28,7 +28,7 @@ struct GpuPickerView: View {
             if let stock = store.stock {
                 ForEach(stock.gpus) { row in rowView(row, stock: stock) }
             } else if store.isLoading {
-                ProgressView("Reading stock…").frame(maxWidth: .infinity)
+                LoadingBlock(title: "Reading stock…")
             }
         } header: {
             Text("GPU")
