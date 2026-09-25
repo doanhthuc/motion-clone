@@ -60,7 +60,7 @@ struct MigrateSheet: View {
         case .choose:
             chooser
         case .asking(let dc):
-            ProgressView("Checking \(dc)…").frame(maxWidth: .infinity).listRowBackground(Color.clear)
+            LoadingBlock(title: "Checking \(dc)…").listRowBackground(Color.clear)
         case .confirm(let ask):
             confirmation(ask, typed: typed)
         case .started(let dc):
@@ -115,7 +115,7 @@ struct MigrateSheet: View {
             } else if let error = gpu.error {
                 ErrorBanner(error: error) { await gpu.load() }
             } else {
-                ProgressView("Reading stock…").frame(maxWidth: .infinity)
+                LoadingBlock(title: "Reading stock…")
             }
         }
     }

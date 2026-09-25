@@ -92,8 +92,7 @@ struct MaterialPicker: View {
         } else if !materials.loaded, let message = materials.errorMessage {
             initialLoadFailure(message)
         } else if !materials.loaded {
-            ProgressView("Loading materials…")
-                .frame(maxWidth: .infinity)
+            LoadingBlock(title: "Loading materials…")
                 .padding(.vertical, 48)
         } else if eligible.isEmpty {
             ContentUnavailableView {
