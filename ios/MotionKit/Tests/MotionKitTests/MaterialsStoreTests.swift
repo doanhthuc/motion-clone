@@ -175,7 +175,7 @@ extension URLProtocolTests {
         #expect(bodies.map { String(decoding: $0, as: UTF8.self) } == [#"{"role":"character"}"#, #"{"role":null}"#])
     }
 
-    @Test func deleteHonorsOwnershipAndServerOutcomes() async throws {
+    @Test func deleteSendsForEveryOwner() async throws {
         StubURLProtocol.install { request in
             if request.httpMethod == "DELETE" { return (204, [:], Data()) }
             return TestSupport.json(list)
@@ -186,11 +186,14 @@ extension URLProtocolTests {
         await store.delete(owned)
         #expect(store.materials.map(\.id) == ["42/driver.mp4"])
 
+        // A Telegram chat's material: the server decides (2026-09-25), so the
+        // request goes out and the row goes on a 204.
         let foreign = try #require(store.materials.first)
-        StubURLProtocol.install { _ in (204, [:], Data()) }
         await store.delete(foreign)
-        #expect(StubURLProtocol.requests.isEmpty)
-        #expect(store.errorMessage == "Only materials uploaded by this app can be deleted.")
+        #expect(store.materials.isEmpty)
+        #expect(StubURLProtocol.requests.contains {
+            $0.httpMethod == "DELETE" && $0.url?.path.hasSuffix("/v1/materials/42/driver.mp4") == true })
+        #expect(store.errorMessage == nil)
     }
 
     @Test func aSecondUploadIsRejectedWhileTheFirstIsActive() async throws {

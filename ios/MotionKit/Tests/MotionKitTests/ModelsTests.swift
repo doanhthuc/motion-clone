@@ -146,9 +146,7 @@ import Testing
         let response = try decoder.decode(MaterialsResponse.self, from: Fixtures.data(Fixtures.materials))
         #expect(response.materials.count == 2)
         #expect(response.materials[0].kind == .image)
-        #expect(response.materials[0].canDelete)
         #expect(response.materials[1].kind == .unknown)
-        #expect(!response.materials[1].canDelete)
     }
 
     @Test func decodesUploadLifecycleResponses() throws {

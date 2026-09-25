@@ -164,10 +164,6 @@ public final class MaterialsStore {
     }
 
     public func delete(_ material: Material) async {
-        guard material.canDelete else {
-            errorMessage = "Only materials uploaded by this app can be deleted."
-            return
-        }
         do {
             try await client.delete("v1", "materials", material.owner, material.name)
             materials.removeAll { $0.id == material.id }
