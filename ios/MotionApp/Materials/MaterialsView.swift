@@ -153,13 +153,14 @@ struct MaterialsView: View {
         .accessibilityAddTraits(.isHeader)
     }
 
-    /// Bottom centre, above the tab bar: the one place a thumb reaches on a
+    /// Bottom of the screen, above the tab bar, where a thumb reaches on a
     /// Pro Max held in one hand. The navigation bar's + it replaces was the
     /// farthest point on the screen.
     private var addButton: some View {
         Button { adding = true } label: {
             HStack(spacing: 8) {
-                Image(systemName: "plus").font(.title3.weight(.semibold))
+                // Not a bare "plus": the tab bar's New Job is one, right below.
+                Image(systemName: "photo.badge.plus").font(.title3.weight(.semibold))
                 if !addCollapsed {
                     Text("Add material").font(.headline)
                         .transition(.opacity.combined(with: .scale(scale: 0.8, anchor: .leading)))
@@ -176,6 +177,11 @@ struct MaterialsView: View {
         .foregroundStyle(Theme.onAccent)
         .disabled(store.isUploading || store.isImportingLink)
         .accessibilityLabel("Add material")
+        // Centred while it is a labelled pill; collapsed, it moves to the
+        // trailing corner. A centred circle sat straight above New Job's +
+        // in the tab bar, two look-alike buttons stacked (2026-09-25).
+        .frame(maxWidth: .infinity, alignment: addCollapsed ? .trailing : .center)
+        .padding(.horizontal, 20)
         .padding(.bottom, 12)
     }
 
