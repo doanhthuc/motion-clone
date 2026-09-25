@@ -7,32 +7,41 @@ struct RunsView: View {
     let flow: RunFlow
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 13) {
-                header
-                if let error = runs.error, !runs.loaded {
-                    ErrorBanner(error: error) { await refresh() }
-                }
-                if let p = pod.pod, let lease = p.lease { PodStrip(gpu: p.gpu, lease: lease) }
-                if runs.loaded && runs.runs.isEmpty { EmptyRuns() }
-                if let live = runs.live {
+        List {
+            if let error = runs.error, !runs.loaded {
+                Section { ErrorBanner(error: error) { await refresh() } }
+            }
+            if runs.isStale {
+                Section { StaleTag(lastSuccess: runs.lastSuccess) }
+            }
+            if let p = pod.pod, let lease = p.lease {
+                Section { PodStrip(gpu: p.gpu, lease: lease) }
+            }
+            if let live = runs.live {
+                Section("Now") {
                     if live.status == .phaseA {
-                        NavigationLink { RunFlowView(flow: flow, entry: .existing) } label: { LiveRunCard(run: live) }
-                            .buttonStyle(.plain)
+                        NavigationLink { RunFlowView(flow: flow, entry: .existing) } label: { LiveRunRow(run: live) }
                     } else {
-                        NavigationLink(value: live.id) { LiveRunCard(run: live) }.buttonStyle(.plain)
-                    }
-                }
-                if !runs.recent.isEmpty {
-                    SectionLabel(text: "Recent").padding(.top, 2)
-                    ForEach(runs.recent) { run in
-                        NavigationLink(value: run.id) { RunRow(run: run) }.buttonStyle(.plain)
+                        NavigationLink(value: live.id) { LiveRunRow(run: live) }
                     }
                 }
             }
-            .padding(.horizontal, 20)
+            if !runs.recent.isEmpty {
+                Section {
+                    ForEach(runs.recent) { run in
+                        NavigationLink(value: run.id) { RunRow(run: run) }
+                    }
+                } header: {
+                    Text("Recent")
+                } footer: {
+                    Text("\(runs.runs.count) total")
+                }
+            }
         }
-        .background(Theme.bg)
+        .overlay {
+            if runs.loaded && runs.runs.isEmpty { EmptyRuns() }
+        }
+        .navigationTitle("Runs")
         .navigationDestination(for: String.self) { id in
             if let client = runsClient {
                 RunDetailView(store: RunDetailStore(client: client, runID: id), flow: flow, pod: pod)
@@ -41,6 +50,7 @@ struct RunsView: View {
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 NavigationLink { SettingsView() } label: { Image(systemName: "gearshape") }
+                    .accessibilityLabel("Settings")
             }
         }
         .refreshable { await refresh() }
@@ -55,21 +65,6 @@ struct RunsView: View {
         async let b: Void = pod.refresh()
         _ = await (a, b)
     }
-
-    private var header: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            Text("Runs").font(Theme.sans(33, .bold)).foregroundStyle(Theme.ink)
-            HStack(spacing: 12) {
-                if runs.live != nil {
-                    HStack(spacing: 6) { PulseDot(size: 7); Text("1 generating") }
-                        .font(Theme.sans(12, .semibold)).foregroundStyle(Theme.lime)
-                }
-                Text("\(runs.runs.count) total").font(Theme.mono(11)).foregroundStyle(Theme.ink2)
-                if runs.isStale { StaleTag(lastSuccess: runs.lastSuccess) }
-            }
-        }
-        .padding(.top, 6)
-    }
 }
 
 struct PodStrip: View {
@@ -78,84 +73,82 @@ struct PodStrip: View {
     var body: some View {
         TimelineView(.periodic(from: .now, by: 1)) { ctx in
             let elapsed = ctx.date.timeIntervalSince1970 - lease.provisionedAt
-            HStack(spacing: 11) {
+            HStack(spacing: 10) {
                 PulseDot()
-                Text("Pod live").font(Theme.sans(13, .semibold)).foregroundStyle(Theme.ink1)
-                Text("\(gpu) · \(lease.provider)").font(Theme.mono(11)).foregroundStyle(Theme.ink2).lineLimit(1)
-                Spacer(minLength: 0)
-                if let rate = lease.quotedUsdPerHr {
-                    Text("\(Format.usd(rate))/h").font(Theme.mono(13, .semibold)).foregroundStyle(Theme.lime)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Pod live").font(.body)
+                    Text("\(gpu) · \(lease.provider)").font(.subheadline).foregroundStyle(Theme.secondary)
+                        .lineLimit(1)
                 }
-                Text(Format.clock(elapsed)).font(Theme.mono(12)).foregroundStyle(Theme.ink2)
+                Spacer(minLength: 0)
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text(Format.clock(elapsed)).font(.body.monospacedDigit())
+                    if let rate = lease.quotedUsdPerHr {
+                        Text("\(Format.usd(rate))/h").font(.subheadline.monospacedDigit())
+                            .foregroundStyle(Theme.secondary)
+                    }
+                }
             }
-            .padding(.horizontal, 14).padding(.vertical, 12)
-            .card(radius: 14)
         }
     }
 }
 
-struct LiveRunCard: View {
+struct LiveRunRow: View {
     let run: RunSummary
     var body: some View {
-        VStack(alignment: .leading, spacing: 13) {
+        VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 6) {
                 PulseDot(size: 6)
                 Text(run.status == .phaseA ? "Try-on on the VPS" : "Generating")
+                    .font(.footnote.weight(.semibold)).foregroundStyle(Theme.secondary)
             }
-            .font(Theme.sans(11, .bold)).foregroundStyle(Theme.lime)
-            .padding(.horizontal, 10).padding(.vertical, 5)
-            .background(Theme.limeDim, in: .capsule)
-            Text(run.batch ?? run.id).font(Theme.sans(18, .semibold)).foregroundStyle(Theme.ink)
+            Text(run.batch ?? run.id).font(.headline)
             ProgressView(value: Double(run.jobsDone), total: Double(max(run.jobsTotal, 1)))
-                .tint(Theme.lime)
-            Text("\(run.jobsDone)/\(run.jobsTotal) jobs done · \(run.id)")
-                .font(Theme.mono(11)).foregroundStyle(Theme.ink2)
+                .tint(Theme.label)
+            Text("\(run.jobsDone) of \(run.jobsTotal) jobs done")
+                .font(.subheadline.monospacedDigit()).foregroundStyle(Theme.secondary)
         }
-        .padding(14)
-        .card(radius: 20, border: Theme.limeLine)
+        .padding(.vertical, 4)
     }
 }
 
 struct RunRow: View {
     let run: RunSummary
     var body: some View {
-        HStack(spacing: 13) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(run.batch ?? run.id).font(Theme.sans(15, .semibold)).foregroundStyle(Theme.ink)
-                Text("\(run.id) · \(run.jobsDone)/\(run.jobsTotal) jobs")
-                    .font(Theme.mono(11)).foregroundStyle(Theme.ink2)
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(run.batch ?? run.id).font(.body)
+                Text("\(run.jobsDone) of \(run.jobsTotal) jobs")
+                    .font(.subheadline.monospacedDigit()).foregroundStyle(Theme.secondary)
             }
             Spacer(minLength: 0)
             StatusBadge(status: run.status)
         }
-        .padding(11)
-        .card(border: run.status == .error ? Theme.redDim : Theme.line)
     }
 }
 
+/// Icon and word together, so status never rides on color alone.
 struct StatusBadge: View {
     let status: RunStatus
     var body: some View {
         switch status {
         case .done:
-            Image(systemName: "checkmark.circle.fill").foregroundStyle(Theme.ink)
+            Label("Done", systemImage: "checkmark.circle").foregroundStyle(Theme.secondary)
+                .labelStyle(.iconOnly).accessibilityLabel("Done")
         case .error:
-            Image(systemName: "exclamationmark.triangle").foregroundStyle(Theme.red)
+            Label("Failed", systemImage: "exclamationmark.triangle.fill")
+                .font(.subheadline).foregroundStyle(Theme.danger)
         case .running, .phaseA:
-            PulseDot()
+            PulseDot().accessibilityLabel("Running")
         case .stopped, .unknown:
-            Text(status == .stopped ? "stopped" : "unknown").font(Theme.mono(10)).foregroundStyle(Theme.ink3)
+            Text(status == .stopped ? "Stopped" : "Unknown").font(.subheadline).foregroundStyle(Theme.secondary)
         }
     }
 }
 
 struct EmptyRuns: View {
     var body: some View {
-        VStack(spacing: 10) {
-            Text("Nothing yet").font(Theme.sans(22, .bold)).foregroundStyle(Theme.ink)
-            Text("Runs started from Telegram or this app show up here. Try-on happens on the VPS first — no GPU spend until you confirm.")
-                .font(Theme.sans(14)).foregroundStyle(Theme.ink2).multilineTextAlignment(.center)
-        }
-        .frame(maxWidth: .infinity).padding(.vertical, 60)
+        EmptyNote(title: "No runs yet", systemImage: "waveform.path.ecg",
+                  message: "Runs started from Telegram or this app show up here. Try-on happens on the VPS first — no GPU spend until you confirm.")
     }
 }

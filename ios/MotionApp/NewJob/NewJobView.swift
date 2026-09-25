@@ -11,6 +11,9 @@ struct NewJobView: View {
     @Environment(AppModel.self) private var model
     @State private var selectedRole: String?
     @State private var dropCandidate: DraftBatchEntry?
+    @State private var showRun = false
+    @State private var pickingOutfits = false
+    @State private var pickingDrivers = false
 
     var body: some View {
         Group {
@@ -24,7 +27,7 @@ struct NewJobView: View {
                 ContentUnavailableView("New Job unavailable", systemImage: "exclamationmark.triangle")
             }
         }
-        .background(Theme.bg)
+        .navigationTitle("New Job")
         .task { await store.load() }
         .task { await library.load() }
         .refreshable { await store.refresh() }
@@ -76,9 +79,9 @@ struct NewJobView: View {
                 "New Job unavailable",
                 systemImage: "exclamationmark.triangle",
                 description: Text("The draft and pipeline catalog could not be loaded."))
-            ErrorBanner(error: error) { await store.load() }
+            ErrorBanner(error: error) { await store.load() }.heroSurface()
         }
-        .padding(.horizontal, 20)
+        .padding(.horizontal, 16)
     }
 
     private func editor(draft: Draft, pipeline: Pipeline) -> some View {
@@ -88,9 +91,8 @@ struct NewJobView: View {
         // the picker is disabled instead of opening an empty menu behind a label
         // that still names the pipeline the user is on.
         let batchCatalog = store.catalog.filter(BatchComposer.supports)
-        return ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                header(draft)
+        return List {
+            Section {
                 Picker("Mode", selection: Binding(get: { model.newJobMode }, set: { model.newJobMode = $0 })) {
                     Text("Single").tag(NewJobMode.single)
                     Text("Batch").tag(NewJobMode.batch)
@@ -98,30 +100,47 @@ struct NewJobView: View {
                 .pickerStyle(.segmented)
                 .accessibilityIdentifier("newjob.mode")
                 .disabled(store.isBusy || composer.isRunning)
-                banners
-                PipelinePicker(
-                    pipeline: pipeline,
-                    pipelines: isBatch ? batchCatalog : store.catalog,
-                    selectedProvider: draft.provider,
-                    disabled: store.isBusy || composer.isRunning || (isBatch && batchCatalog.isEmpty),
-                    onPipelineSelected: { id in await store.selectPipeline(id) },
-                    onProviderSelected: { id in await store.selectProvider(id) })
-                if isBatch {
-                    BatchComposerSection(store: store, composer: composer,
-                                         materials: materials, pipeline: pipeline,
-                                         onPickRole: { selectedRole = $0 })
-                    clearAction
-                } else {
-                    slots(draft: draft, pipeline: pipeline)
-                    seedBadge(draft)
-                    readiness(draft)
-                    editorActions(draft)
-                }
-                batch(draft)
-                validation(draft)
+                .buttonRow()
             }
-            .padding(.horizontal, 20)
-            .padding(.bottom, 28)
+            banners
+            PipelinePicker(
+                pipeline: pipeline,
+                pipelines: isBatch ? batchCatalog : store.catalog,
+                selectedProvider: draft.provider,
+                disabled: store.isBusy || composer.isRunning || (isBatch && batchCatalog.isEmpty),
+                onPipelineSelected: { id in await store.selectPipeline(id) },
+                onProviderSelected: { id in await store.selectProvider(id) })
+            if isBatch {
+                BatchComposerSection(store: store, composer: composer,
+                                     materials: materials, pipeline: pipeline,
+                                     onPickRole: { selectedRole = $0 },
+                                     pickingOutfits: $pickingOutfits,
+                                     pickingDrivers: $pickingDrivers)
+            } else {
+                slots(draft: draft, pipeline: pipeline)
+                seedBadge(draft)
+                editorActions(draft)
+            }
+            batch(draft)
+            validation(draft)
+        }
+        .navigationSubtitle("\(draft.jobs) jobs")
+        .toolbar {
+            ToolbarItem(placement: .topBarLeading) { clearAction }
+            if store.isStale {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button { Task { await store.refresh() } } label: {
+                        Image(systemName: "clock.arrow.circlepath")
+                    }
+                    .tint(Theme.warning)
+                    .accessibilityLabel("Stale — refresh")
+                }
+            }
+        }
+        .modifier(BatchPickerSheets(pickingOutfits: $pickingOutfits, pickingDrivers: $pickingDrivers,
+                                    composer: composer, materials: materials, pipeline: pipeline))
+        .navigationDestination(isPresented: $showRun) {
+            RunFlowView(flow: flow, entry: .newJob)
         }
         .sheet(
             isPresented: Binding(
@@ -142,45 +161,25 @@ struct NewJobView: View {
         }
     }
 
-    private func header(_ draft: Draft) -> some View {
-        HStack(alignment: .firstTextBaseline) {
-            Text("New Job")
-                .font(Theme.sans(33, .bold))
-                .foregroundStyle(Theme.ink)
-            Spacer()
-            if store.isStale { StaleTag(lastSuccess: store.lastSuccess) }
-            Text("\(draft.jobs) jobs")
-                .font(Theme.mono(11))
-                .foregroundStyle(Theme.ink2)
-        }
-        .padding(.top, 6)
-    }
-
     @ViewBuilder private var banners: some View {
-        if let error = store.error {
-            ErrorBanner(error: error) { await store.refresh() }
-        }
-        if let message = store.message, message != store.error?.userMessage {
-            HStack(alignment: .top, spacing: 10) {
-                Image(systemName: "info.circle").foregroundStyle(Theme.amber)
-                Text(message).font(Theme.sans(13)).foregroundStyle(Theme.ink1)
-                Spacer(minLength: 0)
-                Button("Dismiss") { store.dismissMessage() }
-                    .font(Theme.sans(12, .semibold)).foregroundStyle(Theme.lime)
+        if store.error != nil || (store.message != nil && store.message != store.error?.userMessage) {
+            Section {
+                if let error = store.error {
+                    ErrorBanner(error: error) { await store.refresh() }
+                }
+                if let message = store.message, message != store.error?.userMessage {
+                    MessageCard(text: message) { store.dismissMessage() }
+                }
             }
-            .padding(12)
-            .background(Theme.surface2, in: .rect(cornerRadius: 12))
-            .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Theme.line2))
         }
     }
 
     private func slots(draft: Draft, pipeline: Pipeline) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            SectionLabel(text: "Materials")
-            ForEach(pipeline.required, id: \.self) { role in
+        Section {
+            ForEach(pipeline.required + pipeline.optional, id: \.self) { role in
                 SlotMaterialRow(
                     role: role,
-                    required: true,
+                    required: pipeline.required.contains(role),
                     kind: pipeline.roles[role] ?? .unknown,
                     slot: draft.slots[role],
                     materials: materials,
@@ -188,17 +187,10 @@ struct NewJobView: View {
                         selectedRole = role
                     }
             }
-            ForEach(pipeline.optional, id: \.self) { role in
-                SlotMaterialRow(
-                    role: role,
-                    required: false,
-                    kind: pipeline.roles[role] ?? .unknown,
-                    slot: draft.slots[role],
-                    materials: materials,
-                    disabled: store.isBusy) {
-                        selectedRole = role
-                    }
-            }
+        } header: {
+            Text("Materials")
+        } footer: {
+            readiness(draft)
         }
     }
 
@@ -211,33 +203,20 @@ struct NewJobView: View {
     private func readiness(_ draft: Draft) -> some View {
         let assigned = draft.required.count - draft.missing.count
         let ready = draft.missing.isEmpty
-        return HStack(spacing: 8) {
-            Image(systemName: ready ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
-                .foregroundStyle(ready ? Theme.lime : Theme.amber)
-            Text(ready ? "Ready · \(assigned) of \(draft.required.count) required slots" : "\(assigned) of \(draft.required.count) required slots assigned")
-                .font(Theme.sans(14, .semibold))
-                .foregroundStyle(ready ? Theme.lime : Theme.ink1)
-        }
-        .padding(13)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(ready ? Theme.limeDim : Theme.surface2, in: .rect(cornerRadius: 13))
-        .overlay(RoundedRectangle(cornerRadius: 13).strokeBorder(ready ? Theme.limeLine : Theme.line2))
-        .accessibilityValue(ready ? "Ready" : "Missing required materials")
+        return Text(ready ? "Ready · \(assigned) of \(draft.required.count) required slots" : "\(assigned) of \(draft.required.count) required slots assigned")
+            .accessibilityValue(ready ? "Ready" : "Missing required materials")
     }
 
+    /// The draft's next step gets the one filled button: add while the basket is
+    /// empty, then validate, then continue (see `validation`).
     private func editorActions(_ draft: Draft) -> some View {
-        HStack(spacing: 10) {
+        Section {
             Button("Add to batch") {
                 Task { await store.addToBatch() }
             }
-            .font(Theme.sans(14, .semibold))
-            .foregroundStyle(Theme.limeInk)
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 12)
-            .background(Theme.lime, in: .rect(cornerRadius: 12))
+            .buttonStyle(draft.jobs == 0 ? AnyButtonStyle(PrimaryButtonStyle()) : AnyButtonStyle(SecondaryButtonStyle()))
             .disabled(!draft.missing.isEmpty || store.isBusy || composer.isRunning)
-
-            clearAction
+            .buttonRow()
         }
     }
 
@@ -245,7 +224,8 @@ struct NewJobView: View {
     /// no Clear at all until 2026-09-24: `editorActions` — the only Clear — sat
     /// in the Single arm of `editor`'s if/else alone, so emptying the draft from
     /// Batch meant switching to Single first. That was not theoretical;
-    /// `Phase6SmokeTests` had to do exactly it, twice.
+    /// `Phase6SmokeTests` had to do exactly it, twice. It now lives in the
+    /// navigation bar, away from the add button it used to sit beside at equal weight.
     ///
     /// No accessibility identifier: the smokes find this by its `"Clear"` label
     /// (`Phase4Draft.revealButton`), as they did before, and an identifier
@@ -254,11 +234,7 @@ struct NewJobView: View {
         Button("Clear", role: .destructive) {
             Task { await store.clear() }
         }
-        .font(Theme.sans(14, .semibold))
-        .foregroundStyle(Theme.red)
-        .padding(.horizontal, 16)
-        .padding(.vertical, 12)
-        .background(Theme.redDim, in: .rect(cornerRadius: 12))
+        .tint(Theme.danger)
         .disabled(store.isBusy || composer.isRunning)
     }
 
@@ -266,118 +242,98 @@ struct NewJobView: View {
     /// an unfetched library cannot say a seed is gone, only that it is unseen.
     @ViewBuilder private func seedBadge(_ draft: Draft) -> some View {
         if let seed = draft.tryonSeed {
-            HStack(spacing: 8) {
-                Image(systemName: "photo.badge.checkmark").foregroundStyle(Theme.lime)
-                Text(library.entries.contains { $0.id == seed } || !library.loaded
-                     ? "Uses a saved try-on — Phase A skips the provider for this job"
-                     : "The saved try-on no longer exists")
-                    .font(Theme.sans(13)).foregroundStyle(Theme.ink1)
-                Spacer(minLength: 0)
-                Button("Remove") { Task { await store.apply(DraftPatch(seed: .clear)) } }
-                    .font(Theme.sans(12, .semibold)).foregroundStyle(Theme.red)
-                    .disabled(store.isBusy)
+            let exists = library.entries.contains { $0.id == seed } || !library.loaded
+            Section {
+                HStack(spacing: 10) {
+                    Image(systemName: exists ? "photo.badge.checkmark" : "exclamationmark.triangle.fill")
+                        .foregroundStyle(exists ? Theme.secondary : Theme.warning)
+                    Text(exists
+                         ? "Uses a saved try-on — Phase A skips the provider for this job"
+                         : "The saved try-on no longer exists")
+                        .font(.subheadline)
+                    Spacer(minLength: 0)
+                    Button("Remove") { Task { await store.apply(DraftPatch(seed: .clear)) } }
+                        .font(.subheadline.weight(.semibold))
+                        .buttonStyle(.borderless)
+                        .tint(Theme.danger)
+                        .disabled(store.isBusy)
+                }
             }
-            .padding(12).card(border: Theme.limeLine)
         }
     }
 
     @ViewBuilder private func batch(_ draft: Draft) -> some View {
         if !draft.batch.isEmpty {
-            VStack(alignment: .leading, spacing: 10) {
-                SectionLabel(text: "Batch · \(draft.batch.count)")
+            Section("Batch · \(draft.batch.count)") {
                 ForEach(draft.batch, id: \.digest) { entry in
-                    HStack(alignment: .top, spacing: 10) {
-                        VStack(alignment: .leading, spacing: 4) {
+                    HStack(alignment: .firstTextBaseline, spacing: 12) {
+                        VStack(alignment: .leading, spacing: 2) {
                             Text(entry.digest)
-                                .font(Theme.mono(11, .medium))
-                                .foregroundStyle(Theme.ink1)
-                                .lineLimit(1)
-                            Text(entry.runID)
-                                .font(Theme.mono(10))
-                                .foregroundStyle(Theme.ink2)
-                                .lineLimit(1)
+                                .font(.body)
+                                .lineLimit(1).truncationMode(.middle)
                             Text("\(entry.pipeline) · \(entry.provider)")
-                                .font(Theme.mono(10))
-                                .foregroundStyle(Theme.ink2)
+                                .font(.subheadline)
+                                .foregroundStyle(Theme.secondary)
                             Text(slotSummary(entry))
-                                .font(Theme.mono(9))
-                                .foregroundStyle(Theme.ink3)
+                                .font(.footnote)
+                                .foregroundStyle(Theme.secondary)
                                 .lineLimit(2)
                             if entry.tryonSeed != nil {
-                                Text("Saved try-on").font(Theme.mono(9, .semibold)).foregroundStyle(Theme.lime)
+                                Label("Saved try-on", systemImage: "photo.badge.checkmark")
+                                    .font(.footnote).foregroundStyle(Theme.secondary)
                             }
                         }
                         Spacer(minLength: 0)
                         Button("Drop", role: .destructive) { dropCandidate = entry }
-                            .font(Theme.sans(12, .semibold))
-                            .foregroundStyle(Theme.red)
+                            .font(.subheadline.weight(.semibold))
+                            .buttonStyle(.borderless)
+                            .tint(Theme.danger)
                             .disabled(store.isBusy || composer.isRunning)
                     }
-                    .padding(12)
-                    .card()
                 }
             }
         }
     }
 
     @ViewBuilder private func validation(_ draft: Draft) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            SectionLabel(text: "Validation")
+        Section {
             if store.isValidating {
-                HStack(spacing: 9) {
+                HStack(spacing: 10) {
                     ProgressView()
-                    Text("Validating draft…")
-                        .font(Theme.sans(13, .semibold))
-                        .foregroundStyle(Theme.ink1)
+                    Text("Validating draft…").font(.subheadline)
                 }
-                .padding(13)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .card(border: Theme.limeLine)
             } else if store.isReady {
                 HStack(spacing: 8) {
-                    Image(systemName: "checkmark.circle.fill").foregroundStyle(Theme.lime)
-                    Text("Ready").font(Theme.sans(14, .semibold)).foregroundStyle(Theme.lime)
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(Theme.label)
+                    Text("Ready").font(.headline)
                     if let estimate = draft.estimateMin {
                         Text("· about \(estimate) min")
-                            .font(Theme.mono(11)).foregroundStyle(Theme.ink2)
+                            .font(.subheadline.monospacedDigit()).foregroundStyle(Theme.secondary)
                     }
                 }
-                .padding(13)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .card(border: Theme.limeLine)
             } else if store.validationWasStale {
                 Label("The draft changed during validation. Validate it again.", systemImage: "arrow.triangle.2.circlepath")
-                    .font(Theme.sans(13, .medium))
-                    .foregroundStyle(Theme.amber)
-                    .padding(13)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .card(border: Theme.amber.opacity(0.4))
+                    .font(.subheadline)
+                    .foregroundStyle(Theme.warning)
             }
 
-            Button {
+            Button("Validate") {
                 Task { await store.validate() }
-            } label: {
-                Text("Validate")
-                    .font(Theme.sans(14, .semibold))
-                    .foregroundStyle(Theme.limeInk)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 13)
-                    .background(Theme.lime, in: .rect(cornerRadius: 12))
             }
+            .buttonStyle(draft.jobs > 0 && !store.isReady
+                         ? AnyButtonStyle(PrimaryButtonStyle()) : AnyButtonStyle(SecondaryButtonStyle()))
             .disabled(draft.jobs == 0 || store.isBusy || composer.isRunning)
+            .buttonRow()
 
             if store.isReady {
-                NavigationLink {
-                    RunFlowView(flow: flow, entry: .newJob)
-                } label: {
-                    Text("Continue to run →")
-                        .font(Theme.sans(14, .semibold)).foregroundStyle(Theme.ink1)
-                        .frame(maxWidth: .infinity).padding(.vertical, 13)
-                        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Theme.limeLine))
-                }
-                .accessibilityIdentifier("newjob.continueToRun")
-                .disabled(store.isBusy)
+                Button("Continue to run") { showRun = true }
+                    .buttonStyle(PrimaryButtonStyle())
+                    .accessibilityIdentifier("newjob.continueToRun")
+                    .disabled(store.isBusy)
+                    .buttonRow()
             }
+        } header: {
+            Text("Validation")
         }
     }
 

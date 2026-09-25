@@ -10,8 +10,11 @@ struct BatchComposerSection: View {
     let materials: MaterialsStore
     let pipeline: Pipeline
     let onPickRole: (String) -> Void
-    @State private var pickingOutfits = false
-    @State private var pickingDrivers = false
+    /// Owned by `NewJobView`, whose `List` carries the sheets
+    /// (`BatchPickerSheets`): a sheet hung on lazily-built list content is
+    /// torn down when its row scrolls away.
+    @Binding var pickingOutfits: Bool
+    @Binding var pickingDrivers: Bool
 
     /// Roles the crossed pickers below fill: the outfit always, the driver too
     /// once at least one is multi-selected (mirrors `BatchComposer.crossedRoles`,
@@ -43,63 +46,56 @@ struct BatchComposerSection: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        Group {
             if !BatchComposer.supports(pipeline) {
-                Text(store.catalog.contains(where: BatchComposer.supports)
-                     ? "This pipeline has no character + outfit pair. Pick a try-on pipeline for a batch."
-                     : "No pipeline on this server pairs a character with an outfit, so a batch is unavailable.")
-                    .font(Theme.sans(13)).foregroundStyle(Theme.amber)
-            } else {
-                SectionLabel(text: "Shared")
-                ForEach(sharedRoles, id: \.self) { role in
-                    SlotMaterialRow(role: role, required: pipeline.required.contains(role),
-                                    kind: pipeline.roles[role] ?? .unknown,
-                                    slot: store.draft?.slots[role], materials: materials,
-                                    disabled: store.isBusy || composer.isRunning) { onPickRole(role) }
+                Section {
+                    Label(store.catalog.contains(where: BatchComposer.supports)
+                          ? "This pipeline has no character + outfit pair. Pick a try-on pipeline for a batch."
+                          : "No pipeline on this server pairs a character with an outfit, so a batch is unavailable.",
+                          systemImage: "info.circle")
+                        .font(.subheadline).foregroundStyle(Theme.secondary)
                 }
-                SectionLabel(text: "Outfits · \(composer.outfits.count)/\(outfitCap)")
-                ForEach(composer.outfits) { outfit in outfitRow(outfit) }
-                Button("Choose outfits…") { pickingOutfits = true }
-                    .buttonStyle(SecondaryButtonStyle())
-                    .accessibilityIdentifier("batch.pickOutfits")
-                    .disabled(composer.isRunning)
-                if BatchComposer.supportsDrivers(pipeline) {
-                    SectionLabel(text: "Drivers · \(composer.drivers.count)/\(driverCap)")
-                    ForEach(composer.drivers, id: \.self) { driverID in driverRow(driverID) }
-                    Button("Choose drivers…") { pickingDrivers = true }
-                        .buttonStyle(SecondaryButtonStyle())
-                        .accessibilityIdentifier("batch.pickDrivers")
+            } else {
+                Section("Shared") {
+                    ForEach(sharedRoles, id: \.self) { role in
+                        SlotMaterialRow(role: role, required: pipeline.required.contains(role),
+                                        kind: pipeline.roles[role] ?? .unknown,
+                                        slot: store.draft?.slots[role], materials: materials,
+                                        disabled: store.isBusy || composer.isRunning) { onPickRole(role) }
+                    }
+                }
+                Section("Outfits · \(composer.outfits.count) of \(outfitCap)") {
+                    ForEach(composer.outfits) { outfit in outfitRow(outfit) }
+                    Button("Choose outfits…") { pickingOutfits = true }
+                        .accessibilityIdentifier("batch.pickOutfits")
                         .disabled(composer.isRunning)
                 }
-                Text(summaryText)
-                    .font(Theme.sans(13, .semibold)).foregroundStyle(Theme.ink2)
-                    .accessibilityIdentifier("batch.summary")
-                if composer.cameraAwareTryon && composer.drivers.count > 1 {
-                    Text("Camera pipelines make one try-on per driver.")
-                        .font(Theme.mono(10)).foregroundStyle(Theme.ink3)
+                if BatchComposer.supportsDrivers(pipeline) {
+                    Section("Drivers · \(composer.drivers.count) of \(driverCap)") {
+                        ForEach(composer.drivers, id: \.self) { driverID in driverRow(driverID) }
+                        Button("Choose drivers…") { pickingDrivers = true }
+                            .accessibilityIdentifier("batch.pickDrivers")
+                            .disabled(composer.isRunning)
+                    }
                 }
-                if let capReason = composer.capReason {
-                    Text(capReason).font(Theme.sans(12)).foregroundStyle(Theme.amber)
-                        .accessibilityIdentifier("batch.capReason")
+                Section {
+                    Text(summaryText)
+                        .font(.headline.monospacedDigit())
+                        .accessibilityIdentifier("batch.summary")
+                    if composer.cameraAwareTryon && composer.drivers.count > 1 {
+                        Text("Camera pipelines make one try-on per driver.")
+                            .font(.footnote).foregroundStyle(Theme.secondary)
+                    }
+                    if let capReason = composer.capReason {
+                        Text(capReason).font(.footnote).foregroundStyle(Theme.warning)
+                            .accessibilityIdentifier("batch.capReason")
+                    }
+                    runButton
                 }
-                runButton
             }
         }
         // No seed observer here on purpose: `NewJobView` owns it, above the
         // Single|Batch split, because this view only exists in the Batch arm.
-        .sheet(isPresented: $pickingOutfits) {
-            // `.image` here but `.unknown` for the shared rows above: `accepts`
-            // is false for every material under `.unknown`, and an outfit sheet
-            // with no rows is a dead end, while an images-only one still builds
-            // a batch. The shared rows can afford `.unknown` — `MaterialPicker`
-            // renders an explanation for it.
-            OutfitMultiPicker(composer: composer, materials: materials,
-                              kind: pipeline.roles[BatchComposer.outfitRole] ?? .image)
-        }
-        .sheet(isPresented: $pickingDrivers) {
-            DriverMultiPicker(composer: composer, materials: materials,
-                              kind: pipeline.roles[BatchComposer.driverRole] ?? .video)
-        }
     }
 
     private func outfitRow(_ outfit: CrossOutfit) -> some View {
@@ -109,17 +105,19 @@ struct BatchComposerSection: View {
             HStack(spacing: 10) {
                 MaterialThumbnail(material: material, materials: materials)
                 Text(material?.name ?? outfit.outfitID)
-                    .font(Theme.sans(14, .semibold)).foregroundStyle(Theme.ink1).lineLimit(1)
+                    .font(.body).lineLimit(1).truncationMode(.middle)
                 Spacer()
                 Button(role: .destructive) { composer.toggle(outfitID: outfit.outfitID) } label: {
-                    Image(systemName: "xmark.circle")
+                    Image(systemName: "xmark.circle.fill")
                 }
-                .foregroundStyle(Theme.ink3).disabled(composer.isRunning)
+                .buttonStyle(.borderless)
+                .foregroundStyle(Theme.tertiary).disabled(composer.isRunning)
+                .accessibilityLabel("Remove")
             }
             Toggle("Use saved try-on", isOn: Binding(
                 get: { outfit.seedID != nil },
                 set: { composer.setSeed($0 ? matches.first?.id : nil, for: outfit.outfitID) }))
-                .font(Theme.sans(13)).tint(Theme.lime)
+                .font(.subheadline)
                 .disabled(matches.isEmpty || composer.isRunning)
                 .accessibilityIdentifier("batch.seed.\(outfit.outfitID)")
             if matches.count > 1, outfit.seedID != nil {
@@ -131,14 +129,14 @@ struct BatchComposerSection: View {
                             .tag(entry.id)
                     }
                 }
-                .font(Theme.sans(12))
+                .font(.footnote)
             }
             if matches.isEmpty {
                 Text("No saved try-on for this pair — Phase A will make one.")
-                    .font(Theme.mono(10)).foregroundStyle(Theme.ink3)
+                    .font(.footnote).foregroundStyle(Theme.secondary)
             }
         }
-        .padding(12).card()
+        .padding(.vertical, 2)
         .accessibilityIdentifier("batch.outfit.\(outfit.outfitID)")
     }
 
@@ -150,14 +148,15 @@ struct BatchComposerSection: View {
         return HStack(spacing: 10) {
             MaterialThumbnail(material: material, materials: materials)
             Text(material?.name ?? driverID)
-                .font(Theme.sans(14, .semibold)).foregroundStyle(Theme.ink1).lineLimit(1)
+                .font(.body).lineLimit(1).truncationMode(.middle)
             Spacer()
             Button(role: .destructive) { composer.toggle(driverID: driverID) } label: {
-                Image(systemName: "xmark.circle")
+                Image(systemName: "xmark.circle.fill")
             }
-            .foregroundStyle(Theme.ink3).disabled(composer.isRunning)
+            .buttonStyle(.borderless)
+            .foregroundStyle(Theme.tertiary).disabled(composer.isRunning)
+            .accessibilityLabel("Remove")
         }
-        .padding(12).card()
         .accessibilityIdentifier("batch.driver.\(driverID)")
     }
 
@@ -165,21 +164,22 @@ struct BatchComposerSection: View {
         if let progress = composer.progress, composer.isRunning {
             HStack(spacing: 8) {
                 ProgressView()
-                Text("Adding \(progress.done)/\(progress.total)…").font(Theme.sans(13, .semibold))
+                Text("Adding \(progress.done) of \(progress.total)…").font(.subheadline.monospacedDigit())
             }
             .accessibilityIdentifier("batch.progress")
         }
         if let failure = composer.failure {
-            Text(failure).font(Theme.sans(13)).foregroundStyle(Theme.red)
+            Label(failure, systemImage: "exclamationmark.triangle.fill")
+                .font(.subheadline).foregroundStyle(Theme.danger)
                 .accessibilityIdentifier("batch.failure")
         }
         if let added = composer.lastAdded {
             Text("Added \(added) job\(added == 1 ? "" : "s") to the batch.")
-                .font(Theme.sans(13)).foregroundStyle(Theme.lime)
+                .font(.subheadline).foregroundStyle(Theme.secondary)
         }
         if !composer.missingShared.isEmpty {
             Text("Fill \(composer.missingShared.joined(separator: ", ")) first.")
-                .font(Theme.sans(12)).foregroundStyle(Theme.amber)
+                .font(.footnote).foregroundStyle(Theme.secondary)
         }
         // Hidden once a build has landed: success clears `outfits`, so the
         // label would read "Add 0 jobs to batch" on a disabled button. A
@@ -197,7 +197,34 @@ struct BatchComposerSection: View {
             .buttonStyle(PrimaryButtonStyle())
             .accessibilityIdentifier("batch.run")
             .disabled(!composer.canRun)
+            .buttonRow()
         }
+    }
+}
+
+/// The outfit and driver multi-pickers, attached above the `List`.
+struct BatchPickerSheets: ViewModifier {
+    @Binding var pickingOutfits: Bool
+    @Binding var pickingDrivers: Bool
+    let composer: BatchComposer
+    let materials: MaterialsStore
+    let pipeline: Pipeline
+
+    func body(content: Content) -> some View {
+        content
+            .sheet(isPresented: $pickingOutfits) {
+                // `.image` here but `.unknown` for the shared rows above: `accepts`
+                // is false for every material under `.unknown`, and an outfit sheet
+                // with no rows is a dead end, while an images-only one still builds
+                // a batch. The shared rows can afford `.unknown` — `MaterialPicker`
+                // renders an explanation for it.
+                OutfitMultiPicker(composer: composer, materials: materials,
+                                  kind: pipeline.roles[BatchComposer.outfitRole] ?? .image)
+            }
+            .sheet(isPresented: $pickingDrivers) {
+                DriverMultiPicker(composer: composer, materials: materials,
+                                  kind: pipeline.roles[BatchComposer.driverRole] ?? .video)
+            }
     }
 }
 
@@ -216,15 +243,15 @@ private struct MaterialThumbnail: View {
                 Image(uiImage: image).resizable().scaledToFill()
             } else {
                 ZStack {
-                    Theme.surface2
+                    Theme.surfaceRaised
                     Image(systemName: "photo")
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundStyle(Theme.ink3)
+                        .font(.footnote)
+                        .foregroundStyle(Theme.tertiary)
                 }
             }
         }
-        .frame(width: 34, height: 34)
-        .clipShape(.rect(cornerRadius: 8))
+        .frame(width: 36, height: 36)
+        .clipShape(.rect(cornerRadius: Theme.Radius.small))
         // Decorative: the row already names the outfit, and hiding it keeps the
         // card's accessibility tree the shape the seed and row identifiers expect.
         .accessibilityHidden(true)
@@ -254,10 +281,12 @@ private struct OutfitMultiPicker: View {
                     composer.toggle(outfitID: material.id)
                 } label: {
                     HStack {
-                        Text(material.name).foregroundStyle(Theme.ink1)
+                        Text(material.name).foregroundStyle(Theme.label)
+                            .lineLimit(1).truncationMode(.middle)
                         Spacer()
                         Image(systemName: chosen ? "checkmark.circle.fill" : "circle")
-                            .foregroundStyle(chosen ? Theme.lime : Theme.ink3)
+                            .font(.title3)
+                            .foregroundStyle(chosen ? Theme.accent : Theme.tertiary)
                     }
                 }
                 // Not pre-disabled by a count against `maxJobs`: with drivers
@@ -298,10 +327,12 @@ private struct DriverMultiPicker: View {
                     composer.toggle(driverID: material.id)
                 } label: {
                     HStack {
-                        Text(material.name).foregroundStyle(Theme.ink1)
+                        Text(material.name).foregroundStyle(Theme.label)
+                            .lineLimit(1).truncationMode(.middle)
                         Spacer()
                         Image(systemName: chosen ? "checkmark.circle.fill" : "circle")
-                            .foregroundStyle(chosen ? Theme.lime : Theme.ink3)
+                            .font(.title3)
+                            .foregroundStyle(chosen ? Theme.accent : Theme.tertiary)
                     }
                 }
                 .disabled(composer.isRunning)

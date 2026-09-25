@@ -11,14 +11,14 @@ struct MaterialsView: View {
     @State private var importError: String?
 
     private let columns = [
-        GridItem(.flexible(), spacing: 12),
-        GridItem(.flexible(), spacing: 12),
+        GridItem(.flexible(), spacing: 12, alignment: .top),
+        GridItem(.flexible(), spacing: 12, alignment: .top),
     ]
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-                header
+            VStack(alignment: .leading, spacing: 16) {
+                if store.isStale { StaleTag(lastSuccess: store.lastSuccess) }
                 if let message = importError ?? store.errorMessage {
                     messageBanner(message)
                 }
@@ -26,11 +26,11 @@ struct MaterialsView: View {
                     uploadCard(progress)
                 }
                 if store.loaded && store.materials.isEmpty {
-                    Text("No materials yet. Add an image or video to begin.")
-                        .font(Theme.sans(14)).foregroundStyle(Theme.ink2)
-                        .frame(maxWidth: .infinity).padding(.vertical, 60)
+                    EmptyNote(title: "No materials yet", systemImage: "photo.on.rectangle",
+                              message: "Add an image or video with the + button.")
+                        .padding(.top, 40)
                 } else {
-                    LazyVGrid(columns: columns, spacing: 12) {
+                    LazyVGrid(columns: columns, spacing: 20) {
                         ForEach(store.materials) { material in
                             MaterialCell(store: store, material: material)
                                 .contextMenu {
@@ -44,7 +44,8 @@ struct MaterialsView: View {
                     }
                 }
             }
-            .padding(.horizontal, 20)
+            .padding(.horizontal, 16)
+            .padding(.bottom, 24)
         }
         .background(Theme.bg)
         .refreshable { await store.refresh() }
@@ -74,15 +75,6 @@ struct MaterialsView: View {
         }
     }
 
-    private var header: some View {
-        HStack(alignment: .firstTextBaseline) {
-            Text("Material").font(Theme.sans(33, .bold)).foregroundStyle(Theme.ink)
-            Spacer()
-            if store.isStale { StaleTag(lastSuccess: store.lastSuccess) }
-            Text("\(store.materials.count) items").font(Theme.mono(11)).foregroundStyle(Theme.ink2)
-        }
-    }
-
     private var addMenu: some View {
         Menu {
             PhotosPicker(selection: $photoItem, matching: .any(of: [.images, .videos])) {
@@ -90,33 +82,31 @@ struct MaterialsView: View {
             }
             Button("Files", systemImage: "folder") { showFiles = true }
         } label: {
-            Image(systemName: "plus").font(.system(size: 16, weight: .bold))
+            Image(systemName: "plus")
         }
         .disabled(store.isUploading)
         .accessibilityLabel("Add material")
     }
 
     private func uploadCard(_ progress: UploadProgress) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(progress.fileName).font(Theme.sans(14, .semibold)).foregroundStyle(Theme.ink1)
-                    Text(phaseLabel(progress.phase)).font(Theme.mono(10)).foregroundStyle(Theme.lime)
-                }
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(progress.fileName).font(.subheadline).lineLimit(1).truncationMode(.middle)
                 Spacer()
-                Text("\(ByteCountFormatter.string(fromByteCount: progress.bytesSent, countStyle: .file)) / \(ByteCountFormatter.string(fromByteCount: progress.totalBytes, countStyle: .file))")
-                    .font(Theme.mono(9)).foregroundStyle(Theme.ink2)
+                Text("\(ByteCountFormatter.string(fromByteCount: progress.bytesSent, countStyle: .file)) of \(ByteCountFormatter.string(fromByteCount: progress.totalBytes, countStyle: .file))")
+                    .font(.footnote.monospacedDigit()).foregroundStyle(Theme.secondary)
             }
             ProgressView(value: Double(progress.bytesSent), total: Double(max(progress.totalBytes, 1)))
-                .tint(progress.phase == .processing ? Theme.amber : Theme.lime)
+                .tint(Theme.label)
+            Text(phaseLabel(progress.phase)).font(.footnote).foregroundStyle(Theme.secondary)
         }
-        .padding(13).card(border: Theme.limeLine)
+        .heroSurface()
     }
 
     private func messageBanner(_ message: String) -> some View {
-        HStack(alignment: .top, spacing: 10) {
-            Image(systemName: "exclamationmark.triangle").foregroundStyle(Theme.red)
-            Text(message).font(Theme.sans(13)).foregroundStyle(Theme.ink1)
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(Theme.danger)
+            Text(message).font(.subheadline)
             Spacer(minLength: 0)
             if store.hasPendingUpload {
                 Menu {
@@ -127,19 +117,17 @@ struct MaterialsView: View {
                         Task { await store.discardPendingUpload() }
                     }
                 } label: {
-                    Text("Upload").font(Theme.sans(12, .semibold)).foregroundStyle(Theme.lime)
+                    Text("Upload").font(.subheadline.weight(.semibold))
                 }
             } else {
                 Button("Dismiss") {
                     importError = nil
                     store.clearError()
                 }
-                .font(Theme.sans(12, .semibold)).foregroundStyle(Theme.lime)
+                .font(.subheadline.weight(.semibold))
             }
         }
-        .padding(12)
-        .background(Theme.redDim, in: .rect(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Theme.redLine))
+        .heroSurface()
     }
 
     private func importPhoto(_ item: PhotosPickerItem?) {
@@ -183,10 +171,10 @@ struct MaterialsView: View {
 
     private func phaseLabel(_ phase: UploadPhase) -> String {
         switch phase {
-        case .preparing: "PREPARING"
-        case .transferring: "UPLOADING"
-        case .processing: "PROCESSING"
-        case .complete: "COMPLETE"
+        case .preparing: "Preparing…"
+        case .transferring: "Uploading…"
+        case .processing: "Processing on the server…"
+        case .complete: "Complete"
         }
     }
 }

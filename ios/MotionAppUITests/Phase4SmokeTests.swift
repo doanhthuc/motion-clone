@@ -50,20 +50,21 @@ enum Phase4Draft {
         chooseMaterial(for: "Driver", in: app)
         chooseMaterial(for: "Outfit", in: app)
         revealButton("Validate", in: app).tap()
-        XCTAssertTrue(app.staticTexts["Ready"].waitForExistence(timeout: 30))
+        XCTAssertTrue(revealText("Ready", in: app, timeout: 30))
     }
 
     @MainActor static func clear(in app: XCUIApplication) {
         revealButton("Clear", in: app).tap()
-        XCTAssertTrue(app.staticTexts["0 of 3 required slots assigned"].waitForExistence(timeout: 10)
-            || app.staticTexts["0 of 2 required slots assigned"].waitForExistence(timeout: 1))
+        XCTAssertTrue(revealText("0 of 3 required slots assigned", in: app)
+            || revealText("0 of 2 required slots assigned", in: app, timeout: 1))
     }
 
     @MainActor static func selectTryonPipeline(in app: XCUIApplication) {
-        let current = app.buttons["Pipeline"].value as? String ?? ""
+        let pipeline = revealButton("Pipeline", in: app)
+        let current = pipeline.value as? String ?? ""
         if current.localizedCaseInsensitiveContains("Tryon") { return }
 
-        app.buttons["Pipeline"].tap()
+        pipeline.tap()
         let option = app.buttons.allElementsBoundByIndex.first {
             $0.label.localizedCaseInsensitiveContains("Tryon")
         }
@@ -100,6 +101,19 @@ enum Phase4Draft {
         XCTAssertTrue(button.waitForExistence(timeout: 5), "Missing button: \(label)")
         XCTAssertTrue(button.isHittable, "Button is not visible: \(label)")
         return button
+    }
+
+    /// New Job is a lazy `List`: a row scrolled off screen is not in the
+    /// accessibility tree at all, so `exists` alone reads a live row as missing.
+    /// Waits in place first (the text may still be on its way from the server),
+    /// then scrolls to the top and down until the text appears.
+    @MainActor static func revealText(_ label: String, in app: XCUIApplication,
+                                      timeout: TimeInterval = 10) -> Bool {
+        let text = app.staticTexts[label]
+        if text.waitForExistence(timeout: timeout) { return true }
+        for _ in 0..<6 { app.swipeDown(); if text.exists { return true } }
+        for _ in 0..<10 { app.swipeUp(); if text.waitForExistence(timeout: 1) { return true } }
+        return false
     }
 
     @MainActor static func waitUntil(timeout: TimeInterval, condition: @escaping () -> Bool) -> Bool {

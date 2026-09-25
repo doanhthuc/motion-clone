@@ -60,6 +60,26 @@ The spec's gate record is the single place its gate results are written down.
   test is 2 outfits × 2 drivers, expecting 2 provider calls, and it needs its own approval and a
   quoted price.
 
+## Native design pass (2026-09-25)
+
+An audit of the rendered app found it read as generated. It counted lime in 54 places with eight
+meanings, amber on every untouched slot, eight corner radii, 31 font size/weight variants down to
+9pt, and a bordered card around every row. The app now uses inset-grouped `List`s, SF Pro text
+styles (Dynamic Type), the system grouped palette, two radii (8/12), and lime only for what is
+interactive or selected. Both bundled fonts were removed, and the tabs are Runs · Materials ·
+New Job · Outputs · Pod. `ios/MotionApp/Theme.swift` holds the tokens and their rules. No route,
+field or store changed.
+
+- **Lazy lists change how the UI smokes find things.** A `List` row scrolled off screen is not in
+  the accessibility tree, so the smokes scroll to an element before they assert on it
+  (`Phase4Draft.revealText`, `revealButton`). A new smoke that checks `exists` on a row must do
+  the same.
+- **The Materials | Saved try-ons switch stays in `MaterialTabView`.** Placed as the first row
+  inside a child `ScrollView`, taps landed but the selection never changed.
+- **Gates run 2026-09-25:** `make ios-build`; `make ios-test` (275/275); `make ios-ui-test`
+  (6/6: Phase 3, 4, 5, 6 ×2 and the Outputs feed, zero recorded spends);
+  `scrub-secrets.sh --check`.
+
 ## Phase status
 
 | Phase | Status | Delivered | Remaining evidence |

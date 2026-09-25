@@ -17,26 +17,29 @@ struct RootView: View {
                     Tab("Runs", systemImage: "waveform.path.ecg", value: AppTab.runs) {
                         NavigationStack { RunsView(runs: runs, pod: pod, flow: flow) }
                     }
-                    Tab("Material", systemImage: "square.grid.2x2", value: AppTab.materials) {
+                    Tab("Materials", systemImage: "photo.on.rectangle", value: AppTab.materials) {
                         NavigationStack {
                             MaterialTabView(materials: materials, library: library, draft: draft,
                                             composer: composer)
                         }
                     }
-                    Tab("New Job", systemImage: "plus.circle.fill", value: AppTab.newJob) {
+                    Tab("New Job", systemImage: "plus.circle", value: AppTab.newJob) {
                         NavigationStack {
                             NewJobView(store: draft, materials: materials, flow: flow,
                                        composer: composer, library: library)
                         }
                     }
-                    Tab("Output", systemImage: "play.rectangle", value: AppTab.outputs) {
+                    Tab("Outputs", systemImage: "play.rectangle", value: AppTab.outputs) {
                         NavigationStack { OutputsView(store: outputs) }
                     }
                     Tab("Pod", systemImage: "cpu", value: AppTab.pod) {
                         NavigationStack { PodView(pod: pod, gpu: gpu, balance: balance, flow: flow, runs: runs) }
                     }
                 }
-                .tint(Theme.lime)
+                .tint(Theme.accent)
+                // Sentence-case section headers everywhere: the uppercase
+                // tracked labels were the loudest "template" tell in the audit.
+                .textCase(nil)
                 .safeAreaInset(edge: .top) {
                     VStack(spacing: 8) {
                         KillBanner(pod: pod)
@@ -86,34 +89,33 @@ struct SpendBanner: View {
         if let text = flow.pendingNotice ?? migrate.pendingNotice
             ?? (flow.inFlightLabel ?? migrate.inFlightLabel).map({ "Sending: \($0)" }) {
             HStack(spacing: 10) {
-                ProgressView().controlSize(.small).tint(Theme.lime)
+                ProgressView()
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(text).font(Theme.sans(13, .semibold)).foregroundStyle(Theme.ink1)
+                    Text(text).font(.subheadline.weight(.semibold))
                     if let note = flow.retryNote ?? migrate.retryNote {
-                        Text(note).font(Theme.mono(11)).foregroundStyle(Theme.amber)
+                        Text(note).font(.footnote).foregroundStyle(Theme.warning)
                     }
                 }
                 Spacer(minLength: 0)
             }
-            .padding(12)
-            .card(border: Theme.limeLine)
+            .heroSurface()
             .padding(.horizontal, 16)
         } else if migrate.needsRecheck {
             // Every Phase 4 spend is refused (.notSent) until this is answered,
             // and nothing else outside the migrate sheet says why.
             HStack(spacing: 10) {
-                Text("Migrate unanswered — the volume move may or may not have started.")
-                    .font(Theme.sans(13, .semibold)).foregroundStyle(Theme.amber)
+                Label("Migrate unanswered — the volume move may or may not have started.",
+                      systemImage: "exclamationmark.triangle.fill")
+                    .font(.subheadline.weight(.semibold)).foregroundStyle(Theme.warning)
                 Spacer(minLength: 0)
                 Button("Check again") {
                     model.migrateSheet = MigrateRequest(destination: nil)
                     model.selectedTab = .pod
                 }
-                .font(Theme.sans(13, .semibold)).foregroundStyle(Theme.lime)
+                .font(.subheadline.weight(.semibold))
                 .accessibilityIdentifier("banner.migrateCheckAgain")
             }
-            .padding(12)
-            .card(border: Theme.line)
+            .heroSurface()
             .padding(.horizontal, 16)
         }
     }

@@ -1,45 +1,46 @@
 import SwiftUI
 import MotionKit
 
-/// The five GPUs from `GET /v1/gpu/stock`. Selecting is free (no dialog);
-/// the rent panel passes `onSelected` to re-read its quote.
+/// The five GPUs from `GET /v1/gpu/stock`, as one `List` section. Selecting is
+/// free (no dialog); the rent panel passes `onSelected` to re-read its quote.
 struct GpuPickerView: View {
     let store: GpuStore
     let spending: Bool
     let hasLease: Bool
     var onMigrate: ((String) -> Void)? = nil
     var onSelected: (() async -> Void)? = nil
-    @State private var expanded: String?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        Section {
             if let error = store.error {
                 if store.stock == nil {
                     ErrorBanner(error: error) { await store.load() }
                 } else {
                     HStack {
                         Text("Couldn't reach runpodctl — showing the last list.")
-                            .font(Theme.sans(12)).foregroundStyle(Theme.amber)
+                            .font(.footnote).foregroundStyle(Theme.warning)
                         Spacer()
                         Button("Retry") { Task { await store.load(force: true) } }
-                            .font(Theme.sans(12, .semibold)).foregroundStyle(Theme.lime)
+                            .font(.footnote.weight(.semibold)).buttonStyle(.borderless)
                     }
                 }
             }
             if let stock = store.stock {
                 ForEach(stock.gpus) { row in rowView(row, stock: stock) }
             } else if store.isLoading {
-                ProgressView("Reading stock…").frame(maxWidth: .infinity).padding(.vertical, 20)
+                ProgressView("Reading stock…").frame(maxWidth: .infinity)
             }
-            if hasLease {
-                Text("A change applies to the next rental.").font(Theme.sans(12)).foregroundStyle(Theme.ink3)
-            }
-            if spending {
-                Text("A spend request is in flight — the GPU can't change until it's answered.")
-                    .font(Theme.sans(12)).foregroundStyle(Theme.ink3)
-            }
-            if let message = store.message {
-                Text(message).font(Theme.sans(12)).foregroundStyle(Theme.amber)
+        } header: {
+            Text("GPU")
+        } footer: {
+            VStack(alignment: .leading, spacing: 4) {
+                if hasLease { Text("A change applies to the next rental.") }
+                if spending {
+                    Text("A spend request is in flight — the GPU can't change until it's answered.")
+                }
+                if let message = store.message {
+                    Text(message).foregroundStyle(Theme.warning)
+                }
             }
         }
         .opacity(store.isStale ? 0.6 : 1)
@@ -48,50 +49,70 @@ struct GpuPickerView: View {
     private func rowView(_ row: GpuStockRow, stock: GpuStock) -> some View {
         let selected = row.gpu == stock.selected
         let regions = stock.otherRegions.filter { $0.gpu == row.gpu }
-        return VStack(alignment: .leading, spacing: 8) {
-            Button {
-                Task {
-                    if await store.select(row.gpu, whileSpending: spending) { await onSelected?() }
-                }
-            } label: {
-                HStack(spacing: 10) {
-                    Image(systemName: selected ? "checkmark.circle.fill" : "circle")
-                        .foregroundStyle(selected ? Theme.lime : Theme.ink3)
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(row.name).font(Theme.sans(15, .semibold)).foregroundStyle(Theme.ink)
-                        Text(row.summary).font(Theme.mono(11))
-                            .foregroundStyle(row.soldOutEverywhere ? Theme.amber : Theme.ink2)
-                    }
-                    Spacer()
-                    if store.selecting == row.gpu { ProgressView().controlSize(.small) }
-                }
-                .contentShape(.rect)
-            }
-            .buttonStyle(.plain)
-            .disabled(selected || store.selecting != nil || spending)
-            .accessibilityIdentifier("gpu.row.\(row.gpu)")
-            if !regions.isEmpty {
-                Button(expanded == row.gpu ? "Hide other regions" : "Other regions (\(regions.count))") {
-                    expanded = expanded == row.gpu ? nil : row.gpu
-                }
-                .font(Theme.sans(12, .semibold)).foregroundStyle(Theme.lime)
-                if expanded == row.gpu {
-                    ForEach(regions, id: \.datacenter) { region in
-                        HStack {
-                            Text("\(region.datacenter) · stock \(region.stock)"
-                                 + (region.usdPerHr.map { " · \(Format.usd($0))/h" } ?? ""))
-                                .font(Theme.mono(11)).foregroundStyle(Theme.ink2)
-                            Spacer()
-                            if let onMigrate {
-                                Button("Migrate to \(region.datacenter) →") { onMigrate(region.datacenter) }
-                                    .font(Theme.sans(12, .semibold)).foregroundStyle(Theme.lime)
-                            }
-                        }
-                    }
-                }
-            }
+        return HStack(spacing: 12) {
+            selectButton(row, selected: selected)
+            if !regions.isEmpty { RegionsMenu(regions: regions, onMigrate: onMigrate) }
         }
-        .padding(14)
-        .card(border: selected ? Theme.limeLine : Theme.line)
+    }
+
+    private func selectButton(_ row: GpuStockRow, selected: Bool) -> some View {
+        Button {
+            // Selected rows stay enabled so they don't render dimmed; a tap on
+            // the current choice is simply a no-op.
+            guard !selected else { return }
+            Task {
+                if await store.select(row.gpu, whileSpending: spending) { await onSelected?() }
+            }
+        } label: {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(row.name).font(.body).foregroundStyle(Theme.label)
+                    Text(row.summary).font(.subheadline.monospacedDigit())
+                        .foregroundStyle(row.soldOutEverywhere ? Theme.warning : Theme.secondary)
+                }
+                Spacer()
+                if store.selecting == row.gpu {
+                    ProgressView()
+                } else if selected {
+                    Image(systemName: "checkmark").font(.body.weight(.semibold)).foregroundStyle(Theme.accent)
+                }
+            }
+            .contentShape(.rect)
+        }
+        .buttonStyle(.borderless)
+        .disabled(store.selecting != nil || spending)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+        .accessibilityIdentifier("gpu.row.\(row.gpu)")
+    }
+}
+
+/// Other datacenters with this GPU, as a menu at the row's trailing edge —
+/// a row of its own under every GPU doubled the list's length.
+private struct RegionsMenu: View {
+    let regions: [GpuRegion]
+    let onMigrate: ((String) -> Void)?
+
+    var body: some View {
+        Menu {
+            ForEach(regions, id: \.datacenter) { region in
+                let line = "\(region.datacenter) · stock \(region.stock)"
+                    + (region.usdPerHr.map { " · \(Format.usd($0))/h" } ?? "")
+                if let onMigrate {
+                    // Two Texts in a menu item's label: title plus subtitle.
+                    Button { onMigrate(region.datacenter) } label: {
+                        Text("Migrate to \(region.datacenter)")
+                        Text(line)
+                    }
+                } else {
+                    Text(line)
+                }
+            }
+        } label: {
+            Label("\(regions.count)", systemImage: "globe")
+                .font(.subheadline)
+                .foregroundStyle(Theme.secondary)
+                .frame(minWidth: 44, minHeight: 44)
+        }
+        .accessibilityLabel("Other regions (\(regions.count))")
     }
 }

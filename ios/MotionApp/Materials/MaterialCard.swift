@@ -1,48 +1,60 @@
 import SwiftUI
 import MotionKit
 
+/// A grid tile: the media fills its own rounded frame, two quiet lines below.
+/// No surface behind it — the photo is the surface.
 struct MaterialCard: View {
     let material: MotionKit.Material
     let warning: String?
     let thumbnail: Data?
+    var selected = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            thumbnailView
-                .frame(maxWidth: .infinity)
+        VStack(alignment: .leading, spacing: 6) {
+            Color.clear
                 .aspectRatio(4 / 5, contentMode: .fit)
-                .clipShape(.rect(cornerRadius: 11))
+                .overlay { thumbnailView }
+                .clipShape(.rect(cornerRadius: Theme.Radius.small))
+                .overlay {
+                    if selected {
+                        RoundedRectangle(cornerRadius: Theme.Radius.small)
+                            .strokeBorder(Theme.accent, lineWidth: 3)
+                    }
+                }
+                .overlay(alignment: .bottomLeading) {
+                    if material.kind == .video {
+                        Image(systemName: "video.fill")
+                            .font(.caption).foregroundStyle(.white)
+                            .shadow(color: .black.opacity(0.6), radius: 3)
+                            .padding(8)
+                    }
+                }
 
-            Text(material.name)
-                .font(Theme.sans(14, .semibold))
-                .foregroundStyle(Theme.ink1)
-                .lineLimit(2)
-
-            HStack(spacing: 6) {
-                Text(material.kind.rawValue.uppercased())
-                Text("·")
-                Text(ByteCountFormatter.string(fromByteCount: material.bytes, countStyle: .file))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(material.name)
+                    .font(.subheadline)
+                    .foregroundStyle(Theme.label)
+                    .lineLimit(1).truncationMode(.middle)
+                Text(detail)
+                    .font(.footnote.monospacedDigit())
+                    .foregroundStyle(Theme.secondary)
+                    .lineLimit(1)
             }
-            .font(Theme.mono(9))
-            .foregroundStyle(Theme.ink3)
-
-            HStack {
-                Text(material.owner == "app" ? "THIS APP" : material.owner)
-                Spacer(minLength: 4)
-                Text(Format.ago(Date.now.timeIntervalSince1970 - material.updatedAt) + " ago")
-            }
-            .font(Theme.mono(9))
-            .foregroundStyle(Theme.ink2)
 
             if let warning, !warning.isEmpty {
                 Label(warning, systemImage: "exclamationmark.triangle.fill")
-                    .font(Theme.sans(10, .medium))
-                    .foregroundStyle(Theme.amber)
+                    .font(.caption)
+                    .foregroundStyle(Theme.warning)
                     .lineLimit(2)
             }
         }
-        .padding(10)
-        .card()
+    }
+
+    private var detail: String {
+        let kind = material.kind.rawValue.capitalized
+        let size = ByteCountFormatter.string(fromByteCount: material.bytes, countStyle: .file)
+        let age = Format.ago(Date.now.timeIntervalSince1970 - material.updatedAt)
+        return "\(kind) · \(size) · \(age)"
     }
 
     @ViewBuilder private var thumbnailView: some View {
@@ -50,10 +62,10 @@ struct MaterialCard: View {
             Image(uiImage: image).resizable().scaledToFill()
         } else {
             ZStack {
-                Theme.surface2
+                Theme.surface
                 Image(systemName: material.kind == .video ? "film" : "photo")
-                    .font(.system(size: 28))
-                    .foregroundStyle(Theme.ink3)
+                    .font(.title2)
+                    .foregroundStyle(Theme.tertiary)
             }
         }
     }

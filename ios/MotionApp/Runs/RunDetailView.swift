@@ -8,68 +8,77 @@ struct RunDetailView: View {
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                if let error = store.error, store.detail == nil { ErrorBanner(error: error) { await store.refresh() } }
-                if let d = store.detail {
-                    StatusHero(detail: d, stale: store.isStale, lastSuccess: store.lastSuccess)
-                    if d.id == flow.runID,
-                       flow.canRetryRental,
-                       let failure = flow.pod?.failedRental {
-                        VStack(alignment: .leading, spacing: 8) {
-                            SectionLabel(text: "Rental failed")
-                            Text(failure.detail).font(Theme.sans(13)).foregroundStyle(Theme.ink1)
-                            // The label names the card `retryRental()` actually sends
-                            // (`pod.gpu`, the current .env card), not the one that failed.
-                            let gpu = flow.pod?.gpu ?? failure.gpu
-                            if failure.gpu != gpu {
-                                Text("Last failure was on \(failure.gpu); this retries on \(gpu).")
-                                    .font(Theme.sans(12)).foregroundStyle(Theme.amber)
-                            }
-                            Button("Retry rental · \(gpu)") { Task { await flow.retryRental() } }
-                                .buttonStyle(PrimaryButtonStyle())
-                                .disabled(!flow.canSpend)
-                            if flow.needsRecheck {
-                                Button("Check again") { Task { await flow.recheck() } }
-                                    .buttonStyle(SecondaryButtonStyle())
-                                    .disabled(flow.isSpending)
-                            }
-                            if let message = flow.message {
-                                Text(message).font(Theme.sans(12)).foregroundStyle(Theme.amber)
-                            }
+        List {
+            if let error = store.error, store.detail == nil {
+                Section { ErrorBanner(error: error) { await store.refresh() } }
+            }
+            if let d = store.detail {
+                Section { StatusHero(detail: d, stale: store.isStale, lastSuccess: store.lastSuccess) }
+                    .listRowInsets(EdgeInsets())
+                    .listRowBackground(Color.clear)
+                if d.id == flow.runID,
+                   flow.canRetryRental,
+                   let failure = flow.pod?.failedRental {
+                    Section {
+                        Text(failure.detail).font(.subheadline)
+                        // The label names the card `retryRental()` actually sends
+                        // (`pod.gpu`, the current .env card), not the one that failed.
+                        let gpu = flow.pod?.gpu ?? failure.gpu
+                        if failure.gpu != gpu {
+                            Text("Last failure was on \(failure.gpu); this retries on \(gpu).")
+                                .font(.footnote).foregroundStyle(Theme.secondary)
                         }
-                        .padding(14).card(border: Theme.redLine)
+                        if let message = flow.message {
+                            Text(message).font(.footnote).foregroundStyle(Theme.warning)
+                        }
+                        Button("Retry rental · \(gpu)") { Task { await flow.retryRental() } }
+                            .buttonStyle(PrimaryButtonStyle())
+                            .disabled(!flow.canSpend)
+                            .buttonRow()
+                        if flow.needsRecheck {
+                            Button("Check again") { Task { await flow.recheck() } }
+                                .buttonStyle(SecondaryButtonStyle())
+                                .disabled(flow.isSpending)
+                                .buttonRow()
+                        }
+                    } header: {
+                        Label("Rental failed", systemImage: "exclamationmark.triangle.fill")
+                            .foregroundStyle(Theme.danger)
                     }
-                    if d.id == pod.pod?.runId, pod.showsKill(runStatus: d.status), let runID = pod.pod?.runId {
+                }
+                if d.id == pod.pod?.runId, pod.showsKill(runStatus: d.status), let runID = pod.pod?.runId {
+                    Section {
                         KillButton(pod: pod, runID: runID, hasLease: pod.pod?.lease != nil)
-                        if d.jobs.count > 1 {
-                            Text("Kill stops every remaining job in this batch.")
-                                .font(Theme.sans(12)).foregroundStyle(Theme.ink3)
-                        }
+                            .buttonRow()
+                    } footer: {
+                        if d.jobs.count > 1 { Text("Kill stops every remaining job in this batch.") }
                     }
-                    // A 12-job batch inlined stage-by-stage is a wall of rows; the
-                    // collapsed list puts the job that failed at the top instead.
-                    if d.jobs.count > 1 {
-                        BatchProgressList(jobs: d.jobs)
-                    } else {
+                }
+                // A 12-job batch inlined stage-by-stage is a wall of rows; the
+                // collapsed list puts the job that failed at the top instead.
+                if d.jobs.count > 1 {
+                    BatchProgressList(jobs: d.jobs)
+                } else {
+                    Section("Stages") {
                         ForEach(d.jobs) { job in JobTimeline(job: job) }
                     }
-                    if !d.outputs.isEmpty {
-                        SectionLabel(text: "Outputs")
-                        ForEach(d.outputs, id: \.self) { name in
-                            Text(name).font(Theme.mono(12)).foregroundStyle(Theme.ink1)
-                        }
-                        Text("Open the Output tab to play or save them.")
-                            .font(Theme.sans(12)).foregroundStyle(Theme.ink3)
-                    }
-                } else if store.error == nil {
-                    ProgressView().frame(maxWidth: .infinity).padding(.top, 60)
                 }
+                if !d.outputs.isEmpty {
+                    Section {
+                        ForEach(d.outputs, id: \.self) { name in
+                            Text(name).font(.subheadline).lineLimit(1).truncationMode(.middle)
+                        }
+                    } header: {
+                        Text("Outputs")
+                    } footer: {
+                        Text("Open the Outputs tab to play or save them.")
+                    }
+                }
+            } else if store.error == nil {
+                ProgressView().frame(maxWidth: .infinity).listRowBackground(Color.clear)
             }
-            .padding(.horizontal, 20).padding(.top, 4)
         }
-        .background(Theme.bg)
-        .navigationTitle(store.runID)
+        .navigationTitle(store.detail?.batch ?? store.runID)
         .navigationBarTitleDisplayMode(.inline)
         // Polls only while this screen is visible AND the app is active;
         // `.task(id:)` restarts/cancels the loop when scenePhase changes.
@@ -91,37 +100,37 @@ struct StatusHero: View {
     let lastSuccess: Date?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack {
-                HStack(spacing: 8) {
-                    if detail.status.isLive { PulseDot() }
-                    Text(title).font(Theme.sans(15, .semibold)).foregroundStyle(Theme.ink)
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                if detail.status.isLive { PulseDot() }
+                if detail.status == .error {
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(Theme.danger)
                 }
+                Text(title).font(.title2.bold())
                 Spacer()
                 if stale { StaleTag(lastSuccess: lastSuccess) }
             }
             if let lease = detail.lease {
                 TimelineView(.periodic(from: .now, by: 1)) { ctx in
                     let elapsed = ctx.date.timeIntervalSince1970 - lease.provisionedAt
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(Format.clock(elapsed)).font(Theme.mono(36, .semibold)).foregroundStyle(Theme.ink)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(Format.clock(elapsed)).font(.largeTitle.weight(.semibold).monospacedDigit())
                         if let cost = CostEstimate.usd(elapsed: elapsed, ratePerHour: lease.quotedUsdPerHr) {
                             Text("≈ \(Format.usd(cost)) on \(lease.provider) — a quote, not the invoice")
-                                .font(Theme.mono(11)).foregroundStyle(Theme.ink2)
+                                .font(.subheadline.monospacedDigit()).foregroundStyle(Theme.secondary)
                         } else {
                             Text("\(lease.provider) — no price quote on this lease")
-                                .font(Theme.mono(11)).foregroundStyle(Theme.ink2)
+                                .font(.subheadline).foregroundStyle(Theme.secondary)
                         }
                     }
                 }
             }
             ProgressView(value: Double(detail.jobsDone), total: Double(max(detail.jobsTotal, 1)))
-                .tint(Theme.lime)
-            Text("\(detail.jobsDone)/\(detail.jobsTotal) jobs done" + (detail.batch.map { " · \($0)" } ?? ""))
-                .font(Theme.mono(11)).foregroundStyle(Theme.ink2)
+                .tint(detail.status == .error ? Theme.danger : Theme.label)
+            Text("\(detail.jobsDone) of \(detail.jobsTotal) jobs done · \(detail.id)")
+                .font(.subheadline.monospacedDigit()).foregroundStyle(Theme.secondary)
         }
-        .padding(18)
-        .card(radius: 20, border: detail.status.isLive ? Theme.limeLine : Theme.line)
+        .heroSurface()
     }
 
     private var title: String {
@@ -148,18 +157,18 @@ struct JobTimeline: View {
                     VStack(spacing: 0) {
                         StageDot(status: stage.status)
                         if index < job.stages.count - 1 {
-                            Rectangle().fill(Theme.line2).frame(width: 2).frame(minHeight: 20)
+                            Rectangle().fill(Theme.tertiary).frame(width: 2).frame(minHeight: 20)
                         }
                     }
                     VStack(alignment: .leading, spacing: 3) {
                         Text(Format.stageName(stage.name))
-                            .font(Theme.sans(15, .semibold))
-                            .foregroundStyle(stage.status == .running ? Theme.lime
-                                             : stage.status == .error ? Theme.red
-                                             : stage.status == .done ? Theme.ink : Theme.ink2)
-                        Text(detailLine(stage)).font(Theme.mono(11)).foregroundStyle(Theme.ink2)
+                            .font(.body)
+                            .foregroundStyle(stage.status == .error ? Theme.danger
+                                             : stage.status == .pending || stage.status == .unknown
+                                             ? Theme.secondary : Theme.label)
+                        Text(detailLine(stage)).font(.footnote.monospacedDigit()).foregroundStyle(Theme.secondary)
                     }
-                    .padding(.bottom, 18)
+                    .padding(.bottom, index < job.stages.count - 1 ? 14 : 0)
                 }
             }
         }
@@ -181,16 +190,16 @@ struct StageDot: View {
         ZStack {
             switch status {
             case .done:
-                Circle().fill(Theme.ink)
+                Circle().fill(Theme.label)
                 Image(systemName: "checkmark").font(.system(size: 12, weight: .bold)).foregroundStyle(.black)
             case .running:
-                Circle().strokeBorder(Theme.lime, lineWidth: 2)
-                ProgressView().controlSize(.mini).tint(Theme.lime)
+                Circle().strokeBorder(Theme.label, lineWidth: 2)
+                ProgressView().controlSize(.mini)
             case .error:
-                Circle().fill(Theme.redDim)
-                Image(systemName: "xmark").font(.system(size: 11, weight: .bold)).foregroundStyle(Theme.red)
+                Circle().fill(Theme.danger.opacity(0.18))
+                Image(systemName: "xmark").font(.system(size: 11, weight: .bold)).foregroundStyle(Theme.danger)
             case .pending, .unknown:
-                Circle().strokeBorder(Theme.line2, lineWidth: 1.5)
+                Circle().strokeBorder(Theme.tertiary, lineWidth: 1.5)
             }
         }
         .frame(width: 26, height: 26)
@@ -203,38 +212,31 @@ struct BatchProgressList: View {
 
     var body: some View {
         let summary = BatchSummary(jobs)
-        VStack(alignment: .leading, spacing: 10) {
-            SectionLabel(text: "Batch · \(summary.done)/\(summary.total) done")
-            Text("\(summary.running) running · \(summary.failed) failed")
-                .font(Theme.mono(11)).foregroundStyle(summary.failed > 0 ? Theme.red : Theme.ink2)
-                .accessibilityIdentifier("batch.summary")
+        Section {
             ForEach(summary.ordered) { job in
-                VStack(alignment: .leading, spacing: 10) {
-                    Button {
-                        if expanded.contains(job.id) { expanded.remove(job.id) } else { expanded.insert(job.id) }
-                    } label: {
-                        HStack(spacing: 10) {
-                            StageDot(status: job.status)
-                            Text(job.id).font(Theme.mono(12, .semibold)).foregroundStyle(Theme.ink1).lineLimit(1)
-                            Spacer(minLength: 0)
-                            if job.finishedSec > 0 {
-                                Text(Format.clock(job.finishedSec)).font(Theme.mono(11)).foregroundStyle(Theme.ink2)
-                            }
-                            // Decorative once the Button announces its own state.
-                            Image(systemName: expanded.contains(job.id) ? "chevron.up" : "chevron.down")
-                                .foregroundStyle(Theme.ink3)
-                                .accessibilityHidden(true)
+                DisclosureGroup(isExpanded: Binding(
+                    get: { expanded.contains(job.id) },
+                    set: { if $0 { expanded.insert(job.id) } else { expanded.remove(job.id) } })
+                ) {
+                    JobTimeline(job: job).padding(.vertical, 4)
+                } label: {
+                    HStack(spacing: 10) {
+                        StageDot(status: job.status)
+                        Text(job.id).font(.subheadline).lineLimit(1).truncationMode(.middle)
+                        Spacer(minLength: 0)
+                        if job.finishedSec > 0 {
+                            Text(Format.clock(job.finishedSec)).font(.subheadline.monospacedDigit())
+                                .foregroundStyle(Theme.secondary)
                         }
                     }
-                    .buttonStyle(.plain)
-                    .accessibilityValue(expanded.contains(job.id) ? "expanded" : "collapsed")
-                    // Make the whole row width tappable, not just the glyphs — the
-                    // Spacer between the id and the clock is otherwise dead space.
-                    .contentShape(Rectangle())
-                    if expanded.contains(job.id) { JobTimeline(job: job) }
                 }
-                .padding(12).card()
             }
+        } header: {
+            Text("Batch · \(summary.done) of \(summary.total) done")
+        } footer: {
+            Text("\(summary.running) running · \(summary.failed) failed")
+                .foregroundStyle(summary.failed > 0 ? Theme.danger : Theme.secondary)
+                .accessibilityIdentifier("batch.summary")
         }
     }
 }

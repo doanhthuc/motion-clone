@@ -5,42 +5,41 @@ struct OutputsView: View {
     let store: OutputsStore
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-                HStack(alignment: .firstTextBaseline) {
-                    Text("Outputs").font(Theme.sans(33, .bold)).foregroundStyle(Theme.ink)
-                    Spacer()
-                    if store.isStale { StaleTag(lastSuccess: store.lastSuccess) }
-                    Text("\(store.batches.count) batches").font(Theme.mono(11)).foregroundStyle(Theme.ink2)
-                }
-                if let error = store.error, !store.loaded { ErrorBanner(error: error) { await store.refresh() } }
-                if store.loaded && store.batches.isEmpty {
-                    Text("No finished outputs yet.").font(Theme.sans(14)).foregroundStyle(Theme.ink2)
-                        .frame(maxWidth: .infinity).padding(.vertical, 60)
-                }
-                ForEach(store.batches) { batch in
-                    SectionLabel(text: batch.batch)
+        List {
+            if let error = store.error, !store.loaded {
+                Section { ErrorBanner(error: error) { await store.refresh() } }
+            }
+            if store.isStale {
+                Section { StaleTag(lastSuccess: store.lastSuccess) }
+            }
+            ForEach(store.batches) { batch in
+                Section(batch.batch) {
                     ForEach(batch.files) { file in
                         NavigationLink {
                             OutputFeedView(client: store.client, batch: batch, startAt: file)
                         } label: {
                             HStack(spacing: 12) {
-                                Image(systemName: file.isVideo ? "play.rectangle.fill" : "photo")
-                                    .foregroundStyle(Theme.lime).frame(width: 28)
-                                Text(file.name).font(Theme.mono(12)).foregroundStyle(Theme.ink1).lineLimit(1)
-                                Spacer(minLength: 0)
+                                Image(systemName: file.isVideo ? "play.rectangle" : "photo")
+                                    .foregroundStyle(Theme.secondary)
+                                    .frame(width: 24)
+                                    .accessibilityHidden(true)
+                                Text(file.name).font(.body).lineLimit(1).truncationMode(.middle)
+                                Spacer(minLength: 8)
                                 Text(ByteCountFormatter.string(fromByteCount: Int64(file.bytes), countStyle: .file))
-                                    .font(Theme.mono(11)).foregroundStyle(Theme.ink3)
+                                    .font(.subheadline.monospacedDigit()).foregroundStyle(Theme.secondary)
                             }
-                            .padding(12).card()
                         }
-                        .buttonStyle(.plain)
                     }
                 }
             }
-            .padding(.horizontal, 20)
         }
-        .background(Theme.bg)
+        .overlay {
+            if store.loaded && store.batches.isEmpty {
+                EmptyNote(title: "No outputs yet", systemImage: "play.rectangle",
+                          message: "Finished videos from every run land here.")
+            }
+        }
+        .navigationTitle("Outputs")
         .refreshable { await store.refresh() }
         .task { await store.refresh() }
     }

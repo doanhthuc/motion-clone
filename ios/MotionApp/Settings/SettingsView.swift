@@ -17,7 +17,7 @@ struct SettingsView: View {
             if firstRun {
                 Section {
                     Text("No API credentials yet. Run `make ios-secrets` and rebuild, or paste them here.")
-                        .font(Theme.sans(13)).foregroundStyle(Theme.ink2)
+                        .font(.subheadline).foregroundStyle(Theme.secondary)
                 }
             }
             Section("Control-plane API") {
@@ -32,19 +32,18 @@ struct SettingsView: View {
             }
             Section {
                 Button("Save & test connection") { Task { await saveAndTest() } }
-                    .foregroundStyle(Theme.lime)
                 if let testResult {
-                    Text(testResult).font(Theme.mono(12)).foregroundStyle(testOK ? Theme.lime : Theme.red)
+                    Label(testResult, systemImage: testOK ? "checkmark.circle.fill" : "xmark.octagon.fill")
+                        .font(.subheadline.monospacedDigit())
+                        .foregroundStyle(testOK ? Theme.label : Theme.danger)
                 }
-                if let saveError { Text(saveError).foregroundStyle(Theme.red) }
+                if let saveError { Text(saveError).foregroundStyle(Theme.danger) }
             }
             Section("Notifications") {
                 Text("Telegram reports progress and results — this app has no push (no paid Apple account).")
-                    .font(Theme.sans(13)).foregroundStyle(Theme.ink2)
+                    .font(.subheadline).foregroundStyle(Theme.secondary)
             }
         }
-        .scrollContentBackground(.hidden)
-        .background(Theme.bg)
         .navigationTitle("Settings")
         .onAppear(perform: load)
     }

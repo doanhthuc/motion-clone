@@ -35,7 +35,6 @@ targets:
         UILaunchScreen: {}
         UIUserInterfaceStyle: Dark
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
-        UIAppFonts: [SpaceGrotesk.ttf, JetBrainsMono.ttf]
         NSPhotoLibraryAddUsageDescription: Save finished videos and images to Photos.
         CONTROL_API_URL: $(CONTROL_API_URL)
         CF_ACCESS_CLIENT_ID: $(CF_ACCESS_CLIENT_ID)

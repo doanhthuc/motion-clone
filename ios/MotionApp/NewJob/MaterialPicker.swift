@@ -15,21 +15,21 @@ struct MaterialPicker: View {
     }
 
     private let columns = [
-        GridItem(.flexible(), spacing: 12),
-        GridItem(.flexible(), spacing: 12),
+        GridItem(.flexible(), spacing: 12, alignment: .top),
+        GridItem(.flexible(), spacing: 12, alignment: .top),
     ]
 
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
+                VStack(alignment: .leading, spacing: 16) {
                     header
                     if let message = materials.errorMessage, materials.loaded {
                         refreshFailureBanner(message)
                     }
                     content
                 }
-                .padding(.horizontal, 20)
+                .padding(.horizontal, 16)
                 .padding(.bottom, 24)
             }
             .background(Theme.bg)
@@ -57,15 +57,14 @@ struct MaterialPicker: View {
     }
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: 5) {
+        VStack(alignment: .leading, spacing: 4) {
             Text(displayName(role))
-                .font(Theme.sans(22, .bold))
-                .foregroundStyle(Theme.ink)
+                .font(.title2.bold())
             Text(kindDescription)
-                .font(Theme.sans(13))
-                .foregroundStyle(Theme.ink2)
+                .font(.subheadline)
+                .foregroundStyle(Theme.secondary)
         }
-        .padding(.top, 6)
+        .padding(.top, 8)
     }
 
     @ViewBuilder private var content: some View {
@@ -75,7 +74,7 @@ struct MaterialPicker: View {
             } description: {
                 Text("This role uses a material type this version of Motion does not recognize. Update the app before assigning one.")
             }
-            .foregroundStyle(Theme.ink2)
+            .foregroundStyle(Theme.secondary)
             .frame(maxWidth: .infinity)
             .padding(.vertical, 48)
         } else if !materials.loaded, let message = materials.errorMessage {
@@ -90,11 +89,11 @@ struct MaterialPicker: View {
             } description: {
                 Text("Add \(kindDescriptionForEmptyState) in Material, then choose it here.")
             }
-            .foregroundStyle(Theme.ink2)
+            .foregroundStyle(Theme.secondary)
             .frame(maxWidth: .infinity)
             .padding(.vertical, 48)
         } else {
-            LazyVGrid(columns: columns, spacing: 12) {
+            LazyVGrid(columns: columns, spacing: 20) {
                 ForEach(eligible) { material in
                     MaterialChoice(material: material, materials: materials, selected: material.id == selectedID) {
                         onSelect(material.id)
@@ -106,17 +105,11 @@ struct MaterialPicker: View {
     }
 
     private func initialLoadFailure(_ message: String) -> some View {
-        VStack(spacing: 14) {
-            Image(systemName: "exclamationmark.triangle")
-                .font(.system(size: 28, weight: .medium))
-                .foregroundStyle(Theme.red)
-            Text("Materials unavailable")
-                .font(Theme.sans(18, .bold))
-                .foregroundStyle(Theme.ink)
+        ContentUnavailableView {
+            Label("Materials unavailable", systemImage: "exclamationmark.triangle")
+        } description: {
             Text(message)
-                .font(Theme.sans(13))
-                .foregroundStyle(Theme.ink2)
-                .multilineTextAlignment(.center)
+        } actions: {
             retryButton
         }
         .frame(maxWidth: .infinity)
@@ -124,23 +117,20 @@ struct MaterialPicker: View {
     }
 
     private func refreshFailureBanner(_ message: String) -> some View {
-        HStack(alignment: .top, spacing: 10) {
-            Image(systemName: "exclamationmark.triangle").foregroundStyle(Theme.amber)
-            Text(message).font(Theme.sans(13)).foregroundStyle(Theme.ink1)
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(Theme.warning)
+            Text(message).font(.subheadline)
             Spacer(minLength: 0)
             retryButton
         }
-        .padding(12)
-        .background(Theme.surface2, in: .rect(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Theme.line2))
+        .heroSurface()
     }
 
     private var retryButton: some View {
         Button("Retry") {
             Task { await materials.refresh() }
         }
-        .font(Theme.sans(12, .semibold))
-        .foregroundStyle(Theme.lime)
+        .font(.subheadline.weight(.semibold))
     }
 
     private var kindDescription: String {
@@ -179,16 +169,17 @@ private struct MaterialChoice: View {
             MaterialCard(
                 material: material,
                 warning: materials.warning(for: material.id),
-                thumbnail: thumbnail)
+                thumbnail: thumbnail,
+                selected: selected)
                 .overlay(alignment: .topTrailing) {
                     if selected {
                         Image(systemName: "checkmark.circle.fill")
-                            .font(.system(size: 20, weight: .bold))
-                            .foregroundStyle(Theme.lime)
+                            .font(.title3)
+                            .symbolRenderingMode(.palette)
+                            .foregroundStyle(Theme.onAccent, Theme.accent)
                             .padding(8)
-                        }
+                    }
                 }
-                .overlay(RoundedRectangle(cornerRadius: 15).strokeBorder(selected ? Theme.limeLine : Theme.line))
         }
         .buttonStyle(.plain)
         .accessibilityLabel(material.name)

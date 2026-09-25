@@ -135,7 +135,7 @@ struct OutputFeedView: View {
                 if let toast { toastView(toast) }
                 // Files in a batch share their prefix and differ at the end (…-2.mp4),
                 // so a long name at large text sizes gives up its middle.
-                Text(currentFile?.name ?? "").font(Theme.mono(13, .medium)).foregroundStyle(Theme.ink)
+                Text(currentFile?.name ?? "").font(.subheadline.weight(.medium).monospacedDigit()).foregroundStyle(Theme.label)
                     .lineLimit(1).truncationMode(.middle)
                     .shadow(color: .black.opacity(0.5), radius: 4)
             }
@@ -156,7 +156,7 @@ struct OutputFeedView: View {
                 }
                 // The batch name is on the screen that opened this feed; the position is what's new here.
                 Text("\(position)/\(batch.files.count)")
-                    .font(Theme.mono(11)).foregroundStyle(Theme.ink2).lineLimit(1)
+                    .font(.footnote.monospacedDigit()).foregroundStyle(Theme.secondary).lineLimit(1)
                     .accessibilityLabel("\(position) of \(batch.files.count)")
             }
             .padding(.horizontal, 16)
@@ -168,15 +168,15 @@ struct OutputFeedView: View {
     private func toastView(_ toast: Toast) -> some View {
         HStack(spacing: 12) {
             Text(toast.message)
-                .font(Theme.sans(13, .medium)).foregroundStyle(Theme.ink)
+                .font(.subheadline.weight(.medium)).foregroundStyle(Theme.label)
             if toast.opensSettings {
                 Button("Open Settings") {
                     if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
                 }
-                .font(Theme.sans(13, .semibold)).foregroundStyle(Theme.lime)
+                .font(.subheadline.weight(.semibold)).foregroundStyle(Theme.accent)
                 .frame(minHeight: 44)
                 Button { self.toast = nil } label: {
-                    Image(systemName: "xmark").font(.system(size: 13, weight: .semibold)).foregroundStyle(Theme.ink2)
+                    Image(systemName: "xmark").font(.system(size: 13, weight: .semibold)).foregroundStyle(Theme.secondary)
                         .frame(width: 44, height: 44)
                 }
                 .accessibilityLabel("Dismiss")
@@ -383,7 +383,7 @@ private struct ScrubBar: View {
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
                     Capsule().fill(.white.opacity(0.25))
-                    Capsule().fill(active ? Theme.lime : .white)
+                    Capsule().fill(active ? Theme.accent : .white)
                         .frame(width: geo.size.width * fraction)
                 }
                 .frame(height: active ? 6 : 3)
@@ -412,7 +412,7 @@ private struct ScrubBar: View {
         .overlay(alignment: .top) {
             if active {
                 Text("\(Self.clock(fraction * clip.duration)) / \(Self.clock(clip.duration))")
-                    .font(Theme.mono(13, .medium)).foregroundStyle(Theme.ink)
+                    .font(.subheadline.weight(.medium).monospacedDigit()).foregroundStyle(Theme.label)
                     .shadow(color: .black.opacity(0.5), radius: 4)
                     .offset(y: -timeLift)
                     .transition(.opacity)

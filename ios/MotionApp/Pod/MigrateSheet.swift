@@ -17,32 +17,29 @@ struct MigrateSheet: View {
     var body: some View {
         @Bindable var flow = flow
         NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
-                    content(typed: $flow.typed)
+            List {
+                content(typed: $flow.typed)
+                Section {
                     if flow.needsRecheck {
                         Button("Check again") { Task { await flow.recheck() } }
-                            .buttonStyle(SecondaryButtonStyle())
                             .disabled(flow.isSending)
                     }
                     if flow.isSending {
                         HStack(spacing: 8) {
                             ProgressView()
                             VStack(alignment: .leading, spacing: 2) {
-                                Text(flow.inFlightLabel ?? "").font(Theme.mono(11)).foregroundStyle(Theme.ink2)
+                                Text(flow.inFlightLabel ?? "").font(.footnote.monospacedDigit()).foregroundStyle(Theme.secondary)
                                 if let note = flow.retryNote {
-                                    Text(note).font(Theme.mono(11)).foregroundStyle(Theme.amber)
+                                    Text(note).font(.footnote.monospacedDigit()).foregroundStyle(Theme.warning)
                                 }
                             }
                         }
                     }
                     if let message = flow.message {
-                        Text(message).font(Theme.sans(13)).foregroundStyle(Theme.amber)
+                        Text(message).font(.subheadline).foregroundStyle(Theme.warning)
                     }
                 }
-                .padding(20)
             }
-            .background(Theme.bg)
             .navigationTitle("Move volume")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -63,89 +60,115 @@ struct MigrateSheet: View {
         case .choose:
             chooser
         case .asking(let dc):
-            ProgressView("Checking \(dc)…").frame(maxWidth: .infinity).padding(.top, 30)
+            ProgressView("Checking \(dc)…").frame(maxWidth: .infinity).listRowBackground(Color.clear)
         case .confirm(let ask):
             confirmation(ask, typed: typed)
         case .started(let dc):
-            Label("Migration to \(dc) started", systemImage: "checkmark.circle")
-                .font(Theme.sans(15, .semibold)).foregroundStyle(Theme.lime)
-            Text("Progress shows on the Pod tab and in Telegram.")
-                .font(Theme.sans(13)).foregroundStyle(Theme.ink2)
-            Button("Done") { dismiss() }.buttonStyle(PrimaryButtonStyle())
+            Section {
+                Label("Migration to \(dc) started", systemImage: "checkmark.circle").font(.headline)
+            } footer: {
+                Text("Progress shows on the Pod tab and in Telegram.")
+            }
+            Section { Button("Done") { dismiss() }.buttonStyle(PrimaryButtonStyle()).buttonRow() }
         case .outcomeUnknown:
-            Button("Done") { dismiss() }.buttonStyle(SecondaryButtonStyle())
+            Section { Button("Done") { dismiss() }.buttonStyle(SecondaryButtonStyle()).buttonRow() }
         }
     }
 
     @ViewBuilder private var chooser: some View {
         let blocker = MigrateFlow.blocker(pod: pod.pod, runStatus: runStatus)
-        Text("Copies the Network Volume (models, Postgres, MinIO) to another datacenter, then deletes the current one once the copy verifies. About 25–30 minutes, on two temporary CPU pods.")
-            .font(Theme.sans(13)).foregroundStyle(Theme.ink2)
-        if let blocker {
-            Text(blocker).font(Theme.sans(13, .semibold)).foregroundStyle(Theme.red)
-                .accessibilityIdentifier("migrate.blocked")
+        Section {
+            Text("Copies the Network Volume (models, Postgres, MinIO) to another datacenter, then deletes the current one once the copy verifies. About 25–30 minutes, on two temporary CPU pods.")
+                .font(.subheadline).foregroundStyle(Theme.secondary)
+            if let blocker {
+                Label(blocker, systemImage: "exclamationmark.triangle.fill")
+                    .font(.subheadline.weight(.semibold)).foregroundStyle(Theme.danger)
+                    .accessibilityIdentifier("migrate.blocked")
+            }
         }
-        if let stock = gpu.stock {
-            let destinations = stock.destinations
-            if destinations.isEmpty {
-                Text("No other datacenter has a GPU in stock right now.")
-                    .font(Theme.sans(13)).foregroundStyle(Theme.ink2)
-            }
-            ForEach(destinations) { destination in
-                Button { Task { await flow.ask(toDc: destination.datacenter) } } label: {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(destination.datacenter).font(Theme.mono(15, .semibold)).foregroundStyle(Theme.ink)
-                        Text(destination.gpus.joined(separator: " · "))
-                            .font(Theme.mono(11)).foregroundStyle(Theme.ink2)
-                    }
-                    .padding(14).frame(maxWidth: .infinity, alignment: .leading)
-                    .card(border: destination.datacenter == flow.destination ? Theme.limeLine : Theme.line)
+        Section("Destination") {
+            if let stock = gpu.stock {
+                let destinations = stock.destinations
+                if destinations.isEmpty {
+                    Text("No other datacenter has a GPU in stock right now.")
+                        .font(.subheadline).foregroundStyle(Theme.secondary)
                 }
-                .buttonStyle(.plain)
-                .disabled(blocker != nil || flow.isSending || flow.needsRecheck || flow.pendingNotice != nil)
-                .accessibilityIdentifier("migrate.dest.\(destination.datacenter)")
+                ForEach(destinations) { destination in
+                    Button { Task { await flow.ask(toDc: destination.datacenter) } } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(destination.datacenter).font(.body).foregroundStyle(Theme.label)
+                                Text(destination.gpus.joined(separator: " · "))
+                                    .font(.subheadline).foregroundStyle(Theme.secondary)
+                            }
+                            Spacer()
+                            if destination.datacenter == flow.destination {
+                                Image(systemName: "checkmark").font(.body.weight(.semibold))
+                                    .foregroundStyle(Theme.accent)
+                            }
+                        }
+                        .contentShape(.rect)
+                    }
+                    .disabled(blocker != nil || flow.isSending || flow.needsRecheck || flow.pendingNotice != nil)
+                    .accessibilityIdentifier("migrate.dest.\(destination.datacenter)")
+                }
+            } else if let error = gpu.error {
+                ErrorBanner(error: error) { await gpu.load() }
+            } else {
+                ProgressView("Reading stock…").frame(maxWidth: .infinity)
             }
-        } else if let error = gpu.error {
-            ErrorBanner(error: error) { await gpu.load() }
-        } else {
-            ProgressView("Reading stock…").frame(maxWidth: .infinity)
         }
     }
 
+    // Section-level TimelineViews rather than one around the whole step: a
+    // TimelineView is not a transparent List container, so wrapping Sections
+    // in one would collapse them into a single row.
+    @ViewBuilder
     private func confirmation(_ ask: MigrateAsk, typed: Binding<String>) -> some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("\(ask.homeDatacenter) → \(ask.toDc)").font(Theme.mono(18, .semibold)).foregroundStyle(Theme.ink)
-            Text(ask.warning).font(Theme.sans(14)).foregroundStyle(Theme.red)
+        Section {
+            Text("\(ask.homeDatacenter) → \(ask.toDc)").font(.title3.weight(.semibold))
+            Text(ask.warning).font(.subheadline).foregroundStyle(Theme.danger)
                 .accessibilityIdentifier("migrate.warning")
+        }
+        Section {
+            TextField("Type \(ask.toDc) to confirm", text: typed)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .font(.body.monospaced())
+                .accessibilityIdentifier("migrate.typed")
+        } footer: {
             TimelineView(.periodic(from: .now, by: 1)) { ctx in
                 let left = flow.secondsLeft(at: ctx.date)
-                VStack(alignment: .leading, spacing: 12) {
-                    Text(left > 0 ? "Confirmation valid for \(Format.clock(Double(left)))"
-                                  : "This confirmation expired.")
-                        .font(Theme.mono(11)).foregroundStyle(left > 0 ? Theme.ink2 : Theme.amber)
-                    TextField("Type \(ask.toDc) to confirm", text: typed)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .font(Theme.mono(15)).padding(12).card()
-                        .accessibilityIdentifier("migrate.typed")
+                Text(left > 0 ? "Confirmation valid for \(Format.clock(Double(left)))"
+                              : "This confirmation expired.")
+                    .monospacedDigit()
+                    .foregroundStyle(left > 0 ? Theme.secondary : Theme.warning)
+            }
+        }
+        Section {
+            TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                VStack(spacing: 8) {
                     Button("Migrate and delete the old volume") { Task { await flow.migrate() } }
                         .buttonStyle(DestructiveButtonStyle())
                         .disabled(!flow.canMigrate(at: ctx.date) || spendBlocked)
                         .accessibilityIdentifier("migrate.confirm")
-                    if spendBlocked {
-                        Text("Another spend request is unanswered — resolve it before migrating.")
-                            .font(Theme.sans(12)).foregroundStyle(Theme.amber)
-                    }
-                    if flow.dropBlocked {
-                        Text("A batch drop is still in flight — wait for it before moving the volume.")
-                            .font(Theme.sans(12)).foregroundStyle(Theme.amber)
-                    }
-                    if left == 0 {
+                    if flow.secondsLeft(at: ctx.date) == 0 {
                         Button("Expired — ask again") { Task { await flow.ask(toDc: ask.toDc) } }
                             .buttonStyle(SecondaryButtonStyle())
                     }
                 }
             }
+            .buttonRow()
+        } footer: {
+            VStack(alignment: .leading, spacing: 4) {
+                if spendBlocked {
+                    Text("Another spend request is unanswered — resolve it before migrating.")
+                }
+                if flow.dropBlocked {
+                    Text("A batch drop is still in flight — wait for it before moving the volume.")
+                }
+            }
+            .foregroundStyle(Theme.warning)
         }
     }
 }
