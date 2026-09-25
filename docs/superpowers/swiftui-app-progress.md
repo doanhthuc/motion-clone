@@ -124,8 +124,10 @@ field or store changed.
   `.automatic`, may transcode (HEVC to H.264, HEIC to JPEG) before upload. The server stores video
   byte for byte and turns HEIC into lossless PNG.
 - **Layout.** Materials are grouped into Videos / Images / Other with pinned headers. The Add button
-  floats bottom-centre above the tab bar — reachable one-handed on a Pro Max — as a pill at the top
-  of the grid that shrinks to a circle once the grid scrolls. Tapping a material pushes the preview
+  is part of the layout, a full-width bar under the Materials | Saved try-ons switch: tall at rest
+  ("Photos · TikTok link · Files" spelled out), shrinking to one line as the grid scrolls and never
+  scrolling away. A floating bottom button was tried first and rejected on the phone: collapsed and
+  centred it sat on top of the tab bar's New Job +. Tapping a material pushes the preview
   (edge swipe back, like Outputs); from a picker it opens as a sheet (swipe down).
 
 - **Grouped by role, not by kind** (same day, on request): Motion drivers · Outfits · Characters

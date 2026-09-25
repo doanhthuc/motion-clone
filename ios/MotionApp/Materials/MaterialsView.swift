@@ -9,9 +9,10 @@ struct MaterialsView: View {
     /// An image just uploaded here: ask what it is, as the bot does.
     @State private var sorting: MotionKit.Material?
     @State private var justAdded: MotionKit.Material?
-    /// The Add button shrinks to a circle once the grid scrolls, so it covers
-    /// less of what is being browsed; back at the top it says what it does.
-    @State private var addCollapsed = false
+    /// 0 with the grid at rest, 1 once it has scrolled `collapseDistance`:
+    /// drives the Add button from its tall form to a one-line bar.
+    @State private var collapse: CGFloat = 0
+    private static let collapseDistance: CGFloat = 80
 
     private let columns = [
         GridItem(.flexible(), spacing: 12, alignment: .top),
@@ -31,43 +32,13 @@ struct MaterialsView: View {
     }
 
     var body: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 16, pinnedViews: [.sectionHeaders]) {
-                if store.isStale { StaleTag(lastSuccess: store.lastSuccess) }
-                if let message = store.errorMessage {
-                    messageBanner(message)
-                }
-                if let progress = store.uploadProgress, store.isUploading {
-                    uploadCard(progress)
-                }
-                if store.loaded && store.materials.isEmpty {
-                    EmptyNote(title: "No materials yet", systemImage: "photo.on.rectangle",
-                              message: "Add a photo, a video or a TikTok link with the button below.")
-                        .padding(.top, 40)
-                } else {
-                    ForEach(groups, id: \.title) { group in
-                        Section {
-                            LazyVGrid(columns: columns, spacing: 20) {
-                                ForEach(group.items) { material in tile(material) }
-                            }
-                        } header: {
-                            sectionHeader(group.title, count: group.items.count)
-                        }
-                    }
-                }
-            }
-            .padding(.horizontal, 16)
-            // Room for the floating Add button, so the last row is never under it.
-            .padding(.bottom, 88)
+        VStack(spacing: 0) {
+            addButton
+                .padding(.horizontal, 16)
+                .padding(.bottom, 8)
+            grid
         }
-        .onScrollGeometryChange(for: Bool.self) { geometry in
-            geometry.contentOffset.y + geometry.contentInsets.top > 24
-        } action: { _, scrolled in
-            withAnimation(.snappy) { addCollapsed = scrolled }
-        }
-        .overlay(alignment: .bottom) { addButton }
         .background(Theme.bg)
-        .refreshable { await store.refresh() }
         .task { await store.refresh() }
         .navigationDestination(item: $previewing) { material in
             MaterialPreview(material: material, materials: store)
@@ -116,6 +87,43 @@ struct MaterialsView: View {
         }
     }
 
+    private var grid: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 16, pinnedViews: [.sectionHeaders]) {
+                if store.isStale { StaleTag(lastSuccess: store.lastSuccess) }
+                if let message = store.errorMessage {
+                    messageBanner(message)
+                }
+                if let progress = store.uploadProgress, store.isUploading {
+                    uploadCard(progress)
+                }
+                if store.loaded && store.materials.isEmpty {
+                    EmptyNote(title: "No materials yet", systemImage: "photo.on.rectangle",
+                              message: "Add a photo, a video or a TikTok link with the button above.")
+                        .padding(.top, 40)
+                } else {
+                    ForEach(groups, id: \.title) { group in
+                        Section {
+                            LazyVGrid(columns: columns, spacing: 20) {
+                                ForEach(group.items) { material in tile(material) }
+                            }
+                        } header: {
+                            sectionHeader(group.title, count: group.items.count)
+                        }
+                    }
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 24)
+        }
+        .onScrollGeometryChange(for: CGFloat.self) { geometry in
+            max(0, geometry.contentOffset.y + geometry.contentInsets.top)
+        } action: { _, offset in
+            collapse = min(1, offset / Self.collapseDistance)
+        }
+        .refreshable { await store.refresh() }
+    }
+
     private func tile(_ material: MotionKit.Material) -> some View {
         Button { previewing = material } label: {
             MaterialCell(store: store, material: material)
@@ -153,36 +161,41 @@ struct MaterialsView: View {
         .accessibilityAddTraits(.isHeader)
     }
 
-    /// Bottom of the screen, above the tab bar, where a thumb reaches on a
-    /// Pro Max held in one hand. The navigation bar's + it replaces was the
-    /// farthest point on the screen.
+    /// Part of the layout, directly under the Materials | Saved try-ons
+    /// switch, full width: a big target in the upper-middle of the screen
+    /// rather than the navigation bar's corner +. Tall at rest, with what it
+    /// offers spelled out; as the grid scrolls it shrinks to a one-line bar
+    /// and stays, so it never scrolls out of reach.
     private var addButton: some View {
-        Button { adding = true } label: {
-            HStack(spacing: 8) {
-                // Not a bare "plus": the tab bar's New Job is one, right below.
-                Image(systemName: "photo.badge.plus").font(.title3.weight(.semibold))
-                if !addCollapsed {
+        let height = 88 - 40 * collapse
+        return Button { adding = true } label: {
+            HStack(spacing: 12) {
+                // Not a bare "plus": the tab bar's New Job is one.
+                Image(systemName: "photo.badge.plus")
+                    .font(.system(size: 28 - 8 * collapse, weight: .semibold))
+                VStack(alignment: .leading, spacing: 2) {
                     Text("Add material").font(.headline)
-                        .transition(.opacity.combined(with: .scale(scale: 0.8, anchor: .leading)))
+                    if collapse < 0.5 {
+                        Text("Photos · TikTok link · Files")
+                            .font(.subheadline)
+                            .opacity(1 - collapse * 2)
+                    }
                 }
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.right").font(.footnote.weight(.semibold))
+                    .opacity(0.6)
             }
-            // The glass style adds its own padding: 36 pt inside comes out at
-            // ~56 pt, a circle when collapsed and a pill when not.
-            .padding(.horizontal, addCollapsed ? 0 : 16)
-            .frame(minWidth: 36, minHeight: 36)
+            .foregroundStyle(Theme.onAccent)
+            .padding(.horizontal, 16)
+            .frame(maxWidth: .infinity, minHeight: height, maxHeight: height)
+            .background(Theme.accent, in: .rect(cornerRadius: Theme.Radius.medium))
+            .contentShape(.rect)
         }
-        .buttonStyle(.glassProminent)
-        .buttonBorderShape(addCollapsed ? .circle : .capsule)
-        .controlSize(.large)
-        .foregroundStyle(Theme.onAccent)
+        .buttonStyle(.plain)
         .disabled(store.isUploading || store.isImportingLink)
+        .opacity(store.isUploading || store.isImportingLink ? 0.5 : 1)
         .accessibilityLabel("Add material")
-        // Centred while it is a labelled pill; collapsed, it moves to the
-        // trailing corner. A centred circle sat straight above New Job's +
-        // in the tab bar, two look-alike buttons stacked (2026-09-25).
-        .frame(maxWidth: .infinity, alignment: addCollapsed ? .trailing : .center)
-        .padding(.horizontal, 20)
-        .padding(.bottom, 12)
+        .accessibilityHint("Photos, a TikTok link or Files")
     }
 
     static func title(_ role: MaterialRole) -> String {
