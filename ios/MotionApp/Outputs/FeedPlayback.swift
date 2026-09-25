@@ -15,6 +15,14 @@ final class FeedClip {
     /// Paused by the viewer's tap, as opposed to paused because the page is off screen.
     private(set) var userPaused = false
     private(set) var scrubbing = false
+    /// Playback speed from the long-press sheet. `defaultRate` is what
+    /// `play()` resumes at, so a tap-pause or a scrub keeps the chosen speed.
+    var rate: Float = 1 {
+        didSet {
+            player.defaultRate = rate
+            if player.rate != 0 { player.rate = rate }
+        }
+    }
 
     @ObservationIgnored private let loader: AuthenticatedAssetResourceLoader
     @ObservationIgnored private var timeToken: Any?
@@ -133,6 +141,11 @@ final class FeedPlayback {
     @ObservationIgnored private let client: APIClient
     @ObservationIgnored private let batch: String
     private var focused: String?
+    /// One speed for the whole feed, as in TikTok: set on one video, it holds
+    /// for the next ones swiped to.
+    var rate: Float = 1 {
+        didSet { clips.values.forEach { $0.rate = rate } }
+    }
 
     init(client: APIClient, batch: String) {
         self.client = client
@@ -147,7 +160,9 @@ final class FeedPlayback {
             clips.removeValue(forKey: key)?.teardown()
         }
         for key in keep where clips[key] == nil {
-            clips[key] = FeedClip(client: client, path: ["v1", "outputs", batch, key])
+            let clip = FeedClip(client: client, path: ["v1", "outputs", batch, key])
+            clip.rate = rate
+            clips[key] = clip
         }
         focused = id
         for (key, clip) in clips {

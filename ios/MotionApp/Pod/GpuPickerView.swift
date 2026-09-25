@@ -31,7 +31,11 @@ struct GpuPickerView: View {
                 LoadingBlock(title: "Reading stock…")
             }
         } header: {
-            Text("GPU")
+            HStack {
+                Text("GPU")
+                Spacer()
+                refreshButton
+            }
         } footer: {
             VStack(alignment: .leading, spacing: 4) {
                 if hasLease { Text("A change applies to the next rental.") }
@@ -44,6 +48,28 @@ struct GpuPickerView: View {
             }
         }
         .opacity(store.isStale ? 0.6 : 1)
+    }
+
+    /// Stock moves minute to minute; this re-reads it without pulling the
+    /// whole Pod tab (and its pod/balance/runs reads) to refresh.
+    private var refreshButton: some View {
+        Button {
+            Task { await store.load(force: true) }
+        } label: {
+            ZStack {
+                // Both layers always laid out, so the header doesn't jump.
+                Image(systemName: "arrow.clockwise").opacity(store.isLoading ? 0 : 1)
+                if store.isLoading { ProgressView().controlSize(.small) }
+            }
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(Theme.secondary)
+            .frame(minWidth: 44, minHeight: 44, alignment: .trailing)
+            .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        .disabled(store.isLoading)
+        .accessibilityLabel("Refresh GPU stock")
+        .accessibilityIdentifier("gpu.refresh")
     }
 
     private func rowView(_ row: GpuStockRow, stock: GpuStock) -> some View {

@@ -50,11 +50,14 @@ struct BatchComposerSection: View {
                 }
             } else {
                 Section {
-                    ForEach(sharedRoles, id: \.self) { role in
-                        SlotMaterialRow(role: role, required: pipeline.required.contains(role),
-                                        kind: pipeline.roles[role] ?? .unknown,
-                                        slot: store.draft?.slots[role], materials: materials,
-                                        disabled: store.isBusy || composer.isRunning) { onPickRole(role) }
+                    SlotTileGrid(count: sharedRoles.count) {
+                        ForEach(sharedRoles, id: \.self) { role in
+                            SlotMaterialRow(role: role, required: pipeline.required.contains(role),
+                                            kind: pipeline.roles[role] ?? .unknown,
+                                            slot: store.draft?.slots[role], materials: materials,
+                                            disabled: store.isBusy || composer.isRunning,
+                                            tile: true) { onPickRole(role) }
+                        }
                     }
                 } header: {
                     Text("Shared by every video")

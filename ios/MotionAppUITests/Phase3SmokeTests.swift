@@ -64,7 +64,7 @@ final class Phase3SmokeTests: XCTestCase {
 
     @MainActor
     private func clearDraft(in app: XCUIApplication) {
-        revealButton("Clear", in: app).tap()
+        Phase4Draft.tapClear(in: app)
         XCTAssertTrue(Phase4Draft.revealText("0 of 3 required slots assigned", in: app)
             || Phase4Draft.revealText("0 of 2 required slots assigned", in: app, timeout: 1))
     }
@@ -124,16 +124,7 @@ final class Phase3SmokeTests: XCTestCase {
 
     @MainActor
     private func revealButton(_ label: String, in app: XCUIApplication) -> XCUIElement {
-        let button = app.buttons[label]
-        for _ in 0..<8 where !button.isHittable {
-            app.swipeDown()
-        }
-        for _ in 0..<10 where !button.isHittable {
-            app.swipeUp()
-        }
-        XCTAssertTrue(button.waitForExistence(timeout: 5), "Missing button: \(label)")
-        XCTAssertTrue(button.isHittable, "Button is not visible: \(label)")
-        return button
+        Phase4Draft.revealButton(label, in: app)
     }
 
     @MainActor

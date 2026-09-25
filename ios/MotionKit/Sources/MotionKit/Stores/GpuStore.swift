@@ -27,8 +27,8 @@ public final class GpuStore {
 
     public var isStale: Bool { stock != nil && error != nil }
 
-    /// `force` only from pull-to-refresh or Retry: uncached it is a runpodctl
-    /// round trip (~30 s worst case). A 502 keeps the last good list.
+    /// `force` only from pull-to-refresh, Retry or the GPU header's refresh
+    /// button: uncached it is a runpodctl round trip (~30 s worst case). A 502 keeps the last good list.
     public func load(force: Bool = false) async {
         isLoading = true
         defer { isLoading = false }

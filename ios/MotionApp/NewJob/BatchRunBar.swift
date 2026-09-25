@@ -4,13 +4,20 @@ import SwiftUI
 /// Batch mode's summary and its one primary action, pinned above the tab bar
 /// so "what am I about to add" stays on screen while the strips scroll. It was
 /// the last row of a long list before 2026-09-25, out of sight until the end.
+/// The glass around it is `NewJobActionBar`'s, which it shares with Validate.
 @MainActor
 struct BatchRunBar: View {
     let composer: BatchComposer
 
     /// Nothing to say while nothing is picked and no build has run.
     static func isVisible(_ composer: BatchComposer) -> Bool {
-        !composer.outfits.isEmpty || composer.isRunning || composer.failure != nil || composer.lastAdded != nil
+        ownsAction(composer) || composer.lastAdded != nil
+    }
+
+    /// While this is true the bar's button is the composer's Add (or Continue),
+    /// and the draft's Validate waits until the build has landed.
+    static func ownsAction(_ composer: BatchComposer) -> Bool {
+        !composer.outfits.isEmpty || composer.isRunning || composer.failure != nil
     }
 
     private var summaryText: String {
@@ -27,7 +34,7 @@ struct BatchRunBar: View {
             // label would read "Add 0 jobs to batch" on a disabled button. A
             // failure keeps it visible — that is the Continue a stopped run offers,
             // and a run in flight keeps it so the button does not vanish mid-build.
-            if !composer.outfits.isEmpty || composer.failure != nil || composer.isRunning {
+            if Self.ownsAction(composer) {
                 Text(summaryText)
                     .font(.subheadline.weight(.semibold).monospacedDigit())
                     .accessibilityIdentifier("batch.summary")
@@ -45,10 +52,6 @@ struct BatchRunBar: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(16)
-        .glassEffect(.regular, in: .rect(cornerRadius: 24))
-        .padding(.horizontal, 12)
-        .padding(.bottom, 8)
     }
 
     @ViewBuilder private var statusLines: some View {
