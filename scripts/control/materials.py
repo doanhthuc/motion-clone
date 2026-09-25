@@ -317,6 +317,18 @@ def thumbnail(staging_root: Path, thumbs_root: Path, owner: str, name: str) -> P
     dest = thumbs_root / owner / f"{name}.jpg"
     if dest.is_file() and dest.stat().st_mtime >= src.stat().st_mtime:
         return dest
+    if not render_frame(src, dest, THUMB_WIDTH, video=_kind(src) == "video"):
+        raise MaterialError("unprobeable", f"no preview for {name}")
+    return dest
+
+
+def render_frame(src: Path, dest: Path, width: int, *, video: bool) -> bool:
+    """One JPEG frame of `src` at `dest`, `width` px wide. False if ffmpeg could not.
+
+    Shared by material thumbnails and output posters so both draw from the
+    same two ffmpeg slots below — two separate caps would let a grid of each
+    run four encoders on the 1 GB droplet at once.
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
     # One temp file per call, not a fixed `<name>.tmp.jpg`: the app's grid asks
     # for many thumbnails at once, and two calls for the same material (two
@@ -327,9 +339,9 @@ def thumbnail(staging_root: Path, thumbs_root: Path, owner: str, name: str) -> P
     tmp = dest.with_name(f"{dest.name}.{uuid.uuid4().hex}.tmp")
     # -ss before -i seeks cheaply; 0.5 s skips the black first frame many phone
     # videos start with. For a still image ffmpeg ignores the seek.
-    seek = ["-ss", "0.5"] if _kind(src) == "video" else []
+    seek = ["-ss", "0.5"] if video else []
     cmd = ["ffmpeg", "-v", "error", "-y", *seek, "-i", str(src), "-frames:v", "1",
-           "-vf", f"scale={THUMB_WIDTH}:-2", "-f", "mjpeg", str(tmp)]
+           "-vf", f"scale={width}:-2", "-f", "mjpeg", str(tmp)]
     try:
         # Capped, not queued per request: the box has 1 GB of RAM and each
         # ffmpeg measured 50–150 MB, so an app grid asking for a dozen previews
@@ -337,14 +349,14 @@ def thumbnail(staging_root: Path, thumbs_root: Path, owner: str, name: str) -> P
         # the 2 vCPU droplet.
         with _FFMPEG_SLOTS:
             out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+    except (FileNotFoundError, subprocess.TimeoutExpired):
         tmp.unlink(missing_ok=True)
-        raise MaterialError("unprobeable", f"no preview for {name}: {exc}") from exc
+        return False
     if out.returncode != 0 or not tmp.is_file() or tmp.stat().st_size == 0:
         tmp.unlink(missing_ok=True)
-        raise MaterialError("unprobeable", f"no preview for {name}")
+        return False
     os.replace(tmp, dest)
-    return dest
+    return True
 
 
 def ingest(path: Path) -> tuple[Path, dict]:

@@ -66,10 +66,11 @@ struct RunDetailView: View {
                 }
                 if !d.outputs.isEmpty, let batch = d.batch, let client = model.client {
                     Section("Outputs") {
-                        RunOutputsStrip(client: client, batch: OutputBatch(
-                            batch: batch, updatedAt: d.updatedAt,
-                            // Sizes are not in the run detail; 0 only keys the poster cache.
-                            files: d.outputs.map { OutputFile(name: $0, bytes: 0) }))
+                        // The Outputs tab's copy has sizes and durations; the run
+                        // detail lists names only, which is enough to open the feed.
+                        RunOutputsStrip(client: client, batch: model.outputs?.batches.first { $0.batch == batch }
+                            ?? OutputBatch(batch: batch, updatedAt: d.updatedAt,
+                                           files: d.outputs.map { OutputFile(name: $0, bytes: 0) }))
                             .listRowInsets(EdgeInsets(top: 12, leading: 16, bottom: 12, trailing: 0))
                     }
                 }

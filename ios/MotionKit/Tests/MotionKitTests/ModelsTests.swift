@@ -137,6 +137,8 @@ import Testing
     @Test func decodesOutputs() throws {
         let o = try decoder.decode(OutputsResponse.self, from: Fixtures.data(Fixtures.outputs))
         #expect(o.outputs[0].files.map(\.isVideo) == [true, false])
+        // Only videos carry a duration; an image (or an unprobeable video) decodes as nil.
+        #expect(o.outputs[0].files.map(\.duration) == [12.4, nil])
         #expect(o.outputs[0].id == "2026-09-21-0900")
     }
 

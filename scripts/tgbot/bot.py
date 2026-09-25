@@ -54,6 +54,7 @@ from tgbot.tgclient import Tg, TgError
 from httpapi.server import ApiError, make_server, start_in_thread
 from control import BOT_LOCK, BOT_LOCK_TIMEOUT_SEC, materials, uploads
 import control.drafts as drafts
+import control.outputs as control_outputs
 from control.drafts import DraftStore, PROVIDER_LABELS
 from control.idempotency import IdempotencyStore
 from control.materials import fold_diacritics as _fold_diacritics, safe_name as _safe_name
@@ -387,12 +388,18 @@ def _tick_staging_prune() -> None:
         if thumbs:
             log(f"pruned {len(thumbs)} orphaned thumbnail(s)")
 
+    def orphan_posters() -> None:
+        posters = control_outputs.prune_posters(ROOT / "out")
+        if posters:
+            log(f"pruned {len(posters)} poster(s) of deleted output(s)")
+
     def stale_idempotency_records() -> None:
         removed = IdempotencyStore(ROOT / "batch" / "idempotency").prune(now)
         if removed:
             log(f"pruned {removed} idempotency record(s) older than 24h")
 
-    for sweep in (staged, abandoned_uploads, orphan_thumbs, stale_idempotency_records):
+    for sweep in (staged, abandoned_uploads, orphan_thumbs, orphan_posters,
+                  stale_idempotency_records):
         try:
             sweep()
         except Exception as exc:

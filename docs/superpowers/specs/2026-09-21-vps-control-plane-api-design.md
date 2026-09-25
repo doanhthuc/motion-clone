@@ -198,11 +198,25 @@ A run's `id` is the manifest stem (`batch/<id>.yaml`).
 | `POST /v1/pod/migrate` `{to_dc, confirm_token}` | Step two: `_start_migration`. **Deletes the source volume once the copy verifies** |
 | `GET /v1/outputs` | Batches in `out/*/_final` with their files |
 | `GET /v1/outputs/{batch}/{file}` | Streams the file with HTTP `Range` support so `AVPlayer` plays without a full download |
+| `GET /v1/outputs/{batch}/{file}/poster` | A 480 px JPEG frame of the file, rendered once with ffmpeg (added 2026-09-25) |
 
 Every path parameter that names a file goes through `_safe_child`; `..`, absolute paths and symlinks
 out of the root are `404`.
 Symlinked batch directories under `out/` (the runner's `out/latest`) are not batches: they are left out of
 `GET /v1/outputs` and refused by the file route, so the newest batch never appears twice.
+
+**Posters (2026-09-25).** The app's Outputs grid shows a frame per file instead of file names that
+differ only at the end. Posters are rendered server-side through the same two ffmpeg slots as material
+thumbnails (`materials.render_frame`) and stored in `out/<batch>/_final/.posters/`, beside the files:
+deleting a batch directory deletes its posters, and the bot's daily prune sweep
+(`outputs.prune_posters`) removes the poster of a single file deleted by hand. A subdirectory, not loose
+`<name>.jpg` files, because a `.jpg` in `_final/` is itself an output. Each video entry in
+`GET /v1/outputs` also carries `duration` (seconds, `null` when unprobeable), probed once per file
+version and cached as `.posters/<name>.json`. Measured locally on a 36 MB, 15 s output: poster 22 KB in
+0.15 s; the cached listing reads in under 10 ms. `updated_at` is now the newest file's mtime rather than
+`_final/`'s, since creating `.posters/` touches the directory and would reorder old batches to the top.
+An earlier version (#75) made posters on the phone with `AVAssetImageGenerator`; it worked but left
+nothing tied to the file's lifetime.
 
 ### 5.5 Protecting money
 

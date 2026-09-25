@@ -123,7 +123,7 @@ enum Fixtures {
     static let outputs = #"""
     {"outputs": [
       {"batch": "2026-09-21-0900", "updated_at": 1790000000,
-       "files": [{"name": "model-side__ao-dai.mp4", "bytes": 18000000},
+       "files": [{"name": "model-side__ao-dai.mp4", "bytes": 18000000, "duration": 12.4},
                  {"name": "model-side__ao-dai.png", "bytes": 900000}]}
     ]}
     """#
