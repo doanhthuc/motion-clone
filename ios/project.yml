@@ -28,6 +28,8 @@ targets:
         TARGETED_DEVICE_FAMILY: "1"
         CODE_SIGN_STYLE: Automatic
         ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS: NO
+        # The catalog holds only the provider marks; the app has no icon set yet.
+        ASSETCATALOG_COMPILER_APPICON_NAME: ""
     info:
       path: MotionApp/Info.plist
       properties:
