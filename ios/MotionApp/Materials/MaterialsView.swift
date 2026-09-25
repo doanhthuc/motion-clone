@@ -14,22 +14,9 @@ struct MaterialsView: View {
     @State private var collapse: CGFloat = 0
     private static let collapseDistance: CGFloat = 80
 
-    private let columns = [
-        GridItem(.flexible(), spacing: 12, alignment: .top),
-        GridItem(.flexible(), spacing: 12, alignment: .top),
-    ]
-
-    /// By role, in the order a job is built from: what moves, what is worn,
-    /// who wears it. An image nobody has sorted yet is Unsorted, not guessed —
-    /// the same reason `tgbot/job.py`'s `slot_for` asks instead of inferring.
-    private var groups: [(title: String, items: [MotionKit.Material])] {
-        let all = store.materials
-        let sections: [(String, MaterialRole?)] = [
-            ("Motion drivers", .driver), ("Outfits", .outfit),
-            ("Characters", .character), ("Backgrounds", .background), ("Unsorted", nil)]
-        return sections.map { title, role in (title, all.filter { $0.materialRole == role }) }
-            .filter { !$0.items.isEmpty }
-    }
+    /// Tile width in a category row: three and a bit across a phone, so the
+    /// cut-off fourth says "swipe for more" without a label.
+    private static let rowTileWidth: CGFloat = 112
 
     var body: some View {
         VStack(spacing: 0) {
@@ -59,7 +46,7 @@ struct MaterialsView: View {
             titleVisibility: .visible
         ) {
             ForEach(MaterialRole.options(for: .image), id: \.self) { role in
-                Button(Self.title(role)) {
+                Button(role.title) {
                     guard let material = sorting else { return }
                     sorting = nil
                     Task { await store.setRole(role, for: material) }
@@ -69,27 +56,15 @@ struct MaterialsView: View {
         } message: {
             Text(sorting?.name ?? "")
         }
-        .confirmationDialog(
-            "Delete this material?",
-            isPresented: Binding(
-                get: { deleteCandidate != nil },
-                set: { if !$0 { deleteCandidate = nil } }),
-            titleVisibility: .visible
-        ) {
-            Button("Delete", role: .destructive) {
-                guard let material = deleteCandidate else { return }
-                deleteCandidate = nil
-                Task { await store.delete(material) }
-            }
-            Button("Cancel", role: .cancel) { deleteCandidate = nil }
-        } message: {
-            Text(deleteCandidate?.name ?? "")
+        .modifier(MaterialDeleteDialog(candidate: $deleteCandidate, store: store))
+        .navigationDestination(for: MaterialGroup.self) { group in
+            MaterialCategoryView(group: group, store: store)
         }
     }
 
     private var grid: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 16, pinnedViews: [.sectionHeaders]) {
+            LazyVStack(alignment: .leading, spacing: 24) {
                 if store.isStale { StaleTag(lastSuccess: store.lastSuccess) }
                 if let message = store.errorMessage {
                     messageBanner(message)
@@ -102,14 +77,9 @@ struct MaterialsView: View {
                               message: "Add a photo, a video or a TikTok link with the button above.")
                         .padding(.top, 40)
                 } else {
-                    ForEach(groups, id: \.title) { group in
-                        Section {
-                            LazyVGrid(columns: columns, spacing: 20) {
-                                ForEach(group.items) { material in tile(material) }
-                            }
-                        } header: {
-                            sectionHeader(group.title, count: group.items.count)
-                        }
+                    ForEach(MaterialGroup.all) { group in
+                        let items = group.items(in: store.materials)
+                        if !items.isEmpty { row(group, items) }
                     }
                 }
             }
@@ -124,41 +94,42 @@ struct MaterialsView: View {
         .refreshable { await store.refresh() }
     }
 
-    private func tile(_ material: MotionKit.Material) -> some View {
-        Button { previewing = material } label: {
-            MaterialCell(store: store, material: material)
-        }
-        .buttonStyle(.plain)
-        .accessibilityHint(material.kind == .video ? "Plays the video" : "Shows the full image")
-        .contextMenu {
-            if material.kind == .image {
-                Menu("Move to", systemImage: "folder") {
-                    ForEach(MaterialRole.options(for: .image), id: \.self) { role in
-                        Button(Self.title(role)) { Task { await store.setRole(role, for: material) } }
-                            .disabled(material.materialRole == role)
+    /// One category as a single horizontal row with a See all, so every
+    /// category stays about one screen away however large the library grows —
+    /// stacked full grids pushed the next category a whole grid further down.
+    private func row(_ group: MaterialGroup, _ items: [MotionKit.Material]) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            NavigationLink(value: group) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(group.title).font(.title3.weight(.semibold)).foregroundStyle(Theme.label)
+                    Text("\(items.count)").font(.subheadline.monospacedDigit()).foregroundStyle(Theme.secondary)
+                    Spacer()
+                    Text("See all").font(.subheadline)
+                    Image(systemName: "chevron.right").font(.footnote.weight(.semibold))
+                }
+                .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(Theme.accent)
+            .accessibilityLabel("\(group.title), \(items.count)")
+            .accessibilityHint("Shows all of them")
+            .accessibilityAddTraits(.isHeader)
+
+            ScrollView(.horizontal) {
+                LazyHStack(alignment: .top, spacing: 12) {
+                    ForEach(items) { material in
+                        MaterialTile(material: material, store: store,
+                                     onOpen: { previewing = material },
+                                     onDelete: { deleteCandidate = material })
+                            .frame(width: Self.rowTileWidth)
                     }
                 }
+                .padding(.horizontal, 16)
             }
-            if material.canDelete {
-                Button("Delete", systemImage: "trash", role: .destructive) {
-                    deleteCandidate = material
-                }
-            }
+            .scrollIndicators(.hidden)
+            // Edge to edge: the row scrolls under the screen's side margins.
+            .padding(.horizontal, -16)
         }
-    }
-
-    /// Pinned while its grid scrolls under it, so the kind stays readable.
-    private func sectionHeader(_ title: String, count: Int) -> some View {
-        HStack(alignment: .firstTextBaseline) {
-            Text(title).font(.title3.weight(.semibold))
-            Text("\(count)").font(.subheadline.monospacedDigit()).foregroundStyle(Theme.secondary)
-            Spacer()
-        }
-        .padding(.vertical, 8)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Theme.bg)
-        .accessibilityElement(children: .combine)
-        .accessibilityAddTraits(.isHeader)
     }
 
     /// Part of the layout, directly under the Materials | Saved try-ons
@@ -196,15 +167,6 @@ struct MaterialsView: View {
         .opacity(store.isUploading || store.isImportingLink ? 0.5 : 1)
         .accessibilityLabel("Add material")
         .accessibilityHint("Photos, a TikTok link or Files")
-    }
-
-    static func title(_ role: MaterialRole) -> String {
-        switch role {
-        case .driver: "Motion driver"
-        case .character: "Character"
-        case .outfit: "Outfit"
-        case .background: "Background"
-        }
     }
 
     private func uploadCard(_ progress: UploadProgress) -> some View {
@@ -253,19 +215,5 @@ struct MaterialsView: View {
         case .processing: "Processing on the server…"
         case .complete: "Complete"
         }
-    }
-}
-
-private struct MaterialCell: View {
-    let store: MaterialsStore
-    let material: MotionKit.Material
-    @State private var thumbnail: Data?
-
-    var body: some View {
-        MaterialCard(
-            material: material,
-            warning: store.warning(for: material.id),
-            thumbnail: thumbnail)
-            .task(id: material.id) { thumbnail = await store.thumbnail(for: material) }
     }
 }

@@ -131,7 +131,9 @@ field or store changed.
   (edge swipe back, like Outputs); from a picker it opens as a sheet (swipe down).
 
 - **Grouped by role, not by kind** (same day, on request): Motion drivers · Outfits · Characters
-  (then Backgrounds and Unsorted when non-empty). The role comes from the server
+  (then Backgrounds and Unsorted when non-empty). Each category is **one horizontal row with a
+  See all** (`MaterialCategoryView`, a 3-across grid), not a full grid: stacked grids pushed the
+  next category a whole grid further down as the library grew. The role comes from the server
   (`control/material_roles.py`, see the API spec §5.1). An image uploaded from the Materials tab
   gets the bot's question ("What is this image?"); one imported from inside a job slot is tagged
   with that slot's role; long-press → Move to re-files it. Pickers list their own role first, then
