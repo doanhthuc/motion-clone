@@ -11,6 +11,7 @@ struct MaterialChoice: View {
     var compact = false
     let onSelect: () -> Void
     @State private var thumbnail: Data?
+    @State private var previewing = false
 
     var body: some View {
         Button(action: onSelect) {
@@ -31,6 +32,14 @@ struct MaterialChoice: View {
                 }
         }
         .buttonStyle(.plain)
+        // A tap selects here, so watching comes from the long-press menu.
+        .contextMenu {
+            Button(material.kind == .video ? "Play" : "Preview",
+                   systemImage: material.kind == .video ? "play.fill" : "eye") { previewing = true }
+        }
+        .fullScreenCover(isPresented: $previewing) {
+            MaterialPreview(material: material, materials: materials)
+        }
         .accessibilityLabel(material.name)
         .accessibilityValue(selected ? "Selected" : "Not selected")
         .task(id: material.id) {

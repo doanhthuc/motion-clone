@@ -40,7 +40,7 @@ public actor APIClient {
         url(components)
     }
 
-    nonisolated func url(_ components: [String]) -> URL {
+    public nonisolated func url(_ components: [String]) -> URL {
         components.reduce(credentials.baseURL) { $0.appending(component: $1) }
     }
 
@@ -189,6 +189,13 @@ public actor APIClient {
     /// other request. Used by AVAssetResourceLoader for authenticated seeking.
     public func byteRange(from offset: Int64, length: Int?,
                           _ components: String...) async throws(APIError) -> ByteRangeResponse {
+        try await byteRange(from: offset, length: length, path: components)
+    }
+
+    /// The same, for a caller that holds its path as a value — one resource
+    /// loader plays both outputs and materials.
+    public func byteRange(from offset: Int64, length: Int?,
+                          path components: [String]) async throws(APIError) -> ByteRangeResponse {
         guard offset >= 0 else { throw .transport("invalid negative byte offset") }
         var range = "bytes=\(offset)-"
         if let length {

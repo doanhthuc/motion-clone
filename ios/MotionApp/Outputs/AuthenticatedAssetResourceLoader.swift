@@ -11,20 +11,19 @@ final class AuthenticatedAssetResourceLoader: NSObject, AVAssetResourceLoaderDel
     private static let scheme = "motion-auth"
 
     private let client: APIClient
-    private let batch: String
-    private let fileName: String
+    /// API path segments, e.g. `["v1", "outputs", batch, file]`.
+    private let path: [String]
     private let delegateQueue = DispatchQueue(label: "xyz.doanhthuc.motion.asset-loader")
     private let lock = NSLock()
     private var tasks: [ObjectIdentifier: Task<Void, Never>] = [:]
 
-    init(client: APIClient, batch: String, fileName: String) {
+    init(client: APIClient, path: [String]) {
         self.client = client
-        self.batch = batch
-        self.fileName = fileName
+        self.path = path
     }
 
     func makeAsset() -> AVURLAsset {
-        let target = client.url("v1", "outputs", batch, fileName)
+        let target = client.url(path)
         var components = URLComponents(url: target, resolvingAgainstBaseURL: false)!
         components.scheme = Self.scheme
         let asset = AVURLAsset(url: components.url!)
@@ -61,7 +60,7 @@ final class AuthenticatedAssetResourceLoader: NSObject, AVAssetResourceLoaderDel
             defer { _ = lock.withLock { tasks.removeValue(forKey: key) } }
             do {
                 let response = try await client.byteRange(
-                    from: start, length: length, "v1", "outputs", batch, fileName)
+                    from: start, length: length, path: path)
                 guard !Task.isCancelled else { return }
                 if let info = box.value.contentInformationRequest {
                     info.contentType = response.contentType.flatMap { UTType(mimeType: $0)?.identifier }

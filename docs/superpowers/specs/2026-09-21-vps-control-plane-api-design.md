@@ -151,6 +151,7 @@ All under `/v1`, JSON bodies, errors as `{"error": {"code": "...", "message": ".
 | `GET /v1/uploads/{id}` | Which chunks are present, so an interrupted upload resumes |
 | `POST /v1/uploads/{id}/complete` → `Material` | Assemble, HEIC→PNG (`to_png_if_heic`), probe, stage (`_stage_file` semantics). Probe includes kind, resolution, duration and the quality warning the bot shows |
 | `GET /v1/materials` | List |
+| `GET /v1/materials/{id}` | *Added 2026-09-25.* The file itself, with Range (`send_file`), so the app can play a video material rather than only its poster. `404` outside staging, like `/outputs` |
 | `GET /v1/materials/{id}/thumb` | ffmpeg poster frame / downscaled image, cached on disk |
 | `DELETE /v1/materials/{id}` | `409` if a draft or a live run references it |
 | `POST /v1/materials/link` `{url}` → `Material` | *Added 2026-09-25.* Download a TikTok video with the bot's own `tgbot/tiktok.py` (yt-dlp, then tikwm) and stage it as an app material; same response shape as `complete`. `400 bad_request` for anything that is not a TikTok link, `409 busy` while another link downloads, `502 download_failed` with TikTok's reason, `422 unprobeable` for a video-less file. Held open for the whole download (40 s budget per path, under Cloudflare's 100 s cut); not idempotent — each call is a fresh download |

@@ -24,7 +24,7 @@ final class FeedClip {
     var fraction: Double { duration > 0 ? min(1, max(0, time / duration)) : 0 }
 
     init(client: APIClient, batch: String, fileName: String) {
-        loader = AuthenticatedAssetResourceLoader(client: client, batch: batch, fileName: fileName)
+        loader = AuthenticatedAssetResourceLoader(client: client, path: ["v1", "outputs", batch, fileName])
         let item = AVPlayerItem(asset: loader.makeAsset())
         player = AVPlayer(playerItem: item)
         // Loop by seeking back at the end rather than with AVPlayerLooper: the
