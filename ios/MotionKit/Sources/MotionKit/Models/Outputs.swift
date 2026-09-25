@@ -21,11 +21,14 @@ public struct OutputBatch: Decodable, Sendable, Equatable, Identifiable {
 public struct OutputFile: Decodable, Sendable, Equatable, Identifiable {
     public let name: String
     public let bytes: Int
+    /// Seconds, videos only; nil when the server could not probe the file.
+    public let duration: Double?
     public var id: String { name }
 
-    public init(name: String, bytes: Int) {
+    public init(name: String, bytes: Int, duration: Double? = nil) {
         self.name = name
         self.bytes = bytes
+        self.duration = duration
     }
     /// `control/outputs.py` OUTPUT_SUFFIXES: .mp4/.mov are video, the rest images.
     public var isVideo: Bool {

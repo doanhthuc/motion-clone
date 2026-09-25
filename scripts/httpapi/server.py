@@ -235,6 +235,13 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._send_json(200, detail)
             if rest == ["outputs"]:
                 return self._send_json(200, {"outputs": outputs.list_outputs(s.out_dir)})
+            if len(rest) == 4 and rest[0] == "outputs" and rest[3] == "poster":
+                path = outputs.poster(s.out_dir, rest[1], rest[2])
+                try:
+                    self._settle_body()
+                    return send_file(self, path)
+                except FileNotFoundError:
+                    raise NOT_FOUND
             if len(rest) == 3 and rest[0] == "outputs":
                 path = outputs.resolve_output(s.out_dir, rest[1], rest[2])
                 if path is None:
