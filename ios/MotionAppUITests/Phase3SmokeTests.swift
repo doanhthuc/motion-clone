@@ -73,16 +73,16 @@ final class Phase3SmokeTests: XCTestCase {
     private func selectTryonPipeline(in app: XCUIApplication) {
         let pipeline = revealButton("Pipeline", in: app)
         let current = pipeline.value as? String ?? ""
-        if current.localizedCaseInsensitiveContains("Tryon") { return }
+        if current.localizedCaseInsensitiveContains("Try-on") { return }
 
         pipeline.tap()
         let option = app.buttons.allElementsBoundByIndex.first {
-            $0.label.localizedCaseInsensitiveContains("Tryon")
+            $0.label.localizedCaseInsensitiveContains("Try-on")
         }
         XCTAssertNotNil(option, "A try-on pipeline must be available")
         option?.tap()
         XCTAssertTrue(waitUntil(timeout: 10) {
-            (app.buttons["Pipeline"].value as? String)?.localizedCaseInsensitiveContains("Tryon") == true
+            (app.buttons["Pipeline"].value as? String)?.localizedCaseInsensitiveContains("Try-on") == true
         })
     }
 

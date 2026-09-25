@@ -6,6 +6,7 @@ struct RunDetailView: View {
     let flow: RunFlow
     let pod: PodStore
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(AppModel.self) private var model
 
     var body: some View {
         List {
@@ -63,15 +64,13 @@ struct RunDetailView: View {
                         ForEach(d.jobs) { job in JobTimeline(job: job) }
                     }
                 }
-                if !d.outputs.isEmpty {
-                    Section {
-                        ForEach(d.outputs, id: \.self) { name in
-                            Text(name).font(.subheadline).lineLimit(1).truncationMode(.middle)
-                        }
-                    } header: {
-                        Text("Outputs")
-                    } footer: {
-                        Text("Open the Outputs tab to play or save them.")
+                if !d.outputs.isEmpty, let batch = d.batch, let client = model.client {
+                    Section("Outputs") {
+                        RunOutputsStrip(client: client, batch: OutputBatch(
+                            batch: batch, updatedAt: d.updatedAt,
+                            // Sizes are not in the run detail; 0 only keys the poster cache.
+                            files: d.outputs.map { OutputFile(name: $0, bytes: 0) }))
+                            .listRowInsets(EdgeInsets(top: 12, leading: 16, bottom: 12, trailing: 0))
                     }
                 }
             } else if store.error == nil {
@@ -238,5 +237,32 @@ struct BatchProgressList: View {
                 .foregroundStyle(summary.failed > 0 ? Theme.danger : Theme.secondary)
                 .accessibilityIdentifier("batch.summary")
         }
+    }
+}
+
+/// The run's finished files as posters in a sideways strip; each opens the
+/// same full-screen feed the Outputs tab does, starting at that file.
+private struct RunOutputsStrip: View {
+    let client: APIClient
+    let batch: OutputBatch
+
+    var body: some View {
+        ScrollView(.horizontal) {
+            LazyHStack(spacing: 8) {
+                ForEach(batch.files) { file in
+                    NavigationLink {
+                        OutputFeedView(client: client, batch: batch, startAt: file)
+                    } label: {
+                        OutputPosterTile(client: client, batch: batch.batch, file: file)
+                            .frame(width: 120)
+                            .clipShape(.rect(cornerRadius: Theme.Radius.small))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(file.name)
+                }
+            }
+            .padding(.trailing, 16)
+        }
+        .scrollIndicators(.hidden)
     }
 }
