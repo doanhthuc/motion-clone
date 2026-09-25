@@ -22,17 +22,13 @@ struct RunDetailView: View {
                             // The label names the card `retryRental()` actually sends
                             // (`pod.gpu`, the current .env card), not the one that failed.
                             let gpu = flow.pod?.gpu ?? failure.gpu
-                            if flow.canRetryRental {
-                                // The note belongs to the branch that offers the
-                                // retry: it promises "this retries on <gpu>".
-                                if failure.gpu != gpu {
-                                    Text("Last failure was on \(failure.gpu); this retries on \(gpu).")
-                                        .font(Theme.sans(12)).foregroundStyle(Theme.amber)
-                                }
-                                Button("Retry rental · \(gpu)") { Task { await flow.retryRental() } }
-                                    .buttonStyle(PrimaryButtonStyle())
-                                    .disabled(!flow.canSpend)
+                            if failure.gpu != gpu {
+                                Text("Last failure was on \(failure.gpu); this retries on \(gpu).")
+                                    .font(Theme.sans(12)).foregroundStyle(Theme.amber)
                             }
+                            Button("Retry rental · \(gpu)") { Task { await flow.retryRental() } }
+                                .buttonStyle(PrimaryButtonStyle())
+                                .disabled(!flow.canSpend)
                             if flow.needsRecheck {
                                 Button("Check again") { Task { await flow.recheck() } }
                                     .buttonStyle(SecondaryButtonStyle())

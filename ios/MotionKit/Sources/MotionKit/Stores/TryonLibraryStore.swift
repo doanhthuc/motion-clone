@@ -80,12 +80,19 @@ public final class TryonLibraryStore {
 
     /// Fills the entry's materials and seeds the job with its image. The
     /// pipeline, provider and driver stay as they are; a pipeline that cannot
-    /// use a seed answers 422 and its message is shown.
+    /// use a seed answers 422 and its message is shown. An entry deleted
+    /// elsewhere answers `seed_not_found` and leaves the list, as `delete`'s
+    /// 404 does — kept, its tile could only repeat the same refusal.
     public func use(_ entry: TryonLibraryEntry) async -> Bool {
         message = nil
         let slots = entry.materialIDs.mapValues { Optional($0) }
         let ok = await draft.apply(DraftPatch(slots: slots, seed: .set(entry.id)))
-        if !ok { message = draft.message ?? draft.error?.userMessage }
+        if !ok {
+            if case .server(status: 404, code: "seed_not_found", message: _) = draft.error {
+                forget(entry.id)
+            }
+            message = draft.message ?? draft.error?.userMessage
+        }
         return ok
     }
 

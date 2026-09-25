@@ -448,12 +448,18 @@ No phase remains — Phases 1–6 are implemented in code. Open items, none of t
    validation copy on the phone, and the `Fixtures.pipelines` `mask` vs `background` mismatch. The
    fifth pair — the `app/` owner coupling and the `not_found` collision between a stale material and a
    deleted library entry — closed 2026-09-25 by PR #69 (`seed_not_found`, 404; spec
-   `2026-09-25-seed-not-found-and-owner-coupling-design.md`). It left one small follow-up:
-   `TryonLibraryStore.use` keeps an entry that answered `seed_not_found` in its list, so a second tap
-   shows the same refusal — pre-existing, now distinguishable, could `forget` it the way `delete`'s
-   404 already does. Smaller items recorded in that spec and in the plan's handoff checklist: `MigrateSheet` shows no reason while
-   a drop merely disables its button; `RunDetailView.swift`'s now-redundant inner `canRetryRental`; the
-   Swift post-confirm fixture having no cross-language pin on `clear()`'s shape; and the stamp write's
+   `2026-09-25-seed-not-found-and-owner-coupling-design.md`). Three of its small leftovers closed
+   2026-09-25 on branch `ios-small-followups`: `TryonLibraryStore.use` now `forget`s an entry that
+   answered `seed_not_found`, as `delete`'s 404 already did; `MigrateSheet` says why the confirm is
+   off while a batch drop is in flight (`MigrateFlow.dropBlocked`); and `RunDetailView`'s redundant
+   inner `canRetryRental` is gone. Gates for that branch: `swift test` 275/275, `make ios-build`,
+   `make ios-contract` 14/14, `scrub-secrets.sh --check` exit 0, and `make ios-ui-test` 5/5 with 0
+   skipped on the second run. The first run failed `Phase5SmokeTests` at "ask returned a
+   confirmation": the VPS log shows `POST /v1/pod/migrate/ask` answered 409 at 01:17:03 UTC with no
+   lease, drain or Phase A live, then 200 at 01:26:05 on the rerun. The likeliest cause is the stock
+   cache no longer listing the tapped datacenter (`unknown_datacenter`), but that is unconfirmed —
+   the sheet's message sat below the fold, so the smoke could not show it. Still open: the Swift
+   post-confirm fixture having no cross-language pin on `clear()`'s shape, and the stamp write's
    fail-open race. The five uncovered `batch/` state paths were closed the same day (`ac9ab3a`), after a
    post-deploy `git status` on the VPS showed two of them sitting untracked with a Telegram chat id in
    the filename.

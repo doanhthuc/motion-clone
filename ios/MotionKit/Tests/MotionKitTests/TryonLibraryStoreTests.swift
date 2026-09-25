@@ -39,7 +39,6 @@ extension URLProtocolTests {
             switch (request.httpMethod ?? "GET", path) {
             case ("GET", "/v1/tryon-library"): return TestSupport.json(Self.library)
             case ("GET", "/v1/pipelines"): return TestSupport.json(Fixtures.pipelines)
-            case ("GET", "/v1/draft"), ("PATCH", "/v1/draft"): return TestSupport.json(draftJSON)
             // Two 404 shapes, because they exercise different branches: `gone`
             // is not in `entries` (the tile was never on screen), while `new`
             // IS — that is the one where the 404 branch's local `forget` is
@@ -47,6 +46,11 @@ extension URLProtocolTests {
             case ("DELETE", "/v1/tryon-library/gone"), ("DELETE", "/v1/tryon-library/new"):
                 return TestSupport.json(#"{"error":{"code":"not_found","message":"no such try-on library entry"}}"#, status: 404)
             case ("DELETE", _): return TestSupport.json(#"{"ok":true}"#)
+            // `old` was deleted elsewhere after the list loaded: "Use in job"
+            // names it as the seed and the server refuses before writing.
+            case ("PATCH", "/v1/draft") where (request.httpBody.map { String(decoding: $0, as: UTF8.self) } ?? "").contains(#""tryon_seed":"old""#):
+                return TestSupport.json(#"{"error":{"code":"seed_not_found","message":"no such try-on library entry: old"}}"#, status: 404)
+            case ("GET", "/v1/draft"), ("PATCH", "/v1/draft"): return TestSupport.json(draftJSON)
             case ("GET", _) where path.hasSuffix("/image"): return (200, ["Content-Type": "image/png"], Data("png".utf8))
             default: return (404, [:], Data())
             }
@@ -121,6 +125,21 @@ extension URLProtocolTests {
         let body = try #require(JSONSerialization.jsonObject(with: patch.httpBody ?? Data()) as? [String: Any])
         #expect(body["tryon_seed"] as? String == "new")
         #expect(body["slots"] as? [String: String] == ["character": "app/me.png", "outfit": "app/o1.png"])
+    }
+
+    /// A seed deleted elsewhere (the bot, another phone) answers `seed_not_found`.
+    /// The tile goes, the same way `delete`'s 404 drops it: left in place, a
+    /// second tap would only repeat the same refusal.
+    @Test func useOfAnEntryGoneElsewhereRemovesTheTile() async {
+        let (store, draft) = make()
+        await draft.load()
+        await store.load()
+
+        let ok = await store.use(store.entries[2])     // "old" — the stub refuses its seed
+
+        #expect(!ok)
+        #expect(store.message == "That saved try-on no longer exists.")
+        #expect(store.entries.map(\.id) == ["bg", "new"])
     }
 
     /// The Saved try-ons screen renders this list as its delete confirmation's

@@ -136,6 +136,10 @@ struct MigrateSheet: View {
                         Text("Another spend request is unanswered — resolve it before migrating.")
                             .font(Theme.sans(12)).foregroundStyle(Theme.amber)
                     }
+                    if flow.dropBlocked {
+                        Text("A batch drop is still in flight — wait for it before moving the volume.")
+                            .font(Theme.sans(12)).foregroundStyle(Theme.amber)
+                    }
                     if left == 0 {
                         Button("Expired — ask again") { Task { await flow.ask(toDc: ask.toDc) } }
                             .buttonStyle(SecondaryButtonStyle())

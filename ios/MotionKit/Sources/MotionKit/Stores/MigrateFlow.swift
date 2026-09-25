@@ -74,11 +74,15 @@ public final class MigrateFlow {
         return max(0, Int(deadline.timeIntervalSince(date).rounded(.down)))
     }
 
+    /// A batch drop is in flight, so `canMigrate` is false for a reason the
+    /// sheet has to say out loud — a disabled button alone reads as broken.
+    public var dropBlocked: Bool { runFlow.isDropping }
+
     public func canMigrate(at date: Date) -> Bool {
         guard let ask = currentAsk, let deadline else { return false }
         return typed == ask.toDc && date < deadline
             && !isSending && !needsRecheck && pendingNotice == nil
-            && !runFlow.isDropping
+            && !dropBlocked
     }
 
     /// Why a migration can't start, or nil. The server re-checks every one of
