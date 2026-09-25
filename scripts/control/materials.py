@@ -16,6 +16,7 @@ import uuid
 from pathlib import Path
 
 import control
+from batchlib_ext.handoff import MAILBOX_SUFFIX
 from control.paths import safe_child
 import tgbot.run as run_mod
 from tgbot import ingest as ingest_mod
@@ -251,9 +252,10 @@ def resolve_material(staging_root: Path, owner: str, name: str) -> Path | None:
 
 
 def _in_use(batch_dir: Path, path: Path) -> str | None:
-    """A busy run's manifest, or any draft (the app's or a Telegram chat's), names this file. Only busy
-    runs block: a finished manifest keeps naming its inputs forever, and would
-    make nothing deletable.
+    """A busy run's manifest, a queued job's mailbox, or any draft (the app's
+    or a Telegram chat's), names this file. Only busy runs block: a finished
+    manifest keeps naming its inputs forever, and would make nothing
+    deletable. A mailbox and a draft both block unconditionally — see below.
 
     Matches the whole path, not a bare substring: `needle in text` would also
     match `<path>.bak` or any other manifest value that merely starts with
@@ -272,6 +274,23 @@ def _in_use(batch_dir: Path, path: Path) -> str | None:
             if pattern.search(manifest.read_text(encoding="utf-8", errors="replace")) \
                     and run_mod.busy(manifest):
                 return "a running batch uses this file"
+        except OSError:
+            continue
+    # A job queued behind a running drain lives only in the mailbox file,
+    # <name>.next.yaml (batchlib_ext.handoff.MAILBOX_SUFFIX), until drain.py's
+    # claim_mailbox renames it out to a permanent manifest. By then the draft
+    # that staged it has already been cleared (bot.py clears a draft the
+    # moment it queues, whether the queued job runs immediately or waits),
+    # and busy() is False because nothing has picked this file up yet — so
+    # neither the busy-manifest loop above nor the draft loop below sees it.
+    # Deleting an input in that window lets claim_mailbox rename the manifest
+    # onto a paid-for pod and then fail to find the file (finding 1,
+    # 2026-09-25). A mailbox always names a real, not-yet-run job, so — like
+    # a draft — it blocks unconditionally, not gated on busy().
+    for mailbox in batch_dir.glob(f"*{MAILBOX_SUFFIX}"):
+        try:
+            if pattern.search(mailbox.read_text(encoding="utf-8", errors="replace")):
+                return "a queued job uses this file"
         except OSError:
             continue
     # Drafts name files they have not run yet; deleting one would leave the

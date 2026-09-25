@@ -28,8 +28,11 @@ final class ShareViewController: UIViewController {
         }
     }
 
-    /// URL attachments first (TikTok shares one), then plain text, then the
-    /// item's own text — `SharedLink` picks the first TikTok link among them.
+    /// URL attachments first (TikTok shares one), then each item's own text
+    /// (`attributedContentText`, appended ahead of its attachments' plain
+    /// text in the loop below) — `SharedLink` picks the first TikTok link
+    /// among them, so only "URLs before texts" has to hold, not a finer
+    /// order within `texts` (2026-09-25).
     private static func candidates(from items: [NSExtensionItem]) async -> [String] {
         var urls: [String] = []
         var texts: [String] = []
@@ -58,9 +61,16 @@ final class ShareViewController: UIViewController {
         return (item as? URL)?.absoluteString
     }
 
+    /// `loadItem` for `public.plain-text` is documented to hand back an
+    /// `NSString`, but some senders hand over `Data` (UTF-8) or an
+    /// `NSAttributedString` instead — accepting only `String` silently
+    /// dropped those (2026-09-25, finding 6).
     private static func loadPlainText(_ provider: NSItemProvider) async -> String? {
         guard provider.hasItemConformingToTypeIdentifier(UTType.plainText.identifier) else { return nil }
         guard let item = try? await provider.loadItem(forTypeIdentifier: UTType.plainText.identifier) else { return nil }
-        return item as? String
+        if let text = item as? String { return text }
+        if let data = item as? Data { return String(data: data, encoding: .utf8) }
+        if let attributed = item as? NSAttributedString { return attributed.string }
+        return nil
     }
 }

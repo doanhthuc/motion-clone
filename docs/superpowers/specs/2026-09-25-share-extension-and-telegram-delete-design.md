@@ -79,6 +79,13 @@ Server, `scripts/control/materials.py`:
   file a Telegram draft still points at is refused with `409 in_use`. Busy-manifest rule
   unchanged. Reason strings: `"the app's draft uses this file"` for the app draft, `"a Telegram
   draft uses this file"` for the others.
+- `_in_use` also scans every mailbox file, `batch/*<MAILBOX_SUFFIX>` (`<name>.next.yaml`,
+  `scripts/batchlib_ext/handoff.py`) — a job queued behind a running drain. That job's draft has
+  already been cleared and nothing is `busy()` for a manifest no process has picked up yet, so
+  without this it fell through both checks above: an input could be deleted while still queued,
+  and `claim_mailbox` would later rename the manifest onto an already-paid-for pod and fail to
+  find the file (finding 1, 2026-09-25 final review). A mailbox match blocks unconditionally, the
+  same as a draft, with reason `"a queued job uses this file"`.
 - Known window, accepted: the bot's in-memory draft is saved at the end of each update, so a file
   attached in the same instant as a delete can slip through — the same shape of race the app-draft
   check already accepts. Telegram's own 14-day staging prune already deletes files under drafts
@@ -88,7 +95,8 @@ iOS: `Material.canDelete` is removed; the long-press menu offers Delete for ever
 `MaterialsStore.delete` guard goes away. The server remains the authority (409 text is shown).
 
 Control-plane spec §5.1 (`2026-09-21-vps-control-plane-api-design.md`) is amended in place: the
-DELETE row now says any owner, `409` for any draft (app or Telegram) or a busy run.
+DELETE row now says any owner, `409` for any draft (app or Telegram), a queued job (`*.next.yaml`),
+or a busy run.
 
 ## Testing
 

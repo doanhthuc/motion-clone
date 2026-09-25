@@ -50,8 +50,10 @@ First use: in the share sheet's app row tap More and enable Motion (or pin it to
 ## Materials and uploads
 
 The Materials tab lists the global VPS library, including files uploaded through Telegram. Thumbnails
-use the same Cloudflare Access and bearer headers as the rest of the app. Only materials whose owner
-is `app` can be deleted; the server keeps an in-use material and shows its `409` explanation.
+use the same Cloudflare Access and bearer headers as the rest of the app. Any material can be deleted
+(2026-09-25 — the app is no longer restricted to `owner == "app"`), unless a draft (the app's or a
+Telegram chat's), a queued job, or a running batch still uses it; the server keeps such a material and
+shows its `409` explanation.
 
 Add accepts one image or video from Photos or Files. Uploads are serial and foreground-only. The app
 copies the provider file into Application Support, sends server-sized chunks without reading the whole

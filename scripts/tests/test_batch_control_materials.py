@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import control
 from control import materials
 import tgbot.run as run_mod
+from batchlib_ext.handoff import MAILBOX_SUFFIX
 
 
 class TestNaming(unittest.TestCase):
@@ -419,6 +420,43 @@ class TestDeleteVsAppDraft(unittest.TestCase):
         with self.assertRaises(materials.MaterialError) as cm:
             materials.delete_material(staging, batch, "777", "t.png")
         self.assertEqual(cm.exception.code, "in_use")
+
+
+class TestDeleteVsQueuedJob(unittest.TestCase):
+    """A job queued behind a running drain lives only in the mailbox file
+    (<name>.next.yaml, batchlib_ext.handoff.MAILBOX_SUFFIX) until claim_mailbox
+    renames it out. The draft that staged it is already cleared and nothing is
+    "busy" for a manifest no process has picked up yet, so it must block on
+    its own (finding 1, 2026-09-25).
+    """
+
+    def _staged(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        batch, staging = tmp / "batch", tmp / "batch" / "tg-staging"
+        (staging / "777").mkdir(parents=True)
+        used, free = staging / "777" / "t.png", staging / "777" / "t.png.bak"
+        used.write_bytes(b"x"); free.write_bytes(b"x")
+        return batch, staging, used, free
+
+    def test_delete_refuses_material_a_queued_mailbox_job_uses(self):
+        batch, staging, used, _ = self._staged()
+        (batch / f"tg-777{MAILBOX_SUFFIX}").write_text(
+            f"runs:\n  - inputs: {{character: {used.resolve()}}}\n")
+        with mock.patch.object(run_mod, "busy", return_value=False):
+            with self.assertRaises(materials.MaterialError) as cm:
+                materials.delete_material(staging, batch, "777", "t.png")
+        self.assertEqual(cm.exception.code, "in_use")
+        self.assertEqual(cm.exception.message, "a queued job uses this file")
+        self.assertTrue(used.exists())
+
+    def test_whole_path_match_only(self):
+        batch, staging, used, free = self._staged()
+        (batch / f"tg-777{MAILBOX_SUFFIX}").write_text(
+            f"runs:\n  - inputs: {{character: {used.resolve()}}}\n")
+        with mock.patch.object(run_mod, "busy", return_value=False):
+            materials.delete_material(staging, batch, "777", "t.png.bak")
+        self.assertFalse(free.exists())
 
 
 class TestPruneThumbs(unittest.TestCase):

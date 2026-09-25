@@ -11,6 +11,12 @@ public final class MaterialsStore {
     public private(set) var isUploading = false
     public private(set) var hasPendingUpload = false
     public private(set) var isImportingLink = false
+    /// True only after `importLink` fails with Cloudflare's 524 (the server
+    /// kept downloading past the tunnel's timeout) — a caller that wants to
+    /// show that case as informational rather than a failure reads this
+    /// instead of pattern-matching `errorMessage`'s text (2026-09-25, used by
+    /// the share extension's still-running card).
+    public private(set) var linkImportStillRunning = false
 
     /// Public so a view can build an authenticated player for a material.
     public let client: APIClient
@@ -95,6 +101,7 @@ public final class MaterialsStore {
         guard !isImportingLink else { return nil }
         isImportingLink = true
         errorMessage = nil
+        linkImportStillRunning = false
         defer { isImportingLink = false }
         do {
             let completed = try await client.post(
@@ -106,12 +113,21 @@ public final class MaterialsStore {
         } catch {
             // 524 is Cloudflare giving up on the open request, not the server
             // failing: the download carries on and lands in the list.
-            let message = if case .server(status: 524, _, _) = error {
-                "The download is still running. It will appear in Materials when it finishes."
+            let stillRunning: Bool
+            let message: String
+            if case .server(status: 524, _, _) = error {
+                stillRunning = true
+                message = "The download is still running. It will appear in Materials when it finishes."
             } else {
-                error.userMessage
+                stillRunning = false
+                message = error.userMessage
             }
+            // refresh() runs first because it can overwrite errorMessage (nil
+            // on success, its own message on failure) — this catch's message
+            // must be what's left standing, same ordering the code had before
+            // `linkImportStillRunning` existed.
             await refresh()
+            linkImportStillRunning = stillRunning
             errorMessage = message
             return nil
         }
