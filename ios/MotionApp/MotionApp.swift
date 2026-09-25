@@ -110,6 +110,13 @@ final class AppModel {
         }
     }
 
+    /// A video shared to the Motion extension lands on the server while the
+    /// app is in the background; re-reading on return puts it in the list.
+    func refreshMaterials() {
+        guard let materials else { return }
+        Task { await materials.refresh() }
+    }
+
     /// Once per launch (each flow guards it): resend an interrupted spend with
     /// its original key. The one ledger entry belongs to whichever flow sent it.
     func replayPendingSpend() {
