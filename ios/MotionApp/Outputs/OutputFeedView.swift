@@ -163,7 +163,7 @@ private struct FeedPage: View {
             Color.black
             if file.isVideo {
                 if let clip {
-                    PlayerSurface(player: clip.player, fill: clip.isPortrait)
+                    PlayerSurface(player: clip.player)
                         .ignoresSafeArea()
                     if clip.buffering && !clip.userPaused { ProgressView().tint(.white) }
                     Image(systemName: "play.fill")
@@ -198,7 +198,6 @@ private struct FeedPage: View {
 /// AVPlayerLayer without AVKit's controls.
 private struct PlayerSurface: UIViewRepresentable {
     let player: AVPlayer
-    let fill: Bool
 
     final class LayerView: UIView {
         override class var layerClass: AnyClass { AVPlayerLayer.self }
@@ -208,14 +207,15 @@ private struct PlayerSurface: UIViewRepresentable {
     func makeUIView(context: Context) -> LayerView {
         let view = LayerView()
         view.backgroundColor = .black
-        view.clipsToBounds = true  // aspect-fill must not bleed into the neighbouring pages
+        // Always the whole frame, as TikTok does: a 9:16 clip on a 9:19.5 screen
+        // gets thin black bands rather than losing ~18% of its width to a crop.
+        view.playerLayer.videoGravity = .resizeAspect
         view.playerLayer.player = player
         return view
     }
 
     func updateUIView(_ view: LayerView, context: Context) {
         if view.playerLayer.player !== player { view.playerLayer.player = player }
-        view.playerLayer.videoGravity = fill ? .resizeAspectFill : .resizeAspect
     }
 }
 

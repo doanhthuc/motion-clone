@@ -10,9 +10,6 @@ final class FeedClip {
     private(set) var time: Double = 0
     private(set) var duration: Double = 0
     private(set) var buffering = true
-    /// Portrait clips fill the screen edge to edge like Shorts; the few pixels of
-    /// width lost at 9:16 on a 9:19.5 screen are the price of no black bars.
-    private(set) var isPortrait = true
     /// Paused by the viewer's tap, as opposed to paused because the page is off screen.
     private(set) var userPaused = false
     private(set) var scrubbing = false
@@ -52,7 +49,6 @@ final class FeedClip {
     private func tick(_ t: CMTime) {
         if !scrubbing, t.seconds.isFinite { time = t.seconds }
         if let d = player.currentItem?.duration.seconds, d.isFinite, d > 0 { duration = d }
-        if let size = player.currentItem?.presentationSize, size.width > 0 { isPortrait = size.height >= size.width }
     }
 
     /// The page scrolled into view: always start playing, even if it was tapped paused before.
