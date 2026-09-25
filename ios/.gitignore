@@ -4,3 +4,4 @@ MotionApp/Info.plist
 MotionKit/.build/
 MotionKit/.swiftpm/
 .build-sim/
+.build-device/
