@@ -251,7 +251,7 @@ def resolve_material(staging_root: Path, owner: str, name: str) -> Path | None:
 
 
 def _in_use(batch_dir: Path, path: Path) -> str | None:
-    """A busy run's manifest, or the app's draft, names this file. Only busy
+    """A busy run's manifest, or any draft (the app's or a Telegram chat's), names this file. Only busy
     runs block: a finished manifest keeps naming its inputs forever, and would
     make nothing deletable.
 
@@ -274,15 +274,19 @@ def _in_use(batch_dir: Path, path: Path) -> str | None:
                 return "a running batch uses this file"
         except OSError:
             continue
-    # The phone's draft (control/drafts.py) names files it has not run yet;
-    # deleting one would leave the draft pointing at nothing. Not a manifest,
-    # so not gated on busy(): a draft is always "in use".
-    draft = batch_dir / f"{APP_OWNER}.draft.json"
-    try:
-        if pattern.search(draft.read_text(encoding="utf-8", errors="replace")):
-            return "the app's draft uses this file"
-    except OSError:
-        pass
+    # Drafts name files they have not run yet; deleting one would leave the
+    # draft pointing at nothing. Not a manifest, so not gated on busy(): a
+    # draft is always "in use". The app's draft is app.draft.json; each
+    # Telegram chat's is tg-<chat>.draft.json (tgbot/bot.py:_save_draft, which
+    # rewrites it after every update and lists paths under slots, pending and
+    # basket — the pattern scans the whole text, so all three count).
+    for draft in sorted(batch_dir.glob("*.draft.json")):
+        try:
+            if pattern.search(draft.read_text(encoding="utf-8", errors="replace")):
+                return ("the app's draft uses this file" if draft.name == f"{APP_OWNER}.draft.json"
+                        else "a Telegram draft uses this file")
+        except OSError:
+            continue
     return None
 
 
@@ -291,10 +295,8 @@ def delete_material(staging_root: Path, batch_dir: Path, owner: str, name: str) 
     path = resolve_material(staging_root, owner, name)
     if path is None:
         raise MaterialError("not_found", "no such material")
-    if owner != APP_OWNER:
-        # Telegram's /clear and /wipe own the chat directories; deleting a file
-        # a Telegram draft points at would break that draft with no message.
-        raise MaterialError("forbidden", "only material uploaded from the app can be deleted here")
+    # Any owner since 2026-09-25: the Telegram-draft risk that used to justify
+    # refusing non-app owners is now covered by _in_use scanning every draft.
     # DraftStore.patch can add this same file to the app's draft between the
     # _in_use check and the unlink below (its own ffprobe runs outside
     # control.LOCK, same shape race as its "file deleted between resolve and
