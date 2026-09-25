@@ -1,6 +1,6 @@
 import Foundation
 
-public enum MaterialKind: String, Decodable, Sendable, Equatable {
+public enum MaterialKind: String, Decodable, Sendable, Hashable {
     case image, video, other, unknown
 
     public init(from decoder: Decoder) throws {
@@ -9,7 +9,7 @@ public enum MaterialKind: String, Decodable, Sendable, Equatable {
     }
 }
 
-public struct Material: Decodable, Sendable, Equatable, Identifiable {
+public struct Material: Decodable, Sendable, Hashable, Identifiable {
     public let id: String
     public let owner: String
     public let name: String

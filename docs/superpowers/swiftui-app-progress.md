@@ -110,6 +110,24 @@ field or store changed.
   `AuthenticatedAssetResourceLoader` the Outputs feed uses, now keyed by a path instead of
   batch/file.
 
+## Streaming playback, Materials tab rework (2026-09-25, from a phone session)
+
+- **Playback starts before the download ends.** `AuthenticatedAssetResourceLoader` answered a
+  to-the-end request with one GET for the whole remainder, so AVPlayer saw no byte until all of it
+  had arrived. It now answers in 1 MiB pieces, each handed over as it lands. Measured through the
+  tunnel from the Mac: a 20.7 MB output took 2.0–2.3 s whole, 0.28–0.32 s for its first MiB. Both
+  Outputs and material previews use this loader.
+- **Photos import from the Materials tab works.** Its `PhotosPicker` sat inside a `Menu`, which never
+  presented it. The Add button now opens `AddMaterialSheet`: Photos, TikTok link and Files, the
+  same `MaterialImportBar` tiles as the job pickers.
+- **Original quality.** Both Photos pickers pass `preferredItemEncoding: .current`. The default,
+  `.automatic`, may transcode (HEVC to H.264, HEIC to JPEG) before upload. The server stores video
+  byte for byte and turns HEIC into lossless PNG.
+- **Layout.** Materials are grouped into Videos / Images / Other with pinned headers. The Add button
+  floats bottom-centre above the tab bar — reachable one-handed on a Pro Max — as a pill at the top
+  of the grid that shrinks to a circle once the grid scrolls. Tapping a material pushes the preview
+  (edge swipe back, like Outputs); from a picker it opens as a sheet (swipe down).
+
 ## Phase status
 
 | Phase | Status | Delivered | Remaining evidence |
