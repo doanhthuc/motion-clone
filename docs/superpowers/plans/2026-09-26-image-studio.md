@@ -1074,7 +1074,9 @@ def fit_image(src: Path, dest: Path) -> None:
     size = img_size(src)
     a, b = src.suffix.lower(), dest.suffix.lower()
     same_format = a == b or {a, b} <= {".jpg", ".jpeg"}
-    if size is not None and max(size) <= MAX_REF_SIDE and same_format:
+    # Unprobeable (size None) but already PNG/JPEG: pass it through and let the provider judge,
+    # rather than refusing a file ffprobe merely failed to read.
+    if same_format and (size is None or max(size) <= MAX_REF_SIDE):
         shutil.copyfile(src, dest)
         return
     vf = []
