@@ -483,4 +483,45 @@ picks them up.
 - Moving the core into its own process (approach B) — kept possible, not done.
 - Stock-watch notifications (§5.10) — needs a background poller, a different shape of work than every
   slice so far; a later slice once the app covers slices 1–6.
+
+## Slice 7 — Image Studio (2026-09-26)
+
+Full design: `docs/superpowers/specs/2026-09-26-image-studio-design.md`. This slice is the
+`/v1/studio/*` routes in `scripts/httpapi/server.py`, over `control/studio.py` (project/generation
+storage) and `control/studio_runner.py` (model catalog, request validation, provider calls). Unlike
+the run flow above, Image Studio projects and their images live under `batch/studio/` — outside
+`out/`, so `batch-clean` and `_final` pruning never touch them.
+
+- `GET /v1/studio/models` → `catalog()`: the model list (key, label, provider, max refs, price,
+  availability) plus the aspect ratios and max image count.
+- `GET /v1/studio/projects` → `{"projects": [summary]}`.
+- `POST /v1/studio/projects` `{title?}` → `201 {"project": project}`.
+- `GET|PATCH|DELETE /v1/studio/projects/{pid}` → `{"project": project}` / `{"project": project}` /
+  `204`.
+- `POST /v1/studio/projects/{pid}/generations` (header `Idempotency-Key`) → `202 {"generation": gen}`.
+  Runs on `StudioRunner`'s thread pool (spec approach A, same as the run flow): the phone gets `202`
+  at once and polls the project, because Nano Banana Pro takes tens of seconds per image and
+  Cloudflare cuts a request near 100 s.
+- `GET /v1/studio/projects/{pid}/images/{image_id}`, `GET /v1/studio/projects/{pid}/refs/{file}` →
+  the file.
+- `POST /v1/studio/projects/{pid}/images/{image_id}/promote` `{to: "material"|"tryon"}` →
+  `{"material": item}` (staged into `tg-staging/app/`) or `{"entry": record}` (saved into the try-on
+  library with `provider: "studio:<model>"`).
+- Errors: `404 not_found`; `400 bad_request`; `422 unknown_model|model_unavailable|too_many_refs|
+  ref_not_found|ref_not_image`; `409 outcome_unknown` (idempotency, same meaning as every other
+  money-spending route in §5.5).
+
+**Four reference kinds**, resolved server-side so the phone names things, never paths
+(`_studio_ref_path`): `material` (`owner/name` in `tg-staging`), `tryon` (an id in the try-on
+library), `run_tryon` (`run_id/index`, the current run's live try-on preview), and `studio`
+(`project_id/image_id`, a previous Studio generation reused as a reference). Any resolved path whose
+suffix is outside `materials.IMAGE_SUFFIXES` is `422 ref_not_image` — a video material named as a
+reference, for instance.
+
+**Idempotency scope:** `studio-generate`, in its own `IdempotencyStore(batch_dir / "idempotency")` —
+the same directory the run flow's store uses (`tgbot/bot.py`'s `IdempotencyStore(ROOT / "batch" /
+"idempotency")`); the scope name keeps the keys apart. A request that fails validation (`400`/`422`)
+never begins a record, so a retry after fixing the body is not `409 outcome_unknown`. A request that
+begins a record but then throws (rather than actually submitting) forgets it before re-raising, since
+nothing was sent to a provider.
 - Editing or expiring a try-on library entry automatically (§5.10) — pruned by hand, like materials.
