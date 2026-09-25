@@ -150,8 +150,8 @@ final class Phase6SmokeTests: XCTestCase {
         app.tabBars.buttons["Materials"].tap()
         // Phase 6 nested MaterialsView inside MaterialTabView, one level deeper
         // under the NavigationStack, so the import control ("Add material" —
-        // since 2026-09-25 `MaterialsView.addButton`, floating above the tab
-        // bar, not a toolbar +) must survive the wrapper. Assert it on the
+        // since 2026-09-25 `MaterialsView.addButton`, a full-width bar under
+        // the Materials | Saved try-ons switch, not a toolbar +) must survive the wrapper. Assert it on the
         // Materials segment only: on Saved try-ons it legitimately disappears,
         // because MaterialsView leaves the hierarchy. This is the first smoke to
         // look at the Material tab, and a regression in a shipped screen is
