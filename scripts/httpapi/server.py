@@ -487,16 +487,24 @@ class _Handler(BaseHTTPRequestHandler):
         if method == "POST" and len(rest) == 3 and rest[0] == "projects" and rest[2] == "generations":
             pid = rest[1]
             key = self._idempotency_key()
-            store.get_project(pid)                                  # 404 before anything else
-            req = studio_runner.parse_request(self._read_json(), s.repo_root)
-            paths = [self._studio_ref_path(r) for r in req.refs]   # 422 before spending
+            # begin() before any validation: a retry after a lost response must replay the
+            # stored 202 even if the project was deleted or a ref no longer resolves since the
+            # first attempt — otherwise the phone is told the generation failed while it is
+            # still spending. Forgetting the key on any failure below (including a 404/422 that
+            # only surfaces on this attempt) is safe only because everything between here and
+            # submit() is pure validation, and submit() itself does all its I/O (copying refs,
+            # writing the generation record) before the first _spawn — so nothing has been sent
+            # to a provider yet when the except fires.
             replay = s.studio_idem.begin("studio-generate", key)
             if replay is not None:
                 return self._send_json(*replay)
             try:
+                store.get_project(pid)                                  # 404 before anything else
+                req = studio_runner.parse_request(self._read_json(), s.repo_root)
+                paths = [self._studio_ref_path(r) for r in req.refs]   # 422 before spending
                 gen = s.studio_runner.submit(pid, req, paths)
             except Exception:
-                s.studio_idem.forget("studio-generate", key)       # nothing was sent to a provider
+                s.studio_idem.forget("studio-generate", key)
                 raise
             body = {"generation": gen}
             s.studio_idem.finish("studio-generate", key, 202, body)

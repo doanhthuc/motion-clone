@@ -156,6 +156,35 @@ class TestStudioRoutes(StudioHttpBase):
         status, body = self.json_call("POST", base, {"to": "elsewhere"})
         self.assertEqual(status, 400)
 
+    def test_422_then_corrected_retry_with_same_key_succeeds(self):
+        pid = self.new_project()
+        too_many = {"prompt": "x", "model": "qwen-image-3", "aspect": "1:1", "count": 1,
+                   "refs": [{"kind": "material", "id": "app/me.png"}] * 4}
+        status, body = self.generate(pid, too_many, key="retry-1")
+        self.assertEqual((status, body["error"]["code"]), (422, "too_many_refs"))
+        fixed = {"prompt": "x", "model": "qwen-image-3", "aspect": "1:1", "count": 1,
+                "refs": [{"kind": "material", "id": "app/me.png"}]}
+        status, body = self.generate(pid, fixed, key="retry-1")
+        self.assertEqual(status, 202, body)
+
+    def test_replay_after_project_deleted_returns_the_original_body(self):
+        pid = self.new_project()
+        body = {"prompt": "x", "model": "nano-banana-2", "aspect": "1:1", "count": 1, "refs": []}
+        first = self.generate(pid, body, key="del-1")
+        self.assertEqual(first[0], 202, first)
+        self.assertTrue(self.server.studio_runner.wait_idle(5))
+        status, _ = self.json_call("DELETE", f"/v1/studio/projects/{pid}")
+        self.assertEqual(status, 204)
+        second = self.generate(pid, body, key="del-1")
+        self.assertEqual(second, first)
+
+    def test_unknown_project_is_404_and_retry_with_same_key_is_still_404(self):
+        body = {"prompt": "x", "model": "nano-banana-2", "aspect": "1:1", "count": 1}
+        status, resp = self.generate("no-such-project", body, key="unk-1")
+        self.assertEqual((status, resp["error"]["code"]), (404, "not_found"))
+        status, resp = self.generate("no-such-project", body, key="unk-1")
+        self.assertEqual((status, resp["error"]["code"]), (404, "not_found"))
+
 
 class TestStudioStartup(StudioHttpBase):
     def test_make_server_recovers_interrupted_slots(self):

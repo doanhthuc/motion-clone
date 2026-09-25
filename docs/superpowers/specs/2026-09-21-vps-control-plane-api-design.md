@@ -483,6 +483,7 @@ picks them up.
 - Moving the core into its own process (approach B) — kept possible, not done.
 - Stock-watch notifications (§5.10) — needs a background poller, a different shape of work than every
   slice so far; a later slice once the app covers slices 1–6.
+- Editing or expiring a try-on library entry automatically (§5.10) — pruned by hand, like materials.
 
 ## Slice 7 — Image Studio (2026-09-26)
 
@@ -520,8 +521,12 @@ reference, for instance.
 
 **Idempotency scope:** `studio-generate`, in its own `IdempotencyStore(batch_dir / "idempotency")` —
 the same directory the run flow's store uses (`tgbot/bot.py`'s `IdempotencyStore(ROOT / "batch" /
-"idempotency")`); the scope name keeps the keys apart. A request that fails validation (`400`/`422`)
-never begins a record, so a retry after fixing the body is not `409 outcome_unknown`. A request that
-begins a record but then throws (rather than actually submitting) forgets it before re-raising, since
-nothing was sent to a provider.
-- Editing or expiring a try-on library entry automatically (§5.10) — pruned by hand, like materials.
+"idempotency")`); the scope name keeps the keys apart. `begin()` is called before project lookup,
+request validation or ref resolution — a retry after a lost response must replay the stored `202`
+even if the project or a ref changed since the first attempt, so the phone is never told a
+generation failed while it is still spending. Everything from project lookup through `submit()`
+runs inside one `try`; any exception (`404`, `422`, or anything else) forgets the key before
+re-raising, so a request that never reached `submit()` — or that hit a genuine validation error —
+can be retried with the same key without a `409 outcome_unknown`. Forgetting on a `submit()` failure
+is safe only because `submit()` does all its I/O (copying refs, writing the generation record)
+before the first `_spawn`, so nothing has been sent to a provider yet.
