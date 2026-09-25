@@ -8,6 +8,9 @@ struct MaterialCard: View {
     let warning: String?
     let thumbnail: Data?
     var selected = false
+    /// Three-across grids: the name only, one line — the kind/size/age line
+    /// does not fit a third of a phone and the badge already says "video".
+    var compact = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -32,13 +35,15 @@ struct MaterialCard: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(material.name)
-                    .font(.subheadline)
+                    .font(compact ? .caption : .subheadline)
                     .foregroundStyle(Theme.label)
                     .lineLimit(1).truncationMode(.middle)
-                Text(detail)
-                    .font(.footnote.monospacedDigit())
-                    .foregroundStyle(Theme.secondary)
-                    .lineLimit(1)
+                if !compact {
+                    Text(detail)
+                        .font(.footnote.monospacedDigit())
+                        .foregroundStyle(Theme.secondary)
+                        .lineLimit(1)
+                }
             }
 
             if let warning, !warning.isEmpty {

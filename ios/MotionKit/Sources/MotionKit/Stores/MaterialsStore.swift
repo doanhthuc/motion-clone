@@ -10,6 +10,7 @@ public final class MaterialsStore {
     public private(set) var uploadProgress: UploadProgress?
     public private(set) var isUploading = false
     public private(set) var hasPendingUpload = false
+    public private(set) var isImportingLink = false
 
     private let client: APIClient
     private let uploader: Uploader
@@ -54,10 +55,13 @@ public final class MaterialsStore {
         }
     }
 
-    public func startUpload(fileURL: URL, fileName: String) async {
+    /// The new material on success, so a picker that started the upload can
+    /// select it; nil after a failure, which `errorMessage` describes.
+    @discardableResult
+    public func startUpload(fileURL: URL, fileName: String) async -> Material? {
         guard !isUploading else {
             errorMessage = "An upload is already in progress."
-            return
+            return nil
         }
         isUploading = true
         errorMessage = nil
@@ -68,9 +72,47 @@ public final class MaterialsStore {
             accept(completed)
             hasPendingUpload = false
             await refresh()
+            return completed.material
         } catch {
             hasPendingUpload = await uploader.hasPendingUpload()
             errorMessage = Self.message(for: error)
+            return nil
+        }
+    }
+
+    /// Has the server download a TikTok video into the materials. The server
+    /// holds the request open for the whole download (`scripts/control/links.py`
+    /// budgets 40 s per download path), so the timeout here is longer than
+    /// Cloudflare's 100 s cut. A cut or transport error does not mean the
+    /// download failed — it may still land — so the list is re-read either way.
+    @discardableResult
+    public func importLink(_ text: String) async -> Material? {
+        guard let link = TikTokLink.find(in: text) else {
+            errorMessage = "That isn't a TikTok link."
+            return nil
+        }
+        guard !isImportingLink else { return nil }
+        isImportingLink = true
+        errorMessage = nil
+        defer { isImportingLink = false }
+        do {
+            let completed = try await client.post(
+                UploadCompleteResponse.self, body: LinkImportRequest(url: link),
+                timeout: 120, "v1", "materials", "link")
+            accept(completed)
+            await refresh()
+            return completed.material
+        } catch {
+            // 524 is Cloudflare giving up on the open request, not the server
+            // failing: the download carries on and lands in the list.
+            let message = if case .server(status: 524, _, _) = error {
+                "The download is still running. It will appear in Materials when it finishes."
+            } else {
+                error.userMessage
+            }
+            await refresh()
+            errorMessage = message
+            return nil
         }
     }
 

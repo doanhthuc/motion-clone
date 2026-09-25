@@ -18,6 +18,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 import control.drafts as drafts
+import control.links as links
 import control.materials as materials
 import control.outputs as outputs
 import control.runs as runs
@@ -38,6 +39,8 @@ NOT_FOUND = ApiError(404, "not_found", "no such resource")
 _DOMAIN_STATUS = {"bad_request": 400, "forbidden": 403, "not_found": 404, "in_use": 409,
                   "incomplete": 409, "conflict": 409, "too_many": 409, "busy": 409, "too_large": 413,
                   "unprobeable": 422, "no_space": 507,
+                  # links.import_link: TikTok (or yt-dlp) refused, not our fault.
+                  "download_failed": 502,
                   "unknown_pipeline": 422, "unknown_provider": 422, "unknown_role": 422,
                   "wrong_kind": 422, "not_applicable": 422, "missing_slots": 422,
                   # DraftStore.patch's refusal of a tryon_seed on a job whose
@@ -361,6 +364,9 @@ class _Handler(BaseHTTPRequestHandler):
             # retry is answered from one place rather than re-derived here.
             return self._send_json(201, uploads.complete(
                 s.uploads_root, rest[1], s.staging_root))
+        if method == "POST" and rest == ["materials", "link"]:
+            body = self._read_json()
+            return self._send_json(201, links.import_link(body.get("url"), s.staging_root))
         if method == "GET" and rest == ["materials"]:
             return self._send_json(200, {"materials": materials.list_materials(s.staging_root)})
         if method == "GET" and len(rest) == 4 and rest[0] == "materials" and rest[3] == "thumb":

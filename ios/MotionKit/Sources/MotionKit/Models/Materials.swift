@@ -87,6 +87,30 @@ public struct UploadStatus: Decodable, Sendable, Equatable {
 
 }
 
+/// `POST /v1/materials/link` — the server downloads the video and answers
+/// with an `UploadCompleteResponse`, the same shape an upload completes with.
+public struct LinkImportRequest: Encodable, Sendable, Equatable {
+    public let url: String
+
+    public init(url: String) {
+        self.url = url
+    }
+}
+
+/// The links the server will fetch, mirroring `scripts/tgbot/tiktok.py`'s
+/// `URL_RE`: www./m. for the site, vm./vt. for the app's two share-link shapes.
+/// Checked here too so a copied caption can be trimmed to its link, and the
+/// Import button can stay disabled for anything the server would refuse.
+public enum TikTokLink {
+    public static func find(in text: String) -> String? {
+        guard let match = text.firstMatch(of: pattern) else { return nil }
+        return String(match.output)
+    }
+
+    nonisolated(unsafe) private static let pattern =
+        /https?:\/\/(?:www\.|m\.|vm\.|vt\.)?tiktok\.com\/\S+/.ignoresCase()
+}
+
 public struct UploadCompleteResponse: Decodable, Sendable, Equatable {
     public let material: Material
     public let probe: MaterialProbe

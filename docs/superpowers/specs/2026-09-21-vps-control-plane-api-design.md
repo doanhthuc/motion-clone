@@ -153,6 +153,7 @@ All under `/v1`, JSON bodies, errors as `{"error": {"code": "...", "message": ".
 | `GET /v1/materials` | List |
 | `GET /v1/materials/{id}/thumb` | ffmpeg poster frame / downscaled image, cached on disk |
 | `DELETE /v1/materials/{id}` | `409` if a draft or a live run references it |
+| `POST /v1/materials/link` `{url}` → `Material` | *Added 2026-09-25.* Download a TikTok video with the bot's own `tgbot/tiktok.py` (yt-dlp, then tikwm) and stage it as an app material; same response shape as `complete`. `400 bad_request` for anything that is not a TikTok link, `409 busy` while another link downloads, `502 download_failed` with TikTok's reason, `422 unprobeable` for a video-less file. Held open for the whole download (40 s budget per path, under Cloudflare's 100 s cut); not idempotent — each call is a fresh download |
 
 Unfinished uploads older than 24 h are deleted by `_tick_staging_prune`, extended to cover the
 uploads directory (it currently only ages out staged files after `STAGING_MAX_AGE_DAYS`).
@@ -241,7 +242,7 @@ A mobile client retries. A duplicated `confirm` must never become a second pod.
 | `401` | Missing or wrong bearer token |
 | `404` | Unknown id, or a path outside its root. A draft PATCH whose `tryon_seed` names a deleted library entry is `404 seed_not_found`, distinct from a gone material's `404 not_found` |
 | `409` | World-state refusal: migration in progress, a run already live, Phase A still running, stale `panel_token`, material in use |
-| `502` | `runpodctl` (or another upstream) could not answer a read the app asked for — never for a spend or a kill |
+| `502` | `runpodctl` (or another upstream) could not answer a read the app asked for — never for a spend or a kill. Also `download_failed` from `POST /v1/materials/link` (TikTok refused), which the app shows with the server's text rather than the provider headline |
 | `422` | Draft refusal: missing slots, validation failed, unanswered files |
 | `500` | Unexpected exception — logged, and **never** propagated into the bot's poll loop |
 

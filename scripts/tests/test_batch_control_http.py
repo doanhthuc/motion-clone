@@ -15,7 +15,7 @@ from io import BytesIO
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batchlib_ext.lease import Lease
-from control import materials, uploads
+from control import links, materials, uploads
 import control.runs as runs
 import tgbot.run as run_mod
 import httpapi.files as files_module
@@ -647,6 +647,70 @@ class TestUploadFlow(HttpWriteBase):
         with mock.patch.object(materials, "ingest", side_effect=ingest_then_delete):
             resp, body = self.send("POST", f"/v1/uploads/{uid}/complete")
         self.assertEqual((resp.status, json.loads(body)["error"]["code"]), (404, "not_found"))
+
+
+class TestLinkImport(HttpWriteBase):
+    """POST /v1/materials/link — a pasted TikTok link becomes an app material
+    (2026-09-25), through the bot's own tgbot/tiktok.py downloader."""
+    URL = "https://vt.tiktok.com/ZS8abcde/"
+
+    def fake_download(self, url, *, timeout):
+        self.downloaded = (url, timeout)
+        d = Path(tempfile.mkdtemp(prefix="tiktok-"))
+        (d / "video.mp4").write_bytes(b"clip")
+        self.tmp_dir = d
+        return d / "video.mp4"
+
+    def post(self, url):
+        return self.send("POST", "/v1/materials/link", json_body={"url": url})
+
+    def test_a_tiktok_link_is_staged_as_an_app_material(self):
+        with mock.patch.object(links.tiktok, "download", side_effect=self.fake_download), \
+             mock.patch.object(links.materials, "ingest",
+                               side_effect=lambda p: (p, {"kind": "video", "size_bytes": 4, "warning": ""})):
+            resp, body = self.post(f"look at this {self.URL} lol")
+        self.assertEqual(resp.status, 201)
+        got = json.loads(body)
+        self.assertEqual(got["material"]["owner"], "app")
+        self.assertTrue(got["material"]["name"].startswith("tiktok-"))
+        self.assertEqual(self.downloaded, (self.URL, links.DOWNLOAD_TIMEOUT))
+        staged = self.batch / "tg-staging" / "app" / got["material"]["name"]
+        self.assertEqual(staged.read_bytes(), b"clip")
+        self.assertFalse(self.tmp_dir.exists(), "the download's temp dir must be removed")
+
+    def test_anything_but_a_tiktok_link_is_400_and_downloads_nothing(self):
+        with mock.patch.object(links.tiktok, "download") as download:
+            for url in ("https://youtube.com/watch?v=1", "", None, 42):
+                resp, body = self.post(url)
+                self.assertEqual((resp.status, json.loads(body)["error"]["code"]),
+                                 (400, "bad_request"), url)
+        download.assert_not_called()
+
+    def test_a_failed_download_is_502_and_stages_nothing(self):
+        with mock.patch.object(links.tiktok, "download",
+                               side_effect=RuntimeError("yt-dlp failed: boom")):
+            resp, body = self.post(self.URL)
+        error = json.loads(body)["error"]
+        self.assertEqual((resp.status, error["code"]), (502, "download_failed"))
+        self.assertIn("boom", error["message"])
+        self.assertFalse((self.batch / "tg-staging" / "app").exists()
+                         and any((self.batch / "tg-staging" / "app").iterdir()))
+
+    def test_an_unprobeable_download_is_422_and_leaves_nothing(self):
+        with mock.patch.object(links.tiktok, "download", side_effect=self.fake_download), \
+             mock.patch.object(links.materials, "ingest",
+                               side_effect=materials.MaterialError("unprobeable", "no video")):
+            resp, _ = self.post(self.URL)
+        self.assertEqual(resp.status, 422)
+        self.assertEqual(list((self.batch / "tg-staging" / "app").iterdir()), [])
+
+    def test_a_second_link_while_one_downloads_is_409(self):
+        self.assertTrue(links._SLOT.acquire(blocking=False))
+        try:
+            resp, body = self.post(self.URL)
+        finally:
+            links._SLOT.release()
+        self.assertEqual((resp.status, json.loads(body)["error"]["code"]), (409, "busy"))
 
 
 class TestKeepAlive(HttpWriteBase):

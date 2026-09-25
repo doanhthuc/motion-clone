@@ -78,6 +78,65 @@ extension URLProtocolTests {
         #expect(!store.isUploading && store.isStale)
     }
 
+    @Test func tiktokLinkIsFoundInsideACopiedCaption() {
+        #expect(TikTokLink.find(in: "so good https://vt.tiktok.com/ZS8abcde/ #fyp") == "https://vt.tiktok.com/ZS8abcde/")
+        #expect(TikTokLink.find(in: "HTTPS://www.TikTok.com/@a/video/1") == "HTTPS://www.TikTok.com/@a/video/1")
+        #expect(TikTokLink.find(in: "https://youtube.com/watch?v=1") == nil)
+        #expect(TikTokLink.find(in: "https://nottiktok.com/x") == nil)
+    }
+
+    @Test func importLinkPostsOnlyTheLinkAndSelectsTheNewMaterial() async throws {
+        StubURLProtocol.install { request in
+            switch (request.httpMethod, request.url?.path) {
+            case ("POST", "/v1/materials/link"):
+                return TestSupport.json(#"{"material":{"id":"app/tiktok-1.mp4","owner":"app","name":"tiktok-1.mp4","bytes":12,"updated_at":1790000300,"kind":"video"},"probe":{"kind":"video","size_bytes":12,"warning":""}}"#, status: 201)
+            default:
+                return TestSupport.json(#"{"materials":[{"id":"app/tiktok-1.mp4","owner":"app","name":"tiktok-1.mp4","bytes":12,"updated_at":1790000300,"kind":"video"}]}"#)
+            }
+        }
+        let store = MaterialsStore(client: TestSupport.client())
+
+        let material = await store.importLink("look https://vt.tiktok.com/ZS8abcde/ lol")
+
+        #expect(material?.id == "app/tiktok-1.mp4")
+        #expect(store.materials.map(\.id) == ["app/tiktok-1.mp4"])
+        #expect(!store.isImportingLink && store.errorMessage == nil)
+        let post = try #require(StubURLProtocol.requests.first)
+        let body = try #require(post.httpBody)
+        #expect(try JSONDecoder().decode([String: String].self, from: body) == ["url": "https://vt.tiktok.com/ZS8abcde/"])
+    }
+
+    @Test func importLinkRefusesNonTikTokTextWithoutARequest() async {
+        StubURLProtocol.install { _ in TestSupport.json(list) }
+        let store = MaterialsStore(client: TestSupport.client())
+        #expect(await store.importLink("https://youtube.com/watch?v=1") == nil)
+        #expect(StubURLProtocol.requests.isEmpty)
+        #expect(store.errorMessage == "That isn't a TikTok link.")
+    }
+
+    @Test func aFailedDownloadShowsTheServerReasonNotAProviderOutage() async {
+        StubURLProtocol.install { request in
+            if request.httpMethod == "POST" {
+                return TestSupport.json(#"{"error":{"code":"download_failed","message":"couldn't download that TikTok video: private"}}"#, status: 502)
+            }
+            return TestSupport.json(list)
+        }
+        let store = MaterialsStore(client: TestSupport.client())
+        #expect(await store.importLink("https://vt.tiktok.com/ZS8abcde/") == nil)
+        #expect(store.errorMessage == "couldn't download that TikTok video: private")
+        #expect(store.materials.count == 2, "the list is re-read even after a failure")
+    }
+
+    @Test func aCloudflareCutSaysTheDownloadIsStillRunning() async {
+        StubURLProtocol.install { request in
+            if request.httpMethod == "POST" { return (524, [:], Data("<html>timeout</html>".utf8)) }
+            return TestSupport.json(list)
+        }
+        let store = MaterialsStore(client: TestSupport.client())
+        #expect(await store.importLink("https://vt.tiktok.com/ZS8abcde/") == nil)
+        #expect(store.errorMessage == "The download is still running. It will appear in Materials when it finishes.")
+    }
+
     @Test func deleteHonorsOwnershipAndServerOutcomes() async throws {
         StubURLProtocol.install { request in
             if request.httpMethod == "DELETE" { return (204, [:], Data()) }
