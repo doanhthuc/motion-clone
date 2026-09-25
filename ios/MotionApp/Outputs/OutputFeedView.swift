@@ -24,24 +24,34 @@ struct OutputFeedView: View {
     private var currentFile: OutputFile? { batch.files.first { $0.id == current } }
     private var position: Int { (batch.files.firstIndex { $0.id == current } ?? 0) + 1 }
 
-    var body: some View {
-        ZStack(alignment: .bottom) {
-            ScrollView(.vertical) {
-                LazyVStack(spacing: 0) {
-                    ForEach(batch.files) { file in
-                        FeedPage(client: client, batch: batch.batch, file: file, clip: playback.clips[file.id])
-                            .containerRelativeFrame([.horizontal, .vertical])
-                            .id(file.id)
-                    }
-                }
-                .scrollTargetLayout()
-            }
-            .scrollTargetBehavior(.paging)
-            .scrollPosition(id: $current)
-            .scrollIndicators(.hidden)
-            .ignoresSafeArea()
+    /// TikTok's layout: the video owns the screen down to a black strip the height
+    /// of a tab bar, and the scrub bar and counter live in that strip. Filling
+    /// this shorter area crops ~10% of a 9:16 clip's width on a 402×874pt
+    /// iPhone 17 Pro, against ~18% when filling the whole screen.
+    static let stripHeight: CGFloat = 49
 
-            chrome
+    var body: some View {
+        GeometryReader { geo in
+            let bottomInset = geo.safeAreaInsets.bottom
+            ZStack(alignment: .bottom) {
+                ScrollView(.vertical) {
+                    LazyVStack(spacing: 0) {
+                        ForEach(batch.files) { file in
+                            FeedPage(client: client, batch: batch.batch, file: file, clip: playback.clips[file.id],
+                                     strip: Self.stripHeight + bottomInset)
+                                .containerRelativeFrame([.horizontal, .vertical])
+                                .id(file.id)
+                        }
+                    }
+                    .scrollTargetLayout()
+                }
+                .scrollTargetBehavior(.paging)
+                .scrollPosition(id: $current)
+                .scrollIndicators(.hidden)
+                .ignoresSafeArea()
+
+                chrome
+            }
         }
         .background(.black)
         .toolbar(.hidden, for: .tabBar)
@@ -70,37 +80,42 @@ struct OutputFeedView: View {
         .onDisappear { playback.stopAll() }
     }
 
-    /// Caption, counter and scrub bar over a scrim, pinned above the home indicator.
+    /// Caption over the bottom of the video, then the scrub bar and counter in the strip.
     private var chrome: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            if let toast {
-                Text(toast)
-                    .font(Theme.sans(13, .medium)).foregroundStyle(Theme.ink)
-                    .padding(.horizontal, 14).padding(.vertical, 8)
-                    .background(.black.opacity(0.6), in: .capsule)
-                    .frame(maxWidth: .infinity)
-                    .transition(.opacity.combined(with: .move(edge: .bottom)))
-            }
-            VStack(alignment: .leading, spacing: 3) {
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 10) {
+                if let toast {
+                    Text(toast)
+                        .font(Theme.sans(13, .medium)).foregroundStyle(Theme.ink)
+                        .padding(.horizontal, 14).padding(.vertical, 8)
+                        .background(.black.opacity(0.6), in: .capsule)
+                        .frame(maxWidth: .infinity)
+                        .transition(.opacity.combined(with: .move(edge: .bottom)))
+                }
                 Text(currentFile?.name ?? "").font(Theme.mono(13, .medium)).foregroundStyle(Theme.ink)
                     .lineLimit(1)
+                    .shadow(color: .black.opacity(0.5), radius: 4)
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 4)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(alignment: .bottom) {
+                LinearGradient(colors: [.clear, .black.opacity(0.5)], startPoint: .top, endPoint: .bottom)
+                    .frame(height: 140)
+                    .allowsHitTesting(false)
+            }
+
+            VStack(alignment: .leading, spacing: 0) {
+                if let clip = playback.current {
+                    ScrubBar(clip: clip)
+                } else {
+                    Color.clear.frame(height: 24)
+                }
                 Text("\(batch.batch) · \(position)/\(batch.files.count)")
-                    .font(Theme.mono(11)).foregroundStyle(Theme.ink.opacity(0.7)).lineLimit(1)
+                    .font(Theme.mono(11)).foregroundStyle(Theme.ink2).lineLimit(1)
             }
-            .shadow(color: .black.opacity(0.5), radius: 4)
-            if let clip = playback.current {
-                ScrubBar(clip: clip)
-            } else {
-                Color.clear.frame(height: 24)
-            }
-        }
-        .padding(.horizontal, 16)
-        .padding(.bottom, 4)
-        .background(alignment: .bottom) {
-            LinearGradient(colors: [.clear, .black.opacity(0.55)], startPoint: .top, endPoint: .bottom)
-                .frame(height: 180)
-                .ignoresSafeArea()
-                .allowsHitTesting(false)
+            .padding(.horizontal, 16)
+            .frame(height: Self.stripHeight, alignment: .top)
         }
         .animation(.easeOut(duration: 0.2), value: toast)
     }
@@ -149,22 +164,33 @@ struct OutputFeedView: View {
     }
 }
 
-/// One full-screen page: a video surface or an image, letterboxed on black.
+/// One full-screen page: the video or image above a black strip of `strip` points.
 private struct FeedPage: View {
     let client: APIClient
     let batch: String
     let file: OutputFile
     let clip: FeedClip?
+    let strip: CGFloat
     @State private var image: UIImage?
     @State private var error: APIError?
 
     var body: some View {
+        VStack(spacing: 0) {
+            media.frame(maxWidth: .infinity, maxHeight: .infinity).clipped()
+            Color.black.frame(height: strip)
+        }
+        .background(.black)
+        .contentShape(.rect)
+        .onTapGesture { clip?.togglePause() }
+        .task(id: file.id) { await loadImage() }
+    }
+
+    private var media: some View {
         ZStack {
             Color.black
             if file.isVideo {
                 if let clip {
-                    PlayerSurface(player: clip.player)
-                        .ignoresSafeArea()
+                    PlayerSurface(player: clip.player, videoSize: clip.videoSize)
                     if clip.buffering && !clip.userPaused { ProgressView().tint(.white) }
                     Image(systemName: "play.fill")
                         .font(.system(size: 56))
@@ -183,9 +209,6 @@ private struct FeedPage: View {
                 ProgressView().tint(.white)
             }
         }
-        .contentShape(.rect)
-        .onTapGesture { clip?.togglePause() }
-        .task(id: file.id) { await loadImage() }
     }
 
     private func loadImage() async {
@@ -198,17 +221,29 @@ private struct FeedPage: View {
 /// AVPlayerLayer without AVKit's controls.
 private struct PlayerSurface: UIViewRepresentable {
     let player: AVPlayer
+    let videoSize: CGSize
 
     final class LayerView: UIView {
         override class var layerClass: AnyClass { AVPlayerLayer.self }
         var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
+        var videoSize: CGSize = .zero { didSet { if videoSize != oldValue { setNeedsLayout() } } }
+
+        /// Fill when that costs at most 15% of an edge (a 9:16 clip here loses ~10%),
+        /// otherwise fit: a landscape clip filled into a portrait area would lose ~70%.
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            guard videoSize.width > 0, videoSize.height > 0, bounds.height > 0 else { return }
+            let area = bounds.width / bounds.height
+            let video = videoSize.width / videoSize.height
+            let crop = 1 - min(area, video) / max(area, video)
+            playerLayer.videoGravity = crop <= 0.15 ? .resizeAspectFill : .resizeAspect
+        }
     }
 
     func makeUIView(context: Context) -> LayerView {
         let view = LayerView()
         view.backgroundColor = .black
-        // Always the whole frame, as TikTok does: a 9:16 clip on a 9:19.5 screen
-        // gets thin black bands rather than losing ~18% of its width to a crop.
+        view.clipsToBounds = true
         view.playerLayer.videoGravity = .resizeAspect
         view.playerLayer.player = player
         return view
@@ -216,6 +251,7 @@ private struct PlayerSurface: UIViewRepresentable {
 
     func updateUIView(_ view: LayerView, context: Context) {
         if view.playerLayer.player !== player { view.playerLayer.player = player }
+        view.videoSize = videoSize
     }
 }
 
@@ -227,14 +263,7 @@ private struct ScrubBar: View {
     var body: some View {
         let active = dragFraction != nil
         let fraction = dragFraction ?? clip.fraction
-        VStack(spacing: 6) {
-            if active {
-                Text("\(Self.clock(fraction * clip.duration)) / \(Self.clock(clip.duration))")
-                    .font(Theme.mono(13, .medium)).foregroundStyle(Theme.ink)
-                    .shadow(color: .black.opacity(0.5), radius: 4)
-                    .frame(maxWidth: .infinity)
-                    .transition(.opacity)
-            }
+        Group {
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
                     Capsule().fill(.white.opacity(0.25))
@@ -242,7 +271,9 @@ private struct ScrubBar: View {
                         .frame(width: geo.size.width * fraction)
                 }
                 .frame(height: active ? 6 : 3)
-                .frame(maxHeight: .infinity, alignment: .bottom)
+                // The line sits on the video's bottom edge, as TikTok's does; the
+                // rest of the 24pt hit area hangs down into the strip.
+                .frame(maxHeight: .infinity, alignment: .top)
                 .contentShape(.rect)
                 .gesture(
                     DragGesture(minimumDistance: 0)
@@ -260,6 +291,16 @@ private struct ScrubBar: View {
                 )
             }
             .frame(height: 24)
+        }
+        // Float the time above the bar so the strip's layout never shifts while seeking.
+        .overlay(alignment: .top) {
+            if active {
+                Text("\(Self.clock(fraction * clip.duration)) / \(Self.clock(clip.duration))")
+                    .font(Theme.mono(13, .medium)).foregroundStyle(Theme.ink)
+                    .shadow(color: .black.opacity(0.5), radius: 4)
+                    .offset(y: -28)
+                    .transition(.opacity)
+            }
         }
         .animation(.easeOut(duration: 0.15), value: active)
         .sensoryFeedback(.selection, trigger: active)

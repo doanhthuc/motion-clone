@@ -10,6 +10,7 @@ final class FeedClip {
     private(set) var time: Double = 0
     private(set) var duration: Double = 0
     private(set) var buffering = true
+    private(set) var videoSize: CGSize = .zero
     /// Paused by the viewer's tap, as opposed to paused because the page is off screen.
     private(set) var userPaused = false
     private(set) var scrubbing = false
@@ -49,6 +50,7 @@ final class FeedClip {
     private func tick(_ t: CMTime) {
         if !scrubbing, t.seconds.isFinite { time = t.seconds }
         if let d = player.currentItem?.duration.seconds, d.isFinite, d > 0 { duration = d }
+        if let size = player.currentItem?.presentationSize, size != videoSize { videoSize = size }
     }
 
     /// The page scrolled into view: always start playing, even if it was tapped paused before.
