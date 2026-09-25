@@ -20,6 +20,7 @@ targets:
     dependencies:
       - package: MotionKit
         product: MotionKit
+      - target: MotionShare
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: xyz.doanhthuc.motion
@@ -44,6 +45,53 @@ targets:
         CF_ACCESS_CLIENT_ID: $(CF_ACCESS_CLIENT_ID)
         CF_ACCESS_CLIENT_SECRET: $(CF_ACCESS_CLIENT_SECRET)
         CONTROL_API_TOKEN: $(CONTROL_API_TOKEN)
+    entitlements:
+      path: MotionApp/MotionApp.entitlements
+      properties:
+        # The app's default access group, spelled out so MotionShare can
+        # read the same Keychain items (credentials written by Settings).
+        keychain-access-groups: ["$(AppIdentifierPrefix)xyz.doanhthuc.motion"]
+  MotionShare:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: MotionShare
+        excludes: ["Info.plist"]
+    configFiles:
+      Debug: Secrets.xcconfig
+      Release: Secrets.xcconfig
+    dependencies:
+      - package: MotionKit
+        product: MotionKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: xyz.doanhthuc.motion.share
+        PRODUCT_NAME: MotionShare
+        SWIFT_VERSION: "6.0"
+        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGN_STYLE: Automatic
+    entitlements:
+      path: MotionShare/MotionShare.entitlements
+      properties:
+        keychain-access-groups: ["$(AppIdentifierPrefix)xyz.doanhthuc.motion"]
+    info:
+      path: MotionShare/Info.plist
+      properties:
+        CFBundleDisplayName: Motion
+        UIUserInterfaceStyle: Dark
+        # Fallback for free provisioning: if the shared access group is not
+        # granted, the extension seeds its own Keychain from these, like the app.
+        CONTROL_API_URL: $(CONTROL_API_URL)
+        CF_ACCESS_CLIENT_ID: $(CF_ACCESS_CLIENT_ID)
+        CF_ACCESS_CLIENT_SECRET: $(CF_ACCESS_CLIENT_SECRET)
+        CONTROL_API_TOKEN: $(CONTROL_API_TOKEN)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.share-services
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).ShareViewController
+          NSExtensionAttributes:
+            NSExtensionActivationRule:
+              NSExtensionActivationSupportsWebURLWithMaxCount: 1
+              NSExtensionActivationSupportsText: true
   MotionAppUITests:
     type: bundle.ui-testing
     platform: iOS

@@ -38,6 +38,15 @@ Keychain entries: an edit made in Settings is never overwritten by a rebuild.
 
 No push notifications: Telegram reports progress and results.
 
+## Share to Motion
+
+The `MotionShare` extension adds **Motion** to the share sheet. In TikTok: Share → More (…) →
+Motion. It posts the link to `POST /v1/materials/link`, so the video lands in Materials without
+opening the app; closing the card early is safe (the server stages before it answers). It reads
+the app's Keychain through the shared access group `$(AppIdentifierPrefix)xyz.doanhthuc.motion`,
+and falls back to the baked `Secrets.xcconfig` values if free provisioning does not grant it.
+First use: in the share sheet's app row tap More and enable Motion (or pin it to the top).
+
 ## Materials and uploads
 
 The Materials tab lists the global VPS library, including files uploaded through Telegram. Thumbnails
