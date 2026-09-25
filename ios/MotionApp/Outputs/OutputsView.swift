@@ -48,6 +48,7 @@ struct OutputsView: View {
             }
         }
         .navigationTitle("Outputs")
+        .navigationBarTitleDisplayMode(.inline)
         .refreshable { await store.refresh() }
         .task { await store.refresh() }
     }
