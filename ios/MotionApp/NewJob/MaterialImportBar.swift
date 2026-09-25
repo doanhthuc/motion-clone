@@ -8,10 +8,33 @@ import SwiftUI
 /// taken links since 2026-09-04 — `scripts/tgbot/tiktok.py`).
 @MainActor
 struct MaterialImportBar: View {
-    let kind: PipelineRoleKind
     let materials: MaterialsStore
     /// Called with each material this bar produced, once it is in the list.
     let onImported: (MotionKit.Material) -> Void
+    private let photos: PHPickerFilter
+    private let allowsLink: Bool
+    /// Adds a Files tile; the caller owns the importer (it needs a presenter).
+    private let onFiles: (() -> Void)?
+
+    /// For one pipeline role: Photos filtered to its kind, a link for video.
+    init(kind: PipelineRoleKind, materials: MaterialsStore,
+         onImported: @escaping (MotionKit.Material) -> Void) {
+        self.materials = materials
+        self.onImported = onImported
+        photos = kind == .video ? .videos : .images
+        allowsLink = kind == .video
+        onFiles = nil
+    }
+
+    /// For the Materials tab: any image or video, a link, and Files.
+    init(anyKindIn materials: MaterialsStore, onFiles: @escaping () -> Void,
+         onImported: @escaping (MotionKit.Material) -> Void) {
+        self.materials = materials
+        self.onImported = onImported
+        photos = .any(of: [.images, .videos])
+        allowsLink = true
+        self.onFiles = onFiles
+    }
 
     @State private var photoItem: PhotosPickerItem?
     @State private var showingLink = false
@@ -24,12 +47,18 @@ struct MaterialImportBar: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 12) {
-                PhotosPicker(selection: $photoItem, matching: kind == .video ? .videos : .images) {
-                    SourceTile(title: "Photo Library", systemImage: "photo.on.rectangle.angled")
+                // `.current`: the file as it is in the library. The default,
+                // `.automatic`, lets Photos transcode to a "compatible" format
+                // (HEVC video to H.264, HEIC to JPEG) — a re-encode before the
+                // server, which itself stores video byte for byte and turns
+                // HEIC into lossless PNG.
+                PhotosPicker(selection: $photoItem, matching: photos,
+                             preferredItemEncoding: .current) {
+                    SourceTile(title: "Photos", systemImage: "photo.on.rectangle.angled")
                 }
                 .accessibilityIdentifier("import.photos")
 
-                if kind == .video {
+                if allowsLink {
                     Button {
                         withAnimation(.snappy) { showingLink.toggle() }
                         linkFocused = showingLink
@@ -38,11 +67,18 @@ struct MaterialImportBar: View {
                     }
                     .accessibilityIdentifier("import.tiktok")
                 }
+
+                if let onFiles {
+                    Button(action: onFiles) {
+                        SourceTile(title: "Files", systemImage: "folder")
+                    }
+                    .accessibilityIdentifier("import.files")
+                }
             }
             .buttonStyle(.plain)
             .disabled(busy)
 
-            if showingLink && kind == .video {
+            if showingLink && allowsLink {
                 linkField
                     .transition(.opacity.combined(with: .move(edge: .top)))
             }

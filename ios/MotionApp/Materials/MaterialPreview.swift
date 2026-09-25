@@ -9,6 +9,9 @@ import SwiftUI
 struct MaterialPreview: View {
     let material: MotionKit.Material
     let materials: MaterialsStore
+    /// Presented as a sheet (from a picker, swipe down to close) rather than
+    /// pushed (from the Materials tab, swipe from the edge like the Outputs feed).
+    var modal = false
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
     @State private var clip: FeedClip?
@@ -20,27 +23,34 @@ struct MaterialPreview: View {
     private var paused: Bool { clip?.userPaused ?? false }
 
     var body: some View {
-        NavigationStack {
-            VStack(spacing: 0) {
-                media
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .clipped()
-                    .contentShape(.rect)
-                    .onTapGesture { clip?.togglePause() }
-                    .accessibilityElement(children: .ignore)
-                    .accessibilityLabel(material.name)
-                    .accessibilityValue(isVideo ? (paused ? "Paused" : "Playing") : "")
-                    .accessibilityAddTraits(isVideo ? .startsMediaSession : .isImage)
-                    .accessibilityAction(named: paused ? "Play" : "Pause") { clip?.togglePause() }
-                strip
+        if modal {
+            NavigationStack {
+                screen.toolbar {
+                    ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
+                }
             }
-            .background(.black)
-            .toolbarBackground(.hidden, for: .navigationBar)
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
-            }
+        } else {
+            screen.toolbar(.hidden, for: .tabBar)
         }
+    }
+
+    private var screen: some View {
+        VStack(spacing: 0) {
+            media
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .clipped()
+                .contentShape(.rect)
+                .onTapGesture { clip?.togglePause() }
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(material.name)
+                .accessibilityValue(isVideo ? (paused ? "Paused" : "Playing") : "")
+                .accessibilityAddTraits(isVideo ? .startsMediaSession : .isImage)
+                .accessibilityAction(named: paused ? "Play" : "Pause") { clip?.togglePause() }
+            strip
+        }
+        .background(.black)
+        .toolbarBackground(.hidden, for: .navigationBar)
+        .navigationBarTitleDisplayMode(.inline)
         // Space plays and pauses from a hardware keyboard, as in the feed.
         .background {
             Button("Play or Pause") { clip?.togglePause() }

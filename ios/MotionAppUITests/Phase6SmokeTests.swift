@@ -149,9 +149,9 @@ final class Phase6SmokeTests: XCTestCase {
 
         app.tabBars.buttons["Materials"].tap()
         // Phase 6 nested MaterialsView inside MaterialTabView, one level deeper
-        // under the NavigationStack. SwiftUI still propagates its `.toolbar`
-        // item to the enclosing stack, so the import control ("Add material",
-        // `MaterialsView.addMenu`) must survive the wrapper. Assert it on the
+        // under the NavigationStack, so the import control ("Add material" —
+        // since 2026-09-25 `MaterialsView.addButton`, floating above the tab
+        // bar, not a toolbar +) must survive the wrapper. Assert it on the
         // Materials segment only: on Saved try-ons it legitimately disappears,
         // because MaterialsView leaves the hierarchy. This is the first smoke to
         // look at the Material tab, and a regression in a shipped screen is
@@ -160,7 +160,7 @@ final class Phase6SmokeTests: XCTestCase {
             NSPredicate(format: "label == %@ OR identifier == %@", "Add material", "Add material")
         ).firstMatch
         XCTAssertTrue(addMaterial.waitForExistence(timeout: 10),
-                      "the Materials toolbar import control survived its MaterialTabView wrapper")
+                      "the Materials import control survived its MaterialTabView wrapper")
 
         // "Saved try-ons" is both this segment's label and, since the native
         // design pass, the navigation title (`MaterialTabView`), so tap the

@@ -37,8 +37,8 @@ struct MaterialChoice: View {
             Button(material.kind == .video ? "Play" : "Preview",
                    systemImage: material.kind == .video ? "play.fill" : "eye") { previewing = true }
         }
-        .fullScreenCover(isPresented: $previewing) {
-            MaterialPreview(material: material, materials: materials)
+        .sheet(isPresented: $previewing) {
+            MaterialPreview(material: material, materials: materials, modal: true)
         }
         .accessibilityLabel(material.name)
         .accessibilityValue(selected ? "Selected" : "Not selected")
