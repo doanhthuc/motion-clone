@@ -195,7 +195,7 @@ struct BatchPickerSheets: ViewModifier {
                 MaterialMultiPicker(
                     title: "Choose outfits",
                     kind: pipeline.roles[BatchComposer.outfitRole] ?? .image,
-                    materials: materials, identifierPrefix: "outfit.pick",
+                    role: .outfit, materials: materials, identifierPrefix: "outfit.pick",
                     disabled: composer.isRunning, note: composer.capReason,
                     isChosen: { id in composer.outfits.contains { $0.outfitID == id } },
                     toggle: { composer.toggle(outfitID: $0) })
@@ -204,7 +204,7 @@ struct BatchPickerSheets: ViewModifier {
                 MaterialMultiPicker(
                     title: "Choose drivers",
                     kind: pipeline.roles[BatchComposer.driverRole] ?? .video,
-                    materials: materials, identifierPrefix: "driver.pick",
+                    role: .driver, materials: materials, identifierPrefix: "driver.pick",
                     disabled: composer.isRunning, note: composer.capReason,
                     isChosen: { composer.drivers.contains($0) },
                     toggle: { composer.toggle(driverID: $0) })

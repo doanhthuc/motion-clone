@@ -220,7 +220,7 @@ class DraftStore:
 
     def __init__(self, batch_dir: Path, staging_root: Path, owner: str, *,
                  default_pipeline: str, default_provider: str,
-                 tryon_library: TryonLibrary, probe=ingest.probe):
+                 tryon_library: TryonLibrary, probe=ingest.probe, material_roles=None):
         self.batch_dir, self.owner = batch_dir, owner
         # Resolved once here so it matches materials.resolve_material's own
         # resolved paths (control/paths.py's safe_child): on macOS /var is a
@@ -235,6 +235,10 @@ class DraftStore:
         # suite should fail on, not paper over.
         self.tryon_library = tryon_library
         self._probe = probe
+        # control.material_roles.MaterialRoles, or None (the bot's own store):
+        # a material put into a slot is tagged with that role, so the phone's
+        # library can group it even after the draft is cleared.
+        self.material_roles = material_roles
         self.path = batch_dir / f"{owner}.draft.json"
 
     # -- persistence -------------------------------------------------------
@@ -456,6 +460,10 @@ class DraftStore:
             if "tryon_seed" in body:
                 d.job.tryon_seed = seed_path
             view = self._changed(d)
+        if self.material_roles is not None:
+            for role, material_id in slots.items():
+                if material_id is not None:
+                    self.material_roles.remember(material_id, role)
         view["dropped"] = dropped
         return view
 

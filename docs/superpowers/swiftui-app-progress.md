@@ -128,6 +128,13 @@ field or store changed.
   of the grid that shrinks to a circle once the grid scrolls. Tapping a material pushes the preview
   (edge swipe back, like Outputs); from a picker it opens as a sheet (swipe down).
 
+- **Grouped by role, not by kind** (same day, on request): Motion drivers · Outfits · Characters
+  (then Backgrounds and Unsorted when non-empty). The role comes from the server
+  (`control/material_roles.py`, see the API spec §5.1). An image uploaded from the Materials tab
+  gets the bot's question ("What is this image?"); one imported from inside a job slot is tagged
+  with that slot's role; long-press → Move to re-files it. Pickers list their own role first, then
+  unsorted, then the rest — a role is a hint, never a lock.
+
 ## Phase status
 
 | Phase | Status | Delivered | Remaining evidence |

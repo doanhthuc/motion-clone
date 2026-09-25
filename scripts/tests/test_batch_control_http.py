@@ -771,6 +771,35 @@ class TestMaterialRoutes(HttpWriteBase):
         self.send("GET", "/v1/materials/app/a.mp4", headers={"Range": "bytes=0-0"})
         self.assertFalse(any("/v1/materials/app/a.mp4" in line for line in self.logged))
 
+    def test_role_comes_from_structure_then_history_then_a_tag(self):
+        # Video: the driver by structure. Image: unsorted until a rendered
+        # manifest (the bot's history) names it, then a tag overrides both.
+        staged = (self.batch / "tg-staging" / "99" / "t.png").resolve()
+        roles = lambda: {m["id"]: m["role"] for m in json.loads(self.send("GET", "/v1/materials")[1])["materials"]}
+        self.assertEqual(roles(), {"app/a.mp4": "driver", "99/t.png": None})
+        (self.batch / "old.yaml").write_text(f"runs:\n  - slots:\n      character: {staged}\n"
+                                             "      outfit:     ../.smoke/x.jpg\n")
+        self.assertEqual(roles()["99/t.png"], "character")
+        resp, body = self.send("PUT", "/v1/materials/99/t.png/role", json_body={"role": "outfit"})
+        self.assertEqual((resp.status, json.loads(body)["material"]["role"]), (200, "outfit"))
+        self.assertEqual(roles()["99/t.png"], "outfit")
+        self.send("PUT", "/v1/materials/99/t.png/role", json_body={"role": None})
+        self.assertEqual(roles()["99/t.png"], "character", "clearing the tag hands back to history")
+
+    def test_role_refusals(self):
+        resp, body = self.send("PUT", "/v1/materials/99/t.png/role", json_body={"role": "hat"})
+        self.assertEqual((resp.status, json.loads(body)["error"]["code"]), (400, "bad_request"))
+        resp, _ = self.send("PUT", "/v1/materials/99/missing.png/role", json_body={"role": "outfit"})
+        self.assertEqual(resp.status, 404)
+        resp, _ = self.send("PUT", "/v1/materials/app/..%2F99%2Ft.png/role", json_body={"role": "outfit"})
+        self.assertEqual(resp.status, 404)
+
+    def test_deleting_a_material_drops_its_tag(self):
+        self.send("PUT", "/v1/materials/app/a.mp4/role", json_body={"role": "driver"})
+        self.send("DELETE", "/v1/materials/app/a.mp4")
+        tags = json.loads((self.batch / "material-roles.json").read_text())
+        self.assertNotIn("app/a.mp4", tags)
+
     def test_delete_app_material_is_204(self):
         resp, body = self.send("DELETE", "/v1/materials/app/a.mp4")
         self.assertEqual((resp.status, body), (204, b""))
@@ -840,6 +869,16 @@ class TestDraftRoutes(HttpWriteBase):
         self.assertEqual((status, body["batch"]), (200, []))
         status, body = self.request("POST", "/v1/draft/clear")
         self.assertEqual((status, body["slots"]), (200, {}))
+
+    def test_a_slot_assignment_tags_the_material_with_its_role(self):
+        # 2026-09-25: the phone groups its library by role, and a draft slot is
+        # the one moment the role is certain — it must outlive the draft.
+        self.request("PATCH", "/v1/draft", {"slots": {"outfit": "app/dress.png"}})
+        self.request("POST", "/v1/draft/clear")
+        status, body = self.request("GET", "/v1/materials")
+        roles = {m["id"]: m["role"] for m in body["materials"]}
+        self.assertEqual(roles, {"app/dress.png": "outfit", "app/me.png": None,
+                                 "app/dance.mp4": "driver"})
 
     def test_refusal_statuses(self):
         cases = [

@@ -15,15 +15,18 @@ struct MaterialImportBar: View {
     private let allowsLink: Bool
     /// Adds a Files tile; the caller owns the importer (it needs a presenter).
     private let onFiles: (() -> Void)?
+    /// Filed under this role on arrival, so the Materials tab groups it.
+    private let role: MaterialRole?
 
     /// For one pipeline role: Photos filtered to its kind, a link for video.
-    init(kind: PipelineRoleKind, materials: MaterialsStore,
+    init(kind: PipelineRoleKind, role: MaterialRole? = nil, materials: MaterialsStore,
          onImported: @escaping (MotionKit.Material) -> Void) {
         self.materials = materials
         self.onImported = onImported
         photos = kind == .video ? .videos : .images
         allowsLink = kind == .video
         onFiles = nil
+        self.role = role
     }
 
     /// For the Materials tab: any image or video, a link, and Files.
@@ -34,6 +37,7 @@ struct MaterialImportBar: View {
         photos = .any(of: [.images, .videos])
         allowsLink = true
         self.onFiles = onFiles
+        role = nil
     }
 
     @State private var photoItem: PhotosPickerItem?
@@ -155,7 +159,7 @@ struct MaterialImportBar: View {
             defer { photoItem = nil }
             do {
                 if let material = try await MediaImport.upload(item, to: materials) {
-                    onImported(material)
+                    await arrived(material)
                 } else {
                     takeStoreFailure()
                 }
@@ -178,7 +182,7 @@ struct MaterialImportBar: View {
             if let material = await materials.importLink(text) {
                 link = ""
                 withAnimation(.snappy) { showingLink = false }
-                onImported(material)
+                await arrived(material)
             } else {
                 takeStoreFailure()
             }
@@ -188,6 +192,13 @@ struct MaterialImportBar: View {
     /// Moves the store's error here, next to the control that caused it. Left
     /// on the store it would also show in the picker's list-refresh banner,
     /// whose Retry re-reads the list and would not retry the import.
+    private func arrived(_ material: MotionKit.Material) async {
+        if let role, MaterialRole.options(for: material.kind).contains(role) {
+            await materials.setRole(role, for: material)
+        }
+        onImported(material)
+    }
+
     /// Kept on the store when an upload can still resume: the Materials tab's
     /// banner is the only place that offers its Retry / Discard.
     private func takeStoreFailure() {

@@ -117,6 +117,22 @@ public final class MaterialsStore {
         }
     }
 
+    /// Files `material` under `role` (nil hands it back to the server's
+    /// history). The row is replaced with the server's answer.
+    public func setRole(_ role: MaterialRole?, for material: Material) async {
+        do {
+            let updated = try await client.put(
+                MaterialResponse.self, body: MaterialRoleRequest(role: role),
+                "v1", "materials", material.owner, material.name, "role").material
+            if let index = materials.firstIndex(where: { $0.id == updated.id }) {
+                materials[index] = updated
+            }
+            errorMessage = nil
+        } catch {
+            errorMessage = error.userMessage
+        }
+    }
+
     public func resumePendingUpload() async {
         guard !isUploading else { return }
         hasPendingUpload = await uploader.hasPendingUpload()
