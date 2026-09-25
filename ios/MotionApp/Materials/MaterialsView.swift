@@ -8,6 +8,7 @@ struct MaterialsView: View {
     @State private var photoItem: PhotosPickerItem?
     @State private var showFiles = false
     @State private var deleteCandidate: MotionKit.Material?
+    @State private var previewing: MotionKit.Material?
     @State private var importError: String?
 
     private let columns = [
@@ -32,14 +33,18 @@ struct MaterialsView: View {
                 } else {
                     LazyVGrid(columns: columns, spacing: 20) {
                         ForEach(store.materials) { material in
-                            MaterialCell(store: store, material: material)
-                                .contextMenu {
-                                    if material.canDelete {
-                                        Button("Delete", systemImage: "trash", role: .destructive) {
-                                            deleteCandidate = material
-                                        }
+                            Button { previewing = material } label: {
+                                MaterialCell(store: store, material: material)
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityHint(material.kind == .video ? "Plays the video" : "Shows the full image")
+                            .contextMenu {
+                                if material.canDelete {
+                                    Button("Delete", systemImage: "trash", role: .destructive) {
+                                        deleteCandidate = material
                                     }
                                 }
+                            }
                         }
                     }
                 }
@@ -57,6 +62,9 @@ struct MaterialsView: View {
             onCompletion: importFile)
         .onChange(of: photoItem) { _, item in importPhoto(item) }
         .task { await store.refresh() }
+        .fullScreenCover(item: $previewing) { material in
+            MaterialPreview(material: material, materials: store)
+        }
         .confirmationDialog(
             "Delete this material?",
             isPresented: Binding(

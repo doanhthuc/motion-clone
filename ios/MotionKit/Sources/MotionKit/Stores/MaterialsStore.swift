@@ -12,7 +12,8 @@ public final class MaterialsStore {
     public private(set) var hasPendingUpload = false
     public private(set) var isImportingLink = false
 
-    private let client: APIClient
+    /// Public so a view can build an authenticated player for a material.
+    public let client: APIClient
     private let uploader: Uploader
     private var thumbnails: [String: Data] = [:]
     private var warnings: [String: String] = [:]

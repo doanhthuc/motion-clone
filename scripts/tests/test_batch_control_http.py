@@ -750,6 +750,27 @@ class TestMaterialRoutes(HttpWriteBase):
         self.assertEqual(sorted(m["id"] for m in json.loads(body)["materials"]),
                          ["99/t.png", "app/a.mp4"])
 
+    def test_material_file_is_served_with_ranges_for_any_owner(self):
+        # 2026-09-25: the app plays a video material instead of only its
+        # poster frame, so the file itself is served — Range included, since
+        # AVPlayer asks for nothing else.
+        (self.batch / "tg-staging" / "app" / "a.mp4").write_bytes(b"0123456789")
+        resp, body = self.send("GET", "/v1/materials/app/a.mp4", headers={"Range": "bytes=2-5"})
+        self.assertEqual((resp.status, body), (206, b"2345"))
+        self.assertEqual(resp.getheader("Content-Range"), "bytes 2-5/10")
+        resp, body = self.send("GET", "/v1/materials/99/t.png")
+        self.assertEqual((resp.status, body), (200, b"i"))
+
+    def test_material_file_outside_staging_is_404(self):
+        for path in ("/v1/materials/app/..%2F99%2Ft.png", "/v1/materials/..%2Fr1.yaml/x",
+                     "/v1/materials/app/missing.mp4"):
+            resp, _ = self.send("GET", path)
+            self.assertEqual(resp.status, 404, path)
+
+    def test_material_range_requests_stay_out_of_the_log(self):
+        self.send("GET", "/v1/materials/app/a.mp4", headers={"Range": "bytes=0-0"})
+        self.assertFalse(any("/v1/materials/app/a.mp4" in line for line in self.logged))
+
     def test_delete_app_material_is_204(self):
         resp, body = self.send("DELETE", "/v1/materials/app/a.mp4")
         self.assertEqual((resp.status, body), (204, b""))

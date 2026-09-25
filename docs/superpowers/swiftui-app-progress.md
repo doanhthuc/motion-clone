@@ -100,6 +100,12 @@ field or store changed.
 - **Gates run 2026-09-25:** `make ios-build`; `make ios-test` (280/280); `make ios-ui-test`
   (6/6, 0 skipped); `make batch-test` (2191 OK). No live TikTok download through the phone yet —
   it needs the deploy.
+- **Material preview (follow-up PR).** Tapping a material in the Materials tab opens
+  `MaterialPreview`: a video plays with the system controls, an image loads at full resolution.
+  In the pickers, where a tap selects, it is behind a long-press → Play/Preview. It streams
+  from the new `GET /v1/materials/{owner}/{name}` through the same
+  `AuthenticatedAssetResourceLoader` the Outputs feed uses, now keyed by a path instead of
+  batch/file.
 
 ## Phase status
 

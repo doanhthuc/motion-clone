@@ -75,7 +75,8 @@ class _Handler(BaseHTTPRequestHandler):
         # args[1] is the status code.
         if len(args) >= 2 and args[1] in ("200", "206"):
             parts = urlsplit(self.path).path.split("/")
-            if len(parts) == 5 and parts[1] == "v1" and parts[2] == "outputs":
+            # Same for a material played in the app (GET /v1/materials/<owner>/<name>).
+            if len(parts) == 5 and parts[1] == "v1" and parts[2] in ("outputs", "materials"):
                 return
         self.server.log("api: " + fmt % args)
 
@@ -374,6 +375,17 @@ class _Handler(BaseHTTPRequestHandler):
             try:
                 self._settle_body()
                 return send_file(self, thumb)
+            except FileNotFoundError:
+                raise NOT_FOUND
+        if method == "GET" and len(rest) == 3 and rest[0] == "materials":
+            # The file itself, with Range (send_file), so the app can play a
+            # video material instead of only showing its poster frame.
+            path = materials.resolve_material(s.staging_root, rest[1], rest[2])
+            if path is None:
+                raise NOT_FOUND
+            try:
+                self._settle_body()
+                return send_file(self, path)
             except FileNotFoundError:
                 raise NOT_FOUND
         if method == "DELETE" and len(rest) == 3 and rest[0] == "materials":
