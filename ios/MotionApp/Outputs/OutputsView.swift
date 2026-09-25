@@ -22,7 +22,7 @@ struct OutputsView: View {
                     SectionLabel(text: batch.batch)
                     ForEach(batch.files) { file in
                         NavigationLink {
-                            OutputPlayerView(client: store.client, batch: batch.batch, file: file)
+                            OutputFeedView(client: store.client, batch: batch, startAt: file)
                         } label: {
                             HStack(spacing: 12) {
                                 Image(systemName: file.isVideo ? "play.rectangle.fill" : "photo")
