@@ -1,6 +1,7 @@
 import AVFoundation
 import MotionKit
 import Observation
+import UIKit
 
 /// One looping video in the outputs feed. Owns its player, its authenticated
 /// byte loader and the clock the scrub bar reads.
@@ -53,10 +54,12 @@ final class FeedClip {
         if let size = player.currentItem?.presentationSize, size != videoSize { videoSize = size }
     }
 
-    /// The page scrolled into view: always start playing, even if it was tapped paused before.
+    /// The page scrolled into view: start playing, even if it was tapped paused before,
+    /// unless Settings › Accessibility › Motion › Auto-Play Video Previews is off. Then
+    /// the page lands paused and the play icon says so.
     func activate() {
-        userPaused = false
-        player.play()
+        userPaused = !UIAccessibility.isVideoAutoplayEnabled
+        if !userPaused { player.play() }
     }
 
     /// The page scrolled away: stop and rewind, so coming back starts from the top.
@@ -99,6 +102,14 @@ final class FeedClip {
                 self.resume()
             }
         }
+    }
+
+    /// A jump without a drag, for VoiceOver's adjustable action. Leaves the
+    /// play/pause state as it was.
+    func seek(to fraction: Double) {
+        guard duration > 0 else { return }
+        time = min(1, max(0, fraction)) * duration
+        player.seek(to: CMTime(seconds: time, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
     }
 
     func teardown() {
