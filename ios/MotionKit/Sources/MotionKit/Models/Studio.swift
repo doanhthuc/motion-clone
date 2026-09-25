@@ -3,7 +3,7 @@ import Foundation
 /// Image Studio (spec 2026-09-26). The server names every file; the phone
 /// only ever sends `{kind, id}` references.
 public enum StudioRefKind: String, Codable, Sendable, Hashable {
-    case material, tryon, studio
+    case material, tryon, studio, snapshot
     case runTryon = "run_tryon"
 }
 

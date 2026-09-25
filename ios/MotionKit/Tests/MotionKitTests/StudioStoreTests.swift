@@ -113,5 +113,95 @@ extension URLProtocolTests {
         #expect(id == "p2")
         #expect(store.project?.id == "p2")
     }
+
+    final class RequestGate: @unchecked Sendable {
+        let release = DispatchSemaphore(value: 0)
+    }
+
+    /// A send in flight (up to 3 x 60 s) must not land in whatever project
+    /// happens to be open when the 202 arrives, and must not wipe a prompt
+    /// the user has since typed for whatever they switched to.
+    ///
+    /// The switch itself is `close()`, not a second `open(_:)` — `StubURLProtocol`
+    /// serialises requests through one session, so a real concurrent `open`
+    /// while the POST above is held open never gets its `startLoading()` called
+    /// until the POST's does, and the test hangs until `APIClient.get`'s own
+    /// 30 s timeout. `close()` produces the exact same `project?.id != pid`
+    /// the fix guards against, with no network involved.
+    @Test func sendDuringAProjectSwitchOnlyAffectsTheProjectItWasSentFor() async {
+        let gate = RequestGate()
+        StubURLProtocol.install { request in
+            let path = request.url?.path ?? ""
+            switch (request.httpMethod ?? "GET", path) {
+            case ("GET", "/v1/studio/models"): return TestSupport.json(Self.catalog)
+            case ("GET", "/v1/studio/projects"):
+                return TestSupport.json(#"{"projects":[]}"#)
+            case ("GET", "/v1/studio/projects/p1"):
+                return TestSupport.json(Self.project(status: "running"))
+            case ("POST", "/v1/studio/projects/p1/generations"):
+                gate.release.wait()   // held open until the test has switched away from p1
+                return TestSupport.json(#"{"generation":{"id":"g2","created_at":5,"prompt":"blue","model":"nano-banana-2","aspect":"9:16","count":1,"refs":[],"slots":[{"status":"queued"}],"status":"running","unit_price_usd":0.101,"est_cost_usd":0.101}}"#, status: 202)
+            default: return (404, [:], Data())
+            }
+        }
+        let store = StudioStore(client: TestSupport.client(), sleep: { _ in }, makeKey: { "key-1" }, autoPoll: false)
+        await store.loadCatalog()
+        await store.open("p1")
+        store.prompt = "blue"
+        store.count = 1
+
+        let sending = Task { await store.send() }
+        while StubURLProtocol.requests.filter({ $0.httpMethod == "POST" }).isEmpty {
+            await Task.yield()
+        }
+        store.close()
+        store.prompt = "green"   // typed after leaving p1, while its send is still in flight
+        gate.release.signal()
+        let ok = await sending.value
+
+        #expect(ok)
+        #expect(store.project == nil)
+        #expect(store.prompt == "green")
+    }
+
+    /// Retry must resend the failed generation's own snapshot copies, not the
+    /// original `{kind, id}` — those can be gone (a pruned material, a deleted
+    /// try-on library entry) by the time the user retries.
+    @Test func retrySendsSnapshotRefsForTheFailedGenerationsCopies() async {
+        struct SentRef: Decodable, Equatable { let kind: String; let id: String }
+        struct SentBody: Decodable { let refs: [SentRef] }
+        final class Captured: @unchecked Sendable {
+            private let lock = NSLock()
+            private var body: Data?
+            func set(_ d: Data) { lock.lock(); body = d; lock.unlock() }
+            func get() -> Data? { lock.lock(); defer { lock.unlock() }; return body }
+        }
+        let captured = Captured()
+        StubURLProtocol.install { request in
+            let path = request.url?.path ?? ""
+            switch (request.httpMethod ?? "GET", path) {
+            case ("GET", "/v1/studio/models"): return TestSupport.json(Self.catalog)
+            case ("GET", "/v1/studio/projects"):
+                return TestSupport.json(#"{"projects":[]}"#)
+            case ("GET", "/v1/studio/projects/p1"):
+                return TestSupport.json(Self.project(status: "running"))
+            case ("POST", "/v1/studio/projects/p1/generations"):
+                if let body = request.httpBody { captured.set(body) }
+                return TestSupport.json(#"{"generation":{"id":"g3","created_at":9,"prompt":"red","model":"nano-banana-2","aspect":"9:16","count":1,"refs":[],"slots":[{"status":"queued"}],"status":"running","unit_price_usd":0.101,"est_cost_usd":0.101}}"#, status: 202)
+            default: return (404, [:], Data())
+            }
+        }
+        let store = StudioStore(client: TestSupport.client(), sleep: { _ in }, makeKey: { "key-1" }, autoPoll: false)
+        await store.loadCatalog()
+        await store.open("p1")
+        let gen = try! #require(store.project?.generations.first)
+
+        let ok = await store.retry(gen)
+
+        #expect(ok)
+        let body = try! #require(captured.get())
+        let sent = try! JSONDecoder().decode(SentBody.self, from: body)
+        #expect(sent.refs == [SentRef(kind: "snapshot", id: "p1/g1-0.png")])
+    }
 }
 }

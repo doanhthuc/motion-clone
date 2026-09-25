@@ -28,6 +28,13 @@ public final class StudioStore {
     private let makeKey: @Sendable () -> String
     private var images: [String: Data] = [:]
     private var pollTask: Task<Void, Never>?
+    /// Bumped every time a poll task is started. A finishing task only clears
+    /// `pollTask` if it's still the one it started as — otherwise a cancelled
+    /// task (e.g. from `close()`) finishing after a newer one was already
+    /// started (from the following `open()`) would erase that newer task's
+    /// reference, letting a third caller think nothing is polling and start a
+    /// duplicate.
+    private var pollGeneration = 0
     /// Off in tests, which call `pollUntilIdle()` themselves so the request count is exact.
     private let autoPoll: Bool
 
@@ -132,15 +139,27 @@ public final class StudioStore {
 
     public func send() async -> Bool {
         guard canSend else { return false }
+        // Captured before the await: up to 3 attempts x 60 s can outlast the user
+        // switching projects, and a prompt they've since typed into the newly
+        // opened project must survive this send finishing, not be wiped by it.
+        let startedProject = project?.id
         let ok = await post(prompt: prompt, model: modelKey, aspect: aspect, count: count, refs: attachments)
-        if ok { prompt = "" }
+        if ok && project?.id == startedProject { prompt = "" }
         return ok
     }
 
     /// A new generation with the failed one's parameters and the same references.
+    /// Refs are resent as `snapshot`s of the failed generation's own copies —
+    /// never the original `{kind, id}` — so retry still works after the source
+    /// material was pruned or the try-on library entry it pointed at was deleted.
     public func retry(_ generation: StudioGeneration) async -> Bool {
-        await post(prompt: generation.prompt, model: generation.model, aspect: generation.aspect,
-                   count: generation.count, refs: generation.refs)
+        guard let pid = project?.id else { return false }
+        let refs = generation.refs.map { ref -> StudioRef in
+            guard let file = ref.file else { return ref }
+            return StudioRef(kind: .snapshot, id: "\(pid)/\(file)")
+        }
+        return await post(prompt: generation.prompt, model: generation.model, aspect: generation.aspect,
+                          count: generation.count, refs: refs)
     }
 
     private func post(prompt: String, model: String, aspect: String, count: Int, refs: [StudioRef]) async -> Bool {
@@ -162,8 +181,13 @@ public final class StudioStore {
             case .http(status: 202, body: let data):
                 guard let gen = try? MotionJSON.decoder.decode(StudioGenerationResponse.self, from: data).generation
                 else { message = "The server's answer couldn't be read."; return false }
-                project?.generations.append(gen)
-                startPolling()
+                // The open project may have changed while this was in flight (up to
+                // 3 x 60 s): only fold the generation into the project it was sent
+                // for, never into whatever project happens to be open now.
+                if project?.id == pid {
+                    project?.generations.append(gen)
+                    startPolling()
+                }
                 return true
             case .http(status: let status, body: let data):
                 message = APIClient.error(status: status, body: data).userMessage
@@ -180,9 +204,12 @@ public final class StudioStore {
 
     private func startPolling() {
         guard autoPoll, hasRunning, pollTask == nil else { return }
+        pollGeneration += 1
+        let generation = pollGeneration
         pollTask = Task { [weak self] in
             await self?.pollUntilIdle()
-            self?.pollTask = nil
+            guard let self, self.pollGeneration == generation else { return }
+            self.pollTask = nil
         }
     }
 
@@ -195,6 +222,10 @@ public final class StudioStore {
                   project?.id == id else { continue }
             project = fresh
         }
+        // A cancelled task (e.g. `close()`) has nothing left to refresh, and
+        // `loadProjects()` can set `message` on failure — noise for a screen
+        // the phone has already left.
+        guard !Task.isCancelled else { return }
         await loadProjects()
     }
 
@@ -223,6 +254,8 @@ public final class StudioStore {
             data = try? await client.data("v1", "runs", parts[0], "tryon", parts[1])
         case .studio where parts.count == 2:
             data = try? await client.data("v1", "studio", "projects", parts[0], "images", parts[1])
+        case .snapshot where parts.count == 2:
+            data = try? await client.data("v1", "studio", "projects", parts[0], "refs", parts[1])
         default:
             data = nil
         }

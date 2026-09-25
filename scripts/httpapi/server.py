@@ -458,6 +458,8 @@ class _Handler(BaseHTTPRequestHandler):
             path = s.app_runs.tryon_image(*ident.split("/"))
         elif kind == "studio" and ident.count("/") == 1:
             path = s.studio.resolve_image(*ident.split("/"))
+        elif kind == "snapshot" and ident.count("/") == 1:
+            path = s.studio.resolve_ref(*ident.split("/"))
         if path is None:
             raise ApiError(422, "ref_not_found", f"reference not found: {kind} {ident}")
         if path.suffix.lower() not in materials.IMAGE_SUFFIXES:

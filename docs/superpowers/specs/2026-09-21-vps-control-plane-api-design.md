@@ -512,12 +512,16 @@ the run flow above, Image Studio projects and their images live under `batch/stu
   ref_not_found|ref_not_image`; `409 outcome_unknown` (idempotency, same meaning as every other
   money-spending route in §5.5).
 
-**Four reference kinds**, resolved server-side so the phone names things, never paths
+**Five reference kinds**, resolved server-side so the phone names things, never paths
 (`_studio_ref_path`): `material` (`owner/name` in `tg-staging`), `tryon` (an id in the try-on
-library), `run_tryon` (`run_id/index`, the current run's live try-on preview), and `studio`
-(`project_id/image_id`, a previous Studio generation reused as a reference). Any resolved path whose
-suffix is outside `materials.IMAGE_SUFFIXES` is `422 ref_not_image` — a video material named as a
-reference, for instance.
+library), `run_tryon` (`run_id/index`, the current run's live try-on preview), `studio`
+(`project_id/image_id`, a previous Studio generation reused as a reference), and `snapshot`
+(`project_id/file`, a generation's own copied reference — `control/studio.py`'s
+`add_generation` already snapshots every ref into `refs/` so a job's inputs survive the source being
+pruned; `snapshot` is how the *phone* points at that copy, so Retry keeps working after the original
+material is pruned or its try-on library entry is deleted, by resending the snapshot instead of the
+now-gone original `{kind, id}`). Any resolved path whose suffix is outside `materials.IMAGE_SUFFIXES`
+is `422 ref_not_image` — a video material named as a reference, for instance.
 
 **Idempotency scope:** `studio-generate`, in its own `IdempotencyStore(batch_dir / "idempotency")` —
 the same directory the run flow's store uses (`tgbot/bot.py`'s `IdempotencyStore(ROOT / "batch" /

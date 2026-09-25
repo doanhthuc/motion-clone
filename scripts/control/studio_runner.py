@@ -23,7 +23,7 @@ from control.studio import StudioError, StudioStore
 MAX_REF_SIDE = 2048
 MAX_COUNT = 4
 MAX_PROMPT = 4000
-REF_KINDS = ("material", "tryon", "run_tryon", "studio")
+REF_KINDS = ("material", "tryon", "run_tryon", "studio", "snapshot")
 # Qwen `size` is "W*H" with total pixels <= 2048*2048 (Bailian Qwen Image 3.0 reference,
 # read 2026-09-26). Gemini takes the ratio string itself.
 ASPECTS = {"16:9": "2048*1152", "4:3": "2048*1536", "1:1": "2048*2048",

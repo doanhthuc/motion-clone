@@ -141,6 +141,22 @@ class TestStudioRoutes(StudioHttpBase):
         self.assertEqual(status, 202, body)
         self.assertEqual(len(body["generation"]["refs"]), 2)
 
+    def test_snapshot_ref_survives_the_source_material_being_pruned(self):
+        pid = self.new_project()
+        status, body = self.generate(pid, {"prompt": "x", "model": "nano-banana-2", "aspect": "1:1",
+                                           "count": 1,
+                                           "refs": [{"kind": "material", "id": "app/me.png"}]})
+        self.assertEqual(status, 202, body)
+        self.assertTrue(self.server.studio_runner.wait_idle(5))
+        gen = body["generation"]
+        snapshot_file = gen["refs"][0]["file"]
+        (self.batch / "tg-staging" / "app" / "me.png").unlink()   # pruned, as materials are after 7 days
+        status, body = self.generate(pid, {"prompt": "y", "model": "nano-banana-2", "aspect": "1:1",
+                                           "count": 1,
+                                           "refs": [{"kind": "snapshot", "id": f"{pid}/{snapshot_file}"}]},
+                                     key="k-2")
+        self.assertEqual(status, 202, body)
+
     def test_promote_to_material_and_tryon(self):
         pid = self.new_project()
         self.generate(pid, {"prompt": "x", "model": "nano-banana-2", "aspect": "1:1", "count": 1})
