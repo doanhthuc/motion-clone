@@ -3,8 +3,8 @@ import MotionKit
 import Observation
 import UIKit
 
-/// One looping video in the outputs feed. Owns its player, its authenticated
-/// byte loader and the clock the scrub bar reads.
+/// One looping video — an output in the feed or a material in its preview.
+/// Owns its player, its authenticated byte loader and the clock the scrub bar reads.
 @MainActor @Observable
 final class FeedClip {
     let player: AVPlayer
@@ -23,8 +23,9 @@ final class FeedClip {
 
     var fraction: Double { duration > 0 ? min(1, max(0, time / duration)) : 0 }
 
-    init(client: APIClient, batch: String, fileName: String) {
-        loader = AuthenticatedAssetResourceLoader(client: client, path: ["v1", "outputs", batch, fileName])
+    /// `path` is the file's API path, e.g. `["v1", "outputs", batch, file]`.
+    init(client: APIClient, path: [String]) {
+        loader = AuthenticatedAssetResourceLoader(client: client, path: path)
         let item = AVPlayerItem(asset: loader.makeAsset())
         player = AVPlayer(playerItem: item)
         // Loop by seeking back at the end rather than with AVPlayerLooper: the
@@ -146,7 +147,7 @@ final class FeedPlayback {
             clips.removeValue(forKey: key)?.teardown()
         }
         for key in keep where clips[key] == nil {
-            clips[key] = FeedClip(client: client, batch: batch, fileName: key)
+            clips[key] = FeedClip(client: client, path: ["v1", "outputs", batch, key])
         }
         focused = id
         for (key, clip) in clips {

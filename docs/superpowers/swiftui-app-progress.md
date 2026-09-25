@@ -101,7 +101,10 @@ field or store changed.
   (6/6, 0 skipped); `make batch-test` (2191 OK). No live TikTok download through the phone yet —
   it needs the deploy.
 - **Material preview (follow-up PR).** Tapping a material in the Materials tab opens
-  `MaterialPreview`: a video plays with the system controls, an image loads at full resolution.
+  `MaterialPreview`: a video plays in the Outputs feed's player (tap to pause, loops, the same
+  `ScrubBar` in a black strip — not AVKit's controls, so the two players match), and an image loads
+  at full resolution. `PlayerSurface`, `ScrubBar` and `ClipSurface` live in their own files under
+  `Outputs/`, and `FeedClip` takes an API path.
   In the pickers, where a tap selects, it is behind a long-press → Play/Preview. It streams
   from the new `GET /v1/materials/{owner}/{name}` through the same
   `AuthenticatedAssetResourceLoader` the Outputs feed uses, now keyed by a path instead of
