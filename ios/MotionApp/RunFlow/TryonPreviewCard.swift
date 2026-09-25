@@ -11,45 +11,52 @@ struct TryonPreviewCard: View {
     @State private var confirmDrop = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text(preview.run).font(Theme.mono(12, .semibold)).foregroundStyle(Theme.ink1)
-                if flow.isSeeded(preview) {
-                    Text("Saved try-on").font(Theme.mono(10, .semibold)).foregroundStyle(Theme.lime)
-                        .accessibilityIdentifier("tryon.seeded.\(preview.index)")
+        Section {
+            Group {
+                if let image {
+                    Image(uiImage: image).resizable().scaledToFit()
+                        .clipShape(.rect(cornerRadius: Theme.Radius.small))
+                        .frame(maxWidth: .infinity)
+                } else if preview.hasImage {
+                    ProgressView().frame(maxWidth: .infinity, minHeight: 200)
+                } else {
+                    Text(preview.status == .error ? "Try-on failed for this job." : "No image yet.")
+                        .font(.subheadline).foregroundStyle(Theme.secondary)
                 }
-                Spacer()
-                StageDot(status: preview.status)
             }
-            if let image {
-                Image(uiImage: image).resizable().scaledToFit()
-                    .clipShape(.rect(cornerRadius: 12))
-            } else if preview.hasImage {
-                ProgressView().frame(maxWidth: .infinity, minHeight: 200)
-            } else {
-                Text(preview.status == .error ? "Try-on failed for this job." : "No image yet.")
-                    .font(Theme.sans(13)).foregroundStyle(Theme.ink2)
+            .task(id: "\(preview.index)#\(flow.imageGeneration)#\(preview.hasImage)") {
+                guard preview.hasImage else { image = nil; return }
+                image = await flow.image(index: preview.index).flatMap(UIImage.init(data:))
             }
-            if preview.hasImage {
-                HStack(spacing: 10) {
-                    Button(flow.isKept(preview.index) ? "Saved" : "Keep") {
-                        Task { await flow.keep(index: preview.index) }
-                    }
-                    .buttonStyle(SecondaryButtonStyle())
-                    .disabled(flow.isKept(preview.index))
-                    Button("Versions") {
-                        showVersions.toggle()
-                        if showVersions { Task { await flow.loadVersions(index: preview.index) } }
-                    }
-                    .buttonStyle(SecondaryButtonStyle())
+            .sheet(isPresented: $showRegenerate) { regenerateSheet }
+            // On the always-present first row, not on the trigger: that button
+            // lives in a conditional branch and disables itself the moment
+            // `isDropping` flips.
+            .confirmationDialog("Drop \(preview.run) from the batch?", isPresented: $confirmDrop, titleVisibility: .visible) {
+                Button("Drop", role: .destructive) {
+                    confirmDrop = false
+                    Task { await flow.drop(preview) }
                 }
+                Button("Cancel", role: .cancel) { confirmDrop = false }
+            } message: {
+                Text("Free — nothing is rented yet. The draft is validated again, and Confirm then rents only what is left.")
             }
             if !(preview.shares?.isEmpty ?? true) {
                 Text("Used by \((preview.shares?.count ?? 0) + 1) videos")
-                    .font(Theme.mono(11)).foregroundStyle(Theme.ink2)
+                    .font(.subheadline).foregroundStyle(Theme.secondary)
+            }
+            if preview.hasImage {
+                Button(flow.isKept(preview.index) ? "Saved to library" : "Keep") {
+                    Task { await flow.keep(index: preview.index) }
+                }
+                .disabled(flow.isKept(preview.index))
+                Button(showVersions ? "Hide versions" : "Versions") {
+                    showVersions.toggle()
+                    if showVersions { Task { await flow.loadVersions(index: preview.index) } }
+                }
+                if showVersions { versionStrip }
             }
             Button("Regenerate…") { showRegenerate = true }
-                .buttonStyle(SecondaryButtonStyle())
                 .disabled(!flow.canSpend)
             // `RunFlow.canDropFromBatch(_:)` requires `!isDropping`, so without
             // the second term the control would disappear the instant a drop
@@ -58,38 +65,30 @@ struct TryonPreviewCard: View {
             // outlives the writes on purpose.
             if flow.canDropFromBatch(preview) || flow.isDropping {
                 Button(flow.isDropping ? "Dropping…" : "Drop from batch", role: .destructive) { confirmDrop = true }
-                    .buttonStyle(SecondaryButtonStyle())
                     .disabled(!flow.canDropFromBatch(preview) || flow.batchEntry(for: preview) == nil)
                     .accessibilityIdentifier("tryon.drop.\(preview.index)")
                 if flow.batchEntry(for: preview) == nil {
-                    Text("Draft changed — reload").font(Theme.mono(10)).foregroundStyle(Theme.amber)
+                    Text("Draft changed — reload").font(.footnote).foregroundStyle(Theme.warning)
                 }
             }
-            if showVersions { versionStrip }
-        }
-        .padding(14).card()
-        .task(id: "\(preview.index)#\(flow.imageGeneration)#\(preview.hasImage)") {
-            guard preview.hasImage else { image = nil; return }
-            image = await flow.image(index: preview.index).flatMap(UIImage.init(data:))
-        }
-        .sheet(isPresented: $showRegenerate) { regenerateSheet }
-        // On the card, not on the trigger: that button lives in a conditional
-        // branch and disables itself the moment `isDropping` flips.
-        .confirmationDialog("Drop \(preview.run) from the batch?", isPresented: $confirmDrop, titleVisibility: .visible) {
-            Button("Drop", role: .destructive) {
-                confirmDrop = false
-                Task { await flow.drop(preview) }
+        } header: {
+            HStack(spacing: 8) {
+                Text(preview.run).lineLimit(1).truncationMode(.middle)
+                if flow.isSeeded(preview) {
+                    Label("Saved try-on", systemImage: "photo.badge.checkmark")
+                        .labelStyle(.titleAndIcon)
+                        .accessibilityIdentifier("tryon.seeded.\(preview.index)")
+                }
+                Spacer()
+                StageDot(status: preview.status).scaleEffect(0.8)
             }
-            Button("Cancel", role: .cancel) { confirmDrop = false }
-        } message: {
-            Text("Free — nothing is rented yet. The draft is validated again, and Confirm then rents only what is left.")
         }
     }
 
     @ViewBuilder private var versionStrip: some View {
         let items = flow.versions[preview.index] ?? []
         if items.isEmpty {
-            Text("No earlier versions.").font(Theme.mono(11)).foregroundStyle(Theme.ink3)
+            Text("No earlier versions.").font(.footnote).foregroundStyle(Theme.secondary)
         } else {
             ScrollView(.horizontal) {
                 HStack(spacing: 8) {
@@ -97,9 +96,9 @@ struct TryonPreviewCard: View {
                         VStack(spacing: 4) {
                             if let ui = UIImage(data: data) {
                                 Image(uiImage: ui).resizable().scaledToFill()
-                                    .frame(width: 72, height: 96).clipShape(.rect(cornerRadius: 8))
+                                    .frame(width: 72, height: 96).clipShape(.rect(cornerRadius: Theme.Radius.small))
                             }
-                            Text("v\(n + 1)").font(Theme.mono(10)).foregroundStyle(Theme.ink2)
+                            Text("v\(n + 1)").font(.footnote.monospacedDigit()).foregroundStyle(Theme.secondary)
                         }
                     }
                 }
@@ -119,7 +118,7 @@ struct TryonPreviewCard: View {
                 }
                 Section {
                     Text("Spends Gemini/Qwen quota again. The current image becomes an earlier version.")
-                        .font(Theme.sans(12)).foregroundStyle(Theme.ink2)
+                        .font(.footnote).foregroundStyle(Theme.secondary)
                 }
             }
             .navigationTitle("Regenerate #\(preview.index)")

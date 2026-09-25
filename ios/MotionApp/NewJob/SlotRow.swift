@@ -1,6 +1,9 @@
 import MotionKit
 import SwiftUI
 
+/// One material slot as a navigation-style row: thumbnail, role, current value,
+/// chevron. An empty slot is neutral — "Missing required" only earns a warning
+/// color once validation says so, not on a form nobody has touched.
 @MainActor
 struct SlotRow: View {
     let role: String
@@ -15,53 +18,46 @@ struct SlotRow: View {
         slot?.materialID != nil && slot?.exists == true
     }
 
+    /// What VoiceOver and the UI smokes read; the visible line is `valueText`.
     private var stateText: String {
         assigned ? (slot?.name ?? "Assigned") : (required ? "Missing required" : "Empty optional")
+    }
+
+    private var valueText: String {
+        if assigned { return slot?.name ?? "Assigned" }
+        return required ? "Choose \(kindNoun)" : "Optional · \(kindNoun)"
     }
 
     var body: some View {
         Button(action: onTap) {
             HStack(spacing: 12) {
                 thumbnailView
-                    .frame(width: 48, height: 48)
-                    .clipShape(.rect(cornerRadius: 10))
+                    .frame(width: 44, height: 44)
+                    .clipShape(.rect(cornerRadius: Theme.Radius.small))
 
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack(spacing: 7) {
-                        Text(displayName(role))
-                            .font(Theme.sans(15, .semibold))
-                            .foregroundStyle(Theme.ink1)
-                        Text(required ? "Required" : "Optional")
-                            .font(Theme.mono(9, .medium))
-                            .foregroundStyle(required ? Theme.amber : Theme.ink3)
-                    }
-
-                    Text(stateText)
-                        .font(Theme.sans(12))
-                        .foregroundStyle(assigned ? Theme.ink2 : (required ? Theme.amber : Theme.ink3))
-                        .lineLimit(1)
-
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(displayName(role))
+                        .font(.body)
+                        .foregroundStyle(Theme.label)
+                    Text(valueText)
+                        .font(.subheadline)
+                        .foregroundStyle(Theme.secondary)
+                        .lineLimit(1).truncationMode(.middle)
                     if let warning = slot?.warning, !warning.isEmpty {
                         Label(warning, systemImage: "exclamationmark.triangle.fill")
-                            .font(Theme.sans(10, .medium))
-                            .foregroundStyle(Theme.amber)
-                            .lineLimit(1)
-                    } else {
-                        Text(kindLabel)
-                            .font(Theme.mono(9))
-                            .foregroundStyle(Theme.ink3)
+                            .font(.footnote)
+                            .foregroundStyle(Theme.warning)
+                            .lineLimit(2)
                     }
                 }
 
                 Spacer(minLength: 0)
-                Text(assigned ? "Change" : "Choose")
-                    .font(Theme.sans(12, .semibold))
-                    .foregroundStyle(Theme.lime)
+                Image(systemName: "chevron.right")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(Theme.tertiary)
             }
-            .padding(11)
-            .card(border: required && !assigned ? Theme.amber.opacity(0.35) : Theme.line)
+            .contentShape(.rect)
         }
-        .buttonStyle(.plain)
         .disabled(disabled)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(displayName(role))
@@ -74,10 +70,10 @@ struct SlotRow: View {
             Image(uiImage: image).resizable().scaledToFill()
         } else {
             ZStack {
-                assigned ? Theme.surface2 : Theme.surface3
+                Theme.surfaceRaised
                 Image(systemName: iconName)
-                    .font(.system(size: 19, weight: .medium))
-                    .foregroundStyle(assigned ? Theme.ink3 : (required ? Theme.amber : Theme.ink3))
+                    .font(.body)
+                    .foregroundStyle(Theme.tertiary)
             }
         }
     }
@@ -90,11 +86,11 @@ struct SlotRow: View {
         }
     }
 
-    private var kindLabel: String {
+    private var kindNoun: String {
         switch kind {
-        case .image: "IMAGE"
-        case .video: "VIDEO"
-        case .unknown: "UNKNOWN TYPE"
+        case .image: "an image"
+        case .video: "a video"
+        case .unknown: "a material"
         }
     }
 

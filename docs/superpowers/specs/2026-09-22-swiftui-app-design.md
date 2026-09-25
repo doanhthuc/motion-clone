@@ -78,6 +78,14 @@ ios/
   for material warnings). Space Grotesk (UI) and JetBrains Mono (numbers, ids, prices) are bundled; both
   are SIL OFL, fine in a public repo. Tabs: Runs · Material · + (New job) · Output · Pod.
 
+  *Amended 2026-09-25 (native design pass).* A rendered-UI audit found the look read as generated: lime
+  in 54 places with eight meanings, amber on every untouched slot, eight corner radii, 31 font
+  size/weight variants down to 9pt, and a bordered card around every row. The app now uses
+  inset-grouped `List`s, SF Pro text styles (Dynamic Type), the system grouped palette for surfaces,
+  two radii (8 media, 12 everything else), and lime only for what is interactive or selected. Both
+  bundled fonts were removed. Tabs are Runs · Materials · New Job · Outputs · Pod. Tokens and the
+  rules they carry live in `ios/MotionApp/Theme.swift`.
+
 ## 3. Screens → API
 
 | Board(s) | Reads | Writes | Notes |

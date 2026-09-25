@@ -1,16 +1,6 @@
 import SwiftUI
 import MotionKit
 
-struct DestructiveButtonStyle: ButtonStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(Theme.sans(14, .semibold)).foregroundStyle(Theme.red)
-            .frame(maxWidth: .infinity).padding(.vertical, 13)
-            .background(Theme.redDim.opacity(configuration.isPressed ? 0.6 : 1), in: .rect(cornerRadius: 12))
-            .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Theme.redLine))
-    }
-}
-
 /// Red, behind a confirmation dialog. Never disabled by a pending spend —
 /// only by a kill already sending or polling (Phase 5 design §4).
 struct KillButton: View {
@@ -23,7 +13,7 @@ struct KillButton: View {
         VStack(alignment: .leading, spacing: 8) {
             Button { confirming = true } label: {
                 HStack(spacing: 8) {
-                    if pod.isKilling { ProgressView().controlSize(.small).tint(Theme.red) }
+                    if pod.isKilling { ProgressView().tint(Theme.danger) }
                     Text(label)
                 }
             }
@@ -57,8 +47,9 @@ struct KillNotice: View {
     let pod: PodStore
     var body: some View {
         if let notice = pod.killNotice {
-            Text(notice.text).font(Theme.sans(13))
-                .foregroundStyle(notice.isError ? Theme.red : Theme.ink2)
+            Text(notice.text).font(.subheadline)
+                .foregroundStyle(notice.isError ? Theme.danger : Theme.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
         if pod.killStillRunning {
             Button("Check again") { Task { await pod.checkKillAgain() } }
@@ -76,14 +67,12 @@ struct KillBanner: View {
         if let kill = pod.unverifiedKill {
             VStack(alignment: .leading, spacing: 8) {
                 Label("Pod may still be billing — check RunPod", systemImage: "exclamationmark.octagon.fill")
-                    .font(Theme.sans(14, .semibold)).foregroundStyle(Theme.red)
-                Text(kill.message).font(Theme.sans(12)).foregroundStyle(Theme.ink1)
+                    .font(.headline).foregroundStyle(Theme.danger)
+                Text(kill.message).font(.subheadline)
                 Button("I checked — the pod is gone") { confirming = true }
-                    .font(Theme.sans(12, .semibold)).foregroundStyle(Theme.lime)
+                    .font(.subheadline.weight(.semibold))
             }
-            .padding(12).frame(maxWidth: .infinity, alignment: .leading)
-            .background(Theme.redDim, in: .rect(cornerRadius: 12))
-            .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Theme.redLine))
+            .heroSurface()
             .padding(.horizontal, 16)
             .accessibilityIdentifier("pod.unverifiedKill")
             .confirmationDialog("Only confirm after checking the RunPod console (or runpodctl get pod).",

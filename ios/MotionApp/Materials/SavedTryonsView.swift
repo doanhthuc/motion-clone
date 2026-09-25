@@ -9,26 +9,23 @@ struct SavedTryonsView: View {
     @Environment(AppModel.self) private var model
     @State private var deleteCandidate: TryonLibraryEntry?
 
-    private let columns = [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)]
+    private let columns = [GridItem(.flexible(), spacing: 12, alignment: .top),
+                           GridItem(.flexible(), spacing: 12, alignment: .top)]
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-                HStack(alignment: .firstTextBaseline) {
-                    Text("Saved try-ons").font(Theme.sans(33, .bold)).foregroundStyle(Theme.ink)
-                    Spacer()
-                    if library.isStale { StaleTag(lastSuccess: library.lastSuccess) }
-                }
+            VStack(alignment: .leading, spacing: 16) {
+                if library.isStale { StaleTag(lastSuccess: library.lastSuccess) }
                 if let message = library.message {
-                    MessageCard(text: message) { library.dismissMessage() }
+                    MessageCard(text: message) { library.dismissMessage() }.heroSurface()
                 }
                 if library.loaded && library.entries.isEmpty {
-                    Text("Nothing saved yet. Tap Keep on a try-on preview to save it here.")
-                        .font(Theme.sans(14)).foregroundStyle(Theme.ink2)
-                        .frame(maxWidth: .infinity).padding(.vertical, 60)
+                    EmptyNote(title: "Nothing saved yet", systemImage: "photo.stack",
+                              message: "Tap Keep on a try-on preview to save it here.")
+                        .padding(.top, 40)
                         .accessibilityIdentifier("saved.empty")
                 } else {
-                    LazyVGrid(columns: columns, spacing: 12) {
+                    LazyVGrid(columns: columns, spacing: 20) {
                         ForEach(library.entries) { entry in
                             SavedTryonTile(entry: entry, library: library, materials: materials,
                                            disabled: draft.isBusy || composer.isRunning,
@@ -37,8 +34,10 @@ struct SavedTryonsView: View {
                     }
                 }
             }
-            .padding(.horizontal, 20)
+            .padding(.horizontal, 16)
+            .padding(.bottom, 24)
         }
+        .background(Theme.bg)
         .refreshable { await library.load() }
         .task {
             await library.load()
@@ -95,35 +94,39 @@ private struct SavedTryonTile: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Group {
-                if let image {
-                    Image(uiImage: image).resizable().scaledToFill()
-                } else {
-                    // `image(id:)` answers nil for both "this entry has no image"
-                    // and "the server was unreachable", so a spinner here would
-                    // read as "still loading" and never resolve.
-                    Rectangle().fill(Theme.surface2)
-                        .overlay(Image(systemName: "photo").foregroundStyle(Theme.ink3))
+            Color.clear
+                .aspectRatio(4 / 5, contentMode: .fit)
+                .overlay {
+                    if let image {
+                        Image(uiImage: image).resizable().scaledToFill()
+                    } else {
+                        // `image(id:)` answers nil for both "this entry has no image"
+                        // and "the server was unreachable", so a spinner here would
+                        // read as "still loading" and never resolve.
+                        Theme.surface.overlay(Image(systemName: "photo").font(.title2)
+                            .foregroundStyle(Theme.tertiary))
+                    }
                 }
+                .clipShape(.rect(cornerRadius: Theme.Radius.small))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(name("character") + " · " + name("outfit"))
+                    .font(.subheadline).lineLimit(1).truncationMode(.middle)
+                Text("\(entry.provider) · \(Date(timeIntervalSince1970: entry.savedAt).formatted(date: .abbreviated, time: .omitted))")
+                    .font(.footnote).foregroundStyle(Theme.secondary)
             }
-            .frame(height: 170).frame(maxWidth: .infinity).clipped()
-            .clipShape(.rect(cornerRadius: 12))
-            Text(name("character") + " · " + name("outfit"))
-                .font(Theme.sans(12, .semibold)).foregroundStyle(Theme.ink1).lineLimit(2)
-            Text("\(entry.provider) · \(Date(timeIntervalSince1970: entry.savedAt).formatted(date: .abbreviated, time: .omitted))")
-                .font(Theme.mono(10)).foregroundStyle(Theme.ink2)
             HStack {
                 Button("Use in job", action: onUse)
-                    .font(Theme.sans(12, .semibold)).foregroundStyle(Theme.lime)
+                    .font(.subheadline.weight(.semibold))
                     .accessibilityIdentifier("saved.use.\(entry.id)")
                     .disabled(disabled)
                 Spacer()
                 Button(role: .destructive, action: onDelete) { Image(systemName: "trash") }
-                    .foregroundStyle(Theme.red)
+                    .foregroundStyle(Theme.secondary)
+                    .accessibilityLabel("Delete")
                     .disabled(disabled)
             }
+            .frame(minHeight: 44)
         }
-        .padding(10).card()
         .task(id: entry.id) { image = await library.image(id: entry.id).flatMap(UIImage.init(data:)) }
     }
 

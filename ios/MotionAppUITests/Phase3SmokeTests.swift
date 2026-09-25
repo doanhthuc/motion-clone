@@ -18,7 +18,7 @@ final class Phase3SmokeTests: XCTestCase {
         XCTAssertNotEqual(app.buttons["Outfit"].value as? String, "Missing required")
 
         selectPipeline(named: "Motion Enhance", in: app)
-        XCTAssertTrue(app.staticTexts["Removed incompatible slots: outfit."].waitForExistence(timeout: 10))
+        XCTAssertTrue(Phase4Draft.revealText("Removed incompatible slots: outfit.", in: app))
 
         selectTryonPipeline(in: app)
         chooseMaterial(for: "Character", in: app)
@@ -43,7 +43,7 @@ final class Phase3SmokeTests: XCTestCase {
         revealButton("Add to batch", in: app).tap()
         _ = revealButton("Drop", in: app)
         revealButton("Validate", in: app).tap()
-        XCTAssertTrue(app.staticTexts["Ready"].waitForExistence(timeout: 15))
+        XCTAssertTrue(Phase4Draft.revealText("Ready", in: app, timeout: 15))
         XCTAssertTrue(app.staticTexts.matching(
             NSPredicate(format: "label CONTAINS[c] %@ AND label CONTAINS[c] %@", "about", "min")
         ).firstMatch.waitForExistence(timeout: 5))
@@ -65,16 +65,17 @@ final class Phase3SmokeTests: XCTestCase {
     @MainActor
     private func clearDraft(in app: XCUIApplication) {
         revealButton("Clear", in: app).tap()
-        XCTAssertTrue(app.staticTexts["0 of 3 required slots assigned"].waitForExistence(timeout: 10)
-            || app.staticTexts["0 of 2 required slots assigned"].waitForExistence(timeout: 1))
+        XCTAssertTrue(Phase4Draft.revealText("0 of 3 required slots assigned", in: app)
+            || Phase4Draft.revealText("0 of 2 required slots assigned", in: app, timeout: 1))
     }
 
     @MainActor
     private func selectTryonPipeline(in app: XCUIApplication) {
-        let current = app.buttons["Pipeline"].value as? String ?? ""
+        let pipeline = revealButton("Pipeline", in: app)
+        let current = pipeline.value as? String ?? ""
         if current.localizedCaseInsensitiveContains("Tryon") { return }
 
-        app.buttons["Pipeline"].tap()
+        pipeline.tap()
         let option = app.buttons.allElementsBoundByIndex.first {
             $0.label.localizedCaseInsensitiveContains("Tryon")
         }
@@ -87,7 +88,7 @@ final class Phase3SmokeTests: XCTestCase {
 
     @MainActor
     private func selectPipeline(named name: String, in app: XCUIApplication) {
-        app.buttons["Pipeline"].tap()
+        revealButton("Pipeline", in: app).tap()
         XCTAssertTrue(app.buttons[name].waitForExistence(timeout: 5))
         app.buttons[name].tap()
         XCTAssertTrue(waitUntil(timeout: 10) {

@@ -45,6 +45,7 @@ final class Phase6SmokeTests: XCTestCase {
         // the exact inverse of `Phase4Draft.chooseMaterial`'s post-condition.
         // Not `readiness`'s "Missing required materials", which is a different
         // element's `accessibilityValue` and Single-only besides.
+        _ = Phase4Draft.revealButton("Character", in: app)
         XCTAssertTrue(Phase4Draft.waitUntil(timeout: 10) {
             (app.buttons["Character"].value as? String) == "Missing required"
         }, "Batch mode's Clear must unassign the shared slots, not just empty the basket"
@@ -73,8 +74,8 @@ final class Phase6SmokeTests: XCTestCase {
         // path, never cleared. Either pipeline's empty count is accepted (tryon = 3
         // required, motion-enhance = 2), as `Phase4Draft.clear(in:)` does.
         guard app.staticTexts["0 jobs"].waitForExistence(timeout: 10),
-              app.staticTexts["0 of 3 required slots assigned"].waitForExistence(timeout: 10)
-                  || app.staticTexts["0 of 2 required slots assigned"].waitForExistence(timeout: 1) else {
+              Phase4Draft.revealText("0 of 3 required slots assigned", in: app)
+                  || Phase4Draft.revealText("0 of 2 required slots assigned", in: app, timeout: 1) else {
             // This one reason covers three different causes, so name the
             // literals: (a) a genuinely non-empty draft, (b) a draft or catalog
             // load failure — `initialLoadFailure` (`NewJobView.swift:71-80`)
@@ -89,7 +90,11 @@ final class Phase6SmokeTests: XCTestCase {
                 + "number of roles.")
         }
 
-        app.segmentedControls["newjob.mode"].buttons["Batch"].tap()
+        // The guard above may have scrolled down to the readiness footer; the
+        // mode control is New Job's first row, so scroll back until it is built.
+        let mode = app.segmentedControls["newjob.mode"]
+        for _ in 0..<6 where !mode.exists { app.swipeDown() }
+        mode.buttons["Batch"].tap()
         Phase4Draft.selectTryonPipeline(in: app)
         Phase4Draft.chooseMaterial(for: "Character", in: app)
         Phase4Draft.chooseMaterial(for: "Driver", in: app)
@@ -117,11 +122,11 @@ final class Phase6SmokeTests: XCTestCase {
         run.tap()
         // Two sequential PATCH + add-to-batch round-trips, then the
         // outfit-clearing PATCH; a slow draft probe can make each one linger.
-        XCTAssertTrue(app.staticTexts["Added 2 jobs to the batch."].waitForExistence(timeout: 120))
-        // `SectionLabel` renders `Text(text.uppercased())` (`StatusViews.swift`),
-        // so the basket header reads "BATCH · 2", not "Batch · 2". XCUITest's
-        // subscript match is exact — do not "fix" the case back.
-        XCTAssertTrue(app.staticTexts["BATCH · 2"].waitForExistence(timeout: 15))
+        XCTAssertTrue(Phase4Draft.revealText("Added 2 jobs to the batch.", in: app, timeout: 120))
+        // The basket is a `List` section whose header is sentence case
+        // (`RootView` sets `.textCase(nil)`), so it reads "Batch · 2". XCUITest's
+        // subscript match is exact — the case matters.
+        XCTAssertTrue(Phase4Draft.revealText("Batch · 2", in: app, timeout: 15))
 
         // Two basket entries means two "Drop" buttons, so scope to the first;
         // `app.buttons["Drop"]` would be an ambiguous query a tap cannot
@@ -135,14 +140,14 @@ final class Phase6SmokeTests: XCTestCase {
         firstDrop.tap()
         XCTAssertTrue(app.sheets["Drop this batch entry?"].waitForExistence(timeout: 5))
         app.sheets["Drop this batch entry?"].buttons["Drop"].tap()
-        XCTAssertTrue(app.staticTexts["BATCH · 1"].waitForExistence(timeout: 15))
+        XCTAssertTrue(Phase4Draft.revealText("Batch · 1", in: app, timeout: 15))
 
         // Leave the live draft empty, as the Phase 3-5 smokes do. Batch mode
         // clears directly now; the drop's DELETE and trailing refresh can still
         // hold `store.isBusy` true, which `clearFromBatch` waits out.
         clearFromBatch(app)
 
-        app.tabBars.buttons["Material"].tap()
+        app.tabBars.buttons["Materials"].tap()
         // Phase 6 nested MaterialsView inside MaterialTabView, one level deeper
         // under the NavigationStack. SwiftUI still propagates its `.toolbar`
         // item to the enclosing stack, so the import control ("Add material",
@@ -157,11 +162,11 @@ final class Phase6SmokeTests: XCTestCase {
         XCTAssertTrue(addMaterial.waitForExistence(timeout: 10),
                       "the Materials toolbar import control survived its MaterialTabView wrapper")
 
-        // "Saved try-ons" is both this segment's label and the screen title
-        // (`SavedTryonsView`), so the static-text query matches twice; tap the
-        // segment by its control and assert the text with `.firstMatch`.
+        // "Saved try-ons" is both this segment's label and, since the native
+        // design pass, the navigation title (`MaterialTabView`), so tap the
+        // segment by its control and assert the switch by the navigation bar.
         app.segmentedControls["material.mode"].buttons["Saved try-ons"].tap()
-        XCTAssertTrue(app.staticTexts["Saved try-ons"].firstMatch.waitForExistence(timeout: 15))
+        XCTAssertTrue(app.navigationBars["Saved try-ons"].waitForExistence(timeout: 15))
 
         XCTAssertEqual(app.descendants(matching: .any)["uitest.recordedSpends"].label, "0",
                        "the recording gate saw no spend")
@@ -186,13 +191,17 @@ final class Phase6SmokeTests: XCTestCase {
         // Same precondition as `testCrossBuildDropAndLibrary` — see its comment
         // for why both "0 jobs" and the readiness line are required together.
         guard app.staticTexts["0 jobs"].waitForExistence(timeout: 10),
-              app.staticTexts["0 of 3 required slots assigned"].waitForExistence(timeout: 10)
-                  || app.staticTexts["0 of 2 required slots assigned"].waitForExistence(timeout: 1) else {
+              Phase4Draft.revealText("0 of 3 required slots assigned", in: app)
+                  || Phase4Draft.revealText("0 of 2 required slots assigned", in: app, timeout: 1) else {
             throw XCTSkip("New Job never rendered an empty draft: expected \"0 jobs\" plus "
                 + "\"0 of 3 required slots assigned\" or \"0 of 2 required slots assigned\".")
         }
 
-        app.segmentedControls["newjob.mode"].buttons["Batch"].tap()
+        // The guard above may have scrolled down to the readiness footer; the
+        // mode control is New Job's first row, so scroll back until it is built.
+        let mode = app.segmentedControls["newjob.mode"]
+        for _ in 0..<6 where !mode.exists { app.swipeDown() }
+        mode.buttons["Batch"].tap()
         Phase4Draft.selectTryonPipeline(in: app)
         Phase4Draft.chooseMaterial(for: "Character", in: app)
         // Driver is deliberately left unfilled as a shared slot: picking at
@@ -226,6 +235,7 @@ final class Phase6SmokeTests: XCTestCase {
         app.buttons["Done"].tap()
 
         let summary = app.staticTexts["batch.summary"]
+        _ = Phase4Draft.revealText("batch.summary", in: app, timeout: 2)
         XCTAssertTrue(Phase4Draft.waitUntil(timeout: 15) {
             summary.exists && summary.label.contains("2 outfits × 2 drivers = 4 videos")
         }, "expected \"2 outfits × 2 drivers = 4 videos\" in the summary, got: \(summary.label)")
@@ -237,7 +247,7 @@ final class Phase6SmokeTests: XCTestCase {
         // Four sequential PATCH + add-to-batch round-trips, then the
         // outfit-and-driver-clearing PATCH; a slow draft probe can make each
         // one linger.
-        XCTAssertTrue(app.staticTexts["Added 4 jobs to the batch."].waitForExistence(timeout: 180))
+        XCTAssertTrue(Phase4Draft.revealText("Added 4 jobs to the batch.", in: app, timeout: 180))
         XCTAssertTrue(app.staticTexts["4 jobs"].waitForExistence(timeout: 15))
 
         clearFromBatch(app)

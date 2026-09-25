@@ -7,7 +7,7 @@ final class OutputFeedSmokeTests: XCTestCase {
     func testFeedPagesBetweenOutputs() throws {
         let app = XCUIApplication()
         app.launch()
-        app.tabBars.buttons["Output"].tap()
+        app.tabBars.buttons["Outputs"].tap()
 
         let video = app.buttons.matching(NSPredicate(format: "label CONTAINS[c] %@", ".mp4")).firstMatch
         XCTAssertTrue(video.waitForExistence(timeout: 20), "no finished video in Outputs")

@@ -40,7 +40,7 @@ No push notifications: Telegram reports progress and results.
 
 ## Materials and uploads
 
-The Material tab lists the global VPS library, including files uploaded through Telegram. Thumbnails
+The Materials tab lists the global VPS library, including files uploaded through Telegram. Thumbnails
 use the same Cloudflare Access and bearer headers as the rest of the app. Only materials whose owner
 is `app` can be deleted; the server keeps an in-use material and shows its `409` explanation.
 
@@ -156,7 +156,7 @@ offers kill, GPU choice and the Network Volume migration. Design:
 ## Phase 6 batch and library
 
 The New Job tab gains a **Single | Batch** segmented control (`newjob.mode`); Single is the Phase 3
-composer, unchanged. The Material tab gains a **Materials | Saved try-ons** split (`material.mode`).
+composer, unchanged. The Materials tab gains a **Materials | Saved try-ons** split (`material.mode`).
 Design: `docs/superpowers/specs/2026-09-23-swiftui-app-phase-6-design.md`.
 
 - **Cross build (Batch mode).** One character (and `background` when the pipeline has it), shared

@@ -7,73 +7,86 @@ struct RentPanelView: View {
     @State private var changingGpu = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            SectionLabel(text: "Rent GPU")
+        Group {
             if let panel = flow.panel {
-                Text("\(panel.jobs) job\(panel.jobs == 1 ? "" : "s") · about \(Int(panel.estimateMin)) min"
-                     + (panel.afterPhaseA ? " · try-on already done" : ""))
-                    .font(Theme.mono(11)).foregroundStyle(Theme.ink2)
-                runpodRow(panel.runpod)
-                vastRow(panel.vast)
-                HStack(spacing: 10) {
+                Section {
+                    runpodRow(panel.runpod)
+                    vastRow(panel.vast)
+                } header: {
+                    Text("Rent GPU")
+                } footer: {
+                    Text("\(panel.jobs) job\(panel.jobs == 1 ? "" : "s") · about \(Int(panel.estimateMin)) min"
+                         + (panel.afterPhaseA ? " · try-on already done" : ""))
+                        .monospacedDigit()
+                }
+                Section {
                     Button("Change GPU") { changingGpu = true }
-                        .buttonStyle(SecondaryButtonStyle())
                         .disabled(flow.isSpending)
                         .accessibilityIdentifier("runflow.changeGpu")
+                        // On the trigger row, not the Group: a modifier on a
+                        // Group applies to every child, so it would present once per section.
+                        .sheet(isPresented: $changingGpu) { gpuSheet }
                     if panel.runpod.soldOut {
-                        Button("Migrate →") {
+                        Button("Migrate the volume…") {
                             model.selectedTab = .pod
                             model.migrateSheet = MigrateRequest(destination: nil)
                         }
-                        .buttonStyle(SecondaryButtonStyle())
                         .accessibilityIdentifier("runflow.migrate")
                     }
                 }
-                if let price = flow.quote(for: flow.selectedProvider) {
-                    // Shown but disabled while any spend is unanswered, so the
-                    // price stays visible next to "Check again".
-                    Button {
-                        Task { await flow.confirm() }
-                    } label: {
-                        Text("Confirm · ~\(Format.usd(price)) quote")
+                Section {
+                    if let price = flow.quote(for: flow.selectedProvider) {
+                        // Shown but disabled while any spend is unanswered, so the
+                        // price stays visible next to "Check again".
+                        Button {
+                            Task { await flow.confirm() }
+                        } label: {
+                            Text("Confirm · ~\(Format.usd(price)) quote").monospacedDigit()
+                        }
+                        .buttonStyle(PrimaryButtonStyle())
+                        .disabled(!flow.canConfirm(flow.selectedProvider))
+                        .accessibilityIdentifier("runflow.confirm")
+                        .buttonRow()
+                    } else if flow.quote(for: .runpod) == nil && flow.quote(for: .vast) == nil {
+                        Label("Nothing can be rented right now.", systemImage: "xmark.octagon")
+                            .font(.headline).foregroundStyle(Theme.danger)
+                            .accessibilityIdentifier("runflow.soldOut")
                     }
-                    .buttonStyle(PrimaryButtonStyle())
-                    .disabled(!flow.canConfirm(flow.selectedProvider))
-                    .accessibilityIdentifier("runflow.confirm")
-                    Text("A quote from the estimate, not the invoice.")
-                        .font(Theme.mono(10)).foregroundStyle(Theme.ink3)
-                        .accessibilityIdentifier("runflow.quote")
-                } else if flow.quote(for: .runpod) == nil && flow.quote(for: .vast) == nil {
-                    Label("Nothing can be rented right now.", systemImage: "xmark.octagon")
-                        .font(Theme.sans(14, .semibold)).foregroundStyle(Theme.red)
-                        .accessibilityIdentifier("runflow.soldOut")
-                }
-                if flow.isSpending {
-                    HStack(spacing: 8) {
-                        ProgressView()
-                        Text(flow.inFlightLabel ?? "").font(Theme.mono(11)).foregroundStyle(Theme.ink2)
+                    if flow.isSpending {
+                        HStack(spacing: 10) {
+                            ProgressView()
+                            Text(flow.inFlightLabel ?? "").font(.subheadline).foregroundStyle(Theme.secondary)
+                        }
+                    }
+                } footer: {
+                    if flow.quote(for: flow.selectedProvider) != nil {
+                        Text("A quote from the estimate, not the invoice.")
+                            .accessibilityIdentifier("runflow.quote")
                     }
                 }
             } else if flow.isLoadingPanel {
-                ProgressView("Reading stock and prices…").frame(maxWidth: .infinity).padding(.top, 30)
+                ProgressView("Reading stock and prices…").frame(maxWidth: .infinity)
+                    .listRowBackground(Color.clear)
             }
         }
-        .sheet(isPresented: $changingGpu) {
-            if let gpu = model.gpu {
-                NavigationStack {
-                    ScrollView {
-                        GpuPickerView(store: gpu, spending: flow.isSpending, hasLease: false,
-                                      onSelected: {
-                                          changingGpu = false
-                                          await flow.reloadPanelAfterGpuChange()
-                                      })
-                        .padding(20)
-                    }
-                    .background(Theme.bg)
-                    .navigationTitle("Change GPU")
-                    .navigationBarTitleDisplayMode(.inline)
-                    .task { if gpu.stock == nil { await gpu.load() } }
+    }
+
+    @ViewBuilder private var gpuSheet: some View {
+        if let gpu = model.gpu {
+            NavigationStack {
+                List {
+                    GpuPickerView(store: gpu, spending: flow.isSpending, hasLease: false,
+                                  onSelected: {
+                                      changingGpu = false
+                                      await flow.reloadPanelAfterGpuChange()
+                                  })
                 }
+                .navigationTitle("Change GPU")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) { Button("Cancel") { changingGpu = false } }
+                }
+                .task { if gpu.stock == nil { await gpu.load() } }
             }
         }
     }
@@ -98,22 +111,24 @@ struct RentPanelView: View {
         return Button {
             flow.selectedProvider = provider
         } label: {
-            VStack(alignment: .leading, spacing: 5) {
-                HStack {
-                    Image(systemName: selected && enabled ? "largecircle.fill.circle" : "circle")
-                        .foregroundStyle(enabled ? Theme.lime : Theme.ink3)
-                    Text(title).font(Theme.sans(15, .semibold)).foregroundStyle(enabled ? Theme.ink : Theme.ink3)
-                    Spacer()
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title).font(.body).foregroundStyle(enabled ? Theme.label : Theme.tertiary)
+                    if !detail.isEmpty {
+                        Text(detail).font(.subheadline.monospacedDigit()).foregroundStyle(Theme.secondary)
+                    }
+                    ForEach(blockers, id: \.self) { b in
+                        Text(b).font(.footnote).foregroundStyle(Theme.warning)
+                    }
                 }
-                if !detail.isEmpty { Text(detail).font(Theme.mono(11)).foregroundStyle(Theme.ink2) }
-                ForEach(blockers, id: \.self) { b in
-                    Text(b).font(Theme.sans(12)).foregroundStyle(Theme.amber)
+                Spacer(minLength: 0)
+                if selected && enabled {
+                    Image(systemName: "checkmark").font(.body.weight(.semibold)).foregroundStyle(Theme.accent)
                 }
             }
-            .padding(14).frame(maxWidth: .infinity, alignment: .leading)
-            .card(border: selected && enabled ? Theme.limeLine : Theme.line)
+            .contentShape(.rect)
         }
-        .buttonStyle(.plain)
         .disabled(!enabled || flow.isSpending)
+        .accessibilityAddTraits(selected && enabled ? .isSelected : [])
     }
 }
