@@ -220,6 +220,7 @@ extension URLProtocolTests {
         await migrate.ask(toDc: "EU-CZ-1")
         migrate.typed = "EU-CZ-1"
         #expect(migrate.canMigrate(at: clock.now))          // ready before the drop
+        #expect(!migrate.dropBlocked)
         await flow.start(.existing)
         let blazer = try #require(flow.tryon?.previews.first { $0.run == "model__blazer" })
 
@@ -232,6 +233,7 @@ extension URLProtocolTests {
         #expect(observed)               // never vacuous: a drop really was in flight
 
         #expect(!migrate.canMigrate(at: clock.now))         // the button is off the glass
+        #expect(migrate.dropBlocked)                        // ...and the sheet can say why
         let stepBefore = migrate.step
         await migrate.migrate()
         #expect(migrate.message == "A batch drop is still in flight — wait for it before moving the volume.")
@@ -242,6 +244,7 @@ extension URLProtocolTests {
         await dropTask
         #expect(!flow.isDropping)
         #expect(migrate.canMigrate(at: clock.now))          // temporary, not sticky
+        #expect(!migrate.dropBlocked)
     }
 
     /// Review Focus 4, the `recheck()` half — the launch-replay half is
