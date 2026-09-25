@@ -33,6 +33,7 @@ struct MaterialCategoryView: View {
         .background(Theme.bg)
         .navigationTitle(group.title)
         .navigationSubtitle("\(items.count)")
+        .navigationBarTitleDisplayMode(.inline)
         .refreshable { await store.refresh() }
         .navigationDestination(item: $previewing) { material in
             MaterialPreview(material: material, materials: store)

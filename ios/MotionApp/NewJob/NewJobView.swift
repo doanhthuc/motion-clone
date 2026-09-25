@@ -29,6 +29,7 @@ struct NewJobView: View {
             }
         }
         .navigationTitle("New Job")
+        .navigationBarTitleDisplayMode(.inline)
         .task { await store.load() }
         .task { await library.load() }
         .refreshable { await store.refresh() }
@@ -107,16 +108,6 @@ struct NewJobView: View {
         // them under the tab bar. The next step is pinned below the list
         // (`NewJobActionBar`) rather than being its last rows.
         return List {
-            Section {
-                Picker("Mode", selection: Binding(get: { model.newJobMode }, set: { model.newJobMode = $0 })) {
-                    Text("Single").tag(NewJobMode.single)
-                    Text("Batch").tag(NewJobMode.batch)
-                }
-                .pickerStyle(.segmented)
-                .accessibilityIdentifier("newjob.mode")
-                .disabled(store.isBusy || composer.isRunning)
-                .buttonRow()
-            }
             banners
             if isBatch {
                 BatchComposerSection(store: store, composer: composer,
@@ -137,8 +128,34 @@ struct NewJobView: View {
                 onProviderSelected: { id in await store.selectProvider(id) })
             batch(draft)
         }
-        .navigationSubtitle("\(draft.jobs) job\(draft.jobs == 1 ? "" : "s")")
+        // An inline bar already separates the first card from the top; the
+        // inset-grouped default added ~35pt of empty band under it.
+        .contentMargins(.top, 8, for: .scrollContent)
+        // One bar row instead of three: the Single | Batch switch stands in
+        // for the title (the tab bar already says "New Job") and the job
+        // count is plain text across from the menu (2026-09-25).
         .toolbar {
+            ToolbarItem(placement: .principal) {
+                Picker("Mode", selection: Binding(get: { model.newJobMode }, set: { model.newJobMode = $0 })) {
+                    Text("Single").tag(NewJobMode.single)
+                    Text("Batch").tag(NewJobMode.batch)
+                }
+                .pickerStyle(.segmented)
+                .fixedSize()
+                .accessibilityIdentifier("newjob.mode")
+                .disabled(store.isBusy || composer.isRunning)
+            }
+            ToolbarItem(placement: .topBarLeading) {
+                Text("\(draft.jobs) job\(draft.jobs == 1 ? "" : "s")")
+                    .font(.subheadline.weight(.semibold).monospacedDigit())
+                    .foregroundStyle(draft.jobs > 0 ? Theme.accent : .secondary)
+                    .fixedSize()
+                    .contentTransition(.numericText())
+                    .animation(.snappy, value: draft.jobs)
+            }
+            // A count, not a control: without this iOS 26 wraps it in the
+            // same glass capsule as the menu and it reads as a button.
+            .sharedBackgroundVisibility(.hidden)
             if store.isStale {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button { Task { await store.refresh() } } label: {

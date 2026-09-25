@@ -30,6 +30,10 @@ struct PodView: View {
             }
         }
         .navigationTitle("Pod")
+        .navigationBarTitleDisplayMode(.inline)
+        // An inline bar already separates the first card from the top; the
+        // inset-grouped default added ~35pt of empty band under it.
+        .contentMargins(.top, 8, for: .scrollContent)
         .refreshable {
             async let a: Void = pod.refresh()
             async let b: Void = balance.load()

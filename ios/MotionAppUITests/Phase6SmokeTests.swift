@@ -157,11 +157,13 @@ final class Phase6SmokeTests: XCTestCase {
         XCTAssertTrue(addMaterial.waitForExistence(timeout: 10),
                       "the Materials import control survived its MaterialTabView wrapper")
 
-        // "Saved try-ons" is both this segment's label and, since the native
-        // design pass, the navigation title (`MaterialTabView`), so tap the
-        // segment by its control and assert the switch by the navigation bar.
-        app.segmentedControls["material.mode"].buttons["Saved try-ons"].tap()
-        XCTAssertTrue(app.navigationBars["Saved try-ons"].waitForExistence(timeout: 15))
+        // The switch sits in the navigation bar in place of a title, so tap
+        // the segment by its control and assert the switch by what left the
+        // hierarchy: MaterialsView's import control goes with it.
+        let savedSegment = app.segmentedControls["material.mode"].buttons["Saved try-ons"]
+        savedSegment.tap()
+        XCTAssertTrue(savedSegment.isSelected)
+        XCTAssertTrue(addMaterial.waitForNonExistence(timeout: 15))
 
         XCTAssertEqual(app.descendants(matching: .any)["uitest.recordedSpends"].label, "0",
                        "the recording gate saw no spend")
