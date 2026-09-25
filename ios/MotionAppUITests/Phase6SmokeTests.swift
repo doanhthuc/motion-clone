@@ -23,15 +23,10 @@ final class Phase6SmokeTests: XCTestCase {
     /// comes from `TG_PIPELINE`.
     @MainActor
     private func clearFromBatch(_ app: XCUIApplication) {
-        let clear = Phase4Draft.revealButton("Clear", in: app)
-        // `revealButton` only waits for `isHittable`. Clear is
+        // `tapClear` waits for the menu item to be enabled: Clear is
         // `.disabled(store.isBusy || composer.isRunning)`, and a tap on a
-        // disabled SwiftUI control is a silent no-op — so wait for `isEnabled`
-        // separately, or the draft stays full and the assertions below are the
-        // only thing that notices.
-        XCTAssertTrue(Phase4Draft.waitUntil(timeout: 10) { clear.isEnabled },
-                      "Clear must re-enable before it is tapped")
-        clear.tap()
+        // disabled SwiftUI control is a silent no-op.
+        Phase4Draft.tapClear(in: app)
         // The load-bearing half. Do not delete it as redundant just because
         // "0 jobs" below already passes: `_jobs` counts the basket plus the
         // edited job only once that job is *complete*

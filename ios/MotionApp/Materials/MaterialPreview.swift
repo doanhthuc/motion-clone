@@ -5,6 +5,7 @@ import SwiftUI
 /// screen above a black strip that holds the scrub bar and the name, tap
 /// pauses, and it loops. An image loads at full resolution. Before 2026-09-25
 /// the app only ever showed a poster frame, so a video could not be watched.
+/// A long press opens the same Save / Share / speed sheet as the feed.
 @MainActor
 struct MaterialPreview: View {
     let material: MotionKit.Material
@@ -17,6 +18,8 @@ struct MaterialPreview: View {
     @State private var clip: FeedClip?
     @State private var image: UIImage?
     @State private var failed = false
+    @State private var exporter = MediaExporter()
+    @State private var showingActions = false
 
     private var path: [String] { ["v1", "materials", material.owner, material.name] }
     private var isVideo: Bool { material.kind == .video }
@@ -41,11 +44,20 @@ struct MaterialPreview: View {
                 .clipped()
                 .contentShape(.rect)
                 .onTapGesture { clip?.togglePause() }
+                .onLongPressGesture(minimumDuration: 0.35) { showingActions = true }
+                .overlay(alignment: .bottom) {
+                    MediaStatusView(exporter: exporter).padding(.horizontal, 16).padding(.bottom, 12)
+                }
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel(material.name)
                 .accessibilityValue(isVideo ? (paused ? "Paused" : "Playing") : "")
                 .accessibilityAddTraits(isVideo ? .startsMediaSession : .isImage)
                 .accessibilityAction(named: paused ? "Play" : "Pause") { clip?.togglePause() }
+                // The long press has no VoiceOver gesture; its two actions do, directly.
+                .accessibilityAction(named: "Save to Photos") {
+                    Task { await exporter.saveToPhotos(isVideo: isVideo, download) }
+                }
+                .accessibilityAction(named: "Share") { Task { await exporter.share(download) } }
             strip
         }
         .background(.black)
@@ -58,6 +70,9 @@ struct MaterialPreview: View {
                 .opacity(0)
                 .accessibilityHidden(true)
         }
+        .mediaActions(isPresented: $showingActions, exporter: exporter, isVideo: isVideo,
+                      rate: clip.map { clip in Binding(get: { clip.rate }, set: { clip.rate = $0 }) },
+                      download: download)
         .task(id: material.id) { await load() }
         .onChange(of: scenePhase) { _, phase in
             phase == .active ? clip?.resume() : clip?.suspend()
@@ -93,6 +108,10 @@ struct MaterialPreview: View {
         }
         .padding(.horizontal, 16)
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func download() async throws -> URL {
+        try await materials.client.download(path[0], path[1], path[2], path[3])
     }
 
     private func load() async {

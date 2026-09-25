@@ -16,11 +16,13 @@ final class OutputFeedSmokeTests: XCTestCase {
         let counter = app.staticTexts.matching(NSPredicate(format: "label MATCHES %@", "\\d+ of \\d+")).firstMatch
         XCTAssertTrue(counter.waitForExistence(timeout: 10))
         XCTAssertFalse(app.tabBars.firstMatch.isHittable, "tab bar should hide over the feed")
-        XCTAssertTrue(app.buttons["Save to Photos"].exists)
-        XCTAssertTrue(app.buttons["Share"].exists)
+        // Save and Share moved off the bar into the long-press sheet on 2026-09-25.
+        XCTAssertFalse(app.navigationBars.buttons["Share"].exists, "no Share over the video")
+        XCTAssertFalse(app.navigationBars.buttons["Save to Photos"].exists, "no Save over the video")
         sleep(4)  // let the first clip buffer and play
         shot("1-first")
         try checkAccessibleControls(app)
+        try checkLongPressSheet(app)
 
         let first = counter.label
         let total = Int(first.split(separator: " ").last ?? "") ?? 1
@@ -70,6 +72,25 @@ final class OutputFeedSmokeTests: XCTestCase {
             XCTAssertTrue(check(Double(at) / Double(of)), "scrub toward \(target) landed at \(scrub.value ?? "")")
         }
         app.typeKey(" ", modifierFlags: [])
+    }
+
+    /// A long press on the video raises the actions sheet, TikTok-style, and it
+    /// goes away again without having saved, shared or paused anything.
+    @MainActor private func checkLongPressSheet(_ app: XCUIApplication) throws {
+        let page = app.otherElements.matching(NSPredicate(format: "value IN %@", ["Playing", "Paused"])).firstMatch
+        XCTAssertTrue(page.waitForExistence(timeout: 5))
+        page.press(forDuration: 0.8)
+        let save = app.buttons["media.save"]
+        XCTAssertTrue(save.waitForExistence(timeout: 5), "long press opens the actions sheet")
+        XCTAssertTrue(app.buttons["media.share"].exists)
+        XCTAssertTrue(app.segmentedControls["media.speed"].exists, "a video offers its speed")
+        shot("4-actions")
+        // Tap above the sheet, on the video, to close it.
+        app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.2)).tap()
+        let gone = NSPredicate(format: "exists == false")
+        expectation(for: gone, evaluatedWith: save)
+        waitForExpectations(timeout: 5)
+        XCTAssertEqual(page.value as? String, "Playing", "closing the sheet did not tap-pause the video")
     }
 
     /// "0:04 of 0:09" → (4, 9) in seconds.

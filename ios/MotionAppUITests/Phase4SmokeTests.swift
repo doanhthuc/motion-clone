@@ -54,9 +54,32 @@ enum Phase4Draft {
     }
 
     @MainActor static func clear(in app: XCUIApplication) {
-        revealButton("Clear", in: app).tap()
+        tapClear(in: app)
         XCTAssertTrue(revealText("0 of 3 required slots assigned", in: app)
             || revealText("0 of 2 required slots assigned", in: app, timeout: 1))
+    }
+
+    /// Clear sits in New Job's "More" menu behind a confirmation since
+    /// 2026-09-25. A menu snapshots its items when it opens, so an item
+    /// disabled while a draft change was in flight stays disabled until the
+    /// menu is reopened — and a tap on it is a silent no-op. Reopen until the
+    /// item is enabled rather than waiting on a stale one.
+    @MainActor static func tapClear(in app: XCUIApplication) {
+        let more = app.buttons["newjob.more"]
+        XCTAssertTrue(more.waitForExistence(timeout: 10), "Missing New Job's More menu")
+        let item = app.buttons["Clear draft"]
+        for _ in 0..<10 {
+            more.tap()
+            XCTAssertTrue(item.waitForExistence(timeout: 5), "Missing Clear draft in More")
+            if item.isEnabled { break }
+            more.tap()
+            Thread.sleep(forTimeInterval: 1)
+        }
+        XCTAssertTrue(item.isEnabled, "Clear draft must be enabled before it is tapped")
+        item.tap()
+        let dialog = app.sheets["Clear the draft?"]
+        XCTAssertTrue(dialog.waitForExistence(timeout: 5))
+        dialog.buttons["Clear"].tap()
     }
 
     @MainActor static func selectTryonPipeline(in app: XCUIApplication) {
@@ -92,15 +115,28 @@ enum Phase4Draft {
 
     @MainActor static func revealButton(_ label: String, in app: XCUIApplication) -> XCUIElement {
         let button = app.buttons[label]
-        for _ in 0..<8 where !button.isHittable {
+        for _ in 0..<8 where !reachable(button, label, in: app) {
             app.swipeDown()
         }
-        for _ in 0..<10 where !button.isHittable {
+        for _ in 0..<10 where !reachable(button, label, in: app) {
             app.swipeUp()
         }
         XCTAssertTrue(button.waitForExistence(timeout: 5), "Missing button: \(label)")
-        XCTAssertTrue(button.isHittable, "Button is not visible: \(label)")
+        XCTAssertTrue(reachable(button, label, in: app), "Button is not visible: \(label)")
         return button
+    }
+
+    /// `isHittable` alone is not enough on New Job: since 2026-09-25 its next
+    /// step is pinned in a glass bar over the bottom of the list, and a row
+    /// scrolled under that bar still reads as hittable while a tap on it lands
+    /// on the bar. The first run of Phase 3 against the pinned bar failed
+    /// exactly so — the Pipeline row's tap never pushed its list.
+    @MainActor private static func reachable(_ button: XCUIElement, _ label: String,
+                                             in app: XCUIApplication) -> Bool {
+        guard button.isHittable else { return false }
+        let bar = app.otherElements["newjob.actionBar"]
+        guard bar.exists, !bar.buttons[label].exists else { return true }
+        return button.frame.maxY <= bar.frame.minY
     }
 
     /// New Job is a lazy `List`: a row scrolled off screen is not in the

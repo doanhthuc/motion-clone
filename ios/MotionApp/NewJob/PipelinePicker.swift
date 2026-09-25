@@ -1,9 +1,12 @@
 import MotionKit
 import SwiftUI
 
-/// Two `List` sections: the pipeline menu, then the provider as checkmark rows.
-/// Rows, not chips, because provider labels run to ~40 characters and a chip
-/// strip cut the second option off at "Gemi…".
+/// One "Settings" section: the pipeline and the provider, one row each, both
+/// opening a full list of choices. Until 2026-09-25 the providers were
+/// checkmark rows inline, and their ~40-character labels plus caveats took
+/// ~550 pt, which pushed the materials — what the user actually came to pick —
+/// below the tab bar. The caveats now live in `ProviderChoiceList`, and the
+/// row keeps the first clause ("Runs here, no pod wait").
 @MainActor
 struct PipelinePicker: View {
     let pipeline: Pipeline
@@ -14,68 +17,41 @@ struct PipelinePicker: View {
     let onProviderSelected: (String) async -> Void
 
     var body: some View {
-        Section("Pipeline") {
+        Section("Settings") {
             NavigationLink {
                 PipelineChoiceList(current: pipeline.id, pipelines: pipelines,
                                    name: displayName, stages: stageLine,
                                    onSelected: onPipelineSelected)
             } label: {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(displayName(pipeline.id))
-                        .font(.body)
+                SettingRow(title: displayName(pipeline.id),
+                           detail: pipeline.stages.isEmpty ? nil : stageLine(pipeline)) {
+                    Image(systemName: "arrow.triangle.branch")
+                        .resizable().scaledToFit()
                         .foregroundStyle(Theme.label)
-                    if !pipeline.stages.isEmpty {
-                        Text(stageLine(pipeline))
-                            .font(.subheadline)
-                            .foregroundStyle(Theme.secondary)
-                            .lineLimit(1)
-                    }
+                        .frame(width: 20, height: 20)
+                        .frame(width: 28)
                 }
             }
             .disabled(disabled)
             .accessibilityLabel("Pipeline")
             .accessibilityValue(displayName(pipeline.id))
-        }
 
-        if !pipeline.providers.isEmpty {
-            Section("Provider") {
-                ForEach(pipeline.providers) { provider in
-                    let selected = provider.id == selectedProvider
-                    let parts = plainLabel(provider.label).components(separatedBy: " — ")
-                    Button {
-                        guard !selected else { return }
-                        Task { await onProviderSelected(provider.id) }
-                    } label: {
-                        HStack(spacing: 12) {
-                            ProviderMark(id: provider.id)
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(parts[0]).font(.body).foregroundStyle(Theme.label)
-                                if parts.count > 1 {
-                                    Text(parts.dropFirst().joined(separator: " — ").capitalizedFirst)
-                                        .font(.subheadline).foregroundStyle(Theme.secondary)
-                                }
-                            }
-                            Spacer(minLength: 0)
-                            if selected {
-                                Image(systemName: "checkmark").font(.body.weight(.semibold))
-                                    .foregroundStyle(Theme.accent)
-                            }
-                        }
-                        .contentShape(.rect)
+            if let provider = pipeline.providers.first(where: { $0.id == selectedProvider })
+                ?? pipeline.providers.first {
+                let parts = ProviderText(label: provider.label)
+                NavigationLink {
+                    ProviderChoiceList(providers: pipeline.providers, current: selectedProvider,
+                                       onSelected: onProviderSelected)
+                } label: {
+                    SettingRow(title: parts.name, detail: parts.shortCaveat) {
+                        ProviderMark(id: provider.id)
                     }
-                    .disabled(disabled)
-                    .accessibilityLabel(provider.label)
-                    .accessibilityAddTraits(selected ? .isSelected : [])
-                    .accessibilityValue(selected ? "Selected" : "Not selected")
                 }
+                .disabled(disabled)
+                .accessibilityLabel("Provider")
+                .accessibilityValue(parts.name)
             }
         }
-    }
-
-    /// The server's labels lead with an emoji ("🖥 Self-host…", "☁️ Gemini…");
-    /// the row shows text only. VoiceOver still gets the label verbatim.
-    private func plainLabel(_ label: String) -> String {
-        String(label.drop { !$0.isLetter && !$0.isNumber })
     }
 
     private func stageLine(_ pipeline: Pipeline) -> String {
@@ -138,6 +114,95 @@ private struct PipelineChoiceList: View {
         }
         .navigationTitle("Pipeline")
         .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+/// A leading mark, a title and one secondary line — the two Settings rows.
+private struct SettingRow<Mark: View>: View {
+    let title: String
+    let detail: String?
+    @ViewBuilder let mark: () -> Mark
+
+    var body: some View {
+        HStack(spacing: 12) {
+            mark()
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.body).foregroundStyle(Theme.label)
+                if let detail {
+                    Text(detail)
+                        .font(.subheadline)
+                        .foregroundStyle(Theme.secondary)
+                        .lineLimit(1)
+                }
+            }
+        }
+    }
+}
+
+/// Every provider with its full caveat, so the choice is made knowing the
+/// trade-off; the row that opens this shows only the first clause.
+private struct ProviderChoiceList: View {
+    let providers: [PipelineProvider]
+    let current: String
+    let onSelected: (String) async -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        List {
+            Section {
+                ForEach(providers) { provider in
+                    let selected = provider.id == current
+                    let parts = ProviderText(label: provider.label)
+                    Button {
+                        if !selected { Task { await onSelected(provider.id) } }
+                        dismiss()
+                    } label: {
+                        HStack(spacing: 12) {
+                            ProviderMark(id: provider.id)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(parts.name).font(.body).foregroundStyle(Theme.label)
+                                if let caveat = parts.caveat {
+                                    Text(caveat).font(.subheadline).foregroundStyle(Theme.secondary)
+                                }
+                            }
+                            Spacer(minLength: 0)
+                            if selected {
+                                Image(systemName: "checkmark").font(.body.weight(.semibold))
+                                    .foregroundStyle(Theme.accent)
+                            }
+                        }
+                        .contentShape(.rect)
+                    }
+                    .accessibilityLabel(provider.label)
+                    .accessibilityAddTraits(selected ? .isSelected : [])
+                    .accessibilityValue(selected ? "Selected" : "Not selected")
+                }
+            } footer: {
+                Text("Hosted providers make the try-on here, before any pod is rented.")
+            }
+        }
+        .navigationTitle("Provider")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+/// A server provider label split for display: "☁️ Gemini API — runs here, no
+/// pod wait; may crop…" → name "Gemini API", caveat "Runs here, no pod wait;
+/// may crop…", short caveat "Runs here, no pod wait". The label leads with an
+/// emoji, which the rows drop; VoiceOver in the choice list still gets it verbatim.
+private struct ProviderText {
+    let name: String
+    let caveat: String?
+
+    init(label: String) {
+        let plain = String(label.drop { !$0.isLetter && !$0.isNumber })
+        let parts = plain.components(separatedBy: " — ")
+        name = parts[0]
+        caveat = parts.count > 1 ? parts.dropFirst().joined(separator: " — ").capitalizedFirst : nil
+    }
+
+    var shortCaveat: String? {
+        caveat?.components(separatedBy: ";").first
     }
 }
 
