@@ -18,7 +18,7 @@ Decisions made in chat (2026-09-26):
 | Conversation model | **Flow-style, stateless.** Each send = prompt + the references currently attached. To keep editing, attach the result and prompt again. No multi-turn context (Qwen cannot do it, and resending history makes each turn cost more). |
 | Organisation | **Many projects**, like Flow. New project is titled with its creation date/time, renamable. |
 | Placement | **Not a new tab.** A slide-out sidebar (like the Claude app's code/chat/design spaces) switches between the Motion space (today's 5 tabs, unchanged) and the Studio space. |
-| Models | Nano Banana Pro, Nano Banana 2 (default), Nano Banana 2 Lite, Qwen Image Edit. Aspect 16:9 / 4:3 / 1:1 / 3:4 / 9:16, count x1–x4. |
+| Models | Nano Banana Pro, Nano Banana 2 (default), Nano Banana 2 Lite, Qwen Image 3.0 Pro (the model try-on already uses — `QWEN_IMAGE_MODEL=qwen-image-3.0-pro` in `.env`). Every model does both text-to-image and editing. Aspect 16:9 / 4:3 / 1:1 / 3:4 / 9:16, count x1–x4. |
 | Execution | **Approach A:** background thread on the VPS, app polls. |
 | Prompt language | Sent verbatim to every provider, Vietnamese included. **No translation**, Qwen too. |
 
@@ -28,8 +28,16 @@ Decisions made in chat (2026-09-26):
   - `gemini_edit(images, prompt, key, out_path, aspect_ratio=, model=, image_size=)` — one
     `generateContent` call, 300 s timeout, raises `JobError` with the provider's HTTP code/body.
   - `qwen_max_edit(images, prompt, key, out_path, negative_prompt=, model=, size=)` — synchronous
-    DashScope multimodal-generation call; uses only `images[:3]`. Needs `DASHSCOPE_API_KEY` plus
-    `QWEN_IMAGE_WORKSPACE` (or `QWEN_IMAGE_BASE`); `qwen_max_configured()` reads that live.
+    DashScope multimodal-generation call; uses only `images[:3]`, reads only the first returned
+    image. Needs `DASHSCOPE_API_KEY` plus `QWEN_IMAGE_WORKSPACE` (or `QWEN_IMAGE_BASE`);
+    `qwen_max_configured()` reads that live. The model is `QWEN_IMAGE_MODEL`, which `.env` sets to
+    `qwen-image-3.0-pro` (the code default `qwen-image-edit-plus` and the comment saying 3.0 access
+    was not yet granted are stale).
+- Qwen Image 3.0 API (Bailian docs, `qwen-image-generation-and-editing-api-reference.md`, read
+  2026-09-26): the same sync endpoint does **text-to-image** (content = one `{"text"}` only) and
+  editing (1–3 `{"image"}` + one `{"text"}`); `parameters.n` 1–6; total pixels 512²–2048², aspect
+  1:8–8:1, no `size` = model picks; input images ≤10 MB, 384–2048 px per side recommended; prompts
+  in any language, sent as-is.
   - Measured 2026-09-16: `gemini-3-pro-image` without `imageConfig.imageSize` falls back to 1K
     (768×1376 for 9:16), whatever the input size.
 - `scripts/control/tryon_library.py` — the pattern to copy: one JSON index per owner, rewritten
@@ -100,15 +108,21 @@ Unresolvable → `422 ref_not_found` naming the ref. Only images are accepted (`
 | `nano-banana-pro` | `gemini_edit(model="gemini-3-pro-image", image_size="2K")` | 14 | |
 | `nano-banana-2` (default) | `gemini_edit(model="gemini-3.1-flash-image", image_size="2K")` | 14 | |
 | `nano-banana-2-lite` | `gemini_edit(model="gemini-3.1-flash-lite-image")` | 14 | whether it accepts `imageSize` is checked during implementation; record the answer here |
-| `qwen-image-edit` | `qwen_max_edit(model=QWEN_IMAGE_MODEL)` | 3 | requires ≥1 ref (edit-only); unavailable when `qwen_max_configured()` is false |
+| `qwen-image-3` | Qwen call with `model=QWEN_IMAGE_MODEL` (`qwen-image-3.0-pro`) | 3 | text-to-image with 0 refs, edit with 1–3; unavailable when `qwen_max_configured()` is false |
 
 The 14-reference cap for Gemini is checked against Google's docs per model during implementation.
 Exceeding a cap → `422 too_many_refs`; **never silently truncate** (today `qwen_max_edit` slices
 `[:3]` — the API check sits in front of it). Aspect maps to Gemini `aspectRatio` and to a Qwen
-`size` string.
+`size` of about 2K total pixels (e.g. 1536×2048 for 3:4), inside the 2048² cap.
 
-Each slot is one provider call; x4 = four calls on a small thread pool (max 4 concurrent per
-generation). A slot failure does not fail its siblings.
+The Qwen helper is extended, not forked: accept zero images (text-only content), pass `n`, and
+download every returned image rather than only the first. Try-on's existing calls keep working
+unchanged. Reference images are downscaled server-side to ≤2048 px per side before sending (Qwen
+caps inputs at 10 MB; Gemini inline payloads also grow with size).
+
+Gemini: each slot is one call; x4 = four calls on a small thread pool (max 4 concurrent per
+generation), and a slot failure does not fail its siblings. Qwen: one call with `n = count`
+(the API returns up to 6); if that call fails, every slot of the generation shows the error.
 
 Gemini sometimes returns no image but a text part or a `finishReason` (e.g. a safety block).
 `gemini_edit` today raises "không trả ảnh" with a 300-char dump; the Studio wrapper extracts the
@@ -117,7 +131,9 @@ text/finishReason into `slot.error` so the app can show *why*.
 ### Cost
 
 A server-side price table (`STUDIO_PRICES`, USD per image, source URL and date in a comment) feeds
-`est_cost_usd` and the `GET /v1/studio/models` response. The app never hardcodes prices. After the
+`est_cost_usd` and the `GET /v1/studio/models` response. The app never hardcodes prices. Qwen Image 3.0 Pro's Bailian model card lists, per image,
+¥0.02 per input image and ¥0.25 (1K) / ¥0.5 (2K) per output image — mainland CNY pricing; the
+Singapore-workspace USD price is taken from the international pricing page during implementation. After the
 first live run of each model, compare against the Google/DashScope billing pages and record the
 measurement in this spec. No spend cap — personal tool — but the price is shown before sending.
 
@@ -138,7 +154,7 @@ POST   /v1/studio/projects/{pid}/images/{image_id}/promote   {to: "material"|"tr
 ```
 
 Retry = the app re-posts the failed generation's parameters as a new generation; nothing is
-overwritten. Empty prompt with no refs → `400`. Qwen without refs → `422 model_needs_ref`.
+overwritten. Empty prompt → `400` (every provider requires a text prompt).
 
 ## iOS
 
@@ -166,8 +182,8 @@ overwritten. Empty prompt with no refs → `400`. Qwen without refs → `422 mod
   - ＋ → source menu: Photos / Camera (goes through the existing upload → material), Materials,
     Try-on library, current run's try-on previews, Studio images.
   - Settings pill "model · aspect · xN" → bottom sheet (like Flow's): aspect row, x1–x4 row, model
-    list with per-image price. Qwen is disabled with an explanation while nothing is attached, or
-    when unavailable server-side.
+    list with per-image price. Qwen is disabled with an explanation only when unavailable
+    server-side, or when more than 3 references are attached.
   - Send button shows the total estimate ("x4 · ~$0.54").
 
 ### Entry points from the Motion space
@@ -180,7 +196,7 @@ app switches to Studio.
 
 `StudioAPI` + Codable models + `StudioStore` (`@Observable`). The store polls the open project
 every 3 s while any slot is `queued`/`running` and stops when none is. Price totals and the
-"Qwen needs a reference / Qwen cap 3" rules live in MotionKit so they are unit-tested.
+"Qwen caps references at 3" rule live in MotionKit so they are unit-tested.
 
 ## Testing
 
@@ -194,7 +210,7 @@ All free unless marked.
 - `make ios-build`, and a UI smoke test against the live API using GETs only.
 - `make ios-contract` extended with the Studio GET endpoints.
 - **Live (costs money, ask first):** one x1 generation per model on the VPS, Vietnamese prompt
-  included for Qwen; expected under ~$0.40 total. Record observed latency and billed cost here.
+  included; Qwen tested both text-to-image and edit. Expected under ~$0.50 total. Record observed latency and billed cost here.
 
 ## Deploy
 
@@ -205,5 +221,5 @@ earlier phases. `motions-studio/setup/scrub-secrets.sh --check` must pass before
 
 ## Out of scope
 
-- Multi-turn Gemini context, masks/inpainting brushes, video in Studio, Qwen text-to-image
-  (`qwen-image-plus`), the Telegram bot and the Nuxt FE.
+- Multi-turn Gemini context, masks/inpainting brushes, video in Studio, the Telegram bot and the
+  Nuxt FE.
