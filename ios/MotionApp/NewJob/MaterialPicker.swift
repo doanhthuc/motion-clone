@@ -10,8 +10,10 @@ struct MaterialPicker: View {
     let onSelect: (String?) -> Void
     @Environment(\.dismiss) private var dismiss
 
+    /// This role's own materials first, then unsorted ones, then the rest —
+    /// the rest stay pickable, since a role is a hint and not a lock.
     private var eligible: [MotionKit.Material] {
-        materials.materials.filter(kind.accepts)
+        MaterialRole.ordered(materials.materials.filter(kind.accepts), for: MaterialRole(rawValue: role))
     }
 
     private let columns = [
@@ -25,7 +27,8 @@ struct MaterialPicker: View {
                 VStack(alignment: .leading, spacing: 16) {
                     header
                     if kind != .unknown {
-                        MaterialImportBar(kind: kind, materials: materials) { material in
+                        MaterialImportBar(kind: kind, role: MaterialRole(rawValue: role),
+                                          materials: materials) { material in
                             onSelect(material.id)
                             dismiss()
                         }

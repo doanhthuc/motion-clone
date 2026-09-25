@@ -150,7 +150,8 @@ All under `/v1`, JSON bodies, errors as `{"error": {"code": "...", "message": ".
 | `PUT /v1/uploads/{id}/chunks/{n}` | Idempotent; re-sending a chunk overwrites it |
 | `GET /v1/uploads/{id}` | Which chunks are present, so an interrupted upload resumes |
 | `POST /v1/uploads/{id}/complete` → `Material` | Assemble, HEIC→PNG (`to_png_if_heic`), probe, stage (`_stage_file` semantics). Probe includes kind, resolution, duration and the quality warning the bot shows |
-| `GET /v1/materials` | List |
+| `GET /v1/materials` | List. *Amended 2026-09-25:* each item carries `role` (`driver`/`character`/`outfit`/`background`/`null`) from `control/material_roles.py`: a tag (written when a draft slot takes the material, or set by hand), else the role it filled in a rendered `batch/*.yaml` manifest, else `driver` for a video |
+| `PUT /v1/materials/{id}/role` `{role}` → `{material}` | *Added 2026-09-25.* Tag a material's role; `null` drops the tag so history decides again. `400` for an unknown role, `404` outside staging. Deleting a material drops its tag |
 | `GET /v1/materials/{id}` | *Added 2026-09-25.* The file itself, with Range (`send_file`), so the app can play a video material rather than only its poster. `404` outside staging, like `/outputs` |
 | `GET /v1/materials/{id}/thumb` | ffmpeg poster frame / downscaled image, cached on disk |
 | `DELETE /v1/materials/{id}` | `409` if a draft or a live run references it |

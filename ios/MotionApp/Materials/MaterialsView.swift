@@ -6,6 +6,9 @@ struct MaterialsView: View {
     @State private var adding = false
     @State private var deleteCandidate: MotionKit.Material?
     @State private var previewing: MotionKit.Material?
+    /// An image just uploaded here: ask what it is, as the bot does.
+    @State private var sorting: MotionKit.Material?
+    @State private var justAdded: MotionKit.Material?
     /// The Add button shrinks to a circle once the grid scrolls, so it covers
     /// less of what is being browsed; back at the top it says what it does.
     @State private var addCollapsed = false
@@ -15,13 +18,15 @@ struct MaterialsView: View {
         GridItem(.flexible(), spacing: 12, alignment: .top),
     ]
 
-    /// Videos first — drivers are what a batch runs out of soonest — then
-    /// images, then anything the server lists that is neither.
+    /// By role, in the order a job is built from: what moves, what is worn,
+    /// who wears it. An image nobody has sorted yet is Unsorted, not guessed —
+    /// the same reason `tgbot/job.py`'s `slot_for` asks instead of inferring.
     private var groups: [(title: String, items: [MotionKit.Material])] {
         let all = store.materials
-        return [("Videos", all.filter { $0.kind == .video }),
-                ("Images", all.filter { $0.kind == .image }),
-                ("Other", all.filter { $0.kind != .video && $0.kind != .image })]
+        let sections: [(String, MaterialRole?)] = [
+            ("Motion drivers", .driver), ("Outfits", .outfit),
+            ("Characters", .character), ("Backgrounds", .background), ("Unsorted", nil)]
+        return sections.map { title, role in (title, all.filter { $0.materialRole == role }) }
             .filter { !$0.items.isEmpty }
     }
 
@@ -67,8 +72,31 @@ struct MaterialsView: View {
         .navigationDestination(item: $previewing) { material in
             MaterialPreview(material: material, materials: store)
         }
-        .sheet(isPresented: $adding) {
-            AddMaterialSheet(store: store)
+        // The question waits for the sheet to finish closing: a dialog cannot
+        // present from a view that is still covered.
+        .sheet(isPresented: $adding, onDismiss: {
+            sorting = justAdded
+            justAdded = nil
+        }) {
+            AddMaterialSheet(store: store) { material in
+                if material.kind == .image { justAdded = material }
+            }
+        }
+        .confirmationDialog(
+            "What is this image?",
+            isPresented: Binding(get: { sorting != nil }, set: { if !$0 { sorting = nil } }),
+            titleVisibility: .visible
+        ) {
+            ForEach(MaterialRole.options(for: .image), id: \.self) { role in
+                Button(Self.title(role)) {
+                    guard let material = sorting else { return }
+                    sorting = nil
+                    Task { await store.setRole(role, for: material) }
+                }
+            }
+            Button("Decide later", role: .cancel) { sorting = nil }
+        } message: {
+            Text(sorting?.name ?? "")
         }
         .confirmationDialog(
             "Delete this material?",
@@ -95,6 +123,14 @@ struct MaterialsView: View {
         .buttonStyle(.plain)
         .accessibilityHint(material.kind == .video ? "Plays the video" : "Shows the full image")
         .contextMenu {
+            if material.kind == .image {
+                Menu("Move to", systemImage: "folder") {
+                    ForEach(MaterialRole.options(for: .image), id: \.self) { role in
+                        Button(Self.title(role)) { Task { await store.setRole(role, for: material) } }
+                            .disabled(material.materialRole == role)
+                    }
+                }
+            }
             if material.canDelete {
                 Button("Delete", systemImage: "trash", role: .destructive) {
                     deleteCandidate = material
@@ -141,6 +177,15 @@ struct MaterialsView: View {
         .disabled(store.isUploading || store.isImportingLink)
         .accessibilityLabel("Add material")
         .padding(.bottom, 12)
+    }
+
+    static func title(_ role: MaterialRole) -> String {
+        switch role {
+        case .driver: "Motion driver"
+        case .character: "Character"
+        case .outfit: "Outfit"
+        case .background: "Background"
+        }
     }
 
     private func uploadCard(_ progress: UploadProgress) -> some View {

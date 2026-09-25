@@ -16,18 +16,64 @@ public struct Material: Decodable, Sendable, Hashable, Identifiable {
     public let bytes: Int64
     public let updatedAt: Double
     public let kind: MaterialKind
+    /// The server's answer to "what is this for" (`control/material_roles.py`):
+    /// a tag, the bot's history, or video ⇒ driver. Absent from upload
+    /// responses and older servers, and nil for an image nobody has sorted.
+    public let role: String?
 
     public init(id: String, owner: String, name: String, bytes: Int64,
-                updatedAt: Double, kind: MaterialKind) {
+                updatedAt: Double, kind: MaterialKind, role: String? = nil) {
         self.id = id
         self.owner = owner
         self.name = name
         self.bytes = bytes
         self.updatedAt = updatedAt
         self.kind = kind
+        self.role = role
     }
 
     public var canDelete: Bool { owner == "app" }
+    public var materialRole: MaterialRole? { role.flatMap(MaterialRole.init(rawValue:)) }
+}
+
+/// The pipeline roles a material can fill.
+public enum MaterialRole: String, CaseIterable, Sendable {
+    case driver, character, outfit, background
+
+    /// Which roles a material of `kind` can take — only a video drives.
+    public static func options(for kind: MaterialKind) -> [MaterialRole] {
+        kind == .video ? [.driver] : [.character, .outfit, .background]
+    }
+
+    /// `role`'s own materials first, then unsorted, then everything else,
+    /// each group keeping its order (newest first, as the server lists).
+    public static func ordered(_ items: [Material], for role: MaterialRole?) -> [Material] {
+        guard let role else { return items }
+        func rank(_ m: Material) -> Int {
+            m.materialRole == role ? 0 : (m.materialRole == nil ? 1 : 2)
+        }
+        return items.enumerated()
+            .sorted { (rank($0.element), $0.offset) < (rank($1.element), $1.offset) }
+            .map(\.element)
+    }
+}
+
+public struct MaterialRoleRequest: Encodable, Sendable {
+    public let role: String?
+
+    public init(role: MaterialRole?) {
+        self.role = role?.rawValue
+    }
+
+    // Explicit so `nil` is sent as `"role": null` (clear the tag), not left out.
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(["role": role])
+    }
+}
+
+public struct MaterialResponse: Decodable, Sendable {
+    public let material: Material
 }
 
 public struct MaterialsResponse: Decodable, Sendable, Equatable {

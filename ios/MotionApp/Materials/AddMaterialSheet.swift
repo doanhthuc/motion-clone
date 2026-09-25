@@ -9,6 +9,8 @@ import UniformTypeIdentifiers
 @MainActor
 struct AddMaterialSheet: View {
     let store: MaterialsStore
+    /// Each material this sheet produced, just before it closes itself.
+    let onImported: (MotionKit.Material) -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var showFiles = false
     @State private var fileFailure: String?
@@ -16,8 +18,8 @@ struct AddMaterialSheet: View {
     var body: some View {
         NavigationStack {
             VStack(alignment: .leading, spacing: 12) {
-                MaterialImportBar(anyKindIn: store, onFiles: { showFiles = true }) { _ in
-                    dismiss()
+                MaterialImportBar(anyKindIn: store, onFiles: { showFiles = true }) { material in
+                    finish(with: material)
                 }
                 if let fileFailure {
                     Label(fileFailure, systemImage: "exclamationmark.triangle.fill")
@@ -39,6 +41,11 @@ struct AddMaterialSheet: View {
                       allowsMultipleSelection: false, onCompletion: importFile)
     }
 
+    private func finish(with material: MotionKit.Material) {
+        onImported(material)
+        dismiss()
+    }
+
     private func importFile(_ result: Result<[URL], any Error>) {
         fileFailure = nil
         Task {
@@ -46,8 +53,8 @@ struct AddMaterialSheet: View {
                 guard let source = try result.get().first else { return }
                 let imported = try await ImportStaging.stageAsync(source, securityScoped: true)
                 defer { imported.removeStagedCopy() }
-                if await store.startUpload(fileURL: imported.url, fileName: imported.fileName) != nil {
-                    dismiss()
+                if let material = await store.startUpload(fileURL: imported.url, fileName: imported.fileName) {
+                    finish(with: material)
                 } else {
                     fileFailure = store.errorMessage
                 }

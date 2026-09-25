@@ -13,6 +13,7 @@ import SwiftUI
 struct MaterialMultiPicker: View {
     let title: String
     let kind: PipelineRoleKind
+    let role: MaterialRole
     let materials: MaterialsStore
     /// `outfit.pick` / `driver.pick` — the UI smokes find tiles by this prefix.
     let identifierPrefix: String
@@ -28,14 +29,16 @@ struct MaterialMultiPicker: View {
         GridItem(.flexible(), spacing: 12, alignment: .top),
     ]
 
-    private var eligible: [MotionKit.Material] { materials.materials.filter(kind.accepts) }
+    private var eligible: [MotionKit.Material] {
+        MaterialRole.ordered(materials.materials.filter(kind.accepts), for: role)
+    }
     private var chosenCount: Int { eligible.count { isChosen($0.id) } }
 
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    MaterialImportBar(kind: kind, materials: materials) { material in
+                    MaterialImportBar(kind: kind, role: role, materials: materials) { material in
                         // A fresh import is almost always meant for this batch.
                         if !isChosen(material.id) { toggle(material.id) }
                     }

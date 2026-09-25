@@ -137,6 +137,44 @@ extension URLProtocolTests {
         #expect(store.errorMessage == "The download is still running. It will appear in Materials when it finishes.")
     }
 
+    @Test func roleDecodesWhenPresentAndIsNilWhenAbsentOrUnknown() throws {
+        let body = #"{"materials":[{"id":"app/a.png","owner":"app","name":"a.png","bytes":1,"updated_at":1,"kind":"image","role":"outfit"},{"id":"app/b.png","owner":"app","name":"b.png","bytes":1,"updated_at":1,"kind":"image","role":null},{"id":"app/c.png","owner":"app","name":"c.png","bytes":1,"updated_at":1,"kind":"image","role":"hat"},{"id":"app/d.png","owner":"app","name":"d.png","bytes":1,"updated_at":1,"kind":"image"}]}"#
+        let items = try MotionJSON.decoder.decode(MaterialsResponse.self, from: Data(body.utf8)).materials
+        #expect(items.map(\.materialRole) == [.outfit, nil, nil, nil])
+        #expect(MaterialRole.options(for: .video) == [.driver])
+        #expect(MaterialRole.options(for: .image) == [.character, .outfit, .background])
+    }
+
+    @Test func pickersListTheirRoleFirstThenUnsortedThenTheRest() {
+        func m(_ name: String, _ role: String?) -> Material {
+            Material(id: "app/\(name)", owner: "app", name: name, bytes: 1, updatedAt: 1, kind: .image, role: role)
+        }
+        let items = [m("c1", "character"), m("u1", nil), m("o1", "outfit"), m("c2", "character"), m("o2", "outfit")]
+        #expect(MaterialRole.ordered(items, for: .outfit).map(\.name) == ["o1", "o2", "u1", "c1", "c2"])
+        #expect(MaterialRole.ordered(items, for: nil).map(\.name) == items.map(\.name))
+    }
+
+    @Test func setRoleSendsTheRoleAndNullToClear() async throws {
+        StubURLProtocol.install { request in
+            if request.httpMethod == "PUT" {
+                #expect(request.url?.path == "/v1/materials/app/coat.png/role")
+                let role = (try? JSONSerialization.jsonObject(with: request.httpBody ?? Data()) as? [String: Any])?["role"]
+                let value = (role as? String).map { "\"\($0)\"" } ?? "null"
+                return TestSupport.json(#"{"material":{"id":"app/coat.png","owner":"app","name":"coat.png","bytes":901,"updated_at":1790000100,"kind":"image","role":"# + value + "}}")
+            }
+            return TestSupport.json(list)
+        }
+        let store = MaterialsStore(client: TestSupport.client())
+        await store.refresh()
+        let coat = try #require(store.materials.first)
+        await store.setRole(.character, for: coat)
+        #expect(store.materials.first?.materialRole == .character)
+        await store.setRole(nil, for: coat)
+        #expect(store.materials.first?.role == nil)
+        let bodies = StubURLProtocol.requests.filter { $0.httpMethod == "PUT" }.compactMap(\.httpBody)
+        #expect(bodies.map { String(decoding: $0, as: UTF8.self) } == [#"{"role":"character"}"#, #"{"role":null}"#])
+    }
+
     @Test func deleteHonorsOwnershipAndServerOutcomes() async throws {
         StubURLProtocol.install { request in
             if request.httpMethod == "DELETE" { return (204, [:], Data()) }

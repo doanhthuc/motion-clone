@@ -19,6 +19,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 import control.drafts as drafts
 import control.links as links
+import control.material_roles as material_roles
 import control.materials as materials
 import control.outputs as outputs
 import control.runs as runs
@@ -109,7 +110,7 @@ class _Handler(BaseHTTPRequestHandler):
         except ApiError as exc:
             self._error(exc.status, exc.code, exc.message)
         except (uploads.UploadError, materials.MaterialError, drafts.DraftError,
-                IdempotencyError) as exc:
+                material_roles.MaterialRoleError, IdempotencyError) as exc:
             self._error(_DOMAIN_STATUS.get(exc.code, 400), exc.code, exc.message)
         except Exception:
             # Logged in full, returned opaque: the client gets no internals.
@@ -369,7 +370,8 @@ class _Handler(BaseHTTPRequestHandler):
             body = self._read_json()
             return self._send_json(201, links.import_link(body.get("url"), s.staging_root))
         if method == "GET" and rest == ["materials"]:
-            return self._send_json(200, {"materials": materials.list_materials(s.staging_root)})
+            return self._send_json(200, {"materials": s.material_roles.annotate(
+                materials.list_materials(s.staging_root))})
         if method == "GET" and len(rest) == 4 and rest[0] == "materials" and rest[3] == "thumb":
             thumb = materials.thumbnail(s.staging_root, s.thumbs_root, rest[1], rest[2])
             try:
@@ -388,8 +390,18 @@ class _Handler(BaseHTTPRequestHandler):
                 return send_file(self, path)
             except FileNotFoundError:
                 raise NOT_FOUND
+        if method == "PUT" and len(rest) == 4 and rest[0] == "materials" and rest[3] == "role":
+            body = self._read_json()
+            path = materials.resolve_material(s.staging_root, rest[1], rest[2])
+            if path is None:
+                raise NOT_FOUND
+            material_id = f"{rest[1]}/{path.name}"
+            s.material_roles.set(material_id, body.get("role"))
+            item = s.material_roles.annotate([materials.material_item(rest[1], path)])[0]
+            return self._send_json(200, {"material": item})
         if method == "DELETE" and len(rest) == 3 and rest[0] == "materials":
             materials.delete_material(s.staging_root, s.batch_dir, rest[1], rest[2])
+            s.material_roles.forget(f"{rest[1]}/{rest[2]}")
             return self._send_empty(204)
         if method == "GET" and rest == ["pipelines"]:
             return self._send_json(200, {"pipelines": drafts.pipeline_catalog()})
@@ -509,10 +521,12 @@ def make_server(*, token: str, batch_dir: Path, out_dir: Path,
     server.thumbs_root = batch_dir / "thumbs"
     server.repo_root = batch_dir.parent
     server.tryon_library = tryon_library.TryonLibrary(batch_dir / "tryon-library", materials.APP_OWNER)
+    server.material_roles = material_roles.MaterialRoles(
+        batch_dir / "material-roles.json", batch_dir, server.staging_root)
     server.drafts = drafts.DraftStore(
         batch_dir, server.staging_root, materials.APP_OWNER,
         default_pipeline=default_pipeline, default_provider=default_provider,
-        tryon_library=server.tryon_library,
+        tryon_library=server.tryon_library, material_roles=server.material_roles,
         **({"probe": probe} if probe is not None else {}))
     # Set by the caller (bot._start_control_api) once its own AppRuns exists
     # — a chicken-and-egg the constructor can't resolve itself, since AppRuns
