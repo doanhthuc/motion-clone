@@ -32,7 +32,6 @@ public struct Material: Decodable, Sendable, Hashable, Identifiable {
         self.role = role
     }
 
-    public var canDelete: Bool { owner == "app" }
     public var materialRole: MaterialRole? { role.flatMap(MaterialRole.init(rawValue:)) }
 }
 
@@ -155,6 +154,15 @@ public enum TikTokLink {
 
     nonisolated(unsafe) private static let pattern =
         /https?:\/\/(?:www\.|m\.|vm\.|vt\.)?tiktok\.com\/\S+/.ignoresCase()
+}
+
+/// What a share sheet hands the extension, reduced to the one TikTok link in
+/// it. TikTok shares a URL; other apps send text with prose around the link,
+/// so every candidate goes through `TikTokLink.find`, in the order given.
+public enum SharedLink {
+    public static func tiktok(in candidates: [String]) -> String? {
+        candidates.lazy.compactMap(TikTokLink.find(in:)).first
+    }
 }
 
 public struct UploadCompleteResponse: Decodable, Sendable, Equatable {

@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import control
 from control import materials
 import tgbot.run as run_mod
+from batchlib_ext.handoff import MAILBOX_SUFFIX
 
 
 class TestNaming(unittest.TestCase):
@@ -194,10 +195,12 @@ class TestDelete(MaterialsBase):
         materials.delete_material(self.staging, self.batch, "app", "a.mp4")
         self.assertFalse(self.a.exists())
 
-    def test_telegram_material_is_forbidden(self):
-        with self.assertRaises(materials.MaterialError) as cm:
-            materials.delete_material(self.staging, self.batch, "12345", "b.png")
-        self.assertEqual(cm.exception.code, "forbidden")
+    def test_deletes_telegram_material(self):
+        # 2026-09-25: the app can delete a file that arrived through the bot,
+        # as long as no draft or busy run still names it.
+        b = self.staging / "12345" / "b.png"
+        materials.delete_material(self.staging, self.batch, "12345", "b.png")
+        self.assertFalse(b.exists())
 
     def test_unknown_is_not_found(self):
         with self.assertRaises(materials.MaterialError) as cm:
@@ -385,6 +388,74 @@ class TestDeleteVsAppDraft(unittest.TestCase):
         self.assertEqual(cm.exception.code, "in_use")
         self.assertEqual(cm.exception.message, "the app's draft uses this file")
         materials.delete_material(staging, batch, "app", "a.png.bak")   # whole-path match only
+        self.assertFalse(free.exists())
+
+    def _staged(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        batch, staging = tmp / "batch", tmp / "batch" / "tg-staging"
+        (staging / "777").mkdir(parents=True)
+        used, free = staging / "777" / "t.png", staging / "777" / "t.png.bak"
+        used.write_bytes(b"x"); free.write_bytes(b"x")
+        return batch, staging, used, free
+
+    def test_delete_refuses_material_a_telegram_draft_uses(self):
+        batch, staging, used, free = self._staged()
+        (batch / "tg-777.draft.json").write_text(
+            json.dumps({"slots": {"character": str(used.resolve())}}, indent=2))
+        with self.assertRaises(materials.MaterialError) as cm:
+            materials.delete_material(staging, batch, "777", "t.png")
+        self.assertEqual(cm.exception.code, "in_use")
+        self.assertEqual(cm.exception.message, "a Telegram draft uses this file")
+        self.assertTrue(used.exists())
+        materials.delete_material(staging, batch, "777", "t.png.bak")   # whole-path match only
+        self.assertFalse(free.exists())
+
+    def test_a_telegram_draft_blocks_from_pending_and_basket_too(self):
+        # bot.py's _save_draft also writes staged paths under "pending" and
+        # "basket"; the scan is over the whole file, not just "slots".
+        batch, staging, used, _ = self._staged()
+        (batch / "tg-777.draft.json").write_text(json.dumps(
+            {"slots": {}, "pending": [[str(used.resolve()), {"kind": "image"}]], "basket": []}, indent=2))
+        with self.assertRaises(materials.MaterialError) as cm:
+            materials.delete_material(staging, batch, "777", "t.png")
+        self.assertEqual(cm.exception.code, "in_use")
+
+
+class TestDeleteVsQueuedJob(unittest.TestCase):
+    """A job queued behind a running drain lives only in the mailbox file
+    (<name>.next.yaml, batchlib_ext.handoff.MAILBOX_SUFFIX) until claim_mailbox
+    renames it out. The draft that staged it is already cleared and nothing is
+    "busy" for a manifest no process has picked up yet, so it must block on
+    its own (finding 1, 2026-09-25).
+    """
+
+    def _staged(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        batch, staging = tmp / "batch", tmp / "batch" / "tg-staging"
+        (staging / "777").mkdir(parents=True)
+        used, free = staging / "777" / "t.png", staging / "777" / "t.png.bak"
+        used.write_bytes(b"x"); free.write_bytes(b"x")
+        return batch, staging, used, free
+
+    def test_delete_refuses_material_a_queued_mailbox_job_uses(self):
+        batch, staging, used, _ = self._staged()
+        (batch / f"tg-777{MAILBOX_SUFFIX}").write_text(
+            f"runs:\n  - inputs: {{character: {used.resolve()}}}\n")
+        with mock.patch.object(run_mod, "busy", return_value=False):
+            with self.assertRaises(materials.MaterialError) as cm:
+                materials.delete_material(staging, batch, "777", "t.png")
+        self.assertEqual(cm.exception.code, "in_use")
+        self.assertEqual(cm.exception.message, "a queued job uses this file")
+        self.assertTrue(used.exists())
+
+    def test_whole_path_match_only(self):
+        batch, staging, used, free = self._staged()
+        (batch / f"tg-777{MAILBOX_SUFFIX}").write_text(
+            f"runs:\n  - inputs: {{character: {used.resolve()}}}\n")
+        with mock.patch.object(run_mod, "busy", return_value=False):
+            materials.delete_material(staging, batch, "777", "t.png.bak")
         self.assertFalse(free.exists())
 
 

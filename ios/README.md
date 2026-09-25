@@ -38,11 +38,22 @@ Keychain entries: an edit made in Settings is never overwritten by a rebuild.
 
 No push notifications: Telegram reports progress and results.
 
+## Share to Motion
+
+The `MotionShare` extension adds **Motion** to the share sheet. In TikTok: Share → More (…) →
+Motion. It posts the link to `POST /v1/materials/link`, so the video lands in Materials without
+opening the app; closing the card early is safe (the server stages before it answers). It reads
+the app's Keychain through the shared access group `$(AppIdentifierPrefix)xyz.doanhthuc.motion`,
+and falls back to the baked `Secrets.xcconfig` values if free provisioning does not grant it.
+First use: in the share sheet's app row tap More and enable Motion (or pin it to the top).
+
 ## Materials and uploads
 
 The Materials tab lists the global VPS library, including files uploaded through Telegram. Thumbnails
-use the same Cloudflare Access and bearer headers as the rest of the app. Only materials whose owner
-is `app` can be deleted; the server keeps an in-use material and shows its `409` explanation.
+use the same Cloudflare Access and bearer headers as the rest of the app. Any material can be deleted
+(2026-09-25 — the app is no longer restricted to `owner == "app"`), unless a draft (the app's or a
+Telegram chat's), a queued job, or a running batch still uses it; the server keeps such a material and
+shows its `409` explanation.
 
 Add accepts one image or video from Photos or Files. Uploads are serial and foreground-only. The app
 copies the provider file into Application Support, sends server-sized chunks without reading the whole

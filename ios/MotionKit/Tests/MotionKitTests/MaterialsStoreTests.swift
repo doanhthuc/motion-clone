@@ -100,7 +100,7 @@ extension URLProtocolTests {
 
         #expect(material?.id == "app/tiktok-1.mp4")
         #expect(store.materials.map(\.id) == ["app/tiktok-1.mp4"])
-        #expect(!store.isImportingLink && store.errorMessage == nil)
+        #expect(!store.isImportingLink && store.errorMessage == nil && !store.linkImportStillRunning)
         let post = try #require(StubURLProtocol.requests.first)
         let body = try #require(post.httpBody)
         #expect(try JSONDecoder().decode([String: String].self, from: body) == ["url": "https://vt.tiktok.com/ZS8abcde/"])
@@ -125,6 +125,7 @@ extension URLProtocolTests {
         #expect(await store.importLink("https://vt.tiktok.com/ZS8abcde/") == nil)
         #expect(store.errorMessage == "couldn't download that TikTok video: private")
         #expect(store.materials.count == 2, "the list is re-read even after a failure")
+        #expect(!store.linkImportStillRunning, "an ordinary failure is not the still-running case")
     }
 
     @Test func aCloudflareCutSaysTheDownloadIsStillRunning() async {
@@ -135,6 +136,7 @@ extension URLProtocolTests {
         let store = MaterialsStore(client: TestSupport.client())
         #expect(await store.importLink("https://vt.tiktok.com/ZS8abcde/") == nil)
         #expect(store.errorMessage == "The download is still running. It will appear in Materials when it finishes.")
+        #expect(store.linkImportStillRunning, "a caller can tell this apart from a real failure without matching the text")
     }
 
     @Test func roleDecodesWhenPresentAndIsNilWhenAbsentOrUnknown() throws {
@@ -175,7 +177,7 @@ extension URLProtocolTests {
         #expect(bodies.map { String(decoding: $0, as: UTF8.self) } == [#"{"role":"character"}"#, #"{"role":null}"#])
     }
 
-    @Test func deleteHonorsOwnershipAndServerOutcomes() async throws {
+    @Test func deleteSendsForEveryOwner() async throws {
         StubURLProtocol.install { request in
             if request.httpMethod == "DELETE" { return (204, [:], Data()) }
             return TestSupport.json(list)
@@ -186,11 +188,14 @@ extension URLProtocolTests {
         await store.delete(owned)
         #expect(store.materials.map(\.id) == ["42/driver.mp4"])
 
+        // A Telegram chat's material: the server decides (2026-09-25), so the
+        // request goes out and the row goes on a 204.
         let foreign = try #require(store.materials.first)
-        StubURLProtocol.install { _ in (204, [:], Data()) }
         await store.delete(foreign)
-        #expect(StubURLProtocol.requests.isEmpty)
-        #expect(store.errorMessage == "Only materials uploaded by this app can be deleted.")
+        #expect(store.materials.isEmpty)
+        #expect(StubURLProtocol.requests.contains {
+            $0.httpMethod == "DELETE" && $0.url?.path.hasSuffix("/v1/materials/42/driver.mp4") == true })
+        #expect(store.errorMessage == nil)
     }
 
     @Test func aSecondUploadIsRejectedWhileTheFirstIsActive() async throws {

@@ -805,9 +805,16 @@ class TestMaterialRoutes(HttpWriteBase):
         self.assertEqual((resp.status, body), (204, b""))
         self.assertFalse((self.batch / "tg-staging" / "app" / "a.mp4").exists())
 
-    def test_delete_telegram_material_is_403(self):
-        resp, _ = self.send("DELETE", "/v1/materials/99/t.png")
-        self.assertEqual(resp.status, 403)
+    def test_delete_telegram_material_is_204(self):
+        resp, body = self.send("DELETE", "/v1/materials/99/t.png")
+        self.assertEqual((resp.status, body), (204, b""))
+        self.assertFalse((self.batch / "tg-staging" / "99" / "t.png").exists())
+
+    def test_delete_refused_while_a_telegram_draft_uses_it(self):
+        staged = (self.batch / "tg-staging" / "99" / "t.png").resolve()
+        (self.batch / "tg-99.draft.json").write_text(json.dumps({"slots": {"outfit": str(staged)}}))
+        resp, body = self.send("DELETE", "/v1/materials/99/t.png")
+        self.assertEqual((resp.status, json.loads(body)["error"]["code"]), (409, "in_use"))
 
     def test_delete_traversal_is_404(self):
         resp, _ = self.send("DELETE", "/v1/materials/app/..%2F99%2Ft.png")

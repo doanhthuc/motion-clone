@@ -28,9 +28,7 @@ struct MaterialTile: View {
                     }
                 }
             }
-            if material.canDelete {
-                Button("Delete", systemImage: "trash", role: .destructive, action: onDelete)
-            }
+            Button("Delete", systemImage: "trash", role: .destructive, action: onDelete)
         }
         .task(id: material.id) { thumbnail = await store.thumbnail(for: material) }
     }

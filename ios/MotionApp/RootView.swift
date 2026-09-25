@@ -73,6 +73,7 @@ struct RootView: View {
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
                 model.resumeMaterialsUpload()
+                model.refreshMaterials()
                 model.replayPendingSpend()
                 if let pod = model.pod { Task { await pod.refresh() } }
             }
