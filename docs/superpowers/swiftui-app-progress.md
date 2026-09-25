@@ -80,6 +80,27 @@ field or store changed.
   (6/6: Phase 3, 4, 5, 6 ×2 and the Outputs feed, zero recorded spends);
   `scrub-secrets.sh --check`.
 
+## Batch screen redesign, Photos and TikTok import in pickers (2026-09-25)
+
+- **Every material picker can bring material in.** `MaterialImportBar` sits at the top of the
+  single picker and the outfit/driver multi-pickers: Photo Library (filtered to the role's kind)
+  for any role, plus **TikTok link** for video roles — a field with the system `PasteButton`, so
+  a copied share caption imports in one tap. The new material is selected (or toggled into the
+  batch) as soon as it lands; the sheet cannot be swiped away mid-transfer.
+- **New route, `POST /v1/materials/link {url}`** (`scripts/control/links.py`). It reuses the bot's
+  `tgbot/tiktok.py` unchanged and answers like an upload `complete`. The request is held open for
+  the download; a Cloudflare `524` is shown as "still running" and the list is re-read, because
+  the download carries on server-side. Spec: control-plane API §5.1. **Deploys with the next
+  push under `scripts/**`**; until then the TikTok field answers 404.
+- **Batch mode layout.** Outfits and drivers are horizontal thumbnail strips with the add tile
+  first (it never scrolls out of reach); a tile's menu holds the saved-try-on choice and Remove,
+  replacing the sub-44 pt ✕. The outfit/driver pickers are 3-across photo grids instead of lists
+  of file names. The summary and "Add N jobs" moved into `BatchRunBar`, a glass panel pinned above
+  the tab bar. Every smoke identifier (`batch.*`, `outfit.pick.*`, `driver.pick.*`) is unchanged.
+- **Gates run 2026-09-25:** `make ios-build`; `make ios-test` (280/280); `make ios-ui-test`
+  (6/6, 0 skipped); `make batch-test` (2191 OK). No live TikTok download through the phone yet —
+  it needs the deploy.
+
 ## Phase status
 
 | Phase | Status | Delivered | Remaining evidence |

@@ -39,6 +39,9 @@ public enum APIError: Error, Sendable, Equatable {
                 // reader on the phone: see `detailMessage`, which lists its four
                 // forms and names the Telegram reader one of them is for.
                 return "This draft didn't pass validation, so it can't run yet."
+            // A pasted link (`POST /v1/materials/link`): TikTok or yt-dlp
+            // refused, and the server's text says which — not a GPU provider.
+            case 502 where code == "download_failed": return message
             case 502: return "RunPod/Vast didn't answer. Try again."
             case 503: return "The bot is busy. Try again in a moment."
             case 500...: return "Server error (\(code))."

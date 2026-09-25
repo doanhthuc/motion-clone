@@ -137,6 +137,13 @@ struct NewJobView: View {
                 }
             }
         }
+        .safeAreaInset(edge: .bottom) {
+            if isBatch && BatchComposer.supports(pipeline) && BatchRunBar.isVisible(composer) {
+                BatchRunBar(composer: composer)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .animation(.snappy, value: isBatch && BatchRunBar.isVisible(composer))
         .modifier(BatchPickerSheets(pickingOutfits: $pickingOutfits, pickingDrivers: $pickingDrivers,
                                     composer: composer, materials: materials, pipeline: pipeline))
         .navigationDestination(isPresented: $showRun) {

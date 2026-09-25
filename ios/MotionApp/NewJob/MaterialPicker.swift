@@ -24,6 +24,12 @@ struct MaterialPicker: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     header
+                    if kind != .unknown {
+                        MaterialImportBar(kind: kind, materials: materials) { material in
+                            onSelect(material.id)
+                            dismiss()
+                        }
+                    }
                     if let message = materials.errorMessage, materials.loaded {
                         refreshFailureBanner(message)
                     }
@@ -48,6 +54,9 @@ struct MaterialPicker: View {
                     Button("Done") { dismiss() }
                 }
             }
+            // An upload or download started here finishes by selecting its
+            // material; a swipe-down mid-way would select it behind a closed sheet.
+            .interactiveDismissDisabled(materials.isUploading || materials.isImportingLink)
         }
         .task {
             if !materials.loaded {
@@ -87,7 +96,9 @@ struct MaterialPicker: View {
             ContentUnavailableView {
                 Label("No matching materials", systemImage: "photo.on.rectangle.angled")
             } description: {
-                Text("Add \(kindDescriptionForEmptyState) in Material, then choose it here.")
+                Text(kind == .video
+                     ? "Import a video from your library or paste a TikTok link above."
+                     : "Import \(kindDescriptionForEmptyState) from your library above.")
             }
             .foregroundStyle(Theme.secondary)
             .frame(maxWidth: .infinity)
@@ -153,39 +164,5 @@ struct MaterialPicker: View {
         value.replacingOccurrences(of: "-", with: " ")
             .replacingOccurrences(of: "_", with: " ")
             .capitalized
-    }
-}
-
-@MainActor
-private struct MaterialChoice: View {
-    let material: MotionKit.Material
-    let materials: MaterialsStore
-    let selected: Bool
-    let onSelect: () -> Void
-    @State private var thumbnail: Data?
-
-    var body: some View {
-        Button(action: onSelect) {
-            MaterialCard(
-                material: material,
-                warning: materials.warning(for: material.id),
-                thumbnail: thumbnail,
-                selected: selected)
-                .overlay(alignment: .topTrailing) {
-                    if selected {
-                        Image(systemName: "checkmark.circle.fill")
-                            .font(.title3)
-                            .symbolRenderingMode(.palette)
-                            .foregroundStyle(Theme.onAccent, Theme.accent)
-                            .padding(8)
-                    }
-                }
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(material.name)
-        .accessibilityValue(selected ? "Selected" : "Not selected")
-        .task(id: material.id) {
-            thumbnail = await materials.thumbnail(for: material)
-        }
     }
 }
