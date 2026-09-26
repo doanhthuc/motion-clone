@@ -21,6 +21,9 @@ struct MaterialMultiPicker: View {
     let note: String?
     let isChosen: (String) -> Bool
     let toggle: (String) -> Void
+    /// Set by a chained pick: a Next button walks on to the next empty card;
+    /// Done still closes the chain.
+    var onNext: (() -> Void)?
     @Environment(\.dismiss) private var dismiss
     @State private var deleteCandidate: MotionKit.Material?
 
@@ -57,7 +60,14 @@ struct MaterialMultiPicker: View {
             .navigationSubtitle(chosenCount == 0 ? "" : "\(chosenCount) selected")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
+                if let onNext {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Next", action: onNext).disabled(chosenCount == 0)
+                    }
+                    ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
+                } else {
+                    ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
+                }
             }
             .interactiveDismissDisabled(materials.isUploading || materials.isImportingLink)
             .modifier(MaterialDeleteDialog(candidate: $deleteCandidate, store: materials) { deleted in

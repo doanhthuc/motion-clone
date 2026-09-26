@@ -8,6 +8,9 @@ struct MaterialPicker: View {
     let selectedID: String?
     let materials: MaterialsStore
     let onSelect: (String?) -> Void
+    /// Set by a chained pick (2026-09-26 spec §3): after a selection the sheet
+    /// moves to the next empty card instead of closing.
+    var onAdvance: (() -> Void)?
     @Environment(\.dismiss) private var dismiss
     @State private var deleteCandidate: MotionKit.Material?
 
@@ -31,7 +34,7 @@ struct MaterialPicker: View {
                         MaterialImportBar(kind: kind, role: MaterialRole(rawValue: role),
                                           materials: materials) { material in
                             onSelect(material.id)
-                            dismiss()
+                            if let onAdvance { onAdvance() } else { dismiss() }
                         }
                     }
                     if let message = materials.errorMessage, materials.loaded {
@@ -116,7 +119,7 @@ struct MaterialPicker: View {
                     MaterialChoice(material: material, materials: materials, selected: material.id == selectedID,
                                    onDelete: { deleteCandidate = material }) {
                         onSelect(material.id)
-                        dismiss()
+                        if let onAdvance { onAdvance() } else { dismiss() }
                     }
                 }
             }
