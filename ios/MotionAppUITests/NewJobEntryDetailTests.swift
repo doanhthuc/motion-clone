@@ -46,6 +46,7 @@ final class NewJobEntryDetailTests: XCTestCase {
         XCTAssertTrue(provider.waitForExistence(timeout: 10))
         let before = provider.value as? String ?? ""
         provider.tap()
+        attach(app, "entry-provider-open")
         let other = app.buttons.allElementsBoundByIndex
             .first { $0.label.contains("Self-host") || ($0.label.contains("Gemini") && !before.contains("Gemini")) }
         let target = try XCTUnwrap(other, "another provider must be offered")

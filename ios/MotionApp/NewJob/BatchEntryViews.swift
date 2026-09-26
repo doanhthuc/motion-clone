@@ -211,6 +211,7 @@ struct BatchEntryDetail: View {
     @Environment(\.dismiss) private var dismiss
     @State private var confirmingDrop = false
     @State private var replacing: String?
+    @State private var choosingProvider = false
 
     private var entry: DraftBatchEntry? {
         guard let batch = store.draft?.batch, batch.indices.contains(position) else { return nil }
@@ -266,7 +267,9 @@ struct BatchEntryDetail: View {
                         .font(.body.weight(.semibold))
                         .frame(maxWidth: .infinity, minHeight: 44)
                 }
-                .buttonStyle(.bordered)
+                // Filled: the tinted bordered style read as disabled next to
+                // the dark cards (user, 2026-09-26).
+                .buttonStyle(.borderedProminent)
                 .tint(Theme.danger)
                 .disabled(disabled)
                 .confirmationDialog("Drop this batch entry?", isPresented: $confirmingDrop,
@@ -295,46 +298,77 @@ struct BatchEntryDetail: View {
 
     // MARK: Provider
 
+    /// The choices open inside the card rather than in a menu: the menu's
+    /// popover floated off the row it belonged to (user, 2026-09-26). A pick
+    /// folds the card back to the one row.
     private func providerMenu(_ entry: DraftBatchEntry, pipeline: Pipeline) -> some View {
-        Menu {
-            Picker("Provider", selection: Binding(
-                get: { entry.provider },
-                set: { id in
-                    guard id != entry.provider else { return }
-                    Task { await store.editBatch(entry.digest, BatchEntryEdit.provider(id, in: entry)) }
-                })) {
-                ForEach(pipeline.providers) { provider in
-                    let text = ProviderText(label: provider.label)
-                    Label {
-                        Text(text.name)
-                        if let caveat = text.caveat { Text(caveat) }
-                    } icon: {
-                        Image(systemName: provider.id == "qwen" ? "cpu" : "cloud")
+        VStack(spacing: 0) {
+            Button {
+                withAnimation(.snappy) { choosingProvider.toggle() }
+            } label: {
+                HStack(spacing: 12) {
+                    ProviderMark(id: entry.provider)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Provider").font(.caption).foregroundStyle(Theme.secondary)
+                        Text(BatchEntryText.provider(entry, pipeline: pipeline))
+                            .font(.body.weight(.semibold)).foregroundStyle(Theme.label)
                     }
-                    .tag(provider.id)
+                    Spacer(minLength: 0)
+                    Image(systemName: "chevron.down")
+                        .font(.footnote.weight(.semibold)).foregroundStyle(Theme.secondary)
+                        .rotationEffect(.degrees(choosingProvider ? 180 : 0))
+                }
+                .padding(.horizontal, 14).frame(minHeight: 56)
+                .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Provider")
+            .accessibilityValue(BatchEntryText.provider(entry, pipeline: pipeline))
+            .accessibilityHint(choosingProvider ? "Hide the providers" : "Show the providers")
+            .accessibilityIdentifier("entry.provider")
+            if choosingProvider {
+                ForEach(pipeline.providers) { provider in
+                    Divider().padding(.leading, 14)
+                    providerRow(provider, selected: provider.id == entry.provider) {
+                        withAnimation(.snappy) { choosingProvider = false }
+                        guard provider.id != entry.provider else { return }
+                        Task { await store.editBatch(entry.digest, BatchEntryEdit.provider(provider.id, in: entry)) }
+                    }
                 }
             }
-            .pickerStyle(.inline)
-        } label: {
-            HStack(spacing: 12) {
-                ProviderMark(id: entry.provider)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Provider").font(.caption).foregroundStyle(Theme.secondary)
-                    Text(BatchEntryText.provider(entry, pipeline: pipeline))
-                        .font(.body.weight(.semibold)).foregroundStyle(Theme.label)
+        }
+        .background(Theme.surface, in: .rect(cornerRadius: Theme.Radius.medium))
+        .clipShape(.rect(cornerRadius: Theme.Radius.medium))
+        .disabled(disabled)
+        .onChange(of: disabled) { _, now in if now { choosingProvider = false } }
+    }
+
+    private func providerRow(_ provider: PipelineProvider, selected: Bool, action: @escaping () -> Void) -> some View {
+        let text = ProviderText(label: provider.label)
+        return Button(action: action) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: provider.id == "qwen" ? "cpu" : "cloud")
+                    .font(.body).foregroundStyle(Theme.secondary).frame(width: 22)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(text.name).font(.body).foregroundStyle(Theme.label)
+                    if let caveat = text.caveat {
+                        Text(caveat).font(.caption).foregroundStyle(Theme.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
                 Spacer(minLength: 0)
-                Image(systemName: "chevron.up.chevron.down")
-                    .font(.footnote.weight(.semibold)).foregroundStyle(Theme.secondary)
+                Image(systemName: "checkmark")
+                    .font(.body.weight(.semibold)).foregroundStyle(Theme.accent)
+                    .opacity(selected ? 1 : 0)
             }
             .padding(.horizontal, 14).padding(.vertical, 10)
-            .background(Theme.surface, in: .rect(cornerRadius: Theme.Radius.medium))
+            .frame(minHeight: 44)
             .contentShape(.rect)
         }
-        .disabled(disabled)
-        .accessibilityLabel("Provider")
-        .accessibilityValue(BatchEntryText.provider(entry, pipeline: pipeline))
-        .accessibilityIdentifier("entry.provider")
+        .buttonStyle(.plain)
+        .accessibilityLabel(text.name)
+        .accessibilityValue(text.caveat ?? "")
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 
     // MARK: Materials
