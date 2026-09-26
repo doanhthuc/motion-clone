@@ -66,7 +66,7 @@ offer the step that matters next.
 | Empty card | open the picker | — | — |
 | Single-select card | open the picker to change it | peek + menu (Clear) | — |
 | Multi-select card (Outfit/Driver) | open the multi-picker | menu for the item shown: saved try-on / Remove | horizontal: page through the items, with page dots |
-| Basket job | open the detail (the existing `BatchEntryDetail`) | peek | leading: Drop, with confirmation |
+| Basket job | open the detail (the existing `BatchEntryDetail`) | peek | trailing (swipe left): Drop, with confirmation |
 | Basket drawer | expand / collapse | — | up / down |
 
 The ✕ glyph on a filled tile is removed: it was below the 44 pt minimum. Clearing moves into the
@@ -90,10 +90,18 @@ per outfit, chosen from the outfit card's long-press menu and shown as a badge o
 
 `SavedTryonsView.use(_:)` writes the draft directly (character, outfit and `tryonSeed` through the
 library store) and today forces `newJobMode = .single`. MotionKit gains
-`BatchComposer.adopt(outfitID:seedID:)`: when the composer has no outfits and the draft carries an
-outfit slot, New Job adopts that outfit with the draft's seed as the composer's single outfit.
-When the composer already has outfits, it does nothing, so a hand-built selection is never
-overwritten. `NewJobMode` and `AppModel.newJobMode` are deleted.
+`BatchComposer.adoptDraftSelection()`: when the composer has no outfits and the draft carries an
+outfit slot, that outfit becomes the composer's single outfit, with the draft's `tryonSeed` as its
+seed. When the composer has no drivers and the pipeline has a driver role, the draft's driver slot
+is adopted the same way. Each adopted slot, and the seed with the outfit, is then cleared on the
+draft in one PATCH, so the composer is the only place the crossed roles live. A dimension that
+already has a selection is left alone, so a hand-built selection is never overwritten. New Job
+calls it whenever the draft's outfit or driver slot changes. `NewJobMode` and
+`AppModel.newJobMode` are deleted.
+
+`BatchComposer.reset()` empties the selection. Clear draft calls it next to `store.clear()`,
+because the selection now lives outside the draft. Selecting a pipeline without a character +
+outfit pair calls it too, since its cards cannot show the selection.
 
 ### The action bar
 
@@ -128,7 +136,8 @@ exits at any point.
 | `PickerChain` (new) | drives chained picking |
 | deleted | `BatchComposerSection`, `BatchRunBar` |
 
-MotionKit only gains `adopt(outfitID:seedID:)`. No server route, no field, nothing under
+MotionKit gains `BatchComposer.adoptDraftSelection()`, `BatchComposer.reset()` and a pure
+`NewJobState` (what each card holds, what is missing, what Add and Continue would do). No server route, no field, nothing under
 `scripts/**`, so the deploy-bot workflow does not run.
 
 The seed observers (`composer.seedKey`, `library.loaded`) stay in `NewJobView` for the reason their
@@ -136,8 +145,9 @@ comment gives. The mode split they were placed above is gone, but the reason sti
 
 ## 5. Verification
 
-- `make ios-test`: unit tests for `adopt` (adopts into an empty composer, ignores a non-empty one,
-  carries the seed or nil).
+- `make ios-test`: unit tests for `adoptDraftSelection` (adopts into an empty composer and clears
+  the draft slots, ignores a non-empty dimension, carries the seed or nil), `reset`, and
+  `NewJobState`.
 - `make ios-build`.
 - `make ios-ui-test`: Phase 4/5/6 smokes use `newjob.mode`, `"Validate"`, `"Add to batch"` and the
   Settings `"Pipeline"` row. They are rewritten for the new flow. The identifiers `batch.run`,
