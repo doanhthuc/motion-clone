@@ -81,10 +81,12 @@ plan: [`plans/2026-09-26-newjob-single-stage.md`](plans/2026-09-26-newjob-single
   button that came and went with `isStale` crowded the chip, and iOS 26 then dropped the whole
   trailing group, Clear with it (seen in the first Phase 3 run).
 - **Gates:**
-  - `make ios-test`: 316/316 passed.
+  - `make ios-test`: 320/320 passed after the review fixes.
   - `make ios-build`: clean.
-  - `make ios-ui-test`: 8/9 on the rerun. `Phase5SmokeTests` timed out once waiting for the RunPod
-    migrate ask, then passed alone.
+  - `make ios-ui-test`: 8/8 test cases passed after the review fixes. On an earlier run,
+    `Phase5SmokeTests` timed out once waiting for the RunPod migrate ask, then passed alone.
+  - The whole-branch review returned "with fixes": 0 Critical, 9 Important (all fixed in `74bed7c`),
+    and 10 Minor. The Minor items are deferred and listed below.
   - `NewJobStageTests` passed on an iPhone SE (3rd gen) and an iPhone 18 Pro Max simulator. It checks
     that every card sits above the action bar and that `⋯` stays in the bar, with no swipe.
     Screenshots are in `out/newjob-stage/` (gitignored).
@@ -93,6 +95,15 @@ plan: [`plans/2026-09-26-newjob-single-stage.md`](plans/2026-09-26-newjob-single
   - No screenshot covers the drawer open, the error banner, or the chain mid-way.
   - The gestures (paging through outfits on a card, dragging the drawer, the long-press menus) have
     only been exercised by XCUITest taps, not by hand.
+  - Deferred minors from the review:
+    - The banners neither dismiss themselves nor swipe away, and a persistent error covers the top
+      cards.
+    - The chain's progress title from the spec is missing.
+    - After a stopped build, two buttons both read "Continue". Rename the composer's to "Resume".
+    - The drawer stays expanded after the last job is dropped.
+    - `SlotCard`'s page can point at an item that was removed.
+    - Adopt and reset change the selection before their server writes, with no rollback.
+    - An adopted driver lives only in memory, so a relaunch or the Telegram bot shows no driver.
 
 ## Materials add flow (2026-09-26)
 
