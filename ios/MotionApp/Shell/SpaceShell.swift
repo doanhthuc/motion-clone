@@ -122,8 +122,16 @@ extension View {
     /// (not hittable, not drawn) while Studio shows; `toolbarVisibility(.hidden,
     /// for: .tabBar)` on the tab stacks or roots didn't remove it either
     /// (simulator, 2026-09-26).
+    ///
+    /// The off-screen offset is load-bearing: `allowsHitTesting(false)` does not
+    /// stop the hidden space's UIKit navigation bar from taking touches, so the
+    /// hidden Motion bar swallowed every tap on Studio's ☰ at the same spot and
+    /// the button's action never ran (logged on the simulator, 2026-09-26).
+    /// Moving the hidden space out of the window keeps its state and puts its
+    /// UIKit views where no touch can land.
     fileprivate func spaceVisibility(_ visible: Bool) -> some View {
         opacity(visible ? 1 : 0)
+            .offset(x: visible ? 0 : 20_000)
             .allowsHitTesting(visible)
             .accessibilityHidden(!visible)
     }
