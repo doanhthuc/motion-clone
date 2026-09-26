@@ -5,7 +5,7 @@ struct StudioSpaceView: View {
     @Environment(AppModel.self) private var model
     let studio: StudioStore
     @State private var viewing: Viewing?
-    /// Which reference is long-pressed for the enlarged preview + ⓧ. Owned
+    /// Which reference is tapped open for the enlarged preview + ⓧ. Owned
     /// here, not by the composer: the backdrop dim below has to cover the
     /// grid, and a dim drawn from inside the pinned composer can't reliably
     /// reach past its own bounds.
@@ -33,6 +33,7 @@ struct StudioSpaceView: View {
                             .padding(.horizontal, 4)
                     }
                     .defaultScrollAnchor(.top)
+                    .scrollDismissesKeyboard(.immediately)
                     .overlay {
                         // Attached before `safeAreaInset` below, so it fills the
                         // ScrollView's own bounds (the grid) while the pinned

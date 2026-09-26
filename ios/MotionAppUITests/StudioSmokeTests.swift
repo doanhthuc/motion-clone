@@ -25,6 +25,16 @@ final class StudioSmokeTests: XCTestCase {
         XCTAssertTrue(app.textFields["studio.prompt"].waitForExistence(timeout: 10)
                       || app.textViews["studio.prompt"].waitForExistence(timeout: 1))
         XCTAssertFalse(app.buttons["studio.send"].isEnabled, "Send stays disabled with an empty prompt")
+        // Tapping outside the prompt dismisses the keyboard (app-wide
+        // recognizer, KeyboardDismissal.swift). Typing a prompt is free: only
+        // Send spends.
+        let prompt = app.textViews["studio.prompt"].exists ? app.textViews["studio.prompt"] : app.textFields["studio.prompt"]
+        prompt.tap()
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 5))
+        prompt.typeText("a red chair")
+        app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.35)).tap()
+        expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: app.keyboards.firstMatch)
+        waitForExpectations(timeout: 5)
         app.buttons["studio.settings"].tap()
         XCTAssertTrue(app.buttons["studio.settings.done"].waitForExistence(timeout: 10))
         // The sheet opens at its medium detent; the model list is below the fold

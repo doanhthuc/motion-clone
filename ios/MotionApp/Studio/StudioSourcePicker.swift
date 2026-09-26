@@ -8,20 +8,26 @@ struct StudioSourcePicker: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     let studio: StudioStore
-    @State private var photo: PhotosPickerItem?
-    @State private var uploading = false
+    @State private var photos: [PhotosPickerItem] = []
+    /// (done, total) while a multi-photo pick uploads, one after another:
+    /// `MaterialsStore` tracks a single upload at a time.
+    @State private var progress: (done: Int, total: Int)?
+    private var uploading: Bool { progress != nil }
     @State private var failure: String?
 
     var body: some View {
         NavigationStack {
             List {
                 Section {
-                    PhotosPicker(selection: $photo, matching: .images) {
+                    PhotosPicker(selection: $photos, maxSelectionCount: maxPick,
+                                 selectionBehavior: .ordered, matching: .images) {
                         Label("Photo library", systemImage: "photo.on.rectangle")
                     }
                     .disabled(uploading)
-                    if uploading {
-                        Label { Text("Uploading…") } icon: { ProgressView().controlSize(.small) }
+                    .accessibilityIdentifier("studio.source.photos")
+                    if let progress {
+                        Label { Text("Uploading \(min(progress.done + 1, progress.total)) of \(progress.total)…") }
+                            icon: { ProgressView().controlSize(.small) }
                             .font(.footnote).foregroundStyle(Theme.secondary)
                     } else if let failure {
                         Text(failure).font(.footnote).foregroundStyle(Theme.danger)
@@ -50,22 +56,40 @@ struct StudioSourcePicker: View {
                 await model.materials?.refresh()
                 await model.tryonLibrary?.load()
             }
-            .onChange(of: photo) { _, item in
-                guard let item, let materials = model.materials else { return }
-                uploading = true
+            .onChange(of: photos) { _, items in
+                guard !items.isEmpty, let materials = model.materials else { return }
+                failure = nil
+                progress = (0, items.count)
                 Task {
-                    defer { uploading = false; photo = nil }
-                    do {
-                        if let material = try await MediaImport.upload(item, to: materials) {
-                            studio.attach(StudioRef(kind: .material, id: material.id))
-                            dismiss()
-                        } else {
-                            failure = materials.errorMessage ?? "Upload failed."
+                    defer { progress = nil; photos = [] }
+                    var failed = 0
+                    for (i, item) in items.enumerated() {
+                        progress = (i, items.count)
+                        do {
+                            if let material = try await MediaImport.upload(item, to: materials) {
+                                studio.attach(StudioRef(kind: .material, id: material.id))
+                            } else {
+                                failed += 1
+                                failure = materials.errorMessage ?? "Upload failed."
+                            }
+                        } catch {
+                            failed += 1
+                            failure = error.localizedDescription
                         }
-                    } catch { failure = error.localizedDescription }
+                    }
+                    if failed == 0 { dismiss() } else if items.count > 1 {
+                        failure = "\(failed) of \(items.count) photos failed to upload. \(failure ?? "")"
+                    }
                 }
             }
         }
+    }
+
+    /// Room left under the selected model's reference cap; `nil` (no cap) when
+    /// the catalog isn't loaded yet.
+    private var maxPick: Int? {
+        guard let cap = studio.selectedModel?.maxRefs else { return nil }
+        return max(1, cap - studio.attachments.count)
     }
 
     /// Try-on previews of the live Phase A run, if any.
