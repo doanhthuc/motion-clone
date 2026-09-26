@@ -131,8 +131,8 @@ struct SlotCard: View {
     }
 }
 
-/// A material's thumbnail filling the card, fetched the way `SlotMaterialRow`
-/// did it (a `@ViewBuilder` cannot hold the `@State`).
+/// A material's thumbnail filling the card, fetched per card because a
+/// `@ViewBuilder` cannot hold the `@State`.
 @MainActor
 private struct CardThumbnail: View {
     let materialID: String
@@ -164,8 +164,8 @@ private struct CardThumbnail: View {
     }
 }
 
-/// The dashed "tap to fill" face, kept from `SlotTile` so an empty card
-/// reads the same as before.
+/// The dashed "tap to fill" face, the same one the tiles had before
+/// 2026-09-26, so "tap to fill" reads as it did.
 private struct EmptyCardFace: View {
     let kind: PipelineRoleKind
     let multi: Bool
