@@ -13,8 +13,6 @@ struct MaterialImportBar: View {
     let onImported: (MotionKit.Material) -> Void
     private let photos: PHPickerFilter
     private let allowsLink: Bool
-    /// Adds a Files tile; the caller owns the importer (it needs a presenter).
-    private let onFiles: (() -> Void)?
     /// Filed under this role on arrival, so the Materials tab groups it.
     private let role: MaterialRole?
 
@@ -25,19 +23,7 @@ struct MaterialImportBar: View {
         self.onImported = onImported
         photos = kind == .video ? .videos : .images
         allowsLink = kind == .video
-        onFiles = nil
         self.role = role
-    }
-
-    /// For the Materials tab: any image or video, a link, and Files.
-    init(anyKindIn materials: MaterialsStore, onFiles: @escaping () -> Void,
-         onImported: @escaping (MotionKit.Material) -> Void) {
-        self.materials = materials
-        self.onImported = onImported
-        photos = .any(of: [.images, .videos])
-        allowsLink = true
-        self.onFiles = onFiles
-        role = nil
     }
 
     @State private var photoItem: PhotosPickerItem?
@@ -70,13 +56,6 @@ struct MaterialImportBar: View {
                         SourceTile(title: "TikTok link", systemImage: "link", selected: showingLink)
                     }
                     .accessibilityIdentifier("import.tiktok")
-                }
-
-                if let onFiles {
-                    Button(action: onFiles) {
-                        SourceTile(title: "Files", systemImage: "folder")
-                    }
-                    .accessibilityIdentifier("import.files")
                 }
             }
             .buttonStyle(.plain)
