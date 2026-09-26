@@ -1,13 +1,54 @@
 import SwiftUI
 import MotionKit
+import UserNotifications
 
 @main
 struct MotionApp: App {
+    @UIApplicationDelegateAdaptor private var appDelegate: AppDelegate
     @State private var model = AppModel()
     var body: some Scene {
         WindowGroup {
             RootView().environment(model).preferredColorScheme(.dark).dismissesKeyboardOnOutsideTap()
+                .task { appDelegate.openMaterials = { [model] in model.openMaterials() } }
         }
+    }
+}
+
+/// Receives taps on the share extension's banners (they are posted under the
+/// app's identity). Set as the center's delegate at launch, before SwiftUI
+/// builds a view, so a tap that cold-launches the app is not missed — it is
+/// parked in `pendingMaterials` until `openMaterials` is wired up.
+@MainActor
+final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
+    private var pendingMaterials = false
+    var openMaterials: (() -> Void)? {
+        didSet {
+            guard pendingMaterials, let openMaterials else { return }
+            pendingMaterials = false
+            openMaterials()
+        }
+    }
+
+    func application(_ application: UIApplication,
+                     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        UNUserNotificationCenter.current().delegate = self
+        return true
+    }
+
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                            didReceive response: UNNotificationResponse) async {
+        let route = response.notification.request.content.userInfo[ShareImportNotice.routeKey] as? String
+        guard route == ShareImportNotice.materialsRoute else { return }
+        await MainActor.run {
+            if let openMaterials { openMaterials() } else { pendingMaterials = true }
+        }
+    }
+
+    /// Sharing happens from another app, but a share finishing after the user
+    /// has switched to Motion should still show its banner.
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                            willPresent notification: UNNotification) async -> UNNotificationPresentationOptions {
+        [.banner, .list]
     }
 }
 
@@ -129,6 +170,23 @@ final class AppModel {
             await materials.resumePendingUpload()
             self?.materialResumeTask = nil
         }
+    }
+
+    /// A tap on a share-extension banner: show the list the video landed in.
+    func openMaterials() {
+        selectedSpace = .motion
+        isSidebarOpen = false
+        selectedTab = .materials
+        refreshMaterials()
+    }
+
+    /// The share extension reports through banners only if the app has been
+    /// granted them; iOS asks once and remembers the answer.
+    /// Skipped under UI tests: the system alert would sit over the screens they tap.
+    func requestNotificationPermission() {
+        let args = ProcessInfo.processInfo.arguments
+        guard !Self.isUITestRecording, !args.contains("-UITestNoNotificationPrompt") else { return }
+        Task { _ = try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) }
     }
 
     /// A video shared to the Motion extension lands on the server while the

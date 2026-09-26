@@ -36,7 +36,8 @@ No paid Apple account, so the app expires 7 days after install. Re-run from Xcod
 The Keychain survives this, so the secrets do not need re-entering. The secrets are seeded only into empty
 Keychain entries: an edit made in Settings is never overwritten by a rebuild.
 
-No push notifications: Telegram reports progress and results.
+No push notifications: Telegram reports progress and results. Local notifications (the share
+extension's banners) need no paid account.
 
 ## Share to Motion
 
@@ -46,6 +47,23 @@ opening the app; closing the card early is safe (the server stages before it ans
 the app's Keychain through the shared access group `$(AppIdentifierPrefix)xyz.doanhthuc.motion`,
 and falls back to the baked `Secrets.xcconfig` values if free provisioning does not grant it.
 First use: in the share sheet's app row tap More and enable Motion (or pin it to the top).
+
+Progress is reported through notifications when the app has permission (asked on first launch):
+the card closes at once, a "Downloading…" banner appears, and the same banner is replaced by the
+outcome ("TikTok video added" with the clip's length and poster frame, or the failure); tapping it
+opens the Materials tab. The extension stays alive past closing through
+`ProcessInfo.performExpiringActivity`; if iOS takes that time back first, the banner says "Still
+downloading" and the video lands on its own. Without permission the card stays up and reports in
+place, as before.
+
+**Dynamic Island.** The share extension cannot start a Live Activity: `Activity.request` fails with
+`unsupportedTarget` even with `NSSupportsLiveActivities` on every target (measured on device
+2026-09-26). The island comes from Shortcuts instead: the app ships a **Save TikTok to Motion**
+action (`MotionApp/Intents/SaveTikTokIntent.swift`, runs in the background). Build a shortcut once —
+Receive **URLs** from **Share Sheet** → Save TikTok to Motion (Link: Shortcut Input), with "Show in
+Share Sheet" on; "If there's no input: Get Clipboard" lets it run on a copied link too — and share
+to that shortcut: Shortcuts draws its progress ring in the island while the action runs, and the
+outcome arrives as the same banner the extension posts (no result dialog to dismiss).
 
 ## Materials and uploads
 
