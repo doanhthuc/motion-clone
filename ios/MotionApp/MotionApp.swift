@@ -59,8 +59,6 @@ enum AppSpace: String { case motion, studio }
 
 /// How many jobs the draft stands for: `.single` is the one job being edited,
 /// `.batch` is a cross build of many.
-enum NewJobMode: Hashable { case single, batch }
-
 /// Opens the migrate sheet (RootView presents it over every tab).
 struct MigrateRequest: Identifiable, Equatable {
     let id = UUID()
@@ -98,9 +96,6 @@ final class AppModel {
     private var spendGate: (any SpendSending)?
     static let isUITestRecording = ProcessInfo.processInfo.arguments.contains("-UITestRecordingSpendGate")
     var selectedTab: AppTab = .runs
-    /// Views write this directly: adopting a saved try-on sets `.single` and
-    /// moves to the New Job tab.
-    var newJobMode: NewJobMode = .single
     private var materialResumeTask: Task<Void, Never>?
     private var replayTask: Task<Void, Never>?
 

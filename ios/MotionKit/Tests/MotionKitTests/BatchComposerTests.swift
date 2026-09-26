@@ -13,6 +13,7 @@ extension URLProtocolTests {
         private var seed: String?
         private var batch: [(slots: [String: String], seed: String?)] = []
         private var failPatchFor: String?
+        private var failAnyPatch = false
         private var basketNextPatchFor: String?
         private var dropBatchArmed = false
         private var characterOnNextRead: String?
@@ -35,6 +36,12 @@ extension URLProtocolTests {
         }
 
         func failNextPatch(for outfit: String) { lock.withLock { failPatchFor = outfit } }
+        func failNextPatch() { lock.withLock { failAnyPatch = true } }
+        /// The edited job already names an outfit (and maybe a seed), the way
+        /// Saved try-ons' "Use in job" leaves it.
+        func preset(outfit: String, seed: String?) {
+            lock.withLock { self.outfit = outfit; self.seed = seed }
+        }
         func preload(outfit: String, seed: String?) {
             lock.withLock { batch.append((shared.merging(["outfit": outfit]) { $1 }, seed)) }
         }
@@ -69,6 +76,10 @@ extension URLProtocolTests {
                     return TestSupport.json(json())
                 case ("PATCH", "/v1/draft"):
                     let body = (try? JSONSerialization.jsonObject(with: r.httpBody ?? Data())) as? [String: Any] ?? [:]
+                    if failAnyPatch {
+                        failAnyPatch = false
+                        return TestSupport.json(#"{"error":{"code":"unprobeable","message":"could not read"}}"#, status: 422)
+                    }
                     if let slots = body["slots"] as? [String: Any], slots.keys.contains("outfit") {
                         let value = slots["outfit"] as? String
                         if let fail = failPatchFor, fail == value {
@@ -94,6 +105,12 @@ extension URLProtocolTests {
                         return TestSupport.json(#"{"error":{"code":"duplicate","message":"that exact job is already in the batch"}}"#, status: 422)
                     }
                     batch.append((slots, seed))
+                    return TestSupport.json(json())
+                case ("POST", "/v1/draft/clear"):
+                    shared = [:]
+                    outfit = nil
+                    seed = nil
+                    batch.removeAll()
                     return TestSupport.json(json())
                 default: return (404, [:], Data())
                 }
@@ -143,6 +160,191 @@ extension URLProtocolTests {
     }
 
     private func writePaths() -> [String] { writes().map { "\($0.0) \($0.1)" } }
+
+    @Test func adoptMovesTheDraftsOutfitSeedAndDriverIntoTheComposer() async {
+        let server = FakeDraftServer()
+        server.preset(outfit: "app/o1.png", seed: "s1")
+        let (composer, draft) = await make(server)
+
+        await composer.adoptDraftSelection()
+
+        #expect(composer.outfits == [CrossOutfit(outfitID: "app/o1.png", seedID: "s1")])
+        #expect(composer.drivers == ["app/dance.mp4"])
+        // One PATCH empties both slots and the seed: the composer is now the
+        // only place the crossed roles live.
+        let w = writes()
+        #expect(w.map { "\($0.0) \($0.1)" } == ["PATCH /v1/draft"])
+        let slots = w.first?.2?["slots"] as? [String: Any]
+        #expect(slots?["outfit"] is NSNull)
+        #expect(slots?["driver"] is NSNull)
+        #expect(w.first?.2?["tryon_seed"] is NSNull)
+        #expect(draft.draft?.filledSlots["outfit"] == nil)
+        #expect(draft.draft?.filledSlots["driver"] == nil)
+        #expect(composer.canRun)
+    }
+
+    /// Review finding 4: Saved try-ons' "Use in job" while outfits are picked
+    /// adds its outfit (and seed) to the selection instead of leaving it hidden
+    /// on the draft. The hand-picked outfits and drivers stay as they were.
+    @Test func adoptAppendsTheDraftsOutfitToAnExistingSelection() async {
+        let server = FakeDraftServer()
+        server.preset(outfit: "app/o1.png", seed: "s1")
+        let (composer, draft) = await make(server)
+        composer.toggle(outfitID: "app/o9.png")
+        composer.toggle(driverID: "app/d9.mp4")
+
+        await composer.adoptDraftSelection()
+
+        #expect(composer.outfits == [CrossOutfit(outfitID: "app/o9.png", seedID: nil),
+                                     CrossOutfit(outfitID: "app/o1.png", seedID: "s1")])
+        #expect(composer.drivers == ["app/d9.mp4"])
+        #expect(draft.draft?.filledSlots["outfit"] == nil)
+        let slots = writes().first?.2?["slots"] as? [String: Any]
+        #expect(slots?.keys.sorted() == ["outfit"])
+    }
+
+    @Test func adoptOfAnOutfitAlreadyPickedOnlyClearsTheDraft() async {
+        let server = FakeDraftServer()
+        server.preset(outfit: "app/o9.png", seed: nil)
+        let (composer, _) = await make(server)
+        composer.toggle(outfitID: "app/o9.png")
+
+        await composer.adoptDraftSelection()
+
+        #expect(composer.outfits.map(\.outfitID) == ["app/o9.png"])
+        #expect(writes().count == 1)
+    }
+
+    @Test func adoptWithNothingOnTheDraftWritesNothing() async {
+        let server = FakeDraftServer()
+        let (composer, _) = await make(server)
+        composer.toggle(driverID: "app/d9.mp4")   // the draft's driver is not adopted over it
+
+        await composer.adoptDraftSelection()
+
+        #expect(composer.outfits.isEmpty)
+        #expect(composer.drivers == ["app/d9.mp4"])
+        #expect(writes().isEmpty)
+    }
+
+    @Test func adoptWithoutASeedFallsBackToTheNewestMatch() async {
+        let library = #"{"entries":[{"id":"s7","owner":"app","material_ids":{"character":"app/me.png","outfit":"app/o1.png"},"provider":"gemini","saved_at":10}]}"#
+        let server = FakeDraftServer(library: library)
+        server.preset(outfit: "app/o1.png", seed: nil)
+        let (composer, _) = await make(server)
+
+        await composer.adoptDraftSelection()
+
+        #expect(composer.outfits.first?.seedID == "s7")
+    }
+
+    /// A refused PATCH leaves the outfit and driver on the draft, so the
+    /// composer must not hold them too: the draft would count its complete
+    /// edited job and the cards would show the same outfit as a second job.
+    @Test func adoptThatTheServerRefusesPutsTheSelectionBack() async {
+        let server = FakeDraftServer()
+        server.preset(outfit: "app/o1.png", seed: "s1")
+        let (composer, draft) = await make(server)
+        composer.toggle(outfitID: "app/o9.png")
+        server.failNextPatch()
+
+        await composer.adoptDraftSelection()
+
+        #expect(composer.outfits.map(\.outfitID) == ["app/o9.png"])
+        #expect(composer.drivers.isEmpty)
+        #expect(draft.draft?.filledSlots["outfit"] == "app/o1.png")
+    }
+
+    @Test func clearEmptiesTheDraftAndTheSelection() async {
+        let server = FakeDraftServer()
+        let (composer, draft) = await make(server)
+        composer.toggle(outfitID: "app/o1.png")
+        composer.toggle(driverID: "app/d1.mp4")
+
+        await composer.clear()
+
+        #expect(composer.outfits.isEmpty && composer.drivers.isEmpty)
+        #expect(draft.draft?.filledSlots.isEmpty == true)
+    }
+
+    /// A clear that did not land leaves the server's draft as it was, so the
+    /// picks on screen stay too rather than vanishing from one half only.
+    @Test func clearThatFailsKeepsTheSelection() async {
+        let server = FakeDraftServer()
+        let (composer, _) = await make(server)
+        composer.toggle(outfitID: "app/o1.png")
+        composer.toggle(driverID: "app/d1.mp4")
+        StubURLProtocol.install { r in
+            r.url?.path == "/v1/draft/clear"
+                ? TestSupport.json(#"{"error":{"code":"busy","message":"busy"}}"#, status: 409)
+                : server.answer(r)
+        }
+
+        await composer.clear()
+
+        #expect(composer.outfits.map(\.outfitID) == ["app/o1.png"])
+        #expect(composer.drivers == ["app/d1.mp4"])
+    }
+
+    /// Review finding 2: leaving a try-on pipeline for one without an outfit
+    /// hands a single picked driver back to the draft's driver slot, so a
+    /// look at the try-on pipeline does not cost the user their driver.
+    @Test func releasingToAPipelineWithADriverHandsASingleDriverBack() async {
+        let server = FakeDraftServer()
+        let (composer, _) = await make(server)
+        composer.toggle(outfitID: "app/o1.png")
+        composer.toggle(driverID: "app/d1.mp4")
+
+        await composer.release(keepingDriver: true)
+
+        #expect(composer.outfits.isEmpty && composer.drivers.isEmpty)
+        let w = writes()
+        #expect(w.map { "\($0.0) \($0.1)" } == ["PATCH /v1/draft"])
+        #expect((w.first?.2?["slots"] as? [String: Any])?["driver"] as? String == "app/d1.mp4")
+    }
+
+    /// A refused hand-back leaves the draft without the driver, so the
+    /// composer keeps it: back on a try-on pipeline the Driver card shows it
+    /// again, and the next switch away tries the hand-back once more.
+    @Test func releaseWhoseHandBackIsRefusedKeepsTheDriver() async {
+        let server = FakeDraftServer()
+        let (composer, _) = await make(server)
+        composer.toggle(outfitID: "app/o1.png")
+        composer.toggle(driverID: "app/d1.mp4")
+        server.failNextPatch()
+
+        await composer.release(keepingDriver: true)
+
+        #expect(composer.outfits.isEmpty)
+        #expect(composer.drivers == ["app/d1.mp4"])
+    }
+
+    @Test func releasingWithSeveralDriversOrNoDriverRoleWritesNothing() async {
+        let server = FakeDraftServer()
+        let (composer, _) = await make(server)
+        composer.toggle(driverID: "app/d1.mp4")
+        composer.toggle(driverID: "app/d2.mp4")
+        await composer.release(keepingDriver: true)
+        #expect(composer.drivers.isEmpty)
+        composer.toggle(driverID: "app/d1.mp4")
+        await composer.release(keepingDriver: false)
+        #expect(composer.drivers.isEmpty)
+        #expect(writes().isEmpty)
+    }
+
+    @Test func resetEmptiesTheSelection() async {
+        let server = FakeDraftServer()
+        let (composer, _) = await make(server)
+        composer.toggle(outfitID: "app/o1.png")
+        composer.toggle(driverID: "app/d1.mp4")
+
+        composer.reset()
+
+        #expect(composer.outfits.isEmpty && composer.drivers.isEmpty)
+        #expect(composer.capReason == nil && composer.failure == nil)
+        #expect(composer.progress == nil && composer.lastAdded == nil)
+        #expect(writes().isEmpty)
+    }
 
     @Test func threeOutfitsAreThreePatchAddPairsThenTheOutfitIsCleared() async {
         let server = FakeDraftServer()
@@ -387,7 +589,11 @@ extension URLProtocolTests {
         #expect(w[8].2?.keys.contains("tryon_seed") == false)
         #expect(draft.draft?.batch.count == 4)
         #expect(composer.failure == nil && composer.lastAdded == 4)
-        #expect(composer.outfits.isEmpty && composer.drivers.isEmpty && composer.progress == nil)
+        #expect(composer.outfits.isEmpty && composer.progress == nil)
+        // Drivers stay picked, like the character: the next outfits are
+        // usually for the same moves (2026-09-26, New Job single stage).
+        #expect(composer.drivers == ["app/d1.mp4", "app/d2.mp4"])
+        #expect(!composer.canRun)   // nothing left to add until outfits are picked again
     }
 
     @Test func noDriversSelectedKeepsTodaysBehaviour() async {

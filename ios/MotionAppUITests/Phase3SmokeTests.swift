@@ -11,46 +11,53 @@ final class Phase3SmokeTests: XCTestCase {
 
         clearDraft(in: app)
         selectTryonPipeline(in: app)
-
-        chooseMaterial(for: "Outfit", in: app)
+        Phase4Draft.chooseMaterial(for: "Outfit", in: app)
         XCTAssertFalse(app.staticTexts.matching(
-            NSPredicate(format: "label CONTAINS[c] %@", "DecodingError")
-        ).firstMatch.exists)
+            NSPredicate(format: "label CONTAINS[c] %@", "DecodingError")).firstMatch.exists)
         XCTAssertNotEqual(app.buttons["Outfit"].value as? String, "Missing required")
 
+        // A pipeline without an outfit drops the selection instead of hiding it.
         selectPipeline(named: "Motion Enhance", in: app)
-        XCTAssertTrue(Phase4Draft.revealText("Removed incompatible slots: outfit.", in: app))
-
+        XCTAssertTrue(app.buttons["Outfit"].waitForNonExistence(timeout: 5))
         selectTryonPipeline(in: app)
-        chooseMaterial(for: "Character", in: app)
-        chooseMaterial(for: "Driver", peekFirst: true, in: app)
-        chooseMaterial(for: "Outfit", in: app)
+        XCTAssertTrue(Phase4Draft.waitUntil(timeout: 10) {
+            (app.buttons["Outfit"].value as? String) == "Missing required"
+        })
+
+        Phase4Draft.chooseMaterial(for: "Character", peekFirst: true, in: app, attach: { self.add($0) })
+        Phase4Draft.chooseMaterial(for: "Driver", in: app)
+        Phase4Draft.chooseMaterial(for: "Outfit", in: app)
 
         clearMaterial(for: "Character", in: app)
-        XCTAssertEqual(app.buttons["Character"].value as? String, "Missing required")
-        XCTAssertFalse(revealButton("Add to batch", in: app).isEnabled)
-        chooseMaterial(for: "Character", in: app)
+        XCTAssertFalse(app.buttons["newjob.continueToRun"].isEnabled)
+        Phase4Draft.chooseMaterial(for: "Character", in: app)
 
-        let add = revealButton("Add to batch", in: app)
-        XCTAssertTrue(add.isEnabled)
+        let add = app.buttons["batch.run"]
+        XCTAssertTrue(add.waitForExistence(timeout: 10))
+        XCTAssertTrue(Phase4Draft.waitUntil(timeout: 20) { add.isEnabled })
         add.tap()
+        XCTAssertTrue(app.staticTexts["Batch · 1"].waitForExistence(timeout: 60))
 
-        let firstDrop = revealButton("Drop", in: app)
+        app.buttons["newjob.basket"].tap()
+        let firstDrop = app.buttons["Drop"].firstMatch
+        XCTAssertTrue(firstDrop.waitForExistence(timeout: 5))
         firstDrop.tap()
         XCTAssertTrue(app.sheets["Drop this batch entry?"].waitForExistence(timeout: 5))
         app.sheets["Drop this batch entry?"].buttons["Drop"].tap()
-        XCTAssertTrue(app.buttons["Drop"].waitForNonExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts["Batch · 1"].waitForNonExistence(timeout: 10))
 
-        revealButton("Add to batch", in: app).tap()
-        _ = revealButton("Drop", in: app)
-        revealButton("Validate", in: app).tap()
-        XCTAssertTrue(Phase4Draft.revealText("Ready", in: app, timeout: 15))
+        // Continue adds the pending outfit itself, validates, and opens the run flow.
+        Phase4Draft.chooseMaterial(for: "Outfit", in: app)
+        let proceed = app.buttons["newjob.continueToRun"]
+        XCTAssertTrue(Phase4Draft.waitUntil(timeout: 20) { proceed.isEnabled })
+        proceed.tap()
+        XCTAssertTrue(app.buttons["runflow.rentWithoutPreview"].waitForExistence(timeout: 90))
+        app.navigationBars.buttons.element(boundBy: 0).tap()
+        XCTAssertTrue(app.staticTexts["Batch · 1"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts["Ready"].waitForExistence(timeout: 10))
         XCTAssertTrue(app.staticTexts.matching(
             NSPredicate(format: "label CONTAINS[c] %@ AND label CONTAINS[c] %@", "about", "min")
         ).firstMatch.waitForExistence(timeout: 5))
-
-        clearMaterial(for: "Character", in: app)
-        XCTAssertTrue(app.staticTexts["Ready"].waitForNonExistence(timeout: 10))
 
         // The Pod tab (Phase 5) is a tab-bar item, not a New Job action.
         for forbidden in ["Phase A", "Run", "Rent", "Pod"] {
@@ -65,31 +72,20 @@ final class Phase3SmokeTests: XCTestCase {
 
     @MainActor
     private func clearDraft(in app: XCUIApplication) {
-        Phase4Draft.tapClear(in: app)
-        XCTAssertTrue(Phase4Draft.revealText("0 of 3 required slots assigned", in: app)
-            || Phase4Draft.revealText("0 of 2 required slots assigned", in: app, timeout: 1))
+        Phase4Draft.clear(in: app)
     }
 
     @MainActor
     private func selectTryonPipeline(in app: XCUIApplication) {
-        let pipeline = revealButton("Pipeline", in: app)
-        let current = pipeline.value as? String ?? ""
-        if current.localizedCaseInsensitiveContains("Try-on") { return }
-
-        pipeline.tap()
-        let option = app.buttons.allElementsBoundByIndex.first {
-            $0.label.localizedCaseInsensitiveContains("Try-on")
-        }
-        XCTAssertNotNil(option, "A try-on pipeline must be available")
-        option?.tap()
-        XCTAssertTrue(waitUntil(timeout: 10) {
-            (app.buttons["Pipeline"].value as? String)?.localizedCaseInsensitiveContains("Try-on") == true
-        })
+        Phase4Draft.selectTryonPipeline(in: app)
     }
 
     @MainActor
     private func selectPipeline(named name: String, in app: XCUIApplication) {
-        revealButton("Pipeline", in: app).tap()
+        let chip = app.buttons["Pipeline"]
+        XCTAssertTrue(chip.waitForExistence(timeout: 10))
+        chip.tap()
+        XCTAssertTrue(app.navigationBars["Settings"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.buttons[name].waitForExistence(timeout: 5))
         app.buttons[name].tap()
         XCTAssertTrue(waitUntil(timeout: 10) {
@@ -97,67 +93,22 @@ final class Phase3SmokeTests: XCTestCase {
         })
     }
 
+    /// Clear lives in the card's long-press menu since 2026-09-26.
     @MainActor
-    private func chooseMaterial(for role: String, peekFirst: Bool = false, in app: XCUIApplication) {
-        revealButton(role, in: app).tap()
-        XCTAssertTrue(app.navigationBars["Choose material"].waitForExistence(timeout: 10))
-
-        let choice = app.buttons.matching(
-            NSPredicate(format: "value == %@", "Not selected")
-        ).firstMatch
-        XCTAssertTrue(choice.waitForExistence(timeout: 10), "A compatible material must exist for \(role)")
-        if peekFirst {
-            // The long press peeks and offers full screen and delete; full screen
-            // opens the player sheet, whose Done comes back to the picker.
-            choice.press(forDuration: 1.0)
-            let fullScreen = app.buttons["View full screen"]
-            XCTAssertTrue(fullScreen.waitForExistence(timeout: 5))
-            XCTAssertTrue(app.buttons["Delete"].exists)
-            let shot = XCTAttachment(screenshot: app.screenshot())
-            shot.name = "material-peek"
-            shot.lifetime = .keepAlways
-            add(shot)
-            fullScreen.tap()
-            let done = app.navigationBars.buttons["Done"].firstMatch
-            XCTAssertTrue(done.waitForExistence(timeout: 5))
-            done.tap()
-            XCTAssertTrue(app.navigationBars["Choose material"].waitForExistence(timeout: 5))
-        }
-        choice.tap()
-        XCTAssertTrue(app.navigationBars["Choose material"].waitForNonExistence(timeout: 10))
+    private func clearMaterial(for role: String, in app: XCUIApplication) {
+        let card = app.buttons[role]
+        XCTAssertTrue(card.waitForExistence(timeout: 10))
+        card.press(forDuration: 1.0)
+        let clear = app.buttons["Clear"]
+        XCTAssertTrue(clear.waitForExistence(timeout: 5))
+        clear.tap()
         XCTAssertTrue(waitUntil(timeout: 10) {
-            (app.buttons[role].value as? String) != "Missing required"
+            (app.buttons[role].value as? String) == "Missing required"
         })
     }
 
     @MainActor
-    private func clearMaterial(for role: String, in app: XCUIApplication) {
-        revealButton(role, in: app).tap()
-        let picker = app.navigationBars["Choose material"]
-        XCTAssertTrue(picker.waitForExistence(timeout: 10))
-        XCTAssertTrue(picker.buttons["Clear"].waitForExistence(timeout: 5))
-        picker.buttons["Clear"].tap()
-        XCTAssertTrue(app.navigationBars["Choose material"].waitForNonExistence(timeout: 10))
-    }
-
-    @MainActor
-    private func revealButton(_ label: String, in app: XCUIApplication) -> XCUIElement {
-        Phase4Draft.revealButton(label, in: app)
-    }
-
-    @MainActor
     private func waitUntil(timeout: TimeInterval, condition: @escaping () -> Bool) -> Bool {
-        let expectation = XCTNSPredicateExpectation(
-            predicate: NSPredicate { _, _ in condition() }, object: nil)
-        return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
-    }
-}
-
-private extension XCUIElement {
-    @MainActor
-    func waitForNonExistence(timeout: TimeInterval) -> Bool {
-        let predicate = NSPredicate(format: "exists == false")
-        let expectation = XCTNSPredicateExpectation(predicate: predicate, object: self)
-        return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
+        Phase4Draft.waitUntil(timeout: timeout, condition: condition)
     }
 }

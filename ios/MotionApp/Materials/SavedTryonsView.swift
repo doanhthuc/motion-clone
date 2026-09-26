@@ -72,7 +72,6 @@ struct SavedTryonsView: View {
     private func use(_ entry: TryonLibraryEntry) {
         Task {
             if await library.use(entry) {
-                model.newJobMode = .single
                 model.selectedTab = .newJob
             }
         }

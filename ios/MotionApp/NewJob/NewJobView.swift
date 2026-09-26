@@ -1,6 +1,14 @@
 import MotionKit
 import SwiftUI
 
+/// New Job as one stage that does not scroll (2026-09-26 spec): the job's
+/// inputs as cards sized to the screen, the pipeline and provider in a
+/// toolbar chip, the basket in a drawer, and Add / Continue pinned above the
+/// tab bar. It replaces a `List` with a Single | Batch switch: in Batch mode
+/// the shared slots, two strips, Settings and the basket stacked past the
+/// screen, and the mode itself was one more thing to hold in mind. The mode
+/// is now what is picked. Outfit and Driver take many on a try-on pipeline,
+/// and one of each is one job.
 @MainActor
 struct NewJobView: View {
     let store: DraftStore
@@ -8,18 +16,20 @@ struct NewJobView: View {
     let flow: RunFlow
     let composer: BatchComposer
     let library: TryonLibraryStore
-    @Environment(AppModel.self) private var model
-    @State private var selectedRole: String?
-    @State private var dropCandidate: DraftBatchEntry?
+    @State private var pick: PickTarget?
+    @State private var openEntry: DraftBatchEntry?
     @State private var showRun = false
-    @State private var pickingOutfits = false
-    @State private var pickingDrivers = false
+    @State private var basketExpanded = false
     @State private var clearSource: ClearSource?
+    /// The error whose banner was swiped away or timed out. The error itself
+    /// stays on the store: it is what turns the More icon into the stale
+    /// warning, whose Refresh is the same retry.
+    @State private var hiddenError: APIError?
 
     var body: some View {
         Group {
             if let draft = store.draft, let pipeline = store.selectedPipeline {
-                editor(draft: draft, pipeline: pipeline)
+                stage(draft: draft, pipeline: pipeline)
             } else if let error = store.error {
                 initialLoadFailure(error)
             } else if store.isRefreshing {
@@ -32,118 +42,82 @@ struct NewJobView: View {
         .navigationBarTitleDisplayMode(.inline)
         .task { await store.load() }
         .task { await library.load() }
-        .refreshable { await store.refresh() }
         .onChange(of: store.needsMaterialsRefresh) { _, needsRefresh in
             guard needsRefresh else { return }
             Task {
                 await materials.refresh()
                 store.acknowledgeMaterialsRefresh()
-                closePickerIfSelectionDisappeared()
             }
         }
-        // Both seed observers sit above the Single|Batch split so they outlive the
-        // Batch arm: Single mode edits the same draft slots through
-        // `slots(draft:pipeline:)`, and an arm removed while they changed never
-        // re-picks. The seed chosen for the old character/outfit pair would then be
-        // PATCHed for the new one, and Phase A skips the provider and seeds the job
-        // from an image made from different materials. `library.loaded` is observed
-        // too because `matches(for:)` is empty against an unfetched library, so an
-        // outfit chosen before `load()` returns would keep no seed at all; no manual
-        // pick can be lost by that, since the seed toggle is disabled while
-        // `matches` is empty. `seedKey`, not `sharedSlots`: toggling the first
-        // driver on or the last off moves `driver` in or out of `sharedSlots`,
-        // and re-picking then would overwrite a hand-chosen seed for nothing.
+        // Kept from before the mode split was removed, for the reason it was
+        // written: a seed picked for the old character/outfit pair must never
+        // be PATCHed for a new one. `library.loaded` because `matches(for:)` is
+        // empty against an unfetched library.
         .onChange(of: composer.seedKey) { _, _ in composer.refreshSeeds() }
         .onChange(of: library.loaded) { _, loaded in
             if loaded { composer.refreshSeeds() }
         }
+        // A crossed role on the draft (Saved try-ons' "Use in job", the
+        // Telegram bot, a pre-redesign draft) moves into the composer, the
+        // only place the Outfit and Driver cards read.
+        .task(id: adoptKey) { await composer.adoptDraftSelection() }
     }
 
-    /// Where Clear was asked from. Each source carries its own dialog, because
-    /// on iOS 26 a confirmation dialog is a popover pointing at the view it is
-    /// attached to: hung on the whole `List`, as both dialogs here were until
-    /// 2026-09-25, its arrow pointed at the middle of the screen, at nothing.
-    private enum ClearSource { case menu, batchHeader }
-
-    private func confirmsClear(_ source: ClearSource) -> Binding<Bool> {
-        Binding(get: { clearSource == source }, set: { if !$0 { clearSource = nil } })
+    private var adoptKey: [String] {
+        [store.draft?.pipeline ?? "", store.draft?.filledSlots[BatchComposer.outfitRole] ?? "",
+         store.draft?.filledSlots[BatchComposer.driverRole] ?? ""]
     }
 
-    private func clearDialog(_ source: ClearSource) -> some ViewModifier {
-        ClearDraftDialog(isPresented: confirmsClear(source), message: clearMessage) {
-            Task { await store.clear() }
-        }
+    private var locked: Bool { store.isBusy || composer.isRunning }
+
+    private func state(_ draft: Draft, _ pipeline: Pipeline) -> NewJobState {
+        NewJobState(pipeline: pipeline, draft: draft,
+                    outfits: composer.outfits.count, drivers: composer.drivers.count)
     }
 
-    /// Clear empties the basket *and* unassigns every slot, in both modes
-    /// (`POST /v1/draft/clear`), so the dialog names both before it happens.
-    private var clearMessage: String {
-        let queued = store.draft?.batch.count ?? 0
-        return queued == 0
-            ? "Every picked material is removed."
-            : "\(queued) job\(queued == 1 ? "" : "s") in the batch and every picked material are removed."
-    }
-
-    private func initialLoadFailure(_ error: APIError) -> some View {
-        VStack(spacing: 16) {
-            ContentUnavailableView(
-                "New Job unavailable",
-                systemImage: "exclamationmark.triangle",
-                description: Text("The draft and pipeline catalog could not be loaded."))
-            ErrorBanner(error: error) { await store.load() }.heroSurface()
-        }
-        .padding(.horizontal, 16)
-    }
-
-    private func editor(draft: Draft, pipeline: Pipeline) -> some View {
-        let isBatch = model.newJobMode == .batch
-        // Cross build needs a character + outfit pair, so Batch mode offers only the
-        // pipelines that have one. When none qualify there is nothing to choose, so
-        // the picker is disabled instead of opening an empty menu behind a label
-        // that still names the pipeline the user is on.
-        let batchCatalog = store.catalog.filter(BatchComposer.supports)
-        let batchSupported = BatchComposer.supports(pipeline)
-        // Materials first, settings after: the inputs are what the user came
-        // to pick, and before 2026-09-25 the provider rows (~550 pt) pushed
-        // them under the tab bar. The next step is pinned below the list
-        // (`NewJobActionBar`) rather than being its last rows.
-        return List {
-            banners
-            if isBatch {
-                BatchComposerSection(store: store, composer: composer,
-                                     materials: materials, pipeline: pipeline,
-                                     onPickRole: { selectedRole = $0 },
-                                     pickingOutfits: $pickingOutfits,
-                                     pickingDrivers: $pickingDrivers)
-            } else {
-                slots(draft: draft, pipeline: pipeline)
-                seedBadge(draft)
+    private func stage(draft: Draft, pipeline: Pipeline) -> some View {
+        let state = state(draft, pipeline)
+        return GeometryReader { proxy in
+            SlotCardGrid(count: state.cards.count) { size in
+                ForEach(state.cards, id: \.self) { card in
+                    slotCard(card, state: state, draft: draft, pipeline: pipeline, size: size)
+                }
             }
-            PipelinePicker(
-                pipeline: pipeline,
-                pipelines: isBatch ? batchCatalog : store.catalog,
-                selectedProvider: draft.provider,
-                disabled: store.isBusy || composer.isRunning || (isBatch && batchCatalog.isEmpty),
-                onPipelineSelected: { id in await store.selectPipeline(id) },
-                onProviderSelected: { id in await store.selectProvider(id) })
-            batch(draft)
+            .padding(.horizontal, 16)
+            .padding(.top, 8)
+            // Room for the collapsed drawer, so it never covers the bottom
+            // row's captions (review, 2026-09-26); only the expanded list
+            // lies over the cards.
+            .padding(.bottom, draft.batch.isEmpty ? 0 : BasketDrawer.collapsedHeight + 8)
+            .overlay(alignment: .bottom) {
+                if !draft.batch.isEmpty {
+                    BasketDrawer(batch: draft.batch, pipeline: self.pipeline(for:), materials: materials,
+                                 locked: locked, expanded: $basketExpanded,
+                                 onOpen: { openEntry = $0 },
+                                 onDrop: { await store.dropFromBatch($0.digest) },
+                                 clearAll: AnyView(clearAllButton))
+                        .frame(maxHeight: basketExpanded ? proxy.size.height * 0.7 : nil, alignment: .bottom)
+                        .padding(.horizontal, 12)
+                }
+            }
+            .overlay(alignment: .top) { banners.padding(.horizontal, 12) }
+            // Dropping the last job removes the drawer; collapse it too, so the
+            // next job's basket does not reappear open over the cards.
+            .onChange(of: draft.batch.isEmpty) { _, empty in if empty { basketExpanded = false } }
         }
-        // An inline bar already separates the first card from the top; the
-        // inset-grouped default added ~35pt of empty band under it.
-        .contentMargins(.top, 8, for: .scrollContent)
-        // One bar row instead of three: the Single | Batch switch stands in
-        // for the title (the tab bar already says "New Job") and the job
-        // count is plain text across from the menu (2026-09-25).
         .toolbar {
             ToolbarItem(placement: .principal) {
-                Picker("Mode", selection: Binding(get: { model.newJobMode }, set: { model.newJobMode = $0 })) {
-                    Text("Single").tag(NewJobMode.single)
-                    Text("Batch").tag(NewJobMode.batch)
-                }
-                .pickerStyle(.segmented)
-                .fixedSize()
-                .accessibilityIdentifier("newjob.mode")
-                .disabled(store.isBusy || composer.isRunning)
+                SettingsChip(pipeline: pipeline, pipelines: store.catalog, selectedProvider: draft.provider,
+                             disabled: locked,
+                             onPipelineSelected: { id in
+                                 await store.selectPipeline(id)
+                                 if let selected = store.selectedPipeline, !BatchComposer.supports(selected) {
+                                     await composer.release(
+                                         keepingDriver: selected.required.contains(BatchComposer.driverRole)
+                                             || selected.optional.contains(BatchComposer.driverRole))
+                                 }
+                             },
+                             onProviderSelected: { id in await store.selectProvider(id) })
             }
             ToolbarItem(placement: .topBarLeading) {
                 Text("\(draft.jobs) job\(draft.jobs == 1 ? "" : "s")")
@@ -153,290 +127,202 @@ struct NewJobView: View {
                     .contentTransition(.numericText())
                     .animation(.snappy, value: draft.jobs)
             }
-            // A count, not a control: without this iOS 26 wraps it in the
-            // same glass capsule as the menu and it reads as a button.
+            // A count, not a control: without this iOS 26 wraps it in glass.
             .sharedBackgroundVisibility(.hidden)
-            if store.isStale {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button { Task { await store.refresh() } } label: {
-                        Image(systemName: "clock.arrow.circlepath")
-                    }
-                    .tint(Theme.warning)
-                    .accessibilityLabel("Stale — refresh")
-                }
-            }
             ToolbarItem(placement: .topBarTrailing) { moreMenu }
         }
         .safeAreaInset(edge: .bottom) {
-            if NewJobActionBar.isVisible(draft: draft, isBatch: isBatch, batchSupported: batchSupported,
-                                         composer: composer) {
-                NewJobActionBar(store: store, composer: composer, draft: draft, isBatch: isBatch,
-                                batchSupported: batchSupported, onContinue: { showRun = true })
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-            }
+            NewJobActionBar(store: store, composer: composer, draft: draft, state: state,
+                            onContinue: { showRun = true })
         }
-        .animation(.snappy, value: NewJobActionBar.isVisible(draft: draft, isBatch: isBatch,
-                                                            batchSupported: batchSupported,
-                                                            composer: composer))
-        .modifier(BatchPickerSheets(pickingOutfits: $pickingOutfits, pickingDrivers: $pickingDrivers,
-                                    composer: composer, materials: materials, pipeline: pipeline))
-        .navigationDestination(isPresented: $showRun) {
-            RunFlowView(flow: flow, entry: .newJob)
+        .sheet(item: $pick) { target in
+            PickerChainSheet(start: target, pipeline: pipeline, store: store, composer: composer,
+                             materials: materials, onClose: { pick = nil })
         }
-        .sheet(
-            isPresented: Binding(
-                get: { selectedRole != nil },
-                set: { if !$0 { selectedRole = nil } })
-        ) {
-            if let role = selectedRole {
-                MaterialPicker(
-                    role: role,
-                    kind: pipeline.roles[role] ?? .unknown,
-                    selectedID: draft.slots[role]?.materialID,
-                    materials: materials,
-                    onSelect: { materialID in
-                        Task { await store.assign(role: role, materialID: materialID) }
-                    })
-                    .interactiveDismissDisabled(store.isBusy)
-            }
+        .sheet(item: $openEntry) { entry in
+            let index = (store.draft?.batch.firstIndex { $0.digest == entry.digest } ?? 0) + 1
+            BatchEntryDetail(index: index, entry: entry, pipeline: self.pipeline(for: entry),
+                             materials: materials, library: library, dropDisabled: locked,
+                             onDrop: { await store.dropFromBatch(entry.digest) })
         }
+        .navigationDestination(isPresented: $showRun) { RunFlowView(flow: flow, entry: .newJob) }
     }
 
-    @ViewBuilder private var banners: some View {
-        if store.error != nil || (store.message != nil && store.message != store.error?.userMessage) {
-            Section {
-                if let error = store.error {
-                    ErrorBanner(error: error) { await store.refresh() }
-                }
-                if let message = store.message, message != store.error?.userMessage {
-                    MessageCard(text: message) { store.dismissMessage() }
-                }
-            }
+    private func slotCard(_ card: NewJobState.Card, state: NewJobState, draft: Draft,
+                          pipeline: Pipeline, size: CGSize) -> some View {
+        let role = state.role(of: card)
+        let items: [SlotCardItem]? = switch card {
+        case .single: nil
+        case .outfits: composer.outfits.map { SlotCardItem(id: $0.outfitID, seeded: $0.seedID != nil) }
+        case .drivers: composer.drivers.map { SlotCardItem(id: $0, seeded: false) }
         }
+        return SlotCard(
+            role: role, required: state.required.contains(role), kind: pipeline.roles[role] ?? .unknown,
+            // A Driver card with nothing multi-picked still shows the shared
+            // driver slot, which is what one job with no driver list runs on.
+            slot: draft.slots[role], items: (card == .drivers && composer.drivers.isEmpty) ? nil : items,
+            materials: materials, disabled: locked,
+            identifier: card == .outfits ? "batch.pickOutfits" : card == .drivers ? "batch.pickDrivers" : nil,
+            size: size,
+            onTap: { pick = PickTarget(card: card, chained: state.isFresh) },
+            menu: { item in AnyView(cardMenu(card, role: role, item: item)) })
     }
 
-    private func slots(draft: Draft, pipeline: Pipeline) -> some View {
-        Section {
-            SlotTileGrid(count: (pipeline.required + pipeline.optional).count) {
-                ForEach(pipeline.required + pipeline.optional, id: \.self) { role in
-                    SlotMaterialRow(
-                        role: role,
-                        required: pipeline.required.contains(role),
-                        kind: pipeline.roles[role] ?? .unknown,
-                        slot: draft.slots[role],
-                        materials: materials,
-                        disabled: store.isBusy,
-                        tile: true) {
-                            selectedRole = role
+    @ViewBuilder private func cardMenu(_ card: NewJobState.Card, role: String, item: SlotCardItem?) -> some View {
+        switch card {
+        case .single:
+            Button("Clear", systemImage: "xmark.circle", role: .destructive) {
+                Task { await store.assign(role: role, materialID: nil) }
+            }
+        case .outfits:
+            if let item {
+                let matches = composer.matches(for: item.id)
+                let seed = composer.outfits.first { $0.outfitID == item.id }?.seedID
+                Toggle("Use saved try-on", systemImage: "photo.badge.checkmark", isOn: Binding(
+                    get: { seed != nil },
+                    set: { composer.setSeed($0 ? matches.first?.id : nil, for: item.id) }))
+                    .disabled(matches.isEmpty)
+                    .accessibilityIdentifier("batch.seed.\(item.id)")
+                if matches.count > 1, seed != nil {
+                    Picker("Saved image", selection: Binding(
+                        get: { seed ?? "" }, set: { composer.setSeed($0, for: item.id) })) {
+                        ForEach(matches) { entry in
+                            Text("\(entry.provider) · \(Date(timeIntervalSince1970: entry.savedAt).formatted(date: .abbreviated, time: .shortened))")
+                                .tag(entry.id)
                         }
+                    }
+                    .pickerStyle(.menu)
                 }
+                if matches.isEmpty { Text("No saved try-on for this pair — Phase A will make one.") }
+                Divider()
+                Button("Remove", systemImage: "trash", role: .destructive) { composer.toggle(outfitID: item.id) }
             }
-        } header: {
-            Text("Materials")
-        } footer: {
-            VStack(alignment: .leading, spacing: 4) {
-                ForEach(slotWarnings(draft, pipeline: pipeline), id: \.self) { warning in
-                    Label(warning, systemImage: "exclamationmark.triangle.fill")
-                        .foregroundStyle(Theme.warning)
+        case .drivers:
+            if let item {
+                Button("Remove", systemImage: "trash", role: .destructive) { composer.toggle(driverID: item.id) }
+            } else {
+                Button("Clear", systemImage: "xmark.circle", role: .destructive) {
+                    Task { await store.assign(role: role, materialID: nil) }
                 }
-                readiness(draft)
             }
         }
     }
 
-    /// A tile has room for a warning glyph, not its sentence; the sentences
-    /// sit under the grid, each named by its slot.
-    private func slotWarnings(_ draft: Draft, pipeline: Pipeline) -> [String] {
-        (pipeline.required + pipeline.optional).compactMap { role in
-            guard let warning = draft.slots[role]?.warning, !warning.isEmpty else { return nil }
-            return "\(SlotText(role: role, required: true, kind: .unknown, slot: nil).title): \(warning)"
+    /// Over the top row of cards, so neither stays for good (review,
+    /// 2026-09-26): each goes on a swipe up or after `bannerSeconds`.
+    @ViewBuilder private var banners: some View {
+        VStack(spacing: 8) {
+            if let error = store.error, error != hiddenError {
+                ErrorBanner(error: error) { await store.refresh() }
+                    .heroSurface()
+                    .modifier(SwipeUpToDismiss { hiddenError = error })
+                    .task(id: error.userMessage) {
+                        try? await Task.sleep(for: .seconds(Self.bannerSeconds))
+                        hiddenError = error
+                    }
+            }
+            if let message = store.message, message != store.error?.userMessage {
+                MessageCard(text: message) { store.dismissMessage() }
+                    .heroSurface()
+                    .modifier(SwipeUpToDismiss { store.dismissMessage() })
+                    .task(id: message) {
+                        try? await Task.sleep(for: .seconds(Self.bannerSeconds))
+                        store.dismissMessage()
+                    }
+            }
+        }
+        .transition(.move(edge: .top).combined(with: .opacity))
+        .animation(.snappy, value: store.message)
+        .animation(.snappy, value: hiddenError)
+        // A new failure of the same kind shows its banner again.
+        .onChange(of: store.error) { _, error in if error == nil { hiddenError = nil } }
+    }
+
+    /// Long enough to read a two-line message; its Retry is in More after.
+    private static let bannerSeconds = 8.0
+
+    private func initialLoadFailure(_ error: APIError) -> some View {
+        VStack(spacing: 16) {
+            ContentUnavailableView("New Job unavailable", systemImage: "exclamationmark.triangle",
+                                   description: Text("The draft and pipeline catalog could not be loaded."))
+            ErrorBanner(error: error) { await store.load() }.heroSurface()
+        }
+        .padding(.horizontal, 16)
+    }
+
+    // MARK: Clear
+
+    /// Where Clear was asked from. Each source carries its own dialog: on
+    /// iOS 26 a confirmation dialog is a popover pointing at its anchor.
+    private enum ClearSource { case menu, basket }
+
+    private func confirmsClear(_ source: ClearSource) -> Binding<Bool> {
+        Binding(get: { clearSource == source }, set: { if !$0 { clearSource = nil } })
+    }
+
+    private func clearDialog(_ source: ClearSource) -> some ViewModifier {
+        ClearDraftDialog(isPresented: confirmsClear(source), message: clearMessage) {
+            // The selection lives outside the draft since 2026-09-26, so the
+            // server's clear alone would leave the Outfit and Driver cards full.
+            // Only once the server's clear lands (`BatchComposer.clear`).
+            Task { await composer.clear() }
         }
     }
 
-    /// Single mode only, deliberately. This reports the *edited job*'s required
-    /// and missing roles, and the Batch arm does not render the edited job — it
-    /// renders shared slots plus an outfit multi-select. A "2 of 3 required
-    /// slots assigned" line under a cross-build form would describe a job the
-    /// user is not looking at. Batch mode's own readiness is `BatchComposer`'s
-    /// `canRun`, which the run button's disabled state already shows.
-    private func readiness(_ draft: Draft) -> some View {
-        let assigned = draft.required.count - draft.missing.count
-        let ready = draft.missing.isEmpty
-        return Text(ready ? "Ready · \(assigned) of \(draft.required.count) required slots" : "\(assigned) of \(draft.required.count) required slots assigned")
-            .accessibilityValue(ready ? "Ready" : "Missing required materials")
+    private var clearMessage: String {
+        let queued = store.draft?.batch.count ?? 0
+        return queued == 0
+            ? "Every picked material is removed."
+            : "\(queued) job\(queued == 1 ? "" : "s") in the batch and every picked material are removed."
     }
 
-    /// Clear sits behind "More", the way Photos and Notes keep destructive
-    /// actions, and behind a confirmation. Until 2026-09-25 it was a bare red
-    /// capsule in the leading corner, where a Back button is expected, and it
-    /// emptied the draft on one tap. The batch header offers the same action
-    /// next to the jobs it removes.
     private var moreMenu: some View {
+        // Refresh lives here rather than as its own bar button: a bar item that
+        // came and went with `isStale` crowded the chip, and iOS 26 then dropped
+        // the whole trailing group, this menu with it (Phase 3 smoke,
+        // 2026-09-26). The stage has no pull to refresh, so this is also the
+        // manual reload. The icon turns to a warning while the draft is stale.
         Menu {
+            Button("Refresh", systemImage: "arrow.clockwise") { Task { await store.refresh() } }
             Button("Clear draft", systemImage: "trash", role: .destructive) { clearSource = .menu }
-                .disabled(store.isBusy || composer.isRunning)
+                .disabled(locked)
         } label: {
-            Image(systemName: "ellipsis")
+            Image(systemName: store.isStale ? "exclamationmark.arrow.circlepath" : "ellipsis")
+                .foregroundStyle(store.isStale ? Theme.warning : Theme.label)
         }
         .accessibilityLabel("More")
+        .accessibilityValue(store.isStale ? "Draft may be out of date" : "")
         .accessibilityIdentifier("newjob.more")
         .modifier(clearDialog(.menu))
     }
 
-    /// The edited job's own seed. `!library.loaded` counts as "still exists":
-    /// an unfetched library cannot say a seed is gone, only that it is unseen.
-    @ViewBuilder private func seedBadge(_ draft: Draft) -> some View {
-        if let seed = draft.tryonSeed {
-            let exists = library.entries.contains { $0.id == seed } || !library.loaded
-            Section {
-                HStack(spacing: 10) {
-                    Image(systemName: exists ? "photo.badge.checkmark" : "exclamationmark.triangle.fill")
-                        .foregroundStyle(exists ? Theme.secondary : Theme.warning)
-                    Text(exists
-                         ? "Uses a saved try-on — Phase A skips the provider for this job"
-                         : "The saved try-on no longer exists")
-                        .font(.subheadline)
-                    Spacer(minLength: 0)
-                    Button("Remove") { Task { await store.apply(DraftPatch(seed: .clear)) } }
-                        .font(.subheadline.weight(.semibold))
-                        .buttonStyle(.borderless)
-                        .tint(Theme.danger)
-                        .disabled(store.isBusy)
-                }
-            }
-        }
+    private var clearAllButton: some View {
+        Button("Clear all") { clearSource = .basket }
+            .font(.subheadline)
+            .buttonStyle(.borderless)
+            .tint(Theme.danger)
+            .disabled(locked)
+            .accessibilityIdentifier("newjob.clearAll")
+            .modifier(clearDialog(.basket))
     }
 
-    @ViewBuilder private func batch(_ draft: Draft) -> some View {
-        if !draft.batch.isEmpty {
-            Section {
-                ForEach(draft.batch, id: \.digest) { entry in
-                    HStack(alignment: .firstTextBaseline, spacing: 12) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(entry.digest)
-                                .font(.body)
-                                .lineLimit(1).truncationMode(.middle)
-                            Text("\(entry.pipeline) · \(entry.provider)")
-                                .font(.subheadline)
-                                .foregroundStyle(Theme.secondary)
-                            Text(slotSummary(entry))
-                                .font(.footnote)
-                                .foregroundStyle(Theme.secondary)
-                                .lineLimit(2)
-                            if entry.tryonSeed != nil {
-                                Label("Saved try-on", systemImage: "photo.badge.checkmark")
-                                    .font(.footnote).foregroundStyle(Theme.secondary)
-                            }
-                        }
-                        Spacer(minLength: 0)
-                        Button("Drop", role: .destructive) { dropCandidate = entry }
-                            .font(.subheadline.weight(.semibold))
-                            .buttonStyle(.borderless)
-                            .tint(Theme.danger)
-                            .disabled(store.isBusy || composer.isRunning)
-                            // On the button, so the popover points at this row's Drop.
-                            .confirmationDialog(
-                                "Drop this batch entry?",
-                                isPresented: Binding(
-                                    get: { dropCandidate?.digest == entry.digest },
-                                    set: { if !$0 { dropCandidate = nil } }),
-                                titleVisibility: .visible
-                            ) {
-                                Button("Drop", role: .destructive) {
-                                    dropCandidate = nil
-                                    Task { await store.dropFromBatch(entry.digest) }
-                                }
-                                Button("Cancel", role: .cancel) { dropCandidate = nil }
-                            } message: {
-                                Text(entry.digest)
-                            }
-                    }
-                }
-            } header: {
-                HStack {
-                    // Its own `Text`: the smokes read "Batch · 2" by exact string.
-                    Text("Batch · \(draft.batch.count)")
-                    Spacer()
-                    Button("Clear all") { clearSource = .batchHeader }
-                        .font(.subheadline)
-                        .buttonStyle(.borderless)
-                        .tint(Theme.danger)
-                        .disabled(store.isBusy || composer.isRunning)
-                        .accessibilityIdentifier("newjob.clearAll")
-                        .modifier(clearDialog(.batchHeader))
-                }
-            }
-        }
-    }
-
-    private func slotSummary(_ entry: DraftBatchEntry) -> String {
-        entry.slots.keys.sorted().map { role in
-            let materialID: String? = entry.slots[role] ?? nil
-            return "\(role): \(materialID ?? "empty")"
-        }.joined(separator: " · ")
-    }
-
-    private func closePickerIfSelectionDisappeared() {
-        guard let selectedRole,
-              let materialID = store.draft?.slots[selectedRole]?.materialID,
-              !materials.materials.contains(where: { $0.id == materialID }) else { return }
-        self.selectedRole = nil
+    private func pipeline(for entry: DraftBatchEntry) -> Pipeline? {
+        store.catalog.first { $0.id == entry.pipeline }
     }
 }
 
-@MainActor
-struct SlotMaterialRow: View {
-    let role: String
-    let required: Bool
-    let kind: PipelineRoleKind
-    let slot: DraftSlot?
-    let materials: MaterialsStore
-    let disabled: Bool
-    var tile = false
-    let onTap: () -> Void
-    @State private var thumbnail: Data?
+/// A banner dismissed by flicking it up, the way a notification goes.
+private struct SwipeUpToDismiss: ViewModifier {
+    let dismiss: () -> Void
+    @GestureState private var drag: CGFloat = 0
 
-    private var material: MotionKit.Material? {
-        guard let materialID = slot?.materialID else { return nil }
-        return materials.materials.first { $0.id == materialID }
-    }
-
-    var body: some View {
-        Group {
-            if tile {
-                SlotTile(role: role, required: required, kind: kind, slot: slot,
-                         thumbnail: thumbnail, disabled: disabled, onTap: onTap)
-            } else {
-                SlotRow(role: role, required: required, kind: kind, slot: slot,
-                        thumbnail: thumbnail, disabled: disabled, onTap: onTap)
-            }
-        }
-            .task(id: material?.id) {
-                guard let material else {
-                    thumbnail = nil
-                    return
-                }
-                thumbnail = await materials.thumbnail(for: material)
-            }
-    }
-}
-
-/// Slot tiles in one row, three or four across, filling one `List` row, so a
-/// whole job's materials show at a glance. Four fit because the try-on
-/// pipelines top out at three required inputs plus an optional background;
-/// at three columns that background wrapped onto a second row of its own and
-/// pushed Settings back under the action bar.
-struct SlotTileGrid<Content: View>: View {
-    let count: Int
-    @ViewBuilder let content: () -> Content
-
-    var body: some View {
-        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 12, alignment: .top),
-                                 count: min(max(count, 3), 4)),
-                  alignment: .leading, spacing: 16) {
-            content()
-        }
-        .padding(.vertical, 12)
+    func body(content: Content) -> some View {
+        content
+            .offset(y: min(drag, 0))
+            .gesture(DragGesture(minimumDistance: 10)
+                .updating($drag) { value, state, _ in state = value.translation.height }
+                .onEnded { value in if value.translation.height < -30 { dismiss() } })
+            .accessibilityAction(named: "Dismiss", dismiss)
     }
 }
 

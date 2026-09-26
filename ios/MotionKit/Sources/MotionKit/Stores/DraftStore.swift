@@ -127,7 +127,8 @@ public final class DraftStore {
         }
     }
 
-    public func clear() async {
+    @discardableResult
+    public func clear() async -> Bool {
         await mutate {
             try await self.client.post(Draft.self, "v1", "draft", "clear")
         }

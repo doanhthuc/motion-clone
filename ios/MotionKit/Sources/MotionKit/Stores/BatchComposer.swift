@@ -53,9 +53,9 @@ public final class BatchComposer {
     /// while the try-ons (the old reason for capping outfits) are now shared
     /// across drivers and grow slower. 12 is the old outfit cap kept as a job
     /// cap, so a driver-less build is capped exactly as before.
-    public static let maxJobs = 12
-    public static let outfitRole = "outfit"
-    public static let driverRole = "driver"
+    public nonisolated static let maxJobs = 12
+    public nonisolated static let outfitRole = "outfit"
+    public nonisolated static let driverRole = "driver"
 
     public private(set) var outfits: [CrossOutfit] = []
     /// Driver material ids, multi-selected. Empty means the edited job's own
@@ -83,12 +83,12 @@ public final class BatchComposer {
         self.library = library
     }
 
-    public static func supports(_ pipeline: Pipeline) -> Bool {
+    public nonisolated static func supports(_ pipeline: Pipeline) -> Bool {
         let roles = Set(pipeline.required + pipeline.optional)
         return roles.contains("character") && roles.contains(outfitRole)
     }
 
-    public static func supportsDrivers(_ pipeline: Pipeline) -> Bool {
+    public nonisolated static func supportsDrivers(_ pipeline: Pipeline) -> Bool {
         (pipeline.required + pipeline.optional).contains(driverRole)
     }
 
@@ -218,6 +218,92 @@ public final class BatchComposer {
         progress = nil
     }
 
+    /// New Job (2026-09-26 spec) shows one Outfit card and one Driver card, both
+    /// backed by this selection, so a crossed role the draft carries — left
+    /// there by Saved try-ons' "Use in job", the Telegram bot, or a draft from
+    /// before the redesign — is moved in here and cleared on the draft in one
+    /// PATCH. Otherwise the card would show nothing while the draft held a job
+    /// that Run would submit. A dimension that already has a selection is left
+    /// alone: a hand-built selection is never replaced by what the draft says.
+    public func adoptDraftSelection() async {
+        guard !isRunning, let current = draft.draft,
+              let pipeline = draft.selectedPipeline, Self.supports(pipeline) else { return }
+        let before = (outfits, drivers, capReason, progress, lastAdded)
+        var clear: [String: String?] = [:]
+        var seed: DraftPatch.Seed = .keep
+        if drivers.isEmpty, Self.supportsDrivers(pipeline),
+           let driverID = current.filledSlots[Self.driverRole] {
+            drivers = [driverID]
+            clear[Self.driverRole] = .some(nil)
+        }
+        // After the driver, so `matches(for:)` reads the shared slots without it.
+        // With outfits already picked the draft's outfit is added beside them
+        // rather than left hidden on the draft (review, 2026-09-26): that is
+        // what "Use in job" from Saved try-ons means while a batch is being
+        // composed. Past the cap it is refused with the usual reason, and the
+        // draft slot is cleared either way so nothing hides there.
+        if let outfitID = current.filledSlots[Self.outfitRole] {
+            if !outfits.contains(where: { $0.outfitID == outfitID }) {
+                if fits(outfits: outfits.count + 1, drivers: drivers.count) {
+                    outfits.append(CrossOutfit(outfitID: outfitID,
+                                               seedID: current.tryonSeed ?? matches(for: outfitID).first?.id))
+                } else {
+                    refuse()
+                }
+            }
+            clear[Self.outfitRole] = .some(nil)
+            seed = .clear
+        }
+        guard !clear.isEmpty else { return }
+        let reason = capReason
+        selectionChanged()
+        capReason = reason
+        // A refused PATCH leaves both roles on the draft, which then counts its
+        // complete edited job, so holding them here too showed that job twice.
+        // The failure is in the store's banner; its Retry reloads the draft.
+        if await !draft.apply(DraftPatch(slots: clear, seed: seed)) {
+            (outfits, drivers, capReason, progress, lastAdded) = before
+        }
+    }
+
+    /// Leaving a try-on pipeline for one without a character + outfit pair:
+    /// the selection cannot be shown there, so it is dropped, but a single
+    /// picked driver goes back to the draft's driver slot when the new pipeline
+    /// has one. Otherwise a look at a try-on pipeline cost the user the driver
+    /// they had picked (review, 2026-09-26), since adoption had moved it here.
+    public func release(keepingDriver: Bool) async {
+        guard !isRunning else { return }
+        let driverID = drivers.count == 1 ? drivers.first : nil
+        reset()
+        // A refused hand-back keeps the driver here rather than losing it: the
+        // selection is hidden on this pipeline and counts no jobs, a try-on
+        // pipeline shows it again, and the next switch away retries.
+        if keepingDriver, let driverID,
+           await !draft.apply(DraftPatch(slots: [Self.driverRole: driverID])) {
+            drivers = [driverID]
+        }
+    }
+
+    /// Clear draft empties the draft on the server, but this selection lives
+    /// only here, so it is emptied beside it. Also called when a pipeline
+    /// without a character + outfit pair is selected: its cards cannot show
+    /// the selection, and hidden outfits would still count as jobs.
+    public func reset() {
+        guard !isRunning else { return }
+        outfits = []
+        drivers = []
+        failure = nil
+        selectionChanged()
+    }
+
+    /// Clear draft: the server's clear, then this selection beside it — only
+    /// once the clear landed, so a failed one never leaves the cards empty
+    /// over a draft that still holds the job.
+    public func clear() async {
+        guard !isRunning else { return }
+        if await draft.clear() { reset() }
+    }
+
     public func matches(for outfitID: String) -> [TryonLibraryEntry] {
         library.matches(slots: sharedSlots.merging([Self.outfitRole: outfitID]) { $1 })
     }
@@ -341,8 +427,11 @@ public final class BatchComposer {
         // `jobCount` would report the whole selection after a Continue that
         // only added the pairs not already basketed.
         lastAdded = steps.count
+        // Drivers stay picked, like the character: after a build the next
+        // outfits are usually for the same moves, and New Job (2026-09-26) has
+        // no shared driver slot to fall back on. They live here, not on the
+        // draft, so the PATCH above still clears the draft's driver slot.
         outfits = []
-        drivers = []
         progress = nil
     }
 
