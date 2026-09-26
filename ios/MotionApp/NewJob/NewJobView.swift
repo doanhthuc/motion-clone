@@ -120,13 +120,6 @@ struct NewJobView: View {
                 slots(draft: draft, pipeline: pipeline)
                 seedBadge(draft)
             }
-            PipelinePicker(
-                pipeline: pipeline,
-                pipelines: isBatch ? batchCatalog : store.catalog,
-                selectedProvider: draft.provider,
-                disabled: store.isBusy || composer.isRunning || (isBatch && batchCatalog.isEmpty),
-                onPipelineSelected: { id in await store.selectPipeline(id) },
-                onProviderSelected: { id in await store.selectProvider(id) })
             batch(draft)
         }
         // An inline bar already separates the first card from the top; the
@@ -137,14 +130,11 @@ struct NewJobView: View {
         // count is plain text across from the menu (2026-09-25).
         .toolbar {
             ToolbarItem(placement: .principal) {
-                Picker("Mode", selection: Binding(get: { model.newJobMode }, set: { model.newJobMode = $0 })) {
-                    Text("Single").tag(NewJobMode.single)
-                    Text("Batch").tag(NewJobMode.batch)
-                }
-                .pickerStyle(.segmented)
-                .fixedSize()
-                .accessibilityIdentifier("newjob.mode")
-                .disabled(store.isBusy || composer.isRunning)
+                SettingsChip(pipeline: pipeline, pipelines: isBatch ? batchCatalog : store.catalog,
+                             selectedProvider: draft.provider,
+                             disabled: store.isBusy || composer.isRunning || (isBatch && batchCatalog.isEmpty),
+                             onPipelineSelected: { id in await store.selectPipeline(id) },
+                             onProviderSelected: { id in await store.selectProvider(id) })
             }
             ToolbarItem(placement: .topBarLeading) {
                 Text("\(draft.jobs) job\(draft.jobs == 1 ? "" : "s")")
@@ -282,6 +272,12 @@ struct NewJobView: View {
     /// next to the jobs it removes.
     private var moreMenu: some View {
         Menu {
+            // Interim until the stage rewrite removes the mode.
+            Picker("Mode", selection: Binding(get: { model.newJobMode }, set: { model.newJobMode = $0 })) {
+                Text("Single").tag(NewJobMode.single)
+                Text("Batch").tag(NewJobMode.batch)
+            }
+            .pickerStyle(.inline)
             Button("Clear draft", systemImage: "trash", role: .destructive) { clearSource = .menu }
                 .disabled(store.isBusy || composer.isRunning)
         } label: {
