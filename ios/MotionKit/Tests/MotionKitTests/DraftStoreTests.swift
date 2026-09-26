@@ -407,6 +407,34 @@ extension URLProtocolTests {
                 "The server answered in a shape this app doesn't know (The pipeline catalog is empty.). Update the app.")
     }
 
+    @Test func editBatchPatchesTheEntryByDigest() async throws {
+        StubURLProtocol.install { request in
+            request.url?.path == "/v1/pipelines"
+                ? TestSupport.json(Fixtures.pipelines)
+                : TestSupport.json(Fixtures.draft)
+        }
+        let store = DraftStore(client: TestSupport.client())
+        await store.load()
+
+        let ok = await store.editBatch("abc123def0", BatchEntryPatch(provider: "qwen", slots: ["outfit": "app/o.png"],
+                                                                   seed: .clear))
+        #expect(ok)
+        let sent = try #require(StubURLProtocol.requests.last)
+        #expect(sent.httpMethod == "PATCH")
+        #expect(sent.url?.path == "/v1/draft/batch/abc123def0")
+        #expect(sent.timeoutInterval == 95)
+        let body = try #require(JSONSerialization.jsonObject(with: sent.httpBody ?? Data()) as? [String: Any])
+        #expect(body["provider"] as? String == "qwen")
+        #expect((body["slots"] as? [String: Any])?["outfit"] as? String == "app/o.png")
+        #expect(body.keys.contains("tryon_seed") && body["tryon_seed"] is NSNull)
+
+        // Only what changed is sent: a provider-only edit names no slot or seed.
+        _ = await store.editBatch("abc123def0", BatchEntryPatch(provider: "gemini"))
+        let second = try #require(
+            JSONSerialization.jsonObject(with: StubURLProtocol.requests.last?.httpBody ?? Data()) as? [String: Any])
+        #expect(Set(second.keys) == ["provider"])
+    }
+
     @Test func applySendsSlotsAndSeedAndReportsTheResult() async throws {
         // Verbatim from `drafts.py` `patch` (`not_local`, 422) — the copy the user sees.
         let refusal = "tryon_seed only applies to a local try-on provider (gemini or qwen-max) — switch the provider first"

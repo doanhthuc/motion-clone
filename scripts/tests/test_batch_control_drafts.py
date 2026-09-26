@@ -529,6 +529,73 @@ class TestBatch(StoreCase):
         self.assertTrue((self.staging / "app" / "me.png").exists())
 
 
+class TestEditBatch(StoreCase):
+    """PATCH /v1/draft/batch/<digest> (2026-09-26): a queued job's material,
+    provider and seed change in place, keeping its place in the batch."""
+
+    def queue_two(self):
+        self.fill()
+        self.store.add_to_batch()
+        self.store.patch({"slots": {"outfit": "app/bg.png"}})
+        return self.store.add_to_batch()["batch"]
+
+    def test_replaces_a_material_in_place(self):
+        first, second = self.queue_two()
+        v = self.store.edit_batch(first["digest"], {"slots": {"character": "app/bg.png"}})
+        self.assertEqual([b["slots"]["character"] for b in v["batch"]], ["app/bg.png", "app/me.png"])
+        self.assertNotEqual(v["batch"][0]["digest"], first["digest"])
+        self.assertEqual(v["batch"][1]["digest"], second["digest"])
+        self.assertEqual(v["slots"]["outfit"]["material_id"], "app/bg.png")   # the draft is untouched
+
+    def test_changes_the_provider(self):
+        [first, _] = self.queue_two()
+        v = self.store.edit_batch(first["digest"], {"provider": "qwen"})
+        self.assertEqual(v["batch"][0]["provider"], "qwen")
+
+    def test_clears_an_optional_slot_but_not_a_required_one(self):
+        self.store.patch({"slots": {"background": "app/bg.png"}})
+        [first] = self.fill() and self.store.add_to_batch()["batch"]
+        v = self.store.edit_batch(first["digest"], {"slots": {"background": None}})
+        self.assertNotIn("background", v["batch"][0]["slots"])
+        self.assertRefused("missing_slots", self.store.edit_batch, v["batch"][0]["digest"],
+                           {"slots": {"character": None}})
+
+    def test_refusals_leave_the_entry_as_it_was(self):
+        first, second = self.queue_two()
+        cases = [
+            ("not_found", "0000000000", {"provider": "qwen"}),
+            ("bad_request", first["digest"], {"pipeline": "motion-enhance"}),
+            ("bad_request", first["digest"], {}),
+            ("wrong_kind", first["digest"], {"slots": {"driver": "app/me.png"}}),
+            ("unknown_role", first["digest"], {"slots": {"hat": "app/me.png"}}),
+            ("unknown_provider", first["digest"], {"provider": "nope"}),
+            ("not_found", first["digest"], {"slots": {"character": "app/none.png"}}),
+            # Would become an exact copy of the second entry.
+            ("duplicate", first["digest"], {"slots": {"outfit": "app/bg.png"}}),
+        ]
+        for code, digest, body in cases:
+            with self.subTest(code=code, body=body):
+                self.assertRefused(code, self.store.edit_batch, digest, body)
+        self.assertEqual([b["digest"] for b in self.store.view()["batch"]],
+                         [first["digest"], second["digest"]])
+
+    def test_a_seed_needs_a_local_provider(self):
+        [first, _] = self.queue_two()
+        seed = self.saved_seed()
+        v = self.store.edit_batch(first["digest"], {"tryon_seed": seed})
+        self.assertEqual(v["batch"][0]["tryon_seed"], seed)
+        self.assertRefused("not_local", self.store.edit_batch, v["batch"][0]["digest"], {"provider": "qwen"})
+        v = self.store.edit_batch(v["batch"][0]["digest"], {"provider": "qwen", "tryon_seed": None})
+        self.assertEqual((v["batch"][0]["provider"], v["batch"][0]["tryon_seed"]), ("qwen", None))
+
+    def test_invalidates_the_last_validate(self):
+        [first, _] = self.queue_two()
+        g = self.store.view()["generation"]
+        v = self.store.edit_batch(first["digest"], {"provider": "qwen"})
+        self.assertGreater(v["generation"], g)
+        self.assertIsNone(v["validated"])
+
+
 class TestValidate(StoreCase):
     def fake_run(self, returncode=0, out="  ✓ manifest hợp lệ · 1 run\n", err="", before=None):
         calls = []

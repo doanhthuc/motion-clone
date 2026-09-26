@@ -11,9 +11,8 @@ struct SlotCardItem: Identifiable, Equatable {
 /// One input of the job, picture first (2026-09-26 spec §2). A single-select
 /// card shows its draft slot. A multi-select card (Outfit, Driver on a
 /// try-on pipeline) pages horizontally through its picks with page dots, and
-/// shows "×N" in the corner. Tap opens the picker, and long press opens the
-/// menu for what is on screen. The ✕ glyph the tiles had until this change was
-/// under 44 pt, so Clear lives in that menu. The accessibility label and
+/// shows "×N" in the corner. Tap opens the picker, long press opens the menu
+/// for what is on screen, and ✕ clears it. The accessibility label and
 /// value are `SlotText`'s, which the UI smokes read.
 @MainActor
 struct SlotCard: View {
@@ -28,6 +27,9 @@ struct SlotCard: View {
     let size: CGSize
     let onTap: () -> Void
     let menu: (SlotCardItem?) -> AnyView
+    /// The ✕ on a filled card: empties a single card, removes the pick on
+    /// screen from a multi-select one.
+    let onClear: (SlotCardItem?) -> Void
     @State private var page: String?
 
     private var text: SlotText { SlotText(role: role, required: required, kind: kind, slot: slot) }
@@ -68,14 +70,30 @@ struct SlotCard: View {
                 } preview: {
                     if let material = currentMaterial { MaterialPeek(material: material, materials: materials) }
                 }
-                .overlay(alignment: .topTrailing) {
+                .overlay(alignment: .bottomTrailing) {
                     if picks.count > 1 {
                         Text("×\(picks.count)")
                             .font(.caption.weight(.bold).monospacedDigit())
                             .foregroundStyle(Theme.onAccent)
                             .padding(.horizontal, 7).padding(.vertical, 3)
                             .background(Theme.accent, in: .capsule)
-                            .padding(6)
+                            .padding(8)
+                    }
+                }
+                // Back on the card since 2026-09-26, asked for as the quick way
+                // to empty it. The glyph the tiles had before was under 44 pt;
+                // this one draws 24 pt inside a 44 pt target.
+                .overlay(alignment: .topTrailing) {
+                    if filled, !disabled {
+                        Button { onClear(currentItem) } label: {
+                            Image(systemName: "xmark")
+                                .font(.caption.weight(.bold)).foregroundStyle(.white)
+                                .frame(width: 24, height: 24)
+                                .background(.black.opacity(0.55), in: .circle)
+                                .frame(width: 44, height: 44)
+                                .contentShape(.rect)
+                        }
+                        .buttonStyle(.plain)
                     }
                 }
                 .overlay(alignment: .topLeading) {
@@ -104,7 +122,12 @@ struct SlotCard: View {
         .accessibilityAction { if !disabled { onTap() } }
         // The long-press menu and the paging live on the picture, which the
         // ignored children hide from VoiceOver, so both are offered here too.
-        .accessibilityActions { if filled, !disabled { menu(currentItem) } }
+        .accessibilityActions {
+            if filled, !disabled {
+                Button(isMulti ? "Remove shown" : "Clear") { onClear(currentItem) }
+                menu(currentItem)
+            }
+        }
         .accessibilityAdjustableAction { direction in
             guard picks.count > 1 else { return }
             let index = picks.firstIndex { $0.id == currentItem?.id } ?? 0
@@ -128,7 +151,7 @@ struct SlotCard: View {
             TabView(selection: $page) {
                 ForEach(picks) { item in
                     CardThumbnail(materialID: item.id, kind: kind, materials: materials)
-                        .overlay(alignment: .bottomTrailing) {
+                        .overlay(alignment: .topLeading) {
                             if item.seeded {
                                 Image(systemName: "photo.badge.checkmark")
                                     .font(.caption).foregroundStyle(Theme.onAccent)

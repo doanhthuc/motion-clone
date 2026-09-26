@@ -151,3 +151,30 @@ public struct DraftPatch: Encodable, Sendable, Equatable {
         }
     }
 }
+
+/// A queued batch job's edit, `PATCH /v1/draft/batch/<digest>` (2026-09-26).
+/// Only what is named is sent; the pipeline is not editable on a queued job.
+public struct BatchEntryPatch: Encodable, Sendable, Equatable {
+    public let provider: String?
+    public let slots: [String: String?]
+    public let seed: DraftPatch.Seed
+
+    public init(provider: String? = nil, slots: [String: String?] = [:], seed: DraftPatch.Seed = .keep) {
+        self.provider = provider
+        self.slots = slots
+        self.seed = seed
+    }
+
+    private enum CodingKeys: String, CodingKey { case provider, slots, tryonSeed }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(provider, forKey: .provider)
+        if !slots.isEmpty { try container.encode(slots, forKey: .slots) }
+        switch seed {
+        case .keep: break
+        case .clear: try container.encodeNil(forKey: .tryonSeed)
+        case .set(let id): try container.encode(id, forKey: .tryonSeed)
+        }
+    }
+}

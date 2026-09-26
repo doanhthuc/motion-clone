@@ -17,8 +17,12 @@ enum PipelineText {
     }
 
     static func stages(_ pipeline: Pipeline) -> String {
-        pipeline.stages.map { Format.stageName($0).replacingOccurrences(of: "-", with: " ") }
-            .joined(separator: " → ")
+        pipeline.stages.map(stage).joined(separator: " → ")
+    }
+
+    /// `camera-tryon` → "Camera try-on".
+    static func stage(_ id: String) -> String {
+        Format.stageName(id).replacingOccurrences(of: "-", with: " ")
             .replacingOccurrences(of: "Try on", with: "Try-on")
             .replacingOccurrences(of: "tryon", with: "try-on")
     }

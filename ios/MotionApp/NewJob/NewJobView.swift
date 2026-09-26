@@ -17,7 +17,7 @@ struct NewJobView: View {
     let composer: BatchComposer
     let library: TryonLibraryStore
     @State private var pick: PickTarget?
-    @State private var openEntry: DraftBatchEntry?
+    @State private var openEntry: OpenedEntry?
     @State private var showRun = false
     @State private var basketExpanded = false
     @State private var clearSource: ClearSource?
@@ -93,7 +93,9 @@ struct NewJobView: View {
                 if !draft.batch.isEmpty {
                     BasketDrawer(batch: draft.batch, pipeline: self.pipeline(for:), materials: materials,
                                  locked: locked, expanded: $basketExpanded,
-                                 onOpen: { openEntry = $0 },
+                                 onOpen: { entry in
+                                     openEntry = draft.batch.firstIndex { $0.digest == entry.digest }.map(OpenedEntry.init)
+                                 },
                                  onDrop: { await store.dropFromBatch($0.digest) },
                                  clearAll: AnyView(clearAllButton))
                         .frame(maxHeight: basketExpanded ? proxy.size.height * 0.7 : nil, alignment: .bottom)
@@ -139,11 +141,9 @@ struct NewJobView: View {
             PickerChainSheet(start: target, pipeline: pipeline, store: store, composer: composer,
                              materials: materials, onClose: { pick = nil })
         }
-        .sheet(item: $openEntry) { entry in
-            let index = (store.draft?.batch.firstIndex { $0.digest == entry.digest } ?? 0) + 1
-            BatchEntryDetail(index: index, entry: entry, pipeline: self.pipeline(for: entry),
-                             materials: materials, library: library, dropDisabled: locked,
-                             onDrop: { await store.dropFromBatch(entry.digest) })
+        .sheet(item: $openEntry) { opened in
+            BatchEntryDetail(position: opened.position, store: store, pipelineFor: self.pipeline(for:),
+                             materials: materials, library: library, locked: locked)
         }
         .navigationDestination(isPresented: $showRun) { RunFlowView(flow: flow, entry: .newJob) }
     }
@@ -165,7 +165,16 @@ struct NewJobView: View {
             identifier: card == .outfits ? "batch.pickOutfits" : card == .drivers ? "batch.pickDrivers" : nil,
             size: size,
             onTap: { pick = PickTarget(card: card, chained: state.isFresh) },
-            menu: { item in AnyView(cardMenu(card, role: role, item: item)) })
+            menu: { item in AnyView(cardMenu(card, role: role, item: item)) },
+            onClear: { item in clear(card, role: role, item: item) })
+    }
+
+    private func clear(_ card: NewJobState.Card, role: String, item: SlotCardItem?) {
+        switch (card, item) {
+        case (.outfits, let item?): composer.toggle(outfitID: item.id)
+        case (.drivers, let item?): composer.toggle(driverID: item.id)
+        default: Task { await store.assign(role: role, materialID: nil) }
+        }
     }
 
     @ViewBuilder private func cardMenu(_ card: NewJobState.Card, role: String, item: SlotCardItem?) -> some View {
@@ -309,6 +318,13 @@ struct NewJobView: View {
     private func pipeline(for entry: DraftBatchEntry) -> Pipeline? {
         store.catalog.first { $0.id == entry.pipeline }
     }
+}
+
+/// The batch job a detail sheet is open on, by position: editing it changes
+/// its digest.
+private struct OpenedEntry: Identifiable {
+    let position: Int
+    var id: Int { position }
 }
 
 /// A banner dismissed by flicking it up, the way a notification goes.

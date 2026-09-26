@@ -877,6 +877,15 @@ class TestDraftRoutes(HttpWriteBase):
         status, body = self.request("POST", "/v1/draft/clear")
         self.assertEqual((status, body["slots"]), (200, {}))
 
+    def test_edit_a_batch_entry(self):
+        self.request("PATCH", "/v1/draft", {"slots": {
+            "character": "app/me.png", "outfit": "app/dress.png", "driver": "app/dance.mp4"}})
+        digest = self.request("POST", "/v1/draft/add-to-batch")[1]["batch"][0]["digest"]
+        status, body = self.request("PATCH", f"/v1/draft/batch/{digest}", {"provider": "qwen"})
+        self.assertEqual((status, body["batch"][0]["provider"]), (200, "qwen"))
+        status, body = self.request("PATCH", "/v1/draft/batch/0000000000", {"provider": "qwen"})
+        self.assertEqual((status, body["error"]["code"]), (404, "not_found"))
+
     def test_a_slot_assignment_tags_the_material_with_its_role(self):
         # 2026-09-25: the phone groups its library by role, and a draft slot is
         # the one moment the role is certain — it must outlive the draft.

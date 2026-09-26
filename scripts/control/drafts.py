@@ -196,6 +196,7 @@ class _Draft:
 
 
 _PATCH_KEYS = frozenset({"pipeline", "provider", "slots", "tryon_seed"})
+_EDIT_KEYS = _PATCH_KEYS - {"pipeline"}
 
 
 def _seed_id(seed: Path | None) -> str | None:
@@ -367,10 +368,12 @@ class DraftStore:
             raise DraftError("not_found", f"no such material: {material_id}")
         return path
 
-    def patch(self, body: dict) -> dict:
-        if not isinstance(body, dict) or not body or set(body) - _PATCH_KEYS:
-            raise DraftError("bad_request",
-                             "expected an object with pipeline, provider, slots and/or tryon_seed")
+    def _prepare(self, body: dict, keys: frozenset) -> tuple:
+        """Everything about a patch body that needs no lock: its shape, the
+        named pipeline/provider/seed, and each material resolved and probed.
+        Shared by the draft's patch and a batch entry's edit."""
+        if not isinstance(body, dict) or not body or set(body) - keys:
+            raise DraftError("bad_request", "expected an object with " + ", ".join(sorted(keys)))
         pipeline, provider, slots = body.get("pipeline"), body.get("provider"), body.get("slots", {})
         if pipeline is not None and not isinstance(pipeline, str):
             raise DraftError("bad_request", "pipeline must be a string")
@@ -381,7 +384,7 @@ class DraftStore:
         # Resolved outside the lock like the slot probes below, for the same
         # reason: resolve_image takes control.LOCK itself, and control.LOCK is
         # reentrant only for the thread that already holds it — doing this
-        # inside the `with` below would work, but would also make the lock's
+        # inside the caller's `with` would work, but would also make the lock's
         # "slow work stays outside" rule one exception weaker.
         tryon_seed = body.get("tryon_seed")
         if tryon_seed is not None and not isinstance(tryon_seed, str):
@@ -411,60 +414,100 @@ class DraftStore:
                 # already sees in the slot; nothing else in the exception is
                 # theirs to see.
                 raise DraftError("unprobeable", f"{path.name} could not be read as media")
+        return pipeline, provider, slots, seed_path, filled
 
-        with control.LOCK:
-            d = self._load()
-            target = pipeline or d.job.pipeline
-            usable = required_roles(target) | optional_roles(target)
-            for role in slots:
-                if role not in usable:
-                    raise DraftError("unknown_role", f"{target} has no {role!r} slot")
-            for role, (path, probed) in filled.items():
-                if probed.kind != role_kind(role):
-                    raise DraftError("wrong_kind",
-                                     f"{role} must be {role_kind(role)}, {path.name} is {probed.kind}")
-            if provider is not None and _tryon_stage(target) is None:
-                raise DraftError("not_applicable", f"{target} has no try-on stage to pick a provider for")
-            # Both halves of the post-patch job, not the stored one: setting a
-            # seed and a local provider in the SAME patch is a good request.
-            #
-            # A seed beside a non-local provider is never read: runner.py's
-            # _local_tryon_stage only names a stage whose provider passes
-            # is_local_provider, so Phase A skips the run and the job goes on to
-            # a real, PAID pod try-on while the caller believes they asked for a
-            # reuse. Refuse loudly instead — the same call the bot's _regen_tryon
-            # already refuses with "not_local" for the same underlying condition.
-            resolved_provider = provider if provider is not None else d.job.provider
-            resolved_seed = seed_path if "tryon_seed" in body else d.job.tryon_seed
-            if (resolved_seed is not None and _tryon_stage(target) is not None
-                    and not is_local_provider(resolved_provider)):
-                raise DraftError("not_local",
-                                 "tryon_seed only applies to a local try-on provider "
-                                 "(gemini or qwen-max) — switch the provider first")
-            # Re-checked under the lock, right before applying: ffprobe (above)
-            # ran outside the lock, so a delete could land in the gap between
-            # resolving/probing a path and getting here.
-            for role, (path, probed) in filled.items():
-                if not path.is_file():
-                    raise DraftError("not_found", f"no such material: {path.name}")
-            # Every check passed: apply. Nothing above wrote anything.
-            dropped = drop_unusable(d.job, target) if pipeline is not None else []
-            if provider is not None:
-                d.job.provider = provider
-            for role, material_id in slots.items():
-                if material_id is None:
-                    d.job.slots.pop(role, None)
-                    d.job.probes.pop(role, None)
-                else:
-                    d.job.slots[role], d.job.probes[role] = filled[role]
-            if "tryon_seed" in body:
-                d.job.tryon_seed = seed_path
-            view = self._changed(d)
+    def _apply(self, job: Job, body: dict, prepared: tuple) -> list[str]:
+        """Check a prepared patch against `job` and apply it; called under
+        control.LOCK. Every check runs before the first write, so a refusal
+        leaves `job` as it was. Returns the roles a pipeline switch dropped."""
+        pipeline, provider, slots, seed_path, filled = prepared
+        target = pipeline or job.pipeline
+        usable = required_roles(target) | optional_roles(target)
+        for role in slots:
+            if role not in usable:
+                raise DraftError("unknown_role", f"{target} has no {role!r} slot")
+        for role, (path, probed) in filled.items():
+            if probed.kind != role_kind(role):
+                raise DraftError("wrong_kind",
+                                 f"{role} must be {role_kind(role)}, {path.name} is {probed.kind}")
+        if provider is not None and _tryon_stage(target) is None:
+            raise DraftError("not_applicable", f"{target} has no try-on stage to pick a provider for")
+        # Both halves of the post-patch job, not the stored one: setting a
+        # seed and a local provider in the SAME patch is a good request.
+        #
+        # A seed beside a non-local provider is never read: runner.py's
+        # _local_tryon_stage only names a stage whose provider passes
+        # is_local_provider, so Phase A skips the run and the job goes on to
+        # a real, PAID pod try-on while the caller believes they asked for a
+        # reuse. Refuse loudly instead — the same call the bot's _regen_tryon
+        # already refuses with "not_local" for the same underlying condition.
+        resolved_provider = provider if provider is not None else job.provider
+        resolved_seed = seed_path if "tryon_seed" in body else job.tryon_seed
+        if (resolved_seed is not None and _tryon_stage(target) is not None
+                and not is_local_provider(resolved_provider)):
+            raise DraftError("not_local",
+                             "tryon_seed only applies to a local try-on provider "
+                             "(gemini or qwen-max) — switch the provider first")
+        # Re-checked under the lock, right before applying: ffprobe ran
+        # outside the lock, so a delete could land in the gap between
+        # resolving/probing a path and getting here.
+        for role, (path, probed) in filled.items():
+            if not path.is_file():
+                raise DraftError("not_found", f"no such material: {path.name}")
+        # Every check passed: apply. Nothing above wrote anything.
+        dropped = drop_unusable(job, target) if pipeline is not None else []
+        if provider is not None:
+            job.provider = provider
+        for role, material_id in slots.items():
+            if material_id is None:
+                job.slots.pop(role, None)
+                job.probes.pop(role, None)
+            else:
+                job.slots[role], job.probes[role] = filled[role]
+        if "tryon_seed" in body:
+            job.tryon_seed = seed_path
+        return dropped
+
+    def _remember_roles(self, slots: dict) -> None:
         if self.material_roles is not None:
             for role, material_id in slots.items():
                 if material_id is not None:
                     self.material_roles.remember(material_id, role)
+
+    def patch(self, body: dict) -> dict:
+        prepared = self._prepare(body, _PATCH_KEYS)
+        with control.LOCK:
+            d = self._load()
+            dropped = self._apply(d.job, body, prepared)
+            view = self._changed(d)
+        self._remember_roles(prepared[2])
         view["dropped"] = dropped
+        return view
+
+    def edit_batch(self, digest: str, body: dict) -> dict:
+        """Change a queued job's material, provider or seed where it sits in
+        the batch (2026-09-26). The pipeline stays: switching it drops slots,
+        and a queued job that silently lost one is worse than drop and re-add.
+        Its digest changes with its signature; the view carries the new one."""
+        prepared = self._prepare(body, _EDIT_KEYS)
+        with control.LOCK:
+            d = self._load()
+            index = next((i for i, b in enumerate(d.basket) if job_digest(b) == digest), None)
+            if index is None:
+                raise DraftError("not_found", "that entry is no longer in the batch")
+            # Edited on a copy, so the duplicate check below can still refuse
+            # without having touched the entry.
+            edited = copy_job(d.basket[index])
+            self._apply(edited, body, prepared)
+            if self._missing(edited):
+                raise DraftError("missing_slots", "a queued job keeps every required slot: "
+                                 + ", ".join(self._missing(edited)))
+            if any(signature(edited) == signature(other)
+                   for i, other in enumerate(d.basket) if i != index):
+                raise DraftError("duplicate", "that exact job is already in the batch")
+            d.basket[index] = edited
+            view = self._changed(d)
+        self._remember_roles(prepared[2])
         return view
 
     def add_to_batch(self) -> dict:

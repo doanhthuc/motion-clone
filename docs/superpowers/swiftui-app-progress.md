@@ -110,6 +110,25 @@ plan: [`plans/2026-09-26-newjob-single-stage.md`](plans/2026-09-26-newjob-single
   - Still deferred: an adopted driver lives only in memory, so a relaunch or the Telegram bot shows
     no driver.
 
+## Editing a queued job (2026-09-26)
+
+- **The batch job's detail sheet edits the job in place** through `PATCH /v1/draft/batch/{digest}`
+  (`DraftStore.editBatch`). The user chose in-place over "load it back into the stage", then picked
+  layout B from three mockups: pipeline name once with a strip of stage capsules (the old sheet printed
+  the name and a "Stages" row saying the same thing), the provider as a menu, the materials as a
+  horizontal row of cards (tap replaces, long press peeks with Replace / View full screen / Remove on
+  an optional role), the saved try-on toggle, and Drop job.
+- **The long press peeks at the material pressed.** The old sheet was a `List` with the whole tile grid
+  in one cell, and every long press peeked at Character. The sheet is a `ScrollView` now; the
+  `NewJobEntryDetailTests` smoke long-presses Driver and attaches the screenshot.
+- **The sheet is opened by position, not digest**, because an edit changes the digest.
+- **`BatchEntryEdit` drops the saved try-on with the change that makes it wrong**, in the same request:
+  replacing Character or Outfit (the seed was made from the old pair), or switching to the pod provider
+  (the server refuses a seed there with `not_local`).
+- **The ✕ is back on filled New Job cards**, at the top right, a 24 pt glyph in a 44 pt target. On a
+  multi-select card it removes the pick on screen. The ×N badge moved to the bottom right and an
+  outfit's saved try-on badge to the top left to make room.
+
 ## Materials add flow (2026-09-26)
 
 - **The category is chosen before the pick.** The "What is this image?" dialog that followed each

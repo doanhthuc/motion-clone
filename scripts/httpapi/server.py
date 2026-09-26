@@ -555,6 +555,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send_json(200, store.validate(repo_root=self.server.repo_root))
         if method == "DELETE" and len(rest) == 2 and rest[0] == "batch":
             return self._send_json(200, store.drop_from_batch(rest[1]))
+        if method == "PATCH" and len(rest) == 2 and rest[0] == "batch":
+            return self._send_json(200, store.edit_batch(rest[1], self._read_json()))
         raise NOT_FOUND
 
     def _etag_matches(self, etag: str) -> bool:

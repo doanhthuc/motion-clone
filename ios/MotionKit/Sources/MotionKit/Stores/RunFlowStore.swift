@@ -16,7 +16,7 @@ public final class RunFlow {
 
     public enum Entry: Sendable { case newJob, existing }
 
-    static let localTryonProviders: Set<String> = ["gemini", "qwen-max"]
+    nonisolated static let localTryonProviders: Set<String> = ["gemini", "qwen-max"]
 
     public private(set) var phase: Phase = .loading
     public private(set) var pod: PodStatus?
