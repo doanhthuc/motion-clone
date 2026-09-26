@@ -35,6 +35,11 @@ extension URLProtocolTests {
         }
 
         func failNextPatch(for outfit: String) { lock.withLock { failPatchFor = outfit } }
+        /// The edited job already names an outfit (and maybe a seed), the way
+        /// Saved try-ons' "Use in job" leaves it.
+        func preset(outfit: String, seed: String?) {
+            lock.withLock { self.outfit = outfit; self.seed = seed }
+        }
         func preload(outfit: String, seed: String?) {
             lock.withLock { batch.append((shared.merging(["outfit": outfit]) { $1 }, seed)) }
         }
@@ -143,6 +148,79 @@ extension URLProtocolTests {
     }
 
     private func writePaths() -> [String] { writes().map { "\($0.0) \($0.1)" } }
+
+    @Test func adoptMovesTheDraftsOutfitSeedAndDriverIntoTheComposer() async {
+        let server = FakeDraftServer()
+        server.preset(outfit: "app/o1.png", seed: "s1")
+        let (composer, draft) = await make(server)
+
+        await composer.adoptDraftSelection()
+
+        #expect(composer.outfits == [CrossOutfit(outfitID: "app/o1.png", seedID: "s1")])
+        #expect(composer.drivers == ["app/dance.mp4"])
+        // One PATCH empties both slots and the seed: the composer is now the
+        // only place the crossed roles live.
+        let w = writes()
+        #expect(w.map { "\($0.0) \($0.1)" } == ["PATCH /v1/draft"])
+        let slots = w.first?.2?["slots"] as? [String: Any]
+        #expect(slots?["outfit"] is NSNull)
+        #expect(slots?["driver"] is NSNull)
+        #expect(w.first?.2?["tryon_seed"] is NSNull)
+        #expect(draft.draft?.filledSlots["outfit"] == nil)
+        #expect(draft.draft?.filledSlots["driver"] == nil)
+        #expect(composer.canRun)
+    }
+
+    @Test func adoptLeavesAnExistingSelectionAlone() async {
+        let server = FakeDraftServer()
+        server.preset(outfit: "app/o1.png", seed: nil)
+        let (composer, _) = await make(server)
+        composer.toggle(outfitID: "app/o9.png")
+        composer.toggle(driverID: "app/d9.mp4")
+
+        await composer.adoptDraftSelection()
+
+        #expect(composer.outfits.map(\.outfitID) == ["app/o9.png"])
+        #expect(composer.drivers == ["app/d9.mp4"])
+        #expect(writes().isEmpty)
+    }
+
+    @Test func adoptWithNothingOnTheDraftWritesNothing() async {
+        let server = FakeDraftServer()
+        let (composer, _) = await make(server)
+        composer.toggle(driverID: "app/d9.mp4")   // the draft's driver is not adopted over it
+
+        await composer.adoptDraftSelection()
+
+        #expect(composer.outfits.isEmpty)
+        #expect(composer.drivers == ["app/d9.mp4"])
+        #expect(writes().isEmpty)
+    }
+
+    @Test func adoptWithoutASeedFallsBackToTheNewestMatch() async {
+        let library = #"{"entries":[{"id":"s7","owner":"app","material_ids":{"character":"app/me.png","outfit":"app/o1.png"},"provider":"gemini","saved_at":10}]}"#
+        let server = FakeDraftServer(library: library)
+        server.preset(outfit: "app/o1.png", seed: nil)
+        let (composer, _) = await make(server)
+
+        await composer.adoptDraftSelection()
+
+        #expect(composer.outfits.first?.seedID == "s7")
+    }
+
+    @Test func resetEmptiesTheSelection() async {
+        let server = FakeDraftServer()
+        let (composer, _) = await make(server)
+        composer.toggle(outfitID: "app/o1.png")
+        composer.toggle(driverID: "app/d1.mp4")
+
+        composer.reset()
+
+        #expect(composer.outfits.isEmpty && composer.drivers.isEmpty)
+        #expect(composer.capReason == nil && composer.failure == nil)
+        #expect(composer.progress == nil && composer.lastAdded == nil)
+        #expect(writes().isEmpty)
+    }
 
     @Test func threeOutfitsAreThreePatchAddPairsThenTheOutfitIsCleared() async {
         let server = FakeDraftServer()

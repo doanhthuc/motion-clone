@@ -218,6 +218,47 @@ public final class BatchComposer {
         progress = nil
     }
 
+    /// New Job (2026-09-26 spec) shows one Outfit card and one Driver card, both
+    /// backed by this selection, so a crossed role the draft carries — left
+    /// there by Saved try-ons' "Use in job", the Telegram bot, or a draft from
+    /// before the redesign — is moved in here and cleared on the draft in one
+    /// PATCH. Otherwise the card would show nothing while the draft held a job
+    /// that Run would submit. A dimension that already has a selection is left
+    /// alone: a hand-built selection is never replaced by what the draft says.
+    public func adoptDraftSelection() async {
+        guard !isRunning, let current = draft.draft,
+              let pipeline = draft.selectedPipeline, Self.supports(pipeline) else { return }
+        var clear: [String: String?] = [:]
+        var seed: DraftPatch.Seed = .keep
+        if drivers.isEmpty, Self.supportsDrivers(pipeline),
+           let driverID = current.filledSlots[Self.driverRole] {
+            drivers = [driverID]
+            clear[Self.driverRole] = .some(nil)
+        }
+        // After the driver, so `matches(for:)` reads the shared slots without it.
+        if outfits.isEmpty, let outfitID = current.filledSlots[Self.outfitRole] {
+            outfits = [CrossOutfit(outfitID: outfitID,
+                                   seedID: current.tryonSeed ?? matches(for: outfitID).first?.id)]
+            clear[Self.outfitRole] = .some(nil)
+            seed = .clear
+        }
+        guard !clear.isEmpty else { return }
+        selectionChanged()
+        await draft.apply(DraftPatch(slots: clear, seed: seed))
+    }
+
+    /// Clear draft empties the draft on the server, but this selection lives
+    /// only here, so it is emptied beside it. Also called when a pipeline
+    /// without a character + outfit pair is selected: its cards cannot show
+    /// the selection, and hidden outfits would still count as jobs.
+    public func reset() {
+        guard !isRunning else { return }
+        outfits = []
+        drivers = []
+        failure = nil
+        selectionChanged()
+    }
+
     public func matches(for outfitID: String) -> [TryonLibraryEntry] {
         library.matches(slots: sharedSlots.merging([Self.outfitRole: outfitID]) { $1 })
     }
