@@ -3,6 +3,7 @@ import SwiftUI
 
 /// Aspect, count, and model with its per-image price (like Flow's sheet).
 struct StudioSettingsSheet: View {
+    @Environment(\.dismiss) private var dismiss
     let studio: StudioStore
 
     var body: some View {
@@ -43,6 +44,11 @@ struct StudioSettingsSheet: View {
                 }
             }
             .navigationTitle("Settings").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") { dismiss() }.accessibilityIdentifier("studio.settings.done")
+                }
+            }
         }
     }
 }

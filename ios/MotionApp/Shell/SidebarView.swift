@@ -21,6 +21,7 @@ struct SidebarView: View {
                 Button { Task { await model.openStudio(projectID: nil) } } label: {
                     Label("New project", systemImage: "plus")
                 }
+                .accessibilityIdentifier("sidebar.newProject")
                 ForEach(studio.projects) { p in
                     Button { Task { await model.openStudio(projectID: p.id) } } label: {
                         VStack(alignment: .leading, spacing: 2) {
