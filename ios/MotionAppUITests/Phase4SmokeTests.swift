@@ -12,11 +12,12 @@ final class Phase4SmokeTests: XCTestCase {
         app.tabBars.buttons["New Job"].tap()
         XCTAssertTrue(app.staticTexts["New Job"].waitForExistence(timeout: 15))
 
-        Phase4Draft.composeValidatedTryonJob(in: app)
+        Phase4Draft.composeTryonJob(in: app)
 
         let proceed = app.buttons["newjob.continueToRun"]
         XCTAssertTrue(proceed.waitForExistence(timeout: 10))
-        proceed.tap()
+        XCTAssertTrue(Phase4Draft.waitUntil(timeout: 20) { proceed.isEnabled })
+        proceed.tap()      // adds the pending outfit, validates, opens the run flow
 
         let rent = app.buttons["runflow.rentWithoutPreview"]
         XCTAssertTrue(rent.waitForExistence(timeout: 20))
@@ -43,20 +44,84 @@ final class Phase4SmokeTests: XCTestCase {
 /// Copied from `Phase3SmokeTests`'s private helpers (verbatim bodies) so this
 /// file can compose a validated try-on draft without depending on that file.
 enum Phase4Draft {
-    @MainActor static func composeValidatedTryonJob(in app: XCUIApplication) {
+    /// Composes a one-job try-on draft. Continue (validate + navigate) is the
+    /// caller's step since 2026-09-26, when Validate stopped being one.
+    @MainActor static func composeTryonJob(in app: XCUIApplication) {
         clear(in: app)
         selectTryonPipeline(in: app)
         chooseMaterial(for: "Character", in: app)
         chooseMaterial(for: "Driver", in: app)
         chooseMaterial(for: "Outfit", in: app)
-        revealButton("Validate", in: app).tap()
-        XCTAssertTrue(revealText("Ready", in: app, timeout: 30))
     }
 
     @MainActor static func clear(in app: XCUIApplication) {
         tapClear(in: app)
-        XCTAssertTrue(revealText("0 of 3 required slots assigned", in: app)
-            || revealText("0 of 2 required slots assigned", in: app, timeout: 1))
+        XCTAssertTrue(waitUntil(timeout: 15) { isEmptyDraft(app) }, "Clear must leave an empty draft")
+    }
+
+    /// Nothing basketed and every required card empty. Since 2026-09-26 the
+    /// stage has no "0 of N required slots assigned" line; the cards say it.
+    @MainActor static func isEmptyDraft(_ app: XCUIApplication) -> Bool {
+        guard app.staticTexts["0 jobs"].exists else { return false }
+        let cards = ["Character", "Driver", "Outfit"].map { app.buttons[$0] }.filter(\.exists)
+        return !cards.isEmpty && cards.allSatisfy { ($0.value as? String) == "Missing required" }
+    }
+
+    /// One material for `role`, from either picker: the single picker
+    /// ("Choose material") or a try-on pipeline's multi-picker ("Choose
+    /// outfits"/"Choose drivers"). A pick on a fresh draft chains to the next
+    /// card, so a sheet still open afterwards is closed with Done.
+    @MainActor static func chooseMaterial(for role: String, peekFirst: Bool = false,
+                                          in app: XCUIApplication, attach: ((XCTAttachment) -> Void)? = nil) {
+        let card = app.buttons[role]
+        XCTAssertTrue(card.waitForExistence(timeout: 10), "Missing card: \(role)")
+        card.tap()
+        let single = app.navigationBars["Choose material"]
+        let anyPicker = app.navigationBars.matching(NSPredicate(format: "identifier BEGINSWITH %@", "Choose ")).firstMatch
+        XCTAssertTrue(anyPicker.waitForExistence(timeout: 10), "No picker opened for \(role)")
+        if single.exists {
+            let choice = app.buttons.matching(NSPredicate(format: "value == %@", "Not selected")).firstMatch
+            XCTAssertTrue(choice.waitForExistence(timeout: 10), "A compatible material must exist for \(role)")
+            if peekFirst {
+                // The long press peeks and offers full screen and delete; full screen
+                // opens the player sheet, whose Done comes back to the picker.
+                choice.press(forDuration: 1.0)
+                let fullScreen = app.buttons["View full screen"]
+                XCTAssertTrue(fullScreen.waitForExistence(timeout: 5))
+                XCTAssertTrue(app.buttons["Delete"].exists)
+                let shot = XCTAttachment(screenshot: app.screenshot())
+                shot.name = "material-peek"
+                shot.lifetime = .keepAlways
+                attach?(shot)
+                fullScreen.tap()
+                let done = app.navigationBars.buttons["Done"].firstMatch
+                XCTAssertTrue(done.waitForExistence(timeout: 5))
+                done.tap()
+                XCTAssertTrue(single.waitForExistence(timeout: 5))
+            }
+            choice.tap()
+        } else {
+            let prefix = role == "Outfit" ? "outfit.pick." : "driver.pick."
+            let tile = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", prefix)).firstMatch
+            XCTAssertTrue(tile.waitForExistence(timeout: 10), "A compatible material must exist for \(role)")
+            tile.tap()
+        }
+        closePickerIfOpen(app)
+        XCTAssertTrue(waitUntil(timeout: 10) {
+            (app.buttons[role].value as? String) != "Missing required"
+        })
+    }
+
+    /// A single pick closes its own sheet unless it chained on; a multi pick
+    /// never does. Waits for a single pick's dismissal before looking, so a
+    /// Done caught mid-animation is not tapped.
+    @MainActor static func closePickerIfOpen(_ app: XCUIApplication) {
+        let picker = app.navigationBars.matching(NSPredicate(format: "identifier BEGINSWITH %@", "Choose ")).firstMatch
+        Thread.sleep(forTimeInterval: 0.8)
+        guard picker.exists else { return }
+        let done = picker.buttons["Done"]
+        if done.waitForExistence(timeout: 3) { done.tap() }
+        XCTAssertTrue(picker.waitForNonExistence(timeout: 10), "The picker must close")
     }
 
     /// Clear sits in New Job's "More" menu behind a confirmation since
@@ -88,6 +153,7 @@ enum Phase4Draft {
         if current.localizedCaseInsensitiveContains("Try-on") { return }
 
         pipeline.tap()
+        XCTAssertTrue(app.navigationBars["Settings"].waitForExistence(timeout: 5))
         let option = app.buttons.allElementsBoundByIndex.first {
             $0.label.localizedCaseInsensitiveContains("Try-on")
         }
@@ -95,21 +161,6 @@ enum Phase4Draft {
         option?.tap()
         XCTAssertTrue(waitUntil(timeout: 10) {
             (app.buttons["Pipeline"].value as? String)?.localizedCaseInsensitiveContains("Try-on") == true
-        })
-    }
-
-    @MainActor static func chooseMaterial(for role: String, in app: XCUIApplication) {
-        revealButton(role, in: app).tap()
-        XCTAssertTrue(app.navigationBars["Choose material"].waitForExistence(timeout: 10))
-
-        let choice = app.buttons.matching(
-            NSPredicate(format: "value == %@", "Not selected")
-        ).firstMatch
-        XCTAssertTrue(choice.waitForExistence(timeout: 10), "A compatible material must exist for \(role)")
-        choice.tap()
-        XCTAssertTrue(app.navigationBars["Choose material"].waitForNonExistence(timeout: 10))
-        XCTAssertTrue(waitUntil(timeout: 10) {
-            (app.buttons[role].value as? String) != "Missing required"
         })
     }
 

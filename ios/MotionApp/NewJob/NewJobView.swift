@@ -116,13 +116,6 @@ struct NewJobView: View {
             }
             // A count, not a control: without this iOS 26 wraps it in glass.
             .sharedBackgroundVisibility(.hidden)
-            if store.isStale {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button { Task { await store.refresh() } } label: { Image(systemName: "clock.arrow.circlepath") }
-                        .tint(Theme.warning)
-                        .accessibilityLabel("Stale — refresh")
-                }
-            }
             ToolbarItem(placement: .topBarTrailing) { moreMenu }
         }
         .safeAreaInset(edge: .bottom) {
@@ -250,13 +243,21 @@ struct NewJobView: View {
     }
 
     private var moreMenu: some View {
+        // Refresh lives here rather than as its own bar button: a bar item that
+        // came and went with `isStale` crowded the chip, and iOS 26 then dropped
+        // the whole trailing group, this menu with it (Phase 3 smoke,
+        // 2026-09-26). The stage has no pull to refresh, so this is also the
+        // manual reload. The icon turns to a warning while the draft is stale.
         Menu {
+            Button("Refresh", systemImage: "arrow.clockwise") { Task { await store.refresh() } }
             Button("Clear draft", systemImage: "trash", role: .destructive) { clearSource = .menu }
                 .disabled(locked)
         } label: {
-            Image(systemName: "ellipsis")
+            Image(systemName: store.isStale ? "exclamationmark.arrow.circlepath" : "ellipsis")
+                .foregroundStyle(store.isStale ? Theme.warning : Theme.label)
         }
         .accessibilityLabel("More")
+        .accessibilityValue(store.isStale ? "Draft may be out of date" : "")
         .accessibilityIdentifier("newjob.more")
         .modifier(clearDialog(.menu))
     }

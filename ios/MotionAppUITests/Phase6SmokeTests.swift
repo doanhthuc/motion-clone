@@ -9,45 +9,15 @@ import XCTest
 /// spend button is recorded on the phone and never sent; the recorded counter
 /// is asserted zero at the end.
 final class Phase6SmokeTests: XCTestCase {
-    /// Batch mode has had its own Clear since 2026-09-24, but
-    /// `Phase4Draft.clear(in:)` still cannot be reused from here: its
-    /// post-condition is the readiness line ("0 of 3 required slots assigned"),
-    /// which is Single-only and stays Single-only. Both post-conditions below
-    /// read elements the Batch arm renders — a shared slot row
-    /// (`BatchComposerSection.sharedRoles`) and the header's job count
-    /// (`NewJobView.header`) — but only the job count is unconditional. The
-    /// slot row is drawn only in the `else` of `if !BatchComposer.supports(pipeline)`,
-    /// so under a catalog that pairs no character with an outfit the row is
-    /// absent for a configuration reason and Clear still worked; `supports` is
-    /// `required ∪ optional` containing both roles, and the default pipeline
-    /// comes from `TG_PIPELINE`.
+    /// Clear, then prove it worked. `Phase4Draft.clear` checks both halves:
+    /// "0 jobs" alone is not enough, because the server counts the edited job
+    /// only once it is complete (`scripts/control/drafts.py` `jobs_for`), so a
+    /// Clear that silently no-op'd on the skip path would still read "0 jobs"
+    /// with Character assigned, and surface one run later as a permanent skip.
+    /// The cards reading "Missing required" is the other half.
     @MainActor
     private func clearFromBatch(_ app: XCUIApplication) {
-        // `tapClear` waits for the menu item to be enabled: Clear is
-        // `.disabled(store.isBusy || composer.isRunning)`, and a tap on a
-        // disabled SwiftUI control is a silent no-op.
-        Phase4Draft.tapClear(in: app)
-        // The load-bearing half. Do not delete it as redundant just because
-        // "0 jobs" below already passes: `_jobs` counts the basket plus the
-        // edited job only once that job is *complete*
-        // (`scripts/control/drafts.py:294-307`, `:337`), so on the
-        // fewer-than-two-outfits skip path the header read "0 jobs" *before* the
-        // tap too — nothing basketed, and Outfit never assigned. A Clear that
-        // silently no-op'd would leave Character and Driver assigned and still
-        // read "0 jobs" here, and the damage would surface one run later as a
-        // permanent silent skip (that path's `XCTSkip`), not as a failure.
-        // "Missing required" is `SlotRow.stateText` for an empty required role —
-        // the exact inverse of `Phase4Draft.chooseMaterial`'s post-condition.
-        // Not `readiness`'s "Missing required materials", which is a different
-        // element's `accessibilityValue` and Single-only besides.
-        _ = Phase4Draft.revealButton("Character", in: app)
-        XCTAssertTrue(Phase4Draft.waitUntil(timeout: 10) {
-            (app.buttons["Character"].value as? String) == "Missing required"
-        }, "Batch mode's Clear must unassign the shared slots, not just empty the basket"
-            + " — if the row is absent instead, the server's default pipeline is not"
-            + " batch-supported (check TG_PIPELINE)")
-        XCTAssertTrue(app.staticTexts["0 jobs"].waitForExistence(timeout: 10),
-                      "Batch mode's Clear emptied the draft")
+        Phase4Draft.clear(in: app)
     }
 
     @MainActor
@@ -58,38 +28,18 @@ final class Phase6SmokeTests: XCTestCase {
         app.tabBars.buttons["New Job"].tap()
         XCTAssertTrue(app.staticTexts["New Job"].waitForExistence(timeout: 15))
 
-        // Precondition: an empty draft, not merely an empty basket. `draft.jobs`
-        // is the server's `len(jobs)` (`scripts/control/drafts.py:337`), and `_jobs`
-        // (`:294-307`) counts the basket plus the edited job only once it is
-        // *complete* — so "0 jobs" alone would let the smoke proceed on a draft
-        // with a slot already assigned, then overwrite and clear it. Requiring the
-        // readiness line too (`NewJobView.readiness`, rendered in Single mode)
-        // proves no required slot is filled. Together: nothing basketed, no
-        // required slot assigned. A real draft is never overwritten and, on this
-        // path, never cleared. Either pipeline's empty count is accepted (tryon = 3
-        // required, motion-enhance = 2), as `Phase4Draft.clear(in:)` does.
+        // Precondition: an empty draft, not merely an empty basket — see
+        // `clearFromBatch` for why "0 jobs" alone would let the smoke overwrite
+        // a draft with a slot already assigned.
         guard app.staticTexts["0 jobs"].waitForExistence(timeout: 10),
-              Phase4Draft.revealText("0 of 3 required slots assigned", in: app)
-                  || Phase4Draft.revealText("0 of 2 required slots assigned", in: app, timeout: 1) else {
-            // This one reason covers three different causes, so name the
-            // literals: (a) a genuinely non-empty draft, (b) a draft or catalog
-            // load failure — `initialLoadFailure` (`NewJobView.swift:71-80`)
-            // replaces the editor, so neither line ever renders, and a network
-            // blip would otherwise send whoever reads this hunting for a
-            // phantom draft — and (c) a pipeline whose required-role count is
-            // neither 3 nor 2.
-            throw XCTSkip("New Job never rendered an empty draft: expected \"0 jobs\" plus "
-                + "\"0 of 3 required slots assigned\" or \"0 of 2 required slots assigned\". "
-                + "Either the draft is not empty (this smoke never overwrites a real one), "
-                + "or the draft/catalog load failed, or the pipeline requires a different "
-                + "number of roles.")
+              Phase4Draft.waitUntil(timeout: 10, condition: { Phase4Draft.isEmptyDraft(app) }) else {
+            // Covers a genuinely non-empty draft (never overwritten here), a
+            // draft or catalog load failure, and a server whose default pipeline
+            // has none of Character, Driver, Outfit as a required card.
+            throw XCTSkip("New Job never rendered an empty draft: expected \"0 jobs\" and every "
+                + "required card reading \"Missing required\".")
         }
 
-        // The guard above may have scrolled down to the readiness footer; the
-        // mode control is New Job's first row, so scroll back until it is built.
-        let mode = app.segmentedControls["newjob.mode"]
-        for _ in 0..<6 where !mode.exists { app.swipeDown() }
-        mode.buttons["Batch"].tap()
         Phase4Draft.selectTryonPipeline(in: app)
         Phase4Draft.chooseMaterial(for: "Character", in: app)
         Phase4Draft.chooseMaterial(for: "Driver", in: app)
@@ -98,8 +48,7 @@ final class Phase6SmokeTests: XCTestCase {
         let picks = app.buttons.matching(
             NSPredicate(format: "identifier BEGINSWITH %@", "outfit.pick."))
         guard Phase4Draft.waitUntil(timeout: 15, condition: { picks.count >= 2 }) else {
-            // Character and Driver were assigned above, so clean up. Batch mode
-            // has its own Clear, so this no longer switches to Single first.
+            // Character and Driver were assigned above, so clean up.
             app.buttons["Done"].tap()
             clearFromBatch(app)
             throw XCTSkip("Fewer than two image materials to use as outfits.")
@@ -127,9 +76,8 @@ final class Phase6SmokeTests: XCTestCase {
         // `app.buttons["Drop"]` would be an ambiguous query a tap cannot
         // resolve. The confirmation dialog is matched by its title, never
         // app-wide, because the run-flow card carries its own "Drop" too.
+        app.buttons["newjob.basket"].tap()     // the basket is a drawer since 2026-09-26
         let firstDrop = app.buttons["Drop"].firstMatch
-        for _ in 0..<8 where !firstDrop.isHittable { app.swipeDown() }
-        for _ in 0..<10 where !firstDrop.isHittable { app.swipeUp() }
         XCTAssertTrue(firstDrop.waitForExistence(timeout: 5), "a basket Drop button must exist")
         XCTAssertTrue(firstDrop.isHittable, "the basket Drop button must be visible")
         firstDrop.tap()
@@ -137,9 +85,9 @@ final class Phase6SmokeTests: XCTestCase {
         app.sheets["Drop this batch entry?"].buttons["Drop"].tap()
         XCTAssertTrue(Phase4Draft.revealText("Batch · 1", in: app, timeout: 15))
 
-        // Leave the live draft empty, as the Phase 3-5 smokes do. Batch mode
-        // clears directly now; the drop's DELETE and trailing refresh can still
-        // hold `store.isBusy` true, which `clearFromBatch` waits out.
+        // Leave the live draft empty, as the Phase 3-5 smokes do. The drop's
+        // DELETE and trailing refresh can still hold `store.isBusy` true, which
+        // `tapClear` waits out.
         clearFromBatch(app)
 
         app.tabBars.buttons["Materials"].tap()
@@ -185,27 +133,20 @@ final class Phase6SmokeTests: XCTestCase {
         app.tabBars.buttons["New Job"].tap()
         XCTAssertTrue(app.staticTexts["New Job"].waitForExistence(timeout: 15))
 
-        // Same precondition as `testCrossBuildDropAndLibrary` — see its comment
-        // for why both "0 jobs" and the readiness line are required together.
+        // Same precondition as `testCrossBuildDropAndLibrary`.
         guard app.staticTexts["0 jobs"].waitForExistence(timeout: 10),
-              Phase4Draft.revealText("0 of 3 required slots assigned", in: app)
-                  || Phase4Draft.revealText("0 of 2 required slots assigned", in: app, timeout: 1) else {
-            throw XCTSkip("New Job never rendered an empty draft: expected \"0 jobs\" plus "
-                + "\"0 of 3 required slots assigned\" or \"0 of 2 required slots assigned\".")
+              Phase4Draft.waitUntil(timeout: 10, condition: { Phase4Draft.isEmptyDraft(app) }) else {
+            // Covers a genuinely non-empty draft (never overwritten here), a
+            // draft or catalog load failure, and a server whose default pipeline
+            // has none of Character, Driver, Outfit as a required card.
+            throw XCTSkip("New Job never rendered an empty draft: expected \"0 jobs\" and every "
+                + "required card reading \"Missing required\".")
         }
 
-        // The guard above may have scrolled down to the readiness footer; the
-        // mode control is New Job's first row, so scroll back until it is built.
-        let mode = app.segmentedControls["newjob.mode"]
-        for _ in 0..<6 where !mode.exists { app.swipeDown() }
-        mode.buttons["Batch"].tap()
         Phase4Draft.selectTryonPipeline(in: app)
         Phase4Draft.chooseMaterial(for: "Character", in: app)
-        // Driver is deliberately left unfilled as a shared slot: picking at
-        // least one driver below moves it into `BatchComposer.crossedRoles`,
-        // which drops it out of `missingShared` (`BatchComposerSection.swift`,
-        // `BatchComposer.swift:139-143`) — the multi-select is how a
-        // multi-driver build fills that role now, not the shared row.
+        // Driver is filled by the Driver card's multi-select below, the only
+        // way a try-on pipeline takes drivers since 2026-09-26.
 
         Phase4Draft.revealButton("batch.pickDrivers", in: app).tap()
         let driverPicks = app.buttons.matching(

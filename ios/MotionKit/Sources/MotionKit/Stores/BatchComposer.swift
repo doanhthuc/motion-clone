@@ -382,8 +382,11 @@ public final class BatchComposer {
         // `jobCount` would report the whole selection after a Continue that
         // only added the pairs not already basketed.
         lastAdded = steps.count
+        // Drivers stay picked, like the character: after a build the next
+        // outfits are usually for the same moves, and New Job (2026-09-26) has
+        // no shared driver slot to fall back on. They live here, not on the
+        // draft, so the PATCH above still clears the draft's driver slot.
         outfits = []
-        drivers = []
         progress = nil
     }
 

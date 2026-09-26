@@ -465,7 +465,11 @@ extension URLProtocolTests {
         #expect(w[8].2?.keys.contains("tryon_seed") == false)
         #expect(draft.draft?.batch.count == 4)
         #expect(composer.failure == nil && composer.lastAdded == 4)
-        #expect(composer.outfits.isEmpty && composer.drivers.isEmpty && composer.progress == nil)
+        #expect(composer.outfits.isEmpty && composer.progress == nil)
+        // Drivers stay picked, like the character: the next outfits are
+        // usually for the same moves (2026-09-26, New Job single stage).
+        #expect(composer.drivers == ["app/d1.mp4", "app/d2.mp4"])
+        #expect(!composer.canRun)   // nothing left to add until outfits are picked again
     }
 
     @Test func noDriversSelectedKeepsTodaysBehaviour() async {

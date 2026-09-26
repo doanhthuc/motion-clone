@@ -22,17 +22,22 @@ struct SettingsChip: View {
 
     var body: some View {
         Button { open = true } label: {
-            HStack(spacing: 6) {
-                Text(PipelineText.name(pipeline.id)).lineLimit(1)
-                if let provider {
-                    Text("· \(ProviderText(label: provider.label).name)")
-                        .foregroundStyle(Theme.secondary).lineLimit(1)
+            // Two short lines, capped at 170 pt: centered in the bar, the chip
+            // may only be as wide as the bar minus twice its wider side.
+            HStack(spacing: 4) {
+                VStack(spacing: 0) {
+                    Text(PipelineText.name(pipeline.id))
+                        .font(.caption.weight(.semibold))
+                    if let provider {
+                        Text(ProviderText(label: provider.label).name)
+                            .font(.caption2).foregroundStyle(Theme.secondary)
+                    }
                 }
+                .lineLimit(1)
                 Image(systemName: "chevron.down").font(.caption2.weight(.semibold))
                     .foregroundStyle(Theme.secondary)
             }
-            .font(.subheadline.weight(.semibold))
-            .frame(maxWidth: 240)
+            .frame(maxWidth: 170)
         }
         .disabled(disabled)
         .accessibilityLabel("Pipeline")
