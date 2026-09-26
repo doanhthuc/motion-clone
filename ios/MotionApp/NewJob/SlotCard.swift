@@ -35,13 +35,21 @@ struct SlotCard: View {
     private var isMulti: Bool { items != nil }
     private var filled: Bool { isMulti ? !picks.isEmpty : text.assigned }
 
+    private var warning: String? {
+        guard !isMulti, let warning = slot?.warning, !warning.isEmpty else { return nil }
+        return warning
+    }
+
     private var accessibilityValue: String {
-        guard isMulti else { return text.state }
+        guard isMulti else { return warning.map { "\(text.state). \($0)" } ?? text.state }
         if picks.isEmpty { return required ? "Missing required" : "Empty optional" }
         return "\(picks.count) selected"
     }
 
+    /// A slot warning takes the subtitle: the glyph alone said something was
+    /// wrong but not what, and the old list's warning lines are gone.
     private var subtitle: String {
+        if let warning { return warning }
         if isMulti {
             return picks.isEmpty ? (required ? "Required · pick many" : "Optional") : "\(picks.count) selected"
         }
@@ -82,7 +90,7 @@ struct SlotCard: View {
                     .font(.subheadline.weight(.semibold)).foregroundStyle(Theme.label)
                     .lineLimit(1).minimumScaleFactor(0.8)
                 Text(subtitle)
-                    .font(.caption).foregroundStyle(Theme.secondary)
+                    .font(.caption).foregroundStyle(warning == nil ? Theme.secondary : Theme.warning)
                     .lineLimit(1).truncationMode(.middle)
             }
             .frame(height: SlotCardGrid<EmptyView>.captionHeight - 6, alignment: .top)
@@ -94,6 +102,15 @@ struct SlotCard: View {
         .accessibilityHint(isMulti ? "Choose one or more materials" : "Choose a material")
         .accessibilityAddTraits(.isButton)
         .accessibilityAction { if !disabled { onTap() } }
+        // The long-press menu and the paging live on the picture, which the
+        // ignored children hide from VoiceOver, so both are offered here too.
+        .accessibilityActions { if filled, !disabled { menu(currentItem) } }
+        .accessibilityAdjustableAction { direction in
+            guard picks.count > 1 else { return }
+            let index = picks.firstIndex { $0.id == currentItem?.id } ?? 0
+            let next = direction == .increment ? min(index + 1, picks.count - 1) : max(index - 1, 0)
+            page = picks[next].id
+        }
         .accessibilityIdentifier(identifier ?? role)
     }
 

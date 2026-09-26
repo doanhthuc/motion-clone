@@ -80,7 +80,7 @@ struct NewJobActionBar: View {
             Label("The draft changed during validation. Tap Continue again.",
                   systemImage: "arrow.triangle.2.circlepath")
                 .font(.subheadline).foregroundStyle(Theme.warning)
-        } else if !state.missing.isEmpty, !state.canContinue {
+        } else if !state.missing.isEmpty, !state.canContinue || !composer.outfits.isEmpty {
             Text("Pick \(missingNames) to continue.")
                 .font(.footnote).foregroundStyle(Theme.secondary)
         }
@@ -114,13 +114,21 @@ struct NewJobActionBar: View {
             }
         }
         .buttonStyle(PrimaryButtonStyle())
-        .disabled(locked || !state.canContinue || composer.failure != nil)
+        // Not blocked by `composer.failure`: a stopped build keeps its outfits,
+        // so Continue resumes it first (and stops again if it fails), and a
+        // failure after every job was added — the final slot clear — must not
+        // leave both buttons dead (review, 2026-09-26).
+        .disabled(locked || !state.canContinue)
         .accessibilityIdentifier("newjob.continueToRun")
     }
 
     @discardableResult
     private func add() async -> Bool {
         if state.isBatch {
+            // `run()` returns early without a failure when it cannot run, which
+            // must not read as success: Continue would then run the basket
+            // without the outfits on screen.
+            guard composer.canRun else { return false }
             await composer.run()
             return composer.failure == nil
         }
@@ -129,9 +137,8 @@ struct NewJobActionBar: View {
 
     /// Add what is pending, validate, open the run flow — stopping at the
     /// first step that fails, whose message is already on screen (the
-    /// composer's failure line, or the store's banner). A stopped build keeps
-    /// Continue disabled until its own "Continue" finishes it, so a half-added
-    /// batch never goes to validation.
+    /// composer's failure line, or the store's banner). A stopped build is
+    /// resumed by the add, and a half-added batch never goes to validation.
     private func runContinue() async {
         continuing = true
         defer { continuing = false }

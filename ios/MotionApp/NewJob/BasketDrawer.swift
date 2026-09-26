@@ -19,6 +19,9 @@ struct BasketDrawer: View {
     @State private var dropCandidate: DraftBatchEntry?
     @GestureState private var drag: CGFloat = 0
 
+    /// The handle's height; `NewJobView` reserves it under the cards.
+    static let collapsedHeight: CGFloat = 48
+
     var body: some View {
         VStack(spacing: 0) {
             handle
@@ -26,15 +29,6 @@ struct BasketDrawer: View {
         }
         .background(.regularMaterial, in: .rect(cornerRadius: 20))
         .offset(y: max(drag, expanded ? 0 : -40) * (expanded ? 1 : 0.3))
-        .gesture(
-            DragGesture(minimumDistance: 12)
-                .updating($drag) { value, state, _ in state = value.translation.height }
-                .onEnded { value in
-                    withAnimation(.snappy) {
-                        if value.translation.height < -40 { expanded = true }
-                        if value.translation.height > 40 { expanded = false }
-                    }
-                })
         .animation(.snappy, value: expanded)
     }
 
@@ -59,10 +53,23 @@ struct BasketDrawer: View {
                 Spacer(minLength: 0)
                 if expanded { clearAll }
             }
-            .padding(.horizontal, 16).padding(.vertical, 12)
+            .padding(.horizontal, 16)
+            .frame(height: Self.collapsedHeight)
             .contentShape(.rect)
         }
         .buttonStyle(.plain)
+        // On the handle only: over the whole drawer it took the list's
+        // horizontal swipe-to-Drop and its vertical scroll (review, 2026-09-26).
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 12)
+                .updating($drag) { value, state, _ in state = value.translation.height }
+                .onEnded { value in
+                    withAnimation(.snappy) {
+                        if value.translation.height < -40 { expanded = true }
+                        if value.translation.height > 40 { expanded = false }
+                    }
+                })
+
         .accessibilityHint(expanded ? "Collapse the batch" : "Show the batch")
         .accessibilityIdentifier("newjob.basket")
     }

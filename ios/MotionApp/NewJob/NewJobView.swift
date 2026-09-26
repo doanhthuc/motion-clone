@@ -81,6 +81,10 @@ struct NewJobView: View {
             }
             .padding(.horizontal, 16)
             .padding(.top, 8)
+            // Room for the collapsed drawer, so it never covers the bottom
+            // row's captions (review, 2026-09-26); only the expanded list
+            // lies over the cards.
+            .padding(.bottom, draft.batch.isEmpty ? 0 : BasketDrawer.collapsedHeight + 8)
             .overlay(alignment: .bottom) {
                 if !draft.batch.isEmpty {
                     BasketDrawer(batch: draft.batch, pipeline: self.pipeline(for:), materials: materials,
@@ -101,7 +105,9 @@ struct NewJobView: View {
                              onPipelineSelected: { id in
                                  await store.selectPipeline(id)
                                  if let selected = store.selectedPipeline, !BatchComposer.supports(selected) {
-                                     composer.reset()
+                                     await composer.release(
+                                         keepingDriver: selected.required.contains(BatchComposer.driverRole)
+                                             || selected.optional.contains(BatchComposer.driverRole))
                                  }
                              },
                              onProviderSelected: { id in await store.selectProvider(id) })

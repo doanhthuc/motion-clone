@@ -37,7 +37,7 @@ struct PickerChainSheet: View {
             case .single(let role):
                 MaterialPicker(role: role, kind: pipeline.roles[role] ?? .unknown,
                                selectedID: store.draft?.slots[role]?.materialID, materials: materials,
-                               onSelect: { id in Task { await store.assign(role: role, materialID: id); if start.chained { advance() } } },
+                               onSelect: { id in pick(id, for: role) },
                                onAdvance: start.chained ? {} : nil)
                     .interactiveDismissDisabled(store.isBusy)
             case .outfits:
@@ -62,8 +62,23 @@ struct PickerChainSheet: View {
         .transition(.push(from: .trailing))
     }
 
-    /// Runs after the pick has landed (single cards await `assign`), so
-    /// `next(after:)` reads the card just filled as filled.
+    /// A chained single pick moves on only once the pick has landed and only
+    /// from the card it was made on. `assign` reports a refusal in a banner,
+    /// not a result, so an advance that ignored it walked past a card the
+    /// server refused, and a second tap during a slow assign advanced twice
+    /// (review, 2026-09-26).
+    private func pick(_ id: String?, for role: String) {
+        let from = current
+        Task {
+            await store.assign(role: role, materialID: id)
+            guard start.chained, let id, current == from,
+                  store.draft?.slots[role]?.materialID == id else { return }
+            advance()
+        }
+    }
+
+    /// Runs after the pick has landed, so `next(after:)` reads the card just
+    /// filled as filled.
     private func advance() {
         guard let next = state?.next(after: current) else { return onClose() }
         withAnimation(.snappy) { card = next }

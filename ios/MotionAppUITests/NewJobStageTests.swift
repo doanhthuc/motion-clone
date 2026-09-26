@@ -24,6 +24,20 @@ final class NewJobStageTests: XCTestCase {
         assertCardsFit(in: app)
         attach(app, "stage-filled")
 
+        // With a basket the collapsed drawer sits above the action bar; the
+        // cards must stay clear of it too (review, 2026-09-26).
+        let add = app.buttons["batch.run"]
+        XCTAssertTrue(Phase4Draft.waitUntil(timeout: 20) { add.isEnabled })
+        add.tap()
+        XCTAssertTrue(app.staticTexts["Batch · 1"].waitForExistence(timeout: 60))
+        let basket = app.buttons["newjob.basket"]
+        XCTAssertTrue(basket.waitForExistence(timeout: 5))
+        for card in ["Character", "Driver", "Outfit", "Background"].map({ app.buttons[$0] }).filter(\.exists) {
+            XCTAssertLessThanOrEqual(card.frame.maxY, basket.frame.minY + 1,
+                                     "\(card.label) runs under the basket drawer")
+        }
+        attach(app, "stage-basket")
+
         Phase4Draft.clear(in: app)
         XCTAssertEqual(app.descendants(matching: .any)["uitest.recordedSpends"].label, "0",
                        "the recording gate saw no spend")

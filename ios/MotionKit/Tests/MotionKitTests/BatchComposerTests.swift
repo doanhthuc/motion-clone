@@ -171,18 +171,36 @@ extension URLProtocolTests {
         #expect(composer.canRun)
     }
 
-    @Test func adoptLeavesAnExistingSelectionAlone() async {
+    /// Review finding 4: Saved try-ons' "Use in job" while outfits are picked
+    /// adds its outfit (and seed) to the selection instead of leaving it hidden
+    /// on the draft. The hand-picked outfits and drivers stay as they were.
+    @Test func adoptAppendsTheDraftsOutfitToAnExistingSelection() async {
         let server = FakeDraftServer()
-        server.preset(outfit: "app/o1.png", seed: nil)
-        let (composer, _) = await make(server)
+        server.preset(outfit: "app/o1.png", seed: "s1")
+        let (composer, draft) = await make(server)
         composer.toggle(outfitID: "app/o9.png")
         composer.toggle(driverID: "app/d9.mp4")
 
         await composer.adoptDraftSelection()
 
-        #expect(composer.outfits.map(\.outfitID) == ["app/o9.png"])
+        #expect(composer.outfits == [CrossOutfit(outfitID: "app/o9.png", seedID: nil),
+                                     CrossOutfit(outfitID: "app/o1.png", seedID: "s1")])
         #expect(composer.drivers == ["app/d9.mp4"])
-        #expect(writes().isEmpty)
+        #expect(draft.draft?.filledSlots["outfit"] == nil)
+        let slots = writes().first?.2?["slots"] as? [String: Any]
+        #expect(slots?.keys.sorted() == ["outfit"])
+    }
+
+    @Test func adoptOfAnOutfitAlreadyPickedOnlyClearsTheDraft() async {
+        let server = FakeDraftServer()
+        server.preset(outfit: "app/o9.png", seed: nil)
+        let (composer, _) = await make(server)
+        composer.toggle(outfitID: "app/o9.png")
+
+        await composer.adoptDraftSelection()
+
+        #expect(composer.outfits.map(\.outfitID) == ["app/o9.png"])
+        #expect(writes().count == 1)
     }
 
     @Test func adoptWithNothingOnTheDraftWritesNothing() async {
@@ -206,6 +224,36 @@ extension URLProtocolTests {
         await composer.adoptDraftSelection()
 
         #expect(composer.outfits.first?.seedID == "s7")
+    }
+
+    /// Review finding 2: leaving a try-on pipeline for one without an outfit
+    /// hands a single picked driver back to the draft's driver slot, so a
+    /// look at the try-on pipeline does not cost the user their driver.
+    @Test func releasingToAPipelineWithADriverHandsASingleDriverBack() async {
+        let server = FakeDraftServer()
+        let (composer, _) = await make(server)
+        composer.toggle(outfitID: "app/o1.png")
+        composer.toggle(driverID: "app/d1.mp4")
+
+        await composer.release(keepingDriver: true)
+
+        #expect(composer.outfits.isEmpty && composer.drivers.isEmpty)
+        let w = writes()
+        #expect(w.map { "\($0.0) \($0.1)" } == ["PATCH /v1/draft"])
+        #expect((w.first?.2?["slots"] as? [String: Any])?["driver"] as? String == "app/d1.mp4")
+    }
+
+    @Test func releasingWithSeveralDriversOrNoDriverRoleWritesNothing() async {
+        let server = FakeDraftServer()
+        let (composer, _) = await make(server)
+        composer.toggle(driverID: "app/d1.mp4")
+        composer.toggle(driverID: "app/d2.mp4")
+        await composer.release(keepingDriver: true)
+        #expect(composer.drivers.isEmpty)
+        composer.toggle(driverID: "app/d1.mp4")
+        await composer.release(keepingDriver: false)
+        #expect(composer.drivers.isEmpty)
+        #expect(writes().isEmpty)
     }
 
     @Test func resetEmptiesTheSelection() async {

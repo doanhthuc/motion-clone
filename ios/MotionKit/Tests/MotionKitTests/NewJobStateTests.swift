@@ -70,4 +70,16 @@ import Testing
         let u = NewJobState(pipeline: tryon, draft: d, outfits: 1, drivers: 1)
         #expect(u.next(after: .outfits) == nil)       // background is optional
     }
+
+    /// Review finding 1: picked outfits that cannot be added (a required card
+    /// is empty) must block Continue even when the basket has jobs, or Continue
+    /// runs the basket and silently leaves the outfits on screen behind.
+    @Test func pickedOutfitsThatCannotBeAddedBlockContinue() {
+        let d = draft(tryon, filled: ["driver": "d"], jobs: 2)   // Character missing
+        let s = NewJobState(pipeline: tryon, draft: d, outfits: 3, drivers: 0)
+        #expect(s.addCount == 0)
+        #expect(!s.canContinue)
+        // Nothing composed: the basket alone can still run.
+        #expect(NewJobState(pipeline: tryon, draft: d, outfits: 0, drivers: 0).canContinue)
+    }
 }

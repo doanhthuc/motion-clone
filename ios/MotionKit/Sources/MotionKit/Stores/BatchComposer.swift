@@ -236,15 +236,42 @@ public final class BatchComposer {
             clear[Self.driverRole] = .some(nil)
         }
         // After the driver, so `matches(for:)` reads the shared slots without it.
-        if outfits.isEmpty, let outfitID = current.filledSlots[Self.outfitRole] {
-            outfits = [CrossOutfit(outfitID: outfitID,
-                                   seedID: current.tryonSeed ?? matches(for: outfitID).first?.id)]
+        // With outfits already picked the draft's outfit is added beside them
+        // rather than left hidden on the draft (review, 2026-09-26): that is
+        // what "Use in job" from Saved try-ons means while a batch is being
+        // composed. Past the cap it is refused with the usual reason, and the
+        // draft slot is cleared either way so nothing hides there.
+        if let outfitID = current.filledSlots[Self.outfitRole] {
+            if !outfits.contains(where: { $0.outfitID == outfitID }) {
+                if fits(outfits: outfits.count + 1, drivers: drivers.count) {
+                    outfits.append(CrossOutfit(outfitID: outfitID,
+                                               seedID: current.tryonSeed ?? matches(for: outfitID).first?.id))
+                } else {
+                    refuse()
+                }
+            }
             clear[Self.outfitRole] = .some(nil)
             seed = .clear
         }
         guard !clear.isEmpty else { return }
+        let reason = capReason
         selectionChanged()
+        capReason = reason
         await draft.apply(DraftPatch(slots: clear, seed: seed))
+    }
+
+    /// Leaving a try-on pipeline for one without a character + outfit pair:
+    /// the selection cannot be shown there, so it is dropped, but a single
+    /// picked driver goes back to the draft's driver slot when the new pipeline
+    /// has one. Otherwise a look at a try-on pipeline cost the user the driver
+    /// they had picked (review, 2026-09-26), since adoption had moved it here.
+    public func release(keepingDriver: Bool) async {
+        guard !isRunning else { return }
+        let driverID = drivers.count == 1 ? drivers.first : nil
+        reset()
+        if keepingDriver, let driverID {
+            await draft.apply(DraftPatch(slots: [Self.driverRole: driverID]))
+        }
     }
 
     /// Clear draft empties the draft on the server, but this selection lives

@@ -15,9 +15,9 @@ public struct NewJobState: Equatable, Sendable {
     public let isBatch: Bool
     /// Jobs Add would put in the basket now; 0 means Add has nothing to do.
     public let addCount: Int
-    /// Continue has something to run: a pending add, or jobs the server
-    /// already counts (the basket plus a complete edited job — `drafts.py`
-    /// `jobs_for`).
+    /// Continue has something to run — a pending add, or jobs the server
+    /// already counts (the basket plus a complete edited job, `drafts.py`
+    /// `jobs_for`) — and no picked outfit would be left behind.
     public let canContinue: Bool
     /// Nothing picked anywhere: the only state that chains the pickers.
     public let isFresh: Bool
@@ -51,7 +51,11 @@ public struct NewJobState: Equatable, Sendable {
         } else {
             addCount = 1
         }
-        canContinue = addCount > 0 || draft.jobs > 0
+        // Outfits on screen that cannot be added (a required card is empty)
+        // block Continue even with a basket: it would run the basket and leave
+        // them behind, renting a GPU for fewer jobs than the screen shows.
+        let strandedOutfits = batch && outfits > 0 && addCount == 0
+        canContinue = (addCount > 0 || draft.jobs > 0) && !strandedOutfits
         isFresh = draftFilled.isEmpty && outfits == 0 && drivers == 0
     }
 
