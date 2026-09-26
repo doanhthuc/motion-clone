@@ -5,6 +5,11 @@ struct StudioSpaceView: View {
     @Environment(AppModel.self) private var model
     let studio: StudioStore
     @State private var viewing: Viewing?
+    /// Which reference is long-pressed for the enlarged preview + ⓧ. Owned
+    /// here, not by the composer: the backdrop dim below has to cover the
+    /// grid, and a dim drawn from inside the pinned composer can't reliably
+    /// reach past its own bounds.
+    @State private var peeking: StudioRef?
 
     struct Viewing: Identifiable {
         let generation: StudioGeneration
@@ -26,7 +31,19 @@ struct StudioSpaceView: View {
                             .padding(.horizontal, 4)
                     }
                     .defaultScrollAnchor(.top)
-                    .safeAreaInset(edge: .bottom) { StudioComposerSlot(studio: studio) }
+                    .overlay {
+                        // Attached before `safeAreaInset` below, so it fills the
+                        // ScrollView's own bounds (the grid) while the pinned
+                        // composer, added after, still renders on top of it
+                        // undimmed.
+                        if peeking != nil {
+                            Color.black.opacity(0.5)
+                                .ignoresSafeArea()
+                                .onTapGesture { withAnimation(.snappy) { peeking = nil } }
+                                .transition(.opacity)
+                        }
+                    }
+                    .safeAreaInset(edge: .bottom) { StudioComposer(studio: studio, peeking: $peeking) }
                     .navigationTitle(StudioFormat.title(project.title, createdAt: project.createdAt))
                 } else {
                     ContentUnavailableView {
@@ -49,10 +66,4 @@ struct StudioSpaceView: View {
             .task { await studio.loadCatalog() }
         }
     }
-}
-
-/// Task 9 replaces this with the real composer.
-struct StudioComposerSlot: View {
-    let studio: StudioStore
-    var body: some View { Color.clear.frame(height: 0) }
 }
