@@ -7,7 +7,10 @@ public final class RunDetailStore {
     public private(set) var detail: RunDetail?
     public private(set) var error: APIError?
     public private(set) var lastSuccess: Date?
-    private let client: APIClient
+    public let client: APIClient
+    private var tryon: TryonPreviews?
+    private var tryonLoaded = false
+    private var tryonImages: [String: Data] = [:]
 
     public init(client: APIClient, runID: String) {
         self.client = client
@@ -19,7 +22,8 @@ public final class RunDetailStore {
     public func refresh() async {
         do {
             // nil = 304: the run did not change since the last poll.
-            if let fresh = try await client.getIfChanged(RunDetail.self, "v1", "runs", runID) {
+            if let fresh = try await client.getIfChanged(RunDetail.self, haveCopy: detail != nil,
+                                                           "v1", "runs", runID) {
                 detail = fresh
             }
             error = nil
@@ -38,5 +42,21 @@ public final class RunDetailStore {
             await refresh()
             do { try await sleep(interval) } catch { return }
         }
+    }
+
+    /// The try-on a job was made from — the one picture a job has before its
+    /// video exists. Read once per screen: Phase A is over by the time a run has
+    /// jobs, so the previews do not move under a detail poll. A run without a
+    /// try-on stage answers 404 and every job gets nil.
+    public func tryonImage(forJob job: String) async -> Data? {
+        if !tryonLoaded {
+            tryonLoaded = true
+            tryon = try? await client.get(TryonPreviews.self, "v1", "runs", runID, "tryon")
+        }
+        guard let preview = tryon?.previews.first(where: { $0.run == job }), preview.hasImage else { return nil }
+        if let cached = tryonImages[preview.index] { return cached }
+        guard let data = try? await client.data("v1", "runs", runID, "tryon", preview.index) else { return nil }
+        tryonImages[preview.index] = data
+        return data
     }
 }

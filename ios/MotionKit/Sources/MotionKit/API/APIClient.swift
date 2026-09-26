@@ -51,12 +51,16 @@ public actor APIClient {
         return try decode(type, data)
     }
 
-    /// nil means 304 Not Modified — keep what you have.
-    public func getIfChanged<T: Decodable & Sendable>(_ type: T.Type, _ components: String...) async throws(APIError) -> T? {
+    /// nil means 304 Not Modified — keep what you have. The ETag cache is
+    /// per client, not per caller, so a caller holding nothing yet must pass
+    /// `haveCopy: false`, or a 304 answers it with nothing to keep.
+    public func getIfChanged<T: Decodable & Sendable>(
+        _ type: T.Type, haveCopy: Bool = true, _ components: String...
+    ) async throws(APIError) -> T? {
         let target = url(components)
         let key = target.absoluteString
         var headers: [String: String] = [:]
-        if let etag = etags[key] { headers["If-None-Match"] = etag }
+        if haveCopy, let etag = etags[key] { headers["If-None-Match"] = etag }
         let (data, response) = try await send(target, extraHeaders: headers, okStatuses: [200, 304])
         if response.statusCode == 304 { return nil }
         if let etag = response.value(forHTTPHeaderField: "ETag") { etags[key] = etag }
