@@ -103,9 +103,3 @@ private struct SidebarButton: ViewModifier {
         }
     }
 }
-
-/// Replaced by the real Studio screen in Task 8.
-struct StudioSpaceView: View {
-    let studio: StudioStore
-    var body: some View { NavigationStack { Text("Image Studio").sidebarButton() } }
-}
