@@ -262,15 +262,14 @@ struct BatchEntryDetail: View {
                 if let pipeline, !pipeline.providers.isEmpty {
                     seedRow(entry)
                 }
-                Button(role: .destructive) { confirmingDrop = true } label: {
+                // No destructive role: it paints the label red over the red
+                // fill whatever the style says. The dialog's Drop keeps it.
+                Button { confirmingDrop = true } label: {
                     Label("Drop job", systemImage: "trash")
-                        .font(.body.weight(.semibold))
-                        .frame(maxWidth: .infinity, minHeight: 44)
                 }
                 // Filled: the tinted bordered style read as disabled next to
                 // the dark cards (user, 2026-09-26).
-                .buttonStyle(.borderedProminent)
-                .tint(Theme.danger)
+                .buttonStyle(DangerButtonStyle())
                 .disabled(disabled)
                 .confirmationDialog("Drop this batch entry?", isPresented: $confirmingDrop,
                                     titleVisibility: .visible) {

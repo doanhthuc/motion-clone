@@ -84,12 +84,21 @@ struct DestructiveButtonStyle: ButtonStyle {
     }
 }
 
-/// The body of all three styles. A view rather than code in `makeBody`, so
+/// Red fill, white text: a screen whose main action is to delete the thing
+/// it shows. Don't give its Button `role: .destructive`: the role paints the
+/// label red over the red fill, whatever this style sets (2026-09-26).
+struct DangerButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        StyledButton(configuration: configuration, kind: .danger)
+    }
+}
+
+/// The body of all four styles. A view rather than code in `makeBody`, so
 /// `isEnabled` resolves even when `AnyButtonStyle` calls `makeBody` by hand —
 /// an `@Environment` on the style struct itself is only filled in when SwiftUI
 /// installs that style.
 private struct StyledButton: View {
-    enum Kind { case primary, secondary, destructive }
+    enum Kind { case primary, secondary, destructive, danger }
     let configuration: ButtonStyleConfiguration
     let kind: Kind
     @Environment(\.isEnabled) private var isEnabled
@@ -101,7 +110,7 @@ private struct StyledButton: View {
             .frame(maxWidth: .infinity, minHeight: 50)
             .background(background.opacity(configuration.isPressed ? 0.7 : 1),
                         in: .rect(cornerRadius: Theme.Radius.medium))
-            .opacity(kind == .primary && !isEnabled ? 0.4 : 1)
+            .opacity((kind == .primary || kind == .danger) && !isEnabled ? 0.4 : 1)
             .contentShape(.rect)
     }
 
@@ -110,10 +119,17 @@ private struct StyledButton: View {
         case .primary: Theme.onAccent
         case .secondary: isEnabled ? Theme.label : Theme.tertiary
         case .destructive: isEnabled ? Theme.danger : Theme.tertiary
+        case .danger: .white
         }
     }
 
-    private var background: Color { kind == .primary ? Theme.accent : Theme.surface }
+    private var background: Color {
+        switch kind {
+        case .primary: Theme.accent
+        case .danger: Theme.danger
+        case .secondary, .destructive: Theme.surface
+        }
+    }
 }
 
 struct AnyButtonStyle: ButtonStyle {
