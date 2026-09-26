@@ -13,6 +13,8 @@ struct MaterialPicker: View {
     var onAdvance: (() -> Void)?
     /// A chain's progress, "Character ✓ → Outfit", under the title.
     var progress: String?
+    /// Off where the slot may not be emptied: a queued job's required role.
+    var allowsClear = true
     @Environment(\.dismiss) private var dismiss
     @State private var deleteCandidate: MotionKit.Material?
 
@@ -53,7 +55,7 @@ struct MaterialPicker: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    if selectedID != nil {
+                    if selectedID != nil, allowsClear {
                         Button("Clear", role: .destructive) {
                             onSelect(nil)
                             dismiss()

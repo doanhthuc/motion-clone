@@ -169,6 +169,7 @@ uploads directory (it currently only ages out staged files after `STAGING_MAX_AG
 | `PATCH /v1/draft` `{pipeline?, provider?, slots?: {role: material_id}, tryon_seed?: id \| null}` | Same rules as `_switch_pipeline` / `_switch_provider` / `_fill_slot`. `tryon_seed` names a try-on library entry to seed the job's try-on stage from (§5.10, slice 6) |
 | `POST /v1/draft/add-to-batch` | `_add_to_batch` — already accepts any number of jobs; a "1 character × N outfits" cross build is the app calling `PATCH` + this once per outfit (§5.10) |
 | `DELETE /v1/draft/batch/{digest}` | `_drop_from_batch` — free (nothing rented yet), so this is how the app drops one try-on from a batch before renting (§5.10) |
+| `PATCH /v1/draft/batch/{digest}` `{provider?, slots?, tryon_seed?}` (added 2026-09-26) | `DraftStore.edit_batch` — changes a queued job in place, keeping its position; the same checks as `PATCH /v1/draft` (shared `_prepare`/`_apply`), plus: no `pipeline` (a switch drops slots, and a queued job that silently lost one is worse than drop and re-add), a required slot cannot be emptied (`missing_slots`), and the edit must not duplicate another entry (`duplicate`). The digest changes with the signature; the returned view carries the new one |
 | `POST /v1/draft/clear` | `_clear_job` |
 | `POST /v1/draft/validate` | `make batch-validate` — free, no pod |
 

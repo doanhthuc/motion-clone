@@ -127,6 +127,16 @@ public final class DraftStore {
         }
     }
 
+    /// Changes a queued job where it sits in the batch. The slow timeout because a
+    /// replaced material is probed on the server, the same as `assign`.
+    @discardableResult
+    public func editBatch(_ digest: String, _ patch: BatchEntryPatch) async -> Bool {
+        await mutate(materialAssignment: !patch.slots.isEmpty) {
+            try await self.client.patch(
+                Draft.self, body: patch, timeout: Self.slowDraftTimeout, "v1", "draft", "batch", digest)
+        }
+    }
+
     @discardableResult
     public func clear() async -> Bool {
         await mutate {
