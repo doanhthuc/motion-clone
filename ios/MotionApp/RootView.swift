@@ -12,28 +12,36 @@ struct RootView: View {
                let materials = model.materials, let draft = model.draft,
                let outputs = model.outputs, let flow = model.runFlow,
                let gpu = model.gpu, let balance = model.balance, let migrate = model.migrate,
-               let library = model.tryonLibrary, let composer = model.batchComposer {
-                TabView(selection: $model.selectedTab) {
-                    Tab("Runs", systemImage: "waveform.path.ecg", value: AppTab.runs) {
-                        NavigationStack { RunsView(runs: runs, pod: pod, flow: flow) }
-                    }
-                    Tab("Materials", systemImage: "photo.on.rectangle", value: AppTab.materials) {
-                        NavigationStack {
-                            MaterialTabView(materials: materials, library: library, draft: draft,
-                                            composer: composer)
+               let library = model.tryonLibrary, let composer = model.batchComposer,
+               let studio = model.studio {
+                SpaceShell(studio: studio) {
+                    TabView(selection: $model.selectedTab) {
+                        Tab("Runs", systemImage: "waveform.path.ecg", value: AppTab.runs) {
+                            NavigationStack { RunsView(runs: runs, pod: pod, flow: flow).sidebarButton() }
                         }
-                    }
-                    Tab("New Job", systemImage: "plus.circle", value: AppTab.newJob) {
-                        NavigationStack {
-                            NewJobView(store: draft, materials: materials, flow: flow,
-                                       composer: composer, library: library)
+                        Tab("Materials", systemImage: "photo.on.rectangle", value: AppTab.materials) {
+                            NavigationStack {
+                                MaterialTabView(materials: materials, library: library, draft: draft,
+                                                composer: composer)
+                                    .sidebarButton()
+                            }
                         }
-                    }
-                    Tab("Outputs", systemImage: "play.rectangle", value: AppTab.outputs) {
-                        NavigationStack { OutputsView(store: outputs) }
-                    }
-                    Tab("Pod", systemImage: "cpu", value: AppTab.pod) {
-                        NavigationStack { PodView(pod: pod, gpu: gpu, balance: balance, flow: flow, runs: runs) }
+                        Tab("New Job", systemImage: "plus.circle", value: AppTab.newJob) {
+                            NavigationStack {
+                                NewJobView(store: draft, materials: materials, flow: flow,
+                                           composer: composer, library: library)
+                                    .sidebarButton()
+                            }
+                        }
+                        Tab("Outputs", systemImage: "play.rectangle", value: AppTab.outputs) {
+                            NavigationStack { OutputsView(store: outputs).sidebarButton() }
+                        }
+                        Tab("Pod", systemImage: "cpu", value: AppTab.pod) {
+                            NavigationStack {
+                                PodView(pod: pod, gpu: gpu, balance: balance, flow: flow, runs: runs)
+                                    .sidebarButton()
+                            }
+                        }
                     }
                 }
                 .tint(Theme.accent)
