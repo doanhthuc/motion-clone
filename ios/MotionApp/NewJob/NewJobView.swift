@@ -159,16 +159,11 @@ struct NewJobView: View {
             ToolbarItem(placement: .topBarTrailing) { moreMenu }
         }
         .safeAreaInset(edge: .bottom) {
-            if NewJobActionBar.isVisible(draft: draft, isBatch: isBatch, batchSupported: batchSupported,
-                                         composer: composer) {
-                NewJobActionBar(store: store, composer: composer, draft: draft, isBatch: isBatch,
-                                batchSupported: batchSupported, onContinue: { showRun = true })
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-            }
+            NewJobActionBar(store: store, composer: composer, draft: draft,
+                            state: NewJobState(pipeline: pipeline, draft: draft,
+                                               outfits: composer.outfits.count, drivers: composer.drivers.count),
+                            onContinue: { showRun = true })
         }
-        .animation(.snappy, value: NewJobActionBar.isVisible(draft: draft, isBatch: isBatch,
-                                                            batchSupported: batchSupported,
-                                                            composer: composer))
         .modifier(BatchPickerSheets(pickingOutfits: $pickingOutfits, pickingDrivers: $pickingDrivers,
                                     composer: composer, materials: materials, pipeline: pipeline))
         .sheet(item: $openEntry) { entry in
