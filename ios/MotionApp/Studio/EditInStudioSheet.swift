@@ -24,9 +24,10 @@ struct EditInStudioSheet: View {
     }
 
     // Dismiss first: `openStudio` flips `selectedSpace` to `.studio`, and `SpaceShell`
-    // then tears down the Motion subtree that owns this sheet's presentation, so
-    // dismissing after that races with the teardown. `model` is captured into a local
-    // so the Task never reaches back into sheet-owned state once the sheet is gone.
+    // then hides the Motion subtree that owns this sheet's presentation (it stays
+    // mounted, so the pushed screen is still there on the way back), and a sheet
+    // left up over a hidden space would cover Studio. `model` is captured into a
+    // local so the Task never reaches back into sheet-owned state once it is gone.
     // Attach still runs after `openStudio` returns: it may call `createProject()`,
     // which clears `attachments`, while `open()` clears them only on a project switch —
     // attaching after either has settled is the only ordering that survives both.

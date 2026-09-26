@@ -17,13 +17,14 @@ struct RootView: View {
                 SpaceShell(studio: studio) {
                     TabView(selection: $model.selectedTab) {
                         Tab("Runs", systemImage: "waveform.path.ecg", value: AppTab.runs) {
-                            NavigationStack { RunsView(runs: runs, pod: pod, flow: flow).sidebarButton() }
+                            NavigationStack { RunsView(runs: runs, pod: pod, flow: flow).sidebarButton().motionTabRoot(.runs) }
                         }
                         Tab("Materials", systemImage: "photo.on.rectangle", value: AppTab.materials) {
                             NavigationStack {
                                 MaterialTabView(materials: materials, library: library, draft: draft,
                                                 composer: composer)
                                     .sidebarButton()
+                                    .motionTabRoot(.materials)
                             }
                         }
                         Tab("New Job", systemImage: "plus.circle", value: AppTab.newJob) {
@@ -31,15 +32,17 @@ struct RootView: View {
                                 NewJobView(store: draft, materials: materials, flow: flow,
                                            composer: composer, library: library)
                                     .sidebarButton()
+                                    .motionTabRoot(.newJob)
                             }
                         }
                         Tab("Outputs", systemImage: "play.rectangle", value: AppTab.outputs) {
-                            NavigationStack { OutputsView(store: outputs).sidebarButton() }
+                            NavigationStack { OutputsView(store: outputs).sidebarButton().motionTabRoot(.outputs) }
                         }
                         Tab("Pod", systemImage: "cpu", value: AppTab.pod) {
                             NavigationStack {
                                 PodView(pod: pod, gpu: gpu, balance: balance, flow: flow, runs: runs)
                                     .sidebarButton()
+                                    .motionTabRoot(.pod)
                             }
                         }
                     }
@@ -56,6 +59,9 @@ struct RootView: View {
                 }
                 .onChange(of: flow.podRequested) { _, requested in
                     guard requested else { return }
+                    // The request can come from anywhere the spend banner or a
+                    // run screen is reachable; the Pod tab only exists in Motion.
+                    model.selectedSpace = .motion
                     model.selectedTab = .pod
                     Task { await pod.refresh() }
                     flow.acknowledgePodRequest()
@@ -119,6 +125,7 @@ struct SpendBanner: View {
                 Spacer(minLength: 0)
                 Button("Check again") {
                     model.migrateSheet = MigrateRequest(destination: nil)
+                    model.selectedSpace = .motion
                     model.selectedTab = .pod
                 }
                 .font(.subheadline.weight(.semibold))

@@ -1,9 +1,14 @@
 import MotionKit
 import SwiftUI
 
-/// Hosts the current space and slides the sidebar in from the left — edge
-/// swipe or the ☰ button. Not NavigationSplitView: on iPhone that collapses
-/// into a push stack, not a panel.
+/// Hosts both spaces and slides the sidebar in from the left — edge swipe or
+/// the ☰ button. Not NavigationSplitView: on iPhone that collapses into a
+/// push stack, not a panel.
+///
+/// Both spaces stay mounted and the inactive one is only hidden: a `switch`
+/// rebuilt the Motion tree on every space change, which reset every tab's
+/// navigation stack (Edit in Studio from a pushed run, then back to Motion,
+/// landed on the Runs root — reproduced on the simulator 2026-09-26).
 struct SpaceShell<Motion: View>: View {
     @Environment(AppModel.self) private var model
     let studio: StudioStore
@@ -14,6 +19,21 @@ struct SpaceShell<Motion: View>: View {
     /// defensive gap, not load-bearing: keeps the edge-swipe hot zone from
     /// covering it at all (2026-09-26 review).
     private let edgeStripBottomMargin: CGFloat = 90
+    /// Keeps the strip clear of the navigation bar, so the leading edge of
+    /// ☰ and Back stays tappable. 44 pt inline bar plus a small margin.
+    private let edgeStripTopMargin: CGFloat = 56
+
+    /// The open-swipe strip must never sit over a pushed screen: it took the
+    /// system swipe-back there and opened the sidebar instead (simulator,
+    /// 2026-09-26). Studio has no pushed screens; in Motion the strip only
+    /// exists while the selected tab shows its root.
+    private var edgeSwipeEnabled: Bool {
+        guard !model.isSidebarOpen else { return false }
+        switch model.selectedSpace {
+        case .studio: return true
+        case .motion: return model.motionTabsAtRoot.contains(model.selectedTab)
+        }
+    }
 
     var body: some View {
         let offset = max(0, min(width, (model.isSidebarOpen ? width : 0) + drag))
@@ -24,11 +44,9 @@ struct SpaceShell<Motion: View>: View {
                 // Drag-to-close while open. When closed, this view is offset
                 // entirely off-screen, so nothing here is reachable to drag.
                 .gesture(closeDrag)
-            Group {
-                switch model.selectedSpace {
-                case .motion: motion()
-                case .studio: StudioSpaceView(studio: studio)
-                }
+            ZStack {
+                motion().spaceVisibility(model.selectedSpace == .motion)
+                StudioSpaceView(studio: studio).spaceVisibility(model.selectedSpace == .studio)
             }
             .overlay {
                 Color.black.opacity(0.35 * offset / width)
@@ -41,7 +59,7 @@ struct SpaceShell<Motion: View>: View {
             }
             .offset(x: offset)
 
-            if !model.isSidebarOpen {
+            if edgeSwipeEnabled {
                 // A narrow hot zone for the open-swipe only — not a gesture on
                 // the whole app. That used to contend with ScrubBar's drag,
                 // the Outputs feed's ScrollView, and the edge-to-edge
@@ -52,6 +70,7 @@ struct SpaceShell<Motion: View>: View {
                     .contentShape(Rectangle())
                     .frame(width: 20)
                     .frame(maxHeight: .infinity, alignment: .leading)
+                    .padding(.top, edgeStripTopMargin)
                     .padding(.bottom, edgeStripBottomMargin)
                     .gesture(openDrag)
             }
@@ -87,6 +106,37 @@ struct SpaceShell<Motion: View>: View {
 extension View {
     /// The ☰ that opens the sidebar, in the leading slot of a navigation bar.
     func sidebarButton() -> some View { modifier(SidebarButton()) }
+
+    /// Marks the root screen of a Motion tab. A NavigationStack's root gets
+    /// `onDisappear` when a screen is pushed over it and `onAppear` when it is
+    /// popped back to, so this tracks "that tab is at its root" without a
+    /// NavigationPath — the tabs push with value links, destination links and
+    /// `navigationDestination(isPresented:)`, which no single path binding sees.
+    /// Keyed per tab, so the order in which two tabs' roots appear/disappear on
+    /// a tab switch doesn't matter.
+    func motionTabRoot(_ tab: AppTab) -> some View { modifier(MotionTabRoot(tab: tab)) }
+
+    /// Hidden, inert and invisible to VoiceOver while its space isn't selected,
+    /// but still mounted so its navigation state survives. One known gap: the
+    /// Motion tab bar is UIKit underneath and stays in the accessibility tree
+    /// (not hittable, not drawn) while Studio shows; `toolbarVisibility(.hidden,
+    /// for: .tabBar)` on the tab stacks or roots didn't remove it either
+    /// (simulator, 2026-09-26).
+    fileprivate func spaceVisibility(_ visible: Bool) -> some View {
+        opacity(visible ? 1 : 0)
+            .allowsHitTesting(visible)
+            .accessibilityHidden(!visible)
+    }
+}
+
+private struct MotionTabRoot: ViewModifier {
+    @Environment(AppModel.self) private var model
+    let tab: AppTab
+    func body(content: Content) -> some View {
+        content
+            .onAppear { model.motionTabsAtRoot.insert(tab) }
+            .onDisappear { model.motionTabsAtRoot.remove(tab) }
+    }
 }
 
 private struct SidebarButton: ViewModifier {

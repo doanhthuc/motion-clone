@@ -17,6 +17,8 @@ struct StudioSpaceView: View {
         var id: String { imageID }
     }
 
+    private var isActive: Bool { model.selectedSpace == .studio }
+
     var body: some View {
         NavigationStack {
             Group {
@@ -59,11 +61,15 @@ struct StudioSpaceView: View {
             .navigationBarTitleDisplayMode(.inline)
             .sidebarButton()
             .background(Theme.bg)
-            .alert("Studio", isPresented: Binding(get: { studio.message != nil }, set: { if !$0 { studio.message = nil } })) {
+            // `SpaceShell` keeps this view mounted while Motion is showing, so
+            // the alert and the catalog load are gated on Studio being the
+            // visible space: a failed Studio call must not pop over Motion.
+            .alert("Studio", isPresented: Binding(get: { isActive && studio.message != nil },
+                                                  set: { if !$0 { studio.message = nil } })) {
                 Button("OK", role: .cancel) {}
             } message: { Text(studio.message ?? "") }
             .sheet(item: $viewing) { v in StudioImageViewer(studio: studio, generation: v.generation, imageID: v.imageID) }
-            .task { await studio.loadCatalog() }
+            .task(id: isActive) { if isActive { await studio.loadCatalog() } }
         }
     }
 }

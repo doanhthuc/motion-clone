@@ -48,6 +48,9 @@ final class AppModel {
         didSet { UserDefaults.standard.set(selectedSpace.rawValue, forKey: "selectedSpace") }
     }
     var isSidebarOpen = false
+    /// Motion tabs whose NavigationStack currently shows its root screen
+    /// (`motionTabRoot`). The sidebar's edge swipe is only live on those.
+    var motionTabsAtRoot: Set<AppTab> = []
     var migrateSheet: MigrateRequest?
     /// UI-test builds only: how many spend taps the recording gate swallowed.
     private(set) var recordedSpends = 0
