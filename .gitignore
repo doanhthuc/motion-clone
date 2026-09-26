@@ -135,3 +135,7 @@ batch/tryon-library/
 # (tgbot/preview.py). Throwaways, but they are still the user's own photographs
 # and this repo is public.
 batch/tg-preview/
+
+# Claude Code per-machine state
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
