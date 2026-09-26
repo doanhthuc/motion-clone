@@ -15,6 +15,11 @@ public enum APIError: Error, Sendable, Equatable {
         return false
     }
 
+    public var isNotFound: Bool {
+        if case .server(404, _, _) = self { return true }
+        return false
+    }
+
     /// What the phone shows. 409 carries the server's own text — the same
     /// wording Telegram shows for the same refusal. A 422 does too, except
     /// `invalid`, whose text is never written for a reader on the phone, on any

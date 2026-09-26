@@ -4,7 +4,7 @@ import SwiftUI
 /// The pinned prompt bar: reference thumbnails, the prompt, ＋, the
 /// "model · aspect · xN" pill and Send (spec "Project screen").
 ///
-/// `peeking` is owned by `StudioSpaceView`, not this view: the long-press
+/// `peeking` is owned by `StudioSpaceView`, not this view: the peek's
 /// backdrop dim has to cover the grid above the composer, and a dim drawn
 /// from inside this view (pinned via `safeAreaInset`) can't reliably reach
 /// past its own bounds. The composer only reads/writes the binding and still
@@ -81,8 +81,10 @@ struct StudioComposer: View {
     }
 }
 
-/// A reference thumbnail. The ⓧ appears only while this ref is being peeked
-/// (long-press), as in Flow; a plain tap does nothing.
+/// A reference thumbnail. A tap peeks it — enlarged preview plus ⓧ — and a
+/// second tap closes the peek. It was a long-press, as in Flow, until the
+/// user asked for a plain tap (2026-09-26): nothing else on a thumbnail
+/// competes for the tap.
 private struct RefThumb: View {
     let studio: StudioStore
     let ref: StudioRef
@@ -104,7 +106,9 @@ private struct RefThumb: View {
         }
         .frame(width: 56, height: 56)
         .clipShape(RoundedRectangle(cornerRadius: 12))
-        .onLongPressGesture(minimumDuration: 0.35) { withAnimation(.snappy) { peeking = ref } }
+        .contentShape(Rectangle())
+        .onTapGesture { withAnimation(.snappy) { peeking = peeking == ref ? nil : ref } }
+        .accessibilityAddTraits(.isButton)
         .task { if let data = await studio.thumbnail(for: ref) { image = UIImage(data: data) } }
         .accessibilityIdentifier("studio.ref")
     }

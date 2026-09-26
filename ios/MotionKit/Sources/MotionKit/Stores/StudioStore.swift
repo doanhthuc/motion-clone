@@ -91,6 +91,12 @@ public final class StudioStore {
         do {
             project = try await client.get(StudioProjectResponse.self, "v1", "studio", "projects", id).project
             startPolling()
+        } catch let error as APIError where error.isNotFound {
+            // Deleted from another device (or the sidebar list was stale):
+            // drop it instead of leaving a dead project open.
+            if project?.id == id { close() }
+            message = "That project was deleted."
+            await loadProjects()
         } catch { message = error.userMessage }
     }
 
@@ -100,12 +106,17 @@ public final class StudioStore {
     }
 
     public func createProject() async -> String? {
+        await createProject(keepingDraft: false)
+    }
+
+    private func createProject(keepingDraft: Bool) async -> String? {
         struct Body: Encodable, Sendable { let title: String }
         do {
             let created = try await client.post(StudioProjectResponse.self, body: Body(title: ""),
                                                 "v1", "studio", "projects").project
+            pollTask?.cancel(); pollTask = nil
             project = created
-            attachments = []; prompt = ""
+            if !keepingDraft { attachments = []; prompt = "" }
             await loadProjects()
             return created.id
         } catch { message = error.userMessage; return nil }
@@ -142,8 +153,20 @@ public final class StudioStore {
         // Captured before the await: up to 3 attempts x 60 s can outlast the user
         // switching projects, and a prompt they've since typed into the newly
         // opened project must survive this send finishing, not be wiped by it.
-        let startedProject = project?.id
-        let ok = await post(prompt: prompt, model: modelKey, aspect: aspect, count: count, refs: attachments)
+        var startedProject = project?.id
+        var outcome = await post(prompt: prompt, model: modelKey, aspect: aspect, count: count, refs: attachments)
+        if outcome == .projectGone, project?.id == startedProject {
+            // The project was deleted elsewhere while this one sat open (its
+            // 404 bought nothing). Keep the prompt and references and send
+            // them into a fresh project rather than dead-ending on an alert —
+            // seen on the phone 2026-09-26, when an empty project was
+            // deleted from another client mid-compose.
+            guard let fresh = await createProject(keepingDraft: true) else { return false }
+            startedProject = fresh
+            outcome = await post(prompt: prompt, model: modelKey, aspect: aspect, count: count, refs: attachments)
+        }
+        if outcome == .projectGone { message = "That project was deleted." }
+        let ok = outcome == .sent
         if ok && project?.id == startedProject { prompt = "" }
         return ok
     }
@@ -163,8 +186,10 @@ public final class StudioStore {
             guard let file = ref.file else { return ref }
             return StudioRef(kind: .snapshot, id: "\(pid)/\(file)")
         }
-        return await post(prompt: generation.prompt, model: generation.model, aspect: generation.aspect,
-                          count: retryCount(for: generation), refs: refs)
+        let outcome = await post(prompt: generation.prompt, model: generation.model, aspect: generation.aspect,
+                                 count: retryCount(for: generation), refs: refs)
+        if outcome == .projectGone { message = "That project was deleted." }
+        return outcome == .sent
     }
 
     /// How many images `retry(_:)` asks for. The grid shows its price on the button.
@@ -174,15 +199,17 @@ public final class StudioStore {
         return max(1, generation.slots.filter { $0.status == .error }.count)
     }
 
-    private func post(prompt: String, model: String, aspect: String, count: Int, refs: [StudioRef]) async -> Bool {
-        guard let pid = project?.id, !isSending else { return false }
+    enum PostOutcome { case sent, failed, projectGone }
+
+    private func post(prompt: String, model: String, aspect: String, count: Int, refs: [StudioRef]) async -> PostOutcome {
+        guard let pid = project?.id, !isSending else { return .failed }
         struct Ref: Encodable { let kind: String; let id: String }
         struct Body: Encodable { let prompt: String; let model: String; let aspect: String; let count: Int; let refs: [Ref] }
         let body: Data
         do {
             body = try JSONEncoder().encode(Body(prompt: prompt, model: model, aspect: aspect, count: count,
                                                  refs: refs.map { Ref(kind: $0.kind.rawValue, id: $0.id) }))
-        } catch { message = "Couldn't encode the request."; return false }
+        } catch { message = "Couldn't encode the request."; return .failed }
         isSending = true
         defer { isSending = false }
         message = nil
@@ -192,7 +219,7 @@ public final class StudioStore {
                                           idempotencyKey: key, timeout: 60) {
             case .http(status: 202, body: let data):
                 guard let gen = try? MotionJSON.decoder.decode(StudioGenerationResponse.self, from: data).generation
-                else { message = "The server's answer couldn't be read."; return false }
+                else { message = "The server's answer couldn't be read."; return .failed }
                 // The open project may have changed while this was in flight (up to
                 // 3 x 60 s): only fold the generation into the project it was sent
                 // for, never into whatever project happens to be open now.
@@ -200,7 +227,7 @@ public final class StudioStore {
                     project?.generations.append(gen)
                     startPolling()
                 }
-                return true
+                return .sent
             case .http(status: 409, body: let data) where Self.errorCode(data) == "outcome_unknown":
                 // An earlier request with this key is still being submitted on
                 // the server. It will land as a generation of its own; resending
@@ -208,20 +235,24 @@ public final class StudioStore {
                 // re-read the project so it shows up and polling starts.
                 message = "That generation is still being submitted — it will appear in the grid shortly."
                 if project?.id == pid { await open(pid) }
-                return true
+                return .sent
+            case .http(status: 404, body: let data) where Self.errorCode(data, status: 404) == "not_found":
+                // Only the project itself answers a bare `not_found` here; a
+                // missing reference is a 422 `ref_not_found`.
+                return .projectGone
             case .http(status: let status, body: let data):
                 message = APIClient.error(status: status, body: data).userMessage
-                return false
+                return .failed
             case .transport(let reason):
-                if attempt == Self.sendAttempts { message = "Couldn't reach the server: \(reason)"; return false }
+                if attempt == Self.sendAttempts { message = "Couldn't reach the server: \(reason)"; return .failed }
                 try? await sleep(.seconds(2))
             }
         }
-        return false
+        return .failed
     }
 
-    private static func errorCode(_ body: Data) -> String? {
-        if case .server(_, let code, _) = APIClient.error(status: 409, body: body) { return code }
+    private static func errorCode(_ body: Data, status: Int = 409) -> String? {
+        if case .server(_, let code, _) = APIClient.error(status: status, body: body) { return code }
         return nil
     }
 

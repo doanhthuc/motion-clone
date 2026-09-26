@@ -175,12 +175,18 @@ overwritten. Empty prompt → `400` (every provider requires a text prompt).
 - Tap an image → full-screen viewer: **Edit this** (attach as reference), **Use as material**,
   **Save to try-on library**, Save/Share (`MediaActions`), and the prompt/model that made it.
 - Composer pinned at the bottom:
-  - Attached reference thumbnails row. **The ✕ is hidden by default.** Long-press a thumbnail →
+  - Attached reference thumbnails row. **The ✕ is hidden by default.** Tap a thumbnail →
     backdrop dims, an enlarged preview appears above the composer, and ⓧ shows on the thumbnail;
-    tap ⓧ to remove, tap elsewhere to dismiss (as Flow does).
+    tap ⓧ to remove, tap the thumbnail again or elsewhere to dismiss. (Flow uses a long-press; the
+    user asked for a plain tap after using it on the phone, 2026-09-26.)
   - Prompt field growing to about 5 lines.
   - ＋ → source menu: Photos / Camera (goes through the existing upload → material), Materials,
-    Try-on library, current run's try-on previews, Studio images.
+    Try-on library, current run's try-on previews, Studio images. Photos is multi-select, capped at
+    the selected model's remaining reference slots; the picks upload one after another and all
+    attach (added 2026-09-26).
+  - A send whose project was deleted elsewhere (404 `not_found`, which bought nothing) creates a
+    fresh project and resends the same prompt and references there once, instead of an alert —
+    hit on the phone 2026-09-26 when an empty project was deleted from another client mid-compose.
   - Settings pill "model · aspect · xN" → bottom sheet (like Flow's): aspect row, x1–x4 row, model
     list with per-image price. Qwen is disabled with an explanation only when unavailable
     server-side, or when more than 3 references are attached.

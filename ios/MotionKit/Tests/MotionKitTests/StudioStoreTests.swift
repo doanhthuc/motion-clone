@@ -20,6 +20,8 @@ extension URLProtocolTests {
         var keys: [String] = []
         var polls = 0
         var failFirstPost = false
+        var projectGone = false
+        var postPaths: [String] = []
         let lock = NSLock()
         func record(key: String?) { lock.lock(); keys.append(key ?? ""); lock.unlock() }
     }
@@ -36,7 +38,11 @@ extension URLProtocolTests {
             case ("GET", "/v1/studio/projects/p1"):
                 box.lock.lock(); box.polls += 1; let n = box.polls; box.lock.unlock()
                 return TestSupport.json(Self.project(status: n >= 3 ? "done" : "running"))
-            case ("POST", "/v1/studio/projects/p1/generations"):
+            case ("POST", "/v1/studio/projects/p1/generations") where box.projectGone:
+                box.lock.lock(); box.postPaths.append(path); box.lock.unlock()
+                return TestSupport.json(#"{"error":{"code":"not_found","message":"no such studio project"}}"#, status: 404)
+            case ("POST", "/v1/studio/projects/p1/generations"), ("POST", "/v1/studio/projects/p2/generations"):
+                box.lock.lock(); box.postPaths.append(path); box.lock.unlock()
                 box.record(key: request.value(forHTTPHeaderField: "Idempotency-Key"))
                 if box.failFirstPost && box.keys.count == 1 { return (-1, [:], Data()) }   // dropped connection
                 return TestSupport.json(#"{"generation":{"id":"g2","created_at":5,"prompt":"blue","model":"nano-banana-2","aspect":"9:16","count":2,"refs":[],"slots":[{"status":"queued"},{"status":"queued"}],"status":"running","unit_price_usd":0.101,"est_cost_usd":0.202}}"#, status: 202)
@@ -95,6 +101,27 @@ extension URLProtocolTests {
         #expect(box.keys == ["key-1", "key-1"])
         #expect(store.project?.generations.contains { $0.id == "g2" } == true)
         #expect(store.prompt.isEmpty)
+    }
+
+    /// The open project was deleted elsewhere mid-compose: the send lands in a
+    /// fresh project with the same prompt and references instead of failing.
+    @Test func sendToADeletedProjectMovesIntoANewOne() async {
+        let box = Box()
+        box.projectGone = true
+        let store = make(box: box)
+        await store.loadCatalog()
+        await store.open("p1")
+        let ref = StudioRef(kind: .material, id: "app/me.png")
+        store.attach(ref)
+        store.prompt = "blue"
+        let ok = await store.send()
+        #expect(ok)
+        #expect(box.postPaths == ["/v1/studio/projects/p1/generations", "/v1/studio/projects/p2/generations"])
+        #expect(store.project?.id == "p2")
+        #expect(store.project?.generations.contains { $0.id == "g2" } == true)
+        #expect(store.attachments == [ref])
+        #expect(store.prompt.isEmpty)
+        #expect(store.message == nil)
     }
 
     @Test func pollingStopsWhenNothingRuns() async {
