@@ -31,6 +31,16 @@ struct PickerChainSheet: View {
                                       outfits: composer.outfits.count, drivers: composer.drivers.count) }
     }
 
+    /// Only in a chain: "Character ✓ → Driver → Outfit" (spec §3), so the
+    /// user sees where the walk is and how much is left.
+    private var progress: String? {
+        guard start.chained, let state else { return nil }
+        return state.chainSteps.map { step in
+            let title = SlotText(role: state.role(of: step.card), required: true, kind: .unknown, slot: nil).title
+            return step.filled ? "\(title) ✓" : title
+        }.joined(separator: " → ")
+    }
+
     var body: some View {
         Group {
             switch current {
@@ -38,7 +48,7 @@ struct PickerChainSheet: View {
                 MaterialPicker(role: role, kind: pipeline.roles[role] ?? .unknown,
                                selectedID: store.draft?.slots[role]?.materialID, materials: materials,
                                onSelect: { id in pick(id, for: role) },
-                               onAdvance: start.chained ? {} : nil)
+                               onAdvance: start.chained ? {} : nil, progress: progress)
                     .interactiveDismissDisabled(store.isBusy)
             case .outfits:
                 MaterialMultiPicker(
@@ -47,7 +57,7 @@ struct PickerChainSheet: View {
                     disabled: composer.isRunning, note: composer.capReason,
                     isChosen: { id in composer.outfits.contains { $0.outfitID == id } },
                     toggle: { composer.toggle(outfitID: $0) },
-                    onNext: start.chained ? { advance() } : nil)
+                    onNext: start.chained ? { advance() } : nil, progress: progress)
             case .drivers:
                 MaterialMultiPicker(
                     title: "Choose drivers", kind: pipeline.roles[BatchComposer.driverRole] ?? .video,
@@ -55,7 +65,7 @@ struct PickerChainSheet: View {
                     disabled: composer.isRunning, note: composer.capReason,
                     isChosen: { composer.drivers.contains($0) },
                     toggle: { composer.toggle(driverID: $0) },
-                    onNext: start.chained ? { advance() } : nil)
+                    onNext: start.chained ? { advance() } : nil, progress: progress)
             }
         }
         .id(current)

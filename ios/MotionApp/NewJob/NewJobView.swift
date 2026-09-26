@@ -21,6 +21,10 @@ struct NewJobView: View {
     @State private var showRun = false
     @State private var basketExpanded = false
     @State private var clearSource: ClearSource?
+    /// The error whose banner was swiped away or timed out. The error itself
+    /// stays on the store: it is what turns the More icon into the stale
+    /// warning, whose Refresh is the same retry.
+    @State private var hiddenError: APIError?
 
     var body: some View {
         Group {
@@ -97,6 +101,9 @@ struct NewJobView: View {
                 }
             }
             .overlay(alignment: .top) { banners.padding(.horizontal, 12) }
+            // Dropping the last job removes the drawer; collapse it too, so the
+            // next job's basket does not reappear open over the cards.
+            .onChange(of: draft.batch.isEmpty) { _, empty in if empty { basketExpanded = false } }
         }
         .toolbar {
             ToolbarItem(placement: .principal) {
@@ -201,17 +208,38 @@ struct NewJobView: View {
         }
     }
 
+    /// Over the top row of cards, so neither stays for good (review,
+    /// 2026-09-26): each goes on a swipe up or after `bannerSeconds`.
     @ViewBuilder private var banners: some View {
         VStack(spacing: 8) {
-            if let error = store.error {
+            if let error = store.error, error != hiddenError {
                 ErrorBanner(error: error) { await store.refresh() }
+                    .heroSurface()
+                    .modifier(SwipeUpToDismiss { hiddenError = error })
+                    .task(id: error.userMessage) {
+                        try? await Task.sleep(for: .seconds(Self.bannerSeconds))
+                        hiddenError = error
+                    }
             }
             if let message = store.message, message != store.error?.userMessage {
                 MessageCard(text: message) { store.dismissMessage() }
+                    .heroSurface()
+                    .modifier(SwipeUpToDismiss { store.dismissMessage() })
+                    .task(id: message) {
+                        try? await Task.sleep(for: .seconds(Self.bannerSeconds))
+                        store.dismissMessage()
+                    }
             }
         }
+        .transition(.move(edge: .top).combined(with: .opacity))
         .animation(.snappy, value: store.message)
+        .animation(.snappy, value: hiddenError)
+        // A new failure of the same kind shows its banner again.
+        .onChange(of: store.error) { _, error in if error == nil { hiddenError = nil } }
     }
+
+    /// Long enough to read a two-line message; its Retry is in More after.
+    private static let bannerSeconds = 8.0
 
     private func initialLoadFailure(_ error: APIError) -> some View {
         VStack(spacing: 16) {
@@ -236,8 +264,8 @@ struct NewJobView: View {
         ClearDraftDialog(isPresented: confirmsClear(source), message: clearMessage) {
             // The selection lives outside the draft since 2026-09-26, so the
             // server's clear alone would leave the Outfit and Driver cards full.
-            composer.reset()
-            Task { await store.clear() }
+            // Only once the server's clear lands (`BatchComposer.clear`).
+            Task { await composer.clear() }
         }
     }
 
@@ -280,6 +308,21 @@ struct NewJobView: View {
 
     private func pipeline(for entry: DraftBatchEntry) -> Pipeline? {
         store.catalog.first { $0.id == entry.pipeline }
+    }
+}
+
+/// A banner dismissed by flicking it up, the way a notification goes.
+private struct SwipeUpToDismiss: ViewModifier {
+    let dismiss: () -> Void
+    @GestureState private var drag: CGFloat = 0
+
+    func body(content: Content) -> some View {
+        content
+            .offset(y: min(drag, 0))
+            .gesture(DragGesture(minimumDistance: 10)
+                .updating($drag) { value, state, _ in state = value.translation.height }
+                .onEnded { value in if value.translation.height < -30 { dismiss() } })
+            .accessibilityAction(named: "Dismiss", dismiss)
     }
 }
 

@@ -24,6 +24,8 @@ struct MaterialMultiPicker: View {
     /// Set by a chained pick: a Next button walks on to the next empty card;
     /// Done still closes the chain.
     var onNext: (() -> Void)?
+    /// A chain's progress, "Character ✓ → Outfit", under the title.
+    var progress: String?
     @Environment(\.dismiss) private var dismiss
     @State private var deleteCandidate: MotionKit.Material?
 
@@ -57,7 +59,8 @@ struct MaterialMultiPicker: View {
             }
             .background(Theme.bg)
             .navigationTitle(title)
-            .navigationSubtitle(chosenCount == 0 ? "" : "\(chosenCount) selected")
+            .navigationSubtitle([progress, chosenCount == 0 ? nil : "\(chosenCount) selected"]
+                .compactMap { $0 }.joined(separator: " · "))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 if let onNext {

@@ -94,11 +94,11 @@ struct NewJobActionBar: View {
 
     /// "Add to batch" keeps its old label on single pipelines, which the
     /// Phase 3 smoke finds by name. On a try-on pipeline it names the job
-    /// count, or "Continue" after a stopped build, which is the composer's
-    /// resume. The identifier `batch.run` stays on both.
+    /// count, or "Resume" after a stopped build — not "Continue", which is
+    /// the primary button beside it. The identifier `batch.run` stays on both.
     private var addButton: some View {
         let title = !state.isBatch ? "Add to batch"
-            : composer.failure != nil ? "Continue"
+            : composer.failure != nil ? "Resume"
             : "Add \(count(state.addCount, "job"))"
         return Button(title) { Task { await add() } }
             .buttonStyle(SecondaryButtonStyle())

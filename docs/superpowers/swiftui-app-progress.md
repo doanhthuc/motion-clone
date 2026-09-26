@@ -95,15 +95,18 @@ plan: [`plans/2026-09-26-newjob-single-stage.md`](plans/2026-09-26-newjob-single
   - No screenshot covers the drawer open, the error banner, or the chain mid-way.
   - The gestures (paging through outfits on a card, dragging the drawer, the long-press menus) have
     only been exercised by XCUITest taps, not by hand.
-  - Deferred minors from the review:
-    - The banners neither dismiss themselves nor swipe away, and a persistent error covers the top
-      cards.
-    - The chain's progress title from the spec is missing.
-    - After a stopped build, two buttons both read "Continue". Rename the composer's to "Resume".
-    - The drawer stays expanded after the last job is dropped.
-    - `SlotCard`'s page can point at an item that was removed.
-    - Adopt and reset change the selection before their server writes, with no rollback.
-    - An adopted driver lives only in memory, so a relaunch or the Telegram bot shows no driver.
+  - Deferred minors from the review, fixed in a follow-up pass:
+    - Banners now sit on a surface, go on a swipe up or after 8 s. A hidden error stays on the store,
+      so the More icon still warns and its Refresh is the retry.
+    - A chained picker shows "Character ✓ → Driver → Outfit" as its navigation subtitle
+      (`NewJobState.chainSteps`).
+    - The composer's resume button reads "Resume", no longer a second "Continue".
+    - The drawer collapses when the last job is dropped.
+    - `SlotCard` moves its page to the neighbor when the shown pick is removed.
+    - Adopt restores the selection when its PATCH is refused. Clear draft goes through
+      `BatchComposer.clear()`, which empties the selection only once the server's clear landed.
+  - Still deferred: an adopted driver lives only in memory, so a relaunch or the Telegram bot shows
+    no driver. `release(keepingDriver:)` still drops the selection even if its PATCH fails.
 
 ## Materials add flow (2026-09-26)
 

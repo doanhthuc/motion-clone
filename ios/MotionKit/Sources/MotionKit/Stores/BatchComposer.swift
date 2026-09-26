@@ -228,6 +228,7 @@ public final class BatchComposer {
     public func adoptDraftSelection() async {
         guard !isRunning, let current = draft.draft,
               let pipeline = draft.selectedPipeline, Self.supports(pipeline) else { return }
+        let before = (outfits, drivers, capReason, progress, lastAdded)
         var clear: [String: String?] = [:]
         var seed: DraftPatch.Seed = .keep
         if drivers.isEmpty, Self.supportsDrivers(pipeline),
@@ -257,7 +258,12 @@ public final class BatchComposer {
         let reason = capReason
         selectionChanged()
         capReason = reason
-        await draft.apply(DraftPatch(slots: clear, seed: seed))
+        // A refused PATCH leaves both roles on the draft, which then counts its
+        // complete edited job, so holding them here too showed that job twice.
+        // The failure is in the store's banner; its Retry reloads the draft.
+        if await !draft.apply(DraftPatch(slots: clear, seed: seed)) {
+            (outfits, drivers, capReason, progress, lastAdded) = before
+        }
     }
 
     /// Leaving a try-on pipeline for one without a character + outfit pair:
@@ -284,6 +290,14 @@ public final class BatchComposer {
         drivers = []
         failure = nil
         selectionChanged()
+    }
+
+    /// Clear draft: the server's clear, then this selection beside it — only
+    /// once the clear landed, so a failed one never leaves the cards empty
+    /// over a draft that still holds the job.
+    public func clear() async {
+        guard !isRunning else { return }
+        if await draft.clear() { reset() }
     }
 
     public func matches(for outfitID: String) -> [TryonLibraryEntry] {

@@ -13,6 +13,7 @@ extension URLProtocolTests {
         private var seed: String?
         private var batch: [(slots: [String: String], seed: String?)] = []
         private var failPatchFor: String?
+        private var failAnyPatch = false
         private var basketNextPatchFor: String?
         private var dropBatchArmed = false
         private var characterOnNextRead: String?
@@ -35,6 +36,7 @@ extension URLProtocolTests {
         }
 
         func failNextPatch(for outfit: String) { lock.withLock { failPatchFor = outfit } }
+        func failNextPatch() { lock.withLock { failAnyPatch = true } }
         /// The edited job already names an outfit (and maybe a seed), the way
         /// Saved try-ons' "Use in job" leaves it.
         func preset(outfit: String, seed: String?) {
@@ -74,6 +76,10 @@ extension URLProtocolTests {
                     return TestSupport.json(json())
                 case ("PATCH", "/v1/draft"):
                     let body = (try? JSONSerialization.jsonObject(with: r.httpBody ?? Data())) as? [String: Any] ?? [:]
+                    if failAnyPatch {
+                        failAnyPatch = false
+                        return TestSupport.json(#"{"error":{"code":"unprobeable","message":"could not read"}}"#, status: 422)
+                    }
                     if let slots = body["slots"] as? [String: Any], slots.keys.contains("outfit") {
                         let value = slots["outfit"] as? String
                         if let fail = failPatchFor, fail == value {
@@ -99,6 +105,12 @@ extension URLProtocolTests {
                         return TestSupport.json(#"{"error":{"code":"duplicate","message":"that exact job is already in the batch"}}"#, status: 422)
                     }
                     batch.append((slots, seed))
+                    return TestSupport.json(json())
+                case ("POST", "/v1/draft/clear"):
+                    shared = [:]
+                    outfit = nil
+                    seed = nil
+                    batch.removeAll()
                     return TestSupport.json(json())
                 default: return (404, [:], Data())
                 }
@@ -224,6 +236,54 @@ extension URLProtocolTests {
         await composer.adoptDraftSelection()
 
         #expect(composer.outfits.first?.seedID == "s7")
+    }
+
+    /// A refused PATCH leaves the outfit and driver on the draft, so the
+    /// composer must not hold them too: the draft would count its complete
+    /// edited job and the cards would show the same outfit as a second job.
+    @Test func adoptThatTheServerRefusesPutsTheSelectionBack() async {
+        let server = FakeDraftServer()
+        server.preset(outfit: "app/o1.png", seed: "s1")
+        let (composer, draft) = await make(server)
+        composer.toggle(outfitID: "app/o9.png")
+        server.failNextPatch()
+
+        await composer.adoptDraftSelection()
+
+        #expect(composer.outfits.map(\.outfitID) == ["app/o9.png"])
+        #expect(composer.drivers.isEmpty)
+        #expect(draft.draft?.filledSlots["outfit"] == "app/o1.png")
+    }
+
+    @Test func clearEmptiesTheDraftAndTheSelection() async {
+        let server = FakeDraftServer()
+        let (composer, draft) = await make(server)
+        composer.toggle(outfitID: "app/o1.png")
+        composer.toggle(driverID: "app/d1.mp4")
+
+        await composer.clear()
+
+        #expect(composer.outfits.isEmpty && composer.drivers.isEmpty)
+        #expect(draft.draft?.filledSlots.isEmpty == true)
+    }
+
+    /// A clear that did not land leaves the server's draft as it was, so the
+    /// picks on screen stay too rather than vanishing from one half only.
+    @Test func clearThatFailsKeepsTheSelection() async {
+        let server = FakeDraftServer()
+        let (composer, _) = await make(server)
+        composer.toggle(outfitID: "app/o1.png")
+        composer.toggle(driverID: "app/d1.mp4")
+        StubURLProtocol.install { r in
+            r.url?.path == "/v1/draft/clear"
+                ? TestSupport.json(#"{"error":{"code":"busy","message":"busy"}}"#, status: 409)
+                : server.answer(r)
+        }
+
+        await composer.clear()
+
+        #expect(composer.outfits.map(\.outfitID) == ["app/o1.png"])
+        #expect(composer.drivers == ["app/d1.mp4"])
     }
 
     /// Review finding 2: leaving a try-on pipeline for one without an outfit

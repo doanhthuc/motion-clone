@@ -140,6 +140,13 @@ struct SlotCard: View {
                 }
             }
             .tabViewStyle(.page(indexDisplayMode: picks.count > 1 ? .always : .never))
+            // A removed pick must not stay the page: the TabView would show no
+            // tag while the menu acted on another. Its neighbor takes over.
+            .onChange(of: picks.map(\.id)) { old, ids in
+                guard let page, !ids.contains(page) else { return }
+                let index = old.firstIndex(of: page) ?? 0
+                self.page = ids.isEmpty ? nil : ids[min(index, ids.count - 1)]
+            }
         } else if !isMulti, text.assigned, let id = slot?.materialID {
             CardThumbnail(materialID: id, kind: kind, materials: materials)
         } else {

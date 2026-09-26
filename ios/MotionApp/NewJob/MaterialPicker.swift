@@ -11,6 +11,8 @@ struct MaterialPicker: View {
     /// Set by a chained pick (2026-09-26 spec §3): after a selection the sheet
     /// moves to the next empty card instead of closing.
     var onAdvance: (() -> Void)?
+    /// A chain's progress, "Character ✓ → Outfit", under the title.
+    var progress: String?
     @Environment(\.dismiss) private var dismiss
     @State private var deleteCandidate: MotionKit.Material?
 
@@ -47,6 +49,7 @@ struct MaterialPicker: View {
             }
             .background(Theme.bg)
             .navigationTitle("Choose material")
+            .navigationSubtitle(progress ?? "")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {

@@ -28,6 +28,14 @@ import Testing
         #expect(s.addCount == 0 && !s.canContinue && s.isFresh)
     }
 
+    /// The chain's progress title walks the required cards in card order,
+    /// optional ones (Background) left out.
+    @Test func chainStepsAreTheRequiredCardsInOrderWithWhatIsFilled() {
+        let s = NewJobState(pipeline: tryon, draft: draft(tryon, filled: ["character": "c"]), outfits: 0, drivers: 0)
+        #expect(s.chainSteps.map(\.card) == [.single("character"), .drivers, .outfits])
+        #expect(s.chainSteps.map(\.filled) == [true, false, false])
+    }
+
     @Test func aPipelineWithoutAnOutfitKeepsEveryCardSingle() {
         let s = NewJobState(pipeline: motion, draft: draft(motion, filled: ["character": "c"]), outfits: 0, drivers: 0)
         #expect(!s.isBatch)

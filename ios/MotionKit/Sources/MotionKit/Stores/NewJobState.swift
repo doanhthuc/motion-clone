@@ -67,6 +67,12 @@ public struct NewJobState: Equatable, Sendable {
         }
     }
 
+    /// The required cards in card order and whether each is filled: a
+    /// chained picker's progress title, "Character ✓ → Driver → Outfit".
+    public var chainSteps: [(card: Card, filled: Bool)] {
+        cards.filter { required.contains(role(of: $0)) }.map { ($0, isFilled($0)) }
+    }
+
     public func isFilled(_ card: Card) -> Bool { filled.contains(role(of: card)) }
 
     /// The next empty required card after `card`, in card order; nil when none
