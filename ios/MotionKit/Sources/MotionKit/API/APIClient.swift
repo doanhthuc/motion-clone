@@ -160,6 +160,14 @@ public actor APIClient {
         return try decode(response, data)
     }
 
+    public func delete<Response: Decodable & Sendable>(
+        _ response: Response.Type, query: [URLQueryItem], _ components: String...
+    ) async throws(APIError) -> Response {
+        let (data, _) = try await send(
+            url(components).appending(queryItems: query), method: "DELETE", extraHeaders: [:], okStatuses: [200])
+        return try decode(response, data)
+    }
+
     public func get<T: Decodable & Sendable>(
         _ type: T.Type, query: [URLQueryItem], timeout: TimeInterval = 30, _ components: String...
     ) async throws(APIError) -> T {

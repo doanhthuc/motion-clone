@@ -24,7 +24,8 @@ public enum Format {
         let s = max(0, Int(seconds))
         if s < 60 { return "\(s)s ago" }
         if s < 3600 { return "\(s / 60)m ago" }
-        return "\(s / 3600)h ago"
+        if s < 86400 { return "\(s / 3600)h ago" }
+        return "\(s / 86400)d ago"
     }
 
     /// Journal stage keys ("tryon", "motion", "enhance") → labels.

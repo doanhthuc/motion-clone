@@ -22,7 +22,7 @@ struct StaleTag: View {
     let lastSuccess: Date?
     var body: some View {
         TimelineView(.periodic(from: .now, by: 10)) { ctx in
-            Label("Stale · " + Format.ago(ctx.date.timeIntervalSince(lastSuccess ?? ctx.date)) + " ago",
+            Label("Stale · " + Format.ago(ctx.date.timeIntervalSince(lastSuccess ?? ctx.date)),
                   systemImage: "clock.arrow.circlepath")
                 .font(.footnote).foregroundStyle(Theme.warning)
         }

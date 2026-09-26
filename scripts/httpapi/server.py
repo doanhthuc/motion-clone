@@ -305,6 +305,12 @@ class _Handler(BaseHTTPRequestHandler):
             payload = self._read_json()
             status, body = app_runs.regen(rest[1], rest[3], payload, key)
             return self._send_json(status, body)
+        if method == "DELETE" and len(rest) == 2 and rest[0] == "runs":
+            # Same spelling rule as rent-panel's force: only "1" means yes, so
+            # deleting the videos never hangs on how "true" was typed.
+            videos = parse_qs(urlsplit(self.path).query).get("videos", ["0"])[0] == "1"
+            status, body = self._app_runs().delete_run(s.batch_dir, s.out_dir, rest[1], videos)
+            return self._send_json(status, body)
         if method == "POST" and len(rest) == 3 and rest[0] == "runs" and rest[2] == "kill":
             app_pod = self._app_pod()
             key = self._idempotency_key()

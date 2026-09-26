@@ -10,6 +10,7 @@ reason the API runs inside the bot process (spec §3, approach A).
 """
 from __future__ import annotations
 
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -167,3 +168,55 @@ def status_for(outcome: Outcome) -> int:
     if outcome.ok:
         return 202
     return OUTCOME_STATUS.get(outcome.code, 409)
+
+
+# The files in batch/ that make a run a run: the manifest, its journal and a
+# drain's handoff note. Everything else named after the manifest's stem
+# (`<stem>.draft.json`, `.ledger.json`, logs) belongs to the chat, not to one
+# run, and stays — the Telegram draft and message ledger live on after it.
+_RUN_FILE_SUFFIXES = (".yaml", ".state.json", ".handoff.json")
+
+
+def delete_run(batch_dir: Path, out_dir: Path, run_id: str, *, with_videos: bool) -> tuple[Outcome, int]:
+    """Forget a run, and optionally everything it made (2026-09-27). Returns
+    the outcome and how many videos went with it.
+
+    Always removed: the manifest, journal and handoff note, plus
+    `out/<batch>/runs/` (per-stage intermediates, try-on images included) and
+    the manifest copy there. `_final/` — the videos in Outputs — goes only
+    with `with_videos`, and never while another run's journal still names
+    the same batch directory.
+
+    Refused while anything holds the manifest: a drain or Phase A reads it,
+    and a lease means a pod is billed against it. The caller holds BOT_LOCK
+    so neither can start between this check and the unlink.
+    """
+    manifest = safe_child(batch_dir, f"{run_id}.yaml") if run_id else None
+    if manifest is None or not manifest.is_file() or not state_path_for(manifest).is_file():
+        return Outcome(False, "not_found", "no such run"), 0
+    if run_mod.busy(manifest) or run_mod.lease_for(manifest) is not None:
+        return Outcome(False, "run_busy", "the run is running or has a pod; kill it first"), 0
+    batch = load_state(state_path_for(manifest)).get("batch") or None
+    shared = batch is not None and any(
+        r["batch"] == batch for r in list_runs(batch_dir, out_dir) if r["id"] != manifest.stem)
+
+    for suffix in _RUN_FILE_SUFFIXES:
+        manifest.with_name(manifest.stem + suffix).unlink(missing_ok=True)
+
+    videos = 0
+    target = safe_child(out_dir, batch) if batch and not shared else None
+    if target is not None and not (out_dir / batch.strip()).is_symlink() and target.is_dir():
+        shutil.rmtree(target / "runs", ignore_errors=True)
+        (target / "manifest.yaml").unlink(missing_ok=True)
+        final = target / "_final"
+        if with_videos and final.is_dir():
+            videos = len(final_names(out_dir, batch))
+            shutil.rmtree(final, ignore_errors=True)
+        if not any(target.iterdir()):
+            target.rmdir()
+            # out/latest pointed at the newest batch; left dangling it would
+            # point at nothing.
+            latest = out_dir / "latest"
+            if latest.is_symlink() and not latest.exists():
+                latest.unlink()
+    return Outcome(True, "deleted"), videos
