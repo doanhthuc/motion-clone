@@ -17,13 +17,18 @@ struct MaterialGroup: Identifiable, Hashable {
         MaterialGroup(title: "Unsorted", role: nil),
     ]
 
+    /// The plural category name a role is shown under.
+    static func title(for role: MaterialRole) -> String {
+        all.first { $0.role == role }?.title ?? role.title
+    }
+
     func items(in materials: [MotionKit.Material]) -> [MotionKit.Material] {
         materials.filter { $0.materialRole == role }
     }
 }
 
 extension MaterialRole {
-    /// Singular, for "Move to" and the post-upload question.
+    /// Singular, for "Move to" and the Add sheet's category choice.
     var title: String {
         switch self {
         case .driver: "Motion driver"

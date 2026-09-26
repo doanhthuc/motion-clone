@@ -13,6 +13,18 @@ struct MaterialTabView: View {
     let draft: DraftStore
     let composer: BatchComposer
     @State private var showSaved = false
+    /// Here, not in `MaterialsView`: a batch keeps uploading while the user
+    /// switches to Saved try-ons and back.
+    @State private var uploads: MaterialUploadQueue
+
+    init(materials: MaterialsStore, library: TryonLibraryStore, draft: DraftStore,
+         composer: BatchComposer) {
+        self.materials = materials
+        self.library = library
+        self.draft = draft
+        self.composer = composer
+        _uploads = State(initialValue: MaterialUploadQueue(store: materials))
+    }
 
     var body: some View {
         Group {
@@ -20,7 +32,7 @@ struct MaterialTabView: View {
                 SavedTryonsView(library: library, materials: materials, draft: draft,
                                 composer: composer)
             } else {
-                MaterialsView(store: materials)
+                MaterialsView(store: materials, uploads: uploads)
             }
         }
         .background(Theme.bg)

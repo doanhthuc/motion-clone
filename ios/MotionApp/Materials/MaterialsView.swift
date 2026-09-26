@@ -3,12 +3,10 @@ import SwiftUI
 
 struct MaterialsView: View {
     let store: MaterialsStore
+    let uploads: MaterialUploadQueue
     @State private var adding = false
     @State private var deleteCandidate: MotionKit.Material?
     @State private var previewing: MotionKit.Material?
-    /// An image just uploaded here: ask what it is, as the bot does.
-    @State private var sorting: MotionKit.Material?
-    @State private var justAdded: MotionKit.Material?
     /// 0 with the grid at rest, 1 once it has scrolled `collapseDistance`:
     /// drives the Add button from its tall form to a one-line bar.
     @State private var collapse: CGFloat = 0
@@ -30,35 +28,13 @@ struct MaterialsView: View {
         .navigationDestination(item: $previewing) { material in
             MaterialPreview(material: material, materials: store)
         }
-        // The question waits for the sheet to finish closing: a dialog cannot
-        // present from a view that is still covered.
-        .sheet(isPresented: $adding, onDismiss: {
-            sorting = justAdded
-            justAdded = nil
-        }) {
-            AddMaterialSheet(store: store) { material in
-                if material.kind == .image { justAdded = material }
-            }
-        }
-        .confirmationDialog(
-            "What is this image?",
-            isPresented: Binding(get: { sorting != nil }, set: { if !$0 { sorting = nil } }),
-            titleVisibility: .visible
-        ) {
-            ForEach(MaterialRole.options(for: .image), id: \.self) { role in
-                Button(role.title) {
-                    guard let material = sorting else { return }
-                    sorting = nil
-                    Task { await store.setRole(role, for: material) }
-                }
-            }
-            Button("Decide later", role: .cancel) { sorting = nil }
-        } message: {
-            Text(sorting?.name ?? "")
-        }
+        // The category is chosen in the sheet, before the pick: asked after
+        // the upload, the question floated over the grid, detached from the
+        // image it was about, one dialog per photo (2026-09-26).
+        .modifier(MaterialAdder(isPresented: $adding, group: nil, store: store, queue: uploads))
         .modifier(MaterialDeleteDialog(candidate: $deleteCandidate, store: store))
         .navigationDestination(for: MaterialGroup.self) { group in
-            MaterialCategoryView(group: group, store: store)
+            MaterialCategoryView(group: group, store: store, uploads: uploads)
         }
     }
 
@@ -69,7 +45,11 @@ struct MaterialsView: View {
                 if let message = store.errorMessage {
                     messageBanner(message)
                 }
-                if let progress = store.uploadProgress, store.isUploading {
+                if !uploads.items.isEmpty {
+                    UploadQueueCard(queue: uploads)
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                } else if let progress = store.uploadProgress, store.isUploading {
+                    // A resumed upload (the banner's Retry), outside any batch.
                     uploadCard(progress)
                 }
                 if store.loaded && store.materials.isEmpty {
@@ -85,6 +65,7 @@ struct MaterialsView: View {
             }
             .padding(.horizontal, 16)
             .padding(.bottom, 24)
+            .animation(.snappy, value: uploads.items.isEmpty)
         }
         .onScrollGeometryChange(for: CGFloat.self) { geometry in
             max(0, geometry.contentOffset.y + geometry.contentInsets.top)
@@ -163,11 +144,13 @@ struct MaterialsView: View {
             .contentShape(.rect)
         }
         .buttonStyle(.plain)
-        .disabled(store.isUploading || store.isImportingLink)
-        .opacity(store.isUploading || store.isImportingLink ? 0.5 : 1)
+        .disabled(busy)
+        .opacity(busy ? 0.5 : 1)
         .accessibilityLabel("Add material")
         .accessibilityHint("Photos, a TikTok link or Files")
     }
+
+    private var busy: Bool { uploads.isRunning || store.isUploading || store.isImportingLink }
 
     private func uploadCard(_ progress: UploadProgress) -> some View {
         VStack(alignment: .leading, spacing: 8) {

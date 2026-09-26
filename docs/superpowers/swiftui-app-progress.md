@@ -60,6 +60,24 @@ The spec's gate record is the single place its gate results are written down.
   test is 2 outfits × 2 drivers, expecting 2 provider calls, and it needs its own approval and a
   quoted price.
 
+## Materials add flow (2026-09-26)
+
+- **The category is chosen before the pick.** The "What is this image?" dialog that followed each
+  image upload is gone: it floated over the grid, detached from the image, one dialog per photo.
+  The Add sheet has a "Save photos as" choice (remembered in `materials.add.role`); a See all
+  screen has its own + and files what it adds under that category, with the picker limited to
+  what fits it (videos + TikTok link for drivers, images otherwise).
+- **Multi-select.** Photos and Files take up to 20 at once; `MaterialUploadQueue` uploads them one
+  after another (the store runs one upload at a time) and `UploadQueueCard` shows the batch with a
+  per-item state strip. The queue lives in `MaterialTabView`, so it survives See all and the
+  Saved try-ons switch. A failure that leaves a resumable checkpoint stops the rest of the batch.
+- **Pickers present from the screen, not from the sheet.** The Add sheet closes first. Stacked
+  on the small-detent sheet, the Photos picker lagged and flickered on open and on first scroll
+  (reported on a phone 2026-09-26). Whether this change alone removed the flicker is not yet
+  confirmed on device.
+- Gates: `make ios-build`; `make ios-ui-test` exit 0 (before the last progress fix); installed on
+  the phone.
+
 ## Native design pass (2026-09-25)
 
 An audit of the rendered app found it read as generated. It counted lime in 54 places with eight
