@@ -22,6 +22,7 @@ struct MaterialMultiPicker: View {
     let isChosen: (String) -> Bool
     let toggle: (String) -> Void
     @Environment(\.dismiss) private var dismiss
+    @State private var deleteCandidate: MotionKit.Material?
 
     private let columns = [
         GridItem(.flexible(), spacing: 12, alignment: .top),
@@ -30,7 +31,7 @@ struct MaterialMultiPicker: View {
     ]
 
     private var eligible: [MotionKit.Material] {
-        MaterialRole.ordered(materials.materials.filter(kind.accepts), for: role)
+        MaterialRole.eligible(materials.materials.filter(kind.accepts), for: role)
     }
     private var chosenCount: Int { eligible.count { isChosen($0.id) } }
 
@@ -59,6 +60,9 @@ struct MaterialMultiPicker: View {
                 ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
             }
             .interactiveDismissDisabled(materials.isUploading || materials.isImportingLink)
+            .modifier(MaterialDeleteDialog(candidate: $deleteCandidate, store: materials) { deleted in
+                if isChosen(deleted.id) { toggle(deleted.id) }
+            })
         }
         .task { if !materials.loaded { await materials.refresh() } }
     }
@@ -77,7 +81,8 @@ struct MaterialMultiPicker: View {
             LazyVGrid(columns: columns, spacing: 16) {
                 ForEach(eligible) { material in
                     MaterialChoice(material: material, materials: materials,
-                                   selected: isChosen(material.id), compact: true) {
+                                   selected: isChosen(material.id), compact: true,
+                                   onDelete: { deleteCandidate = material }) {
                         toggle(material.id)
                     }
                     .disabled(disabled)

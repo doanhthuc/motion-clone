@@ -44,16 +44,15 @@ public enum MaterialRole: String, CaseIterable, Sendable {
         kind == .video ? [.driver] : [.character, .outfit, .background]
     }
 
-    /// `role`'s own materials first, then unsorted, then everything else,
+    /// What a picker for `role` lists: that role's own materials, then the
+    /// unsorted ones (so an image nobody has tagged yet can still be used),
     /// each group keeping its order (newest first, as the server lists).
-    public static func ordered(_ items: [Material], for role: MaterialRole?) -> [Material] {
+    /// Other roles' materials are left out — until 2026-09-26 they trailed the
+    /// list, and a Character picker full of outfits and backdrops read as broken.
+    /// A pipeline role outside this enum (`role == nil`) sees everything.
+    public static func eligible(_ items: [Material], for role: MaterialRole?) -> [Material] {
         guard let role else { return items }
-        func rank(_ m: Material) -> Int {
-            m.materialRole == role ? 0 : (m.materialRole == nil ? 1 : 2)
-        }
-        return items.enumerated()
-            .sorted { (rank($0.element), $0.offset) < (rank($1.element), $1.offset) }
-            .map(\.element)
+        return items.filter { $0.materialRole == role } + items.filter { $0.materialRole == nil }
     }
 }
 
