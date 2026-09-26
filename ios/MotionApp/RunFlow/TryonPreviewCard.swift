@@ -9,6 +9,7 @@ struct TryonPreviewCard: View {
     @State private var showRegenerate = false
     @State private var guidance: Set<Guidance> = []
     @State private var confirmDrop = false
+    @State private var editing: StudioRef?
 
     var body: some View {
         Section {
@@ -29,6 +30,7 @@ struct TryonPreviewCard: View {
                 image = await flow.image(index: preview.index).flatMap(UIImage.init(data:))
             }
             .sheet(isPresented: $showRegenerate) { regenerateSheet }
+            .sheet(item: $editing) { EditInStudioSheet(ref: $0) }
             // On the always-present first row, not on the trigger: that button
             // lives in a conditional branch and disables itself the moment
             // `isDropping` flips.
@@ -55,6 +57,11 @@ struct TryonPreviewCard: View {
                     if showVersions { Task { await flow.loadVersions(index: preview.index) } }
                 }
                 if showVersions { versionStrip }
+                if let runID = flow.runID {
+                    Button("Edit in Studio", systemImage: "wand.and.stars") {
+                        editing = StudioRef(kind: .runTryon, id: "\(runID)/\(preview.index)")
+                    }
+                }
             }
             Button("Regenerate…") { showRegenerate = true }
                 .disabled(!flow.canSpend)
