@@ -303,6 +303,22 @@ extension URLProtocolTests {
         #expect((w.first?.2?["slots"] as? [String: Any])?["driver"] as? String == "app/d1.mp4")
     }
 
+    /// A refused hand-back leaves the draft without the driver, so the
+    /// composer keeps it: back on a try-on pipeline the Driver card shows it
+    /// again, and the next switch away tries the hand-back once more.
+    @Test func releaseWhoseHandBackIsRefusedKeepsTheDriver() async {
+        let server = FakeDraftServer()
+        let (composer, _) = await make(server)
+        composer.toggle(outfitID: "app/o1.png")
+        composer.toggle(driverID: "app/d1.mp4")
+        server.failNextPatch()
+
+        await composer.release(keepingDriver: true)
+
+        #expect(composer.outfits.isEmpty)
+        #expect(composer.drivers == ["app/d1.mp4"])
+    }
+
     @Test func releasingWithSeveralDriversOrNoDriverRoleWritesNothing() async {
         let server = FakeDraftServer()
         let (composer, _) = await make(server)

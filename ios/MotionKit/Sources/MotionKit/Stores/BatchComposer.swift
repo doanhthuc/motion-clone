@@ -275,8 +275,12 @@ public final class BatchComposer {
         guard !isRunning else { return }
         let driverID = drivers.count == 1 ? drivers.first : nil
         reset()
-        if keepingDriver, let driverID {
-            await draft.apply(DraftPatch(slots: [Self.driverRole: driverID]))
+        // A refused hand-back keeps the driver here rather than losing it: the
+        // selection is hidden on this pipeline and counts no jobs, a try-on
+        // pipeline shows it again, and the next switch away retries.
+        if keepingDriver, let driverID,
+           await !draft.apply(DraftPatch(slots: [Self.driverRole: driverID])) {
+            drivers = [driverID]
         }
     }
 

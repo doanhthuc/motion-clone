@@ -105,8 +105,10 @@ plan: [`plans/2026-09-26-newjob-single-stage.md`](plans/2026-09-26-newjob-single
     - `SlotCard` moves its page to the neighbor when the shown pick is removed.
     - Adopt restores the selection when its PATCH is refused. Clear draft goes through
       `BatchComposer.clear()`, which empties the selection only once the server's clear landed.
+    - `release(keepingDriver:)` keeps the driver in the composer when its hand-back PATCH is
+      refused: a try-on pipeline shows it again, and the next switch away retries.
   - Still deferred: an adopted driver lives only in memory, so a relaunch or the Telegram bot shows
-    no driver. `release(keepingDriver:)` still drops the selection even if its PATCH fails.
+    no driver.
 
 ## Materials add flow (2026-09-26)
 
