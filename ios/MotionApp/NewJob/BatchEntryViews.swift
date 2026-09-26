@@ -71,6 +71,8 @@ struct BatchEntryMaterialTile: View {
     var showsSeed = false
     /// The file name under the role, where there is room for it.
     var showsName = false
+    /// Off in the collapsed basket drawer, where a tile is 22 pt wide.
+    var showsTitle = true
     /// Off in a batch row, where a tap opens the job instead.
     var tapToPreview = false
     @State private var thumbnail: Data?
@@ -144,10 +146,12 @@ struct BatchEntryMaterialTile: View {
                             .padding(4)
                     }
                 }
-            Text(title)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(Theme.label)
-                .lineLimit(1).minimumScaleFactor(0.8)
+            if showsTitle {
+                Text(title)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Theme.label)
+                    .lineLimit(1).minimumScaleFactor(0.8)
+            }
             if showsName {
                 Text(material?.name ?? materialID.map(BatchEntryText.fileName) ?? "Empty")
                     .font(.caption)
