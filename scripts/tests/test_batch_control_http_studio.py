@@ -214,6 +214,18 @@ class TestStudioStartup(StudioHttpBase):
         self.addCleanup(again.studio_runner.shutdown)
         self.assertEqual(again.studio.generation(pid, gen["id"])["slots"][0]["error"], "interrupted")
 
+    def test_make_server_survives_a_malformed_studio_index(self):
+        from httpapi.server import make_server
+        index = self.batch / "studio" / "app.json"
+        index.parent.mkdir(parents=True, exist_ok=True)
+        index.write_text(json.dumps([{"id": "x"}]))        # valid JSON, wrong shape: KeyError
+        logged = []
+        again = make_server(token="t", batch_dir=self.batch, out_dir=self.out, port=0,
+                            log=logged.append)
+        self.addCleanup(again.server_close)
+        self.addCleanup(again.studio_runner.shutdown)
+        self.assertTrue(any("recover_interrupted failed" in line for line in logged))
+
 
 if __name__ == "__main__":
     unittest.main()

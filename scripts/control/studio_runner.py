@@ -88,7 +88,9 @@ def parse_request(body: dict, root: Path) -> GenerationRequest:
         raise StudioError("bad_request", "prompt is required")
     if len(prompt) > MAX_PROMPT:
         raise StudioError("bad_request", f"prompt is longer than {MAX_PROMPT} characters")
-    spec = MODELS.get(body.get("model"))
+    model = body.get("model")
+    # A non-str key (a list, a dict) would make MODELS.get raise TypeError: a 500, not a 422.
+    spec = MODELS.get(model) if isinstance(model, str) else None
     if spec is None:
         raise StudioError("unknown_model", f"unknown model: {body.get('model')!r}")
     if not _available(spec, root):
@@ -132,8 +134,13 @@ def fit_image(src: Path, dest: Path) -> None:
         # provider APIs take odd dimensions fine and the test fixture expects the unrounded
         # 682.67 -> 683 (measured 2026-09-26).
         vf = ["-vf", f"scale={MAX_REF_SIDE}:-1" if w >= h else f"scale=-1:{MAX_REF_SIDE}"]
-    r = subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(src), *vf, "-frames:v", "1", str(dest)],
-                       capture_output=True, timeout=60)
+    try:
+        r = subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(src), *vf, "-frames:v", "1",
+                            str(dest)], capture_output=True, timeout=60)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        # A hung decode or a box without ffmpeg: still "we couldn't use this reference",
+        # never an unhandled 500.
+        raise StudioError("ref_not_image", f"could not read reference image {src.name}") from None
     if r.returncode != 0:
         raise StudioError("ref_not_image", f"could not read reference image {src.name}")
 
@@ -166,9 +173,19 @@ class StudioRunner:
             pid, prompt=req.prompt, model=req.model.key, aspect=req.aspect, count=req.count,
             refs=list(zip(req.refs, ref_paths)), unit_price_usd=req.model.price_usd, copy=fit_image)
         images = []
-        for ref in gen["refs"]:
-            path = self.store.resolve_ref(pid, ref["file"])
-            images.append((path.read_bytes(), mime_of(path)))
+        try:
+            for ref in gen["refs"]:
+                path = self.store.resolve_ref(pid, ref["file"])
+                if path is None:
+                    raise StudioError("ref_not_image", f"reference snapshot {ref['file']} is missing")
+                images.append((path.read_bytes(), mime_of(path)))
+        except Exception:
+            # The generation is already recorded with queued slots, and no thread will ever
+            # own them: fail them now, or the phone polls them until the next bot restart.
+            for slot in range(req.count):
+                self._mark(pid, gen["id"], slot, status="error",
+                           error="couldn't read the reference images")
+            raise
         if req.model.provider == "qwen":
             self._spawn(self._run_qwen, pid, gen["id"], req, images)
         else:

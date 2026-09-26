@@ -642,7 +642,12 @@ def make_server(*, token: str, batch_dir: Path, out_dir: Path,
     server.studio = studio.StudioStore(batch_dir / "studio", materials.APP_OWNER)
     # Slots a previous process left queued/running have no thread any more (a deploy restarts
     # motion-bot); without this the phone would poll them forever.
-    server.studio.recover_interrupted()
+    # Guarded: a malformed batch/studio/app.json must not crash-loop motion-bot, which would
+    # take Telegram down with the phone API.
+    try:
+        server.studio.recover_interrupted()
+    except Exception:
+        log("studio: recover_interrupted failed at startup\n" + traceback.format_exc())
     server.studio_runner = studio_runner.StudioRunner(server.studio, batch_dir.parent, log=log)
     # Its own store object over the same directory the bot's AppRuns uses; scopes keep keys apart.
     server.studio_idem = IdempotencyStore(batch_dir / "idempotency")

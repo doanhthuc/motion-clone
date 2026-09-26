@@ -154,6 +154,8 @@ class TestCatalogAndParse(StoreBase):
     def test_parse_rejects_bad_input(self):
         cases = [(self.body(prompt="  "), "bad_request"),
                  (self.body(model="dall-e"), "unknown_model"),
+                 (self.body(model=["nano-banana-2"]), "unknown_model"),
+                 (self.body(model={"key": "nano-banana-2"}), "unknown_model"),
                  (self.body(aspect="2:1"), "bad_request"),
                  (self.body(count=5), "bad_request"),
                  (self.body(count="2"), "bad_request"),
@@ -188,6 +190,24 @@ class TestFitImage(StoreBase):
         with mock.patch.object(sr, "img_size", return_value=(800, 600)):
             fit_image(src, dest)
         self.assertEqual(dest.read_bytes(), PNG)
+
+
+    def test_ffmpeg_timeout_is_ref_not_image(self):
+        src = self.ref_file("slow.webp")
+        with mock.patch.object(sr, "img_size", return_value=(800, 600)), \
+                mock.patch.object(sr.subprocess, "run",
+                                  side_effect=subprocess.TimeoutExpired("ffmpeg", 60)):
+            with self.assertRaises(sr.StudioError) as ctx:
+                fit_image(src, self.root / "out.png")
+        self.assertEqual(ctx.exception.code, "ref_not_image")
+
+    def test_missing_ffmpeg_is_ref_not_image(self):
+        src = self.ref_file("photo.webp")
+        with mock.patch.object(sr, "img_size", return_value=(800, 600)), \
+                mock.patch.object(sr.subprocess, "run", side_effect=FileNotFoundError("ffmpeg")):
+            with self.assertRaises(sr.StudioError) as ctx:
+                fit_image(src, self.root / "out.png")
+        self.assertEqual(ctx.exception.code, "ref_not_image")
 
 
 class TestRunner(StoreBase):
@@ -252,6 +272,23 @@ class TestRunner(StoreBase):
         gen = r.submit(self.pid, self.req(count=1), [])
         self.assertTrue(r.wait_idle(5))
         self.assertEqual(self.store.generation(self.pid, gen["id"])["slots"][0]["error"], "internal error")
+
+    def test_unreadable_ref_snapshot_fails_every_slot(self):
+        r = self.runner(gemini=lambda *a: self.fail("no provider call expected"))
+        src = self.ref_file()
+        req = self.req(count=3, refs=[{"kind": "material", "id": "app/ref.png"}])
+        for resolved in (None, "raises"):
+            with self.subTest(resolved=resolved):
+                if resolved is None:
+                    patch = mock.patch.object(self.store, "resolve_ref", return_value=None)
+                else:
+                    bad = mock.Mock(read_bytes=mock.Mock(side_effect=OSError("disk gone")))
+                    patch = mock.patch.object(self.store, "resolve_ref", return_value=bad)
+                with patch, self.assertRaises(Exception):
+                    r.submit(self.pid, req, [src])
+                gen = self.store.get_project(self.pid)["generations"][-1]
+                self.assertEqual([s["status"] for s in gen["slots"]], ["error"] * 3)
+                self.assertTrue(all(s["error"] for s in gen["slots"]))
 
     def test_deleted_project_mid_run_is_ignored(self):
         started, release = threading.Event(), threading.Event()
