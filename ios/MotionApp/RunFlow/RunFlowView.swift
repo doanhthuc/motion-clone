@@ -8,21 +8,28 @@ struct RunFlowView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var didStart = false
 
+    /// Phase A, running or done, is a pager of looks rather than list rows.
+    private var showsCarousel: Bool { flow.phase == .phaseARunning || flow.phase == .previews }
+
     var body: some View {
-        List {
-            if flow.error != nil || flow.message != nil || flow.needsRecheck {
-                Section {
-                    if let error = flow.error { ErrorBanner(error: error) { await flow.start(entry) } }
-                    if let message = flow.message { MessageCard(text: message) { flow.dismissMessage() } }
-                    if flow.needsRecheck {
-                        Button("Check again") { Task { await flow.recheck() } }
-                            .disabled(flow.isSpending)
+        Group {
+            if showsCarousel {
+                VStack(spacing: 0) {
+                    if hasNotices {
+                        VStack(spacing: 8) { notices }
+                            .padding(.horizontal, 20).padding(.top, 8)
                     }
+                    TryonCarousel(flow: flow)
+                }
+                .background(Theme.bg)
+            } else {
+                List {
+                    if hasNotices { Section { notices } }
+                    content
                 }
             }
-            content
         }
-        .navigationTitle("Run")
+        .navigationTitle(showsCarousel ? "Try-on" : "Run")
         .navigationBarTitleDisplayMode(.inline)
         // A shared RunFlow survives navigation (Runs/NewJob both hold the same
         // instance), so re-running `start` on every appear — e.g. popping back
@@ -50,6 +57,17 @@ struct RunFlowView: View {
         }
     }
 
+    private var hasNotices: Bool { flow.error != nil || flow.message != nil || flow.needsRecheck }
+
+    @ViewBuilder private var notices: some View {
+        if let error = flow.error { ErrorBanner(error: error) { await flow.start(entry) } }
+        if let message = flow.message { MessageCard(text: message) { flow.dismissMessage() } }
+        if flow.needsRecheck {
+            Button("Check again") { Task { await flow.recheck() } }
+                .disabled(flow.isSpending)
+        }
+    }
+
     @ViewBuilder private var content: some View {
         switch flow.phase {
         case .loading:
@@ -58,32 +76,8 @@ struct RunFlowView: View {
             }
         case .compose:
             compose
-        case .phaseARunning:
-            Section("Try-on on the VPS") {
-                ForEach(flow.tryon?.previews ?? []) { preview in
-                    HStack(spacing: 12) {
-                        StageDot(status: preview.status)
-                        Text(preview.run).font(.subheadline).lineLimit(1).truncationMode(.middle)
-                    }
-                }
-                if flow.tryon?.previews.isEmpty ?? true {
-                    HStack(spacing: 10) { ProgressView(); Text("Starting…").foregroundStyle(Theme.secondary) }
-                }
-            }
-        case .previews:
-            // One card per look (Phase 6 shared try-on): `flow.cards` is the
-            // leaders only, so a group's followers render inside their
-            // leader's card via the "Used by K videos" label, not as their
-            // own cards.
-            ForEach(flow.cards) { preview in
-                TryonPreviewCard(flow: flow, preview: preview)
-            }
-            Section {
-                Button("Continue to rent") { Task { await flow.continueToRent() } }
-                    .buttonStyle(PrimaryButtonStyle())
-                    .disabled(flow.isSpending)
-                    .buttonRow()
-            }
+        case .phaseARunning, .previews:
+            EmptyView()   // `TryonCarousel`, outside the List
         case .rentPanel:
             RentPanelView(flow: flow)
         case let .choiceRequired(_, provider):

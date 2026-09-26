@@ -20,9 +20,13 @@ struct RunsView: View {
             if let live = runs.live {
                 Section("Now") {
                     if live.status == .phaseA {
-                        NavigationLink { RunFlowView(flow: flow, entry: .existing) } label: { LiveRunRow(run: live) }
+                        NavigationLink { RunFlowView(flow: flow, entry: .existing) } label: {
+                            LiveRunRow(run: live, progress: LiveProgress(run: live, tryon: flow.tryon))
+                        }
                     } else {
-                        NavigationLink(value: live.id) { LiveRunRow(run: live) }
+                        NavigationLink(value: live.id) {
+                            LiveRunRow(run: live, progress: LiveProgress(run: live, tryon: nil))
+                        }
                     }
                 }
             }
@@ -56,6 +60,15 @@ struct RunsView: View {
         }
         .refreshable { await refresh() }
         .task { await refresh() }
+        // While something runs, keep the Now card moving. Stops when the run
+        // does, or when the tab goes out of view.
+        .task(id: runs.live?.id) {
+            while runs.live != nil, !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(5))
+                guard !Task.isCancelled else { return }
+                await refresh()
+            }
+        }
     }
 
     @Environment(AppModel.self) private var model
@@ -65,6 +78,11 @@ struct RunsView: View {
         async let a: Void = runs.refresh()
         async let b: Void = pod.refresh()
         _ = await (a, b)
+        // A Phase A has no journal jobs yet; its looks are the only count.
+        if runs.live?.status == .phaseA {
+            if flow.runID != runs.live?.id { await flow.refreshPod() }
+            await flow.refreshTryon()
+        }
     }
 }
 
@@ -96,20 +114,34 @@ struct PodStrip: View {
 
 struct LiveRunRow: View {
     let run: RunSummary
+    let progress: LiveProgress
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 6) {
-                PulseDot(size: 6)
+                PulseDot(color: Theme.accent, size: 6)
                 Text(run.status == .phaseA ? "Try-on on the VPS" : "Generating")
                     .font(.footnote.weight(.semibold)).foregroundStyle(Theme.secondary)
             }
             Text(run.batch ?? run.id).font(.headline)
-            ProgressView(value: Double(run.jobsDone), total: Double(max(run.jobsTotal, 1)))
-                .tint(Theme.label)
-            Text("\(run.jobsDone) of \(run.jobsTotal) jobs done")
-                .font(.subheadline.monospacedDigit()).foregroundStyle(Theme.secondary)
+            if progress.total > 0 {
+                ProgressView(value: Double(progress.done), total: Double(progress.total))
+                    .tint(Theme.accent)
+                Text(countText)
+                    .font(.subheadline.monospacedDigit()).foregroundStyle(Theme.secondary)
+            } else {
+                Text(run.status == .phaseA ? "Starting try-on · no GPU rented yet" : "Starting…")
+                    .font(.subheadline).foregroundStyle(Theme.secondary)
+            }
         }
         .padding(.vertical, 4)
+    }
+
+    private var countText: String {
+        switch progress.unit {
+        case .looks: "\(progress.done) of \(progress.total) looks ready · no GPU rented yet"
+        case .jobs: "\(progress.done) of \(progress.total) jobs done"
+        }
     }
 }
 

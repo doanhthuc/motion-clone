@@ -309,6 +309,20 @@ extension URLProtocolTests {
         #expect(hits.count == 2)
     }
 
+    /// The carousel's generating state draws the job's own photos, so it must
+    /// read them from that job's batch entry, not the draft being edited.
+    @Test func inputMaterialComesFromTheJobsBatchEntry() async throws {
+        let routes = Routes()
+        routes.draft = Routes.draftTwoJobs
+        routes.tryon = Fixtures.tryonDone
+        let flow = make(routes)
+        await flow.start(.existing)
+        let dress = try #require(flow.tryon?.previews.first { $0.run == "model__dress" })
+        #expect(flow.inputMaterialID(for: dress, role: .outfit) == "app/dress.png")
+        #expect(flow.inputMaterialID(for: dress, role: .character) == "app/model.png")
+        #expect(flow.inputMaterialID(for: dress, role: .background) == nil)
+    }
+
     @Test func dropClearsTheEditedCopyThenDeletesAndRevalidates() async throws {
         let routes = Routes()
         routes.draft = Routes.draftTwoJobs

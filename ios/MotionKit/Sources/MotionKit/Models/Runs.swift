@@ -111,3 +111,47 @@ public struct BatchSummary: Equatable, Sendable {
             .map(\.element)
     }
 }
+
+/// What the Runs tab's "Now" card counts. A Phase A has written nothing to the
+/// journal yet — `jobs_total` is 0 until the drain starts — so while the VPS
+/// makes try-ons the previews are the only real count.
+public struct LiveProgress: Equatable, Sendable {
+    public enum Unit: Sendable { case looks, jobs }
+    public let done: Int
+    public let total: Int
+    public let unit: Unit
+
+    public init(done: Int, total: Int, unit: Unit) {
+        self.done = done
+        self.total = total
+        self.unit = unit
+    }
+
+    /// `tryon` counts only when it belongs to `run`: the shared RunFlow may
+    /// still hold an older run's previews.
+    public init(run: RunSummary, tryon: TryonPreviews?) {
+        guard run.status == .phaseA else {
+            self.init(done: run.jobsDone, total: run.jobsTotal, unit: .jobs)
+            return
+        }
+        let previews = tryon?.runId == run.id ? tryon?.previews ?? [] : []
+        self.init(done: previews.filter { $0.status == .done }.count, total: previews.count, unit: .looks)
+    }
+}
+
+extension RunDetail {
+    /// A job's finished files: `<job>.mp4`, then `<job>-2.mp4` for a re-run,
+    /// newest first. `a-b-cd` is a different job from `a-b-c`, and so is
+    /// `a-b-c-x` — only a numeric suffix is a re-run.
+    public func outputs(forJob job: String) -> [String] {
+        func rerun(_ name: String) -> Int? {
+            let stem = (name as NSString).deletingPathExtension
+            if stem == job { return 1 }
+            guard stem.hasPrefix(job + "-") else { return nil }
+            return Int(stem.dropFirst(job.count + 1))
+        }
+        return outputs.compactMap { name in rerun(name).map { (name, $0) } }
+            .sorted { $0.1 > $1.1 }
+            .map(\.0)
+    }
+}

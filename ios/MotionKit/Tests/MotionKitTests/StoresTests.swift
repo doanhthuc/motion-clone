@@ -39,6 +39,22 @@ extension URLProtocolTests {
         #expect(store.error == nil)
     }
 
+    /// Back out of a run and open it again: the new store starts empty, but the
+    /// shared client still holds the first visit's ETag. A 304 then left the
+    /// screen on its loader forever (2026-09-26).
+    @Test func freshStoreIgnoresTheClientsCachedETag() async {
+        StubURLProtocol.install { req in
+            req.value(forHTTPHeaderField: "If-None-Match") == nil
+                ? TestSupport.json(Fixtures.runDetail, etag: #""e1""#)
+                : (304, [:], Data())
+        }
+        let client = TestSupport.client()
+        await RunDetailStore(client: client, runID: "tg-1000").refresh()
+        let reopened = RunDetailStore(client: client, runID: "tg-1000")
+        await reopened.refresh()
+        #expect(reopened.detail?.id == "tg-1000")
+    }
+
     @Test func pollRefreshesUntilCancelled() async {
         StubURLProtocol.install { _ in TestSupport.json(Fixtures.runDetail) }
         let store = RunDetailStore(client: TestSupport.client(), runID: "tg-1000")

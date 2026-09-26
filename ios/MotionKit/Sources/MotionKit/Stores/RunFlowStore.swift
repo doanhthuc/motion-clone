@@ -248,6 +248,14 @@ public final class RunFlow {
         draft?.batch.first { $0.runID == preview.run }
     }
 
+    /// The material a job was made from in `role`. A draft with no batch is a
+    /// single job, so its own slots are that job's inputs.
+    public func inputMaterialID(for preview: TryonPreview, role: MaterialRole) -> String? {
+        if let entry = batchEntry(for: preview) { return entry.slots[role.rawValue] ?? nil }
+        guard let draft, draft.batch.isEmpty else { return nil }
+        return draft.slots[role.rawValue]?.materialID
+    }
+
     public func isSeeded(_ preview: TryonPreview) -> Bool {
         batchEntry(for: preview)?.tryonSeed != nil
     }
