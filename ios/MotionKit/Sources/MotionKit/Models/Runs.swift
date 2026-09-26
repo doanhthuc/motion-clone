@@ -53,10 +53,20 @@ public struct StageProgress: Decodable, Sendable, Equatable {
     public let elapsedSec: Double?
 }
 
+/// What a job was made from (`control/runs.py` `_job_setups`): material ids
+/// (`owner/name`) by role. Additive — an older server, or a manifest that no
+/// longer loads, sends none.
+public struct JobSetup: Decodable, Sendable, Equatable {
+    public let pipeline: String
+    public let provider: String?
+    public let inputs: [String: String]
+}
+
 public struct JobProgress: Decodable, Sendable, Equatable, Identifiable {
     public let id: String
     public let status: StageStatus
     public let stages: [StageProgress]
+    public let setup: JobSetup?
 }
 
 public struct RunLease: Decodable, Sendable, Equatable {

@@ -8,8 +8,9 @@ public final class RunDetailStore {
     public private(set) var error: APIError?
     public private(set) var lastSuccess: Date?
     public let client: APIClient
-    private var tryon: TryonPreviews?
-    private var tryonLoaded = false
+    /// One read shared by every page that asks: two pages open at once, and a
+    /// "loaded" flag set before the answer came made the second one give up.
+    private var tryonLoad: Task<TryonPreviews?, Never>?
     private var tryonImages: [String: Data] = [:]
 
     public init(client: APIClient, runID: String) {
@@ -49,10 +50,11 @@ public final class RunDetailStore {
     /// jobs, so the previews do not move under a detail poll. A run without a
     /// try-on stage answers 404 and every job gets nil.
     public func tryonImage(forJob job: String) async -> Data? {
-        if !tryonLoaded {
-            tryonLoaded = true
-            tryon = try? await client.get(TryonPreviews.self, "v1", "runs", runID, "tryon")
+        if tryonLoad == nil {
+            let client = client, runID = runID
+            tryonLoad = Task { try? await client.get(TryonPreviews.self, "v1", "runs", runID, "tryon") }
         }
+        let tryon = await tryonLoad?.value
         guard let preview = tryon?.previews.first(where: { $0.run == job }), preview.hasImage else { return nil }
         if let cached = tryonImages[preview.index] { return cached }
         guard let data = try? await client.data("v1", "runs", runID, "tryon", preview.index) else { return nil }
