@@ -1,57 +1,57 @@
 import SwiftUI
 import MotionKit
 
+/// Every run as a cover card: what its jobs look like, how they stand, and
+/// what they were made with. Until 2026-09-27 this was a list of "0 of 2 jobs ·
+/// Stopped" rows — a failed job and one never started read the same, and
+/// nothing showed what the run was of.
 struct RunsView: View {
     let runs: RunsStore
     let pod: PodStore
     let flow: RunFlow
+    @State private var details: RunDetail?
+    @State private var continuing = false
 
     var body: some View {
-        List {
-            if let error = runs.error, !runs.loaded {
-                Section { ErrorBanner(error: error) { await refresh() } }
-            }
-            if runs.isStale {
-                Section { StaleTag(lastSuccess: runs.lastSuccess) }
-            }
-            if let p = pod.pod, let lease = p.lease {
-                Section { PodStrip(gpu: p.gpu, lease: lease) }
-            }
-            if let live = runs.live {
-                Section("Now") {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 14) {
+                if let error = runs.error, !runs.loaded {
+                    ErrorBanner(error: error) { await refresh() }.heroSurface()
+                }
+                if runs.isStale { StaleTag(lastSuccess: runs.lastSuccess) }
+                if let p = pod.pod, let lease = p.lease {
+                    PodStrip(gpu: p.gpu, lease: lease).heroSurface()
+                }
+                if let live = runs.live {
+                    SectionTitle(text: "Now")
                     if live.status == .phaseA {
-                        NavigationLink { RunFlowView(flow: flow, entry: .existing) } label: {
-                            LiveRunRow(run: live, progress: LiveProgress(run: live, tryon: flow.tryon))
-                        }
+                        NavigationLink { RunFlowView(flow: flow, entry: .existing) } label: { card(live) }
+                            .buttonStyle(CardPressStyle())
                     } else {
-                        NavigationLink(value: live.id) {
-                            LiveRunRow(run: live, progress: LiveProgress(run: live, tryon: nil))
-                        }
+                        link(live)
                     }
                 }
-            }
-            if !runs.recent.isEmpty {
-                Section {
-                    ForEach(runs.recent) { run in
-                        NavigationLink(value: run.id) { RunRow(run: run) }
-                    }
-                } header: {
-                    Text("Recent")
-                } footer: {
-                    Text("\(runs.runs.count) total")
+                if !runs.recent.isEmpty {
+                    SectionTitle(text: "Recent")
+                    ForEach(runs.recent) { link($0) }
+                    Text("\(runs.runs.count) total").font(.footnote).foregroundStyle(Theme.secondary)
+                        .padding(.leading, 4)
                 }
             }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 24)
         }
+        .background(Theme.bg)
         .overlay {
             if runs.loaded && runs.runs.isEmpty { EmptyRuns() }
         }
         .navigationTitle("Runs")
         .navigationBarTitleDisplayMode(.inline)
         .navigationDestination(for: String.self) { id in
-            if let client = runsClient {
-                RunDetailView(store: RunDetailStore(client: client, runID: id), flow: flow, pod: pod)
-            }
+            RunDetailView(store: runs.detailStore(for: id), flow: flow, pod: pod)
         }
+        .navigationDestination(isPresented: $continuing) { RunFlowView(flow: flow, entry: .existing) }
+        .sheet(item: $details) { BatchDetailsSheet(detail: $0, focus: nil) }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 NavigationLink { SettingsView() } label: { Image(systemName: "gearshape") }
@@ -71,18 +71,60 @@ struct RunsView: View {
         }
     }
 
-    @Environment(AppModel.self) private var model
-    private var runsClient: APIClient? { model.client }
+    private func card(_ run: RunSummary) -> some View {
+        RunCard(run: run, store: runs.detailStore(for: run.id),
+                progress: LiveProgress(run: run, tryon: run.status == .phaseA ? flow.tryon : nil))
+    }
+
+    /// Tap opens the run; press-and-hold offers what a run is usually opened for.
+    private func link(_ run: RunSummary) -> some View {
+        let store = runs.detailStore(for: run.id)
+        return NavigationLink(value: run.id) { card(run) }
+            .buttonStyle(CardPressStyle())
+            .contextMenu {
+                if let d = store.detail {
+                    Button { details = d } label: { Label("Batch details", systemImage: "info.circle") }
+                    if canContinue(d) {
+                        Button { continuing = true } label: {
+                            Label("Continue batch · \(d.jobsTotal - d.jobsDone) left", systemImage: "play.circle")
+                        }
+                    }
+                }
+                Button { UIPasteboard.general.string = run.id } label: {
+                    Label("Copy run ID", systemImage: "doc.on.doc")
+                }
+            }
+    }
+
+    /// The same rule as the run detail's Continue button.
+    private func canContinue(_ d: RunDetail) -> Bool {
+        d.id == flow.runID && !d.status.isLive && d.lease == nil && pod.pod?.lease == nil
+            && d.jobsDone < d.jobsTotal
+    }
 
     private func refresh() async {
         async let a: Void = runs.refresh()
         async let b: Void = pod.refresh()
-        _ = await (a, b)
+        async let c: Void = flow.refreshPod()
+        _ = await (a, b, c)
         // A Phase A has no journal jobs yet; its looks are the only count.
-        if runs.live?.status == .phaseA {
-            if flow.runID != runs.live?.id { await flow.refreshPod() }
-            await flow.refreshTryon()
-        }
+        if runs.live?.status == .phaseA { await flow.refreshTryon() }
+    }
+}
+
+private struct SectionTitle: View {
+    let text: String
+    var body: some View {
+        Text(text).font(.title3.weight(.semibold)).padding(.leading, 4).padding(.top, 6)
+    }
+}
+
+/// A card sinks a little under the finger, so a press reads as a press.
+struct CardPressStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.97 : 1)
+            .animation(.snappy(duration: 0.2), value: configuration.isPressed)
     }
 }
 
@@ -108,73 +150,6 @@ struct PodStrip: View {
                     }
                 }
             }
-        }
-    }
-}
-
-struct LiveRunRow: View {
-    let run: RunSummary
-    let progress: LiveProgress
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 6) {
-                PulseDot(color: Theme.accent, size: 6)
-                Text(run.status == .phaseA ? "Try-on on the VPS" : "Generating")
-                    .font(.footnote.weight(.semibold)).foregroundStyle(Theme.secondary)
-            }
-            Text(run.batch ?? run.id).font(.headline)
-            if progress.total > 0 {
-                ProgressView(value: Double(progress.done), total: Double(progress.total))
-                    .tint(Theme.accent)
-                Text(countText)
-                    .font(.subheadline.monospacedDigit()).foregroundStyle(Theme.secondary)
-            } else {
-                Text(run.status == .phaseA ? "Starting try-on · no GPU rented yet" : "Starting…")
-                    .font(.subheadline).foregroundStyle(Theme.secondary)
-            }
-        }
-        .padding(.vertical, 4)
-    }
-
-    private var countText: String {
-        switch progress.unit {
-        case .looks: "\(progress.done) of \(progress.total) looks ready · no GPU rented yet"
-        case .jobs: "\(progress.done) of \(progress.total) jobs done"
-        }
-    }
-}
-
-struct RunRow: View {
-    let run: RunSummary
-    var body: some View {
-        HStack(spacing: 12) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(run.batch ?? run.id).font(.body)
-                Text("\(run.jobsDone) of \(run.jobsTotal) jobs")
-                    .font(.subheadline.monospacedDigit()).foregroundStyle(Theme.secondary)
-            }
-            Spacer(minLength: 0)
-            StatusBadge(status: run.status)
-        }
-    }
-}
-
-/// Icon and word together, so status never rides on color alone.
-struct StatusBadge: View {
-    let status: RunStatus
-    var body: some View {
-        switch status {
-        case .done:
-            Label("Done", systemImage: "checkmark.circle").foregroundStyle(Theme.secondary)
-                .labelStyle(.iconOnly).accessibilityLabel("Done")
-        case .error:
-            Label("Failed", systemImage: "exclamationmark.triangle.fill")
-                .font(.subheadline).foregroundStyle(Theme.danger)
-        case .running, .phaseA:
-            PulseDot().accessibilityLabel("Running")
-        case .stopped, .unknown:
-            Text(status == .stopped ? "Stopped" : "Unknown").font(.subheadline).foregroundStyle(Theme.secondary)
         }
     }
 }

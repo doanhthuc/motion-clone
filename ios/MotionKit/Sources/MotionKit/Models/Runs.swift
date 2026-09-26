@@ -165,3 +165,80 @@ extension RunDetail {
             .map(\.0)
     }
 }
+
+/// What a Runs-tab card says about a run, read from its detail: how its jobs
+/// stand, and what they were made with. Until 2026-09-27 the card said only
+/// "0 of 2 jobs", which could not tell a failed job from one never started.
+public struct RunDigest: Equatable, Sendable {
+    public let done: Int
+    public let failed: Int
+    public let running: Int
+    /// Queued, or never reached before the run stopped.
+    public let left: Int
+    /// Distinct, in job order.
+    public let pipelines: [String]
+    public let providers: [String]
+
+    public init(_ detail: RunDetail) {
+        let jobs = detail.jobs
+        done = jobs.filter { $0.status == .done }.count
+        failed = jobs.filter { $0.status == .error }.count
+        running = jobs.filter { $0.status == .running }.count
+        left = jobs.count - done - failed - running
+        func distinct(_ values: [String]) -> [String] {
+            values.reduce(into: []) { if !$0.contains($1) { $0.append($1) } }
+        }
+        pipelines = distinct(jobs.compactMap(\.setup?.pipeline))
+        providers = distinct(jobs.compactMap(\.setup?.provider))
+    }
+
+    /// "4 jobs · 1 done · 1 failed · 2 left" — zero counts are left out.
+    public var countsText: String {
+        let total = done + failed + running + left
+        let parts = ["\(total) job\(total == 1 ? "" : "s")"] + [(done, "done"), (running, "running"), (failed, "failed"), (left, "left")]
+            .filter { $0.0 > 0 }.map { "\($0.0) \($0.1)" }
+        return total == 0 ? "No jobs" : parts.joined(separator: " · ")
+    }
+
+    /// "Try-on → Swap → Enhance · qwen-max", or nil when no job has a setup.
+    public var setupText: String? {
+        guard !pipelines.isEmpty else { return nil }
+        let steps = pipelines.count == 1 ? PipelineName.steps(pipelines[0]) : "\(pipelines.count) pipelines"
+        return ([steps] + providers).joined(separator: " · ")
+    }
+}
+
+public enum PipelineName {
+    /// Pipeline ids are stage names joined by dashes, and two stages are two
+    /// words ("character-swap", "camera-motion"): "tryon-character-swap-enhance"
+    /// reads "Try-on → Swap → Enhance". Unknown words pass through.
+    public static func steps(_ raw: String) -> String {
+        var words = raw.split(separator: "-").map(String.init)[...]
+        var steps: [String] = []
+        while let word = words.popFirst() {
+            switch word {
+            case "tryon": steps.append("Try-on")
+            case "character" where words.first == "swap": words.removeFirst(); steps.append("Swap")
+            case "camera" where words.first == "motion": words.removeFirst(); steps.append("Camera motion")
+            default: steps.append(word.prefix(1).uppercased() + word.dropFirst())
+            }
+        }
+        return steps.joined(separator: " → ")
+    }
+}
+
+public enum RunName {
+    /// Batch runs are named by when they were made ("2026-09-26-1530"); a
+    /// card shows that as "Sep 26 · 15:30". Any other name is its own title.
+    public static func title(_ id: String, calendar: Calendar = .current) -> String {
+        let parts = id.split(separator: "-")
+        guard parts.count == 4, parts[3].count == 4,
+              let year = Int(parts[0]), let month = Int(parts[1]), let day = Int(parts[2]),
+              let hhmm = Int(parts[3]), (1...12).contains(month), (1...31).contains(day),
+              hhmm / 100 < 24, hhmm % 100 < 60 else { return id }
+        let months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+        let sameYear = calendar.component(.year, from: .now) == year
+        let date = sameYear ? "\(months[month - 1]) \(day)" : "\(months[month - 1]) \(day), \(year)"
+        return "\(date) · " + String(format: "%02d:%02d", hhmm / 100, hhmm % 100)
+    }
+}

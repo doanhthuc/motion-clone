@@ -16,6 +16,7 @@ import Testing
         #expect(Format.ago(12) == "12s ago")
         #expect(Format.ago(125) == "2m ago")
         #expect(Format.ago(3 * 3600 + 5) == "3h ago")
+        #expect(Format.ago(50 * 3600) == "2d ago")
     }
     @Test func stageNames() {
         #expect(Format.stageName("tryon") == "Try-on")

@@ -8,6 +8,9 @@ public final class RunsStore {
     public private(set) var error: APIError?
     public private(set) var lastSuccess: Date?
     private let client: APIClient
+    /// One detail store per run, kept across refreshes: a card reads its run's
+    /// jobs from it, and opening the card shows that copy at once.
+    @ObservationIgnored private var details: [String: RunDetailStore] = [:]
 
     public init(client: APIClient) { self.client = client }
 
@@ -15,6 +18,13 @@ public final class RunsStore {
     public var live: RunSummary? { runs.first { $0.status.isLive } }
     public var recent: [RunSummary] { runs.filter { $0.id != live?.id } }
     public var isStale: Bool { loaded && error != nil }
+
+    public func detailStore(for runID: String) -> RunDetailStore {
+        if let store = details[runID] { return store }
+        let store = RunDetailStore(client: client, runID: runID)
+        details[runID] = store
+        return store
+    }
 
     public func refresh() async {
         do {

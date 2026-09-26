@@ -35,7 +35,7 @@ struct RunDetailView: View {
             }
         }
         .background(Theme.bg)
-        .navigationTitle(store.detail?.batch ?? store.runID)
+        .navigationTitle(RunName.title(store.detail?.batch ?? store.runID))
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             if store.detail != nil {
