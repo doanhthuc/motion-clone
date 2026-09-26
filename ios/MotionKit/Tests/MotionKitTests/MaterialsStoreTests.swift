@@ -89,7 +89,7 @@ extension URLProtocolTests {
         StubURLProtocol.install { request in
             switch (request.httpMethod, request.url?.path) {
             case ("POST", "/v1/materials/link"):
-                return TestSupport.json(#"{"material":{"id":"app/tiktok-1.mp4","owner":"app","name":"tiktok-1.mp4","bytes":12,"updated_at":1790000300,"kind":"video"},"probe":{"kind":"video","size_bytes":12,"warning":""}}"#, status: 201)
+                return TestSupport.json(#"{"material":{"id":"app/tiktok-1.mp4","owner":"app","name":"tiktok-1.mp4","bytes":12,"updated_at":1790000300,"kind":"video"},"probe":{"kind":"video","width":1080,"height":1920,"duration_s":15.2,"size_bytes":12,"warning":""}}"#, status: 201)
             default:
                 return TestSupport.json(#"{"materials":[{"id":"app/tiktok-1.mp4","owner":"app","name":"tiktok-1.mp4","bytes":12,"updated_at":1790000300,"kind":"video"}]}"#)
             }
@@ -101,6 +101,7 @@ extension URLProtocolTests {
         #expect(material?.id == "app/tiktok-1.mp4")
         #expect(store.materials.map(\.id) == ["app/tiktok-1.mp4"])
         #expect(!store.isImportingLink && store.errorMessage == nil && !store.linkImportStillRunning)
+        #expect(store.lastLinkProbe?.durationS == 15.2 && store.lastLinkProbe?.height == 1920)
         let post = try #require(StubURLProtocol.requests.first)
         let body = try #require(post.httpBody)
         #expect(try JSONDecoder().decode([String: String].self, from: body) == ["url": "https://vt.tiktok.com/ZS8abcde/"])

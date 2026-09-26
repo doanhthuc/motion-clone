@@ -1,4 +1,5 @@
 import MotionKit
+import os
 import SwiftUI
 
 @MainActor @Observable
@@ -50,16 +51,84 @@ final class ShareImportModel {
             return
         }
         let store = MaterialsStore(client: APIClient(credentials: credentials))
-        if let material = await store.importLink(link) {
+        // Shortcuts-style when banners are allowed: close the sheet at once and
+        // report through notifications. Without permission the card is the
+        // only feedback left, so it stays up as before.
+        //
+        // No Dynamic Island here: Activity.request from this extension fails
+        // with `unsupportedTarget` even with NSSupportsLiveActivities on every
+        // target (measured on device, 2026-09-26) — only the app may start one.
+        // The island path is the Shortcuts action (SaveTikTokIntent).
+        if await ImportNotifier.canNotify() {
+            await downloadInBackground(link, store: store)
+            finish()
+            return
+        }
+        switch await Self.importOutcome(link, store: store) {
+        case .done(let material, _):
             phase = .done(name: material.name)
             try? await Task.sleep(for: .seconds(1.5))
             finish()
-        } else if store.linkImportStillRunning {
+        case .stillRunning:
             phase = .notice(store.errorMessage ?? "The download is still running.")
-        } else {
-            phase = .failed(store.errorMessage ?? "The download failed.")
+        case .failed(let message):
+            phase = .failed(message)
         }
     }
+
+    private enum Outcome {
+        case done(MotionKit.Material, thumbnail: Data?)
+        case failed(String)
+        case stillRunning
+    }
+
+    private static func importOutcome(_ link: String, store: MaterialsStore) async -> Outcome {
+        if let material = await store.importLink(link) {
+            return .done(material, thumbnail: await store.thumbnail(for: material))
+        }
+        if store.linkImportStillRunning { return .stillRunning }
+        return .failed(store.errorMessage ?? "The download failed.")
+    }
+
+    /// Posts "downloading", then keeps the extension alive past
+    /// `completeRequest` with an expiring activity until the server answers,
+    /// and replaces the banner with the outcome. If iOS takes the time back
+    /// first, the banner says the download is still running — true, since
+    /// the server finishes it whether or not we are still listening.
+    private func downloadInBackground(_ link: String, store: MaterialsStore) async {
+        let notifier = ImportNotifier()
+        // Awaited so a fast outcome cannot reach the center ahead of it.
+        await notifier.postAndWait(.downloading)
+        let started = ContinuousClock.now
+        let finished = DispatchSemaphore(value: 0)
+        let settled = OSAllocatedUnfairLock(initialState: false)
+        Task {
+            let outcome = await Self.importOutcome(link, store: store)
+            settled.withLock { $0 = true }
+            Self.log.info("share import answered after \(started.duration(to: .now), privacy: .public)")
+            switch outcome {
+            case .done(_, let thumbnail):
+                let probe = store.lastLinkProbe
+                await notifier.postAndWait(.done(durationS: probe?.durationS), thumbnail: thumbnail)
+            case .failed(let message):
+                await notifier.postAndWait(.failed(message))
+            case .stillRunning:
+                await notifier.postAndWait(.stillRunning)
+            }
+            finished.signal()
+        }
+        ProcessInfo.processInfo.performExpiringActivity(withReason: "Downloading a shared TikTok video") { expired in
+            if expired {
+                if !settled.withLock({ $0 }) { notifier.post(.stillRunning) }
+                // Unblocks the waiting call below so the activity can end.
+                finished.signal()
+                return
+            }
+            finished.wait()
+        }
+    }
+
+    private static let log = Logger(subsystem: "xyz.doanhthuc.motion.share", category: "import")
 }
 
 struct ShareImportView: View {

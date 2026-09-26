@@ -17,6 +17,9 @@ public final class MaterialsStore {
     /// instead of pattern-matching `errorMessage`'s text (2026-09-25, used by
     /// the share extension's still-running card).
     public private(set) var linkImportStillRunning = false
+    /// The probe of the last successful `importLink` — its duration and size
+    /// are what the share extension's "added" banner shows.
+    public private(set) var lastLinkProbe: MaterialProbe?
 
     /// Public so a view can build an authenticated player for a material.
     public let client: APIClient
@@ -102,12 +105,14 @@ public final class MaterialsStore {
         isImportingLink = true
         errorMessage = nil
         linkImportStillRunning = false
+        lastLinkProbe = nil
         defer { isImportingLink = false }
         do {
             let completed = try await client.post(
                 UploadCompleteResponse.self, body: LinkImportRequest(url: link),
                 timeout: 120, "v1", "materials", "link")
             accept(completed)
+            lastLinkProbe = completed.probe
             await refresh()
             return completed.material
         } catch {

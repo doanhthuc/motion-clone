@@ -4,6 +4,7 @@ final class Phase3SmokeTests: XCTestCase {
     @MainActor
     func testDraftCompositionBatchDropAndValidation() throws {
         let app = XCUIApplication()
+        app.launchArguments.append("-UITestNoNotificationPrompt")
         app.launch()
         app.tabBars.buttons["New Job"].tap()
         XCTAssertTrue(app.staticTexts["New Job"].waitForExistence(timeout: 15))

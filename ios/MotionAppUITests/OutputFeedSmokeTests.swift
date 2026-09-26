@@ -6,6 +6,7 @@ final class OutputFeedSmokeTests: XCTestCase {
     @MainActor
     func testFeedPagesBetweenOutputs() throws {
         let app = XCUIApplication()
+        app.launchArguments.append("-UITestNoNotificationPrompt")
         app.launch()
         app.tabBars.buttons["Outputs"].tap()
 

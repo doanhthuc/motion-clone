@@ -83,7 +83,10 @@ struct RootView: View {
             }
         }
         .background(Theme.bg)
-        .task { model.resumeMaterialsUpload() }
+        .task {
+            model.resumeMaterialsUpload()
+            model.requestNotificationPermission()
+        }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
                 model.resumeMaterialsUpload()
