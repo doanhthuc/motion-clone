@@ -152,6 +152,11 @@ public final class StudioStore {
     /// Refs are resent as `snapshot`s of the failed generation's own copies —
     /// never the original `{kind, id}` — so retry still works after the source
     /// material was pruned or the try-on library entry it pointed at was deleted.
+    ///
+    /// Only the failed slots are re-bought: one failed Gemini tile out of four
+    /// must not re-buy all four. Qwen is the exception — a Qwen call returns
+    /// every image of the generation at once, so its slots fail together and
+    /// the whole count is resent.
     public func retry(_ generation: StudioGeneration) async -> Bool {
         guard let pid = project?.id else { return false }
         let refs = generation.refs.map { ref -> StudioRef in
@@ -159,7 +164,14 @@ public final class StudioStore {
             return StudioRef(kind: .snapshot, id: "\(pid)/\(file)")
         }
         return await post(prompt: generation.prompt, model: generation.model, aspect: generation.aspect,
-                          count: generation.count, refs: refs)
+                          count: retryCount(for: generation), refs: refs)
+    }
+
+    /// How many images `retry(_:)` asks for. The grid shows its price on the button.
+    public func retryCount(for generation: StudioGeneration) -> Int {
+        let provider = catalog?.models.first { $0.key == generation.model }?.provider
+        if provider == "qwen" { return generation.count }
+        return max(1, generation.slots.filter { $0.status == .error }.count)
     }
 
     private func post(prompt: String, model: String, aspect: String, count: Int, refs: [StudioRef]) async -> Bool {
@@ -189,6 +201,14 @@ public final class StudioStore {
                     startPolling()
                 }
                 return true
+            case .http(status: 409, body: let data) where Self.errorCode(data) == "outcome_unknown":
+                // An earlier request with this key is still being submitted on
+                // the server. It will land as a generation of its own; resending
+                // would only buy the same images twice. Treat it like a success:
+                // re-read the project so it shows up and polling starts.
+                message = "That generation is still being submitted — it will appear in the grid shortly."
+                if project?.id == pid { await open(pid) }
+                return true
             case .http(status: let status, body: let data):
                 message = APIClient.error(status: status, body: data).userMessage
                 return false
@@ -198,6 +218,11 @@ public final class StudioStore {
             }
         }
         return false
+    }
+
+    private static func errorCode(_ body: Data) -> String? {
+        if case .server(_, let code, _) = APIClient.error(status: 409, body: body) { return code }
+        return nil
     }
 
     // MARK: polling

@@ -56,8 +56,14 @@ private struct StudioTile: View {
                     Image(systemName: "exclamationmark.triangle").foregroundStyle(Theme.danger)
                     Text(tile.state.error ?? "Failed").font(.caption2).multilineTextAlignment(.center)
                         .foregroundStyle(Theme.secondary).lineLimit(4)
-                    Button("Retry") { Task { _ = await studio.retry(tile.generation) } }
-                        .buttonStyle(.bordered).controlSize(.small)
+                    // Priced like Send: Retry is a paid call too, and only
+                    // the failed slots are re-bought (Qwen: all of them).
+                    let n = studio.retryCount(for: tile.generation)
+                    Button("Retry · \(StudioFormat.usd(tile.generation.unitPriceUsd * Double(n)))") {
+                        Task { _ = await studio.retry(tile.generation) }
+                    }
+                    .buttonStyle(.bordered).controlSize(.small)
+                    .disabled(studio.isSending)
                 }.padding(8)
             case .done:
                 if let image {

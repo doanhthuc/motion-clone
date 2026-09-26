@@ -63,6 +63,11 @@ struct StudioComposer: View {
                 .disabled(!studio.canSend)
                 .accessibilityIdentifier("studio.send")
             }
+            if let model = studio.selectedModel, let reason = studio.disabledReason(for: model) {
+                Text(reason)
+                    .font(.caption).foregroundStyle(Theme.warning)
+                    .accessibilityIdentifier("studio.sendDisabledReason")
+            }
         }
         .padding(16)
         .background(RoundedRectangle(cornerRadius: 28).fill(Theme.surface).ignoresSafeArea(edges: .bottom))
