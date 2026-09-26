@@ -27,5 +27,8 @@ final class StudioSmokeTests: XCTestCase {
         XCTAssertTrue(row.waitForExistence(timeout: 10))
         row.press(forDuration: 1.0)
         app.buttons["Delete"].tap()
+        let confirm = app.buttons["sidebar.confirmDelete"]
+        XCTAssertTrue(confirm.waitForExistence(timeout: 5))
+        confirm.tap()
     }
 }

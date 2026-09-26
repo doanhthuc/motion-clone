@@ -7,6 +7,7 @@ struct SidebarView: View {
     @Environment(AppModel.self) private var model
     let studio: StudioStore
     @State private var renaming: StudioProjectSummary?
+    @State private var deleting: StudioProjectSummary?
     @State private var newTitle = ""
     @State private var showSettings = false
 
@@ -32,9 +33,7 @@ struct SidebarView: View {
                                        ? Theme.surfaceRaised : Theme.surface)
                     .contextMenu {
                         Button("Rename", systemImage: "pencil") { newTitle = p.title; renaming = p }
-                        Button("Delete", systemImage: "trash", role: .destructive) {
-                            Task { await studio.delete(p.id) }
-                        }
+                        Button("Delete", systemImage: "trash", role: .destructive) { deleting = p }
                     }
                 }
             }
@@ -51,7 +50,24 @@ struct SidebarView: View {
             Button("Save") { if let p = renaming { Task { await studio.rename(p.id, to: newTitle) } } }
             Button("Cancel", role: .cancel) {}
         }
+        .confirmationDialog(deleting.map { "Delete \(StudioFormat.title($0.title, createdAt: $0.createdAt))?" } ?? "",
+                            isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
+                            titleVisibility: .visible, presenting: deleting) { p in
+            Button("Delete project", role: .destructive) { Task { await studio.delete(p.id) } }
+                .accessibilityIdentifier("sidebar.confirmDelete")
+            Button("Cancel", role: .cancel) {}
+        } message: { p in
+            Text(deleteWarning(for: p))
+        }
         .sheet(isPresented: $showSettings) { NavigationStack { SettingsView(firstRun: false) } }
+    }
+
+    /// Deleting doesn't stop calls already sent: a provider still bills an
+    /// image it is generating even though its result has nowhere to land.
+    private func deleteWarning(for p: StudioProjectSummary) -> String {
+        let base = "Its images and references are removed from the server. This can't be undone."
+        guard studio.project?.id == p.id, studio.hasRunning else { return base }
+        return base + " Images are still generating in this project — they are paid for even though they will be discarded."
     }
 
     private func spaceRow(_ space: AppSpace, title: String, icon: String) -> some View {
