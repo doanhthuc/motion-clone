@@ -188,9 +188,10 @@ overwritten. Empty prompt → `400` (every provider requires a text prompt).
 
 ### Entry points from the Motion space
 
-`TryonPreviewCard`, Saved Try-ons and the try-on image viewer gain **"Edit in Studio"** → a sheet to
-pick an existing project or create one → the image is attached to that project's composer and the
-app switches to Studio.
+Two places gain **"Edit in Studio"**: `TryonPreviewCard` and the Saved try-ons context menu → a
+sheet to pick an existing project or create one → the image is attached to that project's composer
+and the app switches to Studio. (An earlier draft also listed a try-on image viewer; the app has no
+such viewer, so the line was amended 2026-09-26 to name the two entry points that exist.)
 
 ### MotionKit
 
