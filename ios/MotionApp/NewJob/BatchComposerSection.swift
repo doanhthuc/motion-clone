@@ -56,7 +56,10 @@ struct BatchComposerSection: View {
                                             kind: pipeline.roles[role] ?? .unknown,
                                             slot: store.draft?.slots[role], materials: materials,
                                             disabled: store.isBusy || composer.isRunning,
-                                            tile: true) { onPickRole(role) }
+                                            tile: true,
+                                            onClear: { Task { await store.assign(role: role, materialID: nil) } }) {
+                                onPickRole(role)
+                            }
                         }
                     }
                 } header: {

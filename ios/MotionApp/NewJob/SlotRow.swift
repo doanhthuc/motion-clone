@@ -80,6 +80,9 @@ struct SlotTile: View {
     let slot: DraftSlot?
     let thumbnail: Data?
     let disabled: Bool
+    /// Empties the slot in one tap. Before 2026-09-26 the only way was to open
+    /// the picker and deselect, which read as "change", not "remove".
+    var onClear: (() -> Void)?
     let onTap: () -> Void
 
     private var text: SlotText { SlotText(role: role, required: required, kind: kind, slot: slot) }
@@ -99,7 +102,8 @@ struct SlotTile: View {
                                 .padding(8)
                         }
                     }
-                    .overlay(alignment: .topTrailing) {
+                    // Leading, so the clear button owns the trailing corner.
+                    .overlay(alignment: .topLeading) {
                         if let warning = slot?.warning, !warning.isEmpty {
                             Image(systemName: "exclamationmark.triangle.fill")
                                 .font(.footnote)
@@ -130,6 +134,22 @@ struct SlotTile: View {
         .accessibilityLabel(text.title)
         .accessibilityValue(text.state)
         .accessibilityHint("Choose a material")
+        // Outside the tile's `Button`, so its tap is its own and not the
+        // tile's; a button nested in a button takes whichever wins the gesture.
+        .overlay(alignment: .topTrailing) {
+            if text.assigned, !disabled, let onClear {
+                Button(action: onClear) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.title3)
+                        .symbolRenderingMode(.palette)
+                        .foregroundStyle(.white, .black.opacity(0.55))
+                        .padding(4)
+                        .contentShape(.rect)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Clear \(text.title)")
+            }
+        }
     }
 
     /// An empty slot is the dashed add tile `BatchAddTile` already uses, so

@@ -54,19 +54,26 @@ struct PipelinePicker: View {
         }
     }
 
-    private func stageLine(_ pipeline: Pipeline) -> String {
-        pipeline.stages.map { Format.stageName($0).replacingOccurrences(of: "-", with: " ") }
-            .joined(separator: " → ")
-            .replacingOccurrences(of: "Try on", with: "Try-on")
-            .replacingOccurrences(of: "tryon", with: "try-on")
-    }
+    private func stageLine(_ pipeline: Pipeline) -> String { PipelineText.stages(pipeline) }
+    private func displayName(_ id: String) -> String { PipelineText.name(id) }
+}
 
+/// How a pipeline reads to a person, shared by the picker and the batch
+/// entries so the same job never shows under two different names.
+enum PipelineText {
     /// `tryon-camera-motion-enhance` → "Try-on Camera Motion Enhance".
-    private func displayName(_ id: String) -> String {
+    static func name(_ id: String) -> String {
         id.replacingOccurrences(of: "-", with: " ")
             .replacingOccurrences(of: "_", with: " ")
             .capitalized
             .replacingOccurrences(of: "Tryon", with: "Try-on")
+    }
+
+    static func stages(_ pipeline: Pipeline) -> String {
+        pipeline.stages.map { Format.stageName($0).replacingOccurrences(of: "-", with: " ") }
+            .joined(separator: " → ")
+            .replacingOccurrences(of: "Try on", with: "Try-on")
+            .replacingOccurrences(of: "tryon", with: "try-on")
     }
 }
 
@@ -190,7 +197,7 @@ private struct ProviderChoiceList: View {
 /// pod wait; may crop…" → name "Gemini API", caveat "Runs here, no pod wait;
 /// may crop…", short caveat "Runs here, no pod wait". The label leads with an
 /// emoji, which the rows drop; VoiceOver in the choice list still gets it verbatim.
-private struct ProviderText {
+struct ProviderText {
     let name: String
     let caveat: String?
 
@@ -209,7 +216,7 @@ private struct ProviderText {
 /// The provider's mark in one color, like an SF Symbol: the brand shape is
 /// what's recognizable at 22pt, and brand colors would be the only saturated
 /// things in the list besides the accent checkmark that means "selected".
-private struct ProviderMark: View {
+struct ProviderMark: View {
     let id: String
 
     var body: some View {

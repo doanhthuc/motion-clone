@@ -11,6 +11,7 @@ struct NewJobView: View {
     @Environment(AppModel.self) private var model
     @State private var selectedRole: String?
     @State private var dropCandidate: DraftBatchEntry?
+    @State private var openEntry: DraftBatchEntry?
     @State private var showRun = false
     @State private var pickingOutfits = false
     @State private var pickingDrivers = false
@@ -180,6 +181,13 @@ struct NewJobView: View {
                                                             composer: composer))
         .modifier(BatchPickerSheets(pickingOutfits: $pickingOutfits, pickingDrivers: $pickingDrivers,
                                     composer: composer, materials: materials, pipeline: pipeline))
+        .sheet(item: $openEntry) { entry in
+            let index = (store.draft?.batch.firstIndex { $0.digest == entry.digest } ?? 0) + 1
+            BatchEntryDetail(index: index, entry: entry, pipeline: self.pipeline(for: entry),
+                             materials: materials, library: library,
+                             dropDisabled: store.isBusy || composer.isRunning,
+                             onDrop: { await store.dropFromBatch(entry.digest) })
+        }
         .navigationDestination(isPresented: $showRun) {
             RunFlowView(flow: flow, entry: .newJob)
         }
@@ -226,7 +234,8 @@ struct NewJobView: View {
                         slot: draft.slots[role],
                         materials: materials,
                         disabled: store.isBusy,
-                        tile: true) {
+                        tile: true,
+                        onClear: { Task { await store.assign(role: role, materialID: nil) } }) {
                             selectedRole = role
                         }
                 }
@@ -310,47 +319,28 @@ struct NewJobView: View {
     @ViewBuilder private func batch(_ draft: Draft) -> some View {
         if !draft.batch.isEmpty {
             Section {
-                ForEach(draft.batch, id: \.digest) { entry in
-                    HStack(alignment: .firstTextBaseline, spacing: 12) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(entry.digest)
-                                .font(.body)
-                                .lineLimit(1).truncationMode(.middle)
-                            Text("\(entry.pipeline) · \(entry.provider)")
-                                .font(.subheadline)
-                                .foregroundStyle(Theme.secondary)
-                            Text(slotSummary(entry))
-                                .font(.footnote)
-                                .foregroundStyle(Theme.secondary)
-                                .lineLimit(2)
-                            if entry.tryonSeed != nil {
-                                Label("Saved try-on", systemImage: "photo.badge.checkmark")
-                                    .font(.footnote).foregroundStyle(Theme.secondary)
+                ForEach(Array(draft.batch.enumerated()), id: \.element.digest) { offset, entry in
+                    BatchEntryRow(index: offset + 1, entry: entry, pipeline: pipeline(for: entry),
+                                  materials: materials,
+                                  dropDisabled: store.isBusy || composer.isRunning,
+                                  onOpen: { openEntry = entry },
+                                  onDrop: { dropCandidate = entry })
+                        // On the row, so the popover points at the job it drops.
+                        .confirmationDialog(
+                            "Drop this batch entry?",
+                            isPresented: Binding(
+                                get: { dropCandidate?.digest == entry.digest },
+                                set: { if !$0 { dropCandidate = nil } }),
+                            titleVisibility: .visible
+                        ) {
+                            Button("Drop", role: .destructive) {
+                                dropCandidate = nil
+                                Task { await store.dropFromBatch(entry.digest) }
                             }
+                            Button("Cancel", role: .cancel) { dropCandidate = nil }
+                        } message: {
+                            Text("Job \(offset + 1) · \(BatchEntryText.subtitle(entry, pipeline: pipeline(for: entry)))")
                         }
-                        Spacer(minLength: 0)
-                        Button("Drop", role: .destructive) { dropCandidate = entry }
-                            .font(.subheadline.weight(.semibold))
-                            .buttonStyle(.borderless)
-                            .tint(Theme.danger)
-                            .disabled(store.isBusy || composer.isRunning)
-                            // On the button, so the popover points at this row's Drop.
-                            .confirmationDialog(
-                                "Drop this batch entry?",
-                                isPresented: Binding(
-                                    get: { dropCandidate?.digest == entry.digest },
-                                    set: { if !$0 { dropCandidate = nil } }),
-                                titleVisibility: .visible
-                            ) {
-                                Button("Drop", role: .destructive) {
-                                    dropCandidate = nil
-                                    Task { await store.dropFromBatch(entry.digest) }
-                                }
-                                Button("Cancel", role: .cancel) { dropCandidate = nil }
-                            } message: {
-                                Text(entry.digest)
-                            }
-                    }
                 }
             } header: {
                 HStack {
@@ -369,11 +359,8 @@ struct NewJobView: View {
         }
     }
 
-    private func slotSummary(_ entry: DraftBatchEntry) -> String {
-        entry.slots.keys.sorted().map { role in
-            let materialID: String? = entry.slots[role] ?? nil
-            return "\(role): \(materialID ?? "empty")"
-        }.joined(separator: " · ")
+    private func pipeline(for entry: DraftBatchEntry) -> Pipeline? {
+        store.catalog.first { $0.id == entry.pipeline }
     }
 
     private func closePickerIfSelectionDisappeared() {
@@ -393,6 +380,7 @@ struct SlotMaterialRow: View {
     let materials: MaterialsStore
     let disabled: Bool
     var tile = false
+    var onClear: (() -> Void)?
     let onTap: () -> Void
     @State private var thumbnail: Data?
 
@@ -405,7 +393,7 @@ struct SlotMaterialRow: View {
         Group {
             if tile {
                 SlotTile(role: role, required: required, kind: kind, slot: slot,
-                         thumbnail: thumbnail, disabled: disabled, onTap: onTap)
+                         thumbnail: thumbnail, disabled: disabled, onClear: onClear, onTap: onTap)
             } else {
                 SlotRow(role: role, required: required, kind: kind, slot: slot,
                         thumbnail: thumbnail, disabled: disabled, onTap: onTap)
