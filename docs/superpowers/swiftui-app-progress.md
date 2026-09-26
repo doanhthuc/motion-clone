@@ -60,6 +60,40 @@ The spec's gate record is the single place its gate results are written down.
   test is 2 outfits × 2 drivers, expecting 2 provider calls, and it needs its own approval and a
   quoted price.
 
+## New Job single stage (2026-09-26, branch `newjob-single-stage`)
+
+Spec: [`specs/2026-09-26-newjob-single-stage-design.md`](specs/2026-09-26-newjob-single-stage-design.md);
+plan: [`plans/2026-09-26-newjob-single-stage.md`](plans/2026-09-26-newjob-single-stage.md).
+
+- **New Job is one stage that does not scroll.** It has slot cards sized to the space left
+  (`SlotCardGrid`), a Pipeline · Provider chip in the toolbar, a basket drawer above the action bar,
+  and Add / Continue. The Single | Batch switch is gone: on a try-on pipeline, Outfit and Driver take
+  many picks (`NewJobState`), and one of each is one job.
+- **Continue adds a pending composition, validates, and opens the run flow in one tap.** Validate is no
+  longer a step of its own.
+- **The crossed roles live only in `BatchComposer`.** `adoptDraftSelection()` moves a draft's outfit,
+  seed and driver in, which is how Saved try-ons' "Use in job" still works. `reset()` empties the
+  selection on Clear and on switching to a non-try-on pipeline. After a build, **drivers stay picked**
+  and only the outfits clear.
+- **Picking chains only on a fresh draft.** One sheet walks the empty required cards. Long press on a
+  card gives Clear, or the outfit's saved try-on and Remove. Drop is a swipe left in the drawer.
+- **Refresh moved into the `⋯` menu.** The icon turns to a warning while the draft is stale. A bar
+  button that came and went with `isStale` crowded the chip, and iOS 26 then dropped the whole
+  trailing group, Clear with it (seen in the first Phase 3 run).
+- **Gates:**
+  - `make ios-test`: 316/316 passed.
+  - `make ios-build`: clean.
+  - `make ios-ui-test`: 8/9 on the rerun. `Phase5SmokeTests` timed out once waiting for the RunPod
+    migrate ask, then passed alone.
+  - `NewJobStageTests` passed on an iPhone SE (3rd gen) and an iPhone 18 Pro Max simulator. It checks
+    that every card sits above the action bar and that `⋯` stays in the bar, with no swipe.
+    Screenshots are in `out/newjob-stage/` (gitignored).
+- **Not yet done:**
+  - Installed on the phone: no. The phone read `unavailable` to `devicectl` on 2026-09-26.
+  - No screenshot covers the drawer open, the error banner, or the chain mid-way.
+  - The gestures (paging through outfits on a card, dragging the drawer, the long-press menus) have
+    only been exercised by XCUITest taps, not by hand.
+
 ## Materials add flow (2026-09-26)
 
 - **The category is chosen before the pick.** The "What is this image?" dialog that followed each
