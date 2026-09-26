@@ -182,3 +182,41 @@ class TestOutcome(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestJobSetup(RunsTestBase):
+    """What each job was made from, for the phone's batch details. Material
+    ids only — the manifest's absolute paths never leave the box."""
+
+    MANIFEST = (
+        "runs:\n"
+        "  - id: a\n"
+        "    pipeline: tryon-character-swap-enhance\n"
+        "    inputs:\n"
+        "      character: /opt/motion-clone/batch/tg-staging/app/IMG_7145.png\n"
+        "      driver: /opt/motion-clone/batch/tg-staging/app/tiktok-1.mp4\n"
+        "      outfit: /opt/motion-clone/batch/tg-staging/app/IMG_7112.jpeg\n"
+        "    character-swap: { preset: drv-20s }\n"
+        "    tryon: { provider: qwen-max }\n"
+        "  - id: b\n"
+        "    pipeline: motion-enhance\n"
+        "    inputs:\n"
+        "      character: /opt/motion-clone/batch/tg-staging/app/IMG_7145.png\n"
+        "      driver: /opt/motion-clone/batch/tg-staging/app/tiktok-2.mp4\n"
+    )
+
+    def test_each_job_carries_pipeline_provider_and_material_ids(self):
+        manifest = write_run(self.batch, "r", STATE)
+        manifest.write_text(self.MANIFEST, encoding="utf-8")
+        jobs = {j["id"]: j for j in runs.run_detail(self.batch, self.out, "r")["jobs"]}
+        self.assertEqual(jobs["a"]["setup"], {
+            "pipeline": "tryon-character-swap-enhance", "provider": "qwen-max",
+            "inputs": {"character": "app/IMG_7145.png", "driver": "app/tiktok-1.mp4",
+                       "outfit": "app/IMG_7112.jpeg"}})
+        self.assertEqual(jobs["b"]["setup"]["provider"], None)
+        self.assertNotIn("/opt", json.dumps(jobs))
+
+    def test_unreadable_manifest_leaves_setup_null(self):
+        write_run(self.batch, "r", STATE)   # "runs: []" does not load
+        jobs = runs.run_detail(self.batch, self.out, "r")["jobs"]
+        self.assertTrue(all(j["setup"] is None for j in jobs))

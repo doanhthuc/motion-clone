@@ -13,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from batchlib.manifest import load_state, state_path_for
+from batchlib.manifest import ManifestError, load_manifest, load_state, state_path_for
 from control.outputs import final_names
 from control.paths import safe_child
 import tgbot.run as run_mod
@@ -78,6 +78,25 @@ def list_runs(batch_dir: Path, out_dir: Path) -> list[dict]:
     return sorted(found, key=lambda r: r["updated_at"], reverse=True)
 
 
+def _job_setups(manifest: Path) -> dict[str, dict]:
+    """job id -> what it was made from, for the phone's batch details.
+
+    Inputs go out as material ids (`<owner>/<name>`, the staging layout
+    `control.materials` lists), never the manifest's absolute paths. A
+    manifest that no longer loads gives no setups rather than a 500: the
+    journal, not the manifest, is what this route exists to report.
+    """
+    try:
+        loaded = load_manifest(manifest)
+    except (ManifestError, OSError):
+        return {}
+    return {run.id: {"pipeline": run.pipeline,
+                     "provider": (run.stage_params.get("tryon") or {}).get("provider"),
+                     "inputs": {role: f"{path.parent.name}/{path.name}"
+                                for role, path in run.inputs.items()}}
+            for run in loaded.runs}
+
+
 def run_detail(batch_dir: Path, out_dir: Path, run_id: str) -> dict | None:
     manifest = safe_child(batch_dir, f"{run_id}.yaml") if run_id else None
     if manifest is None or not manifest.is_file():
@@ -87,6 +106,7 @@ def run_detail(batch_dir: Path, out_dir: Path, run_id: str) -> dict | None:
         return None
     detail = _summary(manifest, state_file)
     jobs = load_state(state_file).get("runs") or {}
+    setups = _job_setups(manifest)
     # Whitelisted fields only: the journal also holds absolute `file` paths
     # and the full params_sent payload, neither of which the phone needs.
     detail["jobs"] = [
@@ -95,7 +115,8 @@ def run_detail(batch_dir: Path, out_dir: Path, run_id: str) -> dict | None:
                      "status": str(stage.get("status")),
                      "elapsed_sec": stage.get("elapsed_sec")}
                     for name, stage in (job.get("stages") or {}).items()
-                    if isinstance(stage, dict)]}
+                    if isinstance(stage, dict)],
+         "setup": setups.get(job_id)}
         for job_id, job in jobs.items() if isinstance(job, dict)
     ]
     lease = run_mod.lease_for(manifest)

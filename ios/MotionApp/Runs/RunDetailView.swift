@@ -13,6 +13,13 @@ struct RunDetailView: View {
     let pod: PodStore
     @Environment(\.scenePhase) private var scenePhase
     @State private var selection: String?
+    @State private var details: DetailsTarget?
+
+    /// The details sheet, opened for the whole batch or scrolled to one job.
+    private struct DetailsTarget: Identifiable {
+        let focus: String?
+        var id: String { focus ?? "" }
+    }
 
     var body: some View {
         Group {
@@ -30,6 +37,17 @@ struct RunDetailView: View {
         .background(Theme.bg)
         .navigationTitle(store.detail?.batch ?? store.runID)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            if store.detail != nil {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button { details = DetailsTarget(focus: nil) } label: { Image(systemName: "info.circle") }
+                        .accessibilityLabel("Batch details")
+                }
+            }
+        }
+        .sheet(item: $details) { target in
+            if let d = store.detail { BatchDetailsSheet(detail: d, focus: target.focus) }
+        }
         // Polls only while this screen is visible AND the app is active;
         // `.task(id:)` restarts/cancels the loop when scenePhase changes.
         .task(id: scenePhase) {
@@ -77,11 +95,18 @@ struct RunDetailView: View {
         }
     }
 
+    /// Only the bot's current run can be rented again — `confirm`/`resume` act
+    /// on that one manifest — and only while nothing is running or leased.
+    private func canContinue(_ d: RunDetail) -> Bool {
+        d.id == flow.runID && !d.status.isLive && d.lease == nil && pod.pod?.lease == nil
+            && d.jobsDone < d.jobsTotal
+    }
+
     private func pager(_ d: RunDetail) -> some View {
         ScrollView(.horizontal) {
             LazyHStack(spacing: 12) {
                 ForEach(d.jobs) { job in
-                    JobPage(store: store, detail: d, job: job)
+                    JobPage(store: store, detail: d, job: job) { details = DetailsTarget(focus: job.id) }
                         .containerRelativeFrame(.horizontal)
                         .id(job.id)
                 }
@@ -99,6 +124,16 @@ struct RunDetailView: View {
     @ViewBuilder private func actions(_ d: RunDetail) -> some View {
         if d.id == flow.runID, flow.canRetryRental, let failure = flow.pod?.failedRental {
             RetryRentalCard(flow: flow, failure: failure)
+        } else if canContinue(d) {
+            // The same road as after a fresh Phase A: previews, then the rent
+            // panel, where the quote is shown and nothing is rented until Confirm.
+            NavigationLink {
+                RunFlowView(flow: flow, entry: .existing)
+            } label: {
+                Label("Continue batch · \(d.jobsTotal - d.jobsDone) left", systemImage: "play.fill")
+            }
+            .buttonStyle(PrimaryButtonStyle())
+            .accessibilityIdentifier("run.continue")
         }
         if d.id == pod.pod?.runId, pod.showsKill(runStatus: d.status), let runID = pod.pod?.runId {
             KillButton(pod: pod, runID: runID, hasLease: pod.pod?.lease != nil)
@@ -183,6 +218,7 @@ private struct JobPage: View {
     let store: RunDetailStore
     let detail: RunDetail
     let job: JobProgress
+    let showDetails: () -> Void
     @Environment(AppModel.self) private var model
     @State private var tryon: UIImage?
 
@@ -202,6 +238,23 @@ private struct JobPage: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .clipShape(.rect(cornerRadius: 22))
         .overlay(alignment: .bottom) { PageCaption(title: job.id, subtitle: subtitle) }
+        .overlay(alignment: .topTrailing) {
+            Button(action: showDetails) {
+                Image(systemName: "info.circle.fill")
+                    .font(.title3).symbolRenderingMode(.hierarchical).foregroundStyle(.white)
+                    .padding(12)
+            }
+            .accessibilityLabel("Details for \(job.id)")
+        }
+        // A swipe up opens this job's details; simultaneous so the pager's
+        // sideways drag is never blocked.
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 24).onEnded { value in
+                guard value.translation.height < -60,
+                      abs(value.translation.width) < abs(value.translation.height) / 2 else { return }
+                showDetails()
+            }
+        )
         .task(id: job.id) {
             let loaded = await store.tryonImage(forJob: job.id).flatMap(UIImage.init(data:))
             withAnimation(.easeOut(duration: 0.4)) { tryon = loaded }
@@ -235,8 +288,23 @@ private struct JobPage: View {
         }
     }
 
-    private var working: some View {
-        WorkCanvas(backdrop: tryon, animating: job.status == .running) {
+    /// Only a running job is blurred and scanned. A queued, stopped or failed
+    /// one already has a finished try-on, and that picture is worth seeing.
+    @ViewBuilder private var working: some View {
+        if job.status != .running, let tryon {
+            FramedImage(image: tryon)
+                .overlay(alignment: .bottomLeading) {
+                    jobStatus
+                        .padding(.horizontal, 12).padding(.vertical, 8)
+                        .background(.ultraThinMaterial, in: .rect(cornerRadius: Theme.Radius.medium))
+                        .padding(.horizontal, 12).padding(.bottom, 78)
+                }
+        } else {
+            WorkCanvas(backdrop: tryon, animating: job.status == .running) { jobStatus }
+        }
+    }
+
+    @ViewBuilder private var jobStatus: some View {
             switch job.status {
             case .running:
                 WorkStatus(title: "\(Format.stageName(runningStage?.name ?? "working"))…", active: true) {
@@ -257,7 +325,6 @@ private struct JobPage: View {
                     Text(detail.status.isLive ? "Waits for the job before it" : "The run stopped before this job")
                 }
             }
-        }
     }
 
     private var stagePosition: String {
@@ -283,20 +350,30 @@ private struct FramedPoster: View {
     @State private var poster: UIImage?
 
     var body: some View {
-        Theme.surface
-            .overlay {
-                if let poster {
-                    Image(uiImage: poster).resizable().scaledToFill().blur(radius: 40).opacity(0.55)
-                }
-            }
-            .overlay {
-                if let poster { Image(uiImage: poster).resizable().scaledToFit() }
-            }
-            .clipped()
+        FramedImage(image: poster)
             .task(id: file.id) {
                 poster = OutputPosters.shared.cached(batch: batch, file: file)
                 if poster == nil { poster = await OutputPosters.shared.poster(client: client, batch: batch, file: file) }
             }
+    }
+}
+
+/// A picture fitted to the page over a blur of itself, so a portrait frame
+/// fills the page without being cropped.
+struct FramedImage: View {
+    let image: UIImage?
+
+    var body: some View {
+        Theme.surface
+            .overlay {
+                if let image {
+                    Image(uiImage: image).resizable().scaledToFill().blur(radius: 40).opacity(0.55)
+                }
+            }
+            .overlay {
+                if let image { Image(uiImage: image).resizable().scaledToFit() }
+            }
+            .clipped()
     }
 }
 

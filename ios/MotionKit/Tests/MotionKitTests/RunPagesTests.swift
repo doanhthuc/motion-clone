@@ -35,6 +35,14 @@ import Testing
         #expect(LiveProgress(run: run, tryon: try tryon(["done"])) == LiveProgress(done: 1, total: 3, unit: .jobs))
     }
 
+    @Test func jobSetupDecodesAndIsOptional() throws {
+        let json = #"{"id":"r","batch":"b","status":"stopped","updated_at":1,"jobs_total":2,"jobs_done":0,"jobs":[{"id":"a","status":"pending","stages":[],"setup":{"pipeline":"p","provider":null,"inputs":{"character":"app/c.png","driver":"app/d.mp4"}}},{"id":"b","status":"pending","stages":[]}],"lease":null,"outputs":[]}"#
+        let detail = try MotionJSON.decoder.decode(RunDetail.self, from: Data(json.utf8))
+        #expect(detail.jobs[0].setup?.inputs["character"] == "app/c.png")
+        #expect(detail.jobs[0].setup?.provider == nil)
+        #expect(detail.jobs[1].setup == nil)
+    }
+
     @Test func outputsMatchTheirJobIncludingReruns() throws {
         let json = #"{"id":"r","batch":"b","status":"done","updated_at":1,"jobs_total":2,"jobs_done":2,"jobs":[],"lease":null,"outputs":["a-b-c.mp4","a-b-c-2.mp4","a-b-cd.mp4","a-b-c-x.mp4"]}"#
         let detail = try MotionJSON.decoder.decode(RunDetail.self, from: Data(json.utf8))
@@ -45,6 +53,27 @@ import Testing
 
 extension URLProtocolTests {
     @Suite @MainActor struct RunDetailPagesTests {
+        /// Two pages ask at once when the screen opens. The second used to see
+        /// "already loading" with no previews yet and return nil — the second
+        /// job's page stayed blank (2026-09-26, on device).
+        @Test func concurrentPagesBothGetTheirImage() async {
+            StubURLProtocol.install { req in
+                switch req.url?.path {
+                case "/v1/runs/tg-1000/tryon":
+                    TestSupport.json(#"{"run_id":"tg-1000","run_token":"t","phase_a_running":false,"previews":[{"index":"0","run":"a","status":"done","has_image":true},{"index":"1","run":"b","status":"done","has_image":true}]}"#)
+                case "/v1/runs/tg-1000/tryon/0": (200, [:], Data([0]))
+                case "/v1/runs/tg-1000/tryon/1": (200, [:], Data([1]))
+                default: (404, [:], Data())
+                }
+            }
+            let store = RunDetailStore(client: TestSupport.client(), runID: "tg-1000")
+            async let a = store.tryonImage(forJob: "a")
+            async let b = store.tryonImage(forJob: "b")
+            let (ia, ib) = await (a, b)
+            #expect(ia == Data([0]))
+            #expect(ib == Data([1]))
+        }
+
         @Test func detailStoreFindsTheJobsTryonImage() async {
             StubURLProtocol.install { req in
                 switch req.url?.path {
