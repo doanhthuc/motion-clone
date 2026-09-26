@@ -182,6 +182,12 @@ if let runID = slot?.runId {
 } else {
     print("skip GET /v1/runs/{slot}/tryon and rent-panel (no run_id on /v1/pod)")
 }
+await check("GET /v1/studio/models") {
+    _ = try await client.get(StudioCatalog.self, "v1", "studio", "models")
+}
+await check("GET /v1/studio/projects") {
+    _ = try await client.get(StudioProjectsResponse.self, "v1", "studio", "projects")
+}
 await check("GET /v1/materials") {
     _ = try await client.get(MaterialsResponse.self, "v1", "materials")
 }

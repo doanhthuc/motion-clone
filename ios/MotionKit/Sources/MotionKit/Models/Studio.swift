@@ -82,7 +82,7 @@ public struct StudioProject: Decodable, Sendable, Equatable, Identifiable {
     public var generations: [StudioGeneration]
 }
 
-struct StudioProjectsResponse: Decodable, Sendable { let projects: [StudioProjectSummary] }
+public struct StudioProjectsResponse: Decodable, Sendable { public let projects: [StudioProjectSummary] }
 struct StudioProjectResponse: Decodable, Sendable { let project: StudioProject }
 struct StudioGenerationResponse: Decodable, Sendable { let generation: StudioGeneration }
 struct StudioPromoteMaterial: Decodable, Sendable { let material: Material }
