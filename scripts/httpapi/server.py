@@ -23,9 +23,11 @@ import control.material_roles as material_roles
 import control.materials as materials
 import control.outputs as outputs
 import control.runs as runs
+import control.studio as studio
+import control.studio_runner as studio_runner
 import control.tryon_library as tryon_library
 import control.uploads as uploads
-from control.idempotency import IdempotencyError
+from control.idempotency import IdempotencyError, IdempotencyStore
 from httpapi.files import send_file
 
 
@@ -52,7 +54,10 @@ _DOMAIN_STATUS = {"bad_request": 400, "forbidden": 403, "not_found": 404, "in_us
                   # deleted: 404 like not_found, but its own code so the phone
                   # does not mistake it for a stale material and reload them.
                   "seed_not_found": 404,
-                  "duplicate": 422, "nothing_to_validate": 422, "invalid": 422}
+                  "duplicate": 422, "nothing_to_validate": 422, "invalid": 422,
+                  # Image Studio (control/studio_runner.py): a request the models cannot take.
+                  "unknown_model": 422, "model_unavailable": 422, "too_many_refs": 422,
+                  "ref_not_found": 422, "ref_not_image": 422}
 MAX_JSON_BODY = 64 * 1024
 # A body this size or smaller is read and thrown away to keep the connection
 # usable; anything bigger is not worth reading, so the connection is closed
@@ -110,7 +115,7 @@ class _Handler(BaseHTTPRequestHandler):
         except ApiError as exc:
             self._error(exc.status, exc.code, exc.message)
         except (uploads.UploadError, materials.MaterialError, drafts.DraftError,
-                material_roles.MaterialRoleError, IdempotencyError) as exc:
+                material_roles.MaterialRoleError, IdempotencyError, studio.StudioError) as exc:
             self._error(_DOMAIN_STATUS.get(exc.code, 400), exc.code, exc.message)
         except Exception:
             # Logged in full, returned opaque: the client gets no internals.
@@ -435,8 +440,105 @@ class _Handler(BaseHTTPRequestHandler):
             except tryon_library.TryonLibraryError as exc:
                 raise ApiError(404 if exc.code == "not_found" else 400, exc.code, exc.message)
             return self._send_json(200, {"ok": True})
+        if rest[:1] == ["studio"]:
+            return self._route_studio(method, rest[1:])
         if rest[:1] == ["draft"]:
             return self._route_draft(method, rest[1:])
+        raise NOT_FOUND
+
+    def _studio_ref_path(self, ref: dict) -> Path:
+        """The file behind one Studio reference. The phone names things, never paths."""
+        s, kind, ident = self.server, ref["kind"], ref["id"]
+        path = None
+        if kind == "material" and ident.count("/") == 1:
+            path = materials.resolve_material(s.staging_root, *ident.split("/"))
+        elif kind == "tryon":
+            path = s.tryon_library.resolve_image(ident)
+        elif kind == "run_tryon" and ident.count("/") == 1 and s.app_runs is not None:
+            path = s.app_runs.tryon_image(*ident.split("/"))
+        elif kind == "studio" and ident.count("/") == 1:
+            path = s.studio.resolve_image(*ident.split("/"))
+        elif kind == "snapshot" and ident.count("/") == 1:
+            path = s.studio.resolve_ref(*ident.split("/"))
+        if path is None:
+            raise ApiError(422, "ref_not_found", f"reference not found: {kind} {ident}")
+        if path.suffix.lower() not in materials.IMAGE_SUFFIXES:
+            raise ApiError(422, "ref_not_image", f"reference is not an image: {kind} {ident}")
+        return path
+
+    def _route_studio(self, method: str, rest: list[str]) -> None:
+        s = self.server
+        store = s.studio
+        if method == "GET" and rest == ["models"]:
+            return self._send_json(200, studio_runner.catalog(s.repo_root))
+        if rest == ["projects"]:
+            if method == "GET":
+                return self._send_json(200, {"projects": store.list_projects()})
+            if method == "POST":
+                title = self._read_json().get("title") or ""
+                return self._send_json(201, {"project": store.create_project(str(title))})
+        if len(rest) == 2 and rest[0] == "projects":
+            pid = rest[1]
+            if method == "GET":
+                return self._send_json(200, {"project": store.get_project(pid)})
+            if method == "PATCH":
+                return self._send_json(200, {"project": store.rename(pid, str(self._read_json().get("title") or ""))})
+            if method == "DELETE":
+                store.delete_project(pid)
+                return self._send_empty(204)
+        if method == "POST" and len(rest) == 3 and rest[0] == "projects" and rest[2] == "generations":
+            pid = rest[1]
+            key = self._idempotency_key()
+            # begin() before any validation: a retry after a lost response must replay the
+            # stored 202 even if the project was deleted or a ref no longer resolves since the
+            # first attempt — otherwise the phone is told the generation failed while it is
+            # still spending. Forgetting the key on any failure below (including a 404/422 that
+            # only surfaces on this attempt) is safe only because everything between here and
+            # submit() is pure validation, and submit() itself does all its I/O (copying refs,
+            # writing the generation record) before the first _spawn — so nothing has been sent
+            # to a provider yet when the except fires.
+            replay = s.studio_idem.begin("studio-generate", key)
+            if replay is not None:
+                return self._send_json(*replay)
+            try:
+                store.get_project(pid)                                  # 404 before anything else
+                req = studio_runner.parse_request(self._read_json(), s.repo_root)
+                paths = [self._studio_ref_path(r) for r in req.refs]   # 422 before spending
+                gen = s.studio_runner.submit(pid, req, paths)
+            except Exception:
+                s.studio_idem.forget("studio-generate", key)
+                raise
+            body = {"generation": gen}
+            s.studio_idem.finish("studio-generate", key, 202, body)
+            return self._send_json(202, body)
+        if method == "GET" and len(rest) == 4 and rest[0] == "projects" and rest[2] in ("images", "refs"):
+            path = (store.resolve_image(rest[1], rest[3]) if rest[2] == "images"
+                    else store.resolve_ref(rest[1], rest[3]))
+            if path is None:
+                raise NOT_FOUND
+            try:
+                self._settle_body()
+                return send_file(self, path)
+            except FileNotFoundError:
+                raise NOT_FOUND
+        if (method == "POST" and len(rest) == 5 and rest[0] == "projects" and rest[2] == "images"
+                and rest[4] == "promote"):
+            pid, image_id = rest[1], rest[3]
+            target = self._read_json().get("to")
+            if target not in ("material", "tryon"):
+                raise ApiError(400, "bad_request", "to must be 'material' or 'tryon'")
+            path = store.resolve_image(pid, image_id)
+            if path is None:
+                raise NOT_FOUND
+            model = next((g["model"] for g in store.get_project(pid)["generations"]
+                          if image_id.startswith(g["id"] + "-")), "studio")
+            if target == "material":
+                staged = materials.stage_file(s.staging_root / materials.APP_OWNER, path,
+                                              f"studio-{image_id}{path.suffix}")
+                item = s.material_roles.annotate([materials.material_item(materials.APP_OWNER, staged)])[0]
+                return self._send_json(200, {"material": item})
+            record = s.tryon_library.save(image=path, material_ids={}, provider=f"studio:{model}")
+            return self._send_json(200, {"entry": record})
         raise NOT_FOUND
 
     def _route_draft(self, method: str, rest: list[str]) -> None:
@@ -537,6 +639,18 @@ def make_server(*, token: str, batch_dir: Path, out_dir: Path,
     # and is built beside it; its migrate confirm token lives on the instance,
     # so exactly one is built, before the thread starts.
     server.app_pod = app_pod
+    server.studio = studio.StudioStore(batch_dir / "studio", materials.APP_OWNER)
+    # Slots a previous process left queued/running have no thread any more (a deploy restarts
+    # motion-bot); without this the phone would poll them forever.
+    # Guarded: a malformed batch/studio/app.json must not crash-loop motion-bot, which would
+    # take Telegram down with the phone API.
+    try:
+        server.studio.recover_interrupted()
+    except Exception:
+        log("studio: recover_interrupted failed at startup\n" + traceback.format_exc())
+    server.studio_runner = studio_runner.StudioRunner(server.studio, batch_dir.parent, log=log)
+    # Its own store object over the same directory the bot's AppRuns uses; scopes keep keys apart.
+    server.studio_idem = IdempotencyStore(batch_dir / "idempotency")
     return server
 
 

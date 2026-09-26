@@ -690,7 +690,7 @@ class TestCameraComposition(GeminiServerCase):
             lt.qwen_max_edit([(b"x", "image/png")], "prompt", "fake", Path(d) / "camera.png", size="752*1328")
             lt.qwen_max_edit([(b"x", "image/png")], "prompt", "fake", Path(d) / "ordinary.png")
         self.assertEqual(bodies[0]["parameters"]["size"], "752*1328")
-        self.assertEqual(bodies[1]["parameters"], {"watermark": False})
+        self.assertEqual(bodies[1]["parameters"], {"watermark": False, "n": 1})
 
     def test_camera_local_two_step_compose_and_guide_aspect(self):
         # 15/09/2026 - camera compose tách làm 2 lệnh riêng (root cause #2, batch 2026-09-15-0030):

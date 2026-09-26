@@ -8,6 +8,7 @@ struct SavedTryonsView: View {
     let composer: BatchComposer
     @Environment(AppModel.self) private var model
     @State private var deleteCandidate: TryonLibraryEntry?
+    @State private var editing: StudioRef?
 
     private let columns = [GridItem(.flexible(), spacing: 12, alignment: .top),
                            GridItem(.flexible(), spacing: 12, alignment: .top)]
@@ -30,6 +31,11 @@ struct SavedTryonsView: View {
                             SavedTryonTile(entry: entry, library: library, materials: materials,
                                            disabled: draft.isBusy || composer.isRunning,
                                            onUse: { use(entry) }, onDelete: { deleteCandidate = entry })
+                                .contextMenu {
+                                    Button("Edit in Studio", systemImage: "wand.and.stars") {
+                                        editing = StudioRef(kind: .tryon, id: entry.id)
+                                    }
+                                }
                         }
                     }
                 }
@@ -44,6 +50,7 @@ struct SavedTryonsView: View {
             if !materials.loaded { await materials.refresh() }
             if draft.draft == nil { await draft.load() }
         }
+        .sheet(item: $editing) { EditInStudioSheet(ref: $0) }
         .confirmationDialog(
             "Delete this saved try-on?",
             isPresented: Binding(get: { deleteCandidate != nil }, set: { if !$0 { deleteCandidate = nil } }),

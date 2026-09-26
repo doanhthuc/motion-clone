@@ -453,16 +453,35 @@ def _post_json(url: str, query: dict, payload: dict, timeout: int) -> dict:
         raise JobError(f"Gemini API không phản hồi: {exc}") from exc
 
 
-def gemini_edit(images: list[tuple[bytes, str]], prompt: str, key: str, out_path: Path,
-                aspect_ratio: str | None = None, model: str | None = None,
-                base_url: str = GEMINI_API_BASE, image_size: str | None = None) -> Path:
-    """Cổng urllib của linux.py:_gemini_edit (3455-3478, bản gốc dùng requests.post).
+def gemini_no_image_reason(data: dict) -> str:
+    """Why a generateContent answer carried no image, in words a phone can show.
 
-    image_size: generationConfig.imageConfig.imageSize ("1K"/"2K"/"4K", viết hoa K). Không truyền →
-    gemini-3-pro-image tự mặc định 1K (~1MP) BẤT KỂ ảnh input to đến đâu — đo 16/09/2026 (run
-    IMG67441-IMG6957-IMG68943-tiktok178952): candidate bước camera-reframe ra đúng 768x1376, khớp
-    hệt preset 1K cho ảnh dọc 9:16. Đây không phải residual của bug crop đã sửa tối 15/09 (4aca8c9,
-    ép framed xuống pixel driver) — bug đó đã sửa đúng, chỉ là chưa từng có ai set imageSize.
+    Gemini answers a refused image with 200 and no inlineData: the reason sits in
+    promptFeedback.blockReason, a candidate's finishReason, and/or a text part.
+    Image Studio shows this string to the user, so it must not be a JSON dump.
+    """
+    bits = []
+    block = (data.get("promptFeedback") or {}).get("blockReason")
+    if block:
+        bits.append(f"blocked: {block}")
+    for cand in data.get("candidates") or []:
+        if cand.get("finishReason") and cand["finishReason"] != "STOP":
+            bits.append(f"finish: {cand['finishReason']}")
+        for part in (cand.get("content") or {}).get("parts") or []:
+            if part.get("text"):
+                bits.append(part["text"].strip())
+    return " · ".join(bits) or "no image in the response"
+
+
+def gemini_image_bytes(images: list[tuple[bytes, str]], prompt: str, key: str, *,
+                       model: str | None = None, aspect_ratio: str | None = None,
+                       image_size: str | None = None, base_url: str = GEMINI_API_BASE) -> bytes:
+    """One generateContent call → the first returned image's bytes.
+
+    image_size: generationConfig.imageConfig.imageSize ("1K"/"2K"/"4K", capital K). Without it
+    gemini-3-pro-image falls back to 1K (~1 MP) however large the input — measured 2026-09-16
+    (run IMG67441-IMG6957-IMG68943-tiktok178952): the camera-reframe candidate came out 768x1376,
+    the 1K preset for 9:16.
     """
     parts = [{"text": prompt}]
     for data, mime in images:
@@ -481,15 +500,25 @@ def gemini_edit(images: list[tuple[bytes, str]], prompt: str, key: str, out_path
         for part in ((cand.get("content") or {}).get("parts") or []):
             blob = part.get("inlineData") or part.get("inline_data")
             if blob and blob.get("data"):
-                out_path.write_bytes(base64.b64decode(blob["data"]))
-                return out_path
-    raise JobError(f"Gemini không trả ảnh: {json.dumps(data)[:300]}")
+                return base64.b64decode(blob["data"])
+    raise JobError(f"Gemini returned no image: {gemini_no_image_reason(data)}")
 
 
-# linux.py: khối "Qwen-Image (DashScope Model Studio) — provider='qwen-max' & fallback Gemini" (thêm
-# 25/08/2026, ngay sau QWEN_EDIT_MAX_REFS). qwen-image-3.0-pro đang limited preview (Alibaba yêu cầu apply
-# access qua Model Gallery trước khi key gọi được — key user 25/08 CHƯA được duyệt) → mặc định về
-# qwen-image-edit-plus (bản GA). Được duyệt 3.0 → set env QWEN_IMAGE_MODEL=qwen-image-3.0-pro, không cần sửa code.
+def gemini_edit(images: list[tuple[bytes, str]], prompt: str, key: str, out_path: Path,
+                aspect_ratio: str | None = None, model: str | None = None,
+                base_url: str = GEMINI_API_BASE, image_size: str | None = None) -> Path:
+    """urllib port of linux.py:_gemini_edit (3455-3478). See gemini_image_bytes."""
+    out_path.write_bytes(gemini_image_bytes(images, prompt, key, model=model,
+                                            aspect_ratio=aspect_ratio, image_size=image_size,
+                                            base_url=base_url))
+    return out_path
+
+
+# linux.py: the "Qwen-Image (DashScope Model Studio) — provider='qwen-max' & Gemini fallback" block
+# (added 2026-08-25). The code default below is the GA qwen-image-edit-plus; the VPS and local .env
+# set QWEN_IMAGE_MODEL=qwen-image-3.0-pro (access granted since; checked 2026-09-26). Qwen Image 3.0
+# does text-to-image (text only) and editing (1-3 images) on the same endpoint — see
+# qwen_image_generate.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -538,17 +567,25 @@ def _qwen_image_url() -> str:
             "/api/v1/services/aigc/multimodal-generation/generation")
 
 
-def qwen_max_edit(images: list[tuple[bytes, str]], prompt: str, key: str, out_path: Path,
-                  negative_prompt: str | None = None, model: str | None = None,
-                  size: str | None = None) -> Path:
-    """Cổng linux.py:_qwen_max_edit — bản urllib (cùng lý do KHÔNG dùng requests đã ghi đầu file). Call ĐỒNG
-    BỘ (multimodal-generation trả ảnh ngay, không async submit+poll); ảnh trả về là URL OSS sống 24h → tải
-    ngay bằng urllib."""
-    content = [{"image": f"data:{mime};base64,{base64.b64encode(data).decode()}"} for data, mime in images[:3]]
+QWEN_MAX_IMAGES = 3
+
+
+def qwen_image_generate(images: list[tuple[bytes, str]], prompt: str, key: str, *, n: int = 1,
+                        size: str | None = None, model: str | None = None,
+                        negative_prompt: str | None = None) -> list[bytes]:
+    """One synchronous DashScope multimodal-generation call → every returned image's bytes.
+
+    0 images = text-to-image; 1-3 = edit (Bailian API reference for Qwen Image 3.0, read
+    2026-09-26). More than 3 is refused rather than sliced: Image Studio promises never to drop a
+    reference silently. Result URLs are OSS links that live 24 h, so they are downloaded now.
+    """
+    if len(images) > QWEN_MAX_IMAGES:
+        raise JobError(f"Qwen accepts at most {QWEN_MAX_IMAGES} images, got {len(images)}")
+    content = [{"image": f"data:{mime};base64,{base64.b64encode(data).decode()}"} for data, mime in images]
     content.append({"text": prompt})
     body = {"model": model or QWEN_IMAGE_MODEL,
             "input": {"messages": [{"role": "user", "content": content}]},
-            "parameters": {"watermark": False}}
+            "parameters": {"watermark": False, "n": n}}
     if negative_prompt:
         body["parameters"]["negative_prompt"] = negative_prompt
     if size:
@@ -560,15 +597,33 @@ def qwen_max_edit(images: list[tuple[bytes, str]], prompt: str, key: str, out_pa
         with urllib.request.urlopen(req, timeout=180) as resp:
             data = json.loads(resp.read())
     except urllib.error.HTTPError as exc:
-        raise JobError(f"Qwen-Max API {exc.code}: {exc.read()[:300].decode('utf-8', 'replace')}") from exc
+        raise JobError(f"Qwen API {exc.code}: {exc.read()[:300].decode('utf-8', 'replace')}") from exc
     except OSError as exc:
-        raise JobError(f"Qwen-Max API không phản hồi: {exc}") from exc
-    try:
-        img_url = data["output"]["choices"][0]["message"]["content"][0]["image"]
-    except (KeyError, IndexError, TypeError):
-        raise JobError(f"Qwen-Max không trả ảnh: {json.dumps(data)[:300]}")
-    with urllib.request.urlopen(img_url, timeout=180) as resp:
-        out_path.write_bytes(resp.read())
+        raise JobError(f"Qwen API did not respond: {exc}") from exc
+    urls = [item["image"]
+            for choice in ((data.get("output") or {}).get("choices") or [])
+            for item in ((choice.get("message") or {}).get("content") or [])
+            if isinstance(item, dict) and item.get("image")]
+    if not urls:
+        raise JobError(f"Qwen returned no image: {data.get('code') or ''} {data.get('message') or ''}".strip())
+    out = []
+    for url in urls:
+        try:
+            with urllib.request.urlopen(url, timeout=180) as resp:
+                out.append(resp.read())
+        except OSError as exc:
+            raise JobError(f"Qwen image download failed: {exc}") from exc
+    return out
+
+
+def qwen_max_edit(images: list[tuple[bytes, str]], prompt: str, key: str, out_path: Path,
+                  negative_prompt: str | None = None, model: str | None = None,
+                  size: str | None = None) -> Path:
+    """Port of linux.py:_qwen_max_edit. Try-on keeps its historical behaviour: extra images are
+    sliced to the first 3, and only the first result is kept."""
+    results = qwen_image_generate(images[:QWEN_MAX_IMAGES], prompt, key, size=size, model=model,
+                                  negative_prompt=negative_prompt)
+    out_path.write_bytes(results[0])
     return out_path
 
 

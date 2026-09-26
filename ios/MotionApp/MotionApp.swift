@@ -13,6 +13,9 @@ struct MotionApp: App {
 
 enum AppTab: Hashable { case runs, materials, newJob, outputs, pod }
 
+/// Which top-level space `SpaceShell` is showing.
+enum AppSpace: String { case motion, studio }
+
 /// How many jobs the draft stands for: `.single` is the one job being edited,
 /// `.batch` is a cross build of many.
 enum NewJobMode: Hashable { case single, batch }
@@ -40,6 +43,14 @@ final class AppModel {
     private(set) var migrate: MigrateFlow?
     private(set) var tryonLibrary: TryonLibraryStore?
     private(set) var batchComposer: BatchComposer?
+    private(set) var studio: StudioStore?
+    var selectedSpace: AppSpace = AppSpace(rawValue: UserDefaults.standard.string(forKey: "selectedSpace") ?? "") ?? .motion {
+        didSet { UserDefaults.standard.set(selectedSpace.rawValue, forKey: "selectedSpace") }
+    }
+    var isSidebarOpen = false
+    /// Motion tabs whose NavigationStack currently shows its root screen
+    /// (`motionTabRoot`). The sidebar's edge swipe is only live on those.
+    var motionTabsAtRoot: Set<AppTab> = []
     var migrateSheet: MigrateRequest?
     /// UI-test builds only: how many spend taps the recording gate swallowed.
     private(set) var recordedSpends = 0
@@ -68,6 +79,7 @@ final class AppModel {
         guard let credentials = vault.load() else {
             client = nil; runs = nil; pod = nil; materials = nil; draft = nil; outputs = nil; runFlow = nil
             gpu = nil; balance = nil; migrate = nil; tryonLibrary = nil; batchComposer = nil; spendGate = nil
+            studio = nil
             return true
         }
         let client = APIClient(credentials: credentials)
@@ -84,6 +96,7 @@ final class AppModel {
         outputs = OutputsStore(client: client)
         gpu = GpuStore(client: client, pod: pod)
         balance = BalanceStore(client: client)
+        studio = StudioStore(client: client)
         let gate: any SpendSending = Self.isUITestRecording
             ? RecordingSpendGate { [weak self] count in
                 Task { @MainActor in self?.recordedSpends = count }
@@ -100,6 +113,14 @@ final class AppModel {
         replayPendingSpend()
         resumeMaterialsUpload()
         return true
+    }
+
+    /// Switches to Studio and opens (or creates, when `projectID` is nil) a project.
+    func openStudio(projectID: String?) async {
+        guard let studio else { return }
+        if let projectID { await studio.open(projectID) } else { _ = await studio.createProject() }
+        selectedSpace = .studio
+        isSidebarOpen = false
     }
 
     func resumeMaterialsUpload() {
