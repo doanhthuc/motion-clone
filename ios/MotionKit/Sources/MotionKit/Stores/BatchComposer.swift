@@ -53,9 +53,9 @@ public final class BatchComposer {
     /// while the try-ons (the old reason for capping outfits) are now shared
     /// across drivers and grow slower. 12 is the old outfit cap kept as a job
     /// cap, so a driver-less build is capped exactly as before.
-    public static let maxJobs = 12
-    public static let outfitRole = "outfit"
-    public static let driverRole = "driver"
+    public nonisolated static let maxJobs = 12
+    public nonisolated static let outfitRole = "outfit"
+    public nonisolated static let driverRole = "driver"
 
     public private(set) var outfits: [CrossOutfit] = []
     /// Driver material ids, multi-selected. Empty means the edited job's own
@@ -83,12 +83,12 @@ public final class BatchComposer {
         self.library = library
     }
 
-    public static func supports(_ pipeline: Pipeline) -> Bool {
+    public nonisolated static func supports(_ pipeline: Pipeline) -> Bool {
         let roles = Set(pipeline.required + pipeline.optional)
         return roles.contains("character") && roles.contains(outfitRole)
     }
 
-    public static func supportsDrivers(_ pipeline: Pipeline) -> Bool {
+    public nonisolated static func supportsDrivers(_ pipeline: Pipeline) -> Bool {
         (pipeline.required + pipeline.optional).contains(driverRole)
     }
 
