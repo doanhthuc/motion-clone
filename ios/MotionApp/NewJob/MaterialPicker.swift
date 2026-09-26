@@ -9,11 +9,12 @@ struct MaterialPicker: View {
     let materials: MaterialsStore
     let onSelect: (String?) -> Void
     @Environment(\.dismiss) private var dismiss
+    @State private var deleteCandidate: MotionKit.Material?
 
-    /// This role's own materials first, then unsorted ones, then the rest —
-    /// the rest stay pickable, since a role is a hint and not a lock.
+    /// This role's own materials, then unsorted ones. A material filed under
+    /// another role is moved from the Materials tab, not picked across roles.
     private var eligible: [MotionKit.Material] {
-        MaterialRole.ordered(materials.materials.filter(kind.accepts), for: MaterialRole(rawValue: role))
+        MaterialRole.eligible(materials.materials.filter(kind.accepts), for: MaterialRole(rawValue: role))
     }
 
     private let columns = [
@@ -60,6 +61,10 @@ struct MaterialPicker: View {
             // An upload or download started here finishes by selecting its
             // material; a swipe-down mid-way would select it behind a closed sheet.
             .interactiveDismissDisabled(materials.isUploading || materials.isImportingLink)
+            .modifier(MaterialDeleteDialog(candidate: $deleteCandidate, store: materials) { deleted in
+                // The slot would otherwise point at a file that is gone.
+                if deleted.id == selectedID { onSelect(nil) }
+            })
         }
         .task {
             if !materials.loaded {
@@ -108,7 +113,8 @@ struct MaterialPicker: View {
         } else {
             LazyVGrid(columns: columns, spacing: 20) {
                 ForEach(eligible) { material in
-                    MaterialChoice(material: material, materials: materials, selected: material.id == selectedID) {
+                    MaterialChoice(material: material, materials: materials, selected: material.id == selectedID,
+                                   onDelete: { deleteCandidate = material }) {
                         onSelect(material.id)
                         dismiss()
                     }

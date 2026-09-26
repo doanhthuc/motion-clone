@@ -2,7 +2,8 @@ import MotionKit
 import SwiftUI
 
 /// One material in the library, used by the category rows and the See all
-/// grid alike: tap previews, long-press moves it to another role or deletes it.
+/// grid alike: tap previews, long-press peeks at it and moves it to another
+/// role or deletes it.
 @MainActor
 struct MaterialTile: View {
     let material: MotionKit.Material
@@ -29,6 +30,8 @@ struct MaterialTile: View {
                 }
             }
             Button("Delete", systemImage: "trash", role: .destructive, action: onDelete)
+        } preview: {
+            MaterialPeek(material: material, materials: store)
         }
         .task(id: material.id) { thumbnail = await store.thumbnail(for: material) }
     }
@@ -38,6 +41,8 @@ struct MaterialTile: View {
 struct MaterialDeleteDialog: ViewModifier {
     @Binding var candidate: MotionKit.Material?
     let store: MaterialsStore
+    /// Runs after a successful delete, so a picker can drop the material from its selection.
+    var onDeleted: (MotionKit.Material) -> Void = { _ in }
 
     func body(content: Content) -> some View {
         content.confirmationDialog(
@@ -48,7 +53,10 @@ struct MaterialDeleteDialog: ViewModifier {
             Button("Delete", role: .destructive) {
                 guard let material = candidate else { return }
                 candidate = nil
-                Task { await store.delete(material) }
+                Task {
+                    await store.delete(material)
+                    if !store.materials.contains(where: { $0.id == material.id }) { onDeleted(material) }
+                }
             }
             Button("Cancel", role: .cancel) { candidate = nil }
         } message: {

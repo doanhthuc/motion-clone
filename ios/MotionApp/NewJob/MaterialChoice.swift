@@ -9,6 +9,8 @@ struct MaterialChoice: View {
     let materials: MaterialsStore
     let selected: Bool
     var compact = false
+    /// Asks for confirmation; the picker that owns the dialog does the delete.
+    let onDelete: () -> Void
     let onSelect: () -> Void
     @State private var thumbnail: Data?
     @State private var previewing = false
@@ -32,10 +34,13 @@ struct MaterialChoice: View {
                 }
         }
         .buttonStyle(.plain)
-        // A tap selects here, so watching comes from the long-press menu.
+        // A tap selects here, so watching comes from the long press: the peek
+        // plays a video by itself, and full screen adds the scrub bar and sound controls.
         .contextMenu {
-            Button(material.kind == .video ? "Play" : "Preview",
-                   systemImage: material.kind == .video ? "play.fill" : "eye") { previewing = true }
+            Button("View full screen", systemImage: "arrow.up.left.and.arrow.down.right") { previewing = true }
+            Button("Delete", systemImage: "trash", role: .destructive, action: onDelete)
+        } preview: {
+            MaterialPeek(material: material, materials: materials)
         }
         .sheet(isPresented: $previewing) {
             MaterialPreview(material: material, materials: materials, modal: true)

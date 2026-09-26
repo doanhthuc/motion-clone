@@ -148,13 +148,14 @@ extension URLProtocolTests {
         #expect(MaterialRole.options(for: .image) == [.character, .outfit, .background])
     }
 
-    @Test func pickersListTheirRoleFirstThenUnsortedThenTheRest() {
+    @Test func pickersListTheirRoleThenUnsortedAndHideOtherRoles() {
         func m(_ name: String, _ role: String?) -> Material {
             Material(id: "app/\(name)", owner: "app", name: name, bytes: 1, updatedAt: 1, kind: .image, role: role)
         }
         let items = [m("c1", "character"), m("u1", nil), m("o1", "outfit"), m("c2", "character"), m("o2", "outfit")]
-        #expect(MaterialRole.ordered(items, for: .outfit).map(\.name) == ["o1", "o2", "u1", "c1", "c2"])
-        #expect(MaterialRole.ordered(items, for: nil).map(\.name) == items.map(\.name))
+        #expect(MaterialRole.eligible(items, for: .outfit).map(\.name) == ["o1", "o2", "u1"])
+        #expect(MaterialRole.eligible(items, for: .character).map(\.name) == ["c1", "c2", "u1"])
+        #expect(MaterialRole.eligible(items, for: nil).map(\.name) == items.map(\.name))
     }
 
     @Test func setRoleSendsTheRoleAndNullToClear() async throws {

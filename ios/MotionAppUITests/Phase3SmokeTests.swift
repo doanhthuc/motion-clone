@@ -23,7 +23,7 @@ final class Phase3SmokeTests: XCTestCase {
 
         selectTryonPipeline(in: app)
         chooseMaterial(for: "Character", in: app)
-        chooseMaterial(for: "Driver", in: app)
+        chooseMaterial(for: "Driver", peekFirst: true, in: app)
         chooseMaterial(for: "Outfit", in: app)
 
         clearMaterial(for: "Character", in: app)
@@ -98,7 +98,7 @@ final class Phase3SmokeTests: XCTestCase {
     }
 
     @MainActor
-    private func chooseMaterial(for role: String, in app: XCUIApplication) {
+    private func chooseMaterial(for role: String, peekFirst: Bool = false, in app: XCUIApplication) {
         revealButton(role, in: app).tap()
         XCTAssertTrue(app.navigationBars["Choose material"].waitForExistence(timeout: 10))
 
@@ -106,6 +106,23 @@ final class Phase3SmokeTests: XCTestCase {
             NSPredicate(format: "value == %@", "Not selected")
         ).firstMatch
         XCTAssertTrue(choice.waitForExistence(timeout: 10), "A compatible material must exist for \(role)")
+        if peekFirst {
+            // The long press peeks and offers full screen and delete; full screen
+            // opens the player sheet, whose Done comes back to the picker.
+            choice.press(forDuration: 1.0)
+            let fullScreen = app.buttons["View full screen"]
+            XCTAssertTrue(fullScreen.waitForExistence(timeout: 5))
+            XCTAssertTrue(app.buttons["Delete"].exists)
+            let shot = XCTAttachment(screenshot: app.screenshot())
+            shot.name = "material-peek"
+            shot.lifetime = .keepAlways
+            add(shot)
+            fullScreen.tap()
+            let done = app.navigationBars.buttons["Done"].firstMatch
+            XCTAssertTrue(done.waitForExistence(timeout: 5))
+            done.tap()
+            XCTAssertTrue(app.navigationBars["Choose material"].waitForExistence(timeout: 5))
+        }
         choice.tap()
         XCTAssertTrue(app.navigationBars["Choose material"].waitForNonExistence(timeout: 10))
         XCTAssertTrue(waitUntil(timeout: 10) {
