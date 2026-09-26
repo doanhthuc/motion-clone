@@ -1000,6 +1000,10 @@ class FakeAppRuns:
         self.calls.append(("tryon_save_info", index))
         return self.tryon_save_info_result
 
+    def delete_run(self, batch_dir, out_dir, run_id, with_videos):
+        self.calls.append(("delete_run", run_id, with_videos))
+        return 200, {"deleted": run_id, "videos_deleted": 0}
+
 
 class TestAppRunRoutes(HttpWriteBase):
     def setUp(self):
@@ -1022,6 +1026,14 @@ class TestAppRunRoutes(HttpWriteBase):
         resp, body = self.send("GET", "/v1/runs/tg-1/rent-panel?force=1")
         self.assertEqual((resp.status, json.loads(body)), self.fake.rent_panel_response)
         self.assertEqual(self.fake.calls, [("rent_panel", "tg-1", True)])
+
+    def test_delete_run_parses_videos_and_defaults_to_keeping_them(self):
+        resp, body = self.send("DELETE", "/v1/runs/tg-1?videos=1")
+        self.assertEqual((resp.status, json.loads(body)["deleted"]), (200, "tg-1"))
+        self.send("DELETE", "/v1/runs/tg-1")
+        self.send("DELETE", "/v1/runs/tg-1?videos=true")
+        self.assertEqual(self.fake.calls, [("delete_run", "tg-1", True), ("delete_run", "tg-1", False),
+                                           ("delete_run", "tg-1", False)])
 
     def test_rent_panel_defaults_force_to_false(self):
         self.send("GET", "/v1/runs/tg-1/rent-panel")

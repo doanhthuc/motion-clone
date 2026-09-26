@@ -11,6 +11,7 @@ struct RunsView: View {
     let flow: RunFlow
     @State private var details: RunDetail?
     @State private var continuing = false
+    @State private var deleting: RunDeleteTarget?
 
     var body: some View {
         ScrollView {
@@ -52,6 +53,7 @@ struct RunsView: View {
         }
         .navigationDestination(isPresented: $continuing) { RunFlowView(flow: flow, entry: .existing) }
         .sheet(item: $details) { BatchDetailsSheet(detail: $0, focus: nil) }
+        .runDeletion($deleting)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 NavigationLink { SettingsView() } label: { Image(systemName: "gearshape") }
@@ -92,6 +94,13 @@ struct RunsView: View {
                 }
                 Button { UIPasteboard.general.string = run.id } label: {
                     Label("Copy run ID", systemImage: "doc.on.doc")
+                }
+                if !run.status.isLive, store.detail?.lease == nil {
+                    Divider()
+                    Button(role: .destructive) {
+                        deleting = RunDeleteTarget(id: run.id, title: RunName.title(run.batch ?? run.id),
+                                                   videos: store.detail?.outputs.count ?? 0)
+                    } label: { Label("Delete run", systemImage: "trash") }
                 }
             }
     }

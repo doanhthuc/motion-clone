@@ -47,6 +47,13 @@ public struct RunSummary: Decodable, Sendable, Equatable, Identifiable {
     public let jobsDone: Int
 }
 
+/// `DELETE /v1/runs/{id}`: the run is gone; `videosDeleted` counts the
+/// Outputs files that went with it (0 unless `?videos=1`).
+public struct RunDeleted: Decodable, Sendable, Equatable {
+    public let deleted: String
+    public let videosDeleted: Int
+}
+
 public struct StageProgress: Decodable, Sendable, Equatable {
     public let name: String
     public let status: StageStatus

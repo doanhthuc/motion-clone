@@ -1343,3 +1343,37 @@ class TestNoAbsolutePaths(_AppRunsFixture):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAppRunsDeleteRun(_AppRunsFixture):
+    """DELETE /v1/runs/{id} through the bot: the lock, and the wire shape."""
+
+    def _seed_run(self) -> Path:
+        manifest = self.root / "batch" / f"{self.runs.run_id}.yaml"
+        manifest.write_text("runs: []\n")
+        state_path_for(manifest).write_text(json.dumps({"version": 1, "batch": "b1", "runs": {}}))
+        return manifest
+
+    def test_deletes_and_answers_the_count(self):
+        manifest = self._seed_run()
+        status, body = self.runs.delete_run(self.root / "batch", self.root / "out",
+                                            self.runs.run_id, False)
+        self.assertEqual((status, body), (200, {"deleted": self.runs.run_id, "videos_deleted": 0}))
+        self.assertFalse(manifest.exists())
+
+    def test_a_held_run_is_409_and_kept(self):
+        manifest = self._seed_run()
+        with mock.patch("tgbot.run.busy", return_value=True):
+            status, body = self.runs.delete_run(self.root / "batch", self.root / "out",
+                                                self.runs.run_id, True)
+        self.assertEqual((status, body["error"]["code"]), (409, "run_busy"))
+        self.assertTrue(manifest.exists())
+
+    def test_waits_for_the_bot_lock(self):
+        self._seed_run()
+        with bot.BOT_LOCK, mock.patch.object(bot, "BOT_LOCK_TIMEOUT_SEC", 0.1):
+            result = []
+            t = threading.Thread(target=lambda: result.append(
+                self.runs.delete_run(self.root / "batch", self.root / "out", self.runs.run_id, False)))
+            t.start(); t.join(5)
+        self.assertEqual(result[0][0], 503)

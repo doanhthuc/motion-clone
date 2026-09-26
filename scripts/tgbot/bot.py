@@ -59,7 +59,7 @@ from control.drafts import DraftStore, PROVIDER_LABELS
 from control.idempotency import IdempotencyStore
 from control.materials import fold_diacritics as _fold_diacritics, safe_name as _safe_name
 from control.paths import safe_child as _safe_child
-from control.runs import Outcome, quoted_usd_per_hr, status_for
+from control.runs import Outcome, delete_run, quoted_usd_per_hr, status_for
 from tgbot import tiktok
 from tgbot.ingest import (Probe, describe, probe, quality_warning,
                          quality_warning_html,
@@ -7312,6 +7312,19 @@ class AppRuns:
                                   _job_manifest_path(self.chat_id)),
                               "previews": previews})
         return response
+
+    def delete_run(self, batch_dir: Path, out_dir: Path, run_id: str,
+                   with_videos: bool) -> tuple[int, dict]:
+        """DELETE /v1/runs/{id}: under BOT_LOCK, so a confirm or Phase A can
+        not start on the manifest between `delete_run`'s busy check and the
+        unlink. Any run the list shows, not only this chat's."""
+        with self._locked() as busy:
+            if busy is not None:
+                return busy
+            outcome, videos = delete_run(batch_dir, out_dir, run_id, with_videos=with_videos)
+        if not outcome:
+            return status_for(outcome), _run_error(outcome.code, outcome.message)
+        return 200, {"deleted": run_id, "videos_deleted": videos}
 
     def tryon_image(self, run_id: str, index: str) -> Path | None:
         """The try-on image `tryon()`'s preview at `index` points to, or

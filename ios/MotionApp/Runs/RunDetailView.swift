@@ -14,6 +14,8 @@ struct RunDetailView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var selection: String?
     @State private var details: DetailsTarget?
+    @State private var deleting: RunDeleteTarget?
+    @Environment(\.dismiss) private var dismiss
 
     /// The details sheet, opened for the whole batch or scrolled to one job.
     private struct DetailsTarget: Identifiable {
@@ -43,8 +45,19 @@ struct RunDetailView: View {
                     Button { details = DetailsTarget(focus: nil) } label: { Image(systemName: "info.circle") }
                         .accessibilityLabel("Batch details")
                 }
+                if let d = store.detail, !d.status.isLive, d.lease == nil {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button {
+                            deleting = RunDeleteTarget(id: d.id, title: RunName.title(d.batch ?? d.id),
+                                                       videos: d.outputs.count)
+                        } label: { Image(systemName: "trash") }
+                        .accessibilityLabel("Delete run")
+                        .accessibilityIdentifier("run.delete")
+                    }
+                }
             }
         }
+        .runDeletion($deleting) { dismiss() }
         .sheet(item: $details) { target in
             if let d = store.detail { BatchDetailsSheet(detail: d, focus: target.focus) }
         }

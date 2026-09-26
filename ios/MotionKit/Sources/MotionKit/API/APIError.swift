@@ -47,6 +47,8 @@ public enum APIError: Error, Sendable, Equatable {
             // A pasted link (`POST /v1/materials/link`): TikTok or yt-dlp
             // refused, and the server's text says which — not a GPU provider.
             case 502 where code == "download_failed": return message
+            case 409 where code == "run_busy":
+                return "This run is still running or has a GPU. Kill it first, then delete."
             case 502: return "RunPod/Vast didn't answer. Try again."
             case 503: return "The bot is busy. Try again in a moment."
             case 500...: return "Server error (\(code))."

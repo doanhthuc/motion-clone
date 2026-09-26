@@ -43,3 +43,43 @@ import Testing
         #expect(RunName.title("2026-13-01-1530") == "2026-13-01-1530")
     }
 }
+
+extension URLProtocolTests {
+    @Suite @MainActor struct RunDeleteTests {
+        private let list = #"{"runs":[{"id":"a","batch":"b","status":"stopped","updated_at":2,"jobs_total":1,"jobs_done":0},{"id":"c","batch":"d","status":"done","updated_at":1,"jobs_total":1,"jobs_done":1}]}"#
+
+        @Test func deleteSendsTheVideosChoiceAndDropsTheRun() async throws {
+            StubURLProtocol.install { [list] req in
+                if req.httpMethod == "DELETE" { return TestSupport.json(#"{"deleted":"a","videos_deleted":2}"#) }
+                return TestSupport.json(list)
+            }
+            let store = RunsStore(client: TestSupport.client())
+            await store.refresh()
+            let result = try await store.delete("a", withVideos: true)
+            #expect(result == RunDeleted(deleted: "a", videosDeleted: 2))
+            #expect(store.runs.map(\.id) == ["c"])
+            let sent = StubURLProtocol.requests.first { $0.httpMethod == "DELETE" }
+            #expect(sent?.url?.path == "/v1/runs/a")
+            #expect(sent?.url?.query == "videos=1")
+        }
+
+        @Test func aRefusalKeepsTheRunAndSaysWhy() async {
+            StubURLProtocol.install { [list] req in
+                if req.httpMethod == "DELETE" {
+                    return (409, ["Content-Type": "application/json"],
+                            Data(#"{"error":{"code":"run_busy","message":"x"}}"#.utf8))
+                }
+                return TestSupport.json(list)
+            }
+            let store = RunsStore(client: TestSupport.client())
+            await store.refresh()
+            do {
+                try await store.delete("a", withVideos: false)
+                Issue.record("expected a refusal")
+            } catch {
+                #expect(error.userMessage.contains("Kill it first"))
+            }
+            #expect(store.runs.map(\.id) == ["a", "c"])
+        }
+    }
+}

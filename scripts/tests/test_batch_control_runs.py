@@ -220,3 +220,61 @@ class TestJobSetup(RunsTestBase):
         write_run(self.batch, "r", STATE)   # "runs: []" does not load
         jobs = runs.run_detail(self.batch, self.out, "r")["jobs"]
         self.assertTrue(all(j["setup"] is None for j in jobs))
+
+
+class TestDeleteRun(RunsTestBase):
+    """Deleting a run from the phone (2026-09-27): the journal always goes,
+    the videos only when asked, and nothing while the run is held."""
+
+    def setUp(self):
+        super().setUp()
+        self.manifest = write_run(self.batch, "r", STATE)
+        (self.batch / "r.handoff.json").write_text("{}")
+        (self.batch / "r.draft.json").write_text("{}")      # the chat's, not the run's
+        self.out_batch = self.out / "2026-09-20-1000"
+        (self.out_batch / "runs" / "a").mkdir(parents=True)
+        (self.out_batch / "runs" / "a" / "01-tryon.png").write_bytes(b"x")
+        (self.out_batch / "manifest.yaml").write_text("runs: []\n")
+        (self.out_batch / "_final").mkdir()
+        (self.out_batch / "_final" / "a.mp4").write_bytes(b"v")
+        (self.out / "latest").symlink_to(self.out_batch)
+
+    def test_keeps_videos_by_default(self):
+        outcome, videos = runs.delete_run(self.batch, self.out, "r", with_videos=False)
+        self.assertEqual((bool(outcome), videos), (True, 0))
+        self.assertEqual(sorted(p.name for p in self.batch.iterdir()), ["r.draft.json"])
+        self.assertEqual(sorted(p.name for p in self.out_batch.iterdir()), ["_final"])
+        self.assertTrue((self.out_batch / "_final" / "a.mp4").exists())
+        self.assertEqual(runs.list_runs(self.batch, self.out), [])
+
+    def test_with_videos_removes_the_batch_and_the_dangling_latest_link(self):
+        outcome, videos = runs.delete_run(self.batch, self.out, "r", with_videos=True)
+        self.assertEqual((bool(outcome), videos), (True, 1))
+        self.assertEqual(list(self.out.iterdir()), [])
+
+    def test_refused_while_held(self):
+        for name in ("drain_running", "phase_a_running"):
+            with mock.patch.object(run_mod, name, return_value=True):
+                outcome, _ = runs.delete_run(self.batch, self.out, "r", with_videos=True)
+            self.assertEqual((bool(outcome), outcome.code, runs.status_for(outcome)),
+                             (False, "run_busy", 409))
+        with mock.patch.object(run_mod, "lease_for", return_value=object()):
+            self.assertEqual(runs.delete_run(self.batch, self.out, "r", with_videos=True)[0].code,
+                             "run_busy")
+        self.assertTrue(self.manifest.exists())
+        self.assertTrue((self.out_batch / "_final" / "a.mp4").exists())
+
+    def test_unknown_or_unsafe_ids_are_not_found(self):
+        for run_id in ("nope", "../r", "", "example"):
+            outcome, _ = runs.delete_run(self.batch, self.out, run_id, with_videos=True)
+            self.assertEqual(outcome.code, "not_found")
+        (self.batch / "example.yaml").write_text("runs: []\n")   # a manifest with no journal
+        self.assertEqual(runs.delete_run(self.batch, self.out, "example", with_videos=True)[0].code,
+                         "not_found")
+        self.assertTrue((self.batch / "example.yaml").exists())
+
+    def test_a_batch_another_run_still_names_is_left_alone(self):
+        write_run(self.batch, "other", STATE)
+        runs.delete_run(self.batch, self.out, "r", with_videos=True)
+        self.assertTrue((self.out_batch / "_final" / "a.mp4").exists())
+        self.assertTrue((self.out_batch / "runs").exists())
