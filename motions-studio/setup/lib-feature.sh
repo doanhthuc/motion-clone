@@ -542,6 +542,54 @@ phase_app_deps() {
   mkdir -p "$ROOT/.data/minio"
 }
 
+# Vast has no Network Volume, so the models a manifest needs (VAST_MODEL_IDS, from
+# scripts/batchlib/vast_models.py) are downloaded at boot. Both install paths call these: the
+# prebuilt fast boot used to skip phase_comfyui, the only place the download lived, so the Vast
+# box of 2026-09-27 (instance 52971049) came up with an empty models/ and all three camera-motion
+# jobs failed with ComfyUI "Value not in list" — no Vast rental could ever have run a job.
+#
+# The catalog is catalog-motion-transfer.json whatever SETUP_PROFILE says: the registry's ids are
+# defined against it (make check-vast-models), and catalog.json (profile "full", what motion-vps
+# boots) lacks wan-vitpose-onnx, wan-yolo10m-onnx and every swap-* id. The files land in the same
+# models/ tree either way; the catalog only says where to fetch them from.
+PRELOAD_PID=""
+vast_preload_catalog() { printf '%s' "$ROOT/comfyui/catalog-motion-transfer.json"; }
+
+vast_preload_start() {
+  PRELOAD_PID=""
+  [ -n "${VAST_MODEL_IDS:-}" ] || return 0
+  say "    Vast: bắt đầu tải model của manifest, chạy nền song song với cài đặt…"
+  local ID_ARGS=() _id
+  for _id in $VAST_MODEL_IDS; do ID_ARGS+=(--id "$_id"); done
+  ( MODELS_DIR="$COMFY_DIR/models" CATALOG="$(vast_preload_catalog)" bash "$ROOT/setup/preload-models.sh" "${ID_ARGS[@]}" \
+      >/tmp/preload-models.log 2>&1 ) &
+  PRELOAD_PID=$!
+}
+
+# No-op unless a download is running; clears PRELOAD_PID so a second call does nothing.
+vast_preload_wait() {
+  [ -n "$PRELOAD_PID" ] || return 0
+  say "    đợi tải model của manifest xong (chạy nền ở trên)…"
+  local PRELOAD_OK=1
+  wait "$PRELOAD_PID" || PRELOAD_OK=0
+  PRELOAD_PID=""
+  # A missing catalog id is NOT a preload-models.sh failure (its own UNKNOWN handling is a
+  # deliberate skip-and-warn for manual callers) -- but for THIS automated, registry-driven
+  # call it means the box will silently run a motion job without a model it needs (e.g.
+  # wan-vitpose-onnx missing -> silent DWPose fallback), so it must not be treated as success
+  # here even though the script itself exits 0.
+  if grep -q 'không có trong catalog' /tmp/preload-models.log 2>/dev/null; then
+    PRELOAD_OK=0
+  fi
+  if [ "$PRELOAD_OK" = 1 ]; then
+    ok "model của manifest đã tải xong (/tmp/preload-models.log)"
+  else
+    die "tải model của manifest LỖI hoặc THIẾU id trong catalog — xem /tmp/preload-models.log.
+  Sửa xong thì chạy lại tay:
+    CATALOG=$(vast_preload_catalog) MODELS_DIR=$COMFY_DIR/models bash setup/preload-models.sh --id <id> [--id <id> ...]"
+  fi
+}
+
 # #region ALD 19/07/2026 - Fast boot từ image dựng sẵn (MTC_PREBUILT=1).
 # Image chỉ chứa dependency/runtime (không chứa token). Source vẫn clone bằng credential read-only
 # ở bootstrap. Link các dependency dựng sẵn thay vì apt/npm/pip lại ở mỗi lần bật instance.
@@ -581,6 +629,9 @@ phase_prebuilt_deps() {
   [ -f "$COMFY_DIR/main.py" ] || die "Image dựng sẵn thiếu ComfyUI tại $COMFY_DIR"
   [ -x "$COMFY_DIR/venv/bin/python" ] || die "Image dựng sẵn thiếu Python venv của ComfyUI"
   mkdir -p "$ROOT/.data/minio" "$COMFY_DIR/models/uploads"/{loras,checkpoints,unet,vae,text_encoders,clip_vision}
+  # Start the manifest's download now so it overlaps the rest of the boot (PM2, seed, tunnel);
+  # feature_main waits for it before phase_done.
+  vast_preload_start
 
   # Seed models của chính ComfyUI (configs/*.yaml + placeholder) do image dời sang comfy-models-seed
   # để pod-volume.sh nối được $COMFY_DIR/models sang volume. Chép phần CÒN THIẾU sang volume:
@@ -681,15 +732,7 @@ phase_comfyui() {
     # Measured 2026-09-19 (spec section 3.3): ~34.4 GB in 137s, well inside the ~200s the
     # pip/custom-node install below takes on its own, so running both together costs about what
     # the slower one costs alone instead of the sum of the two.
-    PRELOAD_PID=""
-    if [ -n "${VAST_MODEL_IDS:-}" ]; then
-      say "    Vast: bắt đầu tải model của manifest, chạy nền song song với cài đặt bên dưới…"
-      ID_ARGS=()
-      for _id in $VAST_MODEL_IDS; do ID_ARGS+=(--id "$_id"); done
-      ( MODELS_DIR="$COMFY_DIR/models" CATALOG="$CATALOG_FILE" bash "$ROOT/setup/preload-models.sh" "${ID_ARGS[@]}" \
-          >/tmp/preload-models.log 2>&1 ) &
-      PRELOAD_PID=$!
-    fi
+    vast_preload_start
 
     [ -x "$COMFY_DIR/venv/bin/python" ] || python3 -m venv "$COMFY_DIR/venv"
     CPIP="$COMFY_DIR/venv/bin/pip"
@@ -748,26 +791,7 @@ phase_comfyui() {
     fi
     ok "ComfyUI + custom node ($(echo $COMFY_NODES | wc -w) node) ở $COMFY_DIR"
 
-    if [ -n "$PRELOAD_PID" ]; then
-      say "    đợi tải model của manifest xong (chạy nền ở trên)…"
-      PRELOAD_OK=1
-      wait "$PRELOAD_PID" || PRELOAD_OK=0
-      # A missing catalog id is NOT a preload-models.sh failure (its own UNKNOWN handling is a
-      # deliberate skip-and-warn for manual callers) -- but for THIS automated, registry-driven
-      # call it means the box will silently run a motion job without a model it needs (e.g.
-      # wan-vitpose-onnx missing -> silent DWPose fallback), so it must not be treated as success
-      # here even though the script itself exits 0.
-      if grep -q 'không có trong catalog' /tmp/preload-models.log 2>/dev/null; then
-        PRELOAD_OK=0
-      fi
-      if [ "$PRELOAD_OK" = 1 ]; then
-        ok "model của manifest đã tải xong (/tmp/preload-models.log)"
-      else
-        die "tải model của manifest LỖI hoặc THIẾU id trong catalog — xem /tmp/preload-models.log.
-  Sửa xong thì chạy lại tay:
-    CATALOG=$CATALOG_FILE MODELS_DIR=$COMFY_DIR/models bash setup/preload-models.sh --id <id> [--id <id> ...]"
-      fi
-    fi
+    vast_preload_wait
 
     # Thư mục uploads (model user tự upload) + extra_model_paths.
     UP="$COMFY_DIR/models/uploads"; mkdir -p "$UP"/{loras,checkpoints,unet,vae,text_encoders,clip_vision} "$UP/.tmp"
@@ -1003,6 +1027,7 @@ feature_main() {
   phase_seed
   phase_nginx
   phase_https
+  vast_preload_wait
   phase_done
 }
 \

@@ -229,8 +229,11 @@ else
 	@# is not a listing (an auth error has no instance id either, and read as "gone"; the real shape,
 	@# checked 2026-09-19, is {"instances": [...], "next_token": ..., "success": true}), and an id
 	@# with trailing whitespace in .env, which never matched a row (the id is stripped before use).
+	@# The empty account is a bare `[]` on CLI 1.7.0 (podctl.VastCtl.list_pods documents both
+	@# shapes): read as "could not verify", it left instance 52971049's id in .env on 2026-09-27
+	@# after the destroy had worked, and drain's teardown died on the non-zero exit.
 	@listing="$$(vastai show instances-v1 --raw --all 2>&1)"; rc=$$?; \
-	case "$$listing" in *'"instances"'*) shape=ok;; *) shape=bad;; esac; \
+	case "$$(printf '%s' "$$listing" | tr -d ' \n\t')" in *'"instances"'*|'['*) shape=ok;; *) shape=bad;; esac; \
 	if [ $$rc -ne 0 ] || [ "$$shape" != ok ]; then \
 		echo "COULD NOT VERIFY — instance $(strip $(call env,GPU_INSTANCE_ID)) may still be billing."; \
 		echo "$$listing"; \
