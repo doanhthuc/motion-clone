@@ -1253,6 +1253,9 @@ class FakeAppPod:
         self.set_gpu_response = (200, {"gpu": "NVIDIA GeForce RTX 5090"})
         self.migrate_ask_response = (200, {"confirm_token": "tok", "to_dc": "EU-CZ-1"})
         self.migrate_response = (202, {"outcome": "started", "to_dc": "EU-CZ-1"})
+        self.gpu_subs_response = (200, {"subs": [], "fired": []})
+        self.add_gpu_sub_response = (201, {"sub": {"id": "abc123"}})
+        self.remove_gpu_sub_response = (200, {"subs": []})
 
     def kill(self, run_id, key):
         self.calls.append(("kill", run_id, key))
@@ -1266,9 +1269,21 @@ class FakeAppPod:
         self.calls.append(("pod",))
         return self.pod_response
 
-    def gpu_stock(self, force):
-        self.calls.append(("gpu_stock", force))
+    def gpu_stock(self, force, all_dcs=False):
+        self.calls.append(("gpu_stock", force, all_dcs))
         return self.gpu_stock_response
+
+    def gpu_subs(self):
+        self.calls.append(("gpu_subs",))
+        return self.gpu_subs_response
+
+    def add_gpu_sub(self, body):
+        self.calls.append(("add_gpu_sub", body))
+        return self.add_gpu_sub_response
+
+    def remove_gpu_sub(self, sub_id):
+        self.calls.append(("remove_gpu_sub", sub_id))
+        return self.remove_gpu_sub_response
 
     def balance(self, vast):
         self.calls.append(("balance", vast))
@@ -1299,6 +1314,9 @@ _POD_ROUTES = [
     ("PUT", "/v1/pod/gpu", True, False),
     ("POST", "/v1/pod/migrate/ask", True, False),
     ("POST", "/v1/pod/migrate", True, True),
+    ("GET", "/v1/gpu/subs", False, False),
+    ("POST", "/v1/gpu/subs", True, False),
+    ("DELETE", "/v1/gpu/subs/abc123", False, False),
 ]
 
 
@@ -1332,7 +1350,15 @@ class TestAppPodRoutes(HttpWriteBase):
                 self.fake.calls.clear()
                 resp, body = self.send("GET", "/v1/gpu/stock" + query)
                 self.assertEqual((resp.status, json.loads(body)), self.fake.gpu_stock_response)
-                self.assertEqual(self.fake.calls, [("gpu_stock", expected)])
+                self.assertEqual(self.fake.calls[0][1], expected)
+
+    def test_gpu_stock_parses_all_only_for_the_exact_string_1(self):
+        for query, expected in (("?all=1", True), ("?all=true", False),
+                                ("?all=1&force=1", True), ("", False)):
+            with self.subTest(query=query):
+                self.fake.calls.clear()
+                self.send("GET", "/v1/gpu/stock" + query)
+                self.assertEqual(self.fake.calls[0][2], expected)
 
     def test_balance_parses_vast_only_for_the_exact_string_1(self):
         for query, expected in (("", False), ("?vast=1", True), ("?vast=0", False),
@@ -1432,6 +1458,18 @@ class TestAppPodRoutes(HttpWriteBase):
         resp, body = self.send("GET", "/v1/runs/r1")
         self.assertEqual(json.loads(body)["status"], "done")
         self.assertEqual(self.fake.calls, [])
+
+    def test_gpu_subs_routes_reach_app_pod(self):
+        resp, body = self.send("GET", "/v1/gpu/subs")
+        self.assertEqual((resp.status, json.loads(body)), self.fake.gpu_subs_response)
+        payload = {"gpu": "NVIDIA GeForce RTX 5090", "datacenter": "EU-RO-1",
+                   "auto_resume": False}
+        resp, body = self.send("POST", "/v1/gpu/subs", json_body=payload)
+        self.assertEqual((resp.status, json.loads(body)), self.fake.add_gpu_sub_response)
+        resp, body = self.send("DELETE", "/v1/gpu/subs/abc123")
+        self.assertEqual((resp.status, json.loads(body)), self.fake.remove_gpu_sub_response)
+        self.assertEqual(self.fake.calls, [("gpu_subs",), ("add_gpu_sub", payload),
+                                           ("remove_gpu_sub", "abc123")])
 
 
 class TestAppPodRoutesUnavailable(HttpWriteBase):
