@@ -59,7 +59,7 @@ struct RunDetailView: View {
         }
         .runDeletion($deleting) { dismiss() }
         .sheet(item: $details) { target in
-            if let d = store.detail { BatchDetailsSheet(detail: d, focus: target.focus) }
+            if let d = store.detail { BatchDetailsSheet(detail: d, store: store, focus: target.focus) }
         }
         // Polls only while this screen is visible AND the app is active;
         // `.task(id:)` restarts/cancels the loop when scenePhase changes.

@@ -52,7 +52,7 @@ struct RunsView: View {
             RunDetailView(store: runs.detailStore(for: id), flow: flow, pod: pod)
         }
         .navigationDestination(isPresented: $continuing) { RunFlowView(flow: flow, entry: .existing) }
-        .sheet(item: $details) { BatchDetailsSheet(detail: $0, focus: nil) }
+        .sheet(item: $details) { BatchDetailsSheet(detail: $0, store: runs.detailStore(for: $0.id), focus: nil) }
         .runDeletion($deleting)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
