@@ -221,6 +221,9 @@ struct BatchEntryDetail: View {
     let materials: MaterialsStore
     let library: TryonLibraryStore
     let locked: Bool
+    /// Review only (the run flow): no Drop and no replace hint, rather than
+    /// both showing disabled.
+    var readOnly = false
     @Environment(\.dismiss) private var dismiss
     @State private var confirmingDrop = false
     @State private var replacing: String?
@@ -253,7 +256,7 @@ struct BatchEntryDetail: View {
         .onChange(of: entry == nil) { _, gone in if gone { dismiss() } }
     }
 
-    private var disabled: Bool { locked || store.isBusy }
+    private var disabled: Bool { readOnly || locked || store.isBusy }
 
     private func content(_ entry: DraftBatchEntry, pipeline: Pipeline?) -> some View {
         ScrollView {
@@ -275,22 +278,7 @@ struct BatchEntryDetail: View {
                 if let pipeline, !pipeline.providers.isEmpty {
                     seedRow(entry)
                 }
-                // No destructive role: it paints the label red over the red
-                // fill whatever the style says. The dialog's Drop keeps it.
-                Button { confirmingDrop = true } label: {
-                    Label("Drop job", systemImage: "trash")
-                }
-                // Filled: the tinted bordered style read as disabled next to
-                // the dark cards (user, 2026-09-26).
-                .buttonStyle(DangerButtonStyle())
-                .disabled(disabled)
-                .confirmationDialog("Drop this batch entry?", isPresented: $confirmingDrop,
-                                    titleVisibility: .visible) {
-                    Button("Drop", role: .destructive) {
-                        Task { await store.dropFromBatch(entry.digest) }
-                    }
-                    Button("Cancel", role: .cancel) {}
-                }
+                if !readOnly { dropButton(entry) }
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 12)
@@ -305,6 +293,25 @@ struct BatchEntryDetail: View {
                                                             BatchEntryEdit.replacing(role, with: id, in: entry)) }
                            },
                            allowsClear: !required)
+        }
+    }
+
+    // No destructive role: it paints the label red over the red fill
+    // whatever the style says. The dialog's Drop keeps it.
+    private func dropButton(_ entry: DraftBatchEntry) -> some View {
+        Button { confirmingDrop = true } label: {
+            Label("Drop job", systemImage: "trash")
+        }
+        // Filled: the tinted bordered style read as disabled next to
+        // the dark cards (user, 2026-09-26).
+        .buttonStyle(DangerButtonStyle())
+        .disabled(disabled)
+        .confirmationDialog("Drop this batch entry?", isPresented: $confirmingDrop,
+                            titleVisibility: .visible) {
+            Button("Drop", role: .destructive) {
+                Task { await store.dropFromBatch(entry.digest) }
+            }
+            Button("Cancel", role: .cancel) {}
         }
     }
 
@@ -397,7 +404,7 @@ struct BatchEntryDetail: View {
             HStack(alignment: .firstTextBaseline) {
                 Text("Materials").font(.headline)
                 Spacer()
-                Text("Tap to replace · hold to peek").font(.caption).foregroundStyle(Theme.secondary)
+                Text(readOnly ? "Hold to peek" : "Tap to replace · hold to peek").font(.caption).foregroundStyle(Theme.secondary)
             }
             ScrollView(.horizontal) {
                 HStack(alignment: .top, spacing: 12) {

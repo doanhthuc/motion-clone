@@ -60,6 +60,8 @@ extension View {
     func buttonRow() -> some View {
         listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
             .listRowBackground(Color.clear)
+            // Two button rows in one Section drew a separator between them.
+            .listRowSeparator(.hidden)
     }
 }
 
@@ -127,7 +129,9 @@ private struct StyledButton: View {
         switch kind {
         case .primary: Theme.accent
         case .danger: Theme.danger
-        case .secondary, .destructive: Theme.surface
+        // Raised, not `surface`: on the glass action bars a `surface` fill
+        // all but vanished (user, 2026-09-27).
+        case .secondary, .destructive: Theme.surfaceRaised
         }
     }
 }
