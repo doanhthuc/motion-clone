@@ -66,9 +66,10 @@ extension URLProtocolTests {
             return TestSupport.json(Fixtures.runDetail, etag: #"W/"abc""#)
         }
         let client = TestSupport.client()
-        let first = try await client.getIfChanged(RunDetail.self, "v1", "runs", "tg-1000")
-        #expect(first?.id == "tg-1000")
-        let second = try await client.getIfChanged(RunDetail.self, "v1", "runs", "tg-1000")
+        let first = try await client.getIfChanged(RunDetail.self, etag: nil, "v1", "runs", "tg-1000")
+        #expect(first?.value.id == "tg-1000")
+        #expect(first?.etag == #"W/"abc""#)
+        let second = try await client.getIfChanged(RunDetail.self, etag: first?.etag, "v1", "runs", "tg-1000")
         #expect(second == nil)
         #expect(StubURLProtocol.requests.count == 2)
         #expect(StubURLProtocol.requests[0].value(forHTTPHeaderField: "If-None-Match") == nil)
