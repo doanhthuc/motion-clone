@@ -1495,5 +1495,103 @@ def status_for_code(code: str) -> int:
     return status_for(Outcome(False, code, ""))
 
 
+class TestAutoResumeTick(_PodFixture):
+    """`_tick_gpu_subs` handing an armed sub to `_do_resume` (2026-09-27 spec
+    §1 Firing). `start_drain` is patched by `_Fixture`; nothing here rents."""
+
+    GPU = "NVIDIA GeForce RTX 5090"
+
+    def setUp(self):
+        super().setUp()
+        self.job = self._job("app")
+        write_manifest([self.job], self._live(), now=time.strftime("%Y-%m-%d %H:%M:%S"))
+        state_path_for(self._live()).write_text(
+            json.dumps({"batch": "2026-09-27-1200", "runs": {}}), encoding="utf-8")
+        write_provision_failure(provision_failure_path(self._live()), ProvisionFailure(
+            gpu=self.GPU, datacenter="EU-RO-1", stock_out=True,
+            detail="no instances available"))
+        (self.root / ".env").write_text(
+            "GPU=NVIDIA GeForce RTX 4090\nPOD_VOLUME_ID=vol-1\n", encoding="utf-8")
+
+    def _arm(self, dc="EU-RO-1", cap=0.99, token=None):
+        sub = bot._new_gpu_sub(self.GPU, dc, [])
+        sub["auto_resume"] = {"run_id": self._live().stem,
+                              "run_token": token or bot._run_token(ME),
+                              "max_usd_per_hr": cap}
+        bot._gpu_subs_for(ME).append(sub)
+        bot._save_gpu_subs(ME)
+        return sub
+
+    def _fire(self, price=0.99, dc="EU-RO-1"):
+        self.patches["stock_at_cached"].return_value = {self.GPU: [Stock(
+            gpu_id=self.GPU, display_name="RTX 5090", price_per_hr=price,
+            datacenter_id=dc, stock_status="Low")]}
+        bot._tick_gpu_subs(self.tg, ME, dry_run=False)
+        return bot._gpu_fired_for(ME)[0]
+
+    def test_auto_resume_switches_gpu_and_resumes(self):
+        self._arm()
+        fired = self._fire()
+        self.assertEqual(fired["action"], "resumed")
+        self.patches["start_drain"].assert_called_once()
+        self.assertEqual(self.patches["start_drain"].call_args.kwargs["gpu_provider"], "runpod")
+        self.assertEqual(env_get(self.root / ".env", "GPU"), self.GPU)
+        self.assertEqual(bot._gpu_subs_for(ME), [])
+        self.assertTrue(any("Auto-resumed" in text for text in self._texts()))
+
+    def test_auto_resume_refuses_above_the_ceiling(self):
+        self._arm(cap=0.99)
+        fired = self._fire(price=1.29)
+        self.assertEqual(fired["action"], "resume_refused")
+        self.assertIn("ceiling", fired["reason"])
+        self.patches["start_drain"].assert_not_called()
+        self.assertEqual(env_get(self.root / ".env", "GPU"), "NVIDIA GeForce RTX 4090")
+        self.assertTrue(any("Nothing was rented" in text for text in self._texts()))
+
+    def test_auto_resume_refuses_when_the_manifest_changed(self):
+        self._arm(token="1")
+        fired = self._fire()
+        self.assertEqual(fired["action"], "resume_refused")
+        self.patches["start_drain"].assert_not_called()
+
+    def test_auto_resume_refuses_without_an_outstanding_stock_out(self):
+        self._arm()
+        provision_failure_path(self._live()).unlink()
+        fired = self._fire()
+        self.assertEqual(fired["action"], "resume_refused")
+        self.patches["start_drain"].assert_not_called()
+
+    def test_auto_resume_refuses_outside_home(self):
+        self._arm(dc="EU-CZ-1")
+        fired = self._fire(dc="EU-CZ-1")
+        self.assertEqual(fired["action"], "resume_refused")
+        self.patches["start_drain"].assert_not_called()
+
+    def test_auto_resume_refuses_while_a_lease_is_live(self):
+        self._arm()
+        self.patches["read_lease"].return_value = object()
+        fired = self._fire()
+        self.assertEqual(fired["action"], "resume_refused")
+        self.patches["start_drain"].assert_not_called()
+
+    def test_auto_resume_refuses_during_a_migration(self):
+        self._arm()
+        self.patches["migration_running"].return_value = True
+        fired = self._fire()
+        self.assertEqual(fired["action"], "resume_refused")
+        self.patches["start_drain"].assert_not_called()
+
+    def test_a_plain_sub_never_resumes(self):
+        bot._gpu_subs_for(ME).append(bot._new_gpu_sub(self.GPU, "EU-RO-1", []))
+        fired = self._fire()
+        self.assertEqual(fired["action"], "notified")
+        self.patches["start_drain"].assert_not_called()
+
+    def test_unsubscribe_list_marks_the_armed_sub(self):
+        self._arm()
+        text, _ = bot._gpu_subs_lines_and_buttons(ME)
+        self.assertIn("⚡", text)
+
+
 if __name__ == "__main__":
     unittest.main()

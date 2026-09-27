@@ -4638,7 +4638,8 @@ def _gpu_subs_lines_and_buttons(chat_id: int) -> tuple[str, list]:
     for s in subs:
         short = _GPU_DISPLAY_SHORT.get(s["gpu_id"], s["gpu_id"])
         dc = s["datacenter_id"]
-        lines.append(f"  {_esc(short)} @ {_esc(dc)}")
+        bolt = " ⚡ auto-resume" if s.get("auto_resume") else ""
+        lines.append(f"  {_esc(short)} @ {_esc(dc)}{bolt}")
         buttons.append([(f"{short} @ {dc}",
                         f"{_CB_GPUSUB_RM}{_GPU_SHORT.get(s['gpu_id'], '')}:{dc}",
                         _ce_id(ICON_TRASH_CE))])
@@ -4663,7 +4664,40 @@ def _remove_gpu_sub(tg: Tg, chat_id: int, message_id: int, short: str, dc: str) 
                     parse_mode=PARSE_HTML)
 
 
-def _tick_gpu_subs(tg: Tg, chat_id: int) -> None:
+def _auto_resume_refusal(chat_id: int, sub: dict, hit) -> str | None:
+    """Why an armed sub must only notify, or None when it may resume.
+
+    The arming guards again, read at fire time, plus the live-state ones
+    `_do_resume` would refuse on anyway (2026-09-27 spec §1). Each answer is
+    one plain sentence: it goes into the Telegram message and the fired
+    history as-is. `_home_datacenter` is a runpodctl call; this only runs
+    for the rare sub that is both armed and firing.
+    """
+    armed = sub.get("auto_resume") or {}
+    manifest_path = _job_manifest_path(chat_id)
+    if (armed.get("run_id") != manifest_path.stem
+            or armed.get("run_token") != _run_token(chat_id)):
+        return "the run changed since auto-resume was armed"
+    failure = read_provision_failure(provision_failure_path(manifest_path))
+    if failure is None or not failure.stock_out:
+        return "the run no longer has a stock-out to resume from"
+    if sub["datacenter_id"] != _home_datacenter():
+        return "this is not the volume's home datacenter"
+    if busy(manifest_path):
+        return "the run is busy"
+    if migration_running():
+        return "a volume migration is in progress"
+    if read_lease(LEASE_PATH) is not None:
+        return "a pod is already live"
+    cap = armed.get("max_usd_per_hr")
+    price = hit.price_per_hr
+    if not price or cap is None or price > cap:
+        return (f"the price (${price or 0:.2f}/h) is over the ${cap or 0:.2f}/h "
+                "ceiling set when it was armed")
+    return None
+
+
+def _tick_gpu_subs(tg: Tg, chat_id: int, *, dry_run: bool = False) -> None:
     """Fire any subscription whose (gpu, datacenter) is no longer sold out.
 
     Reuses `stock_at_cached` — the same 60s-TTL cache /gpu itself reads from
@@ -4671,6 +4705,11 @@ def _tick_gpu_subs(tg: Tg, chat_id: int) -> None:
     beyond what the poll loop's own cadence already pays for. One-shot: a
     fired subscription is removed immediately, same tick, on the user's own
     request (2026-09-12) — "báo 1 lần rồi gỡ, giống đặt báo thức 1 lần".
+
+    A sub carrying `auto_resume` (2026-09-27 spec §1) additionally tries to
+    resume the stuck run through `_do_resume` — never a second spend path,
+    since `_auto_resume_refusal` gates it with the same checks the recovery
+    buttons already enforce, plus the ceiling armed at /subscribe time.
     """
     subs = _gpu_subs_for(chat_id)
     if not subs:
@@ -4697,19 +4736,39 @@ def _tick_gpu_subs(tg: Tg, chat_id: int) -> None:
     for sub, hit in fired:
         short = _GPU_DISPLAY_SHORT.get(sub["gpu_id"], sub["gpu_id"])
         price = f"${hit.price_per_hr:.2f}/h" if hit.price_per_hr else "?"
-        _record_gpu_fired(chat_id, {
-            "sub_id": sub.get("id") or "", "gpu_id": sub["gpu_id"],
-            "datacenter_id": sub["datacenter_id"], "stock": hit.stock_status,
-            "usd_per_hr": hit.price_per_hr or None, "fired_at": time.time(),
-            "action": "notified"})
+        entry = {"sub_id": sub.get("id") or "", "gpu_id": sub["gpu_id"],
+                 "datacenter_id": sub["datacenter_id"], "stock": hit.stock_status,
+                 "usd_per_hr": hit.price_per_hr or None, "fired_at": time.time(),
+                 "action": "notified"}
+        refusal = _auto_resume_refusal(chat_id, sub, hit) if sub.get("auto_resume") else None
+        if sub.get("auto_resume") and refusal is None:
+            tail = (f"\n⚡ <b>Auto-resumed</b> — renting {_esc(short)} @ "
+                    f"{_esc(sub['datacenter_id'])} · {price}. The clock is running.")
+        elif refusal is not None:
+            tail = (f"\n{ICON_WARN} Auto-resume skipped: {_esc(refusal)}. "
+                    "Nothing was rented.")
+        else:
+            tail = "\nThis subscription cleared itself — /subscribe again to re-arm."
         tg.send_message(
             chat_id,
             f"🔔 <b>{_esc(short)}</b> is now available at "
             f"<b>{_esc(sub['datacenter_id'])}</b>: "
             f"{_stock_icon(hit.stock_status.lower())} {_esc(hit.stock_status)} · "
-            f"{ICON_MONEY_CE} {price}\n"
-            "This subscription cleared itself — /subscribe again to re-arm.",
+            f"{ICON_MONEY_CE} {price}{tail}",
             parse_mode=PARSE_HTML)
+        if sub.get("auto_resume") and refusal is None:
+            # .env's GPU first, exactly as _CB_RECOVER_SWITCH does: the
+            # subscribed card is the one that has stock.
+            env_set(ROOT / ".env", "GPU", sub["gpu_id"])
+            out = _do_resume(tg, chat_id, _job_manifest_path(chat_id),
+                             dry_run=dry_run, gpu_provider="runpod")
+            if out:
+                entry["action"] = "resumed"
+            else:
+                entry["action"], entry["reason"] = "resume_refused", _plain(out.message)
+        elif refusal is not None:
+            entry["action"], entry["reason"] = "resume_refused", refusal
+        _record_gpu_fired(chat_id, entry)
 
 
 def _gpu_price(gpu_id: str, stock: dict) -> float:
@@ -8073,7 +8132,7 @@ def _run_ticks(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
         tick_progress(tg, chat_id)
         tick_phase_a(tg, chat_id, dry_run=dry_run)
         tick_migration_progress(tg, chat_id, dry_run=dry_run)
-        _tick_gpu_subs(tg, chat_id)
+        _tick_gpu_subs(tg, chat_id, dry_run=dry_run)
         _tick_staging_prune()
         _tick_out_prune(tg, chat_id)
 
