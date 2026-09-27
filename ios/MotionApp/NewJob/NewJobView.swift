@@ -19,7 +19,7 @@ struct NewJobView: View {
     @State private var pick: PickTarget?
     @State private var openEntry: OpenedEntry?
     @State private var showRun = false
-    @State private var basketExpanded = false
+    @State private var basketLevel = BasketDrawer.Level.collapsed
     @State private var clearSource: ClearSource?
     /// The error whose banner was swiped away or timed out. The error itself
     /// stays on the store: it is what turns the More icon into the stale
@@ -68,6 +68,16 @@ struct NewJobView: View {
          store.draft?.filledSlots[BatchComposer.driverRole] ?? ""]
     }
 
+    /// Tall leaves a strip of dimmed cards under the bar with the job count
+    /// and pipeline — the place to tap to close it.
+    private func drawerHeight(_ level: BasketDrawer.Level, stage: CGFloat) -> CGFloat? {
+        switch level {
+        case .collapsed: nil
+        case .half: stage * 0.7
+        case .tall: stage * 0.9
+        }
+    }
+
     private var locked: Bool { store.isBusy || composer.isRunning }
 
     private func state(_ draft: Draft, _ pipeline: Pipeline) -> NewJobState {
@@ -91,21 +101,36 @@ struct NewJobView: View {
             .padding(.bottom, draft.batch.isEmpty ? 0 : BasketDrawer.collapsedHeight + 8)
             .overlay(alignment: .bottom) {
                 if !draft.batch.isEmpty {
-                    BasketDrawer(batch: draft.batch, pipeline: self.pipeline(for:), materials: materials,
-                                 locked: locked, expanded: $basketExpanded,
-                                 onOpen: { entry in
-                                     openEntry = draft.batch.firstIndex { $0.digest == entry.digest }.map(OpenedEntry.init)
-                                 },
-                                 onDrop: { await store.dropFromBatch($0.digest) },
-                                 clearAll: AnyView(clearAllButton))
-                        .frame(maxHeight: basketExpanded ? proxy.size.height * 0.7 : nil, alignment: .bottom)
-                        .padding(.horizontal, 12)
+                    // Explicit bottom alignment: the implicit stack is sized
+                    // by the scrim and centred the drawer in it.
+                    ZStack(alignment: .bottom) {
+                        // Over the cards while the drawer is open: a tap here
+                        // closes it rather than opening a card's picker.
+                        if basketLevel != .collapsed {
+                            Color.black.opacity(0.35)
+                                .contentShape(.rect)
+                                .onTapGesture { withAnimation(.snappy) { basketLevel = .collapsed } }
+                                .transition(.opacity)
+                                .accessibilityLabel("Close the batch")
+                                .accessibilityAddTraits(.isButton)
+                                .accessibilityIdentifier("newjob.basketScrim")
+                        }
+                        BasketDrawer(batch: draft.batch, pipeline: self.pipeline(for:), materials: materials,
+                                     locked: locked, level: $basketLevel,
+                                     onOpen: { entry in
+                                         openEntry = draft.batch.firstIndex { $0.digest == entry.digest }.map(OpenedEntry.init)
+                                     },
+                                     onDrop: { await store.dropFromBatch($0.digest) },
+                                     clearAll: AnyView(clearAllButton))
+                            .frame(maxHeight: drawerHeight(basketLevel, stage: proxy.size.height), alignment: .bottom)
+                            .padding(.horizontal, 12)
+                    }
                 }
             }
             .overlay(alignment: .top) { banners.padding(.horizontal, 12) }
             // Dropping the last job removes the drawer; collapse it too, so the
             // next job's basket does not reappear open over the cards.
-            .onChange(of: draft.batch.isEmpty) { _, empty in if empty { basketExpanded = false } }
+            .onChange(of: draft.batch.isEmpty) { _, empty in if empty { basketLevel = .collapsed } }
         }
         .toolbar {
             ToolbarItem(placement: .principal) {

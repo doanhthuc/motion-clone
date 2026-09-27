@@ -14,6 +14,9 @@ struct BatchEntryRow: View {
     let dropDisabled: Bool
     let onOpen: () -> Void
     let onDrop: () -> Void
+    /// Owned by the list, so the swipe action's Drop opens this same dialog.
+    @Binding var confirmingDrop: Bool
+    let onConfirmDrop: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -38,6 +41,16 @@ struct BatchEntryRow: View {
                 .tint(Theme.danger)
                 .disabled(dropDisabled)
                 .accessibilityLabel("Drop")
+                // On the trash button: iOS 26 shows this as a popover, and on
+                // the whole row its arrow pointed at the row's top edge, not at
+                // anything the user tapped (user, 2026-09-27).
+                .confirmationDialog("Drop this batch entry?", isPresented: $confirmingDrop,
+                                    titleVisibility: .visible) {
+                    Button("Drop", role: .destructive, action: onConfirmDrop)
+                    Button("Cancel", role: .cancel) { confirmingDrop = false }
+                } message: {
+                    Text("Job \(index) · \(BatchEntryText.subtitle(entry, pipeline: pipeline))")
+                }
             }
             HStack(alignment: .top, spacing: 8) {
                 ForEach(BatchEntryText.roles(entry, pipeline: pipeline), id: \.self) { role in
