@@ -16,6 +16,8 @@ struct PodView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var openGpu: GpuSheetTarget?
     @State private var showBalance = false
+    @State private var watchLevel = WatchDrawer.Level.collapsed
+    @State private var bannerHidden: String?
 
     var body: some View {
         GeometryReader { proxy in
@@ -28,12 +30,36 @@ struct PodView: View {
             .padding(.top, 8)
             .padding(.bottom, WatchDrawer.collapsedHeight + 8)
             .frame(width: proxy.size.width, height: proxy.size.height, alignment: .top)
+            .overlay(alignment: .bottom) {
+                ZStack(alignment: .bottom) {
+                    if watchLevel == .open {
+                        Color.black.opacity(0.35)
+                            .contentShape(.rect)
+                            .onTapGesture { withAnimation(.snappy) { watchLevel = .collapsed } }
+                            .transition(.opacity)
+                            .accessibilityLabel("Close the watch list")
+                            .accessibilityAddTraits(.isButton)
+                            .accessibilityIdentifier("pod.watchScrim")
+                    }
+                    WatchDrawer(subs: subs, level: $watchLevel)
+                        .frame(maxHeight: watchLevel == .open ? proxy.size.height * 0.7 : nil, alignment: .bottom)
+                        .padding(.horizontal, 12)
+                }
+            }
+            .overlay(alignment: .top) { firedBanner.padding(.horizontal, 12) }
         }
         .accessibilityIdentifier("pod.stage")
         .navigationTitle("Pod")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar { ToolbarItem(placement: .topBarTrailing) { moreMenu } }
         .sheet(isPresented: $showBalance) { BalanceSheet(store: balance) }
+        .sheet(item: $openGpu) { target in
+            if let stock = gpu.stock {
+                GpuSheet(gpu: target.gpu, stock: stock, subs: subs, gpuStore: gpu, pod: pod,
+                         spending: flow.isSpending,
+                         onMigrate: { model.migrateSheet = MigrateRequest(destination: $0) })
+            }
+        }
         .task {
             async let a: Void = pod.refresh()
             async let b: Void = balance.load()
@@ -127,4 +153,27 @@ struct PodView: View {
 struct GpuSheetTarget: Identifiable {
     let gpu: String
     var id: String { gpu }
+}
+
+extension PodView {
+    /// The newest firing the app has not shown yet. Telegram already buzzed
+    /// the phone; this is the same news for whoever opens the app first.
+    @ViewBuilder fileprivate var firedBanner: some View {
+        if watchLevel == .collapsed, let firing = subs.unseen.first, firing.id != bannerHidden {
+            let text = firing.resumed
+                ? "⚡ \(firing.name) @ \(firing.datacenter) came into stock — auto-resumed, a pod was rented."
+                : firing.refused
+                    ? "🔔 \(firing.name) @ \(firing.datacenter) came into stock. Auto-resume skipped: \(firing.reason ?? "refused")."
+                    : "🔔 \(firing.name) @ \(firing.datacenter) came into stock (\(firing.stock))."
+            MessageCard(text: text) { bannerHidden = firing.id; subs.markSeen() }
+                .heroSurface()
+                .modifier(SwipeUpToDismiss { bannerHidden = firing.id; subs.markSeen() })
+                .task(id: firing.id) {
+                    try? await Task.sleep(for: .seconds(8))
+                    bannerHidden = firing.id
+                }
+                .transition(.move(edge: .top).combined(with: .opacity))
+                .accessibilityIdentifier("pod.firedBanner")
+        }
+    }
 }
