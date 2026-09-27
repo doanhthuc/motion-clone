@@ -329,8 +329,22 @@ class _Handler(BaseHTTPRequestHandler):
             # Only the exact string "1" turns these on, like rent-panel's force:
             # "true" or "11" silently meaning yes would make a paid-for slow call
             # (or a forced runpodctl round trip) depend on a spelling.
-            force = parse_qs(urlsplit(self.path).query).get("force", ["0"])[0] == "1"
-            status, body = self._app_pod().gpu_stock(force)
+            query = parse_qs(urlsplit(self.path).query)
+            force = query.get("force", ["0"])[0] == "1"
+            all_dcs = query.get("all", ["0"])[0] == "1"
+            status, body = self._app_pod().gpu_stock(force, all_dcs)
+            return self._send_json(status, body)
+        if method == "GET" and rest == ["gpu", "subs"]:
+            status, body = self._app_pod().gpu_subs()
+            return self._send_json(status, body)
+        if method == "POST" and rest == ["gpu", "subs"]:
+            # No Idempotency-Key: an upsert on (gpu, datacenter), and not a spend.
+            app_pod = self._app_pod()
+            payload = self._read_json()
+            status, body = app_pod.add_gpu_sub(payload)
+            return self._send_json(status, body)
+        if method == "DELETE" and len(rest) == 3 and rest[:2] == ["gpu", "subs"]:
+            status, body = self._app_pod().remove_gpu_sub(rest[2])
             return self._send_json(status, body)
         if method == "GET" and rest == ["balance"]:
             vast = parse_qs(urlsplit(self.path).query).get("vast", ["0"])[0] == "1"

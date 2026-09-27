@@ -29,15 +29,16 @@ public final class GpuStore {
 
     /// `force` only from pull-to-refresh, Retry or the GPU header's refresh
     /// button: uncached it is a runpodctl round trip (~30 s worst case). A 502 keeps the last good list.
+    /// Always `?all=1`: the Pod stage's GPU sheet lists every datacenter,
+    /// sold-out ones included (2026-09-27).
     public func load(force: Bool = false) async {
         isLoading = true
         defer { isLoading = false }
         let selectionsBefore = selections
         do {
-            var fresh = force
-                ? try await client.get(GpuStock.self, query: [URLQueryItem(name: "force", value: "1")],
-                                       timeout: 60, "v1", "gpu", "stock")
-                : try await client.get(GpuStock.self, timeout: 60, "v1", "gpu", "stock")
+            var query = [URLQueryItem(name: "all", value: "1")]
+            if force { query.append(URLQueryItem(name: "force", value: "1")) }
+            var fresh = try await client.get(GpuStock.self, query: query, timeout: 60, "v1", "gpu", "stock")
             if selections != selectionsBefore, let lastSelected { fresh.selected = lastSelected }
             stock = fresh
             error = nil

@@ -167,6 +167,14 @@ await check("GET /v1/pod") { slot = try await client.get(PodStatus.self, "v1", "
 await check("GET /v1/gpu/stock") {
     _ = try await client.get(GpuStock.self, timeout: 60, "v1", "gpu", "stock")
 }
+await check("GET /v1/gpu/stock?all=1") {
+    let stock = try await client.get(GpuStock.self, query: [URLQueryItem(name: "all", value: "1")],
+                                     timeout: 60, "v1", "gpu", "stock")
+    guard stock.datacenters != nil else { throw ContractError.datacentersMissing }
+}
+await check("GET /v1/gpu/subs") {
+    _ = try await client.get(GpuSubs.self, "v1", "gpu", "subs")
+}
 // No ?vast=1: the Vast credit is a ~30 s subprocess and is opt-in.
 await check("GET /v1/balance") {
     _ = try await client.get(Balance.self, timeout: 45, "v1", "balance")
@@ -219,4 +227,5 @@ exit(failed == 0 ? 0 : 1)
 
 enum ContractError: Error {
     case invalidRangeResponse
+    case datacentersMissing
 }

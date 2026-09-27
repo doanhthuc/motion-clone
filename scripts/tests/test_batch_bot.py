@@ -5479,8 +5479,8 @@ class TestGpuSubscribe(unittest.TestCase):
         self.assertIn("RTX 5090", text)
         self.assertIn("EU-RO-1", text)
         subs = bot._gpu_subs_for(ME)
-        self.assertEqual(subs, [{"gpu_id": "NVIDIA GeForce RTX 5090",
-                                 "datacenter_id": "EU-RO-1"}])
+        self.assertEqual([(s["gpu_id"], s["datacenter_id"]) for s in subs],
+                        [("NVIDIA GeForce RTX 5090", "EU-RO-1")])
 
     def test_subscribing_to_the_same_pair_twice_is_refused(self):
         bot.handle(self.tg, cb_from(ME, bot._CB_GPUSUB_DC + "5090:EU-RO-1"),
@@ -5524,8 +5524,8 @@ class TestGpuSubscribe(unittest.TestCase):
         bot.handle(self.tg, cb_from(ME, bot._CB_GPUSUB_RM + "5090:EU-RO-1"),
                   allowed_user_id=ME)
         subs = bot._gpu_subs_for(ME)
-        self.assertEqual(subs, [{"gpu_id": "NVIDIA GeForce RTX 4090",
-                                 "datacenter_id": "EU-RO-1"}])
+        self.assertEqual([(s["gpu_id"], s["datacenter_id"]) for s in subs],
+                        [("NVIDIA GeForce RTX 4090", "EU-RO-1")])
         # The redrawn list reflects the removal in place, not a fresh send.
         self.assertNotIn("RTX 5090", self.tg.edits[-1][1])
         self.assertIn("RTX 4090", self.tg.edits[-1][1])
@@ -5566,9 +5566,56 @@ class TestGpuSubscribe(unittest.TestCase):
                   allowed_user_id=ME)
         bot._GPU_SUBS.clear()
         bot._GPU_SUBS_LOADED.clear()   # what a fresh process actually starts with
-        self.assertEqual(bot._gpu_subs_for(ME),
-                        [{"gpu_id": "NVIDIA GeForce RTX 5090",
-                          "datacenter_id": "EU-RO-1"}])
+        subs = bot._gpu_subs_for(ME)
+        self.assertEqual([(s["gpu_id"], s["datacenter_id"]) for s in subs],
+                        [("NVIDIA GeForce RTX 5090", "EU-RO-1")])
+
+    def test_subscribing_mints_an_id_and_timestamp(self):
+        bot.handle(self.tg, cb_from(ME, bot._CB_GPUSUB_DC + "5090:EU-RO-1"),
+                  allowed_user_id=ME)
+        [sub] = bot._gpu_subs_for(ME)
+        self.assertRegex(sub["id"], r"^[0-9a-f]{6}$")
+        self.assertIsInstance(sub["created_at"], float)
+
+    def test_legacy_entries_gain_ids_and_are_saved(self):
+        """A file written before ids existed (every sub made 2026-09-12 → today)."""
+        path = bot._gpu_subs_path(ME)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps([
+            {"gpu_id": "NVIDIA GeForce RTX 5090", "datacenter_id": "EU-RO-1"},
+            {"gpu_id": "NVIDIA GeForce RTX 4090", "datacenter_id": "EU-RO-1"}]))
+        subs = bot._gpu_subs_for(ME)
+        ids = [s["id"] for s in subs]
+        self.assertEqual(len(set(ids)), 2)
+        on_disk = json.loads(path.read_text())
+        self.assertEqual([s["id"] for s in on_disk], ids)
+
+    def test_tick_records_the_firing(self):
+        bot._gpu_subs_for(ME).append(bot._new_gpu_sub(
+            "NVIDIA GeForce RTX 5090", "EU-RO-1", []))
+        bot._save_gpu_subs(ME)
+        sub_id = bot._gpu_subs_for(ME)[0]["id"]
+        with mock.patch("tgbot.bot.stock_at_cached",
+                       return_value=self._stock(status_5090_ro="Low")):
+            bot._tick_gpu_subs(self.tg, ME)
+        [fired] = bot._gpu_fired_for(ME)
+        self.assertEqual((fired["sub_id"], fired["datacenter_id"], fired["stock"],
+                          fired["usd_per_hr"], fired["action"]),
+                         (sub_id, "EU-RO-1", "Low", 0.99, "notified"))
+        self.assertNotIn("reason", fired)
+
+    def test_fired_history_keeps_the_newest_ten(self):
+        for i in range(12):
+            bot._record_gpu_fired(ME, {"sub_id": f"{i:06x}", "fired_at": float(i)})
+        fired = bot._gpu_fired_for(ME)
+        self.assertEqual(len(fired), bot._GPU_FIRED_KEEP)
+        self.assertEqual(fired[0]["fired_at"], 11.0)
+
+    def test_unreadable_fired_file_reads_as_empty(self):
+        path = bot._gpu_fired_path(ME)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{not json")
+        self.assertEqual(bot._gpu_fired_for(ME), [])
 
 
 class TestKillCommand(unittest.TestCase):

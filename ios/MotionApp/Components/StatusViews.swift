@@ -6,14 +6,16 @@ import MotionKit
 struct PulseDot: View {
     var color: Color = Theme.label
     var size: CGFloat = 8
-    @State private var dim = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var body: some View {
-        Circle().fill(color).frame(width: size, height: size)
-            .opacity(dim && !reduceMotion ? 0.35 : 1)
-            .animation(.easeInOut(duration: 0.75).repeatForever(autoreverses: true), value: dim)
-            .onAppear { dim = true }
-            .accessibilityHidden(true)
+        // PhaseAnimator, not `.animation(.repeatForever, value:)` toggled in
+        // onAppear (2026-09-27): the Pod hero's migration dot never rendered —
+        // zero non-background pixels in five SE screenshots 0.4 s apart —
+        // while its 16 pt slot stayed in the layout.
+        PhaseAnimator(reduceMotion ? [1.0] : [1.0, 0.35]) { opacity in
+            Circle().fill(color).frame(width: size, height: size).opacity(opacity)
+        } animation: { _ in .easeInOut(duration: 0.75) }
+        .accessibilityHidden(true)
     }
 }
 

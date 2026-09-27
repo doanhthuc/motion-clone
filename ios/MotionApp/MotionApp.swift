@@ -78,6 +78,7 @@ final class AppModel {
     private(set) var outputs: OutputsStore?
     private(set) var runFlow: RunFlow?
     private(set) var gpu: GpuStore?
+    private(set) var gpuSubs: GpuSubsStore?
     private(set) var balance: BalanceStore?
     private(set) var migrate: MigrateFlow?
     private(set) var tryonLibrary: TryonLibraryStore?
@@ -95,6 +96,15 @@ final class AppModel {
     private(set) var recordedSpends = 0
     private var spendGate: (any SpendSending)?
     static let isUITestRecording = ProcessInfo.processInfo.arguments.contains("-UITestRecordingSpendGate")
+    /// UI tests only (2026-09-27): the Pod hero renders a fixed migration so
+    /// its tallest state can be laid out on an iPhone SE without starting a
+    /// real (paid) volume move. Display only — no request, no store change.
+    static let isUITestPreviewMigration = ProcessInfo.processInfo.arguments.contains("-UITestPreviewMigration")
+    /// Set by PodView: the fired banner (RootView, every tab) stays out of
+    /// the way while the Pod tab's Watching drawer is open.
+    var watchDrawerOpen = false
+    /// Set by a tap on the fired banner; PodView opens its drawer and clears it.
+    var watchDrawerRequested = false
     var selectedTab: AppTab = .runs
     private var materialResumeTask: Task<Void, Never>?
     private var replayTask: Task<Void, Never>?
@@ -114,7 +124,7 @@ final class AppModel {
         materialResumeTask = nil
         guard let credentials = vault.load() else {
             client = nil; runs = nil; pod = nil; materials = nil; draft = nil; outputs = nil; runFlow = nil
-            gpu = nil; balance = nil; migrate = nil; tryonLibrary = nil; batchComposer = nil; spendGate = nil
+            gpu = nil; gpuSubs = nil; balance = nil; migrate = nil; tryonLibrary = nil; batchComposer = nil; spendGate = nil
             studio = nil
             return true
         }
@@ -131,6 +141,7 @@ final class AppModel {
         batchComposer = BatchComposer(draft: draft, library: library)
         outputs = OutputsStore(client: client)
         gpu = GpuStore(client: client, pod: pod)
+        gpuSubs = GpuSubsStore(client: client)
         balance = BalanceStore(client: client)
         studio = StudioStore(client: client)
         let gate: any SpendSending = Self.isUITestRecording
@@ -165,6 +176,23 @@ final class AppModel {
             await materials.resumePendingUpload()
             self?.materialResumeTask = nil
         }
+    }
+
+    /// A tap on the "came into stock" banner: the Pod tab with the Watching
+    /// drawer open, where the firing and its run are listed.
+    func openWatchList() {
+        selectedSpace = .motion
+        isSidebarOpen = false
+        selectedTab = .pod
+        watchDrawerRequested = true
+    }
+
+    /// The fired banner lives on every tab now (2026-09-27), so the firing
+    /// list is read at launch and on each return to the foreground — not
+    /// only while the Pod tab happens to be showing.
+    func refreshGpuSubs() {
+        guard let gpuSubs else { return }
+        Task { await gpuSubs.load() }
     }
 
     /// A tap on a share-extension banner: show the list the video landed in.

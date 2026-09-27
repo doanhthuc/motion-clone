@@ -34,6 +34,18 @@ public struct PodMigration: Decodable, Sendable, Equatable {
     public let bytesCopied: Double?
     public let totalBytes: Double?
 
+    /// Public so the app can render a fixed migration under a UI-test launch
+    /// argument (`-UITestPreviewMigration`, 2026-09-27) without a real one.
+    public init(running: Bool, phase: String?, toDc: String?, startedAt: Double?,
+                bytesCopied: Double?, totalBytes: Double?) {
+        self.running = running
+        self.phase = phase
+        self.toDc = toDc
+        self.startedAt = startedAt
+        self.bytesCopied = bytesCopied
+        self.totalBytes = totalBytes
+    }
+
     /// nil until both byte counts exist — no bar is better than a made-up one.
     public var fractionCopied: Double? {
         guard let bytesCopied, let totalBytes, totalBytes > 0 else { return nil }

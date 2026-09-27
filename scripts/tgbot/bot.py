@@ -4291,7 +4291,7 @@ def _report_gpu_stock(tg: Tg, chat_id: int, *, message_id: int | None = None,
                  [[("Refresh", _CB_GPU_REFRESH, _ce_id(ICON_REFRESH_CE))]], parse_mode=PARSE_HTML)
 
 
-def _gpu_stock_data(*, force: bool) -> dict:
+def _gpu_stock_data(*, force: bool, all_dcs: bool = False) -> dict:
     """`_report_gpu_stock`'s numbers as JSON for the phone (`GET /v1/gpu/stock`).
 
     A twin, not a caller: `_report_gpu_stock` also sends or edits a Telegram
@@ -4306,6 +4306,11 @@ def _gpu_stock_data(*, force: bool) -> dict:
     runpodctl round trip (~30s worst case, its own timeout). Raises
     RuntimeError when the stock check does; `AppPod.gpu_stock` maps that to
     502, where the Telegram report says "couldn't reach runpodctl".
+
+    `all_dcs=True` (`GET /v1/gpu/stock?all=1`) adds a `datacenters` array
+    listing every (gpu, datacenter) runpodctl knows about, sold out included —
+    for the phone's subscribe picker, which needs exactly the datacenters the
+    default output above drops.
     """
     volume_id = env_get(ROOT / ".env", "POD_VOLUME_ID")
     home_dc = volume_datacenter(volume_id)
@@ -4342,8 +4347,20 @@ def _gpu_stock_data(*, force: bool) -> dict:
                                   "usd_per_hr": e.price_per_hr or None})
     # The primary when .env has no GPU=, the same fallback GET /v1/pod and
     # _gpu_mismatch use — two screens must not show two answers for one value.
-    return {"selected": env_get(ROOT / ".env", "GPU") or _PRIMARY_GPU_ID,
+    data = {"selected": env_get(ROOT / ".env", "GPU") or _PRIMARY_GPU_ID,
             "home_datacenter": home_dc, "gpus": gpus, "other_regions": other_regions}
+    if all_dcs:
+        # A GPU sold out at every datacenter is missing from the default
+        # output (verified live 2026-09-12), which is exactly when the
+        # phone wants to subscribe to it. Its own call, so `gpus` above keeps
+        # the default output's meaning (sold_out_everywhere, entries[0]).
+        full = (stock_at(wanted, include_unavailable=True) if force
+                else stock_at_cached(wanted, include_unavailable=True))
+        data["datacenters"] = [
+            {"gpu": gpu_id, "datacenter": e.datacenter_id,
+             "stock": _plain(e.stock_status), "usd_per_hr": e.price_per_hr or None}
+            for gpu_id in wanted for e in full.get(gpu_id) or []]
+    return data
 
 
 # Below this many hours of runway, /balance warns before a rent is attempted:
@@ -4434,7 +4451,8 @@ def _gpu_subs_path(chat_id: int) -> Path:
 
 def _gpu_subs_for(chat_id: int) -> list[dict]:
     """Every (gpu_id, datacenter_id) this chat is watching. Loaded once per
-    process per chat, same as `_ledger_for`."""
+    process per chat, same as `_ledger_for`. Entries written before ids
+    existed (2026-09-12 → 2026-09-27) get one here, saved straight back."""
     if chat_id not in _GPU_SUBS_LOADED:
         _GPU_SUBS_LOADED.add(chat_id)
         path = _gpu_subs_path(chat_id)
@@ -4444,6 +4462,12 @@ def _gpu_subs_for(chat_id: int) -> list[dict]:
             pass
         except (ValueError, TypeError) as exc:
             log(f"gpu subs for chat {chat_id} unreadable, starting over: {exc!r}")
+        subs = _GPU_SUBS.get(chat_id) or []
+        if any("id" not in s for s in subs):
+            for s in subs:
+                if "id" not in s:
+                    s["id"] = _mint_gpu_sub_id(subs)
+            _save_gpu_subs(chat_id)
     return _GPU_SUBS.setdefault(chat_id, [])
 
 
@@ -4455,6 +4479,49 @@ def _save_gpu_subs(chat_id: int) -> None:
     tmp.replace(path)
 
 
+# The last firings, newest first, for the phone's "Recent" list and its
+# in-app banner (2026-09-27 spec §1). The Telegram message is still the
+# notification; this is only what the app reads back when it opens.
+_GPU_FIRED_KEEP = 10
+
+
+def _gpu_fired_path(chat_id: int) -> Path:
+    return ROOT / "batch" / f"tg-{chat_id}.gpusubs-fired.json"
+
+
+def _mint_gpu_sub_id(existing: list[dict]) -> str:
+    taken = {s.get("id") for s in existing}
+    while True:
+        sub_id = secrets.token_hex(3)
+        if sub_id not in taken:
+            return sub_id
+
+
+def _new_gpu_sub(gpu_id: str, dc: str, existing: list[dict]) -> dict:
+    return {"id": _mint_gpu_sub_id(existing), "gpu_id": gpu_id,
+            "datacenter_id": dc, "created_at": time.time()}
+
+
+def _gpu_fired_for(chat_id: int) -> list[dict]:
+    try:
+        data = json.loads(_gpu_fired_path(chat_id).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except (ValueError, TypeError) as exc:
+        log(f"gpu fired history for chat {chat_id} unreadable, starting over: {exc!r}")
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _record_gpu_fired(chat_id: int, entry: dict) -> None:
+    fired = [entry, *_gpu_fired_for(chat_id)][:_GPU_FIRED_KEEP]
+    path = _gpu_fired_path(chat_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(fired), encoding="utf-8")
+    tmp.replace(path)
+
+
 def _offer_gpu_sub_targets(tg: Tg, chat_id: int) -> None:
     """/subscribe's first step — which of the five GPUs /gpu already tracks."""
     tg.send_message(
@@ -4463,6 +4530,11 @@ def _offer_gpu_sub_targets(tg: Tg, chat_id: int) -> None:
         buttons=[[(_GPU_DISPLAY_SHORT[gpu_id], _CB_GPUSUB_PICK + _GPU_SHORT[gpu_id])]
                  for gpu_id in _GPU_CATALOG],
         parse_mode=PARSE_HTML)
+
+
+# A RunPod datacenter id (EU-RO-1, US-TX-3, ...). Bounded because
+# /unsubscribe embeds it in Telegram callback_data (64-byte cap).
+_GPU_SUB_DC_RE = re.compile(r"[A-Za-z0-9-]{1,32}")
 
 
 def _home_datacenter() -> str | None:
@@ -4562,7 +4634,7 @@ def _add_gpu_sub(tg: Tg, chat_id: int, message_id: int, short: str, dc: str) -> 
                         f"already subscribed to {_esc(_GPU_DISPLAY_SHORT[gpu_id])} "
                         f"@ {_esc(dc)} — see /unsubscribe to remove it.")
         return
-    subs.append({"gpu_id": gpu_id, "datacenter_id": dc})
+    subs.append(_new_gpu_sub(gpu_id, dc, subs))
     _save_gpu_subs(chat_id)
     home_dc = _home_datacenter()
     caveat = (f"\n{ICON_WARN} not your volume's home datacenter — renting here "
@@ -4588,7 +4660,8 @@ def _gpu_subs_lines_and_buttons(chat_id: int) -> tuple[str, list]:
     for s in subs:
         short = _GPU_DISPLAY_SHORT.get(s["gpu_id"], s["gpu_id"])
         dc = s["datacenter_id"]
-        lines.append(f"  {_esc(short)} @ {_esc(dc)}")
+        bolt = " ⚡ auto-resume" if s.get("auto_resume") else ""
+        lines.append(f"  {_esc(short)} @ {_esc(dc)}{bolt}")
         buttons.append([(f"{short} @ {dc}",
                         f"{_CB_GPUSUB_RM}{_GPU_SHORT.get(s['gpu_id'], '')}:{dc}",
                         _ce_id(ICON_TRASH_CE))])
@@ -4613,7 +4686,99 @@ def _remove_gpu_sub(tg: Tg, chat_id: int, message_id: int, short: str, dc: str) 
                     parse_mode=PARSE_HTML)
 
 
-def _tick_gpu_subs(tg: Tg, chat_id: int) -> None:
+def _failure_is_for_current_manifest(chat_id: int) -> bool:
+    """Was this chat's provision-failed.json written for the manifest on disk now?
+
+    Neither `run_id` (always `tg-<chat>`) nor `run_token` (minted at arm time)
+    can tell a stale failure apart: provision-failed.json survives a NEW job
+    being confirmed, so arming from a Pod sheet still showing job A's stock-out
+    would capture job B's token and rent B unattended (final review,
+    2026-09-27). drain.py writes the failure after Phase A, and nothing in the
+    stock-out flow rewrites the manifest after that (only a new/edited job or a
+    try-on provider switch does), so a failure no older than the manifest
+    belongs to it. Fails closed: a missing file on either side is False.
+    """
+    manifest_path = _job_manifest_path(chat_id)
+    try:
+        return (provision_failure_path(manifest_path).stat().st_mtime_ns
+                >= manifest_path.stat().st_mtime_ns)
+    except OSError:
+        return False
+
+
+def _auto_resume_refusal(chat_id: int, sub: dict, hit) -> str | None:
+    """Why an armed sub must only notify, or None when it may resume.
+
+    The arming guards again, read at fire time, plus the live-state ones
+    `_do_resume` would refuse on anyway (2026-09-27 spec §1). Each answer is
+    one plain sentence: it goes into the Telegram message and the fired
+    history as-is. `_home_datacenter` is a runpodctl call; this only runs
+    for the rare sub that is both armed and firing.
+    """
+    armed = sub.get("auto_resume") or {}
+    manifest_path = _job_manifest_path(chat_id)
+    if (armed.get("run_id") != manifest_path.stem
+            or armed.get("run_token") != _run_token(chat_id)):
+        return "the run changed since auto-resume was armed"
+    failure = read_provision_failure(provision_failure_path(manifest_path))
+    if failure is None or not failure.stock_out:
+        return "the run no longer has a stock-out to resume from"
+    if not _failure_is_for_current_manifest(chat_id):
+        return "the stock-out on record belongs to an earlier job"
+    home = _home_datacenter()
+    if home is None:
+        return "couldn't confirm the volume's home datacenter"
+    if sub["datacenter_id"] != home:
+        return "this is not the volume's home datacenter"
+    if busy(manifest_path):
+        return "the run is busy"
+    if migration_running():
+        return "a volume migration is in progress"
+    if read_lease(LEASE_PATH) is not None:
+        return "a pod is already live"
+    cap = armed.get("max_usd_per_hr")
+    price = hit.price_per_hr
+    if not price:
+        return "the current price is unknown"
+    if cap is None:
+        return "no price ceiling was recorded when it was armed"
+    if price > cap:
+        return (f"the price (${price:.2f}/h) is over the ${cap:.2f}/h "
+                "ceiling set when it was armed")
+    return None
+
+
+def _adopt_started_drain(chat_id: int, manifest_path: Path) -> None:
+    """Leave a progress file for a drain `_start_progress` failed to record.
+
+    Review fix (2026-09-27): after an auto-resume's start_drain, a raise in
+    `_start_progress` (usually its send_message) left no progress file, and
+    tick_progress returns at once without one — no progress, no result, no
+    stock-out card. message_id 0 is never a real message, so tick_progress's
+    first edit gets "message to edit not found" (edit_message -> False) and
+    takes its existing rebuild path: send a fresh message and record its id.
+    RunPod only (no billing keys), which is all auto-resume ever rents.
+    """
+    path = _progress_path(chat_id)
+    if path.exists():
+        return      # _start_progress got as far as writing it
+    stages: list[str] = []
+    try:
+        for run in load_manifest(manifest_path).runs:
+            for stage in PIPELINES[run.pipeline]:
+                if stage not in stages:
+                    stages.append(stage)
+    except ManifestError as exc:
+        log(f"adopting drain for chat {chat_id} without stages: {exc}")
+    try:
+        path.write_text(json.dumps({
+            "manifest": str(manifest_path), "message_id": 0,
+            "stages": stages, "sent_tryon": []}, indent=2), encoding="utf-8")
+    except OSError as exc:
+        log(f"could not adopt the started drain for chat {chat_id}: {exc!r}")
+
+
+def _tick_gpu_subs(tg: Tg, chat_id: int, *, dry_run: bool = False) -> None:
     """Fire any subscription whose (gpu, datacenter) is no longer sold out.
 
     Reuses `stock_at_cached` — the same 60s-TTL cache /gpu itself reads from
@@ -4621,6 +4786,11 @@ def _tick_gpu_subs(tg: Tg, chat_id: int) -> None:
     beyond what the poll loop's own cadence already pays for. One-shot: a
     fired subscription is removed immediately, same tick, on the user's own
     request (2026-09-12) — "báo 1 lần rồi gỡ, giống đặt báo thức 1 lần".
+
+    A sub carrying `auto_resume` (2026-09-27 spec §1) additionally tries to
+    resume the stuck run through `_do_resume` — never a second spend path,
+    since `_auto_resume_refusal` gates it with the same checks the recovery
+    buttons already enforce, plus the ceiling armed at /subscribe time.
     """
     subs = _gpu_subs_for(chat_id)
     if not subs:
@@ -4647,14 +4817,82 @@ def _tick_gpu_subs(tg: Tg, chat_id: int) -> None:
     for sub, hit in fired:
         short = _GPU_DISPLAY_SHORT.get(sub["gpu_id"], sub["gpu_id"])
         price = f"${hit.price_per_hr:.2f}/h" if hit.price_per_hr else "?"
-        tg.send_message(
-            chat_id,
-            f"🔔 <b>{_esc(short)}</b> is now available at "
-            f"<b>{_esc(sub['datacenter_id'])}</b>: "
-            f"{_stock_icon(hit.stock_status.lower())} {_esc(hit.stock_status)} · "
-            f"{ICON_MONEY_CE} {price}\n"
-            "This subscription cleared itself — /subscribe again to re-arm.",
-            parse_mode=PARSE_HTML)
+        entry = {"sub_id": sub.get("id") or "", "gpu_id": sub["gpu_id"],
+                 "datacenter_id": sub["datacenter_id"], "stock": hit.stock_status,
+                 "usd_per_hr": hit.price_per_hr or None, "fired_at": time.time(),
+                 "action": "notified"}
+        refusal = _auto_resume_refusal(chat_id, sub, hit) if sub.get("auto_resume") else None
+        if sub.get("auto_resume") and refusal is None:
+            # .env's GPU first, exactly as _CB_RECOVER_SWITCH does: the
+            # subscribed card is the one that has stock. The previous value
+            # is remembered and restored on a refusal — _do_resume has its
+            # own live-state checks _auto_resume_refusal does not repeat
+            # (no "batch" in state, a ManifestError, a busy/migration race
+            # under this same lock), so a refusal here is not hypothetical,
+            # and .env must not end up pointing at a GPU nothing was ever
+            # rented for. The Telegram message below is sent only after this
+            # settles, so it can never claim a resume before one happened.
+            env_path = ROOT / ".env"
+            previous_gpu = env_get(env_path, "GPU")
+            env_set(env_path, "GPU", sub["gpu_id"])
+            started_despite: Exception | None = None
+            try:
+                out = _do_resume(tg, chat_id, _job_manifest_path(chat_id),
+                                 dry_run=dry_run, gpu_provider="runpod")
+            except Exception as exc:
+                log(f"auto-resume raised for chat {chat_id}: {exc!r}")
+                if busy(_job_manifest_path(chat_id)):
+                    # start_drain already ran and only what follows it (the
+                    # progress messages) raised (follow-up fix, 2026-09-27):
+                    # the drain is live and renting on .env's GPU, so .env
+                    # stays as is and the user is told a rental started —
+                    # restoring .env or saying "Nothing was rented" here
+                    # would misreport money already being spent.
+                    started_despite = exc
+                    out = Outcome(True, "started")
+                    _adopt_started_drain(chat_id, _job_manifest_path(chat_id))
+                else:
+                    # An exception before the drain started is a refusal too
+                    # (2026-09-27): .env must not be left pointing at a card
+                    # nothing was rented for, and one bad sub must not stop
+                    # the rest of this tick's firings.
+                    out = Outcome(False, "resume_error", f"auto-resume failed: {exc}")
+            if out:
+                entry["action"] = "resumed"
+                if started_despite is not None:
+                    entry["reason"] = f"started, but progress messages failed: {started_despite}"
+                # "started a rental", not "the clock is running" (2026-09-27):
+                # the rental itself can still stock out after start_drain, and
+                # that case already has its own card.
+                tail = (f"\n⚡ <b>Auto-resume started a rental</b> — renting {_esc(short)} @ "
+                        f"{_esc(sub['datacenter_id'])} · {price}. If the stock is gone "
+                        "again you'll get the usual stock-out card.")
+            else:
+                env_set(env_path, "GPU", previous_gpu)
+                entry["action"], entry["reason"] = "resume_refused", _plain(out.message)
+                tail = (f"\n{ICON_WARN} Auto-resume skipped: {_esc(entry['reason'])}. "
+                        "Nothing was rented.")
+        elif refusal is not None:
+            entry["action"], entry["reason"] = "resume_refused", refusal
+            tail = (f"\n{ICON_WARN} Auto-resume skipped: {_esc(refusal)}. "
+                    "Nothing was rented.")
+        else:
+            tail = "\nThis subscription cleared itself — /subscribe again to re-arm."
+        # Recorded before the send, and the send may fail (review fix,
+        # 2026-09-27): the subs were already removed above, so a Telegram
+        # outage raising here used to drop this firing and every later one
+        # silently. The fired history is what the phone reads anyway.
+        _record_gpu_fired(chat_id, entry)
+        try:
+            tg.send_message(
+                chat_id,
+                f"🔔 <b>{_esc(short)}</b> is now available at "
+                f"<b>{_esc(sub['datacenter_id'])}</b>: "
+                f"{_stock_icon(hit.stock_status.lower())} {_esc(hit.stock_status)} · "
+                f"{ICON_MONEY_CE} {price}{tail}",
+                parse_mode=PARSE_HTML)
+        except Exception as exc:
+            log(f"gpu-sub firing message failed for chat {chat_id}: {exc!r}")
 
 
 def _gpu_price(gpu_id: str, stock: dict) -> float:
@@ -7546,6 +7784,27 @@ def _resume_generation_refusal(chat_id: int, drafts: DraftStore) -> str | None:
     return RESUME_STALE_GENERATION
 
 
+def _gpu_sub_view(sub: dict) -> dict:
+    """A sub as the phone sees it — `run_token` stays on the box."""
+    armed = sub.get("auto_resume")
+    return {"id": sub.get("id") or "", "gpu": sub["gpu_id"],
+            "name": _GPU_DISPLAY_SHORT.get(sub["gpu_id"], sub["gpu_id"]),
+            "datacenter": sub["datacenter_id"], "created_at": sub.get("created_at"),
+            "auto_resume": ({"run_id": armed.get("run_id"),
+                             "max_usd_per_hr": armed.get("max_usd_per_hr")}
+                            if armed else None)}
+
+
+def _gpu_fired_view(entry: dict) -> dict:
+    gpu = entry.get("gpu_id") or ""
+    return {"sub_id": entry.get("sub_id") or "", "gpu": gpu,
+            "name": _GPU_DISPLAY_SHORT.get(gpu, gpu),
+            "datacenter": entry.get("datacenter_id") or "",
+            "stock": entry.get("stock") or "", "usd_per_hr": entry.get("usd_per_hr"),
+            "fired_at": entry.get("fired_at") or 0.0,
+            "action": entry.get("action") or "notified", "reason": entry.get("reason")}
+
+
 class AppPod:
     """The pod-side calls the phone can make (spec §5.9): stop what is
     running, and retry a rental that already failed once.
@@ -7807,15 +8066,16 @@ class AppPod:
         }
         return 200, body
 
-    def gpu_stock(self, force: bool) -> tuple[int, dict]:
-        """`GET /v1/gpu/stock[?force=1]`. Takes no lock: nothing it reads is
-        bot state, and a runpodctl round trip held under `BOT_LOCK` would stall
-        every Telegram update for as long as it runs (`_rent_panel_data`'s
-        reasoning). A dead runpodctl is 502 here, where the rent panel fails
-        open — this endpoint's only job is the stock, so "no data" is the
-        honest answer, not an empty list that reads as "sold out"."""
+    def gpu_stock(self, force: bool, all_dcs: bool = False) -> tuple[int, dict]:
+        """`GET /v1/gpu/stock[?force=1][&all=1]`. Takes no lock: nothing it
+        reads is bot state, and a runpodctl round trip held under `BOT_LOCK`
+        would stall every Telegram update for as long as it runs
+        (`_rent_panel_data`'s reasoning). A dead runpodctl is 502 here, where
+        the rent panel fails open — this endpoint's only job is the stock, so
+        "no data" is the honest answer, not an empty list that reads as
+        "sold out"."""
         try:
-            return 200, _gpu_stock_data(force=bool(force))
+            return 200, _gpu_stock_data(force=bool(force), all_dcs=bool(all_dcs))
         except RuntimeError as exc:
             return 502, _run_error("upstream_unavailable",
                                    _plain(f"couldn't reach runpodctl: {exc}"))
@@ -7843,6 +8103,107 @@ class AppPod:
                 return busy_response
             env_set(ROOT / ".env", "GPU", gpu)
         return 200, {"gpu": gpu, "name": _GPU_DISPLAY_SHORT.get(gpu, gpu)}
+
+    def gpu_subs(self) -> tuple[int, dict]:
+        """`GET /v1/gpu/subs`. Under the lock only because the tick mutates
+        `_GPU_SUBS` under it; no network here."""
+        with _bot_locked() as busy_response:
+            if busy_response is not None:
+                return busy_response
+            subs = [_gpu_sub_view(s) for s in _gpu_subs_for(self.chat_id)]
+            fired = [_gpu_fired_view(e) for e in _gpu_fired_for(self.chat_id)]
+        return 200, {"subs": subs, "fired": fired}
+
+    def add_gpu_sub(self, body: dict) -> tuple[int, dict]:
+        """`POST /v1/gpu/subs` — an upsert on (gpu, datacenter), so a repeat
+        lands on the same entry and no Idempotency-Key is needed (2026-09-27
+        spec §1). `auto_resume: true` arms it; the network reads for that run
+        before the lock, the file checks under it, `migrate_ask`'s split."""
+        body = body if isinstance(body, dict) else {}
+        gpu, dc = body.get("gpu"), body.get("datacenter")
+        auto = body.get("auto_resume", False)
+        run_id = body.get("run_id")
+        if gpu not in _GPU_CATALOG:
+            return 400, _run_error("bad_request", "gpu must be one of the catalog ids "
+                                                  "from GET /v1/gpu/stock")
+        # A strict shape, not just "non-empty": /unsubscribe puts the id into
+        # Telegram callback_data, which caps at 64 bytes (2026-09-27).
+        if not isinstance(dc, str) or not _GPU_SUB_DC_RE.fullmatch(dc.strip()):
+            return 400, _run_error("bad_request", "datacenter must be a datacenter id "
+                                                  "like EU-RO-1")
+        if not isinstance(auto, bool):
+            return 400, _run_error("bad_request", "auto_resume must be true or false")
+        if auto and (not isinstance(run_id, str) or not run_id):
+            return 400, _run_error("bad_request", "run_id is required to arm auto-resume")
+        dc = dc.strip()
+        price = None
+        if auto:
+            home = _home_datacenter()
+            if home is None:
+                return 502, _run_error("upstream_unavailable",
+                                       "couldn't read the volume's datacenter from runpodctl")
+            if dc != home:
+                return 409, _run_error("not_home_dc",
+                                       "auto-resume only rents in the volume's home "
+                                       "datacenter — elsewhere needs a migration first")
+            try:
+                stock = stock_at_cached(list(_GPU_CATALOG), include_unavailable=True)
+            except RuntimeError as exc:
+                return 502, _run_error("upstream_unavailable",
+                                       _plain(f"couldn't reach runpodctl: {exc}"))
+            entry = next((e for e in stock.get(gpu) or [] if e.datacenter_id == dc), None)
+            price = entry.price_per_hr if entry is not None else None
+            if not price:
+                return 409, _run_error("no_price",
+                                       "runpodctl lists no price for this GPU here, so "
+                                       "there is no ceiling to arm auto-resume with")
+        with _bot_locked() as busy_response:
+            if busy_response is not None:
+                return busy_response
+            if auto:
+                manifest_path = _job_manifest_path(self.chat_id)
+                if run_id != manifest_path.stem:
+                    return 409, _run_error("stale_run",
+                                           "the run changed since it was read — read it again")
+                failure = read_provision_failure(provision_failure_path(manifest_path))
+                if failure is None or not failure.stock_out:
+                    return 409, _run_error("no_failure",
+                                           "this run has no stock-out to resume from")
+                if not _failure_is_for_current_manifest(self.chat_id):
+                    return 409, _run_error("no_failure",
+                                           "the stock-out on record belongs to an earlier "
+                                           "job — confirm or retry this one first")
+            subs = _gpu_subs_for(self.chat_id)
+            sub = next((s for s in subs
+                        if s["gpu_id"] == gpu and s["datacenter_id"] == dc), None)
+            created = sub is None
+            if created:
+                sub = _new_gpu_sub(gpu, dc, subs)
+                subs.append(sub)
+            if auto:
+                for other in subs:
+                    other.pop("auto_resume", None)
+                sub["auto_resume"] = {"run_id": run_id, "run_token": _run_token(self.chat_id),
+                                      "max_usd_per_hr": price}
+            else:
+                sub.pop("auto_resume", None)
+            _save_gpu_subs(self.chat_id)
+            view = _gpu_sub_view(sub)
+        return (201 if created else 200), {"sub": view}
+
+    def remove_gpu_sub(self, sub_id: str) -> tuple[int, dict]:
+        """`DELETE /v1/gpu/subs/{id}`. An unknown id is 200: the sub may have
+        fired (and removed itself) since the phone read the list."""
+        with _bot_locked() as busy_response:
+            if busy_response is not None:
+                return busy_response
+            subs = _gpu_subs_for(self.chat_id)
+            remaining = [s for s in subs if s.get("id") != sub_id]
+            if len(remaining) != len(subs):
+                _GPU_SUBS[self.chat_id] = remaining
+                _save_gpu_subs(self.chat_id)
+            views = [_gpu_sub_view(s) for s in remaining]
+        return 200, {"subs": views}
 
     def _migrate_blocked(self) -> tuple[int, dict] | None:
         """The live-state guards both halves of the migration share, read
@@ -8018,7 +8379,7 @@ def _run_ticks(tg: Tg, chat_id: int, *, dry_run: bool) -> None:
         tick_progress(tg, chat_id)
         tick_phase_a(tg, chat_id, dry_run=dry_run)
         tick_migration_progress(tg, chat_id, dry_run=dry_run)
-        _tick_gpu_subs(tg, chat_id)
+        _tick_gpu_subs(tg, chat_id, dry_run=dry_run)
         _tick_staging_prune()
         _tick_out_prune(tg, chat_id)
 

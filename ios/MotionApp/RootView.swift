@@ -11,7 +11,8 @@ struct RootView: View {
             if let runs = model.runs, let pod = model.pod,
                let materials = model.materials, let draft = model.draft,
                let outputs = model.outputs, let flow = model.runFlow,
-               let gpu = model.gpu, let balance = model.balance, let migrate = model.migrate,
+               let gpu = model.gpu, let gpuSubs = model.gpuSubs,
+               let balance = model.balance, let migrate = model.migrate,
                let library = model.tryonLibrary, let composer = model.batchComposer,
                let studio = model.studio {
                 SpaceShell(studio: studio) {
@@ -40,7 +41,7 @@ struct RootView: View {
                         }
                         Tab("Pod", systemImage: "cpu", value: AppTab.pod) {
                             NavigationStack {
-                                PodView(pod: pod, gpu: gpu, balance: balance, flow: flow, runs: runs)
+                                PodView(pod: pod, gpu: gpu, balance: balance, flow: flow, runs: runs, subs: gpuSubs)
                                     .sidebarButton()
                                     .motionTabRoot(.pod)
                             }
@@ -55,6 +56,7 @@ struct RootView: View {
                     VStack(spacing: 8) {
                         KillBanner(pod: pod)
                         SpendBanner(flow: flow, migrate: migrate)
+                        FiredBanner(subs: gpuSubs)
                     }
                 }
                 .onChange(of: flow.podRequested) { _, requested in
@@ -86,12 +88,14 @@ struct RootView: View {
         .task {
             model.resumeMaterialsUpload()
             model.requestNotificationPermission()
+            model.refreshGpuSubs()
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
                 model.resumeMaterialsUpload()
                 model.refreshMaterials()
                 model.replayPendingSpend()
+                model.refreshGpuSubs()
                 if let pod = model.pod { Task { await pod.refresh() } }
             }
         }

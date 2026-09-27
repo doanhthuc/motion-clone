@@ -37,6 +37,91 @@ what actually shipped, what was verified, and the next safe boundary.
   zero spends recorded, 2026-09-24). See "Gate record" below — that table is the single place a gate
   result is written down.
 
+## Pod stage and GPU subscriptions (2026-09-27, branch `gpu-stock-subscribe-ios`)
+
+Spec: [`specs/2026-09-27-gpu-stock-subscribe-ios-design.md`](specs/2026-09-27-gpu-stock-subscribe-ios-design.md);
+plan: [`plans/2026-09-27-gpu-stock-subscribe-ios.md`](plans/2026-09-27-gpu-stock-subscribe-ios.md).
+This section covers Task 9 (UI tests, the contract checks, this handoff); the gate table lives in
+the spec, not here.
+
+- **The Pod tab is now one stage that does not scroll**, matching New Job's layout contract: `PodHero`
+  (lease / no-pod / migration card, plus the balance line as a sheet trigger), a `GPU` header with a
+  refresh icon, five `GpuTile`s sized to the space left in a two-column grid, and a collapsible
+  Watching drawer pinned to the bottom. The old GPU-row `List`, the standalone Vast-credit button and
+  "Move volume…" moved into the `⋯` menu (`pod.more` → `pod.moveVolume`, `pod.menu.checkVast`).
+- **GPU stock subscriptions.** Tapping a tile opens `GpuSheet`: "Use for next rental", every datacenter
+  for that GPU from `GET /v1/gpu/stock?all=1` with a 🔔 to watch/unwatch, and — only on the home
+  datacenter, only while the run is stuck on a stock-out — a ⚡ to arm auto-resume. `GpuSubsStore`
+  wraps `GET/POST/DELETE /v1/gpu/subs`. A firing shows as a one-time in-app banner
+  (`pod.firedBanner`) on the next foreground and appears under the drawer's Recent list. The run
+  detail's stock-out card gained a "Resume when in stock" shortcut (`run.resumeWhenInStock`).
+- **Auto-resume stays inside the existing spend path** (global constraint, unchanged by this task):
+  it only calls `_do_resume(gpu_provider="runpod")`, only at the volume's home datacenter, only under
+  an outstanding `provision-failed.json` with `stock_out: true`, and only at the $/h quoted when
+  armed. It never migrates and never runs Phase A. Subscriptions stay one-shot.
+- **Task 9 gates (this session, 2026-09-27):**
+  - `make batch-test`: 2298 tests, `OK (skipped=1)`, exit 0.
+  - `make ios-test`: 354/354 passed.
+  - `make ios-build`: clean.
+  - `PodStageTests` + the updated `Phase5SmokeTests` ran three times: once each dedicated to the
+    iPhone 18 Pro Max (`CEBAFDD5-2848-423F-A3EA-AC414620C491`) and the iPhone SE (3rd gen)
+    (`710BCEBB-2A9E-4401-A0DE-D59460070556`) via `xcodebuild … -only-testing:`, and once inside the
+    full `make ios-ui-test` suite on an iPhone 18 Pro. All three: `PodStageTests` passed,
+    `Phase5SmokeTests` skipped (a pod is genuinely live on the VPS right now, so its own
+    "nothing rented" precondition correctly declines). `make ios-ui-test`'s full suite: **11 total,
+    10 passed, 1 skipped, 0 failed**. Screenshots (`pod-stage`, `gpu-sheet-no-datacenters`,
+    `watch-open`) are in `out/pod-stage/iphone-18-pro-max/` and `out/pod-stage/iphone-se-3rd-gen/`
+    (gitignored).
+  - `make ios-contract`: **18 checks total — 15 ok, 2 FAIL, 1 skip** (`GET /v1/runs/{id}`, no runs on
+    the server, unrelated and pre-existing). The 2 FAIL are exactly the two checks Task 9 added, both
+    **expected pre-deploy**: `GET /v1/gpu/stock?all=1` (the live server doesn't yet return
+    `datacenters`) and `GET /v1/gpu/subs` (404, route doesn't exist yet on the VPS). The other 16
+    pre-existing checks (15 ok + 1 skip) are unchanged from before this task.
+  - `motions-studio/setup/scrub-secrets.sh --check`: exit 0.
+- **A real bug surfaced and fixed while wiring these tests.** `PodView.swift`'s outer
+  `.accessibilityIdentifier("pod.stage")` — applied to the whole stage's `GeometryReader`, never
+  itself read by any test, only mentioned in the plan doc — was silently overriding the identifiers
+  of unrelated descendant buttons on this iOS 27 / Xcode simulator runtime: `pod.balance`,
+  `gpu.refresh` and `pod.watch` all reported back as `identifier: 'pod.stage'` in the accessibility
+  tree, which made `Phase5SmokeTests`' `pod.hero` wait and `PodStageTests`' `pod.watch` lookup fail.
+  Removing the stray identifier fixed both; confirmed by re-running the same two classes on both
+  simulators before and after the removal (measured 2026-09-27, this session). Nothing currently
+  reads `pod.stage`, so nothing else depends on it existing.
+- **Fix round 1 (review finding, Important, 2026-09-27).** The first cut of `PodStageTests`' sheet
+  check discarded its `waitUntil` result and asserted nothing on `rows` — it could never fail even if
+  `GpuSheet` stopped rendering datacenter rows post-deploy. Fixed by making the pre-deploy state an
+  explicit, asserted-on UI state rather than a silently-tolerated guess: `GpuSheet.swift` now shows a
+  distinct `gpu.dc.unsupported` row ("This server doesn't list datacenters yet — update the bot.")
+  when `stock.datacenters == nil` (the server hasn't shipped `?all=1` yet), separate from the
+  existing "runpodctl lists no datacenter…" text for the non-nil-but-empty case. `PodStageTests` now
+  waits (≤60s) for either `gpu.dc.unsupported` or a non-empty `gpu.dc.*` row set; the unsupported
+  branch is the (still non-failing) pre-deploy path, and otherwise
+  `XCTAssertGreaterThan(rows.count, 0, …)` — so an empty datacenter list post-deploy is now a real
+  failure. The tautological "or the 'Datacenters' header exists" fallback on the sheet-open check was
+  also removed. Confirmed live: both simulators' re-runs actually took the `gpu-sheet-no-datacenters`
+  screenshot branch, i.e. `gpu.dc.unsupported` really fired, not merely assumed. `make ios-contract`'s
+  gate-record numbers were also corrected in the spec (see its Gate record for the reconciled count).
+- **Follow-up fixes (2026-09-27, approved list).** (1) The "came into stock" banner moved from
+  `PodView` to `RootView`'s top inset as `FiredBanner` (every tab; hidden only while the Pod tab's
+  drawer is open, via `AppModel.watchDrawerOpen`; tapping it opens the Pod tab with the drawer);
+  `AppModel.refreshGpuSubs()` reads subs at launch and on each foreground. (2) `-UITestPreviewMigration`
+  renders a fixed mid-copy `MigrationCard`; `PodStageTests.testMigrationHeroLeavesTilesVisible` found
+  the SE's last tile 4 pt under the drawer (541 vs 537), so the hero's card is now `compact` (no
+  Telegram footer) and passes on SE and Pro Max. (3) `GpuSubsStore.unsupported` (404 on
+  `GET /v1/gpu/subs`) hides the bell, bolt and "Resume when in stock"; the drawer says
+  "Subscriptions need a bot update." — seen live pre-deploy in `out/pod-stage/*/watch-open.png`.
+  (4) Refusal messages are per (gpu, datacenter) pair. (5)/(6) bot.py: an exception after
+  `start_drain` keeps `.env`'s GPU and reports `resumed`; the Telegram tail now reads "Auto-resume
+  started a rental … If the stock is gone again you'll get the usual stock-out card."
+- **Not yet proven:**
+  - Deploying this branch to motion-vps, and the two new contract checks passing live.
+  - The live, zero-spend Telegram check: subscribe from the phone/simulator to a datacenter that
+    already has stock, confirm a Telegram message lands within one poll round, and that the drawer
+    shows it under Recent and the banner fires once on the next foreground.
+  - Auto-resume actually firing against a real stock-out — there is no cheap way to cause one, so
+    only the Python `dry_run` unit tests exercise that path.
+  - Install on the phone.
+
 ## Multi-driver batch (2026-09-25, PR #70 → `737c15c`, deployed)
 
 Spec: [`specs/2026-09-25-multi-driver-batch-shared-tryon-design.md`](specs/2026-09-25-multi-driver-batch-shared-tryon-design.md);
@@ -605,10 +690,9 @@ No phase remains — Phases 1–6 are implemented in code. Open items, none of t
    and a quoted price; cost from the balance delta then `runpodctl billing`; `make gpu-destroy` after.
 3. **Parent spec's deferred items** (`2026-09-22-swiftui-app-design.md` §1): pair (1:1) mode was
    replaced by the multi-driver batch (see §"Multi-driver batch", 2026-09-25). Stock-watch
-   notifications are still open. The Telegram bot already has a one-shot `/subscribe`
-   (`bot.py` `_tick_gpu_subs`). Free provisioning rules out push notifications, so the app side would
-   be routes to manage subscriptions, with delivery still going through Telegram. It needs its own
-   spec.
+   notifications: **built in code, 2026-09-27** — see §"Pod stage and GPU subscriptions" above and
+   `specs/2026-09-27-gpu-stock-subscribe-ios-design.md`. Delivery still goes through Telegram only
+   (free provisioning rules out native push); not yet deployed or checked live.
 4. **Phase 6 follow-ups**: four of the five closed 2026-09-24 by PR #68 — the server-side resume
    latch (the money one), the `MigrateFlow.migrate()` `isDropping` residual, the developer-facing
    validation copy on the phone, and the `Fixtures.pipelines` `mask` vs `background` mismatch. The

@@ -1,204 +1,161 @@
 import SwiftUI
 import MotionKit
 
+/// The Pod tab as one stage that does not scroll (2026-09-27 spec §2): the
+/// hero, five GPU tiles sized to the space left, and the Watching drawer
+/// below. The old List ran past the screen with the balance, five rows and
+/// Move volume stacked; those now live in the hero, the tiles and the ⋯ menu.
 struct PodView: View {
     let pod: PodStore
     let gpu: GpuStore
     let balance: BalanceStore
     let flow: RunFlow
     let runs: RunsStore
+    let subs: GpuSubsStore
     @Environment(AppModel.self) private var model
     @Environment(\.scenePhase) private var scenePhase
+    @State private var openGpu: GpuSheetTarget?
+    @State private var showBalance = false
+    @State private var watchLevel = WatchDrawer.Level.collapsed
 
     var body: some View {
-        List {
-            if let error = pod.error, pod.pod == nil {
-                Section { ErrorBanner(error: error) { await pod.refresh() } }
+        GeometryReader { proxy in
+            VStack(alignment: .leading, spacing: 12) {
+                PodHero(pod: pod, balance: balance, runs: runs, onBalance: { showBalance = true })
+                gpuHeader
+                tiles
             }
-            leaseSection
-            if let migration = pod.pod?.migration, migration.running {
-                Section { MigrationCard(migration: migration) }
+            .padding(.horizontal, 16)
+            .padding(.top, 8)
+            .padding(.bottom, WatchDrawer.collapsedHeight + 8)
+            .frame(width: proxy.size.width, height: proxy.size.height, alignment: .top)
+            .overlay(alignment: .bottom) {
+                ZStack(alignment: .bottom) {
+                    if watchLevel == .open {
+                        Color.black.opacity(0.35)
+                            .contentShape(.rect)
+                            .onTapGesture { withAnimation(.snappy) { watchLevel = .collapsed } }
+                            .transition(.opacity)
+                            .accessibilityLabel("Close the watch list")
+                            .accessibilityAddTraits(.isButton)
+                            .accessibilityIdentifier("pod.watchScrim")
+                    }
+                    WatchDrawer(subs: subs, level: $watchLevel)
+                        .frame(maxHeight: watchLevel == .open ? proxy.size.height * 0.7 : nil, alignment: .bottom)
+                        .padding(.horizontal, 12)
+                }
             }
-            BalanceSection(store: balance)
-            GpuPickerView(store: gpu, spending: flow.isSpending, hasLease: pod.pod?.lease != nil,
-                          onMigrate: { model.migrateSheet = MigrateRequest(destination: $0) })
-            Section {
-                Button("Move volume…") { model.migrateSheet = MigrateRequest(destination: nil) }
-                    .accessibilityIdentifier("pod.moveVolume")
-            } footer: {
-                Text("Copies the Network Volume to another datacenter.")
-            }
+        }
+        // The fired banner now lives in RootView (every tab, 2026-09-27); it
+        // reads these two to stay hidden behind an open drawer and to open it.
+        .onChange(of: watchLevel, initial: true) { _, level in model.watchDrawerOpen = level == .open }
+        .onChange(of: model.watchDrawerRequested, initial: true) { _, requested in
+            guard requested else { return }
+            model.watchDrawerRequested = false
+            withAnimation(.snappy) { watchLevel = .open }
         }
         .navigationTitle("Pod")
         .navigationBarTitleDisplayMode(.inline)
-        // An inline bar already separates the first card from the top; the
-        // inset-grouped default added ~35pt of empty band under it.
-        .contentMargins(.top, 8, for: .scrollContent)
-        .refreshable {
-            async let a: Void = pod.refresh()
-            async let b: Void = balance.load()
-            async let c: Void = gpu.load(force: true)
-            async let d: Void = runs.refresh()
-            _ = await (a, b, c, d)
+        .toolbar { ToolbarItem(placement: .topBarTrailing) { moreMenu } }
+        .sheet(isPresented: $showBalance) { BalanceSheet(store: balance) }
+        .sheet(item: $openGpu) { target in
+            if let stock = gpu.stock {
+                GpuSheet(gpu: target.gpu, stock: stock, subs: subs, gpuStore: gpu, pod: pod,
+                         spending: flow.isSpending,
+                         onMigrate: { model.migrateSheet = MigrateRequest(destination: $0) })
+            }
         }
         .task {
             async let a: Void = pod.refresh()
             async let b: Void = balance.load()
             async let c: Void = runs.refresh()
+            async let d: Void = subs.load()
             if gpu.stock == nil { await gpu.load() }
-            _ = await (a, b, c)
+            _ = await (a, b, c, d)
         }
         // Scoped to a visible Pod tab in an active scene; cancelled otherwise.
         .task(id: scenePhase) {
             guard scenePhase == .active else { return }
+            await subs.load()
             await pod.pollMigration()
         }
     }
 
-    @ViewBuilder private var leaseSection: some View {
-        if let status = pod.pod {
-            if let lease = status.lease {
-                Section {
-                    LeaseCard(gpu: status.gpu, lease: lease)
-                        .opacity(pod.isStale ? 0.6 : 1)
-                }
-                .listRowInsets(EdgeInsets())
-                .listRowBackground(Color.clear)
+    private var gpuHeader: some View {
+        HStack {
+            Text("GPU").font(.subheadline.weight(.semibold)).foregroundStyle(Theme.secondary)
+            if let message = gpu.message {
+                Text(message).font(.footnote).foregroundStyle(Theme.warning).lineLimit(1)
+            } else if gpu.isStale {
+                Text("Couldn't reach runpodctl — last list").font(.footnote).foregroundStyle(Theme.warning).lineLimit(1)
             }
-            Section {
-                if status.lease == nil {
-                    Label("No pod running", systemImage: "moon.zzz")
-                        .foregroundStyle(Theme.secondary)
-                        .opacity(pod.isStale ? 0.6 : 1)
-                        .accessibilityIdentifier("pod.none")
+            Spacer()
+            Button { Task { await gpu.load(force: true) } } label: {
+                ZStack {
+                    Image(systemName: "arrow.clockwise").opacity(gpu.isLoading ? 0 : 1)
+                    if gpu.isLoading { ProgressView().controlSize(.small) }
                 }
-                if pod.isStale {
-                    HStack {
-                        StaleTag(lastSuccess: pod.lastSuccess)
-                        Spacer()
-                        Button("Retry") { Task { await pod.refresh() } }.buttonStyle(.borderless)
+                .font(.subheadline.weight(.semibold)).foregroundStyle(Theme.secondary)
+                .frame(minWidth: 44, minHeight: 32, alignment: .trailing)
+                .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            .disabled(gpu.isLoading)
+            .accessibilityLabel("Refresh GPU stock")
+            .accessibilityIdentifier("gpu.refresh")
+        }
+    }
+
+    @ViewBuilder private var tiles: some View {
+        if let stock = gpu.stock {
+            GeometryReader { proxy in
+                let spacing: CGFloat = 10
+                let rows = CGFloat((stock.gpus.count + 1) / 2)
+                // Upper clamp 150, not 110: on an iPhone 18 Pro Max's taller stage 110 left
+                // ~40% of the screen blank above the drawer band (2026-09-27 review round 1).
+                let height = min(max((proxy.size.height - spacing * (rows - 1)) / max(rows, 1), 64), 150)
+                LazyVGrid(columns: [GridItem(.flexible(), spacing: spacing), GridItem(.flexible(), spacing: spacing)],
+                          spacing: spacing) {
+                    ForEach(stock.gpus) { row in
+                        let watched = subs.watching(gpu: row.gpu)
+                        GpuTile(row: row, selected: row.gpu == stock.selected, watching: watched.count,
+                                armed: watched.contains { $0.autoResume != nil }, height: height) {
+                            openGpu = GpuSheetTarget(gpu: row.gpu)
+                        }
                     }
                 }
-                // The server decides kill's own visibility/state; staleness of the
-                // read never hides or disables it.
-                if pod.showsKill(runStatus: runs.live?.status), let runID = status.runId {
-                    KillButton(pod: pod, runID: runID, hasLease: status.lease != nil)
-                        .buttonRow()
-                } else {
-                    KillNotice(pod: pod)
-                }
             }
-        } else if pod.error == nil {
-            LoadingBlock().listRowBackground(Color.clear)
+            .opacity(gpu.isStale ? 0.6 : 1)
+        } else if let error = gpu.error {
+            ErrorBanner(error: error) { await gpu.load() }
+        } else {
+            LoadingBlock(title: "Reading stock…")
         }
+    }
+
+    private var moreMenu: some View {
+        Menu {
+            Button("Refresh stock", systemImage: "arrow.clockwise") { Task { await gpu.load(force: true) } }
+            Button("Move volume…", systemImage: "externaldrive.badge.plus") {
+                model.migrateSheet = MigrateRequest(destination: nil)
+            }
+            .accessibilityIdentifier("pod.moveVolume")
+            Button(balance.isLoadingVast ? "Reading Vast credit…" : "Check Vast credit", systemImage: "cloud") {
+                showBalance = true
+                Task { await balance.loadVast() }
+            }
+            .disabled(balance.isLoadingVast)
+            .accessibilityIdentifier("pod.menu.checkVast")
+        } label: {
+            Image(systemName: "ellipsis.circle")
+        }
+        .accessibilityLabel("More")
+        .accessibilityIdentifier("pod.more")
     }
 }
 
-struct LeaseCard: View {
+/// Which GPU the sheet is open for.
+struct GpuSheetTarget: Identifiable {
     let gpu: String
-    let lease: PodLease
-
-    var body: some View {
-        TimelineView(.periodic(from: .now, by: 1)) { ctx in
-            let elapsed = ctx.date.timeIntervalSince1970 - lease.provisionedAt
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 8) {
-                    PulseDot()
-                    Text("Live on " + (lease.provider == "runpod" ? "RunPod" : lease.provider))
-                        .font(.headline)
-                }
-                // `.env`'s GPU is what the next rental uses; a change made
-                // mid-lease doesn't move the leased card, so it isn't named as it.
-                if lease.provider == "runpod" {
-                    Text("Next rental: \(gpu)").font(.subheadline).foregroundStyle(Theme.secondary)
-                }
-                Text(Format.clock(elapsed)).font(.largeTitle.weight(.semibold).monospacedDigit()).foregroundStyle(Theme.label)
-                if let cost = CostEstimate.usd(elapsed: elapsed, ratePerHour: lease.quotedUsdPerHr) {
-                    Text("≈ \(Format.usd(cost)) — a quote, not the invoice")
-                        .font(.subheadline.monospacedDigit()).foregroundStyle(Theme.secondary)
-                }
-            }
-        }
-        .heroSurface()
-    }
-}
-
-struct MigrationCard: View {
-    let migration: PodMigration
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                PulseDot(color: Theme.warning)
-                Text("Moving the volume" + (migration.toDc.map { " to \($0)" } ?? ""))
-                    .font(.headline)
-            }
-            if let phase = migration.phase {
-                Text(phase).font(.subheadline).foregroundStyle(Theme.secondary)
-            }
-            if let started = migration.startedAt {
-                TimelineView(.periodic(from: .now, by: 1)) { ctx in
-                    Text(Format.clock(ctx.date.timeIntervalSince1970 - started))
-                        .font(.body.monospacedDigit())
-                }
-            }
-            if let fraction = migration.fractionCopied {
-                ProgressView(value: fraction).tint(Theme.warning)
-            }
-            Text("Progress is also posted in Telegram. A migration can't be cancelled.")
-                .font(.footnote).foregroundStyle(Theme.secondary)
-        }
-        .padding(.vertical, 4)
-    }
-}
-
-/// Balance rows: the runway is the hero number, the Vast credit is on tap.
-struct BalanceSection: View {
-    let store: BalanceStore
-
-    var body: some View {
-        Section("Balance") {
-            if let line = store.runpodLine {
-                let low = store.balance?.runpod?.lowRunway == true
-                let refreshFailed = store.error != nil
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("RunPod").font(.subheadline).foregroundStyle(Theme.secondary)
-                    Text(line).font(.title3.weight(.semibold).monospacedDigit())
-                        .foregroundStyle(low ? Theme.warning : Theme.label)
-                    if low {
-                        Label("Under 1 h of runway — top up before renting.", systemImage: "exclamationmark.triangle.fill")
-                            .font(.footnote).foregroundStyle(Theme.warning)
-                    }
-                    if refreshFailed, let error = store.error {
-                        Text("Couldn't refresh — \(error.userMessage)")
-                            .font(.footnote).foregroundStyle(Theme.warning)
-                    }
-                }
-                .opacity(refreshFailed ? 0.6 : 1)
-                .padding(.vertical, 2)
-            } else if let error = store.error {
-                ErrorBanner(error: error) { await store.load() }
-            } else {
-                LoadingBlock()
-            }
-            if let vast = store.vastLine {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Vast").font(.subheadline).foregroundStyle(Theme.secondary)
-                    Text(vast).font(.title3.weight(.semibold).monospacedDigit())
-                }
-                .padding(.vertical, 2)
-            }
-            ForEach(store.balance?.errors ?? [], id: \.self) { text in
-                Text(text).font(.footnote).foregroundStyle(Theme.warning)
-            }
-            Button { Task { await store.loadVast() } } label: {
-                HStack(spacing: 8) {
-                    Text(store.isLoadingVast ? "Reading the Vast credit (~30 s)…" : "Check Vast credit")
-                    if store.isLoadingVast { Spacer(); ProgressView() }
-                }
-            }
-            .disabled(store.isLoadingVast)
-            .accessibilityIdentifier("pod.checkVast")
-        }
-    }
+    var id: String { gpu }
 }
