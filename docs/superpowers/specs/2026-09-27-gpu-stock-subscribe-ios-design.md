@@ -106,8 +106,13 @@ sub is removed in the same tick, and Telegram gets the message it gets today. Ne
 
   If all hold, it does what `_CB_RECOVER_SWITCH` does: `env_set(.env, "GPU", gpu_id)`, then
   `_do_resume(tg, chat_id, manifest, dry_run=…, gpu_provider="runpod")`. The Telegram message then
-  says the clock is running: "⚡ Auto-resumed — renting RTX 5090 @ EU-RO-1 · $0.99/h". Action
-  `resumed`.
+  says a rental started, without claiming it succeeded: "⚡ Auto-resume started a rental — renting
+  RTX 5090 @ EU-RO-1 · $0.99/h. If the stock is gone again you'll get the usual stock-out card."
+  Action `resumed`.
+- If `_do_resume` raises after `start_drain` (so `busy(manifest)` is now true — e.g. the progress
+  messages failed), the drain is live: `.env` keeps the subscribed GPU, the action is `resumed` with
+  reason "started, but progress messages failed: …", and the same started message is sent. An
+  exception before the drain started is rolled back like any other refusal.
 - If any guard fails, the sub fires as notify-only. The Telegram message names the reason, and the
   action is `resume_refused`. Nothing is rented.
 

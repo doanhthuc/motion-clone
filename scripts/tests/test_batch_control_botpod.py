@@ -1567,7 +1567,9 @@ class TestAutoResumeTick(_PodFixture):
         self.assertEqual(self.patches["start_drain"].call_args.kwargs["gpu_provider"], "runpod")
         self.assertEqual(env_get(self.root / ".env", "GPU"), self.GPU)
         self.assertEqual(bot._gpu_subs_for(ME), [])
-        self.assertTrue(any("Auto-resumed" in text for text in self._texts()))
+        self.assertTrue(any("Auto-resume started a rental" in text for text in self._texts()))
+        self.assertTrue(any("usual stock-out card" in text for text in self._texts()))
+        self.assertFalse(any("clock is running" in text for text in self._texts()))
 
     def test_auto_resume_refuses_above_the_ceiling(self):
         self._arm(cap=0.99)
@@ -1647,6 +1649,25 @@ class TestAutoResumeTick(_PodFixture):
         self.assertEqual(env_get(self.root / ".env", "GPU"), "NVIDIA GeForce RTX 4090")
         self.assertEqual(bot._gpu_subs_for(ME), [])
         self.assertTrue(any("Nothing was rented" in text for text in self._texts()))
+
+    def test_auto_resume_keeps_env_when_progress_fails_after_the_drain_started(self):
+        """start_drain succeeded and only `_start_progress` raised: the drain
+        is live and renting on .env's GPU, so rolling .env back (and saying
+        "Nothing was rented") would be a lie about money already committed
+        (follow-up fix, 2026-09-27). `busy` flips to True once start_drain
+        has run, the way the real drain's lease/_RUNNING entry would."""
+        self._arm()
+        self.patches["busy"].side_effect = (
+            lambda *_a, **_k: self.patches["start_drain"].called)
+        with mock.patch("tgbot.bot._start_progress", side_effect=RuntimeError("tg down")):
+            fired = self._fire()
+        self.patches["start_drain"].assert_called_once()
+        self.assertEqual(fired["action"], "resumed")
+        self.assertIn("progress messages failed", fired["reason"])
+        self.assertIn("tg down", fired["reason"])
+        self.assertEqual(env_get(self.root / ".env", "GPU"), self.GPU)
+        self.assertFalse(any("Nothing was rented" in text for text in self._texts()))
+        self.assertTrue(any("Auto-resume started a rental" in text for text in self._texts()))
 
     def test_auto_resume_refuses_while_a_lease_is_live(self):
         self._arm()

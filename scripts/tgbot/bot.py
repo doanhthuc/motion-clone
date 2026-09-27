@@ -4805,19 +4805,37 @@ def _tick_gpu_subs(tg: Tg, chat_id: int, *, dry_run: bool = False) -> None:
             env_path = ROOT / ".env"
             previous_gpu = env_get(env_path, "GPU")
             env_set(env_path, "GPU", sub["gpu_id"])
+            started_despite: Exception | None = None
             try:
                 out = _do_resume(tg, chat_id, _job_manifest_path(chat_id),
                                  dry_run=dry_run, gpu_provider="runpod")
             except Exception as exc:
-                # An exception is a refusal too (2026-09-27): .env must not be
-                # left pointing at a card nothing was rented for, and one bad
-                # sub must not stop the rest of this tick's firings.
                 log(f"auto-resume raised for chat {chat_id}: {exc!r}")
-                out = Outcome(False, "resume_error", f"auto-resume failed: {exc}")
+                if busy(_job_manifest_path(chat_id)):
+                    # start_drain already ran and only what follows it (the
+                    # progress messages) raised (follow-up fix, 2026-09-27):
+                    # the drain is live and renting on .env's GPU, so .env
+                    # stays as is and the user is told a rental started —
+                    # restoring .env or saying "Nothing was rented" here
+                    # would misreport money already being spent.
+                    started_despite = exc
+                    out = Outcome(True, "started")
+                else:
+                    # An exception before the drain started is a refusal too
+                    # (2026-09-27): .env must not be left pointing at a card
+                    # nothing was rented for, and one bad sub must not stop
+                    # the rest of this tick's firings.
+                    out = Outcome(False, "resume_error", f"auto-resume failed: {exc}")
             if out:
                 entry["action"] = "resumed"
-                tail = (f"\n⚡ <b>Auto-resumed</b> — renting {_esc(short)} @ "
-                        f"{_esc(sub['datacenter_id'])} · {price}. The clock is running.")
+                if started_despite is not None:
+                    entry["reason"] = f"started, but progress messages failed: {started_despite}"
+                # "started a rental", not "the clock is running" (2026-09-27):
+                # the rental itself can still stock out after start_drain, and
+                # that case already has its own card.
+                tail = (f"\n⚡ <b>Auto-resume started a rental</b> — renting {_esc(short)} @ "
+                        f"{_esc(sub['datacenter_id'])} · {price}. If the stock is gone "
+                        "again you'll get the usual stock-out card.")
             else:
                 env_set(env_path, "GPU", previous_gpu)
                 entry["action"], entry["reason"] = "resume_refused", _plain(out.message)
