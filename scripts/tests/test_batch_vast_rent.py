@@ -44,6 +44,9 @@ def cfg(**over):
     return vast_rent.RentConfig(**base)
 
 
+TEST_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITESTKEYBODY laptop"
+
+
 class FakeVast:
     """Scripted Vast. `statuses[instance_id]` is the sequence of actual_status values returned
     one per poll (the last repeats). `create_fail` lists offer ids whose create raises."""
@@ -113,6 +116,14 @@ class FakeVast:
 
     def ssh_url(self, instance_id):
         return "ssh://root@1.2.3.4:40022"
+
+    account = [TEST_KEY]                                # keys on the Vast account
+
+    def account_keys(self):
+        return list(self.account)
+
+    def add_account_key(self, public_key):
+        self.account = [*self.account, public_key]
 
 
 class Clock:
@@ -539,6 +550,43 @@ class TestSshRefused(unittest.TestCase):
         self.assertEqual(board.records(), {})
 
 
+class TestAccountKey(unittest.TestCase):
+    VPS_KEY = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABVPSBODY runpodctl-ssh-key"
+
+    def test_a_key_already_on_the_account_adds_nothing(self):
+        api = FakeVast([])
+        # Same key, different comment: vast stores whatever comment was uploaded.
+        self.assertIsNone(vast_rent.ensure_account_key(
+            api, [TEST_KEY.rsplit(" ", 1)[0] + " other-comment"], log=lambda m: None))
+        self.assertEqual(api.account, [TEST_KEY])
+
+    def test_the_vps_key_missing_from_the_account_is_registered(self):
+        # 2026-09-27: the account held only the laptop key, so every rent from motion-vps
+        # booted an instance whose sshd refused the bot.
+        api = FakeVast([])
+        added = vast_rent.ensure_account_key(api, [self.VPS_KEY], log=lambda m: None)
+        self.assertEqual(added, self.VPS_KEY)
+        self.assertEqual(api.account, [TEST_KEY, self.VPS_KEY])
+
+    def test_any_offered_key_on_the_account_is_enough(self):
+        api = FakeVast([])
+        self.assertIsNone(vast_rent.ensure_account_key(api, [self.VPS_KEY, TEST_KEY],
+                                                       log=lambda m: None))
+
+    def test_no_local_key_refuses_before_renting(self):
+        with self.assertRaises(vast_rent.RentError):
+            vast_rent.ensure_account_key(FakeVast([]), [], log=lambda m: None)
+
+    def test_local_public_keys_reads_the_pub_next_to_each_identity_file(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        (tmp / "k1.pub").write_text(self.VPS_KEY + "\n", encoding="utf-8")
+        g = f"user root\nidentityfile {tmp}/k1\nidentityfile {tmp}/missing\n"
+        done = subprocess.CompletedProcess([], 0, stdout=g, stderr="")
+        with mock.patch.object(vast_rent.subprocess, "run", return_value=done):
+            self.assertEqual(vast_rent.local_public_keys(), [self.VPS_KEY])
+
+
 class TestParseSshUrl(unittest.TestCase):
     def test_the_usual_shape(self):
         self.assertEqual(vast_rent.parse_ssh_url("ssh://root@1.2.3.4:40022"),
@@ -712,6 +760,7 @@ class TestSignalHandling(unittest.TestCase):
         with mock.patch.object(vast_rent, "ROOT", tmp), \
              mock.patch.object(vast_rent, "BOARD_PATH", tmp / "vast-machines.json"), \
              mock.patch.object(vast_rent, "make_api", return_value=FakeVast([offer(7, 70)])), \
+             mock.patch.object(vast_rent, "local_public_keys", return_value=[TEST_KEY]), \
              redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             vast_rent.main(["--gpu", "RTX_5090", "--disk", "120", "--image", "img:t",
                            "--max-dph", "0.60", "--reliability", "0.95",
@@ -741,6 +790,7 @@ class TestMain(unittest.TestCase):
     def _main(self, api, *argv):
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(vast_rent, "make_api", return_value=api), \
+             mock.patch.object(vast_rent, "local_public_keys", return_value=[TEST_KEY]), \
              redirect_stdout(out), redirect_stderr(err):
             rc = vast_rent.main(["--gpu", "RTX_5090", "--disk", "120", "--image", "img:t",
                                  "--max-dph", "0.60", "--reliability", "0.95",
@@ -753,6 +803,33 @@ class TestMain(unittest.TestCase):
         self.assertEqual(out.strip(), "7")
         self.assertIn("unmeasured", err)
         self.assertIn("CONFIRM=yes", err)
+
+    def test_confirm_registers_a_missing_ssh_key_before_it_rents(self):
+        api = FakeVast([offer(7, 70)])
+        api.account = ["ssh-rsa AAAAOTHERHOSTKEY other"]
+        rc, out, err = self._main(api, "--confirm")
+        self.assertEqual(rc, 0)
+        self.assertIn(TEST_KEY, api.account)
+        self.assertIn("registered this host's ssh key", err)
+
+    def test_a_dry_run_never_touches_the_account_keys(self):
+        api = FakeVast([offer(7, 70)])
+        api.account = []
+        rc, _, _ = self._main(api)
+        self.assertEqual(rc, 0)
+        self.assertEqual(api.account, [])
+
+    def test_confirm_without_any_local_key_rents_nothing(self):
+        api = FakeVast([offer(7, 70)])
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(vast_rent, "make_api", return_value=api), \
+             mock.patch.object(vast_rent, "local_public_keys", return_value=[]), \
+             redirect_stdout(out), redirect_stderr(err):
+            rc = vast_rent.main(["--gpu", "RTX_5090", "--disk", "120", "--image", "img:t",
+                                 "--max-dph", "0.60", "--reliability", "0.95", "--confirm"])
+        self.assertEqual(rc, 1)
+        self.assertEqual(api.created, [])
+        self.assertIn("no ssh public key", err.getvalue())
 
     def test_confirm_prints_only_the_instance_id_and_writes_it_to_env_and_the_board(self):
         rc, out, _ = self._main(FakeVast([offer(7, 70)]), "--confirm")

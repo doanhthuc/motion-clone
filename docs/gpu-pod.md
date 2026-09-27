@@ -604,6 +604,32 @@ Not implemented yet, so the first paid session is not surprised by it: `-o Ident
 <key>` for ssh when the agent holds several keys (measured need 2026-09-19 — no failure seen yet,
 but nothing here picks a specific key if the ssh-agent offers more than one).
 
+### First bot-driven Vast batch: two things that stopped every one of them (2026-09-27)
+
+Batch `tg-1959705051` (3 × camera-tryon → camera-motion → enhance), rented from motion-vps. The
+first machine (136778) missed the 8-minute pull deadline at 489 s and was destroyed as designed;
+the second (145202, Pennsylvania, $0.69/h) was `running` after 210 s. Then:
+
+1. **sshd refused the bot.** Vast copies the *account's* keys into an instance at create. The account
+   held only the laptop's ed25519 key; motion-vps signs with the RSA key its ssh config points at
+   (`/root/.runpod/ssh/runpodctl-ssh-key`). The instance log showed `Failed publickey … RSA
+   SHA256:pj9x…` on every `pod-wait.sh` probe. `vast_rent.py --confirm` now registers the key `ssh -G`
+   would offer before it rents (`ensure_account_key`), and refuses to rent at all when this host has
+   no public key.
+2. **No models on the box.** `VAST_MODEL_IDS` was only read in `phase_comfyui`, which the prebuilt
+   fast boot (`MTC_PREBUILT=1`, the only image Vast uses) skips entirely. The bill showed a $0.006
+   download charge against the ~61 GB the manifest needs, and all three jobs failed in seconds
+   with ComfyUI `Value not in list`. The download now starts in `phase_prebuilt_deps`, and
+   `feature_main` waits for it before `phase_done`. It reads `catalog-motion-transfer.json`
+   whatever `SETUP_PROFILE` is. `catalog.json`, which the `full` profile uses, lacks
+   `wan-vitpose-onnx`, `wan-yolo10m-onnx` and every `swap-*` id, so it would have failed there as
+   well.
+
+Also fixed: `gpu-destroy`'s verify read CLI 1.7.0's bare `[]` (an empty account) as "could not
+verify". That left the destroyed id in `.env` and made drain's teardown exit with a traceback.
+Cost of the failed attempts: $0.43 across three instances (invoice lines, including the
+earlier 52943882).
+
 <a id="vast-bot"></a>
 ### Choosing Vast from the Telegram bot (2026-09-19)
 

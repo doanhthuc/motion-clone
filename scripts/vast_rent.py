@@ -86,6 +86,8 @@ class VastApi(Protocol):
     def instance_exists(self, instance_id: str) -> bool: ...
     def ssh_url(self, instance_id: str) -> str: ...
     def logs(self, instance_id: str, tail: int) -> str: ...
+    def account_keys(self) -> list[str]: ...
+    def add_account_key(self, public_key: str) -> None: ...
 
 
 class RealVastApi:
@@ -176,6 +178,21 @@ class RealVastApi:
         if out.returncode != 0:
             raise RentError(f"vastai logs failed: {(out.stderr or out.stdout).strip()}")
         return out.stdout
+
+    def account_keys(self) -> list[str]:
+        out = self._run(["vastai", "show", "ssh-keys", "--raw"], 60)
+        if out.returncode != 0:
+            raise RentError(f"vastai show ssh-keys failed: {(out.stderr or out.stdout).strip()}")
+        try:
+            rows = json.loads(out.stdout or "[]")
+        except json.JSONDecodeError as exc:
+            raise RentError(f"vastai show ssh-keys returned invalid JSON: {exc}") from exc
+        return [str(r.get("public_key") or "") for r in rows if isinstance(r, dict)]
+
+    def add_account_key(self, public_key: str) -> None:
+        out = self._run(["vastai", "create", "ssh-key", public_key, "-y"], 60)
+        if out.returncode != 0:
+            raise RentError(f"vastai create ssh-key failed: {(out.stderr or out.stdout).strip()}")
 
 
 @dataclass(frozen=True)
@@ -500,6 +517,60 @@ def check_ssh_refused(api: VastApi, instance_id: str, board: Scoreboard, *,
     return f"{line} — {where} blacklisted for the next rents"
 
 
+# Vast copies the ACCOUNT's ssh keys into an instance when it is created. The account only held
+# the laptop's ed25519 key, while motion-vps (where the bot rents from) signs with the RSA key
+# its ssh config points at (/root/.runpod/ssh/runpodctl-ssh-key). Instance 52971049
+# (2026-09-27) booted fine and then logged "Failed publickey ... RSA SHA256:pj9x…" on every
+# pod-wait probe — no rent from the bot could ever have reached bootstrap. So before renting,
+# make sure one of the keys `ssh` will actually offer is on the account.
+SSH_KEY_PROBE_HOST = "ssh1.vast.ai"
+
+
+def _key_id(public_key: str) -> tuple[str, ...]:
+    """(type, base64 body) — the comment field differs between copies of the same key."""
+    return tuple(public_key.split()[:2])
+
+
+def local_public_keys(host: str = SSH_KEY_PROBE_HOST) -> list[str]:
+    """Public keys of the identity files `ssh` would offer to `host`, in its own order."""
+    try:
+        out = subprocess.run(["ssh", "-G", host], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    keys = []
+    for line in out.stdout.splitlines():
+        name, _, value = line.partition(" ")
+        if name.lower() != "identityfile":
+            continue
+        pub = Path(os.path.expanduser(value.strip()) + ".pub")
+        try:
+            text = pub.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if text and text not in keys:
+            keys.append(text)
+    return keys
+
+
+def ensure_account_key(api: VastApi, local_keys: list[str], *,
+                       log: Callable[[str], None] = _stderr) -> str | None:
+    """Register the first local key on the Vast account unless one is already there.
+
+    Returns the key it added, or None when nothing was needed. Raises RentError when this host
+    has no public key at all: renting would only buy an instance nobody can log into.
+    """
+    if not local_keys:
+        raise RentError("no ssh public key found next to the identity files `ssh -G "
+                        f"{SSH_KEY_PROBE_HOST}` lists — a rented instance would refuse this host")
+    registered = {_key_id(k) for k in api.account_keys()}
+    if any(_key_id(k) in registered for k in local_keys):
+        return None
+    api.add_account_key(local_keys[0])
+    kind, body = _key_id(local_keys[0])
+    log(f"registered this host's ssh key on the Vast account ({kind} …{body[-12:]})")
+    return local_keys[0]
+
+
 def make_api() -> VastApi:
     return RealVastApi()
 
@@ -612,6 +683,11 @@ def main(argv: list[str] | None = None) -> int:
     _stderr(f"searching: {cfg.query}  (<= ${args.max_dph:.2f}/hr at {args.disk} GB disk, "
             f"~{args.gb:.0f} GB to download, ~{args.run_s / 60:.0f} min of GPU work)")
     if args.confirm:
+        try:
+            ensure_account_key(api, local_public_keys())
+        except RentError as exc:
+            print(f"\033[31m ✗ \033[0m{exc}", file=sys.stderr)
+            return 1
         # Only for a real rent: a dry run must not change signal handling. SIGHUP too, not just
         # SIGTERM — a killpg from a detached session (F2) can deliver either depending on how
         # the controlling terminal/session was set up.

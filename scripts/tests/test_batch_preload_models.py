@@ -112,5 +112,43 @@ class TestModelsDirOverride(unittest.TestCase):
             self.assertTrue((vol / "comfy-models").is_dir())
 
 
+LIB_FEATURE = ROOT / "motions-studio" / "setup" / "lib-feature.sh"
+
+
+def _function_body(text: str, name: str) -> str:
+    start = text.index(f"\n{name}() {{")
+    return text[start:text.index("\n}\n", start)]
+
+
+class TestVastPreloadIsWiredIntoBothBootPaths(unittest.TestCase):
+    """2026-09-27, instance 52971049: the prebuilt fast boot skipped phase_comfyui, the only
+    place the Vast download lived, so the box came up with no models and every job failed with
+    ComfyUI "Value not in list". Static checks, because running setup needs a GPU box."""
+
+    def setUp(self):
+        self.text = LIB_FEATURE.read_text(encoding="utf-8")
+
+    def test_the_prebuilt_fast_boot_starts_the_download(self):
+        self.assertIn("vast_preload_start", _function_body(self.text, "phase_prebuilt_deps"))
+
+    def test_the_source_install_still_starts_and_waits_for_it(self):
+        body = _function_body(self.text, "phase_comfyui")
+        self.assertIn("vast_preload_start", body)
+        self.assertIn("vast_preload_wait", body)
+
+    def test_feature_main_waits_before_declaring_the_box_done(self):
+        body = _function_body(self.text, "feature_main")
+        self.assertIn("vast_preload_wait", body)
+        self.assertLess(body.index("vast_preload_wait"), body.index("phase_done"))
+
+    def test_the_download_uses_the_catalog_the_registry_is_checked_against(self):
+        # catalog.json (profile "full", what motion-vps boots) lacks wan-vitpose-onnx and the
+        # swap-* ids; scripts/batchlib/vast_models.py is checked against this one.
+        self.assertIn("comfyui/catalog-motion-transfer.json",
+                      _function_body(self.text, "vast_preload_catalog"))
+        self.assertIn('CATALOG="$(vast_preload_catalog)"',
+                      _function_body(self.text, "vast_preload_start"))
+
+
 if __name__ == "__main__":
     unittest.main()

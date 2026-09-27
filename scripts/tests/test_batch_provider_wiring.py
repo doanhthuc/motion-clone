@@ -214,6 +214,20 @@ class TestGpuDestroyVastVerifyBehaviour(unittest.TestCase):
         self.assertIn("COULD NOT VERIFY", out.stdout)
         self.assertFalse(cleared, ".env was cleared although nothing was verified")
 
+    def test_the_bare_empty_list_cli_1_7_prints_is_gone(self):
+        # Live on motion-vps, 2026-09-27: `vastai show instances-v1 --raw --all` printed `[]`
+        # after instance 52971049 was destroyed; the recipe called that COULD NOT VERIFY.
+        out, cleared = self._destroy("[]\n")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("verified gone", out.stdout)
+        self.assertTrue(cleared)
+
+    def test_a_bare_list_still_holding_our_id_is_still_alive(self):
+        out, cleared = self._destroy(f'[{{"id": {self.ID}, "label": "x"}}]')
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("STILL ALIVE", out.stdout)
+        self.assertFalse(cleared)
+
     def test_an_empty_listing_object_is_gone(self):
         out, cleared = self._destroy('{"instances": [], "next_token": null}')
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
