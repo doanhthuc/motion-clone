@@ -1,0 +1,184 @@
+# GPU stock subscriptions in the iOS app, with auto-resume — design
+
+Date: 2026-09-27 · Status: approved in conversation, awaiting written-spec review
+
+## Why
+
+The Telegram bot has had `/subscribe` since 2026-09-12: pick a GPU and a datacenter, and the bot
+posts one message the moment that pair stops being sold out, then forgets it
+(`scripts/tgbot/bot.py`, `_tick_gpu_subs`). The iPhone app cannot see or create these subscriptions,
+so on the phone a sold-out 5090 is a dead end. The user asked for the same feature in the app, and
+for the Pod tab to follow the no-scroll layout New Job already uses (sized tiles, sheets, a drawer).
+
+While scoping it, the user added one more request: when a subscription fires, rent without waiting
+for a tap.
+
+## Decisions made in conversation
+
+| Question | Chosen | Rejected, and why |
+|---|---|---|
+| Where the UI lives | Rebuild the Pod tab as one stage that does not scroll | A bell on each existing `List` row keeps the scroll. A toolbar bell hides the stock the user is deciding on. |
+| What auto-rent rents | **Resume a run that is stuck on a stock-out**, through the existing `_do_resume` | "Confirm the current draft when stock appears" would be a third spend path around the confirm gate, and the draft can change between arming and firing. "Rent an idle pod" bills ~$1/h with no job, and no rent-without-a-run path exists. |
+| Price ceiling for auto-resume | The GPU's $/h **at the moment the subscription is armed** | A fixed number typed in by the user |
+| Phone notification | **Telegram only**, plus an in-app banner when the app opens | Native push needs APNs, which a free Apple account cannot enable. ntfy was designed, then dropped by the user: Telegram's own notification is enough for now. Background App Refresh wakes the app on iOS's schedule (often hours apart), which is too late for stock that is gone again within minutes. |
+
+Kept from the bot: subscriptions are **one-shot** (fire once, then remove). The user asked for this on
+2026-09-12: "báo 1 lần rồi gỡ, giống đặt báo thức 1 lần". The app and the bot share **one list**:
+the phone API and the bot run in the same process and use the same chat id.
+
+## 1. Server (`scripts/`, deploys to motion-vps)
+
+### Data
+
+`batch/tg-<chat>.gpusubs.json` stays the one store. Each entry gains fields, all optional on read so
+existing files load unchanged:
+
+```json
+{"id": "a1b2c3", "gpu_id": "NVIDIA GeForce RTX 5090", "datacenter_id": "EU-RO-1",
+ "created_at": 1790000000.0,
+ "auto_resume": {"run_id": "tg-123-…", "run_token": "…", "max_usd_per_hr": 0.99}}
+```
+
+- `id` is minted on add (short random hex). If an entry was written before `id` existed, it gets
+  one the first time it is loaded, and the file is saved back.
+- The bot's `/unsubscribe` keeps removing by `(gpu, dc)`. The app removes by `id`.
+
+A new file, `batch/tg-<chat>.gpusubs-fired.json`, keeps the **last 10** firings, newest first:
+
+```json
+{"id": "…", "gpu_id": "…", "datacenter_id": "…", "stock": "Low", "usd_per_hr": 0.99,
+ "fired_at": 1790000123.0, "action": "notified|resumed|resume_refused", "reason": "…"}
+```
+
+`reason` is set only for `resume_refused`: a plain sentence naming the guard that failed.
+
+### Routes (`scripts/httpapi/server.py` → methods on `AppPod`)
+
+| Route | Body / query | Answer |
+|---|---|---|
+| `GET /v1/gpu/subs` | — | `{subs: [...], fired: [...], home_dc}` |
+| `POST /v1/gpu/subs` | `{gpu, datacenter, auto_resume?: {run_id, run_token}}` + `Idempotency-Key` | `201 {sub}`. `409 already_subscribed` for a duplicate `(gpu, dc)`. |
+| `DELETE /v1/gpu/subs/{id}` | — | `200 {subs}`. An unknown id also answers 200: the sub may already have fired. |
+| `GET /v1/gpu/stock?all=1` | — | The existing body plus `datacenters: {gpu_id: [{datacenter, stock, usd_per_hr}]}`, taken from `stock_at(..., include_unavailable=True)` |
+
+`?all=1` exists because a GPU sold out at **every** datacenter is dropped from runpodctl's default
+output (verified live 2026-09-12). That is exactly the moment the user wants to subscribe.
+`_offer_gpu_sub_datacenters` already asks for `include_unavailable` for this reason.
+
+`gpu` must be a `_GPU_CATALOG` id (`400 bad_request` otherwise), and `datacenter` must be a
+non-empty string. The datacenter is not checked against the live stock list: the bot does not check
+it either, and a runpodctl outage should not block subscribing.
+
+### Arming auto-resume
+
+When `POST` carries `auto_resume`, the server checks the following under `BOT_LOCK`, from files only.
+Each failure is a 409 with its own code, and nothing is written:
+
+1. `run_id` is this chat's current run, and `run_token` matches `_run_token(chat_id)` → else `stale_run`.
+2. The run has an outstanding `provision-failed.json` with `stock_out: true` → else `no_failure`.
+3. `datacenter` is the volume's home datacenter (`volume_datacenter(POD_VOLUME_ID)`) → else
+   `not_home_dc`. Auto-resume never migrates: a migration copies ~33GB, takes ~15–25 min, and
+   deletes the original volume.
+4. The GPU's price is known: taken from the stock read the phone showed, re-read through
+   `stock_at_cached` → else `no_price`. It is stored as `max_usd_per_hr`.
+
+Only one armed auto-resume exists at a time. Arming a second one moves `auto_resume` onto the new
+sub; the old sub stays as notify-only.
+
+### Firing (`_tick_gpu_subs`)
+
+Unchanged: stock comes from `stock_at_cached` (the 60s cache `/gpu` already pays for), a firing
+sub is removed in the same tick, and Telegram gets the message it gets today. New in that tick:
+
+- Every firing is appended to the fired file (the file is trimmed to 10).
+- A sub with `auto_resume` re-checks, at fire time, every arming guard above, plus:
+  - `busy(manifest)` is false, `migration_running()` is false, and `read_lease(LEASE_PATH)` is None.
+  - The price at fire time is ≤ `max_usd_per_hr`.
+
+  If all hold, it does what `_CB_RECOVER_SWITCH` does: `env_set(.env, "GPU", gpu_id)`, then
+  `_do_resume(tg, chat_id, manifest, dry_run=…, gpu_provider="runpod")`. The Telegram message then
+  says the clock is running: "⚡ Auto-resumed — renting RTX 5090 @ EU-RO-1 · $0.99/h". Action
+  `resumed`.
+- If any guard fails, the sub fires as notify-only. The Telegram message names the reason, and the
+  action is `resume_refused`. Nothing is rented.
+
+`_tick_gpu_subs` already runs inside `_run_ticks` under `BOT_LOCK`, which `_do_resume` expects.
+
+**No new spend path.** `_do_resume` is still the only way in, and it only runs for a manifest that
+has already been confirmed once. Auto-resume only removes the tap on "Thử lại". It never runs
+Phase A, never migrates, and never spends above the price the user saw when arming.
+
+**One-shot also applies to auto-resume.** If the rental fails again, because the stock vanished in
+the cache window, `drain.py` writes a new `provision-failed.json` and the usual stock-out card
+arrives. The user re-arms by hand. Re-arming automatically could loop rentals, so this is left out
+on purpose.
+
+### Telegram side
+
+`/subscribe` and `/unsubscribe` are unchanged, apart from listing the ⚡ tag on a sub the app armed.
+The stock-out card does not get an auto-resume button in this change.
+
+## 2. iOS: the Pod tab as one stage
+
+```
+┌ Pod ───────────────── ⋯ ┐   ⋯ menu: Refresh stock · Move volume… · Check Vast credit
+│ ╭ HERO ───────────────╮ │   No pod + RunPod balance/runway, or the live lease clock + Kill.
+│ │ ☾ No pod · $12.40   │ │   While a migration runs, the hero is the migration card.
+│ ╰─────────────────────╯ │   Tapping the balance opens a Balance sheet (Vast credit, errors).
+│ [5090 ✓ 🔴 🔔][4090 🟢] │   Five GPU tiles in a grid sized to the space left (like
+│ [PRO45 🟡][A6000 🟠]…   │   SlotCardGrid): name, home stock dot, $/h, ✓ selected, 🔔 watched.
+├─────────────────────────┤
+│ ━ 🔔 Watching 2   ⚡1   │   Drawer (collapsed = one bar). Open: subs (swipe to delete,
+└─────────────────────────┘   ⚡ = auto-resume armed), then "Recent" firings.
+```
+
+- **Stage.** The page does not scroll on an iPhone SE (3rd gen) or an iPhone 18 Pro Max. The old
+  sections move as follows:
+  - Balance becomes a line in the hero plus a sheet.
+  - "Move volume…" and "Check Vast credit" move into `⋯`.
+  - The stale and refresh-failed states become the same banner New Job uses.
+  - `KillButton` and `KillNotice` keep their server-driven visibility and live in the hero.
+- **GPU sheet.** Tapping a tile opens a sheet at the medium detent, laid out top to bottom:
+  - A "Use for next rental" button (the old row tap; disabled while a spend is in flight, as today).
+  - One row per datacenter from `?all=1`: stock dot, $/h, and 📍 on the home datacenter.
+  - On each row, a 🔔 toggle that subscribes or unsubscribes.
+  - On rows other than home, a Migrate… action and the caveat that renting there needs the volume
+    synced first.
+- **Auto-resume.** The home datacenter row offers "Notify + auto-resume <run>" only when
+  `PodStatus.failedRental?.stockOut == true`. Choosing it shows the price ceiling ("rents
+  automatically at ≤ $0.99/h"). The run flow's stock-out card gains the same action as a shortcut:
+  "Resume when in stock".
+- **In-app banner.** On launch, and on each return to the foreground, `GpuSubsStore` reads `fired`.
+  Entries newer than the last-seen timestamp in `UserDefaults` produce one banner (the New Job
+  banner surface), and the drawer marks them as new.
+- **MotionKit.** `GpuSubs` models and `GpuSubsStore` (load, add, remove, lastSeen), decoded with
+  optional fields as the other stores are. `GpuStock` gains the optional `datacenters`.
+
+## 3. Verification
+
+All of these are free (no GPU spend):
+
+- **Python unittest** (`scripts/tests/`):
+  - the routes, including idempotent replay;
+  - loading a legacy file;
+  - one-shot firing and the trim to 10;
+  - each arming refusal and each fire-time refusal;
+  - a resume path that goes through `_do_resume`, with `dry_run`;
+  - a `max_usd_per_hr` breach.
+- **iOS**:
+  - `make ios-test` for the store and models;
+  - `make ios-build`;
+  - `make ios-contract` (GET `/v1/gpu/subs`, GET `/v1/gpu/stock?all=1`);
+  - a UI test that screenshots the stage on SE and Pro Max and asserts that nothing sits below the
+    drawer or needs a scroll.
+- **Live, no spend.** After deploy, subscribe from the phone to a datacenter that already has stock
+ . The next tick fires it; check that a Telegram
+  message arrives and that the phone's drawer shows it under Recent.
+
+Not provable without a real stock-out: an auto-resume on the real pod. There is no cheap way to
+cause a stock-out, so this path is covered by `dry_run` tests only until one happens naturally.
+
+## Out of scope
+
+Native push (needs a paid Apple account), ntfy, auto-resume across datacenters, auto-confirming a
+draft, renting an idle pod, a Telegram button for auto-resume.
