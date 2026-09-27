@@ -4742,9 +4742,31 @@ def _tick_gpu_subs(tg: Tg, chat_id: int, *, dry_run: bool = False) -> None:
                  "action": "notified"}
         refusal = _auto_resume_refusal(chat_id, sub, hit) if sub.get("auto_resume") else None
         if sub.get("auto_resume") and refusal is None:
-            tail = (f"\n⚡ <b>Auto-resumed</b> — renting {_esc(short)} @ "
-                    f"{_esc(sub['datacenter_id'])} · {price}. The clock is running.")
+            # .env's GPU first, exactly as _CB_RECOVER_SWITCH does: the
+            # subscribed card is the one that has stock. The previous value
+            # is remembered and restored on a refusal — _do_resume has its
+            # own live-state checks _auto_resume_refusal does not repeat
+            # (no "batch" in state, a ManifestError, a busy/migration race
+            # under this same lock), so a refusal here is not hypothetical,
+            # and .env must not end up pointing at a GPU nothing was ever
+            # rented for. The Telegram message below is sent only after this
+            # settles, so it can never claim a resume before one happened.
+            env_path = ROOT / ".env"
+            previous_gpu = env_get(env_path, "GPU")
+            env_set(env_path, "GPU", sub["gpu_id"])
+            out = _do_resume(tg, chat_id, _job_manifest_path(chat_id),
+                             dry_run=dry_run, gpu_provider="runpod")
+            if out:
+                entry["action"] = "resumed"
+                tail = (f"\n⚡ <b>Auto-resumed</b> — renting {_esc(short)} @ "
+                        f"{_esc(sub['datacenter_id'])} · {price}. The clock is running.")
+            else:
+                env_set(env_path, "GPU", previous_gpu)
+                entry["action"], entry["reason"] = "resume_refused", _plain(out.message)
+                tail = (f"\n{ICON_WARN} Auto-resume skipped: {_esc(entry['reason'])}. "
+                        "Nothing was rented.")
         elif refusal is not None:
+            entry["action"], entry["reason"] = "resume_refused", refusal
             tail = (f"\n{ICON_WARN} Auto-resume skipped: {_esc(refusal)}. "
                     "Nothing was rented.")
         else:
@@ -4756,18 +4778,6 @@ def _tick_gpu_subs(tg: Tg, chat_id: int, *, dry_run: bool = False) -> None:
             f"{_stock_icon(hit.stock_status.lower())} {_esc(hit.stock_status)} · "
             f"{ICON_MONEY_CE} {price}{tail}",
             parse_mode=PARSE_HTML)
-        if sub.get("auto_resume") and refusal is None:
-            # .env's GPU first, exactly as _CB_RECOVER_SWITCH does: the
-            # subscribed card is the one that has stock.
-            env_set(ROOT / ".env", "GPU", sub["gpu_id"])
-            out = _do_resume(tg, chat_id, _job_manifest_path(chat_id),
-                             dry_run=dry_run, gpu_provider="runpod")
-            if out:
-                entry["action"] = "resumed"
-            else:
-                entry["action"], entry["reason"] = "resume_refused", _plain(out.message)
-        elif refusal is not None:
-            entry["action"], entry["reason"] = "resume_refused", refusal
         _record_gpu_fired(chat_id, entry)
 
 

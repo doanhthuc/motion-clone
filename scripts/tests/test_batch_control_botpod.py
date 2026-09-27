@@ -1567,6 +1567,20 @@ class TestAutoResumeTick(_PodFixture):
         self.assertEqual(fired["action"], "resume_refused")
         self.patches["start_drain"].assert_not_called()
 
+    def test_auto_resume_rolls_back_env_when_do_resume_itself_refuses(self):
+        """`_auto_resume_refusal` passes every guard it repeats, but `_do_resume`
+        has its own live-state check `load_state(...).get("batch")` this test
+        starves — the case the fix round found: no false "clock is running"
+        claim, and .env's GPU must not stay pointed at a card nothing rented."""
+        self._arm()
+        state_path_for(self._live()).write_text(json.dumps({"runs": {}}), encoding="utf-8")
+        fired = self._fire()
+        self.assertEqual(fired["action"], "resume_refused")
+        self.patches["start_drain"].assert_not_called()
+        self.assertEqual(env_get(self.root / ".env", "GPU"), "NVIDIA GeForce RTX 4090")
+        self.assertFalse(any("clock is running" in text for text in self._texts()))
+        self.assertTrue(any("Nothing was rented" in text for text in self._texts()))
+
     def test_auto_resume_refuses_while_a_lease_is_live(self):
         self._arm()
         self.patches["read_lease"].return_value = object()
