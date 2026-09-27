@@ -56,6 +56,7 @@ struct RootView: View {
                     VStack(spacing: 8) {
                         KillBanner(pod: pod)
                         SpendBanner(flow: flow, migrate: migrate)
+                        FiredBanner(subs: gpuSubs)
                     }
                 }
                 .onChange(of: flow.podRequested) { _, requested in
@@ -87,12 +88,14 @@ struct RootView: View {
         .task {
             model.resumeMaterialsUpload()
             model.requestNotificationPermission()
+            model.refreshGpuSubs()
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
                 model.resumeMaterialsUpload()
                 model.refreshMaterials()
                 model.replayPendingSpend()
+                model.refreshGpuSubs()
                 if let pod = model.pod { Task { await pod.refresh() } }
             }
         }

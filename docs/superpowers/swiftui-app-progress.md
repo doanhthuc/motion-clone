@@ -101,6 +101,18 @@ the spec, not here.
   also removed. Confirmed live: both simulators' re-runs actually took the `gpu-sheet-no-datacenters`
   screenshot branch, i.e. `gpu.dc.unsupported` really fired, not merely assumed. `make ios-contract`'s
   gate-record numbers were also corrected in the spec (see its Gate record for the reconciled count).
+- **Follow-up fixes (2026-09-27, approved list).** (1) The "came into stock" banner moved from
+  `PodView` to `RootView`'s top inset as `FiredBanner` (every tab; hidden only while the Pod tab's
+  drawer is open, via `AppModel.watchDrawerOpen`; tapping it opens the Pod tab with the drawer);
+  `AppModel.refreshGpuSubs()` reads subs at launch and on each foreground. (2) `-UITestPreviewMigration`
+  renders a fixed mid-copy `MigrationCard`; `PodStageTests.testMigrationHeroLeavesTilesVisible` found
+  the SE's last tile 4 pt under the drawer (541 vs 537), so the hero's card is now `compact` (no
+  Telegram footer) and passes on SE and Pro Max. (3) `GpuSubsStore.unsupported` (404 on
+  `GET /v1/gpu/subs`) hides the bell, bolt and "Resume when in stock"; the drawer says
+  "Subscriptions need a bot update." — seen live pre-deploy in `out/pod-stage/*/watch-open.png`.
+  (4) Refusal messages are per (gpu, datacenter) pair. (5)/(6) bot.py: an exception after
+  `start_drain` keeps `.env`'s GPU and reports `resumed`; the Telegram tail now reads "Auto-resume
+  started a rental … If the stock is gone again you'll get the usual stock-out card."
 - **Not yet proven:**
   - Deploying this branch to motion-vps, and the two new contract checks passing live.
   - The live, zero-spend Telegram check: subscribe from the phone/simulator to a datacenter that

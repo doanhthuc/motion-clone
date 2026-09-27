@@ -219,6 +219,12 @@ fake-server result is not a live one.
 | `xcodebuild … -only-testing:MotionAppUITests/PodStageTests -only-testing:MotionAppUITests/Phase5SmokeTests` on the iPhone 18 Pro Max sim (fix round 1 re-run) | `PodStageTests` **passed**, and its screenshot manifest confirms it took the `gpu-sheet-no-datacenters` branch (`gpu.dc.unsupported` present) — the pre-deploy path is exercised, not skipped past; `Phase5SmokeTests` **skipped**, same live-pod reason as before | 2026-09-27 | implementer (Task 9, fix round 1) |
 | Same, on the iPhone SE (3rd gen) sim (fix round 1 re-run) | `PodStageTests` **passed**, same `gpu-sheet-no-datacenters` branch confirmed; `Phase5SmokeTests` **skipped**, same reason | 2026-09-27 | implementer (Task 9, fix round 1) |
 | `motions-studio/setup/scrub-secrets.sh --check` (fix round 1 re-run) | exit 0 | 2026-09-27 | implementer (Task 9, fix round 1) |
+| `make batch-test` (follow-up fixes 5–6: tick keeps a started drain, new Telegram wording) | exit 0, `OK (skipped=1)`, 2305 tests | 2026-09-27 | implementer (follow-up) |
+| `make ios-test` (follow-up fixes 3–4: `unsupported`, per-pair messages) | 359/359 passed | 2026-09-27 | implementer (follow-up) |
+| `make ios-build` (follow-up fixes 1–4) | exit 0 | 2026-09-27 | implementer (follow-up) |
+| `xcodebuild … -only-testing:MotionAppUITests/PodStageTests` on the iPhone SE (3rd gen) sim | first run **failed** `testMigrationHeroLeavesTilesVisible` (last tile maxY 541 > drawer minY 537, full `MigrationCard`); after the hero's card went `compact`: both tests **passed**. Screenshots `pod-stage-migration-before-compact`, `pod-stage-migration` in `out/pod-stage/iphone-se-3rd-gen/` | 2026-09-27 | implementer (follow-up) |
+| Same, on the iPhone 18 Pro Max sim | both tests **passed**; `pod-stage-migration` in `out/pod-stage/iphone-18-pro-max/` | 2026-09-27 | implementer (follow-up) |
+| `motions-studio/setup/scrub-secrets.sh --check` (follow-up) | exit 0 | 2026-09-27 | implementer (follow-up) |
 
 **A bug found and fixed while wiring these gates**: `PodView.swift`'s outer
 `.accessibilityIdentifier("pod.stage")` — never itself asserted on by any test — was overriding the

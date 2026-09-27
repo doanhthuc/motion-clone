@@ -11,8 +11,10 @@ struct PodHero: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            if let migration = pod.pod?.migration, migration.running {
-                MigrationCard(migration: migration)
+            if AppModel.isUITestPreviewMigration {
+                MigrationCard(migration: Self.previewMigration, compact: true)
+            } else if let migration = pod.pod?.migration, migration.running {
+                MigrationCard(migration: migration, compact: true)
             } else if let status = pod.pod, let lease = status.lease {
                 LeaseCard(gpu: status.gpu, lease: lease)
             } else if pod.pod != nil {
@@ -45,6 +47,12 @@ struct PodHero: View {
         .heroSurface()
         .accessibilityIdentifier("pod.hero")
     }
+
+    /// `-UITestPreviewMigration` only: a mid-copy move, the hero's tallest
+    /// state, so PodStageTests can check it fits an iPhone SE (2026-09-27).
+    static let previewMigration = PodMigration(
+        running: true, phase: "copying", toDc: "EU-CZ-1",
+        startedAt: Date.now.timeIntervalSince1970 - 300, bytesCopied: 10e9, totalBytes: 33e9)
 
     /// Runway is the number that decides whether to rent; the rest of the
     /// balance (Vast credit, errors) is one tap away.
@@ -95,6 +103,11 @@ struct LeaseCard: View {
 
 struct MigrationCard: View {
     let migration: PodMigration
+    /// Drops the Telegram/no-cancel footer. The Pod hero uses it: on an
+    /// iPhone SE (3rd gen) the full card pushed the last GPU tile 4 pt under
+    /// the Watching drawer (541 vs 537, PodStageTests, 2026-09-27), and the
+    /// footer was already truncated to one line there.
+    var compact = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -115,8 +128,10 @@ struct MigrationCard: View {
             if let fraction = migration.fractionCopied {
                 ProgressView(value: fraction).tint(Theme.warning)
             }
-            Text("Progress is also posted in Telegram. A migration can't be cancelled.")
-                .font(.footnote).foregroundStyle(Theme.secondary)
+            if !compact {
+                Text("Progress is also posted in Telegram. A migration can't be cancelled.")
+                    .font(.footnote).foregroundStyle(Theme.secondary)
+            }
         }
         .padding(.vertical, 4)
     }

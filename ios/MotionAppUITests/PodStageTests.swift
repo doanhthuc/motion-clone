@@ -56,6 +56,40 @@ final class PodStageTests: XCTestCase {
                        "the recording gate saw no spend")
     }
 
+    /// The hero's tallest state — a migration mid-copy — rendered from a
+    /// fixed fake under `-UITestPreviewMigration` (2026-09-27): no real move
+    /// is started, so this checks on an iPhone SE that the five tiles still
+    /// fit above the drawer when the hero is at its biggest.
+    @MainActor
+    func testMigrationHeroLeavesTilesVisible() throws {
+        let app = XCUIApplication()
+        app.launchArguments += ["-UITestRecordingSpendGate", "-UITestPreviewMigration"]
+        app.launch()
+        app.tabBars.buttons["Pod"].tap()
+
+        XCTAssertTrue(app.staticTexts["Moving the volume to EU-CZ-1"].waitForExistence(timeout: 30),
+                      "the preview migration renders in the hero")
+        let tiles = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "gpu.tile."))
+        XCTAssertTrue(Phase4Draft.waitUntil(timeout: 90) { tiles.count == 5 }, "five GPU tiles")
+        let drawer = app.buttons["pod.watch"]
+        XCTAssertTrue(drawer.waitForExistence(timeout: 10))
+        // `.accessibilityIdentifier("pod.hero")` on the hero's container is
+        // inherited by several of its children on this runtime, so the query
+        // matches more than one element; the hero's bottom is the lowest.
+        let heroParts = app.descendants(matching: .any).matching(identifier: "pod.hero").allElementsBoundByIndex
+        XCTAssertFalse(heroParts.isEmpty, "the hero exists")
+        let heroBottom = heroParts.map(\.frame.maxY).max() ?? 0
+        for i in 0..<tiles.count {
+            let tile = tiles.element(boundBy: i)
+            XCTAssertTrue(tile.isHittable, "\(tile.identifier) is not hittable")
+            XCTAssertGreaterThanOrEqual(tile.frame.minY, heroBottom - 1, "\(tile.identifier) overlaps the hero")
+            XCTAssertLessThanOrEqual(tile.frame.maxY, drawer.frame.minY + 1, "\(tile.identifier) runs under the drawer")
+        }
+        attach(app, "pod-stage-migration")
+        XCTAssertEqual(app.descendants(matching: .any)["uitest.recordedSpends"].label, "0",
+                       "the recording gate saw no spend")
+    }
+
     @MainActor
     private func attach(_ app: XCUIApplication, _ name: String) {
         let shot = XCTAttachment(screenshot: app.screenshot())

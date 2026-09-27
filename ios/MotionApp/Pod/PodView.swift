@@ -17,7 +17,6 @@ struct PodView: View {
     @State private var openGpu: GpuSheetTarget?
     @State private var showBalance = false
     @State private var watchLevel = WatchDrawer.Level.collapsed
-    @State private var bannerHidden: String?
 
     var body: some View {
         GeometryReader { proxy in
@@ -46,7 +45,14 @@ struct PodView: View {
                         .padding(.horizontal, 12)
                 }
             }
-            .overlay(alignment: .top) { firedBanner.padding(.horizontal, 12) }
+        }
+        // The fired banner now lives in RootView (every tab, 2026-09-27); it
+        // reads these two to stay hidden behind an open drawer and to open it.
+        .onChange(of: watchLevel, initial: true) { _, level in model.watchDrawerOpen = level == .open }
+        .onChange(of: model.watchDrawerRequested, initial: true) { _, requested in
+            guard requested else { return }
+            model.watchDrawerRequested = false
+            withAnimation(.snappy) { watchLevel = .open }
         }
         .navigationTitle("Pod")
         .navigationBarTitleDisplayMode(.inline)
@@ -152,27 +158,4 @@ struct PodView: View {
 struct GpuSheetTarget: Identifiable {
     let gpu: String
     var id: String { gpu }
-}
-
-extension PodView {
-    /// The newest firing the app has not shown yet. Telegram already buzzed
-    /// the phone; this is the same news for whoever opens the app first.
-    @ViewBuilder fileprivate var firedBanner: some View {
-        if watchLevel == .collapsed, let firing = subs.unseen.first, firing.id != bannerHidden {
-            let text = firing.resumed
-                ? "⚡ \(firing.name) @ \(firing.datacenter) came into stock — auto-resume started a rental, check the run."
-                : firing.refused
-                    ? "🔔 \(firing.name) @ \(firing.datacenter) came into stock. Auto-resume skipped: \(firing.reason ?? "refused")."
-                    : "🔔 \(firing.name) @ \(firing.datacenter) came into stock (\(firing.stock))."
-            MessageCard(text: text) { bannerHidden = firing.id; subs.markSeen() }
-                .heroSurface()
-                .modifier(SwipeUpToDismiss { bannerHidden = firing.id; subs.markSeen() })
-                .task(id: firing.id) {
-                    try? await Task.sleep(for: .seconds(8))
-                    bannerHidden = firing.id
-                }
-                .transition(.move(edge: .top).combined(with: .opacity))
-                .accessibilityIdentifier("pod.firedBanner")
-        }
-    }
 }
