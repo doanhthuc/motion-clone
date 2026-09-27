@@ -70,11 +70,16 @@ public final class RunFlow {
 
     /// Preview try-on is the primary action only when some job would call a
     /// hosted try-on provider. A pipeline without a try-on stage never does.
+    ///
+    /// "Has a try-on stage" is the catalog's non-empty `providers`, not a
+    /// stage named "tryon": the server fills `providers` from `_tryon_stage`,
+    /// which matches on job type, so the camera pipeline's `camera-tryon`
+    /// counts. Matching the name hid Preview for a qwen-max camera draft.
     public var hasLocalTryon: Bool {
         guard let draft else { return false }
         func local(_ pipeline: String, _ provider: String) -> Bool {
-            let stages = catalog.first { $0.id == pipeline }?.stages ?? []
-            return stages.contains("tryon") && Self.localTryonProviders.contains(provider)
+            let hasTryon = !(catalog.first { $0.id == pipeline }?.providers.isEmpty ?? true)
+            return hasTryon && Self.localTryonProviders.contains(provider)
         }
         let current = draft.missing.isEmpty && local(draft.pipeline, draft.provider)
         return current || draft.batch.contains { local($0.pipeline, $0.provider) }

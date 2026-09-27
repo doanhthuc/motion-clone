@@ -11,11 +11,13 @@ extension URLProtocolTests {
         private var _tryon = Fixtures.tryonIdle
         private var _panels = [Fixtures.rentPanel]
         private var _draft = Fixtures.draft
+        private var _pipelines = Fixtures.pipelines
         private var _validate = Routes.validation(valid: true, stale: false)
         private var _validateStatus = 200
         var pod: String { get { lock.withLock { _pod } } set { lock.withLock { _pod = newValue } } }
         var tryon: String { get { lock.withLock { _tryon } } set { lock.withLock { _tryon = newValue } } }
         var draft: String { get { lock.withLock { _draft } } set { lock.withLock { _draft = newValue } } }
+        var pipelines: String { get { lock.withLock { _pipelines } } set { lock.withLock { _pipelines = newValue } } }
         var validate: String { get { lock.withLock { _validate } } set { lock.withLock { _validate = newValue } } }
         var validateStatus: Int { get { lock.withLock { _validateStatus } } set { lock.withLock { _validateStatus = newValue } } }
         func setPanels(_ p: [String]) { lock.withLock { _panels = p } }
@@ -153,7 +155,7 @@ extension URLProtocolTests {
             let path = request.url?.path ?? ""
             switch true {
             case path == "/v1/pod": return TestSupport.json(pod)
-            case path == "/v1/pipelines": return TestSupport.json(Fixtures.pipelines)
+            case path == "/v1/pipelines": return TestSupport.json(pipelines)
             case path == "/v1/draft": return TestSupport.json(draft)
             case path.hasPrefix("/v1/draft/batch/"): return TestSupport.json(Self.draftAfterDelete)
             case path == "/v1/draft/validate": return TestSupport.json(validate, status: validateStatus)
@@ -193,6 +195,30 @@ extension URLProtocolTests {
         let flow = make(routes)
         await flow.start(.newJob)
         #expect(!flow.hasLocalTryon)
+    }
+
+    /// The camera pipeline's try-on stage is `camera-tryon`, not `tryon`
+    /// (`scripts/batchlib/pipelines.py`). Keying on the stage name hid
+    /// Preview for a qwen-max camera draft (27/09/2026) while the server's
+    /// Phase A would have run it locally.
+    @Test func cameraTryonDraftHasLocalTryon() async {
+        let routes = Routes()
+        routes.pipelines = #"""
+        {"pipelines":[
+          {"id":"tryon-camera-motion-enhance","stages":["camera-tryon","camera-motion","enhance"],
+           "required":["character","driver","outfit"],"optional":[],
+           "roles":{"character":"image","driver":"video","outfit":"image"},
+           "providers":[{"id":"gemini","label":"Gemini"},{"id":"qwen-max","label":"Qwen Max"}]}
+        ]}
+        """#
+        routes.draft = #"""
+        {"owner":"app","pipeline":"tryon-camera-motion-enhance","provider":"qwen-max","generation":1,"slots":{},
+         "required":["character","driver","outfit"],"optional":[],"missing":[],"validated":true,
+         "batch":[],"jobs":1,"estimate_min":40}
+        """#
+        let flow = make(routes)
+        await flow.start(.newJob)
+        #expect(flow.hasLocalTryon)
     }
 
     @Test func existingEntryWithPreviewsShowsPreviews() async {
