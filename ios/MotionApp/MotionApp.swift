@@ -78,6 +78,7 @@ final class AppModel {
     private(set) var outputs: OutputsStore?
     private(set) var runFlow: RunFlow?
     private(set) var gpu: GpuStore?
+    private(set) var gpuSubs: GpuSubsStore?
     private(set) var balance: BalanceStore?
     private(set) var migrate: MigrateFlow?
     private(set) var tryonLibrary: TryonLibraryStore?
@@ -114,7 +115,7 @@ final class AppModel {
         materialResumeTask = nil
         guard let credentials = vault.load() else {
             client = nil; runs = nil; pod = nil; materials = nil; draft = nil; outputs = nil; runFlow = nil
-            gpu = nil; balance = nil; migrate = nil; tryonLibrary = nil; batchComposer = nil; spendGate = nil
+            gpu = nil; gpuSubs = nil; balance = nil; migrate = nil; tryonLibrary = nil; batchComposer = nil; spendGate = nil
             studio = nil
             return true
         }
@@ -131,6 +132,7 @@ final class AppModel {
         batchComposer = BatchComposer(draft: draft, library: library)
         outputs = OutputsStore(client: client)
         gpu = GpuStore(client: client, pod: pod)
+        gpuSubs = GpuSubsStore(client: client)
         balance = BalanceStore(client: client)
         studio = StudioStore(client: client)
         let gate: any SpendSending = Self.isUITestRecording
