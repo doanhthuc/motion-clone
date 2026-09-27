@@ -6,13 +6,19 @@ import SwiftUI
 /// the jobs over the cards. It is not a system sheet, which would cover the tab
 /// bar and be dismissed by every picker, since iOS shows one sheet at a time.
 /// The list inside is the stage's only scroll.
+///
+/// Three heights (user, 2026-09-27): the handle alone, most of the stage, and
+/// all of it. Dragging the handle steps one level at a time; tapping it or the
+/// dimmed cards above closes the drawer from either open level.
 @MainActor
 struct BasketDrawer: View {
+    enum Level { case collapsed, half, tall }
+
     let batch: [DraftBatchEntry]
     let pipeline: (DraftBatchEntry) -> Pipeline?
     let materials: MaterialsStore
     let locked: Bool
-    @Binding var expanded: Bool
+    @Binding var level: Level
     let onOpen: (DraftBatchEntry) -> Void
     let onDrop: (DraftBatchEntry) async -> Void
     let clearAll: AnyView
@@ -22,18 +28,23 @@ struct BasketDrawer: View {
     /// The handle's height; `NewJobView` reserves it under the cards.
     static let collapsedHeight: CGFloat = 48
 
+    private var expanded: Bool { level != .collapsed }
+
     var body: some View {
         VStack(spacing: 0) {
             handle
             if expanded { list.transition(.move(edge: .bottom).combined(with: .opacity)) }
         }
         .background(.regularMaterial, in: .rect(cornerRadius: 20))
+        // The ScrollView draws into the bottom safe area; without the clip the
+        // next jobs showed through under the action and tab bars.
+        .clipShape(.rect(cornerRadius: 20))
         .offset(y: max(drag, expanded ? 0 : -40) * (expanded ? 1 : 0.3))
-        .animation(.snappy, value: expanded)
+        .animation(.snappy, value: level)
     }
 
     private var handle: some View {
-        Button { withAnimation(.snappy) { expanded.toggle() } } label: {
+        Button { withAnimation(.snappy) { level = expanded ? .collapsed : .half } } label: {
             HStack(spacing: 10) {
                 Image(systemName: expanded ? "chevron.down" : "chevron.up")
                     .font(.footnote.weight(.semibold)).foregroundStyle(Theme.secondary)
@@ -59,14 +70,14 @@ struct BasketDrawer: View {
         }
         .buttonStyle(.plain)
         // On the handle only: over the whole drawer it took the list's
-        // horizontal swipe-to-Drop and its vertical scroll (review, 2026-09-26).
+        // vertical scroll (review, 2026-09-26).
         .simultaneousGesture(
             DragGesture(minimumDistance: 12)
                 .updating($drag) { value, state, _ in state = value.translation.height }
                 .onEnded { value in
                     withAnimation(.snappy) {
-                        if value.translation.height < -40 { expanded = true }
-                        if value.translation.height > 40 { expanded = false }
+                        if value.translation.height < -40 { level = level == .collapsed ? .half : .tall }
+                        if value.translation.height > 40 { level = level == .tall ? .half : .collapsed }
                     }
                 })
 
@@ -74,34 +85,28 @@ struct BasketDrawer: View {
         .accessibilityIdentifier("newjob.basket")
     }
 
+    /// A ScrollView, not a List: a List row carries one context menu, so every
+    /// tile's long-press peeked at the row's first tile — pressing Outfit
+    /// showed the Character (user, 2026-09-27). The row's trash button is the
+    /// Drop now that there is no swipe action.
     private var list: some View {
-        List {
-            ForEach(Array(batch.enumerated()), id: \.element.digest) { offset, entry in
-                BatchEntryRow(index: offset + 1, entry: entry, pipeline: pipeline(entry),
-                              materials: materials, dropDisabled: locked,
-                              onOpen: { onOpen(entry) }, onDrop: { dropCandidate = entry })
-                    .swipeActions(edge: .trailing) {
-                        Button("Drop", systemImage: "trash", role: .destructive) { dropCandidate = entry }
-                            .disabled(locked)
-                    }
-                    // On the row, so the popover points at the job it drops.
-                    .confirmationDialog(
-                        "Drop this batch entry?",
-                        isPresented: Binding(get: { dropCandidate?.digest == entry.digest },
-                                             set: { if !$0 { dropCandidate = nil } }),
-                        titleVisibility: .visible
-                    ) {
-                        Button("Drop", role: .destructive) {
-                            dropCandidate = nil
-                            Task { await onDrop(entry) }
-                        }
-                        Button("Cancel", role: .cancel) { dropCandidate = nil }
-                    } message: {
-                        Text("Job \(offset + 1) · \(BatchEntryText.subtitle(entry, pipeline: pipeline(entry)))")
-                    }
+        ScrollView {
+            LazyVStack(spacing: 0) {
+                ForEach(Array(batch.enumerated()), id: \.element.digest) { offset, entry in
+                    if offset > 0 { Divider().padding(.leading, 16) }
+                    BatchEntryRow(index: offset + 1, entry: entry, pipeline: pipeline(entry),
+                                  materials: materials, dropDisabled: locked,
+                                  onOpen: { onOpen(entry) }, onDrop: { dropCandidate = entry },
+                                  confirmingDrop: Binding(get: { dropCandidate?.digest == entry.digest },
+                                                          set: { if !$0 { dropCandidate = nil } }),
+                                  onConfirmDrop: {
+                                      dropCandidate = nil
+                                      Task { await onDrop(entry) }
+                                  })
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
+                }
             }
         }
-        .listStyle(.plain)
-        .scrollContentBackground(.hidden)
     }
 }
