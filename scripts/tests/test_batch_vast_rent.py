@@ -480,6 +480,63 @@ class TestABadMachineStaysBadWithinTheRun(unittest.TestCase):
         self.assertEqual(result.instance_id, "i2")
 
 
+REFUSED = ("Authentication refused: bad ownership or modes for file "
+           "/root/.ssh/authorized_keys")
+
+
+class RefusingVast:
+    """Just enough Vast for check_ssh_refused: a log and a machine id."""
+
+    def __init__(self, log="", machine_id=143849, logs_error=False):
+        self.log, self.machine_id, self.logs_error = log, machine_id, logs_error
+
+    def logs(self, instance_id, tail):
+        if self.logs_error:
+            raise vast_rent.RentError("vastai logs failed")
+        return self.log
+
+    def instance_status(self, instance_id):
+        return {"actual_status": "running", "machine_id": self.machine_id}
+
+
+class TestSshRefused(unittest.TestCase):
+    """2026-09-27: sshd refused the key on every attempt and pod-wait sat out 25 minutes."""
+
+    def check(self, api, board):
+        saved = []
+        why = vast_rent.check_ssh_refused(api, "52943882", board, now=lambda: 1000.0,
+                                          persist=lambda: saved.append(1), log=lambda m: None)
+        return why, saved
+
+    def test_a_repeating_refusal_blacklists_the_machine(self):
+        board = Scoreboard({143849: MachineRecord(143849, 33.0, None, None, 900.0, "ok")})
+        log = "\n".join(["Server listening on 0.0.0.0 port 22."] + [REFUSED] * 3)
+        why, saved = self.check(RefusingVast(log), board)
+        self.assertIn("bad ownership or modes", why)
+        self.assertIn("machine 143849", why)
+        self.assertTrue(board.is_blacklisted(143849, now=1001.0))
+        self.assertNotIn(143849, board.known_good())
+        self.assertEqual(saved, [1])
+
+    def test_one_stray_line_is_not_a_verdict(self):
+        board = Scoreboard({})
+        why, saved = self.check(RefusingVast(REFUSED), board)
+        self.assertIsNone(why)
+        self.assertEqual((board.records(), saved), ({}, []))
+
+    def test_an_unreadable_log_means_keep_waiting(self):
+        board = Scoreboard({})
+        why, _ = self.check(RefusingVast(logs_error=True), board)
+        self.assertIsNone(why)
+        self.assertEqual(board.records(), {})
+
+    def test_an_unknown_machine_still_reports(self):
+        board = Scoreboard({})
+        why, _ = self.check(RefusingVast("\n".join([REFUSED] * 5), machine_id=None), board)
+        self.assertIn("id unknown", why)
+        self.assertEqual(board.records(), {})
+
+
 class TestParseSshUrl(unittest.TestCase):
     def test_the_usual_shape(self):
         self.assertEqual(vast_rent.parse_ssh_url("ssh://root@1.2.3.4:40022"),

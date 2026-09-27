@@ -188,6 +188,19 @@ while :; do
     fi
   fi
 
+  # A vast sshd that rejects the key for bad authorized_keys ownership never recovers: instance
+  # 52943882 (2026-09-27) refused all 36 attempts from its first second and this loop still sat
+  # out the full 25 minutes. Read the instance log once a minute after 2 minutes; the check also
+  # blacklists the machine, so the next rent does not land on it again.
+  if [ "$PROVIDER" != "runpod" ] && [ "$MINS" -ge 2 ] && [ "$NOW" -ge "${NEXT_REFUSAL_CHECK:-0}" ]; then
+    NEXT_REFUSAL_CHECK=$(( NOW + 60 ))
+    if why="$(python3 "$VAST_RENT" --ssh-refused "$ID" 2>/dev/null)"; then
+      printf '\n✗ sshd on instance %s refuses the key — waiting will not fix it.\n  %s\n' "$ID" "$why"
+      echo "  Destroy it (make gpu-destroy) and rent again; the next rent skips this machine."
+      exit 1
+    fi
+  fi
+
   if [ "$NOW" -ge "$DEADLINE" ]; then
     SPENT="$(python3 -c "print(f'{($NOW - $START) / 3600 * $RATE:.2f}')")"
     printf '\n✗ still "%s" after %s min ($%s burned).\n\n' "$STATUS" "$TIMEOUT" "$SPENT"
