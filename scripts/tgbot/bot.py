@@ -4291,7 +4291,7 @@ def _report_gpu_stock(tg: Tg, chat_id: int, *, message_id: int | None = None,
                  [[("Refresh", _CB_GPU_REFRESH, _ce_id(ICON_REFRESH_CE))]], parse_mode=PARSE_HTML)
 
 
-def _gpu_stock_data(*, force: bool) -> dict:
+def _gpu_stock_data(*, force: bool, all_dcs: bool = False) -> dict:
     """`_report_gpu_stock`'s numbers as JSON for the phone (`GET /v1/gpu/stock`).
 
     A twin, not a caller: `_report_gpu_stock` also sends or edits a Telegram
@@ -4306,6 +4306,11 @@ def _gpu_stock_data(*, force: bool) -> dict:
     runpodctl round trip (~30s worst case, its own timeout). Raises
     RuntimeError when the stock check does; `AppPod.gpu_stock` maps that to
     502, where the Telegram report says "couldn't reach runpodctl".
+
+    `all_dcs=True` (`GET /v1/gpu/stock?all=1`) adds a `datacenters` array
+    listing every (gpu, datacenter) runpodctl knows about, sold out included —
+    for the phone's subscribe picker, which needs exactly the datacenters the
+    default output above drops.
     """
     volume_id = env_get(ROOT / ".env", "POD_VOLUME_ID")
     home_dc = volume_datacenter(volume_id)
@@ -4342,8 +4347,20 @@ def _gpu_stock_data(*, force: bool) -> dict:
                                   "usd_per_hr": e.price_per_hr or None})
     # The primary when .env has no GPU=, the same fallback GET /v1/pod and
     # _gpu_mismatch use — two screens must not show two answers for one value.
-    return {"selected": env_get(ROOT / ".env", "GPU") or _PRIMARY_GPU_ID,
+    data = {"selected": env_get(ROOT / ".env", "GPU") or _PRIMARY_GPU_ID,
             "home_datacenter": home_dc, "gpus": gpus, "other_regions": other_regions}
+    if all_dcs:
+        # A GPU sold out at every datacenter is missing from the default
+        # output (verified live 2026-09-12), which is exactly when the
+        # phone wants to subscribe to it. Its own call, so `gpus` above keeps
+        # the default output's meaning (sold_out_everywhere, entries[0]).
+        full = (stock_at(wanted, include_unavailable=True) if force
+                else stock_at_cached(wanted, include_unavailable=True))
+        data["datacenters"] = [
+            {"gpu": gpu_id, "datacenter": e.datacenter_id,
+             "stock": _plain(e.stock_status), "usd_per_hr": e.price_per_hr or None}
+            for gpu_id in wanted for e in full.get(gpu_id) or []]
+    return data
 
 
 # Below this many hours of runway, /balance warns before a rent is attempted:
@@ -7670,6 +7687,27 @@ def _resume_generation_refusal(chat_id: int, drafts: DraftStore) -> str | None:
     return RESUME_STALE_GENERATION
 
 
+def _gpu_sub_view(sub: dict) -> dict:
+    """A sub as the phone sees it — `run_token` stays on the box."""
+    armed = sub.get("auto_resume")
+    return {"id": sub.get("id") or "", "gpu": sub["gpu_id"],
+            "name": _GPU_DISPLAY_SHORT.get(sub["gpu_id"], sub["gpu_id"]),
+            "datacenter": sub["datacenter_id"], "created_at": sub.get("created_at"),
+            "auto_resume": ({"run_id": armed.get("run_id"),
+                             "max_usd_per_hr": armed.get("max_usd_per_hr")}
+                            if armed else None)}
+
+
+def _gpu_fired_view(entry: dict) -> dict:
+    gpu = entry.get("gpu_id") or ""
+    return {"sub_id": entry.get("sub_id") or "", "gpu": gpu,
+            "name": _GPU_DISPLAY_SHORT.get(gpu, gpu),
+            "datacenter": entry.get("datacenter_id") or "",
+            "stock": entry.get("stock") or "", "usd_per_hr": entry.get("usd_per_hr"),
+            "fired_at": entry.get("fired_at") or 0.0,
+            "action": entry.get("action") or "notified", "reason": entry.get("reason")}
+
+
 class AppPod:
     """The pod-side calls the phone can make (spec §5.9): stop what is
     running, and retry a rental that already failed once.
@@ -7931,15 +7969,16 @@ class AppPod:
         }
         return 200, body
 
-    def gpu_stock(self, force: bool) -> tuple[int, dict]:
-        """`GET /v1/gpu/stock[?force=1]`. Takes no lock: nothing it reads is
-        bot state, and a runpodctl round trip held under `BOT_LOCK` would stall
-        every Telegram update for as long as it runs (`_rent_panel_data`'s
-        reasoning). A dead runpodctl is 502 here, where the rent panel fails
-        open — this endpoint's only job is the stock, so "no data" is the
-        honest answer, not an empty list that reads as "sold out"."""
+    def gpu_stock(self, force: bool, all_dcs: bool = False) -> tuple[int, dict]:
+        """`GET /v1/gpu/stock[?force=1][&all=1]`. Takes no lock: nothing it
+        reads is bot state, and a runpodctl round trip held under `BOT_LOCK`
+        would stall every Telegram update for as long as it runs
+        (`_rent_panel_data`'s reasoning). A dead runpodctl is 502 here, where
+        the rent panel fails open — this endpoint's only job is the stock, so
+        "no data" is the honest answer, not an empty list that reads as
+        "sold out"."""
         try:
-            return 200, _gpu_stock_data(force=bool(force))
+            return 200, _gpu_stock_data(force=bool(force), all_dcs=bool(all_dcs))
         except RuntimeError as exc:
             return 502, _run_error("upstream_unavailable",
                                    _plain(f"couldn't reach runpodctl: {exc}"))
@@ -7967,6 +8006,96 @@ class AppPod:
                 return busy_response
             env_set(ROOT / ".env", "GPU", gpu)
         return 200, {"gpu": gpu, "name": _GPU_DISPLAY_SHORT.get(gpu, gpu)}
+
+    def gpu_subs(self) -> tuple[int, dict]:
+        """`GET /v1/gpu/subs`. Under the lock only because the tick mutates
+        `_GPU_SUBS` under it; no network here."""
+        with _bot_locked() as busy_response:
+            if busy_response is not None:
+                return busy_response
+            subs = [_gpu_sub_view(s) for s in _gpu_subs_for(self.chat_id)]
+            fired = [_gpu_fired_view(e) for e in _gpu_fired_for(self.chat_id)]
+        return 200, {"subs": subs, "fired": fired}
+
+    def add_gpu_sub(self, body: dict) -> tuple[int, dict]:
+        """`POST /v1/gpu/subs` — an upsert on (gpu, datacenter), so a repeat
+        lands on the same entry and no Idempotency-Key is needed (2026-09-27
+        spec §1). `auto_resume: true` arms it; the network reads for that run
+        before the lock, the file checks under it, `migrate_ask`'s split."""
+        body = body if isinstance(body, dict) else {}
+        gpu, dc = body.get("gpu"), body.get("datacenter")
+        auto = body.get("auto_resume", False)
+        run_id = body.get("run_id")
+        if gpu not in _GPU_CATALOG:
+            return 400, _run_error("bad_request", "gpu must be one of the catalog ids "
+                                                  "from GET /v1/gpu/stock")
+        if not isinstance(dc, str) or not dc.strip() or len(dc) > 64:
+            return 400, _run_error("bad_request", "datacenter is required")
+        if not isinstance(auto, bool):
+            return 400, _run_error("bad_request", "auto_resume must be true or false")
+        if auto and (not isinstance(run_id, str) or not run_id):
+            return 400, _run_error("bad_request", "run_id is required to arm auto-resume")
+        dc = dc.strip()
+        price = None
+        if auto:
+            if dc != _home_datacenter():
+                return 409, _run_error("not_home_dc",
+                                       "auto-resume only rents in the volume's home "
+                                       "datacenter — elsewhere needs a migration first")
+            try:
+                stock = stock_at_cached(list(_GPU_CATALOG), include_unavailable=True)
+            except RuntimeError as exc:
+                return 502, _run_error("upstream_unavailable",
+                                       _plain(f"couldn't reach runpodctl: {exc}"))
+            entry = next((e for e in stock.get(gpu) or [] if e.datacenter_id == dc), None)
+            price = entry.price_per_hr if entry is not None else None
+            if not price:
+                return 409, _run_error("no_price",
+                                       "runpodctl lists no price for this GPU here, so "
+                                       "there is no ceiling to arm auto-resume with")
+        with _bot_locked() as busy_response:
+            if busy_response is not None:
+                return busy_response
+            if auto:
+                manifest_path = _job_manifest_path(self.chat_id)
+                if run_id != manifest_path.stem:
+                    return 409, _run_error("stale_run",
+                                           "the run changed since it was read — read it again")
+                failure = read_provision_failure(provision_failure_path(manifest_path))
+                if failure is None or not failure.stock_out:
+                    return 409, _run_error("no_failure",
+                                           "this run has no stock-out to resume from")
+            subs = _gpu_subs_for(self.chat_id)
+            sub = next((s for s in subs
+                        if s["gpu_id"] == gpu and s["datacenter_id"] == dc), None)
+            created = sub is None
+            if created:
+                sub = _new_gpu_sub(gpu, dc, subs)
+                subs.append(sub)
+            if auto:
+                for other in subs:
+                    other.pop("auto_resume", None)
+                sub["auto_resume"] = {"run_id": run_id, "run_token": _run_token(self.chat_id),
+                                      "max_usd_per_hr": price}
+            else:
+                sub.pop("auto_resume", None)
+            _save_gpu_subs(self.chat_id)
+            view = _gpu_sub_view(sub)
+        return (201 if created else 200), {"sub": view}
+
+    def remove_gpu_sub(self, sub_id: str) -> tuple[int, dict]:
+        """`DELETE /v1/gpu/subs/{id}`. An unknown id is 200: the sub may have
+        fired (and removed itself) since the phone read the list."""
+        with _bot_locked() as busy_response:
+            if busy_response is not None:
+                return busy_response
+            subs = _gpu_subs_for(self.chat_id)
+            remaining = [s for s in subs if s.get("id") != sub_id]
+            if len(remaining) != len(subs):
+                _GPU_SUBS[self.chat_id] = remaining
+                _save_gpu_subs(self.chat_id)
+            views = [_gpu_sub_view(s) for s in remaining]
+        return 200, {"subs": views}
 
     def _migrate_blocked(self) -> tuple[int, dict] | None:
         """The live-state guards both halves of the migration share, read

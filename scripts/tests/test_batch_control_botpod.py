@@ -50,6 +50,13 @@ class _PodFixture(_Fixture):
 
     def setUp(self):
         super().setUp()
+        # `_GPU_SUBS`/`_GPU_SUBS_LOADED` are a process-wide cache keyed by
+        # chat_id, loaded once per process (`_gpu_subs_for`'s own docstring).
+        # ME is the same chat_id across every test in this file, so without
+        # this a sub written by an earlier test leaks into the next one's
+        # fresh temp ROOT instead of that test seeing an empty file.
+        bot._GPU_SUBS.pop(ME, None)
+        bot._GPU_SUBS_LOADED.discard(ME)
         for name, value in (("stop_phase_a", True), ("lease_for", None),
                             ("read_lease", None), ("clear_lease", None)):
             patcher = mock.patch(f"tgbot.bot.{name}", return_value=value)
@@ -904,6 +911,19 @@ class TestGpuStock(_PodFixture):
             status, _ = self.pod.gpu_stock(False)
         self.assertEqual(status, 200)
 
+    def test_all_dcs_lists_every_datacenter_including_sold_out(self):
+        self.patches["stock_at_cached"].return_value = _fake_stock()
+        data = bot._gpu_stock_data(force=False, all_dcs=True)
+        kwargs = self.patches["stock_at_cached"].call_args_list[-1].kwargs
+        self.assertTrue(kwargs.get("include_unavailable"))
+        self.assertTrue(data["datacenters"])
+        for row in data["datacenters"]:
+            self.assertEqual(set(row), {"gpu", "datacenter", "stock", "usd_per_hr"})
+
+    def test_plain_stock_has_no_datacenters_key(self):
+        self.patches["stock_at_cached"].return_value = _fake_stock()
+        self.assertNotIn("datacenters", bot._gpu_stock_data(force=False))
+
 
 class TestBalance(_PodFixture):
     def _balance(self, usd: float, *, vast: bool = False, vast_credit=25.0):
@@ -1605,6 +1625,128 @@ class TestAutoResumeTick(_PodFixture):
         self._arm()
         text, _ = bot._gpu_subs_lines_and_buttons(ME)
         self.assertIn("⚡", text)
+
+
+class TestAppPodGpuSubs(_PodFixture):
+    GPU = "NVIDIA GeForce RTX 5090"
+
+    def setUp(self):
+        super().setUp()
+        self.job = self._job("app")
+        write_manifest([self.job], self._live(), now=time.strftime("%Y-%m-%d %H:%M:%S"))
+        (self.root / ".env").write_text("POD_VOLUME_ID=vol-1\n", encoding="utf-8")
+        self.patches["stock_at_cached"].return_value = {self.GPU: [Stock(
+            gpu_id=self.GPU, display_name="RTX 5090", price_per_hr=0.99,
+            datacenter_id="EU-RO-1", stock_status="none")]}
+
+    def _stock_out(self):
+        write_provision_failure(provision_failure_path(self._live()), ProvisionFailure(
+            gpu=self.GPU, datacenter="EU-RO-1", stock_out=True, detail="no instances"))
+
+    def test_add_then_list_then_remove(self):
+        status, body = self.pod.add_gpu_sub({"gpu": self.GPU, "datacenter": "EU-CZ-1"})
+        self.assertEqual(status, 201)
+        sub = body["sub"]
+        self.assertEqual((sub["gpu"], sub["name"], sub["datacenter"], sub["auto_resume"]),
+                         (self.GPU, "RTX 5090", "EU-CZ-1", None))
+        status, listing = self.pod.gpu_subs()
+        self.assertEqual((status, [s["id"] for s in listing["subs"]], listing["fired"]),
+                         (200, [sub["id"]], []))
+        status, after = self.pod.remove_gpu_sub(sub["id"])
+        self.assertEqual((status, after["subs"]), (200, []))
+        self.assertEqual(bot._gpu_subs_for(ME), [])
+
+    def test_add_is_an_upsert(self):
+        first = self.pod.add_gpu_sub({"gpu": self.GPU, "datacenter": "EU-RO-1"})
+        second = self.pod.add_gpu_sub({"gpu": self.GPU, "datacenter": "EU-RO-1"})
+        self.assertEqual((first[0], second[0]), (201, 200))
+        self.assertEqual(first[1]["sub"]["id"], second[1]["sub"]["id"])
+        self.assertEqual(len(bot._gpu_subs_for(ME)), 1)
+
+    def test_bad_bodies_are_400(self):
+        for body in ({"gpu": "nope", "datacenter": "EU-RO-1"},
+                     {"gpu": self.GPU, "datacenter": ""},
+                     {"gpu": self.GPU, "datacenter": "EU-RO-1", "auto_resume": "yes"},
+                     {"gpu": self.GPU, "datacenter": "EU-RO-1", "auto_resume": True}):
+            with self.subTest(body=body):
+                status, resp = self.pod.add_gpu_sub(body)
+                self.assertEqual((status, resp["error"]["code"]), (400, "bad_request"))
+        self.assertEqual(bot._gpu_subs_for(ME), [])
+
+    def test_arming_stores_the_price_and_token_and_hides_the_token(self):
+        self._stock_out()
+        status, body = self.pod.add_gpu_sub({"gpu": self.GPU, "datacenter": "EU-RO-1",
+                                             "auto_resume": True, "run_id": self.pod.run_id})
+        self.assertEqual(status, 201)
+        self.assertEqual(body["sub"]["auto_resume"],
+                         {"run_id": self.pod.run_id, "max_usd_per_hr": 0.99})
+        [stored] = bot._gpu_subs_for(ME)
+        self.assertEqual(stored["auto_resume"]["run_token"], bot._run_token(ME))
+        self.assertNotIn("run_token", json.dumps(self.pod.gpu_subs()[1]))
+
+    def test_arming_outside_home_is_409_and_writes_nothing(self):
+        self._stock_out()
+        status, body = self.pod.add_gpu_sub({"gpu": self.GPU, "datacenter": "EU-CZ-1",
+                                             "auto_resume": True, "run_id": self.pod.run_id})
+        self.assertEqual((status, body["error"]["code"]), (409, "not_home_dc"))
+        self.assertEqual(bot._gpu_subs_for(ME), [])
+
+    def test_arming_without_a_stock_out_is_409(self):
+        status, body = self.pod.add_gpu_sub({"gpu": self.GPU, "datacenter": "EU-RO-1",
+                                             "auto_resume": True, "run_id": self.pod.run_id})
+        self.assertEqual((status, body["error"]["code"]), (409, "no_failure"))
+
+    def test_arming_another_run_is_409_stale_run(self):
+        self._stock_out()
+        status, body = self.pod.add_gpu_sub({"gpu": self.GPU, "datacenter": "EU-RO-1",
+                                             "auto_resume": True, "run_id": "tg-other"})
+        self.assertEqual((status, body["error"]["code"]), (409, "stale_run"))
+
+    def test_arming_without_a_price_is_409(self):
+        self._stock_out()
+        self.patches["stock_at_cached"].return_value = {self.GPU: [Stock(
+            gpu_id=self.GPU, display_name="RTX 5090", price_per_hr=None,
+            datacenter_id="EU-RO-1", stock_status="none")]}
+        status, body = self.pod.add_gpu_sub({"gpu": self.GPU, "datacenter": "EU-RO-1",
+                                             "auto_resume": True, "run_id": self.pod.run_id})
+        self.assertEqual((status, body["error"]["code"]), (409, "no_price"))
+
+    def test_arming_moves_the_bolt_and_false_disarms(self):
+        self._stock_out()
+        self.pod.add_gpu_sub({"gpu": self.GPU, "datacenter": "EU-RO-1",
+                              "auto_resume": True, "run_id": self.pod.run_id})
+        other = "NVIDIA GeForce RTX 4090"
+        self.patches["stock_at_cached"].return_value[other] = [Stock(
+            gpu_id=other, display_name="RTX 4090", price_per_hr=0.69,
+            datacenter_id="EU-RO-1", stock_status="none")]
+        self.pod.add_gpu_sub({"gpu": other, "datacenter": "EU-RO-1",
+                              "auto_resume": True, "run_id": self.pod.run_id})
+        armed = [s["gpu_id"] for s in bot._gpu_subs_for(ME) if s.get("auto_resume")]
+        self.assertEqual(armed, [other])
+        self.pod.add_gpu_sub({"gpu": other, "datacenter": "EU-RO-1", "auto_resume": False})
+        self.assertFalse(any(s.get("auto_resume") for s in bot._gpu_subs_for(ME)))
+
+    def test_runpodctl_down_while_arming_is_502(self):
+        self._stock_out()
+        self.patches["stock_at_cached"].side_effect = RuntimeError("timeout")
+        status, body = self.pod.add_gpu_sub({"gpu": self.GPU, "datacenter": "EU-RO-1",
+                                             "auto_resume": True, "run_id": self.pod.run_id})
+        self.assertEqual((status, body["error"]["code"]), (502, "upstream_unavailable"))
+
+    def test_removing_an_unknown_id_is_200(self):
+        status, body = self.pod.remove_gpu_sub("ffffff")
+        self.assertEqual((status, body), (200, {"subs": []}))
+
+    def test_fired_view_names_the_gpu(self):
+        bot._record_gpu_fired(ME, {"sub_id": "abc123", "gpu_id": self.GPU,
+                                   "datacenter_id": "EU-RO-1", "stock": "Low",
+                                   "usd_per_hr": 0.99, "fired_at": 5.0,
+                                   "action": "resume_refused", "reason": "a pod is already live"})
+        [fired] = self.pod.gpu_subs()[1]["fired"]
+        self.assertEqual(fired, {"sub_id": "abc123", "gpu": self.GPU, "name": "RTX 5090",
+                                 "datacenter": "EU-RO-1", "stock": "Low", "usd_per_hr": 0.99,
+                                 "fired_at": 5.0, "action": "resume_refused",
+                                 "reason": "a pod is already live"})
 
 
 if __name__ == "__main__":
