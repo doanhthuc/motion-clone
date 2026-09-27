@@ -128,7 +128,8 @@ private struct JobCover: View {
             .overlay(alignment: .topTrailing) { badge.padding(6) }
             .clipped()
             .frame(maxWidth: .infinity)
-            .task(id: "\(job.id)/\(store.detail?.outputs.count ?? 0)") {
+            // updatedAt too: a try-on regenerate changes the run but no output.
+            .task(id: "\(job.id)/\(store.detail?.outputs.count ?? 0)/\(store.detail?.updatedAt ?? 0)") {
                 let loaded = await load()
                 withAnimation(.easeOut(duration: 0.3)) { image = loaded }
             }

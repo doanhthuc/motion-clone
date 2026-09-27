@@ -7,6 +7,9 @@ public struct TryonPreview: Decodable, Sendable, Equatable, Identifiable {
     public let run: String
     public let status: StageStatus
     public let hasImage: Bool
+    /// Changes whenever the image does (additive, so an older server still
+    /// decodes). A regenerate keeps the index — and so the URL — the same.
+    public let rev: String?
     /// Phase 6 shared try-on (additive, so an older server still decodes):
     /// the leader's index, or nil for a leader or an ungrouped preview.
     public let sharedFrom: String?

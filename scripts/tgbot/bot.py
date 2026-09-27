@@ -7537,14 +7537,20 @@ class AppRuns:
             previews = []
             for index, run, _stage, entry in entries:
                 status = entry.get("status") or "pending"
-                has_image = status == "done" and Path(entry.get("file") or "").is_file()
+                image = Path(entry.get("file") or "")
+                has_image = status == "done" and image.is_file()
+                # `rev` changes whenever the image does: a regenerate keeps the
+                # same index and URL, and the phone cached by index alone, so
+                # the Runs card kept showing the first version after a regen
+                # (2026-09-27). The app keys its image cache on this instead.
+                rev = str(image.stat().st_mtime_ns) if has_image else None
                 leader = groups.get(run.id, run.id)
                 shared_from = None if leader == run.id else index_of.get(leader)
                 shares = [index_of[other] for other, other_leader in groups.items()
                          if other_leader == run.id and other != run.id]
                 previews.append({"index": index, "run": run.id, "status": status,
-                                 "has_image": has_image, "shared_from": shared_from,
-                                 "shares": shares})
+                                 "has_image": has_image, "rev": rev,
+                                 "shared_from": shared_from, "shares": shares})
             response = (200, {"run_id": self.run_id, "run_token": _run_token(self.chat_id),
                               "phase_a_running": phase_a_running(
                                   _job_manifest_path(self.chat_id)),

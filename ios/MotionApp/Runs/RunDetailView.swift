@@ -268,7 +268,7 @@ private struct JobPage: View {
                 showDetails()
             }
         )
-        .task(id: job.id) {
+        .task(id: "\(job.id)/\(detail.updatedAt)") {
             let loaded = await store.tryonImage(forJob: job.id).flatMap(UIImage.init(data:))
             withAnimation(.easeOut(duration: 0.4)) { tryon = loaded }
         }

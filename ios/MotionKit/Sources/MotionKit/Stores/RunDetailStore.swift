@@ -25,6 +25,9 @@ public final class RunDetailStore {
             // nil = 304: the run did not change since the last poll.
             if let fresh = try await client.getIfChanged(RunDetail.self, haveCopy: detail != nil,
                                                            "v1", "runs", runID) {
+                // The run changed, and a try-on regenerate is one such change:
+                // read the previews again next time a page asks.
+                if fresh.updatedAt != detail?.updatedAt { tryonLoad = nil }
                 detail = fresh
             }
             error = nil
@@ -46,9 +49,13 @@ public final class RunDetailStore {
     }
 
     /// The try-on a job was made from — the one picture a job has before its
-    /// video exists. Read once per screen: Phase A is over by the time a run has
-    /// jobs, so the previews do not move under a detail poll. A run without a
-    /// try-on stage answers 404 and every job gets nil.
+    /// video exists. The previews are read once per change of the run, not once
+    /// per store: a regenerate after the run has jobs replaces the image under
+    /// the same index, and this store lives for the whole app session — keyed
+    /// on the index alone, the Runs card kept the first version (2026-09-27).
+    /// Images are cached by index and `rev`, so an unchanged one is not
+    /// downloaded again. A run without a try-on stage answers 404 and every
+    /// job gets nil.
     public func tryonImage(forJob job: String) async -> Data? {
         if tryonLoad == nil {
             let client = client, runID = runID
@@ -56,9 +63,10 @@ public final class RunDetailStore {
         }
         let tryon = await tryonLoad?.value
         guard let preview = tryon?.previews.first(where: { $0.run == job }), preview.hasImage else { return nil }
-        if let cached = tryonImages[preview.index] { return cached }
+        let key = "\(preview.index)@\(preview.rev ?? "")"
+        if let cached = tryonImages[key] { return cached }
         guard let data = try? await client.data("v1", "runs", runID, "tryon", preview.index) else { return nil }
-        tryonImages[preview.index] = data
+        tryonImages[key] = data
         return data
     }
 }

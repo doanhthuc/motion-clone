@@ -92,5 +92,40 @@ extension URLProtocolTests {
             #expect(StubURLProtocol.requests.filter { $0.url?.path == "/v1/runs/tg-1000/tryon" }.count == 1)
             #expect(StubURLProtocol.requests.filter { $0.url?.path == "/v1/runs/tg-1000/tryon/0" }.count == 1)
         }
+
+        /// A regenerate replaces the image under the same index. This store
+        /// lives for the whole session, and keyed on the index alone the Runs
+        /// card showed the first version until the app relaunched (2026-09-27).
+        @Test func aRegenShowsOnceTheRunChanges() async {
+            let version = Counter()
+            _ = version.increment()
+            StubURLProtocol.install { req in
+                let v = version.value
+                switch req.url?.path {
+                case "/v1/runs/tg-1000":
+                    return TestSupport.json(Fixtures.runDetail.replacingOccurrences(
+                        of: #""updated_at": 1790000000.5"#, with: #""updated_at": \#(v)"#))
+                case "/v1/runs/tg-1000/tryon":
+                    return TestSupport.json(#"{"run_id":"tg-1000","run_token":"t","phase_a_running":false,"previews":[{"index":"0","run":"a","status":"done","has_image":true,"rev":"\#(v)"}]}"#)
+                case "/v1/runs/tg-1000/tryon/0":
+                    return (200, [:], Data([UInt8(v)]))
+                default:
+                    return (404, [:], Data())
+                }
+            }
+            let store = RunDetailStore(client: TestSupport.client(), runID: "tg-1000")
+            await store.refresh()
+            #expect(await store.tryonImage(forJob: "a") == Data([1]))
+
+            await store.refresh()   // nothing changed: previews and image stay cached
+            #expect(await store.tryonImage(forJob: "a") == Data([1]))
+            let tryonReads = { StubURLProtocol.requests.filter { $0.url?.path == "/v1/runs/tg-1000/tryon" }.count }
+            #expect(tryonReads() == 1)
+
+            _ = version.increment()  // the regenerate lands on the server
+            await store.refresh()
+            #expect(await store.tryonImage(forJob: "a") == Data([2]))
+            #expect(tryonReads() == 2)
+        }
     }
 }
