@@ -448,6 +448,7 @@ struct StageDot: View {
 // MARK: - rental failed
 
 private struct RetryRentalCard: View {
+    @Environment(AppModel.self) private var model
     let flow: RunFlow
     let failure: FailedRental
 
@@ -474,8 +475,25 @@ private struct RetryRentalCard: View {
                     .buttonStyle(SecondaryButtonStyle())
                     .disabled(flow.isSpending)
             }
+            // Only for a stock-out at a known datacenter: the server arms
+            // auto-resume only at home, and a stock-out's datacenter IS home
+            // (pod-provision.sh can only try there).
+            if failure.stockOut, let dc = failure.datacenter, let subs = model.gpuSubs, let runID = flow.runID {
+                let armed = subs.armed?.gpu == failure.gpu && subs.armed?.datacenter == dc
+                Button(armed ? "Auto-resume armed · \(failure.gpu) @ \(dc)" : "Resume when in stock",
+                       systemImage: armed ? "bolt.fill" : "bolt") {
+                    Task { await subs.watch(gpu: failure.gpu, datacenter: dc, autoResumeRunID: runID) }
+                }
+                .buttonStyle(SecondaryButtonStyle())
+                .disabled(armed || subs.inFlight.contains("\(failure.gpu)|\(dc)"))
+                .accessibilityIdentifier("run.resumeWhenInStock")
+                if let message = subs.message {
+                    Text(message).font(.footnote).foregroundStyle(Theme.warning)
+                }
+            }
         }
         .heroSurface()
+        .task { await model.gpuSubs?.load() }
     }
 }
 
