@@ -80,7 +80,9 @@ struct PodView: View {
             GeometryReader { proxy in
                 let spacing: CGFloat = 10
                 let rows = CGFloat((stock.gpus.count + 1) / 2)
-                let height = min(max((proxy.size.height - spacing * (rows - 1)) / max(rows, 1), 64), 110)
+                // Upper clamp 150, not 110: on an iPhone 18 Pro Max's taller stage 110 left
+                // ~40% of the screen blank above the drawer band (2026-09-27 review round 1).
+                let height = min(max((proxy.size.height - spacing * (rows - 1)) / max(rows, 1), 64), 150)
                 LazyVGrid(columns: [GridItem(.flexible(), spacing: spacing), GridItem(.flexible(), spacing: spacing)],
                           spacing: spacing) {
                     ForEach(stock.gpus) { row in
@@ -112,7 +114,7 @@ struct PodView: View {
                 Task { await balance.loadVast() }
             }
             .disabled(balance.isLoadingVast)
-            .accessibilityIdentifier("pod.checkVast")
+            .accessibilityIdentifier("pod.menu.checkVast")
         } label: {
             Image(systemName: "ellipsis.circle")
         }
