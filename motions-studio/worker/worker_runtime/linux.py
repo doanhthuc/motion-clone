@@ -5445,7 +5445,24 @@ def run_motion(job):
 
     # ALD 05/07/2026 - faceLock (opt-in faceLock=1 / env MOTION_FACELOCK_DEFAULT=1): khóa identity mặt về ảnh
     # mẫu bằng inswapper. Sau grade/audio, TRƯỚC RIFE/upload. Giữ audio (mux lại bên trong). Tắt/chưa cài = no-op.
-    out_mp4 = _apply_face_lock(out_mp4, ref_local, tmp, params, job_id)
+    # faceLockRef (27/09/2026): which face the swap puts back. "ref" (default) is the image Wan
+    # animated, which on camera-motion is the try-on output. "character" is the original model
+    # photo, sent as the extra input faceRef. Measured with ArcFace on batch 2026-09-27-1133: the
+    # qwen-max try-on keeps only 0.59-0.65 of the character's identity, so swapping back to it
+    # locks the video onto a face that has already drifted, and the driver's features show
+    # through wherever the swap is weakest (a smile, a turned head).
+    _fl_ref = ref_local
+    if str(params.get("faceLockRef", "ref")).strip().lower() == "character":
+        _face_key = inputs.get("faceRef")
+        if not _face_key:
+            api_log(job_id, "faceLockRef=character but the job has no faceRef input — swapping to ref", "warn")
+        else:
+            try:
+                _fl_ref = api_download(_face_key, os.path.join(
+                    tmp, "face_ref" + (os.path.splitext(_face_key)[1] or ".png")))
+            except Exception as e:
+                api_log(job_id, f"faceRef download failed (swapping to ref instead): {e}", "warn")
+    out_mp4 = _apply_face_lock(out_mp4, _fl_ref, tmp, params, job_id)
     # 18/09/2026 - optional CodeFormer pass right after the swap, to fix the flatter/waxier face inswapper_128
     # leaves behind. Opt-in, tested (fidelity 0.5 = acceptable trade-off, see _apply_facelock_restore
     # above). No-op unless params.faceLockRestore=1 (needs faceLock=1 too, since it restores the swap's

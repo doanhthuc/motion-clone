@@ -51,6 +51,10 @@
       }
     },
     "allowed": {
+      "faceLockRef": [
+        "ref",
+        "character"
+      ],
       "quality": [
         "540p",
         "720p"

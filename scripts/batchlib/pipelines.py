@@ -86,7 +86,9 @@ STAGES: dict[str, Stage] = {
     ),
     "camera-motion": Stage(
         name="camera-motion", job_type="motion", param_type="motion",
-        inputs={"ref": "prev", "motion": "material:driver"},
+        # faceRef: the original character photo, for faceLockRef: character (the swap puts that
+        # face back instead of the try-on's). Sent on every run so an A/B needs only the param.
+        inputs={"ref": "prev", "motion": "material:driver", "faceRef": "material:character"},
         output_ext=".mp4", min_bytes=100_000, timeout_min=60,
         # faceLock: this stage follows the driver harder than plain motion (pose 0.9, CLIP 1.2)
         # and Wan feeds it the driver's face crop every frame, so the face drifts off the
@@ -134,11 +136,22 @@ STAGES: dict[str, Stage] = {
         # centre measured by hand at (272,289). Scale 2.5 got closer to Wan still (3.311) but
         # reaches the chin and philtrum, so it stays a diagnostic, not a candidate. Reviewed on
         # video by doanhthuc, who picked 1.3 over 1.0.
+        #
+        # faceLockRef: "character" swaps back to the original model photo (input faceRef) instead
+        # of the try-on image Wan animated. Measured 27/09/2026 with ArcFace on the three vast
+        # videos of batch 2026-09-27-1133: the qwen-max try-on keeps only 0.59-0.65 of the
+        # character's identity, so locking onto it locked onto a face that had already drifted.
+        # Re-swapping those renders onto the character photo lowered the share of frames where
+        # the face reads closer to the driver from 5/5/25% to 0/0/5%. The similarity to the
+        # character rose from 0.49-0.54 to 0.63-0.68, but that rise is partly circular, because
+        # inswapper is conditioned on the same embedding. doanhthuc reviewed the three videos side
+        # by side and judged them better. "ref" brings back the old behaviour for an A/B.
         defaults={"bodyProportionLock": False, "poseStrength": 0.9,
                   "clipStrength": 1.2, "naturalNails": True,
                   "removeWristAccessories": True, "faceLock": 1,
                   "faceLockRestore": 0, "faceLockBlend": 1.0,
-                  "faceLockDetailKeep": 2.0, "faceLockMouthKeep": 1.3},
+                  "faceLockDetailKeep": 2.0, "faceLockMouthKeep": 1.3,
+                  "faceLockRef": "character"},
         locked_params={"cameraAwareMotion": True, "fitDriver": True},
     ),
 }

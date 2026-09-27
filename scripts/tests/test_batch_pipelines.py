@@ -35,6 +35,19 @@ class TestKhaiBao(unittest.TestCase):
         self.assertTrue(got["fitDriver"])
         self.assertTrue(got["cameraAwareMotion"])
 
+    def test_camera_motion_sends_the_original_character_for_the_face_lock(self):
+        # faceLockRef: character swaps back to this photo instead of the try-on output, which
+        # keeps only 0.59-0.65 of the character's ArcFace identity (batch 2026-09-27-1133).
+        self.assertEqual(STAGES["camera-motion"].inputs["faceRef"], "material:character")
+        # Default since 27/09/2026 (reviewed on video); "ref" stays available for an A/B.
+        self.assertEqual(effective_stage_params("camera-motion", {})["faceLockRef"], "character")
+        self.assertEqual(
+            effective_stage_params("camera-motion", {"faceLockRef": "ref"})["faceLockRef"], "ref")
+        self.assertEqual(STAGES["camera-motion"].inputs["ref"], "prev")
+        # No new material: the camera pipeline already requires the character.
+        self.assertEqual(required_roles("tryon-camera-motion-enhance"),
+                         {"character", "outfit", "driver"})
+
     def test_camera_motion_face_lock_is_a_default_not_a_lock(self):
         # Default on: the face drifts toward the driver without it (A/B 18/09/2026).
         self.assertEqual(effective_stage_params("camera-motion", {})["faceLock"], 1)
