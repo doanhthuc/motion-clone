@@ -91,7 +91,7 @@ public final class StudioStore {
         do {
             project = try await client.get(StudioProjectResponse.self, "v1", "studio", "projects", id).project
             startPolling()
-        } catch let error as APIError where error.isNotFound {
+        } catch where error.isNotFound {
             // Deleted from another device (or the sidebar list was stale):
             // drop it instead of leaving a dead project open.
             if project?.id == id { close() }
