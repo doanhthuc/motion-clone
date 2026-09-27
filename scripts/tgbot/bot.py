@@ -7321,6 +7321,43 @@ class AppRuns:
         self.idem.finish("phase-a", key, *response)
         return response
 
+    def _stopped_run(self) -> tuple["Manifest", list] | None:
+        """(manifest, its unfinished runs) when the app's Confirm means
+        "Continue batch": the manifest on disk stopped with work left, and the
+        draft holds no job to confirm instead. None otherwise.
+
+        Without this, Continue batch could only ever resume through the
+        post-Phase-A branch, whose `_PHASE_A_OFFERED` token lives in memory
+        and is popped by the very confirm that started the drain — and whose
+        draft comparison fails once that confirm has cleared the draft. So
+        after any drain that stopped (a pod that never took SSH, a kill), the
+        panel quoted the empty draft: "0 jobs", no Vast quote, "Nothing can be
+        rented right now" (2026-09-27, tg-1959705051 after a killed vast pod).
+
+        The gates are `_do_resume`'s own, plus the two that make "continue"
+        mean something: at least one run not done (else a pod would be rented
+        to do nothing — `resume`'s provision-failure gate exists for the same
+        reason), and an empty draft (a job in the draft is a new confirm, not
+        this). `_do_resume` itself still refuses a busy manifest and one that
+        never started; the confirm stamp is checked by the caller.
+        """
+        if self.drafts.runnable()[0]:
+            return None
+        manifest_path = _job_manifest_path(self.chat_id)
+        if busy(manifest_path):
+            return None
+        state = load_state(state_path_for(manifest_path))
+        if not state.get("batch"):
+            return None
+        try:
+            manifest = load_manifest(manifest_path)
+        except (ManifestError, OSError):
+            return None
+        journal = state.get("runs") or {}
+        left = [run for run in manifest.runs
+                if (journal.get(run.id) or {}).get("status") != "done"]
+        return (manifest, left) if left else None
+
     def confirm(self, run_id: str, body: dict, key) -> tuple[int, dict]:
         # {id} must be the live slot's id (spec §5.8) — checked before the
         # idempotency store ever sees this key, so a wrong id costs nothing.
@@ -7361,7 +7398,16 @@ class AppRuns:
                     self.drafts.clear()
             else:
                 jobs, refusal = self._draft_jobs()
-                if refusal is not None:
+                stopped = self._stopped_run() if refusal is not None else None
+                if stopped is not None:
+                    # Continue batch: re-rent the stopped manifest, the same
+                    # way `resume` does, behind the same draft-moved latch.
+                    stale = _resume_generation_refusal(self.chat_id, self.drafts)
+                    out = (Outcome(False, "stale_run", stale) if stale is not None
+                           else _do_resume(_AppTg(self.tg), self.chat_id,
+                                           _job_manifest_path(self.chat_id),
+                                           dry_run=False, gpu_provider=provider))
+                elif refusal is not None:
                     out = refusal
                 else:
                     out = _do_confirm(_AppTg(self.tg), self.chat_id, dry_run=False,
@@ -7465,13 +7511,20 @@ class AppRuns:
                 # None, never [] — _draft_jobs() only ever returns a
                 # non-empty list or None (nothing to run / not validated).
                 app_jobs, _refusal = self._draft_jobs()
-                # jobs=None here would make _draft_manifest fall back to the
-                # TELEGRAM chat's own queued jobs (its own default), leaking
-                # the Telegram user's draft into the app's rent panel — so
-                # the manifest is only built from a real, non-empty list.
-                manifest = _draft_manifest(self.chat_id, jobs=app_jobs) if app_jobs else None
-                jobs = len(app_jobs) if app_jobs else 0
-                estimate_min = sum(estimate_minutes(j) for j in app_jobs) if app_jobs else 0
+                stopped = None if app_jobs else self._stopped_run()
+                if stopped is not None:
+                    # Continue batch: quote what `confirm` will re-rent — the
+                    # stopped manifest, priced for the runs it has left.
+                    manifest, left = stopped
+                    jobs, estimate_min = len(left), sum(estimate_minutes(r) for r in left)
+                else:
+                    # jobs=None here would make _draft_manifest fall back to the
+                    # TELEGRAM chat's own queued jobs (its own default), leaking
+                    # the Telegram user's draft into the app's rent panel — so
+                    # the manifest is only built from a real, non-empty list.
+                    manifest = _draft_manifest(self.chat_id, jobs=app_jobs) if app_jobs else None
+                    jobs = len(app_jobs) if app_jobs else 0
+                    estimate_min = sum(estimate_minutes(j) for j in app_jobs) if app_jobs else 0
         data = _rent_panel_data(self.chat_id, force=force, manifest=manifest)
         data.update(run_id=self.run_id, panel_token=token, after_phase_a=after_phase_a,
                     jobs=jobs, estimate_min=estimate_min)
