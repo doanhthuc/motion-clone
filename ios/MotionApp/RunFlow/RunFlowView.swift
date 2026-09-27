@@ -22,11 +22,18 @@ struct RunFlowView: View {
                     TryonCarousel(flow: flow)
                 }
                 .background(Theme.bg)
+            } else if flow.phase == .compose, let draftStore = model.draft,
+                      let materials = model.materials, let library = model.tryonLibrary {
+                RunComposeView(flow: flow, draftStore: draftStore, materials: materials,
+                               library: library) {
+                    if hasNotices { VStack(spacing: 8) { notices } }
+                }
             } else {
                 List {
                     if hasNotices { Section { notices } }
                     content
                 }
+                .safeAreaInset(edge: .bottom) { actionBar }
             }
         }
         .navigationTitle(showsCarousel ? "Try-on" : "Run")
@@ -75,7 +82,7 @@ struct RunFlowView: View {
                 LoadingBlock().listRowBackground(Color.clear)
             }
         case .compose:
-            compose
+            EmptyView()   // `RunComposeView`, outside the List
         case .phaseARunning, .previews:
             EmptyView()   // `TryonCarousel`, outside the List
         case .rentPanel:
@@ -95,21 +102,6 @@ struct RunFlowView: View {
                 }
             } header: {
                 Text("Try-on already ran")
-            }
-            // Both buttons rent a pod (a `confirm` with reuse/rerun try-on) —
-            // the label and the quote say so, so a tap here is never a
-            // surprise spend of a different kind than Confirm on the rent panel.
-            Section {
-                Button(price.map { "Reuse try-on & rent · ~\(Format.usd($0))" } ?? "Reuse try-on & rent") {
-                    Task { await flow.choose(.reuse) }
-                }
-                .buttonStyle(PrimaryButtonStyle()).disabled(!flow.canSpend || price == nil)
-                .buttonRow()
-                Button(price.map { "Re-run try-on & rent · ~\(Format.usd($0))" } ?? "Re-run try-on & rent") {
-                    Task { await flow.choose(.rerun) }
-                }
-                .buttonStyle(SecondaryButtonStyle()).disabled(!flow.canSpend || price == nil)
-                .buttonRow()
             }
         case let .started(runID):
             Section {
@@ -131,31 +123,27 @@ struct RunFlowView: View {
 
     @Environment(AppModel.self) private var model
 
-    @ViewBuilder private var compose: some View {
-        let jobs = flow.draft?.jobs ?? 0
-        Section("Next step") {
-            Text("\(jobs) job\(jobs == 1 ? "" : "s") in the draft.")
-        }
-        Section {
-            if flow.hasLocalTryon {
-                Button("Preview try-on") { Task { await flow.startPhaseA() } }
-                    .buttonStyle(PrimaryButtonStyle())
-                    .accessibilityIdentifier("runflow.previewTryon")
-                    .disabled(!flow.canSpend)
-                    .buttonRow()
+    @ViewBuilder private var actionBar: some View {
+        switch flow.phase {
+        case .rentPanel where flow.panel != nil:
+            RunActionBar { RentConfirmBar(flow: flow) }
+        case let .choiceRequired(_, provider):
+            let price = flow.quote(for: provider)
+            // Both buttons rent a pod (a `confirm` with reuse/rerun try-on) —
+            // the label and the quote say so, so a tap here is never a
+            // surprise spend of a different kind than Confirm on the rent panel.
+            RunActionBar {
+                Button(price.map { "Reuse try-on & rent · ~\(Format.usd($0))" } ?? "Reuse try-on & rent") {
+                    Task { await flow.choose(.reuse) }
+                }
+                .buttonStyle(PrimaryButtonStyle()).disabled(!flow.canSpend || price == nil)
+                Button(price.map { "Re-run try-on & rent · ~\(Format.usd($0))" } ?? "Re-run try-on & rent") {
+                    Task { await flow.choose(.rerun) }
+                }
+                .buttonStyle(SecondaryButtonStyle()).disabled(!flow.canSpend || price == nil)
             }
-            Button("Rent without preview") { Task { await flow.continueToRent() } }
-                .buttonStyle(flow.hasLocalTryon ? AnyButtonStyle(SecondaryButtonStyle()) : AnyButtonStyle(PrimaryButtonStyle()))
-                .accessibilityIdentifier("runflow.rentWithoutPreview")
-                .disabled(flow.isSpending)
-                .buttonRow()
-            if !(flow.tryon?.previews.isEmpty ?? true) {
-                Button("View last previews") { Task { await flow.start(.existing) } }
-                    .buttonStyle(SecondaryButtonStyle())
-                    .buttonRow()
-            }
-        } footer: {
-            if flow.hasLocalTryon { Text("Preview spends Gemini/Qwen quota — no pod is rented.") }
+        default:
+            EmptyView()
         }
     }
 }

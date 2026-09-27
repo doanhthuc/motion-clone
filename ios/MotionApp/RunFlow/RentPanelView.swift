@@ -34,36 +34,6 @@ struct RentPanelView: View {
                         .accessibilityIdentifier("runflow.migrate")
                     }
                 }
-                Section {
-                    if let price = flow.quote(for: flow.selectedProvider) {
-                        // Shown but disabled while any spend is unanswered, so the
-                        // price stays visible next to "Check again".
-                        Button {
-                            Task { await flow.confirm() }
-                        } label: {
-                            Text("Confirm · ~\(Format.usd(price)) quote").monospacedDigit()
-                        }
-                        .buttonStyle(PrimaryButtonStyle())
-                        .disabled(!flow.canConfirm(flow.selectedProvider))
-                        .accessibilityIdentifier("runflow.confirm")
-                        .buttonRow()
-                    } else if flow.quote(for: .runpod) == nil && flow.quote(for: .vast) == nil {
-                        Label("Nothing can be rented right now.", systemImage: "xmark.octagon")
-                            .font(.headline).foregroundStyle(Theme.danger)
-                            .accessibilityIdentifier("runflow.soldOut")
-                    }
-                    if flow.isSpending {
-                        HStack(spacing: 10) {
-                            ProgressView()
-                            Text(flow.inFlightLabel ?? "").font(.subheadline).foregroundStyle(Theme.secondary)
-                        }
-                    }
-                } footer: {
-                    if flow.quote(for: flow.selectedProvider) != nil {
-                        Text("A quote from the estimate, not the invoice.")
-                            .accessibilityIdentifier("runflow.quote")
-                    }
-                }
             } else if flow.isLoadingPanel {
                 LoadingBlock(title: "Reading stock and prices…")
                     .listRowBackground(Color.clear)
@@ -130,5 +100,38 @@ struct RentPanelView: View {
         }
         .disabled(!enabled || flow.isSpending)
         .accessibilityAddTraits(selected && enabled ? .isSelected : [])
+    }
+}
+
+/// Confirm and what gates it, in the run flow's bottom bar.
+struct RentConfirmBar: View {
+    let flow: RunFlow
+
+    var body: some View {
+        if flow.isSpending {
+            HStack(spacing: 10) {
+                ProgressView()
+                Text(flow.inFlightLabel ?? "").font(.subheadline).foregroundStyle(Theme.secondary)
+            }
+        }
+        if let price = flow.quote(for: flow.selectedProvider) {
+            Text("A quote from the estimate, not the invoice.")
+                .font(.footnote).foregroundStyle(Theme.secondary)
+                .accessibilityIdentifier("runflow.quote")
+            // Shown but disabled while any spend is unanswered, so the
+            // price stays visible next to "Check again".
+            Button {
+                Task { await flow.confirm() }
+            } label: {
+                Text("Confirm · ~\(Format.usd(price)) quote").monospacedDigit()
+            }
+            .buttonStyle(PrimaryButtonStyle())
+            .disabled(!flow.canConfirm(flow.selectedProvider))
+            .accessibilityIdentifier("runflow.confirm")
+        } else if flow.quote(for: .runpod) == nil && flow.quote(for: .vast) == nil {
+            Label("Nothing can be rented right now.", systemImage: "xmark.octagon")
+                .font(.headline).foregroundStyle(Theme.danger)
+                .accessibilityIdentifier("runflow.soldOut")
+        }
     }
 }
