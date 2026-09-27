@@ -155,7 +155,8 @@ def provision(*, ceiling_min: int, manifest_path: Path, manifest: Manifest) -> s
             gpu=env_get(ROOT / ".env", "GPU"),
             datacenter=volume_datacenter(env_get(ROOT / ".env", "POD_VOLUME_ID")),
             stock_out=_STOCK_OUT_MARKER in result.stderr,
-            detail=result.stderr.strip()))
+            detail=result.stderr.strip(),
+            provider=effective_provider()))
         raise subprocess.CalledProcessError(result.returncode, result.args,
                                             stderr=result.stderr)
     clear_provision_failure(failure_path)

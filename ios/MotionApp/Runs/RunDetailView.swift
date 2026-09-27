@@ -454,14 +454,15 @@ private struct RetryRentalCard: View {
     @State private var confirmingAutoResume = false
 
     var body: some View {
-        // The label names the card `retryRental()` actually sends
-        // (`pod.gpu`, the current .env card), not the one that failed.
-        let gpu = flow.pod?.gpu ?? failure.gpu
+        // The label names what `retryRental()` actually sends: the failed
+        // cloud, and on RunPod the current .env card, not the one that failed.
+        let isVast = failure.spendProvider == .vast
+        let gpu = flow.retryTarget?.name ?? flow.pod?.gpu ?? failure.gpu
         VStack(alignment: .leading, spacing: 10) {
             Label("Rental failed", systemImage: "exclamationmark.triangle.fill")
                 .font(.headline).foregroundStyle(Theme.danger)
             Text(failure.detail).font(.subheadline)
-            if failure.gpu != gpu {
+            if !isVast, failure.gpu != gpu {
                 Text("Last failure was on \(failure.gpu); this retries on \(gpu).")
                     .font(.footnote).foregroundStyle(Theme.secondary)
             }
@@ -481,7 +482,8 @@ private struct RetryRentalCard: View {
             // (pod-provision.sh can only try there).
             // Hidden while the server lacks /v1/gpu/subs (a pre-deploy bot,
             // 2026-09-27): the button could only 404.
-            if failure.stockOut, let dc = failure.datacenter, let subs = model.gpuSubs, !subs.unsupported,
+            // RunPod only: a stock subscription watches the volume's datacenter.
+            if !isVast, failure.stockOut, let dc = failure.datacenter, let subs = model.gpuSubs, !subs.unsupported,
                let runID = flow.runID {
                 let armedSub = subs.armed.flatMap { $0.gpu == failure.gpu && $0.datacenter == dc ? $0 : nil }
                 let name = armedSub?.name ?? displayName(failure.gpu)

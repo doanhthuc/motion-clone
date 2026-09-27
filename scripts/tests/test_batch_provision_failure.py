@@ -29,6 +29,18 @@ class TestWriteReadRoundTrip(unittest.TestCase):
                                           datacenter="EU-RO-1", stock_out=True,
                                           detail="het may"))
 
+    def test_the_provider_round_trips(self):
+        path = Path(tempfile.mkdtemp()) / "tg-1.provision-failed.json"
+        write_provision_failure(path, ProvisionFailure(
+            gpu="x", datacenter=None, stock_out=False, detail="", provider="vast"))
+        self.assertEqual(read_provision_failure(path).provider, "vast")
+
+    def test_a_file_from_before_the_provider_field_reads_as_runpod(self):
+        path = Path(tempfile.mkdtemp()) / "tg-1.provision-failed.json"
+        path.write_text('{"gpu": "x", "datacenter": null, "stock_out": false, "detail": ""}',
+                        encoding="utf-8")
+        self.assertEqual(read_provision_failure(path).provider, "runpod")
+
     def test_datacenter_can_be_none(self):
         path = Path(tempfile.mkdtemp()) / "tg-1.provision-failed.json"
         write_provision_failure(path, ProvisionFailure(

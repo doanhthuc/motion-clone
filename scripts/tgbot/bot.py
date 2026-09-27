@@ -8121,7 +8121,8 @@ class AppPod:
                 "gpu": _plain(failure.gpu),
                 "datacenter": _plain(failure.datacenter) if failure.datacenter else None,
                 "stock_out": failure.stock_out,
-                "detail": _plain(failure.detail)},
+                "detail": _plain(failure.detail),
+                "provider": failure.provider},
         }
         return 200, body
 

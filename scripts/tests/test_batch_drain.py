@@ -145,7 +145,8 @@ class TestProvision(unittest.TestCase):
              mock.patch.object(drain, "env_get",
                                side_effect=lambda path, key: {
                                    "POD_MAX_HOURS": "8", "GPU": "NVIDIA GeForce RTX 5090",
-                                   "POD_VOLUME_ID": "u469c9efga"}[key]), \
+                                   "POD_VOLUME_ID": "u469c9efga",
+                                   "GPU_PROVIDER": "runpod"}[key]), \
              mock.patch.object(drain, "volume_datacenter", return_value="EU-RO-1"):
             mock_run.return_value = mock.Mock(returncode=1, stderr=stderr)
             with self.assertRaises(drain.subprocess.CalledProcessError):
@@ -164,7 +165,8 @@ class TestProvision(unittest.TestCase):
              mock.patch.object(drain, "env_get",
                                side_effect=lambda path, key: {
                                    "POD_MAX_HOURS": "8", "GPU": "NVIDIA GeForce RTX 5090",
-                                   "POD_VOLUME_ID": "u469c9efga"}[key]), \
+                                   "POD_VOLUME_ID": "u469c9efga",
+                                   "GPU_PROVIDER": "runpod"}[key]), \
              mock.patch.object(drain, "volume_datacenter", return_value="EU-RO-1"):
             mock_run.return_value = mock.Mock(returncode=1, stderr=stderr)
             with self.assertRaises(drain.subprocess.CalledProcessError):
@@ -174,6 +176,25 @@ class TestProvision(unittest.TestCase):
         self.assertIsNotNone(failure)
         self.assertFalse(failure.stock_out)
         self.assertIn("some API error", failure.detail)
+        self.assertEqual(failure.provider, "runpod")
+
+    def test_a_vast_failure_records_vast(self):
+        # The app's Retry rental re-rents on the recorded provider; before this
+        # field it always used RunPod, even after a Vast rental failed (2026-09-27).
+        manifest_path = self._manifest_path()
+        with mock.patch.dict(drain.os.environ, {"GPU_PROVIDER": "vast"}), \
+             mock.patch.object(drain.subprocess, "run") as mock_run, \
+             mock.patch.object(drain, "env_get",
+                               side_effect=lambda path, key: {
+                                   "POD_MAX_HOURS": "8", "GPU": "NVIDIA GeForce RTX 5090",
+                                   "POD_VOLUME_ID": "u469c9efga"}[key]), \
+             mock.patch.object(drain, "volume_datacenter", return_value="EU-RO-1"):
+            mock_run.return_value = mock.Mock(returncode=1, stderr="no machine reached running\n")
+            with self.assertRaises(drain.subprocess.CalledProcessError):
+                drain.provision(ceiling_min=120, manifest_path=manifest_path,
+                                manifest=_empty_manifest())
+        self.assertEqual(read_provision_failure(provision_failure_path(manifest_path)).provider,
+                         "vast")
 
     def test_explicit_vast_provider_adds_vast_gb(self):
         m = _manifest_with_a_motion_run()

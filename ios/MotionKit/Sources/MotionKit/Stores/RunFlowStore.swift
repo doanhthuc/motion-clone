@@ -499,12 +499,25 @@ public final class RunFlow {
 
     // MARK: resume
 
+    /// What Retry rental rents on: the failed cloud, and for RunPod the
+    /// current `.env` card (`pod.gpu`), not the one that failed. Vast has no
+    /// card to pin — the server's gpu check is RunPod's.
+    public var retryTarget: (provider: SpendProvider, gpu: String?, name: String)? {
+        guard let failure = pod?.failedRental else { return nil }
+        switch failure.spendProvider {
+        case .vast: return (.vast, nil, "Vast")
+        case .runpod:
+            guard let gpu = pod?.gpu else { return nil }
+            return (.runpod, gpu, gpu)
+        }
+    }
+
     public func retryRental() async {
-        guard canRetryRental, let runID, let gpu = pod?.gpu else { return }
+        guard canRetryRental, let runID, let target = retryTarget else { return }
         await refreshTryon()      // resume needs the CURRENT run_token
         guard let token = tryon?.runToken else { return }
-        await spend(.resume(runID: runID, provider: .runpod, runToken: token, gpu: gpu),
-                    label: "Retry rental · \(gpu)")
+        await spend(.resume(runID: runID, provider: target.provider, runToken: token, gpu: target.gpu),
+                    label: "Retry rental · \(target.name)")
     }
 
     // MARK: recheck and replay
