@@ -45,9 +45,21 @@ extension URLProtocolTests {
         let (store, _) = gpuStore(Routes())
         await store.load()
         #expect(store.stock?.gpus.count == 5)
-        #expect(StubURLProtocol.requests.last?.url?.query == nil)
+        #expect(StubURLProtocol.requests.last?.url?.query == "all=1")
         await store.load(force: true)
-        #expect(StubURLProtocol.requests.last?.url?.query == "force=1")
+        #expect(StubURLProtocol.requests.last?.url?.query == "all=1&force=1")
+    }
+
+    @Test func datacentersDecodeWhenPresent() async {
+        let routes = Routes()
+        routes.stock = TestSupport.json(Fixtures.gpuStock.replacingOccurrences(
+            of: "\"other_regions\"",
+            with: "\"datacenters\": [{\"gpu\": \"NVIDIA GeForce RTX 5090\", \"datacenter\": \"EU-RO-1\", \"stock\": \"none\", \"usd_per_hr\": 0.99}], \"other_regions\""))
+        let (store, _) = gpuStore(routes)
+        await store.load()
+        let rows = store.stock?.datacenters(for: "NVIDIA GeForce RTX 5090") ?? []
+        #expect(rows.map(\.datacenter) == ["EU-RO-1"])
+        #expect(rows.first?.soldOut == true)
     }
 
     @Test func unreachableRunpodctlKeepsTheLastStock() async {

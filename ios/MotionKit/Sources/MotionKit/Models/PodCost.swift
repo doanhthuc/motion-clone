@@ -8,6 +8,13 @@ public struct GpuStock: Decodable, Sendable, Equatable {
     public let homeDatacenter: String?
     public let gpus: [GpuStockRow]
     public let otherRegions: [GpuRegion]
+    /// Every datacenter runpodctl lists per GPU, sold-out ones included —
+    /// only with `?all=1`, which `GpuStore` always asks for.
+    public let datacenters: [GpuDatacenter]?
+
+    public func datacenters(for gpu: String) -> [GpuDatacenter] {
+        (datacenters ?? []).filter { $0.gpu == gpu }
+    }
 
     /// Where a migration can go: every datacenter the stock check lists with
     /// some stock, home excluded, in the server's best-first order. The server
@@ -51,6 +58,15 @@ public struct GpuRegion: Decodable, Sendable, Equatable {
     public let datacenter: String
     public let stock: String
     public let usdPerHr: Double?
+}
+
+public struct GpuDatacenter: Decodable, Sendable, Equatable, Identifiable {
+    public let gpu: String
+    public let datacenter: String
+    public let stock: String
+    public let usdPerHr: Double?
+    public var soldOut: Bool { stock.lowercased() == "none" }
+    public var id: String { "\(gpu)@\(datacenter)" }
 }
 
 public struct MigrationDestination: Sendable, Equatable, Identifiable {
