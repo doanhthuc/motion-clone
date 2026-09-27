@@ -55,6 +55,35 @@ extension URLProtocolTests {
         #expect(reopened.detail?.id == "tg-1000")
     }
 
+    /// Two stores on one run: the Runs card's and the run screen's. The card
+    /// saw the run go live; the screen, holding the older "stopped" copy, sent
+    /// the card's ETag, got 304 and stayed "Stopped" under a live pod
+    /// (2026-09-27). Each store must revalidate its own copy.
+    @Test func aStoreRevalidatesItsOwnCopyNotAnotherStores() async {
+        let live = Counter()
+        StubURLProtocol.install { req in
+            let body = live.value == 0
+                ? Fixtures.runDetail.replacingOccurrences(of: #""status": "running""#, with: #""status": "stopped""#)
+                : Fixtures.runDetail
+            let tag = live.value == 0 ? #""stopped""# : #""running""#
+            return req.value(forHTTPHeaderField: "If-None-Match") == tag
+                ? (304, ["ETag": tag], Data())
+                : TestSupport.json(body, etag: tag)
+        }
+        let client = TestSupport.client()
+        let screen = RunDetailStore(client: client, runID: "tg-1000")
+        await screen.refresh()
+        #expect(screen.detail?.status == .stopped)
+
+        _ = live.increment()   // the drain rents a pod
+        let card = RunDetailStore(client: client, runID: "tg-1000")
+        await card.refresh()
+        #expect(card.detail?.status == .running)
+
+        await screen.refresh()
+        #expect(screen.detail?.status == .running)
+    }
+
     @Test func pollRefreshesUntilCancelled() async {
         StubURLProtocol.install { _ in TestSupport.json(Fixtures.runDetail) }
         let store = RunDetailStore(client: TestSupport.client(), runID: "tg-1000")

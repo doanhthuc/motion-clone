@@ -17,8 +17,6 @@ public struct ByteRangeResponse: Sendable, Equatable {
 public actor APIClient {
     public nonisolated let credentials: Credentials
     private let session: URLSession
-    /// path → last ETag seen. Only `getIfChanged` reads it.
-    private var etags: [String: String] = [:]
 
     public init(credentials: Credentials, session: URLSession = .shared) {
         self.credentials = credentials
@@ -51,20 +49,20 @@ public actor APIClient {
         return try decode(type, data)
     }
 
-    /// nil means 304 Not Modified — keep what you have. The ETag cache is
-    /// per client, not per caller, so a caller holding nothing yet must pass
-    /// `haveCopy: false`, or a 304 answers it with nothing to keep.
+    /// nil means 304 Not Modified — keep what you have. The caller passes the
+    /// ETag of the copy it holds and keeps the one returned with a fresh copy.
+    /// This used to be a cache per client keyed by URL, while each store kept
+    /// its own copy: the Runs card refreshed to "running" and stored that ETag,
+    /// then the run screen's store — still holding "stopped" — sent it and got
+    /// 304 on every poll, stuck on "Stopped" under a live pod (2026-09-27).
     public func getIfChanged<T: Decodable & Sendable>(
-        _ type: T.Type, haveCopy: Bool = true, _ components: String...
-    ) async throws(APIError) -> T? {
-        let target = url(components)
-        let key = target.absoluteString
+        _ type: T.Type, etag: String?, _ components: String...
+    ) async throws(APIError) -> (value: T, etag: String?)? {
         var headers: [String: String] = [:]
-        if haveCopy, let etag = etags[key] { headers["If-None-Match"] = etag }
-        let (data, response) = try await send(target, extraHeaders: headers, okStatuses: [200, 304])
+        if let etag { headers["If-None-Match"] = etag }
+        let (data, response) = try await send(url(components), extraHeaders: headers, okStatuses: [200, 304])
         if response.statusCode == 304 { return nil }
-        if let etag = response.value(forHTTPHeaderField: "ETag") { etags[key] = etag }
-        return try decode(type, data)
+        return (try decode(type, data), response.value(forHTTPHeaderField: "ETag"))
     }
 
     public func health() async throws(APIError) -> Duration {

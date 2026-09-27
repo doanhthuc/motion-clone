@@ -12,6 +12,8 @@ public final class RunDetailStore {
     /// "loaded" flag set before the answer came made the second one give up.
     private var tryonLoad: Task<TryonPreviews?, Never>?
     private var tryonImages: [String: Data] = [:]
+    /// The ETag of `detail` — this copy's, never another store's.
+    private var etag: String?
 
     public init(client: APIClient, runID: String) {
         self.client = client
@@ -23,12 +25,13 @@ public final class RunDetailStore {
     public func refresh() async {
         do {
             // nil = 304: the run did not change since the last poll.
-            if let fresh = try await client.getIfChanged(RunDetail.self, haveCopy: detail != nil,
-                                                           "v1", "runs", runID) {
+            if let (fresh, tag) = try await client.getIfChanged(
+                RunDetail.self, etag: detail == nil ? nil : etag, "v1", "runs", runID) {
                 // The run changed, and a try-on regenerate is one such change:
                 // read the previews again next time a page asks.
                 if fresh.updatedAt != detail?.updatedAt { tryonLoad = nil }
                 detail = fresh
+                etag = tag
             }
             error = nil
             lastSuccess = .now
