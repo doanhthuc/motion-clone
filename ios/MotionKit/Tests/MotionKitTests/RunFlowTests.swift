@@ -980,6 +980,22 @@ extension URLProtocolTests {
         #expect(await gate.labels == ["Retry rental · NVIDIA RTX PRO 4500 Blackwell"])
     }
 
+    /// A failed Vast rental retries on Vast. It was hard-coded to RunPod, so
+    /// the retry re-rented on the cloud that had not failed (2026-09-27).
+    @Test func retryRentalRetriesOnTheCloudThatFailed() async {
+        let routes = Routes()
+        routes.pod = Fixtures.podIdle.replacingOccurrences(
+            of: #""datacenter": "EU-RO-1","#, with: #""datacenter": null, "provider": "vast","#)
+        let gate = FakeSpendGate([.accepted(runID: "tg-1000", outcome: "started")])
+        let flow = make(routes, gate: gate)
+        await flow.start(.existing)
+        #expect(flow.pod?.failedRental?.spendProvider == .vast)
+        await flow.retryRental()
+        #expect(await gate.intents == [.resume(runID: "tg-1000", provider: .vast,
+                                               runToken: "1790000000123.4", gpu: nil)])
+        #expect(await gate.labels == ["Retry rental · Vast"])
+    }
+
     /// `stale_panel` on resume is the server's gpu-mismatch answer: the card
     /// moved again, so the pod is re-read and the button names the new one.
     @Test func stalePanelOnResumeRereadsThePod() async {

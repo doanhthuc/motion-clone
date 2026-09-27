@@ -1052,7 +1052,7 @@ class TestPodState(_PodFixture):
             "started_at": 1_800_000_600.0, "bytes_copied": 40, "total_bytes": 100})
         self.assertEqual(body["failed_rental"], {
             "gpu": P5090, "datacenter": "EU-RO-1", "stock_out": True,
-            "detail": "no instances"})
+            "detail": "no instances", "provider": "runpod"})
         self.assertEqual(body["last_kill"],
                          {"at": 1.0, "ok": True, "code": "killed", "message": "done"})
 

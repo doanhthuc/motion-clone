@@ -21,6 +21,13 @@ public struct FailedRental: Decodable, Sendable, Equatable {
     public let datacenter: String?
     public let stockOut: Bool
     public let detail: String
+    /// The cloud the failed rental was on (additive; null from an older bot,
+    /// which only ever recorded RunPod failures the app could act on).
+    public let provider: String?
+
+    /// Where Retry rental re-rents: the cloud that failed, not always RunPod —
+    /// it used to be hard-coded, so a failed Vast rental retried on RunPod.
+    public var spendProvider: SpendProvider { provider == "vast" ? .vast : .runpod }
 }
 
 /// `GET /v1/pod`'s `migration` (bot.py `AppPod._migration_state`), read from
