@@ -11,7 +11,14 @@ public final class GpuSubsStore {
     public private(set) var error: APIError?
     /// "gpu|datacenter" keys with a request in flight.
     public private(set) var inFlight: Set<String> = []
-    public private(set) var message: String?
+    /// Refusals keyed "gpu|datacenter" (2026-09-27): the GPU sheet and a
+    /// run's retry card each show their own pair, and one surface must never
+    /// show the other's error.
+    private var messages: [String: String] = [:]
+    /// The server answered 404 on `GET /v1/gpu/subs`: a bot deployed before
+    /// the routes existed. The app hides the bell, bolt and "Resume when in
+    /// stock" rather than offer buttons that can only fail (2026-09-27).
+    public private(set) var unsupported = false
     private var lastSeen: Double
 
     private let client: APIClient
@@ -30,10 +37,14 @@ public final class GpuSubsStore {
             subs = fresh.subs
             fired = fresh.fired
             error = nil
+            unsupported = false
             // First read on this install: what already fired is history, not news.
             if lastSeen < 0 { markSeen() }
         } catch {
             self.error = error
+            // Only a 404 is "route missing"; offline or a 5xx leaves the
+            // last answer standing.
+            if error.isNotFound { unsupported = true }
         }
     }
 
@@ -55,14 +66,22 @@ public final class GpuSubsStore {
         defaults.set(lastSeen, forKey: Self.seenKey)
     }
 
-    public func dismissMessage() { message = nil }
+    private static func key(_ gpu: String, _ datacenter: String) -> String { "\(gpu)|\(datacenter)" }
+
+    public func message(gpu: String, datacenter: String) -> String? {
+        messages[Self.key(gpu, datacenter)]
+    }
+
+    public func dismissMessage(gpu: String, datacenter: String) {
+        messages[Self.key(gpu, datacenter)] = nil
+    }
 
     /// Subscribes (or re-subscribes) the pair. With a run id it also arms
     /// auto-resume, which the server refuses outside home or without a
-    /// stock-out; the refusal is shown as `message`.
+    /// stock-out; the refusal is kept under the pair's `message(gpu:datacenter:)`.
     @discardableResult
     public func watch(gpu: String, datacenter: String, autoResumeRunID: String?) async -> Bool {
-        let key = "\(gpu)|\(datacenter)"
+        let key = Self.key(gpu, datacenter)
         guard !inFlight.contains(key) else { return false }
         inFlight.insert(key)
         defer { inFlight.remove(key) }
@@ -72,26 +91,26 @@ public final class GpuSubsStore {
                 body: GpuSubRequest(gpu: gpu, datacenter: datacenter,
                                     autoResume: autoResumeRunID != nil, runId: autoResumeRunID),
                 "v1", "gpu", "subs")
-            message = nil
+            messages[key] = nil
             // Arming moves the bolt off any other sub; re-read rather than guess.
             await load()
             return true
         } catch {
-            message = error.userMessage
+            messages[key] = error.userMessage
             return false
         }
     }
 
     public func unwatch(_ sub: GpuSub) async {
-        let key = "\(sub.gpu)|\(sub.datacenter)"
+        let key = Self.key(sub.gpu, sub.datacenter)
         guard !inFlight.contains(key) else { return }
         inFlight.insert(key)
         defer { inFlight.remove(key) }
         do {
             subs = try await client.delete(GpuSubsRemaining.self, "v1", "gpu", "subs", sub.id).subs
-            message = nil
+            messages[key] = nil
         } catch {
-            message = error.userMessage
+            messages[key] = error.userMessage
         }
     }
 }

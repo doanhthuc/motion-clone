@@ -16,14 +16,22 @@ extension URLProtocolTests {
     final class Routes: @unchecked Sendable {
         private let lock = NSLock()
         private var _listing = GpuSubsStoreTests.listing
+        private var _listingStatus = 200
         private var _post = TestSupport.json(#"{"sub": {"id": "new001", "gpu": "NVIDIA GeForce RTX 5090", "name": "RTX 5090", "datacenter": "EU-CZ-1", "created_at": 2.0, "auto_resume": null}}"#, status: 201)
         var listing: String { get { lock.withLock { _listing } } set { lock.withLock { _listing = newValue } } }
+        var listingStatus: Int { get { lock.withLock { _listingStatus } } set { lock.withLock { _listingStatus = newValue } } }
         var post: (Int, [String: String], Data) { get { lock.withLock { _post } } set { lock.withLock { _post = newValue } } }
         func answer(_ request: URLRequest) -> (Int, [String: String], Data) {
             switch (request.httpMethod ?? "GET", request.url?.path ?? "") {
-            case ("GET", "/v1/gpu/subs"): return TestSupport.json(listing)
+            case ("GET", "/v1/gpu/subs"):
+                // A pre-deploy server answers its generic JSON 404 here.
+                return listingStatus == 404
+                    ? TestSupport.json(#"{"error": {"code": "not_found", "message": "no such route"}}"#, status: 404)
+                    : TestSupport.json(listing)
             case ("POST", "/v1/gpu/subs"): return post
             case ("DELETE", "/v1/gpu/subs/abc123"): return TestSupport.json(#"{"subs": []}"#)
+            case ("DELETE", "/v1/gpu/subs/gone01"):
+                return TestSupport.json(#"{"error": {"code": "busy", "message": "try again in a moment"}}"#, status: 409)
             default: return (404, [:], Data())
             }
         }
@@ -104,8 +112,67 @@ extension URLProtocolTests {
         let (store, _) = store(routes)
         let ok = await store.watch(gpu: "NVIDIA GeForce RTX 5090", datacenter: "EU-CZ-1", autoResumeRunID: "tg-1")
         #expect(!ok)
-        #expect(store.message?.contains("home datacenter") == true)
+        #expect(store.message(gpu: "NVIDIA GeForce RTX 5090", datacenter: "EU-CZ-1")?.contains("home datacenter") == true)
         #expect(store.inFlight.isEmpty)
+    }
+
+    @Test func messagesStayWithTheirOwnPair() async {
+        // The GPU sheet and the run's retry card each show one pair; neither
+        // may show the other's refusal (follow-up, 2026-09-27).
+        let routes = Routes()
+        routes.post = TestSupport.json(#"{"error": {"code": "not_home_dc", "message": "auto-resume only rents in the volume's home datacenter"}}"#, status: 409)
+        let (store, _) = store(routes)
+        await store.load()
+        _ = await store.watch(gpu: "NVIDIA GeForce RTX 5090", datacenter: "EU-CZ-1", autoResumeRunID: "tg-1")
+        #expect(store.message(gpu: "NVIDIA GeForce RTX 5090", datacenter: "EU-CZ-1") != nil)
+        #expect(store.message(gpu: "NVIDIA GeForce RTX 5090", datacenter: "EU-RO-1") == nil)
+        #expect(store.message(gpu: "NVIDIA GeForce RTX 4090", datacenter: "EU-CZ-1") == nil)
+
+        let gone = GpuSub(id: "gone01", gpu: "NVIDIA GeForce RTX 4090", name: "RTX 4090",
+                          datacenter: "EU-RO-1", createdAt: 1, autoResume: nil)
+        await store.unwatch(gone)
+        #expect(store.message(gpu: "NVIDIA GeForce RTX 4090", datacenter: "EU-RO-1")?.contains("try again") == true)
+
+        store.dismissMessage(gpu: "NVIDIA GeForce RTX 5090", datacenter: "EU-CZ-1")
+        #expect(store.message(gpu: "NVIDIA GeForce RTX 5090", datacenter: "EU-CZ-1") == nil)
+        #expect(store.message(gpu: "NVIDIA GeForce RTX 4090", datacenter: "EU-RO-1") != nil)
+    }
+
+    @Test func aSuccessfulWatchClearsOnlyItsOwnMessage() async {
+        let routes = Routes()
+        routes.post = TestSupport.json(#"{"error": {"code": "not_home_dc", "message": "nope"}}"#, status: 409)
+        let (store, _) = store(routes)
+        _ = await store.watch(gpu: "NVIDIA GeForce RTX 5090", datacenter: "EU-CZ-1", autoResumeRunID: "tg-1")
+        _ = await store.watch(gpu: "NVIDIA GeForce RTX 5090", datacenter: "EU-RO-1", autoResumeRunID: "tg-1")
+        routes.post = TestSupport.json(#"{"sub": {"id": "new001", "gpu": "NVIDIA GeForce RTX 5090", "name": "RTX 5090", "datacenter": "EU-RO-1", "created_at": 2.0, "auto_resume": null}}"#, status: 201)
+        _ = await store.watch(gpu: "NVIDIA GeForce RTX 5090", datacenter: "EU-RO-1", autoResumeRunID: nil)
+        #expect(store.message(gpu: "NVIDIA GeForce RTX 5090", datacenter: "EU-RO-1") == nil)
+        #expect(store.message(gpu: "NVIDIA GeForce RTX 5090", datacenter: "EU-CZ-1") != nil)
+    }
+
+    @Test func aMissingRouteMarksTheServerUnsupported() async {
+        // Pre-deploy the VPS has no /v1/gpu/subs: the app hides the bell,
+        // bolt and "Resume when in stock" rather than offer buttons that
+        // can only 404 (follow-up, 2026-09-27).
+        let routes = Routes()
+        routes.listingStatus = 404
+        let (store, _) = store(routes)
+        await store.load()
+        #expect(store.unsupported)
+        routes.listingStatus = 200
+        await store.load()
+        #expect(!store.unsupported)
+        #expect(store.subs.map(\.id) == ["abc123"])
+    }
+
+    @Test func aServerErrorDoesNotClaimUnsupported() async {
+        // Only a 404 means "route missing"; a 500 is a transient failure.
+        StubURLProtocol.install { _ in TestSupport.json(#"{"error": {"code": "internal", "message": "x"}}"#, status: 500) }
+        let store = GpuSubsStore(client: TestSupport.client(),
+                                 defaults: UserDefaults(suiteName: "gpusubs-\(UUID().uuidString)")!)
+        await store.load()
+        #expect(!store.unsupported)
+        #expect(store.error != nil)
     }
 
     @Test func unwatchRemovesLocally() async {

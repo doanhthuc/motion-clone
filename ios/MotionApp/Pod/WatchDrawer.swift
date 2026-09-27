@@ -69,7 +69,10 @@ struct WatchDrawer: View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
                 if subs.subs.isEmpty {
-                    Text("Nothing watched. Open a GPU and tap 🔔 on a datacenter.")
+                    // A pre-deploy bot has no /v1/gpu/subs (2026-09-27): the
+                    // bell is hidden, so don't tell the user to tap it.
+                    Text(subs.unsupported ? "Subscriptions need a bot update."
+                                          : "Nothing watched. Open a GPU and tap 🔔 on a datacenter.")
                         .font(.subheadline).foregroundStyle(Theme.secondary)
                         .padding(16)
                 }

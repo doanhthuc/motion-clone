@@ -63,17 +63,16 @@ struct GpuSheet: View {
                 } header: {
                     Text("Datacenters")
                 } footer: {
-                    Text("🔔 sends one Telegram message the moment it has stock, then clears itself. "
+                    Text((subs.unsupported ? "" : "🔔 sends one Telegram message the moment it has stock, then clears itself. ")
                          + "Only 📍 is rentable now; elsewhere needs the volume synced first.")
-                }
-                if let message = subs.message {
-                    Section { Text(message).font(.footnote).foregroundStyle(Theme.warning) }
                 }
             }
             .navigationTitle(row?.name ?? gpu)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
-            .onDisappear { subs.dismissMessage() }
+            .onDisappear {
+                for dc in stock.datacenters(for: gpu) { subs.dismissMessage(gpu: gpu, datacenter: dc.datacenter) }
+            }
         }
         .presentationDetents([.medium, .large])
         .accessibilityIdentifier("gpu.sheet")
@@ -83,7 +82,10 @@ struct GpuSheet: View {
         let home = dc.datacenter == stock.homeDatacenter
         let sub = subs.sub(gpu: gpu, datacenter: dc.datacenter)
         let busy = subs.inFlight.contains("\(gpu)|\(dc.datacenter)")
-        return HStack(spacing: 10) {
+        // Each row carries its own refusal (2026-09-27): a sheet-wide line
+        // could not say which datacenter's bell or bolt it was about.
+        return VStack(alignment: .leading, spacing: 4) {
+        HStack(spacing: 10) {
             VStack(alignment: .leading, spacing: 2) {
                 Text((home ? "📍 " : "") + dc.datacenter).font(.body)
                 Text("\(dc.stock) · " + (dc.usdPerHr.map { "\(Format.usd($0))/h" } ?? "price ?"))
@@ -92,8 +94,10 @@ struct GpuSheet: View {
             }
             Spacer()
             if busy { ProgressView() }
+            // A bot deployed before /v1/gpu/subs existed 404s the bell and
+            // bolt, so neither is offered (2026-09-27); Migrate needs no sub.
             if home, let runID = stuckRunID {
-                boltButton(dc, sub: sub, runID: runID)
+                if !subs.unsupported { boltButton(dc, sub: sub, runID: runID) }
             } else if !home {
                 // Visible, not a long-press: the old GPU row's globe menu was
                 // the only way to find Migrate, and this replaces it.
@@ -105,7 +109,12 @@ struct GpuSheet: View {
                 .accessibilityLabel("Migrate to \(dc.datacenter)")
                 .accessibilityIdentifier("gpu.migrate.\(dc.datacenter)")
             }
-            bellButton(dc, sub: sub)
+            if !subs.unsupported { bellButton(dc, sub: sub) }
+        }
+        if let message = subs.message(gpu: gpu, datacenter: dc.datacenter) {
+            Text(message).font(.footnote).foregroundStyle(Theme.warning)
+                .accessibilityIdentifier("gpu.dc.message.\(dc.datacenter)")
+        }
         }
         .disabled(busy)
         .accessibilityIdentifier("gpu.dc.\(dc.datacenter)")

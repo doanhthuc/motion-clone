@@ -479,7 +479,10 @@ private struct RetryRentalCard: View {
             // Only for a stock-out at a known datacenter: the server arms
             // auto-resume only at home, and a stock-out's datacenter IS home
             // (pod-provision.sh can only try there).
-            if failure.stockOut, let dc = failure.datacenter, let subs = model.gpuSubs, let runID = flow.runID {
+            // Hidden while the server lacks /v1/gpu/subs (a pre-deploy bot,
+            // 2026-09-27): the button could only 404.
+            if failure.stockOut, let dc = failure.datacenter, let subs = model.gpuSubs, !subs.unsupported,
+               let runID = flow.runID {
                 let armedSub = subs.armed.flatMap { $0.gpu == failure.gpu && $0.datacenter == dc ? $0 : nil }
                 let name = armedSub?.name ?? displayName(failure.gpu)
                 Button(armedSub != nil ? "Auto-resume armed · \(name) @ \(dc)" : "Resume when in stock",
@@ -500,7 +503,9 @@ private struct RetryRentalCard: View {
                 } message: {
                     Text("A pod is rented for this run without asking again, as soon as runpodctl lists stock.")
                 }
-                if let message = subs.message {
+                // Only this card's own pair: a refusal from the GPU sheet's
+                // other rows is not about this run (2026-09-27).
+                if let message = subs.message(gpu: failure.gpu, datacenter: dc) {
                     Text(message).font(.footnote).foregroundStyle(Theme.warning)
                 }
             }
