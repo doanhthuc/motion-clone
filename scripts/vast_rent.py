@@ -4,6 +4,7 @@
     python3 scripts/vast_rent.py --gpu RTX_5090 --disk 120 --image IMG …            # dry run
     python3 scripts/vast_rent.py … --confirm                                        # rents
     python3 scripts/vast_rent.py --ssh-target <instance id>                         # "host port"
+    python3 scripts/vast_rent.py --ssh-refused <instance id>    # exit 0 = sshd rejects the key
 
 Called by pod-provision.sh's Vast branch. Prints ONLY the offer id (dry run) or the instance id
 (--confirm) on stdout; everything human-readable goes to stderr.
@@ -79,6 +80,7 @@ class VastApi(Protocol):
     def destroy_instance(self, instance_id: str) -> None: ...
     def instance_exists(self, instance_id: str) -> bool: ...
     def ssh_url(self, instance_id: str) -> str: ...
+    def logs(self, instance_id: str, tail: int) -> str: ...
 
 
 class RealVastApi:
@@ -159,6 +161,12 @@ class RealVastApi:
         out = self._run(["vastai", "ssh-url", str(instance_id)], 60)
         if out.returncode != 0:
             raise RentError(f"vastai ssh-url failed: {out.stderr.strip()}")
+        return out.stdout
+
+    def logs(self, instance_id: str, tail: int) -> str:
+        out = self._run(["vastai", "logs", str(instance_id), "--tail", str(tail)], 60)
+        if out.returncode != 0:
+            raise RentError(f"vastai logs failed: {(out.stderr or out.stdout).strip()}")
         return out.stdout
 
 
@@ -437,6 +445,50 @@ def parse_ssh_url(text: str) -> tuple[str, str] | None:
     return None
 
 
+# sshd's StrictModes refusal. Instance 52943882 (machine 143849, 2026-09-27) logged this on
+# every one of 36 attempts from the first second: /root/.ssh/authorized_keys had the wrong
+# owner or mode, and nothing in the container ever fixes that — yet pod-wait.sh waited out its
+# full 25 minutes and the scoreboard still called the machine "ok" (its pull was fine), so the
+# next rent would have picked the same offer. The same machine and image had come up fine the
+# week before, so this is treated as a per-rental host fault: blacklist the machine, move on.
+SSH_REFUSED_MARKER = "Authentication refused: bad ownership or modes"
+SSH_REFUSED_MIN_HITS = 3           # one stray line is not a verdict; a repeating one is
+SSH_REFUSED_LOG_TAIL = 300
+
+
+def ssh_refused_line(log_text: str) -> str | None:
+    """The sshd refusal line if it repeats in `log_text`, else None."""
+    hits = [ln.strip() for ln in log_text.splitlines() if SSH_REFUSED_MARKER in ln]
+    return hits[-1] if len(hits) >= SSH_REFUSED_MIN_HITS else None
+
+
+def check_ssh_refused(api: VastApi, instance_id: str, board: Scoreboard, *,
+                      now: Callable[[], float] = time.time,
+                      persist: Callable[[], None] = lambda: None,
+                      log: Callable[[str], None] = _stderr) -> str | None:
+    """If sshd on `instance_id` keeps refusing the key, blacklist its machine and return why.
+
+    Never raises: this runs inside pod-wait.sh's loop, where an unreadable log must mean "keep
+    waiting", not "abort a pod that may be fine".
+    """
+    try:
+        line = ssh_refused_line(api.logs(instance_id, SSH_REFUSED_LOG_TAIL))
+    except RentError as exc:
+        log(f"could not read the logs of instance {instance_id}: {exc}")
+        return None
+    if line is None:
+        return None
+    machine = (api.instance_status(instance_id) or {}).get("machine_id")
+    try:
+        machine_id = int(machine) if machine is not None else None
+    except (TypeError, ValueError):
+        machine_id = None
+    _record(board, machine_id, None, "ssh_refused", now())
+    _safe(persist, "the machine scoreboard", log)
+    where = f"machine {machine_id}" if machine_id is not None else "its machine (id unknown)"
+    return f"{line} — {where} blacklisted for the next rents"
+
+
 def make_api() -> VastApi:
     return RealVastApi()
 
@@ -468,6 +520,9 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
                     help="dry run that prints ONE JSON line (the best offer and its cost terms); "
                          "never rents, and cannot be combined with --confirm")
     ap.add_argument("--ssh-target", metavar="INSTANCE_ID")
+    ap.add_argument("--ssh-refused", metavar="INSTANCE_ID",
+                    help="exit 0 (and blacklist the machine) if the instance's sshd keeps "
+                         "refusing the key; exit 1 otherwise")
     return ap.parse_args(argv)
 
 
@@ -502,6 +557,15 @@ def main(argv: list[str] | None = None) -> int:
         if target is None:
             return 1
         print(f"{target[0]} {target[1]}")
+        return 0
+
+    if args.ssh_refused:
+        board = load_board(BOARD_PATH)
+        why = check_ssh_refused(api, args.ssh_refused, board,
+                                persist=lambda: save_board(BOARD_PATH, board))
+        if why is None:
+            return 1
+        print(why)
         return 0
 
     for required in ("gpu", "disk", "image", "max_dph", "reliability"):
