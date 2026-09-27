@@ -1,6 +1,6 @@
 # GPU stock subscriptions in the iOS app, with auto-resume — design
 
-Date: 2026-09-27 · Status: approved in conversation, awaiting written-spec review
+Date: 2026-09-27 · Status: approved 2026-09-27
 
 ## Why
 
@@ -36,7 +36,7 @@ existing files load unchanged:
 ```json
 {"id": "a1b2c3", "gpu_id": "NVIDIA GeForce RTX 5090", "datacenter_id": "EU-RO-1",
  "created_at": 1790000000.0,
- "auto_resume": {"run_id": "tg-123-…", "run_token": "…", "max_usd_per_hr": 0.99}}
+ "auto_resume": {"run_id": "tg-123", "run_token": "…", "max_usd_per_hr": 0.99}}
 ```
 
 - `id` is minted on add (short random hex). If an entry was written before `id` existed, it gets
@@ -46,7 +46,7 @@ existing files load unchanged:
 A new file, `batch/tg-<chat>.gpusubs-fired.json`, keeps the **last 10** firings, newest first:
 
 ```json
-{"id": "…", "gpu_id": "…", "datacenter_id": "…", "stock": "Low", "usd_per_hr": 0.99,
+{"sub_id": "…", "gpu_id": "…", "datacenter_id": "…", "stock": "Low", "usd_per_hr": 0.99,
  "fired_at": 1790000123.0, "action": "notified|resumed|resume_refused", "reason": "…"}
 ```
 
@@ -56,10 +56,14 @@ A new file, `batch/tg-<chat>.gpusubs-fired.json`, keeps the **last 10** firings,
 
 | Route | Body / query | Answer |
 |---|---|---|
-| `GET /v1/gpu/subs` | — | `{subs: [...], fired: [...], home_dc}` |
-| `POST /v1/gpu/subs` | `{gpu, datacenter, auto_resume?: {run_id, run_token}}` + `Idempotency-Key` | `201 {sub}`. `409 already_subscribed` for a duplicate `(gpu, dc)`. |
+| `GET /v1/gpu/subs` | — | `{subs: [...], fired: [...]}`. There is no `home_dc`: `GET /v1/gpu/stock` already returns `home_datacenter`, and repeating it here would cost a runpodctl call on every read. |
+| `POST /v1/gpu/subs` | `{gpu, datacenter, auto_resume: bool, run_id?}` | An upsert keyed on `(gpu, datacenter)`: `201 {sub}` when new, `200 {sub}` when it existed. `auto_resume: true` (with `run_id`) arms it; `false` leaves or makes it notify-only. |
 | `DELETE /v1/gpu/subs/{id}` | — | `200 {subs}`. An unknown id also answers 200: the sub may already have fired. |
-| `GET /v1/gpu/stock?all=1` | — | The existing body plus `datacenters: {gpu_id: [{datacenter, stock, usd_per_hr}]}`, taken from `stock_at(..., include_unavailable=True)` |
+| `GET /v1/gpu/stock?all=1` | — | The existing body plus `datacenters: [{gpu, datacenter, stock, usd_per_hr}]`, taken from `stock_at_cached(..., include_unavailable=True)` |
+
+No `Idempotency-Key`: the upsert makes a repeated `POST` land on the same entry, and nothing here
+spends. `datacenters` is an array, not an object keyed by GPU id, because the app's
+`convertFromSnakeCase` decoder also rewrites dictionary keys.
 
 `?all=1` exists because a GPU sold out at **every** datacenter is dropped from runpodctl's default
 output (verified live 2026-09-12). That is exactly the moment the user wants to subscribe.
@@ -71,10 +75,15 @@ it either, and a runpodctl outage should not block subscribing.
 
 ### Arming auto-resume
 
-When `POST` carries `auto_resume`, the server checks the following under `BOT_LOCK`, from files only.
+When `POST` carries `auto_resume: true`, the two network reads (`volume_datacenter`,
+`stock_at_cached`) run first, **outside** `BOT_LOCK`, for the reason `migrate_ask` gives: a runpodctl
+round trip under the lock stalls every Telegram update. The file checks then run under the lock.
 Each failure is a 409 with its own code, and nothing is written:
 
-1. `run_id` is this chat's current run, and `run_token` matches `_run_token(chat_id)` → else `stale_run`.
+1. `run_id` is this chat's current run → else `stale_run`. The phone does not send a `run_token`:
+   the Pod tab never reads `GET /v1/runs/{id}/tryon`, where that token lives. Instead the server
+   stores `_run_token(chat_id)` at arming time, and firing refuses if the manifest has been rewritten
+   since.
 2. The run has an outstanding `provision-failed.json` with `stock_out: true` → else `no_failure`.
 3. `datacenter` is the volume's home datacenter (`volume_datacenter(POD_VOLUME_ID)`) → else
    `not_home_dc`. Auto-resume never migrates: a migration copies ~33GB, takes ~15–25 min, and
