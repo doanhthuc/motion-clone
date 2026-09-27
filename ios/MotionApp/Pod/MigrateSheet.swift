@@ -129,6 +129,11 @@ struct MigrateSheet: View {
             Text("\(ask.homeDatacenter) → \(ask.toDc)").font(.title3.weight(.semibold))
             Text(ask.warning).font(.subheadline).foregroundStyle(Theme.danger)
                 .accessibilityIdentifier("migrate.warning")
+            // Moved here from MigrationCard's footer, which the Pod hero now
+            // drops to fit an iPhone SE (2026-09-27): said before the tap is
+            // where it can still change the decision.
+            Text("A migration can't be cancelled once it starts.")
+                .font(.subheadline).foregroundStyle(Theme.secondary)
         }
         Section {
             TextField("Type \(ask.toDc) to confirm", text: typed)

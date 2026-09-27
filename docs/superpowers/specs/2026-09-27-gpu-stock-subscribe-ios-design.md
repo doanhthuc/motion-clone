@@ -112,7 +112,11 @@ sub is removed in the same tick, and Telegram gets the message it gets today. Ne
 - If `_do_resume` raises after `start_drain` (so `busy(manifest)` is now true — e.g. the progress
   messages failed), the drain is live: `.env` keeps the subscribed GPU, the action is `resumed` with
   reason "started, but progress messages failed: …", and the same started message is sent. An
-  exception before the drain started is rolled back like any other refusal.
+  exception before the drain started is rolled back like any other refusal. If no progress file was
+  written, the tick leaves one (message_id 0) so `tick_progress` adopts the drain and later delivers
+  the result or the stock-out card.
+- Each firing is recorded in the fired file before its Telegram message is sent, and a failed send
+  is logged, not raised — so a Telegram outage cannot drop a firing whose sub is already removed.
 - If any guard fails, the sub fires as notify-only. The Telegram message names the reason, and the
   action is `resume_refused`. Nothing is rented.
 
@@ -225,6 +229,10 @@ fake-server result is not a live one.
 | `xcodebuild … -only-testing:MotionAppUITests/PodStageTests` on the iPhone SE (3rd gen) sim | first run **failed** `testMigrationHeroLeavesTilesVisible` (last tile maxY 541 > drawer minY 537, full `MigrationCard`); after the hero's card went `compact`: both tests **passed**. Screenshots `pod-stage-migration-before-compact`, `pod-stage-migration` in `out/pod-stage/iphone-se-3rd-gen/` | 2026-09-27 | implementer (follow-up) |
 | Same, on the iPhone 18 Pro Max sim | both tests **passed**; `pod-stage-migration` in `out/pod-stage/iphone-18-pro-max/` | 2026-09-27 | implementer (follow-up) |
 | `motions-studio/setup/scrub-secrets.sh --check` (follow-up) | exit 0 | 2026-09-27 | implementer (follow-up) |
+| `make batch-test` (follow-up review fixes: adopt a started drain, record before send) | exit 0, `OK (skipped=1)`, 2307 tests | 2026-09-27 | implementer (follow-up fix round) |
+| `make ios-test` / `make ios-build` (follow-up fix round) | 359/359 passed / exit 0 | 2026-09-27 | implementer (follow-up fix round) |
+| `PodStageTests` on the iPhone SE (3rd gen) and iPhone 18 Pro Max sims (follow-up fix round, PulseDot now a PhaseAnimator) | both tests **passed** on both; the migration dot now renders (224 non-background px at its slot in every SE probe shot, was 0) | 2026-09-27 | implementer (follow-up fix round) |
+| `motions-studio/setup/scrub-secrets.sh --check` (follow-up fix round) | exit 0 | 2026-09-27 | implementer (follow-up fix round) |
 
 **A bug found and fixed while wiring these gates**: `PodView.swift`'s outer
 `.accessibilityIdentifier("pod.stage")` — never itself asserted on by any test — was overriding the

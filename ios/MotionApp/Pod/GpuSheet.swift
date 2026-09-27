@@ -85,38 +85,40 @@ struct GpuSheet: View {
         // Each row carries its own refusal (2026-09-27): a sheet-wide line
         // could not say which datacenter's bell or bolt it was about.
         return VStack(alignment: .leading, spacing: 4) {
-        HStack(spacing: 10) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text((home ? "📍 " : "") + dc.datacenter).font(.body)
-                Text("\(dc.stock) · " + (dc.usdPerHr.map { "\(Format.usd($0))/h" } ?? "price ?"))
-                    .font(.subheadline.monospacedDigit())
-                    .foregroundStyle(dc.soldOut ? Theme.warning : Theme.secondary)
-            }
-            Spacer()
-            if busy { ProgressView() }
-            // A bot deployed before /v1/gpu/subs existed 404s the bell and
-            // bolt, so neither is offered (2026-09-27); Migrate needs no sub.
-            if home, let runID = stuckRunID {
-                if !subs.unsupported { boltButton(dc, sub: sub, runID: runID) }
-            } else if !home {
-                // Visible, not a long-press: the old GPU row's globe menu was
-                // the only way to find Migrate, and this replaces it.
-                Button { dismiss(); onMigrate(dc.datacenter) } label: {
-                    Image(systemName: "airplane.departure").foregroundStyle(Theme.secondary)
-                        .frame(minWidth: 44, minHeight: 44)
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text((home ? "📍 " : "") + dc.datacenter).font(.body)
+                    Text("\(dc.stock) · " + (dc.usdPerHr.map { "\(Format.usd($0))/h" } ?? "price ?"))
+                        .font(.subheadline.monospacedDigit())
+                        .foregroundStyle(dc.soldOut ? Theme.warning : Theme.secondary)
                 }
-                .buttonStyle(.borderless)
-                .accessibilityLabel("Migrate to \(dc.datacenter)")
-                .accessibilityIdentifier("gpu.migrate.\(dc.datacenter)")
+                Spacer()
+                if busy { ProgressView() }
+                // A bot deployed before /v1/gpu/subs existed 404s the bell and
+                // bolt, so neither is offered (2026-09-27); Migrate needs no sub.
+                if home, let runID = stuckRunID {
+                    if !subs.unsupported { boltButton(dc, sub: sub, runID: runID) }
+                } else if !home {
+                    // Visible, not a long-press: the old GPU row's globe menu was
+                    // the only way to find Migrate, and this replaces it.
+                    Button { dismiss(); onMigrate(dc.datacenter) } label: {
+                        Image(systemName: "airplane.departure").foregroundStyle(Theme.secondary)
+                            .frame(minWidth: 44, minHeight: 44)
+                    }
+                    .buttonStyle(.borderless)
+                    .accessibilityLabel("Migrate to \(dc.datacenter)")
+                    .accessibilityIdentifier("gpu.migrate.\(dc.datacenter)")
+                }
+                if !subs.unsupported { bellButton(dc, sub: sub) }
             }
-            if !subs.unsupported { bellButton(dc, sub: sub) }
+            // Only the controls: the refusal text below stays readable (not
+            // greyed out) while a retry of the same pair is in flight.
+            .disabled(busy)
+            if let message = subs.message(gpu: gpu, datacenter: dc.datacenter) {
+                Text(message).font(.footnote).foregroundStyle(Theme.warning)
+                    .accessibilityIdentifier("gpu.dc.message.\(dc.datacenter)")
+            }
         }
-        if let message = subs.message(gpu: gpu, datacenter: dc.datacenter) {
-            Text(message).font(.footnote).foregroundStyle(Theme.warning)
-                .accessibilityIdentifier("gpu.dc.message.\(dc.datacenter)")
-        }
-        }
-        .disabled(busy)
         .accessibilityIdentifier("gpu.dc.\(dc.datacenter)")
     }
 
