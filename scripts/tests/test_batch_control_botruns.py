@@ -5,7 +5,7 @@ Telegram chat's one run slot without touching the Telegram draft (spec §5.8).
 Everything here is free: start_drain / start_phase_a are patched, so no pod
 is rented and no try-on API is called.
 """
-import json, sys, tempfile, threading, time, unittest
+import json, os, sys, tempfile, threading, time, unittest
 from dataclasses import replace
 from pathlib import Path
 from unittest import mock
@@ -1035,6 +1035,7 @@ class TestTryonPreviews(_AppRunsFixture):
         self.assertFalse(body["phase_a_running"])
         self.assertEqual(body["previews"],
                          [{"index": "0", "run": run_id, "status": "done", "has_image": True,
+                           "rev": str(image.stat().st_mtime_ns),
                            "shared_from": None, "shares": []}])
 
         got = self.runs.tryon_image(self.runs.run_id, "0")
@@ -1046,6 +1047,32 @@ class TestTryonPreviews(_AppRunsFixture):
         outside.write_bytes(b"img")
         self._write_journal(run_id, tryon={"status": "done", "file": str(outside)})
         self.assertIsNone(self.runs.tryon_image(self.runs.run_id, "0"))
+
+    def test_rev_moves_when_a_regen_replaces_the_image(self):
+        """2026-09-27: after a regen the Runs card kept the first image,
+        because the index (and so the URL) never changes. `rev` must."""
+        job = self._tryon_job()
+        manifest = self._write_live_manifest(job)
+        run_id = manifest.runs[0].id
+        image = self.root / "out" / "batch1" / "runs" / run_id / "01-tryon.png"
+        image.parent.mkdir(parents=True, exist_ok=True)
+        image.write_bytes(b"v1")
+        os.utime(image, ns=(1_000_000_000, 1_000_000_000))
+        self._write_journal(run_id, tryon={"status": "done", "file": str(image)})
+        _, before = self.runs.tryon(self.runs.run_id)
+
+        image.write_bytes(b"v2")
+        os.utime(image, ns=(2_000_000_000, 2_000_000_000))
+        _, after = self.runs.tryon(self.runs.run_id)
+        self.assertEqual(before["previews"][0]["rev"], "1000000000")
+        self.assertEqual(after["previews"][0]["rev"], "2000000000")
+
+    def test_rev_is_null_without_an_image(self):
+        job = self._tryon_job()
+        manifest = self._write_live_manifest(job)
+        self._write_journal(manifest.runs[0].id, tryon={"status": "running"})
+        _, body = self.runs.tryon(self.runs.run_id)
+        self.assertIsNone(body["previews"][0]["rev"])
 
     def test_tryon_previews_carry_the_share_group(self):
         jobs = self._grouped_jobs()

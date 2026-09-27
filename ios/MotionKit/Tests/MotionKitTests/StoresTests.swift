@@ -86,4 +86,5 @@ final class Counter: @unchecked Sendable {
     private let lock = NSLock()
     private var n = 0
     func increment() -> Int { lock.withLock { n += 1; return n } }
+    var value: Int { lock.withLock { n } }
 }
