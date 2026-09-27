@@ -48,7 +48,6 @@ struct PodView: View {
             }
             .overlay(alignment: .top) { firedBanner.padding(.horizontal, 12) }
         }
-        .accessibilityIdentifier("pod.stage")
         .navigationTitle("Pod")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar { ToolbarItem(placement: .topBarTrailing) { moreMenu } }

@@ -12,14 +12,15 @@ final class Phase5SmokeTests: XCTestCase {
         app.launch()
         app.tabBars.buttons["Pod"].tap()
 
-        XCTAssertTrue(app.buttons["pod.checkVast"].waitForExistence(timeout: 60), "balance card renders")
-        let rows = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "gpu.row."))
-        XCTAssertTrue(Phase4Draft.waitUntil(timeout: 90) { rows.count == 5 }, "five GPU rows")
+        XCTAssertTrue(app.descendants(matching: .any)["pod.hero"].waitForExistence(timeout: 60), "hero renders")
+        let tiles = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "gpu.tile."))
+        XCTAssertTrue(Phase4Draft.waitUntil(timeout: 90) { tiles.count == 5 }, "five GPU tiles")
 
         guard app.descendants(matching: .any)["pod.none"].waitForExistence(timeout: 10) else {
             throw XCTSkip("A pod is live — the migrate half of this smoke runs only with nothing rented.")
         }
-        Phase4Draft.revealButton("pod.moveVolume", in: app).tap()
+        app.buttons["pod.more"].tap()
+        app.buttons["pod.moveVolume"].tap()
 
         if app.descendants(matching: .any)["migrate.blocked"].waitForExistence(timeout: 5) {
             throw XCTSkip("The run is busy — migrate is blocked on the phone, as designed.")

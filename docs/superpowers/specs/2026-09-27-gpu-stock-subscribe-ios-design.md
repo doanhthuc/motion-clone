@@ -191,3 +191,36 @@ cause a stock-out, so this path is covered by `dry_run` tests only until one hap
 
 Native push (needs a paid Apple account), ntfy, auto-resume across datacenters, auto-confirming a
 draft, renting an idle pod, a Telegram button for auto-resume.
+
+## Gate record
+
+Append-only: add a row when a gate runs, and do not restate its result in prose elsewhere. "Ran by"
+separates the implementer's worktree gates from the controller's live ones — a simulator or
+fake-server result is not a live one.
+
+| Gate | Result | Date | Ran by |
+|---|---|---|---|
+| `make batch-test` | exit 0, `OK (skipped=1)`, 2298 tests | 2026-09-27 | implementer (Task 9) |
+| `cd ios/MotionKit && swift test` (`make ios-test`) | 354/354 passed, exit 0 | 2026-09-27 | implementer (Task 9) |
+| `make ios-build` | exit 0, clean compile | 2026-09-27 | implementer (Task 9) |
+| `xcodebuild … -only-testing:MotionAppUITests/PodStageTests -only-testing:MotionAppUITests/Phase5SmokeTests` on the iPhone 18 Pro Max sim (`CEBAFDD5-2848-423F-A3EA-AC414620C491`) | `PodStageTests` **passed**; `Phase5SmokeTests` **skipped** (a pod is genuinely live right now — its "nothing rented" precondition correctly declines the migrate half). Screenshots `pod-stage`, `gpu-sheet-no-datacenters`, `watch-open` in `out/pod-stage/iphone-18-pro-max/` | 2026-09-27 | implementer (Task 9) |
+| Same, on the iPhone SE (3rd gen) sim (`710BCEBB-2A9E-4401-A0DE-D59460070556`) | `PodStageTests` **passed**; `Phase5SmokeTests` **skipped**, same reason. Screenshots in `out/pod-stage/iphone-se-3rd-gen/` | 2026-09-27 | implementer (Task 9) |
+| `make ios-ui-test` (full suite, iPhone 18 Pro, `43B83B81-13CD-4383-BB43-4D8AEBEA6582`) | **exit 0**. `xcrun xcresulttool get test-results summary`: `totalTestCount: 11`, `passedTests: 10`, `skippedTests: 1` (`Phase5SmokeTests`, same live-pod reason), `failedTests: 0` | 2026-09-27 | implementer (Task 9) |
+| `make ios-contract` | 15 `ok`, **2 `FAIL` — expected pre-deploy**: `GET /v1/gpu/stock?all=1` (`datacentersMissing`: the live server doesn't return `datacenters` yet) and `GET /v1/gpu/subs` (`404 not_found`: route doesn't exist on the VPS yet). All 13 pre-existing checks passed | 2026-09-27 | implementer (Task 9) |
+| `motions-studio/setup/scrub-secrets.sh --check` | exit 0 | 2026-09-27 | implementer (Task 9) |
+
+**A bug found and fixed while wiring these gates**: `PodView.swift`'s outer
+`.accessibilityIdentifier("pod.stage")` — never itself asserted on by any test — was overriding the
+identifiers of unrelated descendant buttons (`pod.balance`, `gpu.refresh`, `pod.watch` all reported
+back as `pod.stage` in the accessibility tree, iOS 27 / Xcode simulator runtime, build `24A434`),
+which failed `Phase5SmokeTests`' `pod.hero` wait and `PodStageTests`' `pod.watch` lookup. Removed;
+re-ran both classes on both simulators to confirm the fix, then took the passing runs above.
+
+**Not yet proven** (needs the deploy + a live device, out of Task 9's scope):
+- The deploy itself, and the two new `ios-contract` checks passing against the redeployed server.
+- The live, zero-spend Telegram check: watch a datacenter that already has stock, confirm a Telegram
+  message within one poll round, the drawer showing it under Recent, and the banner firing once on
+  the next foreground.
+- Auto-resume firing against a real stock-out (no cheap way to cause one; only the Python `dry_run`
+  unit tests cover this path today).
+- Install on the phone.
