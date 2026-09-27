@@ -1016,6 +1016,75 @@ class TestRentPanel(_AppRunsFixture):
         self.assertFalse(body["vast"]["can_spend"])
 
 
+class TestContinueStoppedRun(_AppRunsFixture):
+    """Continue batch after a drain stopped: the confirm cleared the draft and
+    popped `_PHASE_A_OFFERED`, so the panel quoted "0 jobs" and nothing could
+    be rented (2026-09-27, a killed vast pod)."""
+
+    def _stopped(self, *, done: bool = False) -> str:
+        job = self._seed_draft()
+        self._seed_journal(job)
+        run_id = load_manifest(self._live()).runs[0].id
+        if done:
+            state_path_for(self._live()).write_text(json.dumps(
+                {"batch": "2026-09-21-1200", "runs": {run_id: {"status": "done"}}}),
+                encoding="utf-8")
+        self.store.clear()                     # what the accepted confirm did
+        bot._PHASE_A_OFFERED.pop(ME, None)     # ...and a bot restart, or its pop
+        bot._save_confirm_stamp(ME, self.store.runnable()[2])
+        return run_id
+
+    def test_the_panel_quotes_the_stopped_manifest(self):
+        run_id = self._stopped()
+        with mock.patch("tgbot.bot._rent_panel_data", return_value={}) as data:
+            status, body = self.runs.rent_panel(self.runs.run_id, force=False)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["jobs"], 1)
+        self.assertGreater(body["estimate_min"], 0)
+        self.assertEqual([r.id for r in data.call_args.kwargs["manifest"].runs], [run_id])
+
+    def test_confirm_resumes_the_stopped_manifest_on_the_chosen_provider(self):
+        self._stopped()
+        with mock.patch("tgbot.bot._do_resume",
+                        return_value=Outcome(True, "started")) as do_resume, \
+             mock.patch("tgbot.bot._do_confirm") as do_confirm:
+            status, _ = self.runs.confirm(self.runs.run_id, self._body("vast"), "c1")
+        self.assertEqual(status, 202)
+        do_confirm.assert_not_called()
+        self.assertEqual(do_resume.call_args.kwargs["gpu_provider"], "vast")
+        self.assertEqual(do_resume.call_args.args[2], self._live())
+
+    def test_a_finished_run_is_not_continued(self):
+        self._stopped(done=True)
+        with mock.patch("tgbot.bot._rent_panel_data", return_value={}):
+            _, body = self.runs.rent_panel(self.runs.run_id, force=False)
+        self.assertEqual(body["jobs"], 0)
+        with mock.patch("tgbot.bot._do_resume") as do_resume:
+            status, err = self.runs.confirm(self.runs.run_id, self._body(), "c2")
+        do_resume.assert_not_called()
+        self.assertEqual(err["error"]["code"], "nothing_to_run")
+
+    def test_a_draft_that_moved_since_the_confirm_is_refused(self):
+        self._stopped()
+        bot._save_confirm_stamp(ME, self.store.runnable()[2] - 1)
+        with mock.patch("tgbot.bot._do_resume") as do_resume:
+            status, err = self.runs.confirm(self.runs.run_id, self._body(), "c3")
+        do_resume.assert_not_called()
+        self.assertEqual(status, 409)
+        self.assertEqual(err["error"]["code"], "stale_run")
+
+    def test_a_job_in_the_draft_is_a_new_confirm_not_a_continue(self):
+        self._stopped()
+        self._seed_draft()
+        with mock.patch("tgbot.bot._do_resume") as do_resume, \
+             mock.patch("tgbot.bot._do_confirm",
+                        return_value=Outcome(True, "started")) as do_confirm:
+            status, _ = self.runs.confirm(self.runs.run_id, self._body(), "c4")
+        self.assertEqual(status, 202)
+        do_resume.assert_not_called()
+        do_confirm.assert_called_once()
+
+
 class TestTryonPreviews(_AppRunsFixture):
     """`AppRuns.tryon`/`tryon_image` — the journal `_deliver_tryon_previews`
     itself reads, without the Telegram send."""
