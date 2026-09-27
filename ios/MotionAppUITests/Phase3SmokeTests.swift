@@ -88,6 +88,7 @@ final class Phase3SmokeTests: XCTestCase {
         XCTAssertTrue(app.navigationBars["Settings"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.buttons[name].waitForExistence(timeout: 5))
         app.buttons[name].tap()
+        Phase4Draft.closeSettings(in: app)
         XCTAssertTrue(waitUntil(timeout: 10) {
             (app.buttons["Pipeline"].value as? String) == name
         })

@@ -159,9 +159,18 @@ enum Phase4Draft {
         }
         XCTAssertNotNil(option, "A try-on pipeline must be available")
         option?.tap()
+        closeSettings(in: app)
         XCTAssertTrue(waitUntil(timeout: 10) {
             (app.buttons["Pipeline"].value as? String)?.localizedCaseInsensitiveContains("Try-on") == true
         })
+    }
+
+    /// The Settings sheet stays open after a pick since 2026-09-27, so a
+    /// pipeline and its provider can be set in one visit; Done closes it.
+    @MainActor static func closeSettings(in app: XCUIApplication) {
+        let sheet = app.navigationBars["Settings"]
+        sheet.buttons["Done"].tap()
+        XCTAssertTrue(sheet.waitForNonExistence(timeout: 5), "The Settings sheet must close")
     }
 
     @MainActor static func revealButton(_ label: String, in app: XCUIApplication) -> XCUIElement {
