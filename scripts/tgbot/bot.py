@@ -4748,6 +4748,36 @@ def _auto_resume_refusal(chat_id: int, sub: dict, hit) -> str | None:
     return None
 
 
+def _adopt_started_drain(chat_id: int, manifest_path: Path) -> None:
+    """Leave a progress file for a drain `_start_progress` failed to record.
+
+    Review fix (2026-09-27): after an auto-resume's start_drain, a raise in
+    `_start_progress` (usually its send_message) left no progress file, and
+    tick_progress returns at once without one — no progress, no result, no
+    stock-out card. message_id 0 is never a real message, so tick_progress's
+    first edit gets "message to edit not found" (edit_message -> False) and
+    takes its existing rebuild path: send a fresh message and record its id.
+    RunPod only (no billing keys), which is all auto-resume ever rents.
+    """
+    path = _progress_path(chat_id)
+    if path.exists():
+        return      # _start_progress got as far as writing it
+    stages: list[str] = []
+    try:
+        for run in load_manifest(manifest_path).runs:
+            for stage in PIPELINES[run.pipeline]:
+                if stage not in stages:
+                    stages.append(stage)
+    except ManifestError as exc:
+        log(f"adopting drain for chat {chat_id} without stages: {exc}")
+    try:
+        path.write_text(json.dumps({
+            "manifest": str(manifest_path), "message_id": 0,
+            "stages": stages, "sent_tryon": []}, indent=2), encoding="utf-8")
+    except OSError as exc:
+        log(f"could not adopt the started drain for chat {chat_id}: {exc!r}")
+
+
 def _tick_gpu_subs(tg: Tg, chat_id: int, *, dry_run: bool = False) -> None:
     """Fire any subscription whose (gpu, datacenter) is no longer sold out.
 
@@ -4820,6 +4850,7 @@ def _tick_gpu_subs(tg: Tg, chat_id: int, *, dry_run: bool = False) -> None:
                     # would misreport money already being spent.
                     started_despite = exc
                     out = Outcome(True, "started")
+                    _adopt_started_drain(chat_id, _job_manifest_path(chat_id))
                 else:
                     # An exception before the drain started is a refusal too
                     # (2026-09-27): .env must not be left pointing at a card
@@ -4847,14 +4878,21 @@ def _tick_gpu_subs(tg: Tg, chat_id: int, *, dry_run: bool = False) -> None:
                     "Nothing was rented.")
         else:
             tail = "\nThis subscription cleared itself — /subscribe again to re-arm."
-        tg.send_message(
-            chat_id,
-            f"🔔 <b>{_esc(short)}</b> is now available at "
-            f"<b>{_esc(sub['datacenter_id'])}</b>: "
-            f"{_stock_icon(hit.stock_status.lower())} {_esc(hit.stock_status)} · "
-            f"{ICON_MONEY_CE} {price}{tail}",
-            parse_mode=PARSE_HTML)
+        # Recorded before the send, and the send may fail (review fix,
+        # 2026-09-27): the subs were already removed above, so a Telegram
+        # outage raising here used to drop this firing and every later one
+        # silently. The fired history is what the phone reads anyway.
         _record_gpu_fired(chat_id, entry)
+        try:
+            tg.send_message(
+                chat_id,
+                f"🔔 <b>{_esc(short)}</b> is now available at "
+                f"<b>{_esc(sub['datacenter_id'])}</b>: "
+                f"{_stock_icon(hit.stock_status.lower())} {_esc(hit.stock_status)} · "
+                f"{ICON_MONEY_CE} {price}{tail}",
+                parse_mode=PARSE_HTML)
+        except Exception as exc:
+            log(f"gpu-sub firing message failed for chat {chat_id}: {exc!r}")
 
 
 def _gpu_price(gpu_id: str, stock: dict) -> float:

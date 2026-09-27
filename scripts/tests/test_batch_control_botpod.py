@@ -1669,6 +1669,50 @@ class TestAutoResumeTick(_PodFixture):
         self.assertFalse(any("Nothing was rented" in text for text in self._texts()))
         self.assertTrue(any("Auto-resume started a rental" in text for text in self._texts()))
 
+    def test_a_started_drain_whose_progress_failed_is_adopted_by_tick_progress(self):
+        """Review fix round (2026-09-27): when `_start_progress` raised, no
+        progress file existed and `tick_progress` returned early — no result,
+        no stock-out card, despite the tail promising one. The tick now leaves
+        a progress file for the manifest, and tick_progress (drain running)
+        posts a fresh progress message for it."""
+        self._arm()
+        self.patches["busy"].side_effect = (
+            lambda *_a, **_k: self.patches["start_drain"].called)
+        with mock.patch("tgbot.bot._start_progress", side_effect=RuntimeError("tg down")):
+            self._fire()
+        path = bot._progress_path(ME)
+        self.assertTrue(path.exists(), "tick_progress needs a file to adopt the drain")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(Path(payload["manifest"]).resolve(), self._live().resolve())
+        self.assertNotIn("phase", payload)
+
+        edits: list[int] = []
+        def edit_message(chat_id, message_id, text, **kwargs):
+            edits.append(message_id)
+            return False            # Telegram: "message to edit not found"
+        self.tg.edit_message = edit_message
+        self.patches["drain_running"].return_value = True
+        sent_before = len(self.tg.sent)
+        bot.tick_progress(self.tg, ME)
+        self.assertEqual(edits, [0])
+        self.assertEqual(len(self.tg.sent), sent_before + 1, "a fresh progress message")
+        self.assertNotEqual(json.loads(path.read_text(encoding="utf-8"))["message_id"], 0)
+
+    def test_a_failed_send_still_records_every_firing(self):
+        """Review fix round (2026-09-27): subs are removed before the loop, so
+        a Telegram outage raising out of send_message used to drop every
+        later firing silently — recorded nowhere, sub already gone."""
+        bot._gpu_subs_for(ME).append(bot._new_gpu_sub(self.GPU, "EU-RO-1", []))
+        bot._gpu_subs_for(ME).append(bot._new_gpu_sub(self.GPU, "EU-CZ-1", []))
+        self.patches["stock_at_cached"].return_value = {self.GPU: [
+            Stock(gpu_id=self.GPU, display_name="RTX 5090", price_per_hr=0.99,
+                  datacenter_id=dc, stock_status="Low") for dc in ("EU-RO-1", "EU-CZ-1")]}
+        with mock.patch.object(self.tg, "send_message", side_effect=RuntimeError("tg down")):
+            bot._tick_gpu_subs(self.tg, ME, dry_run=False)
+        fired = bot._gpu_fired_for(ME)
+        self.assertEqual(sorted(f["datacenter_id"] for f in fired), ["EU-CZ-1", "EU-RO-1"])
+        self.assertEqual(bot._gpu_subs_for(ME), [])
+
     def test_auto_resume_refuses_while_a_lease_is_live(self):
         self._arm()
         self.patches["read_lease"].return_value = object()
