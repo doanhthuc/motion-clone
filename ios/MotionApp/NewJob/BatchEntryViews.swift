@@ -319,7 +319,7 @@ struct BatchEntryDetail: View {
                 withAnimation(.snappy) { choosingProvider.toggle() }
             } label: {
                 HStack(spacing: 12) {
-                    ProviderMark(id: entry.provider)
+                    ProviderMark(id: entry.provider).foregroundStyle(Theme.label)
                     VStack(alignment: .leading, spacing: 1) {
                         Text("Provider").font(.caption).foregroundStyle(Theme.secondary)
                         Text(BatchEntryText.provider(entry, pipeline: pipeline))

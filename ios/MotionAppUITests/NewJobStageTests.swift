@@ -77,6 +77,7 @@ final class NewJobStageTests: XCTestCase {
             return XCTFail("A try-on pipeline must be available")
         }
         app.buttons[longest].tap()
+        Phase4Draft.closeSettings(in: app)
         XCTAssertTrue(Phase4Draft.waitUntil(timeout: 10) {
             (app.buttons["Pipeline"].value as? String) == longest
         })
