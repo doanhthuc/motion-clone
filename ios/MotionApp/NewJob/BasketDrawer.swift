@@ -8,8 +8,9 @@ import SwiftUI
 /// The list inside is the stage's only scroll.
 ///
 /// Three heights (user, 2026-09-27): the handle alone, most of the stage, and
-/// all of it. Dragging the handle steps one level at a time; tapping it or the
-/// dimmed cards above closes the drawer from either open level.
+/// all of it. Dragging the handle up steps one level at a time; dragging it
+/// down, tapping it or tapping the dimmed cards above closes the drawer from
+/// either open level (user, 2026-09-27).
 @MainActor
 struct BasketDrawer: View {
     enum Level { case collapsed, half, tall }
@@ -77,7 +78,7 @@ struct BasketDrawer: View {
                 .onEnded { value in
                     withAnimation(.snappy) {
                         if value.translation.height < -40 { level = level == .collapsed ? .half : .tall }
-                        if value.translation.height > 40 { level = level == .tall ? .half : .collapsed }
+                        if value.translation.height > 40 { level = .collapsed }
                     }
                 })
 
