@@ -4434,7 +4434,8 @@ def _gpu_subs_path(chat_id: int) -> Path:
 
 def _gpu_subs_for(chat_id: int) -> list[dict]:
     """Every (gpu_id, datacenter_id) this chat is watching. Loaded once per
-    process per chat, same as `_ledger_for`."""
+    process per chat, same as `_ledger_for`. Entries written before ids
+    existed (2026-09-12 → 2026-09-27) get one here, saved straight back."""
     if chat_id not in _GPU_SUBS_LOADED:
         _GPU_SUBS_LOADED.add(chat_id)
         path = _gpu_subs_path(chat_id)
@@ -4444,6 +4445,12 @@ def _gpu_subs_for(chat_id: int) -> list[dict]:
             pass
         except (ValueError, TypeError) as exc:
             log(f"gpu subs for chat {chat_id} unreadable, starting over: {exc!r}")
+        subs = _GPU_SUBS.get(chat_id) or []
+        if any("id" not in s for s in subs):
+            for s in subs:
+                if "id" not in s:
+                    s["id"] = _mint_gpu_sub_id(subs)
+            _save_gpu_subs(chat_id)
     return _GPU_SUBS.setdefault(chat_id, [])
 
 
@@ -4452,6 +4459,49 @@ def _save_gpu_subs(chat_id: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(_GPU_SUBS.get(chat_id) or []), encoding="utf-8")
+    tmp.replace(path)
+
+
+# The last firings, newest first, for the phone's "Recent" list and its
+# in-app banner (2026-09-27 spec §1). The Telegram message is still the
+# notification; this is only what the app reads back when it opens.
+_GPU_FIRED_KEEP = 10
+
+
+def _gpu_fired_path(chat_id: int) -> Path:
+    return ROOT / "batch" / f"tg-{chat_id}.gpusubs-fired.json"
+
+
+def _mint_gpu_sub_id(existing: list[dict]) -> str:
+    taken = {s.get("id") for s in existing}
+    while True:
+        sub_id = secrets.token_hex(3)
+        if sub_id not in taken:
+            return sub_id
+
+
+def _new_gpu_sub(gpu_id: str, dc: str, existing: list[dict]) -> dict:
+    return {"id": _mint_gpu_sub_id(existing), "gpu_id": gpu_id,
+            "datacenter_id": dc, "created_at": time.time()}
+
+
+def _gpu_fired_for(chat_id: int) -> list[dict]:
+    try:
+        data = json.loads(_gpu_fired_path(chat_id).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except (ValueError, TypeError) as exc:
+        log(f"gpu fired history for chat {chat_id} unreadable, starting over: {exc!r}")
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _record_gpu_fired(chat_id: int, entry: dict) -> None:
+    fired = [entry, *_gpu_fired_for(chat_id)][:_GPU_FIRED_KEEP]
+    path = _gpu_fired_path(chat_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(fired), encoding="utf-8")
     tmp.replace(path)
 
 
@@ -4562,7 +4612,7 @@ def _add_gpu_sub(tg: Tg, chat_id: int, message_id: int, short: str, dc: str) -> 
                         f"already subscribed to {_esc(_GPU_DISPLAY_SHORT[gpu_id])} "
                         f"@ {_esc(dc)} — see /unsubscribe to remove it.")
         return
-    subs.append({"gpu_id": gpu_id, "datacenter_id": dc})
+    subs.append(_new_gpu_sub(gpu_id, dc, subs))
     _save_gpu_subs(chat_id)
     home_dc = _home_datacenter()
     caveat = (f"\n{ICON_WARN} not your volume's home datacenter — renting here "
@@ -4647,6 +4697,11 @@ def _tick_gpu_subs(tg: Tg, chat_id: int) -> None:
     for sub, hit in fired:
         short = _GPU_DISPLAY_SHORT.get(sub["gpu_id"], sub["gpu_id"])
         price = f"${hit.price_per_hr:.2f}/h" if hit.price_per_hr else "?"
+        _record_gpu_fired(chat_id, {
+            "sub_id": sub.get("id") or "", "gpu_id": sub["gpu_id"],
+            "datacenter_id": sub["datacenter_id"], "stock": hit.stock_status,
+            "usd_per_hr": hit.price_per_hr or None, "fired_at": time.time(),
+            "action": "notified"})
         tg.send_message(
             chat_id,
             f"🔔 <b>{_esc(short)}</b> is now available at "
