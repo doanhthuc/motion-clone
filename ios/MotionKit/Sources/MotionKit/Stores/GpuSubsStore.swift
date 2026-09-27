@@ -48,7 +48,10 @@ public final class GpuSubsStore {
     public var unseen: [GpuSubFiring] { fired.filter { $0.firedAt > lastSeen } }
 
     public func markSeen() {
-        lastSeen = fired.map(\.firedAt).max() ?? Date().timeIntervalSince1970
+        // 0, not the phone's clock, when nothing has fired (2026-09-27):
+        // `fired_at` is the VPS's clock, and a phone running ahead of it
+        // would silently swallow the next firing as already seen.
+        lastSeen = fired.map(\.firedAt).max() ?? 0
         defaults.set(lastSeen, forKey: Self.seenKey)
     }
 

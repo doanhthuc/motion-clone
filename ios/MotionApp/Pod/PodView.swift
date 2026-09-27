@@ -160,7 +160,7 @@ extension PodView {
     @ViewBuilder fileprivate var firedBanner: some View {
         if watchLevel == .collapsed, let firing = subs.unseen.first, firing.id != bannerHidden {
             let text = firing.resumed
-                ? "⚡ \(firing.name) @ \(firing.datacenter) came into stock — auto-resumed, a pod was rented."
+                ? "⚡ \(firing.name) @ \(firing.datacenter) came into stock — auto-resume started a rental, check the run."
                 : firing.refused
                     ? "🔔 \(firing.name) @ \(firing.datacenter) came into stock. Auto-resume skipped: \(firing.reason ?? "refused")."
                     : "🔔 \(firing.name) @ \(firing.datacenter) came into stock (\(firing.stock))."

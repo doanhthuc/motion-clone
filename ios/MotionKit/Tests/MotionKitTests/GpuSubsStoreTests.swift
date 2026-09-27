@@ -64,6 +64,19 @@ extension URLProtocolTests {
         #expect(again.unseen.isEmpty)
     }
 
+    @Test func anEmptyFirstLoadStillShowsTheFirstFiring() async {
+        // markSeen with nothing fired must store 0, not the phone's clock: a
+        // phone ahead of the VPS would otherwise hide the next firing.
+        let routes = Routes()
+        routes.listing = #"{"subs": [], "fired": []}"#
+        let (store, defaults) = store(routes)
+        await store.load()
+        #expect(defaults.double(forKey: GpuSubsStore.seenKey) == 0)
+        routes.listing = GpuSubsStoreTests.listing
+        await store.load()
+        #expect(store.unseen.map(\.subId) == ["old001"])
+    }
+
     @Test func watchPostsSnakeCaseThenReloads() async throws {
         let (store, _) = store(Routes())
         let ok = await store.watch(gpu: "NVIDIA GeForce RTX 5090", datacenter: "EU-CZ-1", autoResumeRunID: nil)

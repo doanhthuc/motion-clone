@@ -451,6 +451,7 @@ private struct RetryRentalCard: View {
     @Environment(AppModel.self) private var model
     let flow: RunFlow
     let failure: FailedRental
+    @State private var confirmingAutoResume = false
 
     var body: some View {
         // The label names the card `retryRental()` actually sends
@@ -479,21 +480,49 @@ private struct RetryRentalCard: View {
             // auto-resume only at home, and a stock-out's datacenter IS home
             // (pod-provision.sh can only try there).
             if failure.stockOut, let dc = failure.datacenter, let subs = model.gpuSubs, let runID = flow.runID {
-                let armed = subs.armed?.gpu == failure.gpu && subs.armed?.datacenter == dc
-                Button(armed ? "Auto-resume armed · \(failure.gpu) @ \(dc)" : "Resume when in stock",
-                       systemImage: armed ? "bolt.fill" : "bolt") {
-                    Task { await subs.watch(gpu: failure.gpu, datacenter: dc, autoResumeRunID: runID) }
+                let armedSub = subs.armed.flatMap { $0.gpu == failure.gpu && $0.datacenter == dc ? $0 : nil }
+                let name = armedSub?.name ?? displayName(failure.gpu)
+                Button(armedSub != nil ? "Auto-resume armed · \(name) @ \(dc)" : "Resume when in stock",
+                       systemImage: armedSub != nil ? "bolt.fill" : "bolt") {
+                    confirmingAutoResume = true
                 }
                 .buttonStyle(SecondaryButtonStyle())
-                .disabled(armed || subs.inFlight.contains("\(failure.gpu)|\(dc)"))
+                .disabled(armedSub != nil || subs.inFlight.contains("\(failure.gpu)|\(dc)"))
                 .accessibilityIdentifier("run.resumeWhenInStock")
+                // Arming is an unattended spend, so the ceiling is shown before
+                // it is agreed to (spec §2), never armed in one tap (2026-09-27).
+                .confirmationDialog("Auto-resume when \(name) is back at \(dc)?",
+                                    isPresented: $confirmingAutoResume, titleVisibility: .visible) {
+                    Button("Rents automatically at ≤ \(ceiling(gpu: failure.gpu, datacenter: dc))") {
+                        Task { await subs.watch(gpu: failure.gpu, datacenter: dc, autoResumeRunID: runID) }
+                    }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("A pod is rented for this run without asking again, as soon as runpodctl lists stock.")
+                }
                 if let message = subs.message {
                     Text(message).font(.footnote).foregroundStyle(Theme.warning)
                 }
             }
         }
         .heroSurface()
-        .task { await model.gpuSubs?.load() }
+        .task {
+            await model.gpuSubs?.load()
+            // The ceiling quote reads the stock list; the Pod tab may not
+            // have loaded it yet this session.
+            if failure.stockOut, model.gpu?.stock == nil { await model.gpu?.load() }
+        }
+    }
+
+    /// The home-datacenter price the server will store as the ceiling —
+    /// the same figure the GPU sheet's bolt quotes.
+    private func ceiling(gpu: String, datacenter: String) -> String {
+        model.gpu?.stock?.datacenters(for: gpu).first { $0.datacenter == datacenter }?
+            .usdPerHr.map { "\(Format.usd($0))/h" } ?? "today's price"
+    }
+
+    private func displayName(_ gpu: String) -> String {
+        model.gpu?.stock?.gpus.first { $0.gpu == gpu }?.name ?? gpu
     }
 }
 

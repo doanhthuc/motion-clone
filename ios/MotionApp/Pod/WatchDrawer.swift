@@ -123,7 +123,9 @@ struct FiringRow: View {
                         .font(.footnote).foregroundStyle(Theme.secondary)
                 }
                 if firing.resumed {
-                    Label("Auto-resumed — a pod was rented", systemImage: "bolt.fill")
+                    // "resumed" only means a drain started; the rental itself
+                    // can still fail, so this must not claim a pod exists.
+                    Label("Auto-resume started a rental — check the run", systemImage: "bolt.fill")
                         .font(.footnote).foregroundStyle(Theme.accent)
                 } else if firing.refused, let reason = firing.reason {
                     Label("Auto-resume skipped: \(reason)", systemImage: "exclamationmark.triangle")
