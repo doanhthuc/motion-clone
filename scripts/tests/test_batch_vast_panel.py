@@ -20,7 +20,8 @@ MOTION = Run(id="r1", pipeline="motion-enhance", stage_params={"enhance": {"engi
 
 def _quote(**over):
     base = dict(offer_id=1, machine_id=7, dph=0.90, gpu="RTX 5090", location="Bulgaria, BG",
-                ready_s=556.0, known=False, bandwidth_usd=0.10, gb=51.8, qualifying=4,
+                ready_s=556.0, known=False, bandwidth_usd=0.10, gb=51.8, run_s=430.0,
+                qualifying=4,
                 fetched_at=0.0)
     base.update(over)
     return VastQuote(**base)
@@ -63,17 +64,28 @@ class TestStaticBlockers(unittest.TestCase):
 
 class TestGpuSeconds(unittest.TestCase):
     def test_sums_the_measured_stage_times(self):
-        self.assertEqual(gpu_seconds(_manifest(MOTION)), 247 + 114)
+        self.assertEqual(gpu_seconds(_manifest(MOTION)), 247 + 183)
 
     def test_a_local_tryon_costs_no_gpu_time(self):
         run = Run(id="t", pipeline="tryon-motion-enhance",
                   stage_params={"tryon": {"provider": "gemini"}})
-        self.assertEqual(gpu_seconds(_manifest(run)), 247 + 114)
+        self.assertEqual(gpu_seconds(_manifest(run)), 247 + 183)
 
     def test_a_self_hosted_tryon_does_cost_gpu_time(self):
         run = Run(id="t", pipeline="tryon-motion-enhance",
                   stage_params={"tryon": {"provider": "qwen"}})
-        self.assertEqual(gpu_seconds(_manifest(run)), 351 + 247 + 114)
+        self.assertEqual(gpu_seconds(_manifest(run)), 351 + 247 + 183)
+
+    def test_three_camera_videos_estimate_what_runpod_actually_took(self):
+        # The batch the user runs: three tryon-camera-motion-enhance videos with a local try-on.
+        # Three such batches on a RunPod 5090 took 31.7, 31.7 and 32.4 min of GPU work
+        # (out/2026-09-15-0957, 2026-09-19-1105, 2026-09-23-0946). camera-motion used to be missing
+        # from the table and fell back to its 60-min ceiling: 186 min for this batch.
+        runs = [Run(id=f"r{i}", pipeline="tryon-camera-motion-enhance",
+                    stage_params={"camera-tryon": {"provider": "qwen-max"}}) for i in range(3)]
+        minutes = gpu_seconds(_manifest(*runs)) / 60
+        self.assertAlmostEqual(minutes, 3 * (460 + 183) / 60)
+        self.assertLess(abs(minutes - 32.0), 1.0)
 
     def test_an_unmeasured_stage_falls_back_to_its_timeout_ceiling(self):
         run = Run(id="c", pipeline="character-swap")
@@ -151,7 +163,7 @@ class TestBuildView(unittest.TestCase):
         self.assertIn("52 GB", text)
         self.assertIn("Vast credit: $10.00", text)
         self.assertNotIn("No spend button", text)
-        self.assertAlmostEqual(view.session_usd, session_usd(_quote(), 361.0))
+        self.assertAlmostEqual(view.session_usd, session_usd(_quote(), 247 + 183))
 
     def test_an_unmeasured_machine_says_so_and_a_measured_one_gives_its_own_time(self):
         self.assertIn("not measured", "\n".join(self._view().lines))

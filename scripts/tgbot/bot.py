@@ -67,8 +67,8 @@ from tgbot.ingest import (Probe, describe, probe, quality_warning,
 from tgbot.job import (DEFAULT_PROVIDER, Job, _tryon_stage, _unique_ids, missing_slots,
                        render_manifest, run_id_for, slot_for, write_manifest)
 from tgbot.preview import sheet, slot_preview
-from tgbot.vast_panel import (build_view as vast_build_view, parse_enabled, spend_blockers,
-                              static_blockers)
+from tgbot.vast_panel import (build_view as vast_build_view, gpu_seconds as vast_gpu_seconds,
+                              parse_enabled, spend_blockers, static_blockers)
 # `run as run_mod` alongside the from-imports, for exactly one caller:
 # _busy_reason, which has to resolve drain_running through tgbot.run's OWN
 # globals so it cannot disagree with the busy() that just returned True. See
@@ -5194,7 +5194,8 @@ def _offer_vast_panel(tg: Tg, chat_id: int, *, message_id: int | None, force: bo
     gb = vast_download_gb(manifest)
     view = vast_build_view(
         manifest, gb=gb, enabled=_vast_enabled(),
-        quote_fn=lambda: vast_fetch_quote(gb, force=force, repo_root=_REPO_ROOT),
+        quote_fn=lambda: vast_fetch_quote(gb, vast_gpu_seconds(manifest), force=force,
+                                          repo_root=_REPO_ROOT),
         credit_fn=vast_credit)
     lines = [heading or f"{ICON_NVIDIA_CE} <b>Choose GPU</b>", "", *view.lines]
     buttons = [_provider_row("vast"),
@@ -7189,7 +7190,8 @@ def _rent_panel_data(chat_id: int, *, force: bool, manifest: Manifest | None) ->
         gb = vast_download_gb(manifest)
         view = vast_build_view(
             manifest, gb=gb, enabled=enabled,
-            quote_fn=lambda: vast_fetch_quote(gb, force=force, repo_root=_REPO_ROOT),
+            quote_fn=lambda: vast_fetch_quote(gb, vast_gpu_seconds(manifest), force=force,
+                                              repo_root=_REPO_ROOT),
             credit_fn=vast_credit)
         vast = {"enabled": bool(enabled),
                "usd_per_hr": view.quote.dph if view.quote else None,

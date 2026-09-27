@@ -561,15 +561,28 @@ RunPod's volume). When anything failed, `teardown()` pulls the post-mortem befor
 `scripts/vast_rent.py`. It searches (a random ~40-row sample) plus a `machine_id=` query for the
 machines it has measured as fast, drops offers that fail the filters (price cap `MAX_DPH`,
 `MIN_DISK_BW`, `MIN_CPU_GHZ`, advertised bandwidth `VAST_MIN_INET_MBPS` default 1000, bandwidth
-price `VAST_MAX_DOWN_USD_PER_TB` default 20, direct ports, blacklist), and ranks the rest by
-`dph × ready_seconds / 3600 + GB × $/TB / 1000`. `ready_seconds` is the machine's own measured
+price `VAST_MAX_DOWN_USD_PER_TB` default 20, direct ports, blacklist), and ranks the rest by the
+estimated cost of the whole session, `dph × (ready_seconds + 232 + VAST_RUN_S) / 3600 + GB × $/TB /
+1000` (amended 2026-09-27 — see below). `ready_seconds` is the machine's own measured
 time from AFTER `vastai create` returns until `actual_status` reads `running` (not from before the
 create call — the search and rank steps before it are not part of this figure), read from
 `batch/vast-machines.json` (git-ignored), or 556 s — the slowest ever seen — for a machine nobody
 has measured. `VAST_GB` is the manifest's actual download size PLUS the measured base-image pull
 (`VAST_IMAGE_GB`, `drain.py`) — computed and exported by `drain.py`'s `provision()` before
 renting; it falls back to the `vast_rent.py` default of 60 only when `pod-provision.sh`/
-`vast_rent.py` is run directly, outside `drain.py`. Every instance is created
+`vast_rent.py` is run directly, outside `drain.py`. `VAST_RUN_S` is the manifest's estimated GPU
+work (`tgbot.vast_panel.gpu_seconds`, exported by the same `provision()`; 3600 when run directly),
+and 232 s is the measured bootstrap after `running` (`BOOT_AFTER_RUNNING_S`). The search passes
+`--storage <DISK>`, so `dph` includes the disk actually rented — the CLI otherwise prices 5 GiB.
+
+**Why the whole session, not just the boot (2026-09-27).** The first ranking was
+`dph × ready_seconds + bandwidth`: what it costs to get READY. It left the batch's own GPU hours
+out, and those dominate. On a live 5090 search that day it ranked Alberta ($0.868/h, $4/TB) above
+Quebec ($0.646/h, $8/TB); with 61 GB to pull, Quebec is $0.03 cheaper over a one-hour batch and
+$0.22 per further hour. The same search also showed the missing storage: at 100 GB disk the
+storage alone was $0.02–0.09/h, absent from `dph` without `--storage`. Upload bandwidth is billed
+too but not modelled: a batch sends back only its output videos (tens of MB), under $0.01 even at
+the $40/TB worst case. Every instance is created
 with `--label motion-transfer --cancel-unavail`. If it
 is not `running` after `VAST_PULL_DEADLINE_S` (default 480, clamped to stay under the watchdog's
 10-minute grace minus 60s slack) it is destroyed, the machine is blacklisted for a day, and the

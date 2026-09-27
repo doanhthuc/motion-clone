@@ -6,8 +6,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batchlib_ext.vast_scoreboard import (BLACKLIST_TTL_S, WORST_KNOWN_PULL_S,
                                           MachineRecord, Scoreboard)
-from batchlib_ext.vast_select import (Criteria, dedupe, explain_rejections,
-                                      format_table, rank, reject_reason)
+from batchlib_ext.vast_select import (BOOT_AFTER_RUNNING_S, Criteria, dedupe,
+                                      explain_rejections, format_table, rank, reject_reason,
+                                      session_usd)
 
 NOW = 10_000.0
 
@@ -74,18 +75,44 @@ class TestRejectReason(unittest.TestCase):
 class TestRank(unittest.TestCase):
     def test_bandwidth_is_priced_per_gb_from_the_per_tb_rate(self):
         ranked, _ = rank([offer(internet_down_cost_per_tb=40.0)],
-                         Criteria(0.60, 0, 0, 0, 100.0), Scoreboard({}), gb=50.0, now=NOW)
+                         Criteria(0.60, 0, 0, 0, 100.0), Scoreboard({}), gb=50.0, run_s=0.0,
+                         now=NOW)
         self.assertAlmostEqual(ranked[0].bandwidth_usd, 2.00)
         ranked, _ = rank([offer(internet_down_cost_per_tb=1.37)],
-                         Criteria(0.60, 0, 0, 0, 100.0), Scoreboard({}), gb=50.0, now=NOW)
+                         Criteria(0.60, 0, 0, 0, 100.0), Scoreboard({}), gb=50.0, run_s=0.0,
+                         now=NOW)
         self.assertAlmostEqual(ranked[0].bandwidth_usd, 0.0685)
 
     def test_an_unknown_machine_is_scored_at_the_slowest_ever_seen(self):
         ranked, _ = rank([offer(dph_total=0.36, internet_down_cost_per_tb=0.0)], CRIT,
-                         Scoreboard({}), gb=50.0, now=NOW)
+                         Scoreboard({}), gb=50.0, run_s=0.0, now=NOW)
         self.assertEqual(ranked[0].ready_s, WORST_KNOWN_PULL_S)
         self.assertFalse(ranked[0].known)
-        self.assertAlmostEqual(ranked[0].score, 0.36 * WORST_KNOWN_PULL_S / 3600.0)
+        self.assertAlmostEqual(ranked[0].score,
+                               0.36 * (WORST_KNOWN_PULL_S + BOOT_AFTER_RUNNING_S) / 3600.0)
+
+    def test_the_score_is_the_whole_session_not_just_the_boot(self):
+        # GPU hours bill from create to destroy: the cold start, the bootstrap after `running`,
+        # AND the batch itself, plus the bandwidth the boot pulls.
+        ranked, _ = rank([offer(dph_total=0.60, internet_down_cost_per_tb=4.0)], CRIT,
+                         Scoreboard({}), gb=61.0, run_s=3600.0, now=NOW)
+        expected = 0.60 * (WORST_KNOWN_PULL_S + BOOT_AFTER_RUNNING_S + 3600.0) / 3600.0 \
+            + 61.0 * 4.0 / 1000.0
+        self.assertAlmostEqual(ranked[0].score, expected)
+        self.assertAlmostEqual(ranked[0].score,
+                               session_usd(0.60, WORST_KNOWN_PULL_S, 3600.0, 61.0 * 0.004))
+
+    def test_a_long_batch_prefers_the_cheaper_hour_over_the_cheaper_bandwidth(self):
+        # Live 5090 offers, 2026-09-27: Alberta $0.868/h at $4/TB against Quebec $0.646/h at
+        # $8/TB, 61 GB to pull. The boot-only score put Alberta first; over a one-hour batch
+        # Quebec is $0.03 cheaper, and the gap grows with every further hour.
+        alberta = offer(id=1, machine_id=1, dph_total=0.868, internet_down_cost_per_tb=4.0)
+        quebec = offer(id=2, machine_id=2, dph_total=0.646, internet_down_cost_per_tb=8.0)
+        crit = Criteria(1.00, 3000.0, 2.5, 1000.0, 20.0)
+        short, _ = rank([alberta, quebec], crit, Scoreboard({}), gb=61.0, run_s=0.0, now=NOW)
+        self.assertEqual([r.offer["id"] for r in short], [1, 2])
+        long, _ = rank([alberta, quebec], crit, Scoreboard({}), gb=61.0, run_s=3600.0, now=NOW)
+        self.assertEqual([r.offer["id"] for r in long], [2, 1])
 
     def test_a_known_fast_machine_beats_a_cheaper_unknown_one(self):
         # The point of measuring: 0.60 $/h with a 35 s warm start is cheaper to GET READY than
@@ -93,7 +120,8 @@ class TestRank(unittest.TestCase):
         cheap_unknown = offer(id=1, machine_id=1, dph_total=0.40)
         dear_known = offer(id=2, machine_id=2, dph_total=0.60)
         fast = MachineRecord(2, 35.0, None, None, measured_at=NOW - 60, outcome="ok")
-        ranked, _ = rank([cheap_unknown, dear_known], CRIT, board_with(fast), gb=50.0, now=NOW)
+        ranked, _ = rank([cheap_unknown, dear_known], CRIT, board_with(fast), gb=50.0,
+                         run_s=0.0, now=NOW)
         self.assertEqual([r.offer["id"] for r in ranked], [2, 1])
         self.assertTrue(ranked[0].known)
         self.assertEqual(ranked[0].ready_s, 35.0)
@@ -102,18 +130,20 @@ class TestRank(unittest.TestCase):
         a = offer(id=1, machine_id=1, dph_total=0.50, internet_down_cost_per_tb=0.0)
         b = offer(id=2, machine_id=2, dph_total=0.45, internet_down_cost_per_tb=0.0)
         fast = lambda mid: MachineRecord(mid, 100.0, None, None, NOW, "ok")
-        ranked, _ = rank([a, b], CRIT, board_with(fast(1), fast(2)), gb=0.0, now=NOW)
+        ranked, _ = rank([a, b], CRIT, board_with(fast(1), fast(2)), gb=0.0, run_s=0.0,
+                         now=NOW)
         self.assertEqual([r.offer["id"] for r in ranked], [2, 1])
 
     def test_rejections_are_counted_by_reason(self):
         offers = [offer(id=1), offer(id=2, dph_total=0.90), offer(id=3, dph_total=0.95),
                   offer(id=4, disk_bw=100.0)]
-        ranked, rejected = rank(offers, CRIT, Scoreboard({}), gb=50.0, now=NOW)
+        ranked, rejected = rank(offers, CRIT, Scoreboard({}), gb=50.0, run_s=0.0, now=NOW)
         self.assertEqual([r.offer["id"] for r in ranked], [1])
         self.assertEqual(rejected, Counter({"over price cap": 2, "disk too slow": 1}))
 
     def test_an_offer_without_a_machine_id_is_ranked_as_unknown(self):
-        ranked, _ = rank([offer(machine_id=None)], CRIT, Scoreboard({}), gb=10.0, now=NOW)
+        ranked, _ = rank([offer(machine_id=None)], CRIT, Scoreboard({}), gb=10.0, run_s=0.0,
+                         now=NOW)
         self.assertIsNone(ranked[0].machine_id)
         self.assertEqual(ranked[0].ready_s, WORST_KNOWN_PULL_S)
 
@@ -138,10 +168,11 @@ class TestHelpers(unittest.TestCase):
     def test_table_marks_measured_versus_unmeasured(self):
         fast = MachineRecord(58908, 35.0, None, None, NOW, "ok")
         ranked, _ = rank([offer(), offer(id=2, machine_id=2)], CRIT, board_with(fast),
-                         gb=50.0, now=NOW)
+                         gb=50.0, run_s=0.0, now=NOW)
         table = format_table(ranked)
         self.assertIn("measured", table)
         self.assertIn("unmeasured", table)
+        self.assertIn("session $", table)
         self.assertIn("42230244", table)
 
 

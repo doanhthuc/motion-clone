@@ -12,7 +12,8 @@ from batchlib_ext.vast_quote import fetch_quote, last_quote
 
 _JSON = json.dumps({"offer_id": 4401, "machine_id": 55, "dph": 0.45, "gpu": "RTX 5090",
                     "location": "Bulgaria, BG", "ready_s": 556.0, "known": False,
-                    "bandwidth_usd": 0.07, "gb": 51.8, "qualifying": 6})
+                    "bandwidth_usd": 0.07, "gb": 51.8, "run_s": 361.0,
+                    "session_usd": 0.19, "qualifying": 6})
 
 
 def _proc(stdout="", stderr="", returncode=0):
@@ -40,8 +41,8 @@ class TestFetchQuote(unittest.TestCase):
         vast_quote._last = None
         self.clock = [1000.0]
 
-    def _fetch(self, run, gb=51.8, **kw):
-        return fetch_quote(gb, run=run, now=lambda: self.clock[0], repo_root=Path("/repo"), **kw)
+    def _fetch(self, run, gb=51.8, run_s=361.0, **kw):
+        return fetch_quote(gb, run_s, run=run, now=lambda: self.clock[0], repo_root=Path("/repo"), **kw)
 
     def test_parses_the_last_json_line_amid_log_noise(self):
         run = FakeRun(_proc(stdout="\x1b[36m==>\x1b[0m something\nnoise\n" + _JSON + "\n"))
@@ -49,6 +50,7 @@ class TestFetchQuote(unittest.TestCase):
         self.assertEqual((q.offer_id, q.machine_id, q.dph, q.location), (4401, 55, 0.45, "Bulgaria, BG"))
         self.assertFalse(q.known)
         self.assertEqual(q.ready_s, 556.0)
+        self.assertEqual(q.run_s, 361.0)
 
     def test_runs_the_provision_script_in_quote_mode_on_vast_with_no_volume(self):
         run = FakeRun(_proc(stdout=_JSON))
@@ -60,6 +62,7 @@ class TestFetchQuote(unittest.TestCase):
         self.assertEqual((env["GPU_PROVIDER"], env["POD_VOLUME"], env["VAST_QUOTE"]),
                          ("vast", "", "1"))
         self.assertEqual(env["VAST_GB"], "51.8")
+        self.assertEqual(env["VAST_RUN_S"], "361")
 
     def test_confirm_never_reaches_the_child_even_when_the_bot_process_has_it(self):
         run = FakeRun(_proc(stdout=_JSON))
@@ -86,6 +89,14 @@ class TestFetchQuote(unittest.TestCase):
         run = FakeRun(_proc(stdout=_JSON))
         self._fetch(run, gb=51.8)
         self._fetch(run, gb=17.4)
+        self.assertEqual(len(run.calls), 2)
+
+    def test_a_different_run_time_is_a_different_cache_entry(self):
+        # The best offer depends on the batch length (a long batch favours the cheaper hour),
+        # so a quote for a 6-minute batch must not answer for a 2-hour one.
+        run = FakeRun(_proc(stdout=_JSON))
+        self._fetch(run, run_s=361.0)
+        self._fetch(run, run_s=7200.0)
         self.assertEqual(len(run.calls), 2)
 
     def test_a_failure_raises_the_reason_without_ansi_or_the_knobs_paragraph(self):

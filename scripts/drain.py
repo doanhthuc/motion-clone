@@ -29,6 +29,7 @@ from batchlib_ext.provision_failure import (ProvisionFailure,
                                             clear_provision_failure,
                                             provision_failure_path,
                                             write_provision_failure)
+from tgbot.vast_panel import gpu_seconds
 
 ROOT = Path(__file__).resolve().parents[1]
 LEASE_PATH = ROOT / "batch" / "pod-lease.json"
@@ -130,9 +131,10 @@ def provision(*, ceiling_min: int, manifest_path: Path, manifest: Manifest) -> s
 
     `manifest` is used only to size VAST_GB (the bandwidth-cost term vast_select.rank uses) to
     this run's actual download -- the manifest's models plus the measured base-image pull
-    (VAST_IMAGE_GB) -- never to decide what pipeline/params to run; batch_run.py owns that. Only
-    set for the same explicit non-runpod --provider case POD_VOLUME= already is, below, so a
-    RunPod run's rent command is unchanged.
+    (VAST_IMAGE_GB) -- and VAST_RUN_S (the GPU-hours term) to its estimated GPU work; never to
+    decide what pipeline/params to run, batch_run.py owns that. Only set for the same explicit
+    non-runpod --provider case POD_VOLUME= already is, below, so a RunPod run's rent command is
+    unchanged.
     """
     hours = pod_max_hours(ceiling_min, env_get(ROOT / ".env", "POD_MAX_HOURS"))
     # A vast run has no volume. `.env` keeps the RunPod one for the home provider, and
@@ -143,7 +145,10 @@ def provision(*, ceiling_min: int, manifest_path: Path, manifest: Manifest) -> s
     no_volume = "POD_VOLUME= " if chosen and chosen != "runpod" else ""
     vast_gb = ""
     if chosen and chosen != "runpod":
-        vast_gb = f"VAST_GB={vast_download_gb(manifest):.1f} "
+        # VAST_RUN_S: offers are ranked by the whole session's cost, so the batch's own GPU time
+        # goes in too -- the same estimate the bot's Vast panel prices the session with.
+        vast_gb = (f"VAST_GB={vast_download_gb(manifest):.1f} "
+                   f"VAST_RUN_S={gpu_seconds(manifest):.0f} ")
     result = subprocess.run(
         f"{no_volume}{vast_gb}POD_MAX_HOURS={hours} CONFIRM=yes bash scripts/pod-provision.sh",
         shell=True, cwd=ROOT, stderr=subprocess.PIPE, text=True)

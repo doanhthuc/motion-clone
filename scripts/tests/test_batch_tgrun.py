@@ -634,9 +634,17 @@ class TestStopPhaseA(unittest.TestCase):
 
 class TestEstimateMinutes(unittest.TestCase):
     def test_sums_the_measured_medians_for_the_pipeline(self):
-        # docs/batch-runner.md section 7, batch 2026-08-18-2105: tryon 351s,
-        # motion 247s, enhance 114s = 712s -> 12 min.
+        # tryon 351s and motion 247s (batch 2026-08-18-2105), enhance 183s
+        # (median of 32 runs, 2026-09-12..24) = 781s -> 13 min.
         job = Job(slots={}, probes={}, pipeline="tryon-motion-enhance")
+        self.assertEqual(estimate_minutes(job), 13)
+
+    def test_a_camera_video_uses_the_measured_camera_stages(self):
+        # Medians of 31 RunPod 5090 runs (docs/batch-runner.md section 7):
+        # camera-tryon 70s, camera-motion 460s, enhance 183s = 713s -> 12 min.
+        # Before these were measured camera-tryon and camera-motion fell back
+        # to their 20- and 60-min ceilings: 83 min shown for one video.
+        job = Job(slots={}, probes={}, pipeline="tryon-camera-motion-enhance")
         self.assertEqual(estimate_minutes(job), 12)
 
     def test_a_stage_with_no_measurement_falls_back_to_its_timeout_ceiling(self):
@@ -644,7 +652,7 @@ class TestEstimateMinutes(unittest.TestCase):
         # estimate uses STAGES[...].timeout_min — deliberately the pessimistic
         # number rather than a made-up measurement.
         job = Job(slots={}, probes={}, pipeline="character-swap-enhance")
-        expected = round((STAGES["character-swap"].timeout_min * 60 + 114) / 60)
+        expected = round((STAGES["character-swap"].timeout_min * 60 + 183) / 60)
         self.assertEqual(estimate_minutes(job), expected)
 
 

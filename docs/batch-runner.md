@@ -511,3 +511,20 @@ override theo từng run vẫn còn tác dụng.
 
 Con số của bạn sẽ khác nếu đổi `preset`, `quality` hay `fpsInterp`: 60fps thì enhance vừa lâu hơn vừa
 ra file to hơn 48fps.
+
+**Camera pipeline, measured 2026-09-27.** Medians over every finished run in `out/2026-09-12-1408`
+.. `out/2026-09-24-1136` on the VPS (RTX 5090, RunPod EU-RO-1, 540p, 15–30 s drivers,
+`tryon-camera-motion-enhance` with a local try-on). These are what `tgbot/run.py`'s
+`MEASURED_STAGE_SEC` uses, for the bot's time estimate and for ranking Vast offers:
+
+| Stage | Runs | Median s | p25–p75 s |
+|---|---:|---:|---:|
+| camera-tryon (local, mostly Gemini) | 31 | 70 | 55–98 |
+| camera-tryon, qwen-max only | 7 | 257 | — |
+| camera-motion | 31 | 460 | 432–507 |
+| enhance | 32 | 183 | 172–267 |
+
+Three 3-video batches (`2026-09-15-0957`, `2026-09-19-1105`, `2026-09-23-0946`) summed to 31.7,
+31.7 and 32.4 min of GPU work; 3 × (460 + 183) s = 32.2 min. With bootstrap from the volume that
+is the 35–40 min a 3-video batch takes end to end. Before this table had camera-motion, the stage
+fell back to its 60-min timeout and the same batch was estimated at 186 min.
