@@ -2,9 +2,10 @@ import XCTest
 
 /// Zero-spend, live server: the Pod tab fits on one screen (2026-09-27 spec
 /// §2). Every tile sits inside the window and above the Watching drawer with
-/// no scrolling; the GPU sheet opens and, once the server supports
-/// `?all=1` (post-deploy), lists datacenters. Never taps a bell (a real sub
-/// would post a real Telegram message), Use, Kill or Migrate.
+/// no scrolling; the GPU sheet opens and either lists datacenters or shows
+/// the explicit `gpu.dc.unsupported` notice (pre-deploy, until the server
+/// answers `?all=1` with `datacenters`). Never taps a bell (a real sub would
+/// post a real Telegram message), Use, Kill or Migrate.
 final class PodStageTests: XCTestCase {
     @MainActor
     func testStageFitsAndSheetOpens() throws {
@@ -27,22 +28,22 @@ final class PodStageTests: XCTestCase {
         attach(app, "pod-stage")
 
         tiles.element(boundBy: 0).tap()
+        XCTAssertTrue(app.descendants(matching: .any)["gpu.sheet"].waitForExistence(timeout: 60),
+                      "the GPU sheet opens")
         // Pre-deploy, the live server does not yet answer `?all=1` with
-        // `datacenters`, so the sheet opens with an empty "Datacenters"
-        // section (GpuSheet.swift's "runpodctl lists no datacenter…" copy).
-        // Only assert the sheet itself opens here; the datacenter rows are
-        // verified once the deploy ships (see the spec's gate record).
-        XCTAssertTrue(
-            app.descendants(matching: .any)["gpu.sheet"].waitForExistence(timeout: 60)
-                || app.staticTexts["Datacenters"].waitForExistence(timeout: 5),
-            "the GPU sheet opens"
-        )
+        // `datacenters`, so `GpuSheet` renders the explicit `gpu.dc.unsupported`
+        // notice instead of rows — a distinct, asserted-on state, not a
+        // silently-tolerated absence. Post-deploy, real `gpu.dc.*` rows show
+        // up instead and this test must fail if they ever stop showing up.
+        let unsupported = app.descendants(matching: .any)["gpu.dc.unsupported"]
         let rows = app.descendants(matching: .any).matching(NSPredicate(format: "identifier BEGINSWITH %@", "gpu.dc."))
-        _ = Phase4Draft.waitUntil(timeout: 10) { rows.count > 0 }
-        if rows.count > 0 {
-            attach(app, "gpu-sheet")
-        } else {
+        XCTAssertTrue(Phase4Draft.waitUntil(timeout: 60) { unsupported.exists || rows.count > 0 },
+                      "the sheet shows either datacenters or the pre-deploy notice")
+        if unsupported.exists {
             attach(app, "gpu-sheet-no-datacenters")
+        } else {
+            XCTAssertGreaterThan(rows.count, 0, "the sheet lists datacenters")
+            attach(app, "gpu-sheet")
         }
         app.buttons["Done"].tap()
 

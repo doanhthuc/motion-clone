@@ -206,8 +206,14 @@ fake-server result is not a live one.
 | `xcodebuild … -only-testing:MotionAppUITests/PodStageTests -only-testing:MotionAppUITests/Phase5SmokeTests` on the iPhone 18 Pro Max sim (`CEBAFDD5-2848-423F-A3EA-AC414620C491`) | `PodStageTests` **passed**; `Phase5SmokeTests` **skipped** (a pod is genuinely live right now — its "nothing rented" precondition correctly declines the migrate half). Screenshots `pod-stage`, `gpu-sheet-no-datacenters`, `watch-open` in `out/pod-stage/iphone-18-pro-max/` | 2026-09-27 | implementer (Task 9) |
 | Same, on the iPhone SE (3rd gen) sim (`710BCEBB-2A9E-4401-A0DE-D59460070556`) | `PodStageTests` **passed**; `Phase5SmokeTests` **skipped**, same reason. Screenshots in `out/pod-stage/iphone-se-3rd-gen/` | 2026-09-27 | implementer (Task 9) |
 | `make ios-ui-test` (full suite, iPhone 18 Pro, `43B83B81-13CD-4383-BB43-4D8AEBEA6582`) | **exit 0**. `xcrun xcresulttool get test-results summary`: `totalTestCount: 11`, `passedTests: 10`, `skippedTests: 1` (`Phase5SmokeTests`, same live-pod reason), `failedTests: 0` | 2026-09-27 | implementer (Task 9) |
-| `make ios-contract` | 15 `ok`, **2 `FAIL` — expected pre-deploy**: `GET /v1/gpu/stock?all=1` (`datacentersMissing`: the live server doesn't return `datacenters` yet) and `GET /v1/gpu/subs` (`404 not_found`: route doesn't exist on the VPS yet). All 13 pre-existing checks passed | 2026-09-27 | implementer (Task 9) |
+| `make ios-contract` | **18 checks total: 15 `ok`, 2 `FAIL`, 1 `skip`** (`GET /v1/runs/{id}`, no runs on the server — unrelated, pre-existing). The 2 `FAIL` are exactly the two Task 9 added and both are **expected pre-deploy**: `GET /v1/gpu/stock?all=1` (`datacentersMissing`: the live server doesn't return `datacenters` yet) and `GET /v1/gpu/subs` (`404 not_found`: route doesn't exist on the VPS yet). All 16 pre-existing checks (15 ok + 1 skip) are unchanged from before this task | 2026-09-27 | implementer (Task 9) |
+| `make ios-contract` (fix round 1 re-run, after the `gpu.dc.unsupported` change — that change is UI-only, not a route) | same: 15 `ok`, 2 `FAIL` (identical to the row above), 1 `skip` | 2026-09-27 | implementer (Task 9) |
 | `motions-studio/setup/scrub-secrets.sh --check` | exit 0 | 2026-09-27 | implementer (Task 9) |
+| `make ios-build` (fix round 1 re-run, after the `GpuSheet`/`PodStageTests` changes) | exit 0, clean compile | 2026-09-27 | implementer (Task 9, fix round 1) |
+| `cd ios/MotionKit && swift test` (fix round 1 re-run) | 354/354 passed, exit 0 | 2026-09-27 | implementer (Task 9, fix round 1) |
+| `xcodebuild … -only-testing:MotionAppUITests/PodStageTests -only-testing:MotionAppUITests/Phase5SmokeTests` on the iPhone 18 Pro Max sim (fix round 1 re-run) | `PodStageTests` **passed**, and its screenshot manifest confirms it took the `gpu-sheet-no-datacenters` branch (`gpu.dc.unsupported` present) — the pre-deploy path is exercised, not skipped past; `Phase5SmokeTests` **skipped**, same live-pod reason as before | 2026-09-27 | implementer (Task 9, fix round 1) |
+| Same, on the iPhone SE (3rd gen) sim (fix round 1 re-run) | `PodStageTests` **passed**, same `gpu-sheet-no-datacenters` branch confirmed; `Phase5SmokeTests` **skipped**, same reason | 2026-09-27 | implementer (Task 9, fix round 1) |
+| `motions-studio/setup/scrub-secrets.sh --check` (fix round 1 re-run) | exit 0 | 2026-09-27 | implementer (Task 9, fix round 1) |
 
 **A bug found and fixed while wiring these gates**: `PodView.swift`'s outer
 `.accessibilityIdentifier("pod.stage")` — never itself asserted on by any test — was overriding the
@@ -215,6 +221,19 @@ identifiers of unrelated descendant buttons (`pod.balance`, `gpu.refresh`, `pod.
 back as `pod.stage` in the accessibility tree, iOS 27 / Xcode simulator runtime, build `24A434`),
 which failed `Phase5SmokeTests`' `pod.hero` wait and `PodStageTests`' `pod.watch` lookup. Removed;
 re-ran both classes on both simulators to confirm the fix, then took the passing runs above.
+
+**Fix round 1 (review finding, Important)**: `PodStageTests`' original "sheet lists datacenters"
+check discarded `Phase4Draft.waitUntil`'s result and asserted nothing on `rows`, so the test could
+never fail even if `GpuSheet` stopped rendering `gpu.dc.*` rows after deploy. Fixed by making the
+pre-deploy state an explicit, asserted-on UI state instead of an unchecked guess:
+`GpuSheet.swift` now renders a distinct `gpu.dc.unsupported` row ("This server doesn't list
+datacenters yet — update the bot.") when `stock.datacenters == nil` (server hasn't shipped `?all=1`),
+separate from the pre-existing "runpodctl lists no datacenter…" text for the non-nil-but-empty case.
+`PodStageTests` now waits (≤60s) for either `gpu.dc.unsupported` or a non-empty `gpu.dc.*` row set,
+takes the `gpu.dc.unsupported` branch as the (still non-failing) pre-deploy path, and otherwise
+`XCTAssertGreaterThan(rows.count, 0, …)` — so post-deploy, an empty datacenter list is now a real
+failure. Confirmed live: both simulator re-runs' screenshot manifests show the `gpu-sheet-no-datacenters`
+attachment fired, i.e. the pre-deploy `gpu.dc.unsupported` path was actually exercised, not assumed.
 
 **Not yet proven** (needs the deploy + a live device, out of Task 9's scope):
 - The deploy itself, and the two new `ios-contract` checks passing against the redeployed server.

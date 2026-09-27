@@ -44,12 +44,22 @@ struct GpuSheet: View {
                     else if pod.pod?.lease != nil { Text("A change applies to the next rental.") }
                 }
                 Section {
-                    let rows = stock.datacenters(for: gpu)
-                    if rows.isEmpty {
-                        Text("runpodctl lists no datacenter for this GPU right now.")
+                    // `stock.datacenters == nil` means the server hasn't shipped `?all=1`'s
+                    // `datacenters` field yet (pre-deploy, 2026-09-27 spec §1) — distinct from
+                    // runpodctl genuinely listing nothing, so a UI test (and a user) can tell
+                    // "not deployed" apart from "the feature is broken".
+                    if stock.datacenters == nil {
+                        Text("This server doesn't list datacenters yet — update the bot.")
                             .foregroundStyle(Theme.secondary)
+                            .accessibilityIdentifier("gpu.dc.unsupported")
+                    } else {
+                        let rows = stock.datacenters(for: gpu)
+                        if rows.isEmpty {
+                            Text("runpodctl lists no datacenter for this GPU right now.")
+                                .foregroundStyle(Theme.secondary)
+                        }
+                        ForEach(rows) { dc in datacenterRow(dc) }
                     }
-                    ForEach(rows) { dc in datacenterRow(dc) }
                 } header: {
                     Text("Datacenters")
                 } footer: {

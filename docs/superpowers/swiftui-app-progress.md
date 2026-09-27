@@ -72,10 +72,11 @@ the spec, not here.
     10 passed, 1 skipped, 0 failed**. Screenshots (`pod-stage`, `gpu-sheet-no-datacenters`,
     `watch-open`) are in `out/pod-stage/iphone-18-pro-max/` and `out/pod-stage/iphone-se-3rd-gen/`
     (gitignored).
-  - `make ios-contract`: 15 ok, **2 FAIL — expected pre-deploy**: `GET /v1/gpu/stock?all=1` (the live
-    server doesn't yet return `datacenters`) and `GET /v1/gpu/subs` (404, route doesn't exist yet on
-    the VPS). Both are covered by Task 9's new checks and are expected to flip to `ok` once this
-    branch deploys.
+  - `make ios-contract`: **18 checks total — 15 ok, 2 FAIL, 1 skip** (`GET /v1/runs/{id}`, no runs on
+    the server, unrelated and pre-existing). The 2 FAIL are exactly the two checks Task 9 added, both
+    **expected pre-deploy**: `GET /v1/gpu/stock?all=1` (the live server doesn't yet return
+    `datacenters`) and `GET /v1/gpu/subs` (404, route doesn't exist yet on the VPS). The other 16
+    pre-existing checks (15 ok + 1 skip) are unchanged from before this task.
   - `motions-studio/setup/scrub-secrets.sh --check`: exit 0.
 - **A real bug surfaced and fixed while wiring these tests.** `PodView.swift`'s outer
   `.accessibilityIdentifier("pod.stage")` — applied to the whole stage's `GeometryReader`, never
@@ -86,10 +87,20 @@ the spec, not here.
   Removing the stray identifier fixed both; confirmed by re-running the same two classes on both
   simulators before and after the removal (measured 2026-09-27, this session). Nothing currently
   reads `pod.stage`, so nothing else depends on it existing.
-- **Because `?all=1` isn't live yet, `PodStageTests`' sheet assertion is written to tolerate that**:
-  it asserts only that the sheet opens (`gpu.sheet` exists, or the "Datacenters" header does) and
-  attaches whichever screenshot name (`gpu-sheet` vs. `gpu-sheet-no-datacenters`) matches what it
-  actually found. The datacenter-row assertion (`gpu.dc.*` count > 0) is verified only after deploy.
+- **Fix round 1 (review finding, Important, 2026-09-27).** The first cut of `PodStageTests`' sheet
+  check discarded its `waitUntil` result and asserted nothing on `rows` — it could never fail even if
+  `GpuSheet` stopped rendering datacenter rows post-deploy. Fixed by making the pre-deploy state an
+  explicit, asserted-on UI state rather than a silently-tolerated guess: `GpuSheet.swift` now shows a
+  distinct `gpu.dc.unsupported` row ("This server doesn't list datacenters yet — update the bot.")
+  when `stock.datacenters == nil` (the server hasn't shipped `?all=1` yet), separate from the
+  existing "runpodctl lists no datacenter…" text for the non-nil-but-empty case. `PodStageTests` now
+  waits (≤60s) for either `gpu.dc.unsupported` or a non-empty `gpu.dc.*` row set; the unsupported
+  branch is the (still non-failing) pre-deploy path, and otherwise
+  `XCTAssertGreaterThan(rows.count, 0, …)` — so an empty datacenter list post-deploy is now a real
+  failure. The tautological "or the 'Datacenters' header exists" fallback on the sheet-open check was
+  also removed. Confirmed live: both simulators' re-runs actually took the `gpu-sheet-no-datacenters`
+  screenshot branch, i.e. `gpu.dc.unsupported` really fired, not merely assumed. `make ios-contract`'s
+  gate-record numbers were also corrected in the spec (see its Gate record for the reconciled count).
 - **Not yet proven:**
   - Deploying this branch to motion-vps, and the two new contract checks passing live.
   - The live, zero-spend Telegram check: subscribe from the phone/simulator to a datacenter that
