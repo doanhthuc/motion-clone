@@ -7,7 +7,7 @@ readers are patched by name in `tgbot.bot`, so no test can reach `make
 gpu-destroy`, `volume_migrate.py`, `runpodctl` or `vastai`. A test that could
 reach one unpatched is a defect, not a slow test.
 """
-import contextlib, itertools, json, subprocess, sys, threading, time, unittest
+import contextlib, itertools, json, os, subprocess, sys, threading, time, unittest
 from pathlib import Path
 from unittest import mock
 
@@ -1515,6 +1515,15 @@ def status_for_code(code: str) -> int:
     return status_for(Outcome(False, code, ""))
 
 
+def _stamp_failure(manifest: Path, *, newer: bool) -> None:
+    """Pin the provision failure's mtime one second after (or before) the
+    manifest's, so `_failure_is_for_current_manifest` is tested on an explicit
+    order rather than on how fast two writes happened to land."""
+    base = manifest.stat().st_mtime_ns
+    stamp = base + 1_000_000_000 if newer else base - 1_000_000_000
+    os.utime(provision_failure_path(manifest), ns=(stamp, stamp))
+
+
 class TestAutoResumeTick(_PodFixture):
     """`_tick_gpu_subs` handing an armed sub to `_do_resume` (2026-09-27 spec
     §1 Firing). `start_drain` is patched by `_Fixture`; nothing here rents."""
@@ -1530,6 +1539,7 @@ class TestAutoResumeTick(_PodFixture):
         write_provision_failure(provision_failure_path(self._live()), ProvisionFailure(
             gpu=self.GPU, datacenter="EU-RO-1", stock_out=True,
             detail="no instances available"))
+        _stamp_failure(self._live(), newer=True)
         (self.root / ".env").write_text(
             "GPU=NVIDIA GeForce RTX 4090\nPOD_VOLUME_ID=vol-1\n", encoding="utf-8")
 
@@ -1601,6 +1611,43 @@ class TestAutoResumeTick(_PodFixture):
         self.assertFalse(any("clock is running" in text for text in self._texts()))
         self.assertTrue(any("Nothing was rented" in text for text in self._texts()))
 
+    def test_auto_resume_refuses_a_failure_older_than_the_manifest(self):
+        """Job A stock-outs, job B is confirmed (the manifest is rewritten) and
+        A's provision-failed.json is still on disk: the sub armed with B's
+        token must not rent B unattended (final review, 2026-09-27)."""
+        self._arm()
+        _stamp_failure(self._live(), newer=False)
+        fired = self._fire()
+        self.assertEqual(fired["action"], "resume_refused")
+        self.assertIn("earlier job", fired["reason"])
+        self.patches["start_drain"].assert_not_called()
+        self.assertEqual(env_get(self.root / ".env", "GPU"), "NVIDIA GeForce RTX 4090")
+
+    def test_auto_resume_refuses_when_the_home_datacenter_is_unknown(self):
+        self._arm()
+        self.patches["volume_datacenter"].return_value = None
+        fired = self._fire()
+        self.assertEqual(fired["action"], "resume_refused")
+        self.assertIn("couldn't confirm", fired["reason"])
+        self.patches["start_drain"].assert_not_called()
+
+    def test_auto_resume_with_no_price_says_unknown_not_over_ceiling(self):
+        self._arm()
+        fired = self._fire(price=None)
+        self.assertEqual(fired["action"], "resume_refused")
+        self.assertEqual(fired["reason"], "the current price is unknown")
+        self.patches["start_drain"].assert_not_called()
+
+    def test_auto_resume_restores_env_when_do_resume_raises(self):
+        self._arm()
+        with mock.patch("tgbot.bot._do_resume", side_effect=RuntimeError("boom")):
+            fired = self._fire()
+        self.assertEqual(fired["action"], "resume_refused")
+        self.assertIn("boom", fired["reason"])
+        self.assertEqual(env_get(self.root / ".env", "GPU"), "NVIDIA GeForce RTX 4090")
+        self.assertEqual(bot._gpu_subs_for(ME), [])
+        self.assertTrue(any("Nothing was rented" in text for text in self._texts()))
+
     def test_auto_resume_refuses_while_a_lease_is_live(self):
         self._arm()
         self.patches["read_lease"].return_value = object()
@@ -1642,6 +1689,7 @@ class TestAppPodGpuSubs(_PodFixture):
     def _stock_out(self):
         write_provision_failure(provision_failure_path(self._live()), ProvisionFailure(
             gpu=self.GPU, datacenter="EU-RO-1", stock_out=True, detail="no instances"))
+        _stamp_failure(self._live(), newer=True)
 
     def test_add_then_list_then_remove(self):
         status, body = self.pod.add_gpu_sub({"gpu": self.GPU, "datacenter": "EU-CZ-1"})
@@ -1666,6 +1714,9 @@ class TestAppPodGpuSubs(_PodFixture):
     def test_bad_bodies_are_400(self):
         for body in ({"gpu": "nope", "datacenter": "EU-RO-1"},
                      {"gpu": self.GPU, "datacenter": ""},
+                     {"gpu": self.GPU, "datacenter": "EU RO 1"},
+                     {"gpu": self.GPU, "datacenter": "EU-RO-1:x"},
+                     {"gpu": self.GPU, "datacenter": "A" * 33},
                      {"gpu": self.GPU, "datacenter": "EU-RO-1", "auto_resume": "yes"},
                      {"gpu": self.GPU, "datacenter": "EU-RO-1", "auto_resume": True}):
             with self.subTest(body=body):
@@ -1695,6 +1746,25 @@ class TestAppPodGpuSubs(_PodFixture):
         status, body = self.pod.add_gpu_sub({"gpu": self.GPU, "datacenter": "EU-RO-1",
                                              "auto_resume": True, "run_id": self.pod.run_id})
         self.assertEqual((status, body["error"]["code"]), (409, "no_failure"))
+
+    def test_arming_from_a_failure_older_than_the_manifest_is_409(self):
+        """The stale-failure case (final review, 2026-09-27): the failure file
+        predates the manifest, so it belongs to an earlier job."""
+        self._stock_out()
+        _stamp_failure(self._live(), newer=False)
+        status, body = self.pod.add_gpu_sub({"gpu": self.GPU, "datacenter": "EU-RO-1",
+                                             "auto_resume": True, "run_id": self.pod.run_id})
+        self.assertEqual((status, body["error"]["code"]), (409, "no_failure"))
+        self.assertIn("earlier job", body["error"]["message"])
+        self.assertEqual(bot._gpu_subs_for(ME), [])
+
+    def test_arming_with_an_unknown_home_datacenter_is_502(self):
+        self._stock_out()
+        self.patches["volume_datacenter"].return_value = None
+        status, body = self.pod.add_gpu_sub({"gpu": self.GPU, "datacenter": "EU-RO-1",
+                                             "auto_resume": True, "run_id": self.pod.run_id})
+        self.assertEqual((status, body["error"]["code"]), (502, "upstream_unavailable"))
+        self.assertEqual(bot._gpu_subs_for(ME), [])
 
     def test_arming_another_run_is_409_stale_run(self):
         self._stock_out()

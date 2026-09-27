@@ -4532,6 +4532,11 @@ def _offer_gpu_sub_targets(tg: Tg, chat_id: int) -> None:
         parse_mode=PARSE_HTML)
 
 
+# A RunPod datacenter id (EU-RO-1, US-TX-3, ...). Bounded because
+# /unsubscribe embeds it in Telegram callback_data (64-byte cap).
+_GPU_SUB_DC_RE = re.compile(r"[A-Za-z0-9-]{1,32}")
+
+
 def _home_datacenter() -> str | None:
     """Where the Network Volume lives — the only datacenter a pod can
     actually rent in without migrating first. Same lookup `_report_gpu_stock`
@@ -4681,6 +4686,26 @@ def _remove_gpu_sub(tg: Tg, chat_id: int, message_id: int, short: str, dc: str) 
                     parse_mode=PARSE_HTML)
 
 
+def _failure_is_for_current_manifest(chat_id: int) -> bool:
+    """Was this chat's provision-failed.json written for the manifest on disk now?
+
+    Neither `run_id` (always `tg-<chat>`) nor `run_token` (minted at arm time)
+    can tell a stale failure apart: provision-failed.json survives a NEW job
+    being confirmed, so arming from a Pod sheet still showing job A's stock-out
+    would capture job B's token and rent B unattended (final review,
+    2026-09-27). drain.py writes the failure after Phase A, and nothing in the
+    stock-out flow rewrites the manifest after that (only a new/edited job or a
+    try-on provider switch does), so a failure no older than the manifest
+    belongs to it. Fails closed: a missing file on either side is False.
+    """
+    manifest_path = _job_manifest_path(chat_id)
+    try:
+        return (provision_failure_path(manifest_path).stat().st_mtime_ns
+                >= manifest_path.stat().st_mtime_ns)
+    except OSError:
+        return False
+
+
 def _auto_resume_refusal(chat_id: int, sub: dict, hit) -> str | None:
     """Why an armed sub must only notify, or None when it may resume.
 
@@ -4698,7 +4723,12 @@ def _auto_resume_refusal(chat_id: int, sub: dict, hit) -> str | None:
     failure = read_provision_failure(provision_failure_path(manifest_path))
     if failure is None or not failure.stock_out:
         return "the run no longer has a stock-out to resume from"
-    if sub["datacenter_id"] != _home_datacenter():
+    if not _failure_is_for_current_manifest(chat_id):
+        return "the stock-out on record belongs to an earlier job"
+    home = _home_datacenter()
+    if home is None:
+        return "couldn't confirm the volume's home datacenter"
+    if sub["datacenter_id"] != home:
         return "this is not the volume's home datacenter"
     if busy(manifest_path):
         return "the run is busy"
@@ -4708,8 +4738,12 @@ def _auto_resume_refusal(chat_id: int, sub: dict, hit) -> str | None:
         return "a pod is already live"
     cap = armed.get("max_usd_per_hr")
     price = hit.price_per_hr
-    if not price or cap is None or price > cap:
-        return (f"the price (${price or 0:.2f}/h) is over the ${cap or 0:.2f}/h "
+    if not price:
+        return "the current price is unknown"
+    if cap is None:
+        return "no price ceiling was recorded when it was armed"
+    if price > cap:
+        return (f"the price (${price:.2f}/h) is over the ${cap:.2f}/h "
                 "ceiling set when it was armed")
     return None
 
@@ -4771,8 +4805,15 @@ def _tick_gpu_subs(tg: Tg, chat_id: int, *, dry_run: bool = False) -> None:
             env_path = ROOT / ".env"
             previous_gpu = env_get(env_path, "GPU")
             env_set(env_path, "GPU", sub["gpu_id"])
-            out = _do_resume(tg, chat_id, _job_manifest_path(chat_id),
-                             dry_run=dry_run, gpu_provider="runpod")
+            try:
+                out = _do_resume(tg, chat_id, _job_manifest_path(chat_id),
+                                 dry_run=dry_run, gpu_provider="runpod")
+            except Exception as exc:
+                # An exception is a refusal too (2026-09-27): .env must not be
+                # left pointing at a card nothing was rented for, and one bad
+                # sub must not stop the rest of this tick's firings.
+                log(f"auto-resume raised for chat {chat_id}: {exc!r}")
+                out = Outcome(False, "resume_error", f"auto-resume failed: {exc}")
             if out:
                 entry["action"] = "resumed"
                 tail = (f"\n⚡ <b>Auto-resumed</b> — renting {_esc(short)} @ "
@@ -8029,8 +8070,11 @@ class AppPod:
         if gpu not in _GPU_CATALOG:
             return 400, _run_error("bad_request", "gpu must be one of the catalog ids "
                                                   "from GET /v1/gpu/stock")
-        if not isinstance(dc, str) or not dc.strip() or len(dc) > 64:
-            return 400, _run_error("bad_request", "datacenter is required")
+        # A strict shape, not just "non-empty": /unsubscribe puts the id into
+        # Telegram callback_data, which caps at 64 bytes (2026-09-27).
+        if not isinstance(dc, str) or not _GPU_SUB_DC_RE.fullmatch(dc.strip()):
+            return 400, _run_error("bad_request", "datacenter must be a datacenter id "
+                                                  "like EU-RO-1")
         if not isinstance(auto, bool):
             return 400, _run_error("bad_request", "auto_resume must be true or false")
         if auto and (not isinstance(run_id, str) or not run_id):
@@ -8038,7 +8082,11 @@ class AppPod:
         dc = dc.strip()
         price = None
         if auto:
-            if dc != _home_datacenter():
+            home = _home_datacenter()
+            if home is None:
+                return 502, _run_error("upstream_unavailable",
+                                       "couldn't read the volume's datacenter from runpodctl")
+            if dc != home:
                 return 409, _run_error("not_home_dc",
                                        "auto-resume only rents in the volume's home "
                                        "datacenter — elsewhere needs a migration first")
@@ -8065,6 +8113,10 @@ class AppPod:
                 if failure is None or not failure.stock_out:
                     return 409, _run_error("no_failure",
                                            "this run has no stock-out to resume from")
+                if not _failure_is_for_current_manifest(self.chat_id):
+                    return 409, _run_error("no_failure",
+                                           "the stock-out on record belongs to an earlier "
+                                           "job — confirm or retry this one first")
             subs = _gpu_subs_for(self.chat_id)
             sub = next((s for s in subs
                         if s["gpu_id"] == gpu and s["datacenter_id"] == dc), None)
