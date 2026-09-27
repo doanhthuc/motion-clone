@@ -23,7 +23,7 @@ from batchlib_ext.watchdog import DESTROYABLE_NAMES, GRACE_MIN
 # argparse's own default= expression before it ever looks at argv (F9). Shared between
 # TestMain.setUp and its hermeticity test so both name the same set.
 _VAST_RENT_ENV_KEYS = ("VAST_MIN_INET_MBPS", "VAST_MAX_DOWN_USD_PER_TB", "VAST_GB",
-                       "VAST_PULL_DEADLINE_S", "MAX_DPH")
+                       "VAST_RUN_S", "VAST_PULL_DEADLINE_S", "MAX_DPH")
 
 
 def offer(id, machine_id, dph=0.40, **over):
@@ -39,7 +39,7 @@ CRIT = Criteria(0.60, 3000.0, 2.5, 1000.0, 20.0)
 
 def cfg(**over):
     base = dict(gpu="RTX_5090", disk_gb=120, image="ghcr.io/x/motion-prebuilt:t",
-                reliability=0.95, criteria=CRIT, gb=50.0, pull_deadline_s=480.0)
+                reliability=0.95, criteria=CRIT, gb=50.0, run_s=0.0, pull_deadline_s=480.0)
     base.update(over)
     return vast_rent.RentConfig(**base)
 
@@ -59,13 +59,15 @@ class FakeVast:
         self.destroy_lag = destroy_lag or {}            # polls that still see it after destroy
         self.exists_error = exists_error
         self.queries, self.created, self.destroyed = [], [], []
+        self.storage = []                               # storage_gb each search was priced at
         self.create_attempts, self.destroy_calls, self.exists_checks = [], [], []
         self._polls = {}
         self._seen_after_destroy = {}
         self._n = 0
 
-    def search_offers(self, query):
+    def search_offers(self, query, *, storage_gb):
         self.queries.append(query)
+        self.storage.append(storage_gb)
         if query.startswith("machine_id="):
             mid = int(query.split()[0].split("=")[1])
             return [o for o in self.offers if o["machine_id"] == mid]
@@ -602,20 +604,25 @@ class TestRealVastApi(unittest.TestCase):
 
     def test_search_passes_the_query_as_one_argument_and_parses_a_list(self):
         with self._run(json.dumps([{"id": 1}])) as run:
-            out = vast_rent.RealVastApi().search_offers("gpu_name=RTX_5090 rentable=true")
+            out = vast_rent.RealVastApi().search_offers("gpu_name=RTX_5090 rentable=true",
+                                                        storage_gb=120)
         self.assertEqual(out, [{"id": 1}])
-        self.assertEqual(run.call_args[0][0][:4],
+        argv = run.call_args[0][0]
+        self.assertEqual(argv[:4],
                          ["vastai", "search", "offers", "gpu_name=RTX_5090 rentable=true"])
+        # Priced at the disk we rent: the CLI's default is 5 GiB, which leaves the storage cost
+        # of a 100+ GB disk out of dph_total.
+        self.assertEqual(argv[argv.index("--storage") + 1], "120")
 
     def test_search_rejects_non_list_output(self):
         with self._run(json.dumps({"error": "x"})):
             with self.assertRaises(vast_rent.RentError):
-                vast_rent.RealVastApi().search_offers("q")
+                vast_rent.RealVastApi().search_offers("q", storage_gb=1)
 
     def test_a_missing_binary_is_a_rent_error(self):
         with mock.patch.object(vast_rent.subprocess, "run", side_effect=FileNotFoundError("vastai")):
             with self.assertRaises(vast_rent.RentError):
-                vast_rent.RealVastApi().search_offers("q")
+                vast_rent.RealVastApi().search_offers("q", storage_gb=1)
 
     def test_status_reads_show_instance_and_is_empty_on_failure(self):
         with self._run(json.dumps({"actual_status": "running"})):
@@ -779,6 +786,30 @@ class TestMain(unittest.TestCase):
         self.assertFalse(quote["known"])
         self.assertEqual(quote["qualifying"], 1)
         self.assertEqual(api.create_attempts, [])
+
+    def test_every_search_is_priced_at_the_rented_disk(self):
+        api = FakeVast([offer(7, 70)])
+        self._main(api, "--quote")
+        self.assertTrue(api.storage)
+        self.assertEqual(set(api.storage), {120})
+
+    def test_quote_carries_the_run_time_and_the_session_total_it_ranked_by(self):
+        api = FakeVast([offer(7, 70, dph=0.40, internet_down_cost_per_tb=2.0)])
+        rc, out, _ = self._main(api, "--quote", "--gb", "50", "--run-s", "3600")
+        self.assertEqual(rc, 0)
+        quote = json.loads(out)
+        self.assertEqual(quote["run_s"], 3600.0)
+        expected = 0.40 * (556.0 + 232.0 + 3600.0) / 3600.0 + 50.0 * 2.0 / 1000.0
+        self.assertAlmostEqual(quote["session_usd"], expected)
+
+    def test_run_s_defaults_to_one_hour_when_nobody_passes_a_manifest_estimate(self):
+        rc, out, _ = self._main(FakeVast([offer(7, 70)]), "--quote")
+        self.assertEqual(json.loads(out)["run_s"], 3600.0)
+
+    def test_vast_run_s_from_the_environment_sets_the_run_time(self):
+        with mock.patch.dict(os.environ, {"VAST_RUN_S": "722"}):
+            rc, out, _ = self._main(FakeVast([offer(7, 70)]), "--quote")
+        self.assertEqual(json.loads(out)["run_s"], 722.0)
 
     def test_quote_and_confirm_together_are_refused_before_any_search(self):
         api = FakeVast([offer(7, 70)])

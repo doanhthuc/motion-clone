@@ -206,6 +206,19 @@ class TestProvision(unittest.TestCase):
         cmd = mock_run.call_args[0][0]
         self.assertIn("VAST_GB=51.8", cmd)
 
+    def test_vast_provider_ranks_offers_for_this_manifests_gpu_work(self):
+        # The rental is ranked by its whole session cost, so the rent command needs the batch's
+        # own GPU time -- the same estimate the bot's Vast panel prices the session with.
+        m = _manifest_with_a_motion_run()
+        with mock.patch.object(drain.subprocess, "run") as mock_run, \
+             mock.patch.object(drain, "env_get", side_effect=["8", "pod-xyz"]), \
+             mock.patch.dict(os.environ, {"GPU_PROVIDER": "vast"}, clear=False):
+            mock_run.return_value = mock.Mock(returncode=0, stderr="")
+            drain.provision(ceiling_min=60, manifest_path=Path("x.yaml"), manifest=m)
+        cmd = mock_run.call_args[0][0]
+        self.assertIn(f"VAST_RUN_S={drain.gpu_seconds(m):.0f} ", cmd)
+        self.assertGreater(drain.gpu_seconds(m), 0)
+
     def test_a_manifest_needing_no_models_still_gets_the_image_floor(self):
         m = _empty_manifest()
         with mock.patch.object(drain.subprocess, "run") as mock_run, \
@@ -228,6 +241,7 @@ class TestProvision(unittest.TestCase):
             drain.provision(ceiling_min=60, manifest_path=Path("x.yaml"), manifest=m)
         cmd = mock_run.call_args[0][0]
         self.assertNotIn("VAST_GB", cmd)
+        self.assertNotIn("VAST_RUN_S", cmd)
 
 
 class TestWaitAndBootstrap(unittest.TestCase):

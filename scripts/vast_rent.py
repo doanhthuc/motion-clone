@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Rent a Vast.ai instance: rank by time-to-ready and cost, create, wait, give up on a slow pull.
+"""Rent a Vast.ai instance: rank by estimated session cost, create, wait, give up on a slow pull.
 
     python3 scripts/vast_rent.py --gpu RTX_5090 --disk 120 --image IMG …            # dry run
     python3 scripts/vast_rent.py … --confirm                                        # rents
@@ -55,6 +55,11 @@ VERIFY_POLLS = 3                         # Vast destroys asynchronously: re-list
 VERIFY_SLEEP_S = 3
 FAILED_STATUSES = frozenset({"exited", "error", "offline", "unknown_error"})
 KNOWN_GOOD_QUERIES = 3
+# GPU work a rental is ranked for when the caller has no manifest to estimate it from (a manual
+# `make gpu-provision` session). One hour, the measured average day being 0.85 h (invoice
+# 2026-07-24 -> 08-07, pod-provision.sh): long enough that the hourly rate, not the one-off boot,
+# decides — which is what an interactive session actually pays for.
+DEFAULT_RUN_S = 3600.0
 
 
 class RentError(RuntimeError):
@@ -74,7 +79,7 @@ class _CommandTimeout(RentError):
 
 
 class VastApi(Protocol):
-    def search_offers(self, query: str) -> list[dict]: ...
+    def search_offers(self, query: str, *, storage_gb: int) -> list[dict]: ...
     def create_instance(self, offer_id, *, image: str, disk_gb: int, label: str) -> str: ...
     def instance_status(self, instance_id: str) -> dict: ...
     def destroy_instance(self, instance_id: str) -> None: ...
@@ -92,8 +97,11 @@ class RealVastApi:
         except (OSError, subprocess.SubprocessError) as exc:
             raise RentError(f"could not run {argv[0]}: {exc}") from exc
 
-    def search_offers(self, query: str) -> list[dict]:
-        out = self._run(["vastai", "search", "offers", query, "-o", "dph+", "--raw"], 90)
+    def search_offers(self, query: str, *, storage_gb: int) -> list[dict]:
+        # --storage prices dph_total at the disk we will rent. Without it the CLI assumes 5 GiB,
+        # and at 100 GB the missing storage is $0.02-0.09/h (live 5090 search, 2026-09-27).
+        out = self._run(["vastai", "search", "offers", query, "-o", "dph+", "--raw",
+                         "--storage", str(storage_gb)], 90)
         if out.returncode != 0:
             raise RentError(f"vastai search failed: {out.stderr.strip()} — is your API key set?")
         try:
@@ -178,6 +186,7 @@ class RentConfig:
     reliability: float
     criteria: Criteria
     gb: float                       # GB this rental will download (image + models), prices bandwidth
+    run_s: float                    # seconds of GPU work the batch will do once the box is up
     pull_deadline_s: float
     pin: str | None = None
 
@@ -210,10 +219,10 @@ def _stderr(msg: str) -> None:
 
 
 def gather_offers(api: VastApi, cfg: RentConfig, board: Scoreboard, log) -> list[dict]:
-    offers = list(api.search_offers(cfg.query))
+    offers = list(api.search_offers(cfg.query, storage_gb=cfg.disk_gb))
     for machine_id in board.known_good(limit=KNOWN_GOOD_QUERIES):
         try:
-            offers += api.search_offers(cfg.machine_query(machine_id))
+            offers += api.search_offers(cfg.machine_query(machine_id), storage_gb=cfg.disk_gb)
         except RentError as exc:
             log(f"machine_id={machine_id} lookup failed: {exc}")
     return dedupe(offers)
@@ -332,7 +341,8 @@ def rent(api: VastApi, cfg: RentConfig, board: Scoreboard, *, confirm: bool,
          on_released: Callable[[str], None] = lambda iid: None,
          persist: Callable[[], None] = lambda: None) -> RentResult:
     offers = gather_offers(api, cfg, board, log)
-    ranked, rejected = rank(offers, cfg.criteria, board, gb=cfg.gb, now=now())
+    ranked, rejected = rank(offers, cfg.criteria, board, gb=cfg.gb, run_s=cfg.run_s,
+                             now=now())
     if cfg.pin:
         ranked = [r for r in ranked if str(r.offer["id"]) == str(cfg.pin)]
         if not ranked:
@@ -402,7 +412,7 @@ def rent(api: VastApi, cfg: RentConfig, board: Scoreboard, *, confirm: bool,
                     f"after {pulls} pull attempt(s) and {create_failures} failed create(s){tail}")
 
 
-def quote_json(result: RentResult, gb: float) -> str:
+def quote_json(result: RentResult, gb: float, run_s: float) -> str:
     """The best offer and the terms that priced it, as one JSON line (`--quote`). The bot's
     provider panel reads this instead of scraping the human-readable shortlist."""
     best = result.chosen
@@ -411,7 +421,8 @@ def quote_json(result: RentResult, gb: float) -> str:
         "offer_id": offer.get("id"), "machine_id": best.machine_id,
         "dph": float(offer["dph_total"]), "gpu": offer.get("gpu_name"),
         "location": offer.get("geolocation"), "ready_s": best.ready_s, "known": best.known,
-        "bandwidth_usd": best.bandwidth_usd, "gb": gb, "qualifying": len(result.ranked)},
+        "bandwidth_usd": best.bandwidth_usd, "gb": gb, "run_s": run_s,
+        "session_usd": best.score, "qualifying": len(result.ranked)},
         sort_keys=True)
 
 
@@ -511,6 +522,9 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
     ap.add_argument("--max-down-usd-per-tb", type=float,
                     default=float(_cfg_get("VAST_MAX_DOWN_USD_PER_TB", "20")))
     ap.add_argument("--gb", type=float, default=float(_cfg_get("VAST_GB", "60")))
+    ap.add_argument("--run-s", type=float,
+                    default=float(_cfg_get("VAST_RUN_S", str(DEFAULT_RUN_S))),
+                    help="seconds of GPU work to rank offers for (drain passes the manifest's)")
     ap.add_argument("--pull-deadline", type=float,
                     default=float(_cfg_get("VAST_PULL_DEADLINE_S", str(DEFAULT_PULL_DEADLINE_S))))
     ap.add_argument("--skip", default="")
@@ -591,10 +605,12 @@ def main(argv: list[str] | None = None) -> int:
         skip_offers=frozenset(s.strip() for s in args.skip.split(",") if s.strip()))
     cfg = RentConfig(gpu=args.gpu, disk_gb=args.disk, image=args.image,
                      reliability=args.reliability, criteria=criteria, gb=args.gb,
+                     run_s=args.run_s,
                      pull_deadline_s=pull_deadline, pin=args.offer or None)
     board = load_board(BOARD_PATH)
     env_path = ROOT / ".env"
-    _stderr(f"searching: {cfg.query}  (<= ${args.max_dph:.2f}/hr, ~{args.gb:.0f} GB to download)")
+    _stderr(f"searching: {cfg.query}  (<= ${args.max_dph:.2f}/hr at {args.disk} GB disk, "
+            f"~{args.gb:.0f} GB to download, ~{args.run_s / 60:.0f} min of GPU work)")
     if args.confirm:
         # Only for a real rent: a dry run must not change signal handling. SIGHUP too, not just
         # SIGTERM — a killpg from a detached session (F2) can deliver either depending on how
@@ -612,7 +628,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.quote:
-        print(quote_json(result, args.gb))
+        print(quote_json(result, args.gb, args.run_s))
         return 0
     if not args.confirm:
         _stderr(f"\n{len(result.ranked)} qualifying offer(s), best first:\n"

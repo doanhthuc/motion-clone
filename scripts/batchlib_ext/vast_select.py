@@ -1,13 +1,25 @@
 """Which Vast offers qualify, and in what order — pure functions, no I/O, no clock.
 
-Rank by what it costs to GET READY, not by $/hour alone (spec §3.2):
+Rank by what the whole SESSION will cost, create to destroy (spec §3.2, amended 2026-09-27):
 
-    score = dph_total * ready_s / 3600  +  gb_to_download * internet_down_cost_per_tb / 1000
+    score = dph_total * (ready_s + BOOT_AFTER_RUNNING_S + run_s) / 3600
+            + gb_to_download * internet_down_cost_per_tb / 1000
+
+The first version scored only the cost to GET READY (dph * ready_s + bandwidth). That leaves the
+batch's own GPU hours out, and those dominate: on a live 2026-09-27 search it put Alberta
+($0.868/h, $4/TB) ahead of Quebec ($0.646/h, $8/TB), which is $0.03 cheaper over a one-hour batch
+and further ahead every hour after. `run_s` is the manifest's estimated GPU work
+(tgbot.vast_panel.gpu_seconds), passed in by whoever knows the manifest.
+
+`dph_total` must be priced at the disk actually rented (`vastai search offers --storage`): the CLI
+defaults to 5 GiB, and at 100 GB the storage alone is $0.02-0.09/h on the same search.
 
 `ready_s` is the machine's own measured create -> running time when the scoreboard has one, and
 the slowest ever measured (556 s) when it does not. Bandwidth is billed per TB: a 50 GB boot is
 $2.00 at the Hungarian flat $40/TB and $0.07 at Bulgaria's $1.37/TB, so an expensive-bandwidth host
-is excluded up front rather than discovered on the invoice (docs/gpu-pod.md#vast-ghcr).
+is excluded up front rather than discovered on the invoice (docs/gpu-pod.md#vast-ghcr). Upload is
+billed too, but a batch only sends back its output videos (tens of MB): under $0.01 even at the
+$40/TB worst case seen, so it is not modelled.
 
 `inet_down` is a FILTER here, not a predictor: the Washington host advertised 1593 Mbps and pulled
 a ghcr layer at 15.9 MB/s. It keeps obviously slow lines out; the scoreboard does the real work.
@@ -18,6 +30,17 @@ from collections import Counter
 from dataclasses import dataclass
 
 from .vast_scoreboard import Scoreboard
+
+# What still has to happen AFTER the instance reports `running`, measured 2026-09-19 on a warm host
+# (docs/gpu-pod.md#vast-e2e): SSH answering ~17 s later, bootstrap 200 s (the model download runs
+# inside it), ComfyUI restart ~15 s. The same for every offer, but it is billed at each offer's
+# own rate, so it belongs in the score.
+BOOT_AFTER_RUNNING_S = 232.0
+
+
+def session_usd(dph: float, ready_s: float, run_s: float, bandwidth_usd: float) -> float:
+    """Estimated total for one session: GPU time from create to teardown, plus bandwidth."""
+    return dph * (ready_s + BOOT_AFTER_RUNNING_S + run_s) / 3600.0 + bandwidth_usd
 
 
 @dataclass(frozen=True)
@@ -68,7 +91,7 @@ def reject_reason(offer: dict, c: Criteria, board: Scoreboard, now: float) -> st
     return None
 
 
-def rank(offers: list[dict], c: Criteria, board: Scoreboard, *, gb: float,
+def rank(offers: list[dict], c: Criteria, board: Scoreboard, *, gb: float, run_s: float,
          now: float) -> tuple[list[Ranked], Counter]:
     rejected: Counter = Counter()
     ranked: list[Ranked] = []
@@ -84,7 +107,7 @@ def rank(offers: list[dict], c: Criteria, board: Scoreboard, *, gb: float,
         ready_s = board.ready_estimate_s(machine_id) if machine_id is not None \
             else board.ready_estimate_s(-1)
         bandwidth_usd = gb * float(o["internet_down_cost_per_tb"]) / 1000.0
-        score = float(o["dph_total"]) * ready_s / 3600.0 + bandwidth_usd
+        score = session_usd(float(o["dph_total"]), ready_s, run_s, bandwidth_usd)
         ranked.append(Ranked(o, machine_id, ready_s, known, bandwidth_usd, score))
     ranked.sort(key=lambda r: (r.score, r.offer["dph_total"]))
     return ranked, rejected
@@ -119,7 +142,7 @@ def format_table(ranked: list[Ranked], top: int = 5) -> str:
         lines.append(
             f"  id={o.get('id')!s:<10} ${o.get('dph_total', 0):.3f}/hr  "
             f"ready≈{r.ready_s:.0f}s ({'measured' if r.known else 'unmeasured'})  "
-            f"bw ${r.bandwidth_usd:.2f}  score ${r.score:.3f}  {o.get('gpu_name')} {gb:.0f}GB  "
+            f"bw ${r.bandwidth_usd:.2f}  session ${r.score:.2f}  {o.get('gpu_name')} {gb:.0f}GB  "
             f"disk={o.get('disk_bw') or 0:.0f}MB/s  down={o.get('inet_down') or 0:.0f}Mbps  "
             f"{o.get('geolocation', '?')}")
     return "\n".join(lines)

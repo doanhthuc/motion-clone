@@ -25,6 +25,7 @@ from batchlib.pipelines import PIPELINES, STAGES
 from batchlib.runner import _local_tryon_stage
 from batchlib.vast_models import STAGE_MODEL_IDS
 from batchlib_ext.vast_quote import BOOT_AFTER_RUNNING_S, VastQuote
+from batchlib_ext.vast_select import session_usd as _session_usd
 
 from .run import MEASURED_STAGE_SEC
 
@@ -77,9 +78,8 @@ def gpu_seconds(manifest: Manifest) -> float:
 
 
 def session_usd(quote: VastQuote, run_s: float) -> float:
-    """Estimated total for one session: GPU time from create to teardown, plus bandwidth."""
-    billed_s = quote.ready_s + BOOT_AFTER_RUNNING_S + run_s
-    return quote.dph * billed_s / 3600.0 + quote.bandwidth_usd
+    """Estimated total for one session — the same formula vast_select ranks the offers by."""
+    return _session_usd(quote.dph, quote.ready_s, run_s, quote.bandwidth_usd)
 
 
 def _credit_check(credit_fn: Callable[[], float],

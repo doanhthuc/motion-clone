@@ -40,19 +40,27 @@ ROOT = Path(__file__).resolve().parents[2]
 # a reader; it is duplicated here on purpose, pinned to the one writer.
 LEASE_PATH = ROOT / "batch" / "pod-lease.json"
 
-# Measured medians from ONE real batch (2026-08-18-2105, RTX 5090, RunPod
-# EU-RO-1, $0.99/hr), a 15-second driver at 1088x1920 —
-# docs/batch-runner.md section 7. These are what actually happened once, not
-# a ceiling and not a guarantee: a different preset, targetRes or fpsInterp
-# changes both the runtime and the output size (batch-runner.md section 7's
-# own closing note). A stage not in this table (only character-swap, as of
-# 2026-08-31) falls back to its STAGES[...].timeout_min, which IS a ceiling
-# — so the fallback is intentionally the more pessimistic number, not a
-# substitute measurement.
+# Measured medians, RTX 5090 on RunPod EU-RO-1 — docs/batch-runner.md section 7.
+# tryon and motion come from ONE batch (2026-08-18-2105, a 15-second driver at
+# 1088x1920). camera-tryon, camera-motion and enhance are medians over every
+# finished run in out/2026-09-12-1408 .. 2026-09-24-1136 (31 camera-tryon,
+# 31 camera-motion, 32 enhance; 540p, 15-30 s drivers). Three 3-video batches
+# summed to 31.7, 31.7 and 32.4 min of GPU work, which this table reproduces
+# (3 x (460 + 183) s = 32.2 min). Before 2026-09-27 camera-motion was missing,
+# fell back to its 60-min ceiling, and a 3-video batch was estimated at 186
+# min. camera-tryon's 70 s is mostly Gemini: qwen-max's median over 7 runs is
+# 257 s, so a qwen-max job reads about 3 min short. These are what actually
+# happened, not a ceiling: a different preset, targetRes or fpsInterp changes
+# both the runtime and the output size. A stage not in this table (only
+# character-swap: one finished run, 709 s) falls back to its
+# STAGES[...].timeout_min, which IS a ceiling — so the fallback is
+# intentionally the more pessimistic number, not a substitute measurement.
 MEASURED_STAGE_SEC = {
     "tryon": 351,
     "motion": 247,
-    "enhance": 114,
+    "camera-tryon": 70,
+    "camera-motion": 460,
+    "enhance": 183,
 }
 
 # Popen handles for drains this process itself started, keyed by the

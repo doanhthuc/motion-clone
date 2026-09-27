@@ -7745,7 +7745,8 @@ _MOTION_MANIFEST = ("runs:\n  - id: runA\n    pipeline: motion-enhance\n"
 
 def _vast_quote(**over):
     base = dict(offer_id=4401, machine_id=55, dph=0.90, gpu="RTX 5090", location="Bulgaria, BG",
-                ready_s=556.0, known=False, bandwidth_usd=0.10, gb=51.8, qualifying=4,
+                ready_s=556.0, known=False, bandwidth_usd=0.10, gb=51.8, run_s=430.0,
+                qualifying=4,
                 fetched_at=time.time())
     base.update(over)
     return VastQuote(**base)

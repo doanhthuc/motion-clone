@@ -92,6 +92,12 @@ Selection is by **time-to-ready and total cost**, not by `$/h`:
    `GB_to_download × internet_down_cost_per_tb` (a 50 GB boot is $2.00 at the Hungarian $40/TB,
    $0.07 at Bulgaria's $1.37/TB). A machine with a scoreboard entry uses its measured time; an unknown
    machine is scored as the slowest ever seen (556 s), never optimistically.
+   *Amended 2026-09-27:* ranking only the cost to get ready left the batch's own GPU hours out, and
+   they dominate — a live search ranked Alberta $0.868/h @ $4/TB above Quebec $0.646/h @ $8/TB,
+   though Quebec is cheaper from a one-hour batch on. The score is now the whole session,
+   `dph × (ready_time + 232 s bootstrap + batch GPU seconds) + bandwidth_cost`, the same formula the
+   bot's panel quotes, and the search passes `--storage <DISK>` so `dph` includes the rented disk
+   (the CLI's 5 GiB default left $0.02–0.09/h of storage out at 100 GB).
 3. **Pull deadline.** If the instance is not `running` after `VAST_PULL_DEADLINE` (default 8 min), destroy
    it, blacklist the `machine_id`, and rent the next candidate. At most 2 retries, then a clear failure
    on Telegram. A partial pull is billed for bandwidth, which is why $40/TB hosts are excluded up front.
