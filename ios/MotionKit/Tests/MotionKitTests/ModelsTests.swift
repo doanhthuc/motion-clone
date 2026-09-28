@@ -263,6 +263,35 @@ import Testing
         #expect(draft.filledSlots == ["character": "app/model.png"])
     }
 
+    @Test func draftDurationSecIsOptionalAndDecodes() throws {
+        // `Fixtures.draft` predates the length feature and carries no `duration_sec` —
+        // decodesRunList's Optional-property rule (missing key -> nil) covers that case.
+        let full = try decoder.decode(Draft.self, from: Fixtures.data(Fixtures.draft))
+        #expect(full.durationSec == nil)
+        #expect(full.batch[0].durationSec == nil)
+
+        let withLength = Fixtures.draft
+            .replacingOccurrences(of: #""estimate_min":null}"#,
+                                  with: #""estimate_min":null,"duration_sec":10}"#)
+            .replacingOccurrences(of: #""provider":"gemini","slots":{"character":"app/model.png""#,
+                                  with: #""provider":"gemini","duration_sec":15,"slots":{"character":"app/model.png""#)
+        let draft = try decoder.decode(Draft.self, from: Fixtures.data(withLength))
+        #expect(draft.durationSec == 10)
+        #expect(draft.batch[0].durationSec == 15)
+    }
+
+    @Test func batchEntryDecodesItsOwnDriversLength() throws {
+        // The only source the app has for this — a batch entry's slots are
+        // bare material ids, never the probe that would otherwise carry it.
+        let old = try decoder.decode(Draft.self, from: Fixtures.data(Fixtures.draft))
+        #expect(old.batch[0].driverDurationS == nil)
+
+        let withDriver = Fixtures.draft.replacingOccurrences(
+            of: #""driver":null}}]"#, with: #""driver":null},"driver_duration_s":14.8}]"#)
+        let draft = try decoder.decode(Draft.self, from: Fixtures.data(withDriver))
+        #expect(draft.batch[0].driverDurationS == 14.8)
+    }
+
     @Test func draftPatchEncodesThreeSeedStates() throws {
         // `APIClient` uses the same key-encoding strategy on every write call; `.sortedKeys` is
         // added here only to make the expected bytes deterministic.
@@ -276,6 +305,28 @@ import Testing
                 == #"{"slots":{"outfit":"app\/o.png"},"tryon_seed":null}"#)
         #expect(try text(DraftPatch(slots: ["outfit": nil])) == #"{"slots":{"outfit":null}}"#)
         #expect(try text(DraftPatch(seed: .clear)) == #"{"tryon_seed":null}"#)
+    }
+
+    @Test func durationPatchEncodesFullOrASpecificLength() throws {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        func text(_ p: DurationPatch) throws -> String { String(decoding: try encoder.encode(p), as: UTF8.self) }
+        #expect(try text(DurationPatch(.full)) == #"{"duration_sec":null}"#)
+        #expect(try text(DurationPatch(.seconds(10))) == #"{"duration_sec":10}"#)
+    }
+
+    @Test func batchEntryPatchEncodesPipelineAndDuration() throws {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        encoder.outputFormatting = .sortedKeys
+        func text(_ p: BatchEntryPatch) throws -> String { String(decoding: try encoder.encode(p), as: UTF8.self) }
+        #expect(try text(BatchEntryPatch(pipeline: "motion-enhance"))
+                == #"{"pipeline":"motion-enhance"}"#)
+        #expect(try text(BatchEntryPatch(duration: .seconds(15))) == #"{"duration_sec":15}"#)
+        #expect(try text(BatchEntryPatch(duration: .full)) == #"{"duration_sec":null}"#)
+        // Omitted entirely, same as provider/seed's `.keep` — a length the caller never
+        // mentioned must not be reset to Full by accident.
+        #expect(try text(BatchEntryPatch(provider: "qwen")) == #"{"provider":"qwen"}"#)
     }
 
     @Test func libraryEntriesDecode() throws {

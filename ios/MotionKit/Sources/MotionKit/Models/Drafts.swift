@@ -56,12 +56,19 @@ public struct DraftBatchEntry: Decodable, Sendable, Equatable, Identifiable {
     /// Names the try-on library entry this job was made from. It stays non-nil after that
     /// entry is deleted on purpose — it is a reference, never proof the entry still exists.
     public let tryonSeed: String?
+    /// `nil` is "Full" (the driver's own measured length); a server predating the length
+    /// feature also decodes as `nil`.
+    public let durationSec: Int?
+    /// The attached driver's own probed length in seconds — the only source the app has
+    /// for it, since a batch entry's slots are bare material ids, never a probe. `nil`
+    /// until a driver is attached, or on a server that predates the length feature.
+    public let driverDurationS: Double?
     public var id: String { digest }
 
     private enum CodingKeys: String, CodingKey {
         case digest
         case runID = "runId"
-        case pipeline, provider, slots, tryonSeed
+        case pipeline, provider, slots, tryonSeed, durationSec, driverDurationS
     }
 }
 
@@ -82,6 +89,9 @@ public struct Draft: Decodable, Sendable, Equatable {
     /// Names the try-on library entry the edited job was made from — a reference, not an
     /// existence check. `nil` means an ordinary job, or a server that predates Phase 6.
     public let tryonSeed: String?
+    /// `nil` is "Full" (the driver's own measured length); a server predating the length
+    /// feature also decodes as `nil`.
+    public let durationSec: Int?
 }
 
 public struct DraftValidationResponse: Decodable, Sendable, Equatable {
@@ -104,6 +114,34 @@ public struct ProviderPatch: Encodable, Sendable {
 
     public init(provider: String) {
         self.provider = provider
+    }
+}
+
+/// `.full` sends `duration_sec: null` (the driver's own measured length, today's
+/// default); `.seconds(n)` overrides it — a quick 10s/15s pick or a custom value,
+/// both validated server-side against the attached driver's own probed length.
+public enum DurationChoice: Sendable, Equatable {
+    case full
+    case seconds(Int)
+}
+
+/// `PATCH /v1/draft` naming only the length (2026-09-28), the same single-field
+/// shape as `PipelinePatch`/`ProviderPatch`.
+public struct DurationPatch: Encodable, Sendable {
+    public let duration: DurationChoice
+
+    public init(_ duration: DurationChoice) {
+        self.duration = duration
+    }
+
+    private enum CodingKeys: String, CodingKey { case durationSec }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch duration {
+        case .full: try container.encodeNil(forKey: .durationSec)
+        case .seconds(let n): try container.encode(n, forKey: .durationSec)
+        }
     }
 }
 
@@ -152,29 +190,44 @@ public struct DraftPatch: Encodable, Sendable, Equatable {
     }
 }
 
-/// A queued batch job's edit, `PATCH /v1/draft/batch/<digest>` (2026-09-26).
-/// Only what is named is sent; the pipeline is not editable on a queued job.
+/// A queued batch job's edit, `PATCH /v1/draft/batch/<digest>` (2026-09-26;
+/// pipeline + duration added 2026-09-28). Only what is named is sent. A
+/// pipeline switch keeps whichever slots the new pipeline can still use and
+/// the server refuses the whole edit (`missing_slots`) if a required one
+/// can't be preserved — it never leaves the entry silently short an input.
 public struct BatchEntryPatch: Encodable, Sendable, Equatable {
+    public let pipeline: String?
     public let provider: String?
     public let slots: [String: String?]
     public let seed: DraftPatch.Seed
+    /// `nil` keeps the entry's current length, same as `provider == nil`.
+    public let duration: DurationChoice?
 
-    public init(provider: String? = nil, slots: [String: String?] = [:], seed: DraftPatch.Seed = .keep) {
+    public init(pipeline: String? = nil, provider: String? = nil, slots: [String: String?] = [:],
+               seed: DraftPatch.Seed = .keep, duration: DurationChoice? = nil) {
+        self.pipeline = pipeline
         self.provider = provider
         self.slots = slots
         self.seed = seed
+        self.duration = duration
     }
 
-    private enum CodingKeys: String, CodingKey { case provider, slots, tryonSeed }
+    private enum CodingKeys: String, CodingKey { case pipeline, provider, slots, tryonSeed, durationSec }
 
     public func encode(to encoder: any Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(pipeline, forKey: .pipeline)
         try container.encodeIfPresent(provider, forKey: .provider)
         if !slots.isEmpty { try container.encode(slots, forKey: .slots) }
         switch seed {
         case .keep: break
         case .clear: try container.encodeNil(forKey: .tryonSeed)
         case .set(let id): try container.encode(id, forKey: .tryonSeed)
+        }
+        switch duration {
+        case nil: break
+        case .full: try container.encodeNil(forKey: .durationSec)
+        case .seconds(let n): try container.encode(n, forKey: .durationSec)
         }
     }
 }

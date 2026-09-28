@@ -407,6 +407,29 @@ extension URLProtocolTests {
                 "The server answered in a shape this app doesn't know (The pipeline catalog is empty.). Update the app.")
     }
 
+    @Test func selectDurationPatchesTheDraft() async throws {
+        StubURLProtocol.install { request in
+            request.url?.path == "/v1/pipelines"
+                ? TestSupport.json(Fixtures.pipelines)
+                : TestSupport.json(Fixtures.draft)
+        }
+        let store = DraftStore(client: TestSupport.client())
+        await store.load()
+
+        await store.selectDuration(.seconds(10))
+
+        let sent = try #require(StubURLProtocol.requests.last)
+        #expect(sent.httpMethod == "PATCH")
+        #expect(sent.url?.path == "/v1/draft")
+        let body = try #require(JSONSerialization.jsonObject(with: sent.httpBody ?? Data()) as? [String: Any])
+        #expect(body["duration_sec"] as? Int == 10)
+
+        await store.selectDuration(.full)
+        let second = try #require(
+            JSONSerialization.jsonObject(with: StubURLProtocol.requests.last?.httpBody ?? Data()) as? [String: Any])
+        #expect(second.keys.contains("duration_sec") && second["duration_sec"] is NSNull)
+    }
+
     @Test func editBatchPatchesTheEntryByDigest() async throws {
         StubURLProtocol.install { request in
             request.url?.path == "/v1/pipelines"

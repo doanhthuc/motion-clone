@@ -72,7 +72,7 @@ def copy_job(job: Job) -> Job:
     """
     return Job(pipeline=job.pipeline, slots=dict(job.slots),
                probes=dict(job.probes), provider=job.provider,
-               tryon_seed=job.tryon_seed)
+               tryon_seed=job.tryon_seed, duration_sec=job.duration_sec)
 
 
 def signature(job: Job) -> tuple:
@@ -86,9 +86,11 @@ def signature(job: Job) -> tuple:
 
     The try-on seed (§5.10, slice 6) is part of it for exactly the same
     reason: the same four materials seeded from a saved image and run fresh
-    produce different try-ons at different cost.
+    produce different try-ons at different cost. duration_sec joins them for
+    the same reason again — a 10s and a 15s render of the same material are
+    two different renders, not a cosmetic difference.
     """
-    return (job.pipeline, job.provider,
+    return (job.pipeline, job.provider, job.duration_sec,
             str(job.tryon_seed) if job.tryon_seed else None,
             tuple(sorted((r, str(p)) for r, p in job.slots.items())))
 
@@ -137,7 +139,8 @@ def dump_jobs(jobs: list[Job]) -> list[dict]:
              "provider": j.provider,
              "slots": {r: str(v) for r, v in j.slots.items()},
              "probes": {r: asdict(pr) for r, pr in j.probes.items()},
-             "tryon_seed": str(j.tryon_seed) if j.tryon_seed else None}
+             "tryon_seed": str(j.tryon_seed) if j.tryon_seed else None,
+             "duration_sec": j.duration_sec}
             for j in jobs]
 
 
@@ -152,7 +155,9 @@ def load_jobs(payload: list) -> list[Job]:
                 probes={r: Probe(**d) for r, d in entry["probes"].items()},
                 # .get for the same reason as provider above: a draft written
                 # before slice 6 has no such key.
-                tryon_seed=Path(entry["tryon_seed"]) if entry.get("tryon_seed") else None)
+                tryon_seed=Path(entry["tryon_seed"]) if entry.get("tryon_seed") else None,
+                # .get again: a draft written before the length feature has none.
+                duration_sec=entry.get("duration_sec"))
             for entry in payload]
 
 
@@ -195,8 +200,13 @@ class _Draft:
     generation: int = 0
 
 
-_PATCH_KEYS = frozenset({"pipeline", "provider", "slots", "tryon_seed"})
-_EDIT_KEYS = _PATCH_KEYS - {"pipeline"}
+_PATCH_KEYS = frozenset({"pipeline", "provider", "slots", "tryon_seed", "duration_sec"})
+# A queued batch entry allows every field the pre-batch draft does (2026-09-28):
+# drop_unusable() already keeps whichever slots the new pipeline can still use
+# and _apply()'s missing_slots check already refuses the whole edit rather than
+# leave a required role silently empty, so pipeline needs no separate carve-out
+# here — the same safety net patch() has always relied on.
+_EDIT_KEYS = _PATCH_KEYS
 
 
 def _seed_id(seed: Path | None) -> str | None:
@@ -334,9 +344,14 @@ class DraftStore:
             "missing": self._missing(job),
             "validated": d.validated,
             "tryon_seed": _seed_id(job.tryon_seed),
+            "duration_sec": job.duration_sec,
             "batch": [{"digest": job_digest(b), "run_id": run_id, "pipeline": b.pipeline,
                        "provider": b.provider,
                        "tryon_seed": _seed_id(b.tryon_seed),
+                       "duration_sec": b.duration_sec,
+                       # The app's only source for this: a batch entry carries a
+                       # material id per slot, never the probe that names it.
+                       "driver_duration_s": b.probes["driver"].duration_s if "driver" in b.probes else None,
                        "slots": {r: self._material_id(p) for r, p in sorted(b.slots.items())}}
                       for b, run_id in zip(d.basket, basket_ids)],
             "jobs": len(jobs),
@@ -398,6 +413,14 @@ class DraftStore:
             raise DraftError("unknown_pipeline", f"unknown pipeline {pipeline!r}")
         if provider is not None and provider not in PROVIDER_LABELS:
             raise DraftError("unknown_provider", f"unknown provider {provider!r}")
+        duration_sec = body.get("duration_sec")
+        if duration_sec is not None:
+            # bool before int: True/False are ints in Python, and "duration_sec:
+            # true" is a client bug worth a clear refusal, not a length of 1s.
+            if (isinstance(duration_sec, bool) or not isinstance(duration_sec, int)
+                    or duration_sec < 1):
+                raise DraftError("bad_request",
+                                 "duration_sec must be a positive whole number of seconds, or null for Full")
 
         # Outside the lock: ffprobe takes up to 60 s per file (ingest.probe).
         filled: dict[str, tuple[Path, Probe]] = {}
@@ -414,13 +437,13 @@ class DraftStore:
                 # already sees in the slot; nothing else in the exception is
                 # theirs to see.
                 raise DraftError("unprobeable", f"{path.name} could not be read as media")
-        return pipeline, provider, slots, seed_path, filled
+        return pipeline, provider, slots, seed_path, filled, duration_sec
 
     def _apply(self, job: Job, body: dict, prepared: tuple) -> list[str]:
         """Check a prepared patch against `job` and apply it; called under
         control.LOCK. Every check runs before the first write, so a refusal
         leaves `job` as it was. Returns the roles a pipeline switch dropped."""
-        pipeline, provider, slots, seed_path, filled = prepared
+        pipeline, provider, slots, seed_path, filled, duration_sec = prepared
         target = pipeline or job.pipeline
         usable = required_roles(target) | optional_roles(target)
         for role in slots:
@@ -454,6 +477,20 @@ class DraftStore:
         for role, (path, probed) in filled.items():
             if not path.is_file():
                 raise DraftError("not_found", f"no such material: {path.name}")
+        # Both halves of the post-patch job, same reasoning as provider/seed
+        # above: a driver attached in THIS patch already bounds a duration
+        # requested in the same call.
+        if duration_sec is not None:
+            if "driver" in slots:
+                resolved_driver = filled["driver"][1] if slots["driver"] is not None else None
+            else:
+                resolved_driver = job.probes.get("driver")
+            if resolved_driver is None:
+                raise DraftError("no_driver", "attach a driver video before choosing a length")
+            if duration_sec > resolved_driver.duration_s:
+                raise DraftError("duration_too_long",
+                                 f"{duration_sec}s is longer than the driver video "
+                                 f"({resolved_driver.duration_s:.1f}s)")
         # Every check passed: apply. Nothing above wrote anything.
         dropped = drop_unusable(job, target) if pipeline is not None else []
         if provider is not None:
@@ -466,6 +503,8 @@ class DraftStore:
                 job.slots[role], job.probes[role] = filled[role]
         if "tryon_seed" in body:
             job.tryon_seed = seed_path
+        if "duration_sec" in body:
+            job.duration_sec = duration_sec
         return dropped
 
     def _remember_roles(self, slots: dict) -> None:
@@ -485,10 +524,13 @@ class DraftStore:
         return view
 
     def edit_batch(self, digest: str, body: dict) -> dict:
-        """Change a queued job's material, provider or seed where it sits in
-        the batch (2026-09-26). The pipeline stays: switching it drops slots,
-        and a queued job that silently lost one is worse than drop and re-add.
-        Its digest changes with its signature; the view carries the new one."""
+        """Change a queued job's material, provider, seed, length or pipeline
+        where it sits in the batch (2026-09-26, pipeline+duration 2026-09-28).
+        A pipeline switch keeps whichever slots the new pipeline can still use
+        (drop_unusable) and refuses the whole edit with missing_slots if a
+        required role can't be preserved — the entry never ends up silently
+        missing an input. Its digest changes with its signature; the view
+        carries the new one."""
         prepared = self._prepare(body, _EDIT_KEYS)
         with control.LOCK:
             d = self._load()

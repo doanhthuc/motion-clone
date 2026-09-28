@@ -65,6 +65,43 @@ class TestRenderManifest(unittest.TestCase):
         self.assertIn("character-swap: { preset: drv-15s }", text)
         self.assertNotIn("motion:", text)
 
+    def test_explicit_duration_overrides_the_auto_suggested_preset(self):
+        # VIDEO is 14.8s, which suggest_preset would map to drv-15s (see
+        # test_carries_the_measured_numbers_as_comments) — an explicit
+        # duration_sec must win over that auto guess.
+        job = Job(slots={"character": Path("/c.png"), "driver": Path("/d.mp4")},
+                  probes={"driver": VIDEO}, pipeline="motion-enhance",
+                  duration_sec=10)
+        text = render_manifest([job], now="2026-09-28 09:00:00")
+        self.assertIn("motion: { driverDurSec: 10 }", text)
+        self.assertNotIn("motion: { preset:", text)
+
+    def test_custom_duration_not_matching_any_preset_still_works(self):
+        job = Job(slots={"character": Path("/c.png"), "driver": Path("/d.mp4")},
+                  probes={"driver": VIDEO}, pipeline="motion-enhance",
+                  duration_sec=18)
+        text = render_manifest([job], now="2026-09-28 09:00:00")
+        self.assertIn("motion: { driverDurSec: 18 }", text)
+
+    def test_no_duration_keeps_todays_auto_suggested_preset(self):
+        # duration_sec defaults to None — "Full", unchanged from before this
+        # field existed.
+        job = Job(slots={"character": Path("/c.png"), "driver": Path("/d.mp4")},
+                  probes={"driver": VIDEO}, pipeline="motion-enhance")
+        self.assertIsNone(job.duration_sec)
+        text = render_manifest([job], now="2026-09-28 09:00:00")
+        self.assertIn("motion: { preset: drv-15s }", text)
+        self.assertNotIn("driverDurSec", text)
+
+    def test_explicit_duration_on_camera_pipeline_lands_on_camera_motion(self):
+        camera_job = Job(
+            slots={"character": Path("/c.png"), "outfit": Path("/o.png"),
+                   "background": Path("/b.png"), "driver": Path("/d.mp4")},
+            probes={"driver": VIDEO},
+            pipeline="tryon-camera-motion-enhance", duration_sec=10)
+        text = render_manifest([camera_job], now="2026-09-28 09:00:00")
+        self.assertIn("camera-motion: { driverDurSec: 10 }", text)
+
     def test_camera_pipeline_routes_driver_preset_to_camera_motion(self):
         self.assertEqual(_driver_stage("tryon-camera-motion-enhance"),
                          "camera-motion")

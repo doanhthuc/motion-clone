@@ -88,6 +88,13 @@ public final class DraftStore {
         }
     }
 
+    public func selectDuration(_ duration: DurationChoice) async {
+        await mutate {
+            try await self.client.patch(
+                Draft.self, body: DurationPatch(duration), "v1", "draft")
+        }
+    }
+
     public func assign(role: String, materialID: String?) async {
         await mutate(materialAssignment: true) {
             try await self.client.patch(

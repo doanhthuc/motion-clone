@@ -31,6 +31,12 @@ class Job:
     # spec §5.10, slice 6. Already resolved to a path by the time it lands
     # here; see render_manifest for how it reaches the runner.
     tryon_seed: Path | None = None
+    # None ("Full") keeps render_manifest's auto-suggested preset — the
+    # driver's own measured length. Set explicitly (quick 10s/15s or a
+    # custom value) to override it via driverDurSec, which linux.py reads
+    # as a raw target duration independent of any preset (worker_runtime/
+    # linux.py:5013).
+    duration_sec: int | None = None
 
 
 def _driver_stage(pipeline: str) -> str | None:
@@ -182,8 +188,11 @@ def render_manifest(jobs: list[Job], *, now) -> str:
         driver_stage = _driver_stage(job.pipeline)
         driver_probe = job.probes.get("driver")
         if driver_stage and driver_probe is not None:
-            stage_params.setdefault(driver_stage, {})["preset"] = \
-                suggest_preset(driver_probe.duration_s)
+            if job.duration_sec is not None:
+                stage_params.setdefault(driver_stage, {})["driverDurSec"] = job.duration_sec
+            else:
+                stage_params.setdefault(driver_stage, {})["preset"] = \
+                    suggest_preset(driver_probe.duration_s)
         tryon_stage = _tryon_stage(job.pipeline)
         # DEFAULT_PROVIDER is the self-host GPU path already in effect when the
         # manifest carries no `provider:` at all (linux.py:5653's own fallback)

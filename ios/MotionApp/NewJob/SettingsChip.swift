@@ -11,9 +11,12 @@ struct SettingsChip: View {
     let pipeline: Pipeline
     let pipelines: [Pipeline]
     let selectedProvider: String
+    let selectedDuration: Int?
+    let driverLengthSec: Double?
     let disabled: Bool
     let onPipelineSelected: (String) async -> Void
     let onProviderSelected: (String) async -> Void
+    let onDurationSelected: (DurationChoice) async -> Void
     @State private var open = false
 
     private var provider: PipelineProvider? {
@@ -44,8 +47,9 @@ struct SettingsChip: View {
         .accessibilityValue(PipelineText.name(pipeline.id))
         .sheet(isPresented: $open) {
             SettingsSheet(pipeline: pipeline, pipelines: pipelines, selectedProvider: selectedProvider,
+                          selectedDuration: selectedDuration, driverLengthSec: driverLengthSec,
                           onPipelineSelected: onPipelineSelected, onProviderSelected: onProviderSelected,
-                          onDone: { open = false })
+                          onDurationSelected: onDurationSelected, onDone: { open = false })
         }
     }
 }
@@ -59,12 +63,20 @@ private struct SettingsSheet: View {
     let pipeline: Pipeline
     let pipelines: [Pipeline]
     let selectedProvider: String
+    let selectedDuration: Int?
+    let driverLengthSec: Double?
     let onPipelineSelected: (String) async -> Void
     let onProviderSelected: (String) async -> Void
+    let onDurationSelected: (DurationChoice) async -> Void
     let onDone: () -> Void
     // The draft answers a pick with a PATCH; these show the pick until it lands.
     @State private var pendingPipeline: String?
     @State private var pendingProvider: String?
+
+    private var hasDriver: Bool {
+        pipeline.required.contains(BatchComposer.driverRole)
+            || pipeline.optional.contains(BatchComposer.driverRole)
+    }
 
     /// Every provider any pipeline offers, so the segments stay put (dimmed)
     /// on a pipeline without a try-on stage instead of the rows below jumping.
@@ -90,6 +102,15 @@ private struct SettingsSheet: View {
                         Text("Provider")
                     } footer: {
                         Text(providerFooter)
+                    }
+                }
+                if hasDriver {
+                    Section {
+                        DurationControl(current: selectedDuration, driverLengthSec: driverLengthSec,
+                                        disabled: false, onSelect: onDurationSelected)
+                            .listRowInsets(EdgeInsets(top: 8, leading: 8, bottom: 8, trailing: 8))
+                    } header: {
+                        Text("Length")
                     }
                 }
                 Section {
