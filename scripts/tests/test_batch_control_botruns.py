@@ -1335,12 +1335,12 @@ class TestRegenViaAppRuns(_AppRunsFixture):
         self.patches["start_phase_a"].assert_not_called()
 
     def test_regen_with_guidance_persists_it_into_the_journal(self):
-        # _regen_tryon has no Job list to rewrite the manifest from (unlike
-        # _retry_tryon's provider switch), and start_phase_a's subprocess
-        # re-reads the manifest fresh from disk — so guidance must survive
-        # through the journal write _regen_tryon already makes, not a
-        # manifest edit that never reaches disk. Real _regen_tryon here
-        # (not mocked), so this exercises the actual persistence.
+        # Unlike a provider switch (which rewrites the Job list and manifest
+        # on disk, since start_phase_a's subprocess re-reads the manifest
+        # fresh), guidance has no manifest field of its own — it survives
+        # through the journal write _regen_tryon already makes. Real
+        # _regen_tryon here (not mocked), so this exercises the actual
+        # persistence.
         run_id = self._seed_tryon_run()
         token = bot._run_token(ME)
         status, _body = self.runs.regen(

@@ -18,6 +18,20 @@ public final class RunFlow {
 
     nonisolated static let localTryonProviders: Set<String> = ["gemini", "qwen-max"]
 
+    /// The two providers `regenerate(index:guidance:provider:)` can switch a failed try-on
+    /// to — same set and order as the bot's `_RETRY_PROVIDERS` (bot.py), whose "Retry with
+    /// Gemini/Qwen" buttons this is the app's equivalent of (§5.10). A request for the
+    /// unconfigured one still round-trips to the server and comes back as a normal refusal
+    /// (`message`) — no client-side "is Qwen set up" check exists to keep in sync.
+    public struct RetryProvider: Identifiable, Sendable, Equatable {
+        public let id: String
+        public let label: String
+    }
+    public static let retryProviders: [RetryProvider] = [
+        RetryProvider(id: "gemini", label: "Gemini"),
+        RetryProvider(id: "qwen-max", label: "Qwen"),
+    ]
+
     public private(set) var phase: Phase = .loading
     public private(set) var pod: PodStatus?
     public private(set) var tryon: TryonPreviews?
@@ -573,11 +587,12 @@ public final class RunFlow {
         await spend(.phaseA, label: "Try-on preview · \(jobs) job\(jobs == 1 ? "" : "s")")
     }
 
-    public func regenerate(index: String, guidance: Set<Guidance>) async {
+    public func regenerate(index: String, guidance: Set<Guidance>, provider: String? = nil) async {
         guard let runID, let token = tryon?.runToken else { return }
         let ordered = Guidance.allCases.filter(guidance.contains)
-        await spend(.regen(runID: runID, index: index, runToken: token, guidance: ordered),
-                    label: "Regenerate try-on #\(index)")
+        let label = provider.map { "Retry try-on #\(index) with \($0)" } ?? "Regenerate try-on #\(index)"
+        await spend(.regen(runID: runID, index: index, runToken: token, guidance: ordered,
+                           provider: provider), label: label)
     }
 
     public func dismissMessage() { message = nil }

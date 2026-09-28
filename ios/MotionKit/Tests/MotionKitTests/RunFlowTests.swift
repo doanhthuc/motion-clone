@@ -275,6 +275,17 @@ extension URLProtocolTests {
         #expect(flow.phase == .phaseARunning)
     }
 
+    @Test func regenerateWithProviderSendsIt() async {
+        let routes = Routes()
+        routes.tryon = Fixtures.tryonDone
+        let gate = FakeSpendGate([.accepted(runID: "tg-1000", outcome: "started")])
+        let flow = make(routes, gate: gate)
+        await flow.start(.existing)
+        await flow.regenerate(index: "0", guidance: [], provider: "qwen-max")
+        #expect(await gate.intents == [.regen(runID: "tg-1000", index: "0", runToken: "1790000000123.4",
+                                              guidance: [], provider: "qwen-max")])
+    }
+
     @Test func acceptedSpendAlreadyFinishedLandsInPreviews() async {
         let routes = Routes()
         routes.tryon = Fixtures.tryonDone

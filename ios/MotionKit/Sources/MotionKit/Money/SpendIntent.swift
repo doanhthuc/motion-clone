@@ -17,7 +17,12 @@ public enum SpendKind: Sendable, Equatable {
 /// kill resends the very same path and body with the very same key.
 public enum SpendIntent: Codable, Sendable, Equatable {
     case phaseA
-    case regen(runID: String, index: String, runToken: String, guidance: [Guidance])
+    /// `provider` (nil = keep the current one) switches this run's whole share group onto
+    /// `"gemini"`/`"qwen-max"` before regenerating — the app's equivalent of the bot's
+    /// "Retry with Gemini/Qwen" buttons on a failed try-on (server: bot.py's
+    /// `_regen_tryon`/`_RETRY_PROVIDERS`, §5.10).
+    case regen(runID: String, index: String, runToken: String, guidance: [Guidance],
+              provider: String? = nil)
     case confirm(runID: String, provider: SpendProvider, panelToken: String, gpu: String?,
                  tryon: TryonChoice?)
     case resume(runID: String, provider: SpendProvider, runToken: String, gpu: String?)
@@ -39,15 +44,15 @@ public enum SpendIntent: Codable, Sendable, Equatable {
     public var runID: String? {
         switch self {
         case .phaseA, .migrate: nil
-        case let .regen(runID, _, _, _), let .confirm(runID, _, _, _, _),
-             let .resume(runID, _, _, _): runID
+        case let .regen(runID, _, _, _, _): runID
+        case let .confirm(runID, _, _, _, _), let .resume(runID, _, _, _): runID
         }
     }
 
     public var path: [String] {
         switch self {
         case .phaseA: ["v1", "runs", "phase-a"]
-        case let .regen(runID, index, _, _): ["v1", "runs", runID, "tryon", index, "regen"]
+        case let .regen(runID, index, _, _, _): ["v1", "runs", runID, "tryon", index, "regen"]
         case let .confirm(runID, _, _, _, _): ["v1", "runs", runID, "confirm"]
         case let .resume(runID, _, _, _): ["v1", "runs", runID, "resume"]
         case .migrate: ["v1", "pod", "migrate"]
@@ -62,9 +67,10 @@ public enum SpendIntent: Codable, Sendable, Equatable {
         switch self {
         case .phaseA:
             break
-        case let .regen(_, _, runToken, guidance):
+        case let .regen(_, _, runToken, guidance, provider):
             object["run_token"] = runToken
             object["guidance"] = guidance.map(\.rawValue)
+            if let provider { object["provider"] = provider }
         case let .confirm(_, provider, panelToken, gpu, tryon):
             object["provider"] = provider.rawValue
             object["panel_token"] = panelToken

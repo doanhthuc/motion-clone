@@ -3106,7 +3106,9 @@ _GUIDANCE_FLAGS = {"keep_face": "keepFace", "tighter_crop": "tighterCrop",
 
 
 def _regen_tryon(tg: Tg, chat_id: int, index: str, token: str, *,
-                 dry_run: bool, guidance: list[str] | None = None) -> Outcome:
+                 dry_run: bool, guidance: list[str] | None = None,
+                 provider: str | None = None,
+                 drafted_jobs: list[Job] | None = None) -> Outcome:
     """Redo ONE try-on image, leaving every other run's untouched.
 
     A tap on a follower of a shared try-on redoes its leader's image instead
@@ -3127,6 +3129,19 @@ def _regen_tryon(tg: Tg, chat_id: int, index: str, token: str, *,
     Only before a pod has touched the run. Once a drain is running (or has
     already recorded a later stage), the pod reads or has read this file, and
     a new image would silently not be used.
+
+    `provider`, when given, switches the run's whole share group onto it
+    first (same effect as _retry_tryon's Telegram buttons — folded in here
+    2026-09-28 so the phone's regen route gets it too, §5.10). Placed AFTER
+    the stage_name/seeded guards below on purpose: switching provider on a
+    run this function is about to refuse anyway would leave the manifest
+    changed with nothing regenerated to show for it.
+
+    `drafted_jobs` is what the switch compares/writes against — `_jobs_for(chat_id)`
+    (the Telegram in-chat basket) by default, since that is what every Telegram caller
+    means by "the drafted job". `AppRuns.regen` passes its own `self.drafts.runnable()`
+    jobs instead: the app's draft lives in a DraftStore, not `_BASKET`/`_STATE`, and
+    comparing against the wrong one would refuse every app-originated switch as "stale".
     """
     manifest_path = _job_manifest_path(chat_id)
     if token != _run_token(chat_id):
@@ -3182,6 +3197,31 @@ def _regen_tryon(tg: Tg, chat_id: int, index: str, token: str, *,
                        f"{run.id}'s try-on came from your saved library, not a provider "
                        "call — there is nothing to regenerate. Clear the seed and try "
                        "again to run it through the provider.")
+    if provider is not None:
+        if provider not in _RETRY_PROVIDERS:
+            return _refuse(tg, chat_id, "bad_request",
+                           f"unknown provider {provider!r} — only "
+                           f"{', '.join(sorted(_RETRY_PROVIDERS))} are accepted")
+        if provider == "qwen-max" and not qwen_max_configured(ROOT):
+            return _refuse(tg, chat_id, "qwen_not_configured", _QWEN_MISSING)
+        current = effective_stage_params(
+            stage_name, run.stage_params.get(stage_name)).get("provider")
+        if provider != current:
+            jobs = _jobs_for(chat_id) if drafted_jobs is None else drafted_jobs
+            if [r.id for r in manifest.runs] != _unique_ids(jobs):
+                return _refuse(tg, chat_id, "stale_draft",
+                               "the drafted job no longer matches the batch on disk, "
+                               "so nothing was retried.")
+            members = [i for i, r in enumerate(manifest.runs)
+                      if groups.get(r.id, r.id) == leader_id]
+            for i in members:
+                jobs[i].provider = provider
+            write_manifest(jobs, manifest_path, now=time.strftime("%Y-%m-%d %H:%M:%S"))
+            switched = (f"{_esc(run.id)} switched" if len(members) == 1
+                       else f"{len(members)} runs switched")
+            tg.send_message(chat_id, f"{switched} to {_RETRY_PROVIDERS[provider]} for this "
+                                     "retry; the other runs keep their provider.")
+            token = _run_token(chat_id)
     guidance_params = None
     if guidance:
         unknown = [g for g in guidance if g not in _GUIDANCE_FLAGS]
@@ -3347,76 +3387,17 @@ def _report_failed_tryons(tg: Tg, chat_id: int, manifest_path: Path) -> None:
 
 def _retry_tryon(tg: Tg, chat_id: int, index: str, provider: str, token: str,
                  *, dry_run: bool) -> None:
-    """Retry one failed try-on, switching its share group to `provider` first.
-
-    The switch goes onto the drafted Job as well as the manifest, because
-    [Run] re-renders the manifest from the jobs: a manifest-only edit would be
-    undone by the next render, and Phase A would call the old provider again.
-    Every run in the tapped run's share group switches together: the provider
-    is part of runner.tryon_share_key, so switching the leader alone would
-    split the group and pay the old provider again for the followers. Every
-    other run keeps its params, so local_tryon_reusable still skips their
-    finished images. The rest is _regen_tryon, unchanged.
+    """Retry one failed try-on with a different provider — the retry buttons under a
+    failed-try-on message. A thin wrapper: the provider switch itself (and every guard
+    around it — stale token, drain/phase-a running, Qwen not configured, a drafted job
+    that no longer matches the manifest) lives in _regen_tryon now, shared with the
+    phone's regen route (§5.10) so the two never drift.
     """
     if provider not in _RETRY_PROVIDERS:
         tg.send_message(chat_id, "that button is from an older version of the "
                                  "bot; send /start for the commands")
         return
-    manifest_path = _job_manifest_path(chat_id)
-    # The guards _regen_tryon applies, repeated here because the provider
-    # switch below rewrites the manifest and must not happen when it refuses.
-    if token != _run_token(chat_id):
-        tg.send_message(chat_id, "the job changed since that message was sent, "
-                                 "so nothing was retried.")
-        return
-    if dry_run:
-        tg.send_message(chat_id, "dry run — retrying would spend API quota, "
-                                 "so nothing ran")
-        return
-    if drain_running(manifest_path):
-        tg.send_message(chat_id, "too late to retry — the GPU run has started. "
-                                 "/status shows it.")
-        return
-    if phase_a_running(manifest_path):
-        tg.send_message(chat_id, "the try-on phase is still running — wait for "
-                                 "it to finish, then tap Retry again.")
-        return
-    if provider == "qwen-max" and not qwen_max_configured(ROOT):
-        tg.send_message(chat_id, f"{_QWEN_MISSING} Nothing was retried.")
-        return
-    try:
-        manifest = load_manifest(manifest_path)
-    except ManifestError as exc:
-        tg.send_message(chat_id, f"could not retry — {exc}")
-        return
-    if not index.isdigit() or int(index) >= len(manifest.runs):
-        tg.send_message(chat_id, "that button is from an older version of the "
-                                 "bot; send /start for the commands")
-        return
-    run = manifest.runs[int(index)]
-    stage_name = _local_tryon_stage(run)
-    current = (effective_stage_params(stage_name, run.stage_params.get(stage_name))
-               .get("provider") if stage_name else None)
-    if provider != current:
-        jobs = _jobs_for(chat_id)
-        if [r.id for r in manifest.runs] != _unique_ids(jobs):
-            tg.send_message(chat_id, "the drafted job no longer matches the batch "
-                                     "on disk, so nothing was retried.")
-            return
-        groups = tryon_share_groups(manifest)
-        group = groups.get(run.id, run.id)
-        members = [i for i, r in enumerate(manifest.runs)
-                   if groups.get(r.id, r.id) == group]
-        for i in members:
-            jobs[i].provider = provider
-        write_manifest(jobs, manifest_path, now=time.strftime("%Y-%m-%d %H:%M:%S"))
-        switched = (f"{_esc(run.id)} switched" if len(members) == 1
-                    else f"{len(members)} runs switched")
-        tg.send_message(chat_id, f"{switched} to "
-                                 f"{_RETRY_PROVIDERS[provider]} for this retry; "
-                                 "the other runs keep their provider.")
-        token = _run_token(chat_id)
-    _regen_tryon(tg, chat_id, index, token, dry_run=dry_run)
+    _regen_tryon(tg, chat_id, index, token, dry_run=dry_run, provider=provider)
 
 
 def _settle_regen(tg: Tg, chat_id: int, manifest_path: Path,
@@ -7703,7 +7684,15 @@ class AppRuns:
 
     def regen(self, run_id: str, index: str, body: dict, key) -> tuple[int, dict]:
         """Regenerate one run's try-on image — `_regen_tryon` itself,
-        wrapped the same way `confirm` wraps `_do_confirm`/`_do_resume`."""
+        wrapped the same way `confirm` wraps `_do_confirm`/`_do_resume`.
+
+        `provider` (optional) is the app's "retry with a different provider"
+        action — the same 🔄 buttons the bot's failed-try-on message shows,
+        now reachable from the phone too (this was the gap: the app had no
+        way to retry with a different provider after a try-on failed, only
+        Guidance-only regenerate). Validated shape here; whether it's one of
+        the actually-offered providers (and Qwen is configured) is
+        `_regen_tryon`'s job, same as `guidance`."""
         if run_id != self.run_id:
             return 404, _run_error("not_found", "no such run")
         token = body.get("run_token")
@@ -7717,6 +7706,9 @@ class AppRuns:
             if unknown:
                 return 400, _run_error("bad_request",
                                        f"unknown guidance value(s): {', '.join(unknown)}")
+        provider = body.get("provider")
+        if provider is not None and not isinstance(provider, str):
+            return 400, _run_error("bad_request", "provider must be a string")
         replay = self.idem.begin("regen", key)
         if replay is not None:
             return replay
@@ -7724,8 +7716,13 @@ class AppRuns:
             if busy is not None:
                 self.idem.forget("regen", key)
                 return busy
+            # The app's drafted jobs, not _jobs_for's Telegram _BASKET/_STATE —
+            # _regen_tryon's provider switch compares/writes against whichever
+            # list this is, and the app's draft lives in a DraftStore
+            # (self.drafts), never in those globals.
+            drafted_jobs = self.drafts.runnable()[0] if provider is not None else None
             out = _regen_tryon(_AppTg(self.tg), self.chat_id, index, token, dry_run=False,
-                               guidance=guidance)
+                               guidance=guidance, provider=provider, drafted_jobs=drafted_jobs)
             if out:
                 response = (202, {"run_id": self.run_id, "outcome": out.code})
             else:

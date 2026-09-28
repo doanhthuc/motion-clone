@@ -569,6 +569,32 @@ def _qwen_image_url() -> str:
 
 QWEN_MAX_IMAGES = 3
 
+# Đo 28/09/2026 (batch 2026-09-28-0727, chat tg-1959705051): job thứ 5/5 cùng provider/nhân vật
+# timeout đúng ở "read operation timed out" trong khi 4 job kia (elapsed 229-301s) đã sát hoặc vượt
+# 180s — median đã đo của qwen-max là 257s (scripts/tgbot/run.py:51-52), tức CAO HƠN timeout 180s cũ
+# cho MỘT lệnh gọi mạng, và camera-tryon gọi qwen_image_generate hai lần liên tiếp
+# (_camera_compose_local: bước A ghép nền + bước B xoay góc máy). 180s không phải lỗi mạng bất
+# thường, nó thấp hơn độ trễ bình thường của API — nâng lên 300s (biên trên median) và retry một
+# lần CHỈ cho timeout (không retry HTTPError — lỗi API thật thì thử lại chắc chắn lỗi lại).
+QWEN_NETWORK_TIMEOUT = 300
+QWEN_NETWORK_ATTEMPTS = 2
+
+
+def _qwen_urlopen(req_or_url, *, timeout: int = QWEN_NETWORK_TIMEOUT,
+                  attempts: int = QWEN_NETWORK_ATTEMPTS):
+    """urlopen() với retry chỉ cho OSError (timeout/mất kết nối) — HTTPError (lỗi API thật, vd 4xx/5xx)
+    raise ngay lần đầu, không đợi thêm `timeout` giây cho một lỗi sẽ lặp lại y hệt."""
+    last_exc: OSError | None = None
+    for _attempt in range(attempts):
+        try:
+            with urllib.request.urlopen(req_or_url, timeout=timeout) as resp:
+                return resp.read()
+        except urllib.error.HTTPError:
+            raise
+        except OSError as exc:
+            last_exc = exc
+    raise last_exc  # attempts >= 1 nên last_exc luôn được gán trước khi tới đây
+
 
 def qwen_image_generate(images: list[tuple[bytes, str]], prompt: str, key: str, *, n: int = 1,
                         size: str | None = None, model: str | None = None,
@@ -594,8 +620,7 @@ def qwen_image_generate(images: list[tuple[bytes, str]], prompt: str, key: str, 
         _qwen_image_url(), data=json.dumps(body).encode("utf-8"),
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"}, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            data = json.loads(resp.read())
+        data = json.loads(_qwen_urlopen(req))
     except urllib.error.HTTPError as exc:
         raise JobError(f"Qwen API {exc.code}: {exc.read()[:300].decode('utf-8', 'replace')}") from exc
     except OSError as exc:
@@ -609,8 +634,7 @@ def qwen_image_generate(images: list[tuple[bytes, str]], prompt: str, key: str, 
     out = []
     for url in urls:
         try:
-            with urllib.request.urlopen(url, timeout=180) as resp:
-                out.append(resp.read())
+            out.append(_qwen_urlopen(url))
         except OSError as exc:
             raise JobError(f"Qwen image download failed: {exc}") from exc
     return out

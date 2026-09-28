@@ -174,13 +174,25 @@ private struct TryonPage: View {
     }
 
     private var failed: some View {
-        VStack(spacing: 10) {
+        VStack(spacing: 14) {
             Image(systemName: "exclamationmark.triangle.fill")
                 .font(.system(size: 34)).foregroundStyle(Theme.danger)
             Text("Try-on failed").font(.headline)
-            Text("Regenerate below, or drop this look from the batch.")
+            Text("Retry with a provider below, or drop this look from the batch.")
                 .font(.subheadline).foregroundStyle(Theme.secondary)
                 .multilineTextAlignment(.center)
+            // The bot offers the same two buttons on a failed try-on (bot.py
+            // _report_failed_tryons, §5.10) — a plain same-provider retry is
+            // still the "Regenerate" action in the bar below this card.
+            HStack(spacing: 8) {
+                ForEach(RunFlow.retryProviders) { p in
+                    Button("Retry with \(p.label)") {
+                        Task { await flow.regenerate(index: preview.index, guidance: [], provider: p.id) }
+                    }
+                    .buttonStyle(ActionButtonStyle())
+                    .disabled(!flow.canSpend)
+                }
+            }
         }
         .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity)

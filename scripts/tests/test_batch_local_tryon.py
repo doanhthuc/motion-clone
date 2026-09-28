@@ -282,6 +282,41 @@ class TestQwenImageUrl(unittest.TestCase):
         self.assertEqual(url, "https://custom.example.com/api/v1/services/aigc/multimodal-generation/generation")
 
 
+class TestQwenUrlopenRetry(unittest.TestCase):
+    """Regression test cho batch 2026-09-28-0727: job thứ 5/5 cùng provider chết ngay vì timeout
+    180s cũ thấp hơn median đã đo (257s, scripts/tgbot/run.py:51-52). _qwen_urlopen phải thử lại
+    đúng MỘT lần khi gặp timeout (OSError), và KHÔNG được thử lại khi API trả lỗi thật (HTTPError)."""
+
+    def _fake_resp(self, data: bytes):
+        cm = mock.MagicMock()
+        cm.__enter__.return_value.read.return_value = data
+        cm.__exit__.return_value = False
+        return cm
+
+    def test_timeout_lan_dau_retry_thanh_cong_lan_hai(self):
+        with mock.patch.object(lt.urllib.request, "urlopen",
+                               side_effect=[TimeoutError("timed out"), self._fake_resp(b"ok")]) as m:
+            out = lt._qwen_urlopen("http://example.invalid", timeout=1)
+        self.assertEqual(out, b"ok")
+        self.assertEqual(m.call_count, 2)
+
+    def test_het_luot_retry_raise_loi_cuoi_cung(self):
+        exc2 = TimeoutError("timed out again")
+        with mock.patch.object(lt.urllib.request, "urlopen",
+                               side_effect=[TimeoutError("timed out"), exc2]) as m:
+            with self.assertRaises(TimeoutError) as cm:
+                lt._qwen_urlopen("http://example.invalid", timeout=1)
+        self.assertIs(cm.exception, exc2)
+        self.assertEqual(m.call_count, 2)
+
+    def test_http_error_khong_retry(self):
+        http_exc = lt.urllib.error.HTTPError("http://x", 400, "bad", {}, None)
+        with mock.patch.object(lt.urllib.request, "urlopen", side_effect=http_exc) as m:
+            with self.assertRaises(lt.urllib.error.HTTPError):
+                lt._qwen_urlopen("http://example.invalid", timeout=1)
+        self.assertEqual(m.call_count, 1)
+
+
 class TestQwenMaxConfigured(unittest.TestCase):
     """Whether a Qwen retry can work at all. The bot offers the button only when
     this says yes, so it has to read the same places the call itself does.

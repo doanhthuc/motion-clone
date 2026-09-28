@@ -24,6 +24,14 @@ import Testing
         let body = try object(intent)
         #expect(body["run_token"] as? String == "123.4")
         #expect(body["guidance"] as? [String] == ["keep_face", "match_lighting"])
+        #expect(body["provider"] == nil)
+    }
+
+    @Test func regenBodyIncludesProviderWhenSwitching() throws {
+        let intent = SpendIntent.regen(runID: "tg-1000", index: "2", runToken: "123.4",
+                                       guidance: [], provider: "qwen-max")
+        let body = try object(intent)
+        #expect(body["provider"] as? String == "qwen-max")
     }
 
     @Test func confirmOmitsNilFields() throws {
