@@ -564,7 +564,6 @@ class TestEditBatch(StoreCase):
         first, second = self.queue_two()
         cases = [
             ("not_found", "0000000000", {"provider": "qwen"}),
-            ("bad_request", first["digest"], {"pipeline": "motion-enhance"}),
             ("bad_request", first["digest"], {}),
             ("wrong_kind", first["digest"], {"slots": {"driver": "app/me.png"}}),
             ("unknown_role", first["digest"], {"slots": {"hat": "app/me.png"}}),
@@ -594,6 +593,96 @@ class TestEditBatch(StoreCase):
         v = self.store.edit_batch(first["digest"], {"provider": "qwen"})
         self.assertGreater(v["generation"], g)
         self.assertIsNone(v["validated"])
+
+    def test_pipeline_switch_keeps_slots_matching_the_new_pipelines_roles(self):
+        # "driver" is required by every pipeline today, so drop_unusable never
+        # drops it — only a role the new pipeline genuinely has no use for.
+        [first, _] = self.queue_two()
+        v = self.store.edit_batch(first["digest"], {"pipeline": "motion-enhance"})
+        self.assertEqual(v["batch"][0]["pipeline"], "motion-enhance")
+        self.assertEqual(set(v["batch"][0]["slots"]), {"character", "driver"})
+
+    def test_pipeline_switch_refuses_when_a_required_role_cannot_be_preserved(self):
+        self.store.patch({"pipeline": "character-swap",
+                          "slots": {"character": "app/me.png", "driver": "app/dance.mp4"}})
+        [first] = self.store.add_to_batch()["batch"]
+        self.assertRefused("missing_slots", self.store.edit_batch, first["digest"],
+                           {"pipeline": "tryon-motion-enhance"})
+        # Refused entirely — the entry keeps its original pipeline and slots.
+        self.assertEqual(self.store.view()["batch"][0]["pipeline"], "character-swap")
+
+    def test_duration_is_editable_on_a_queued_entry(self):
+        [first, _] = self.queue_two()   # driver is VID, duration_s=12.0
+        v = self.store.edit_batch(first["digest"], {"duration_sec": 10})
+        self.assertEqual(v["batch"][0]["duration_sec"], 10)
+
+    def test_duration_edit_validates_against_that_entrys_own_driver(self):
+        [first, _] = self.queue_two()
+        self.assertRefused("duration_too_long", self.store.edit_batch, first["digest"],
+                           {"duration_sec": 20})
+
+    def test_view_reports_each_entrys_own_driver_length(self):
+        # The app has no other source for this: a batch entry carries only a
+        # material id per slot, never a probe (unlike the job being edited).
+        # Without it, the app could not bound a custom duration client-side.
+        [first, _] = self.queue_two()
+        self.assertEqual(first["driver_duration_s"], VID.duration_s)
+
+
+class TestDurationSec(StoreCase):
+    """`duration_sec` on the draft: null ("Full") or a whole number of seconds
+    not exceeding the attached driver video's own measured length."""
+
+    def test_default_is_full(self):
+        self.assertIsNone(self.store.view()["duration_sec"])
+
+    def test_setting_a_duration_requires_a_driver_attached(self):
+        self.assertRefused("no_driver", self.store.patch, {"duration_sec": 10})
+
+    def test_sets_and_reports_a_quick_duration(self):
+        self.fill()
+        v = self.store.patch({"duration_sec": 10})
+        self.assertEqual(v["duration_sec"], 10)
+
+    def test_a_custom_value_within_the_drivers_length_is_accepted(self):
+        self.fill()   # VID is 12.0s
+        v = self.store.patch({"duration_sec": 7})
+        self.assertEqual(v["duration_sec"], 7)
+
+    def test_cannot_exceed_the_driver_videos_own_length(self):
+        self.fill()   # VID is 12.0s
+        self.assertRefused("duration_too_long", self.store.patch, {"duration_sec": 20})
+
+    def test_must_be_a_positive_whole_number(self):
+        self.fill()
+        for bad in (0, -5, 10.5, "10", True):
+            with self.subTest(bad=bad):
+                self.assertRefused("bad_request", self.store.patch, {"duration_sec": bad})
+
+    def test_null_resets_to_full(self):
+        self.fill()
+        self.store.patch({"duration_sec": 10})
+        v = self.store.patch({"duration_sec": None})
+        self.assertIsNone(v["duration_sec"])
+
+    def test_survives_add_to_batch(self):
+        self.fill()
+        self.store.patch({"duration_sec": 10})
+        v = self.store.add_to_batch()
+        self.assertEqual(v["batch"][0]["duration_sec"], 10)
+
+    def test_two_jobs_differing_only_by_duration_are_two_jobs(self):
+        self.fill()
+        self.store.add_to_batch()
+        self.store.patch({"duration_sec": 10})
+        v = self.store.add_to_batch()
+        self.assertEqual(len(v["batch"]), 2)
+
+    def test_survives_dump_load_round_trip(self):
+        j = job(driver="/s/d.mp4")
+        j.duration_sec = 10
+        [back] = drafts.load_jobs(drafts.dump_jobs([j]))
+        self.assertEqual(back.duration_sec, 10)
 
 
 class TestValidate(StoreCase):

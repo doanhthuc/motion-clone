@@ -135,6 +135,8 @@ struct NewJobView: View {
         .toolbar {
             ToolbarItem(placement: .principal) {
                 SettingsChip(pipeline: pipeline, pipelines: store.catalog, selectedProvider: draft.provider,
+                             selectedDuration: draft.durationSec,
+                             driverLengthSec: draft.slots[BatchComposer.driverRole]?.probe.durationS,
                              disabled: locked,
                              onPipelineSelected: { id in
                                  await store.selectPipeline(id)
@@ -144,7 +146,8 @@ struct NewJobView: View {
                                              || selected.optional.contains(BatchComposer.driverRole))
                                  }
                              },
-                             onProviderSelected: { id in await store.selectProvider(id) })
+                             onProviderSelected: { id in await store.selectProvider(id) },
+                             onDurationSelected: { choice in await store.selectDuration(choice) })
             }
             ToolbarItem(placement: .topBarLeading) {
                 Text("\(draft.jobs) job\(draft.jobs == 1 ? "" : "s")")

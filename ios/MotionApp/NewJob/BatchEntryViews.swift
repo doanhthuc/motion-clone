@@ -228,6 +228,7 @@ struct BatchEntryDetail: View {
     @State private var confirmingDrop = false
     @State private var replacing: String?
     @State private var choosingProvider = false
+    @State private var choosingPipeline = false
 
     private var entry: DraftBatchEntry? {
         guard let batch = store.draft?.batch, batch.indices.contains(position) else { return nil }
@@ -258,18 +259,21 @@ struct BatchEntryDetail: View {
 
     private var disabled: Bool { readOnly || locked || store.isBusy }
 
+    private func hasDriver(_ pipeline: Pipeline?) -> Bool {
+        guard let pipeline else { return false }
+        return pipeline.required.contains(BatchComposer.driverRole)
+            || pipeline.optional.contains(BatchComposer.driverRole)
+    }
+
     private func content(_ entry: DraftBatchEntry, pipeline: Pipeline?) -> some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
-                VStack(alignment: .leading, spacing: 10) {
-                    Text(PipelineText.name(entry.pipeline))
-                        .font(.title3.bold())
-                    if let pipeline, !pipeline.stages.isEmpty {
-                        StageStrip(stages: pipeline.stages)
-                    }
-                }
+                pipelineCard(entry)
                 if let message = store.message {
                     MessageCard(text: message) { store.dismissMessage() }.heroSurface()
+                }
+                if hasDriver(pipeline) {
+                    durationRow(entry)
                 }
                 if let pipeline, !pipeline.providers.isEmpty {
                     providerMenu(entry, pipeline: pipeline)
@@ -313,6 +317,92 @@ struct BatchEntryDetail: View {
             }
             Button("Cancel", role: .cancel) {}
         }
+    }
+
+    // MARK: Pipeline
+
+    /// The choices expand inside the card, the same pattern `providerMenu`
+    /// uses: a menu's popover floated off the row it belonged to
+    /// (user, 2026-09-26). A switch keeps whichever materials the new
+    /// pipeline can still use and the server refuses the whole edit
+    /// (`missing_slots`) if a required one can't be preserved — surfaced
+    /// through the same `MessageCard` every other refusal here uses.
+    private func pipelineCard(_ entry: DraftBatchEntry) -> some View {
+        VStack(spacing: 0) {
+            Button {
+                withAnimation(.snappy) { choosingPipeline.toggle() }
+            } label: {
+                HStack(alignment: .top, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(PipelineText.name(entry.pipeline))
+                            .font(.title3.bold()).foregroundStyle(Theme.label)
+                        if let pipeline = pipelineFor(entry), !pipeline.stages.isEmpty {
+                            StageStrip(stages: pipeline.stages)
+                        }
+                    }
+                    Spacer(minLength: 0)
+                    Image(systemName: "chevron.down")
+                        .font(.footnote.weight(.semibold)).foregroundStyle(Theme.secondary)
+                        .rotationEffect(.degrees(choosingPipeline ? 180 : 0))
+                }
+                .padding(.horizontal, 14).padding(.vertical, 12)
+                .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Pipeline")
+            .accessibilityValue(PipelineText.name(entry.pipeline))
+            .accessibilityHint(choosingPipeline ? "Hide the pipelines" : "Show the pipelines")
+            .accessibilityIdentifier("entry.pipeline")
+            if choosingPipeline {
+                ForEach(store.catalog) { candidate in
+                    Divider().padding(.leading, 14)
+                    pipelineRow(candidate, selected: candidate.id == entry.pipeline) {
+                        withAnimation(.snappy) { choosingPipeline = false }
+                        guard candidate.id != entry.pipeline else { return }
+                        Task { await store.editBatch(entry.digest, BatchEntryPatch(pipeline: candidate.id)) }
+                    }
+                }
+            }
+        }
+        .background(Theme.surface, in: .rect(cornerRadius: Theme.Radius.medium))
+        .clipShape(.rect(cornerRadius: Theme.Radius.medium))
+        .disabled(disabled)
+        .onChange(of: disabled) { _, now in if now { choosingPipeline = false } }
+    }
+
+    private func pipelineRow(_ candidate: Pipeline, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(PipelineText.name(candidate.id)).font(.body).foregroundStyle(Theme.label)
+                    StageStrip(stages: candidate.stages)
+                }
+                Spacer(minLength: 0)
+                Image(systemName: "checkmark")
+                    .font(.body.weight(.semibold)).foregroundStyle(Theme.accent)
+                    .opacity(selected ? 1 : 0)
+            }
+            .padding(.horizontal, 14).padding(.vertical, 10)
+            .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(PipelineText.name(candidate.id))
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+
+    // MARK: Length
+
+    private func durationRow(_ entry: DraftBatchEntry) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Length").font(.caption).foregroundStyle(Theme.secondary)
+            DurationControl(current: entry.durationSec, driverLengthSec: entry.driverDurationS,
+                            disabled: disabled, onSelect: { choice in
+                                await store.editBatch(entry.digest, BatchEntryPatch(duration: choice))
+                            })
+        }
+        .padding(.horizontal, 14).padding(.vertical, 12)
+        .background(Theme.surface, in: .rect(cornerRadius: Theme.Radius.medium))
+        .accessibilityIdentifier("entry.duration")
     }
 
     // MARK: Provider
