@@ -33,6 +33,9 @@ inside this agent's command sandbox — run it with the sandbox disabled, or fro
 ## Free provisioning
 
 No paid Apple account, so the app expires 7 days after install. Re-run from Xcode to reinstall.
+`make ios-install` does the reinstall from the terminal (build, install, launch on the connected iPhone;
+needs an Apple account signed in under Xcode → Settings → Accounts). An expired app shows up as the
+Shortcuts error "The request to open xyz.doanhthuc.motion failed".
 The Keychain survives this, so the secrets do not need re-entering. The secrets are seeded only into empty
 Keychain entries: an edit made in Settings is never overwritten by a rebuild.
 
