@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: gpu-facelock batch-mcp-check batch-coverage check-comfy-nodes help setup dev down clean gpu-preflight gpu-provision gpu-wait gpu-bootstrap gpu-fe gpu-up gpu-down gpu-destroy gpu-db-dump gpu-db-check gpu-status gpu-logs batch-test batch-params check-batch-params check-vast-models batch-scan batch-validate batch batch-clean watchdog-dry drain bot-dry api-smoke ios-test ios-audio-test ios-secrets ios-contract ios-refusal-smoke ios-gen ios-build ios-ui-test
+.PHONY: gpu-facelock batch-mcp-check batch-coverage check-comfy-nodes help setup dev down clean gpu-preflight gpu-provision gpu-wait gpu-bootstrap gpu-fe gpu-up gpu-down gpu-destroy gpu-db-dump gpu-db-check gpu-status gpu-logs batch-test batch-params check-batch-params check-vast-models batch-scan batch-validate batch batch-clean watchdog-dry drain bot-dry api-smoke ios-test ios-audio-test ios-secrets ios-contract ios-refusal-smoke ios-gen ios-build ios-install ios-ui-test
 
 help: ## Show this help
 	@echo "motion-clone — make targets:"
@@ -324,6 +324,9 @@ ios-gen: ## Generate ios/MotionApp.xcodeproj from ios/project.yml (needs ios/Sec
 ios-build: ios-gen ## Compile the app for the iOS simulator (automatic ad-hoc signing)
 	xcodebuild -project ios/MotionApp.xcodeproj -scheme MotionApp \
 	  -destination 'generic/platform=iOS Simulator' -quiet build
+
+ios-install: ## Build, install and launch the app on the connected iPhone (renews the 7-day free profile)
+	@bash scripts/ios-install.sh
 
 ios-ui-test: ios-gen ## Boot an iPhone Simulator and run the live Phase 3 UI smoke
 	@bash scripts/ios-ui-test.sh
