@@ -72,6 +72,19 @@ class TestLoad(unittest.TestCase):
             self.assertEqual(motion["driverDurSec"], 20)
             self.assertEqual(motion["preset"], "drv-20s")
 
+    def test_camera_length_gets_its_own_drv_preset(self):
+        # A custom 12s was refused at Continue (2026-09-30); it now runs as drv-12s.
+        for params, dur in (("driverDurSec: 12, quality: 720p", 12),
+                            ("driverDurSec: 1, quality: 720p", 1),
+                            ("preset: drv-12s, quality: 720p", 12),
+                            ("preset: drv-12s, driverDurSec: 12, quality: 720p", 12)):
+            with self.subTest(params=params), tempfile.TemporaryDirectory() as d:
+                text = CAMERA.replace("preset: drv-15s, quality: 720p", params)
+                run = load_manifest(_fixture(Path(d), text)).runs[0]
+                for stage in ("camera-tryon", "camera-motion"):
+                    self.assertEqual(run.stage_params[stage]["driverDurSec"], dur)
+                self.assertEqual(run.stage_params["camera-motion"]["preset"], f"drv-{dur}s")
+
     def test_camera_segment_requires_one_supported_duration_source(self):
         text = CAMERA.replace("preset: drv-15s, quality: 720p", "quality: 720p")
         with tempfile.TemporaryDirectory() as d:
@@ -83,8 +96,12 @@ class TestLoad(unittest.TestCase):
     def test_camera_segment_rejects_mismatched_or_unsupported_duration_sources(self):
         cases = (
             "preset: drv-15s, driverDurSec: 10, quality: 720p",
+            "preset: drv-31s, quality: 720p",
+            "preset: drv-0s, quality: 720p",
             "preset: drv-15s, driverDurSec: 15.5, quality: 720p",
-            "preset: drv-7s, quality: 720p",
+            "driverDurSec: 31, quality: 720p",
+            "driverDurSec: 0, quality: 720p",
+            "preset: drv-abc, quality: 720p",
         )
         for params in cases:
             with self.subTest(params=params), tempfile.TemporaryDirectory() as d:

@@ -74,6 +74,7 @@
           "drv-20s",
           "drv-30s"
         ],
+        "pattern": "^drv-\\d+s$",
         "where": "motions-studio/api/src/motion-resolution.js:20",
         "why": "enforceMotionResolution return SỚM nếu preset không nằm trong DRIVER_PRESETS, và worker không hề đọc quality → không có preset drv-* thì quality biến mất, không lỗi, không log. Vô hại ở 540p (đúng mặc định), nhưng ai gõ 720p sẽ nhận 540p mà không có cách nào biết. batch/example.yaml từng dạy chính cái dạng vô hiệu đó."
       }
@@ -94,7 +95,8 @@
             "drv-15s",
             "drv-20s",
             "drv-30s"
-          ]
+          ],
+          "pattern": "^drv-\\d+s$"
         },
         "forced": "tự tính từ driver: thời lượng của preset × fps THẬT của driver",
         "where": "motions-studio/worker/worker_runtime/linux.py:4141-4142",

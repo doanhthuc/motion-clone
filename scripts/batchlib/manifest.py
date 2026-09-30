@@ -31,16 +31,16 @@ class ManifestError(Exception):
 
 _CAMERA_PIPELINE = "tryon-camera-motion-enhance"
 _CAMERA_STAGES = ("camera-tryon", "camera-motion")
-_DRV_PRESET = re.compile(r"^drv-(5|10|15|20|30)s$")
-_CAMERA_DURATIONS = frozenset({5, 10, 15, 20, 30})
+_DRV_PRESET = re.compile(r"^drv-(\d+)s$")
+# The worker clamps a drv-Ns preset to 2..30s (linux.py `_want_sec`), so 30 is the ceiling.
+_CAMERA_MAX_SEC = 30
 
 
-def supported_driver_durations(pipeline: str) -> list[int] | None:
-    """The whole-second lengths `pipeline` accepts as a driver override, or
-    None when any positive length is fine. The camera pipeline only takes the
-    drv-Ns presets, so a custom 12s reached the run and died there with
-    "camera-motion.driverDurSec must be one of ..." (2026-09-30)."""
-    return sorted(_CAMERA_DURATIONS) if pipeline == _CAMERA_PIPELINE else None
+def max_driver_duration(pipeline: str) -> int | None:
+    """The longest driver length `pipeline` accepts, or None for no cap. The
+    camera pipeline is driven by a drv-<N>s preset (steps and resolution hang
+    off it), and the worker's ceiling for N is 30 (2026-09-30)."""
+    return _CAMERA_MAX_SEC if pipeline == _CAMERA_PIPELINE else None
 
 
 def synchronize_camera_stage_segments(
@@ -88,27 +88,30 @@ def synchronize_camera_stage_segments(
     if preset is not None:
         match = _DRV_PRESET.fullmatch(preset) if isinstance(preset, str) else None
         if not match:
-            supported = ", ".join(f"drv-{n}s" for n in sorted(_CAMERA_DURATIONS))
-            raise ManifestError(f"{prefix}camera-motion.preset must be one of {supported}")
+            raise ManifestError(f"{prefix}camera-motion.preset must look like drv-<seconds>s")
         preset_duration = int(match.group(1))
+        if not 1 <= preset_duration <= _CAMERA_MAX_SEC:
+            raise ManifestError(
+                f"{prefix}camera-motion.preset {preset!r}: seconds must be 1 to {_CAMERA_MAX_SEC}")
 
     if duration is None and preset_duration is None:
         raise ManifestError(
             f"{prefix}camera-motion requires driverDurSec or a supported drv-Ns preset"
         )
     if duration is not None:
-        if not duration.is_integer() or int(duration) not in _CAMERA_DURATIONS:
-            supported = ", ".join(map(str, sorted(_CAMERA_DURATIONS)))
-            raise ManifestError(f"{prefix}camera-motion.driverDurSec must be one of {supported}")
+        if not duration.is_integer() or not 1 <= duration <= _CAMERA_MAX_SEC:
+            raise ManifestError(
+                f"{prefix}camera-motion.driverDurSec must be a whole number of seconds, "
+                f"1 to {_CAMERA_MAX_SEC}")
         duration = int(duration)
-    if duration is None:
+        if preset_duration is None:
+            motion["preset"] = f"drv-{duration}s"
+        elif duration != preset_duration:
+            raise ManifestError(
+                f"{prefix}driverDurSec {duration} conflicts with camera-motion.preset {preset!r}"
+            )
+    else:
         duration = preset_duration
-    elif preset_duration is None:
-        motion["preset"] = f"drv-{duration}s"
-    elif duration != preset_duration:
-        raise ManifestError(
-            f"{prefix}driverDurSec {duration} conflicts with camera-motion.preset {preset!r}"
-        )
 
     for stage_name in _CAMERA_STAGES:
         params = copied.setdefault(stage_name, {})

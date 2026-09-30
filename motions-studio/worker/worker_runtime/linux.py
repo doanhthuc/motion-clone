@@ -2646,9 +2646,18 @@ def _wan_window_plan(p, frames):
         "fuse_method": fuse_method,
     }
 
+def _motion_preset(name):
+    """MOTION_PRESETS entry, or the shared drv-Ns one for a length the table does not list
+    (drv-12s): the seconds come off the name in run_motion, the rest is identical."""
+    name = str(name or "")
+    pre = MOTION_PRESETS.get(name)
+    if pre is None and re.fullmatch(r"drv-\d+s", name):
+        pre = MOTION_PRESETS["drv-15s"]
+    return pre
+
 def _normalize_motion_params(p):
     p = dict(p or {})
-    pre = MOTION_PRESETS.get(str(p.get("preset", "")))
+    pre = _motion_preset(p.get("preset", ""))
     if pre:
         # ALD 16/06/2026 - Preset định nghĩa frame/fps/resolution; sampler được khóa Fast sau block này.
         # 'short' xử lý riêng (resolution); 'lora_relight' để user override.

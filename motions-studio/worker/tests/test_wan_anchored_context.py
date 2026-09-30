@@ -333,6 +333,7 @@ class WanAnchoredContextTests(unittest.TestCase):
             ("drv-15s", (544, 960)),
             ("drv-20s", (544, 960)),
             ("drv-30s", (544, 960)),
+            ("drv-12s", (544, 960)),   # not in MOTION_PRESETS: rides the shared drv-Ns entry
         ):
             with self.subTest(preset=preset):
                 normalized = _normalize_motion_params({

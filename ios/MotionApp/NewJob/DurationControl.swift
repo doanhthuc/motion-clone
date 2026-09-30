@@ -14,9 +14,9 @@ struct DurationControl: View {
     /// The attached driver's own probed length; `nil` disables every
     /// segment but Full (no driver attached yet to measure against).
     let driverLengthSec: Double?
-    /// The only lengths the pipeline takes (camera: 5/10/15/20/30). `nil` is any
-    /// length, with 10s/15s quick picks and a custom slider.
-    var allowedSeconds: [Int]?
+    /// The pipeline's own ceiling (camera: 30s), `nil` for none. Lower than the
+    /// driver's length, it is the bound the segments and slider use.
+    var pipelineMaxSec: Int?
     let disabled: Bool
     let onSelect: (DurationChoice) async -> Void
 
@@ -26,7 +26,10 @@ struct DurationControl: View {
     @State private var expandCustom = false
     @State private var customValue: Double = 1
 
-    private var maxSeconds: Int { max(1, Int(driverLengthSec ?? 0)) }
+    private var maxSeconds: Int {
+        let driver = max(1, Int(driverLengthSec ?? 0))
+        return pipelineMaxSec.map { min(driver, $0) } ?? driver
+    }
 
     private var effective: Int? {
         switch pending {
@@ -42,38 +45,6 @@ struct DurationControl: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            if let allowedSeconds {
-                fixedSegments(allowedSeconds)
-            } else { freeSegments }
-            if driverLengthSec == nil {
-                Text("Attach a driver video to choose a length.")
-                    .font(.caption).foregroundStyle(Theme.secondary)
-            }
-        }
-        .disabled(disabled)
-        .animation(.snappy, value: expandCustom)
-        .onAppear(perform: syncCustomValue)
-        .onChange(of: current) { _, _ in syncCustomValue() }
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("Length")
-        .accessibilityValue(effective.map { "\($0) seconds" } ?? "Full")
-    }
-
-    /// A pipeline that takes only preset lengths: one segment per preset the
-    /// driver is long enough for, no slider.
-    private func fixedSegments(_ allowed: [Int]) -> some View {
-        HStack(spacing: 6) {
-            segment(label: "Full", selected: effective == nil, enabled: true) { select(.full) }
-            ForEach(allowed, id: \.self) { n in
-                segment(label: "\(n)s", selected: effective == n, enabled: Double(n) <= (driverLengthSec ?? 0)) {
-                    select(.seconds(n))
-                }
-            }
-        }
-    }
-
-    private var freeSegments: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 6) {
                 segment(label: "Full", selected: effective == nil, enabled: true) {
@@ -97,7 +68,18 @@ struct DurationControl: View {
             if (expandCustom || isCustomValue) && maxSeconds > 1 {
                 customSlider.transition(.opacity.combined(with: .move(edge: .top)))
             }
+            if driverLengthSec == nil {
+                Text("Attach a driver video to choose a length.")
+                    .font(.caption).foregroundStyle(Theme.secondary)
+            }
         }
+        .disabled(disabled)
+        .animation(.snappy, value: expandCustom)
+        .onAppear(perform: syncCustomValue)
+        .onChange(of: current) { _, _ in syncCustomValue() }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Length")
+        .accessibilityValue(effective.map { "\($0) seconds" } ?? "Full")
     }
 
     private func syncCustomValue() {

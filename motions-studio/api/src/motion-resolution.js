@@ -2,7 +2,9 @@
 // Chuẩn hóa ngay ở API trước khi ghi jobs.params để worker đang chạy bản cũ cũng nhận width/height rõ ràng.
 import { enforceMotionFitPolicy } from "./motion-camera-policy.js"
 
-const DRIVER_PRESETS = new Set(["drv-5s", "drv-10s", "drv-15s", "drv-20s", "drv-30s"])
+// Any N: the worker reads the seconds off the name (linux.py ^drv-(\d+)s$), so a fixed list would
+// silently drop `quality` for a preset like drv-12s.
+const DRIVER_PRESET = /^drv-\d+s$/
 
 function round16(value) {
   return Math.max(16, Math.round(Number(value) / 16) * 16)
@@ -19,7 +21,7 @@ function aspectPair(value) {
 export function enforceMotionResolution(type, params) {
   if (type !== "motion" || !params || typeof params !== "object") return params
   const out = { ...params }
-  if (!DRIVER_PRESETS.has(String(out.preset || ""))) return out
+  if (!DRIVER_PRESET.test(String(out.preset || ""))) return out
 
   const [rw, rh] = aspectPair(out.aspectRatio || out.aspect_ratio)
   const quality = String(out.quality || "").trim().toLowerCase() === "720p" ? "720p" : "540p"

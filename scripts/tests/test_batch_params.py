@@ -106,6 +106,12 @@ class TestValidate(unittest.TestCase):
             validate_params("motion", {"quality": "720p", "preset": "drv-5s"},
                             ast_params=self.ast, curated=self.curated), [])
 
+    def test_quality_kem_preset_drv_bat_ky_so_giay_van_co_tac_dung(self):
+        # The API matches /^drv-\\d+s$/, so drv-12s keeps `quality` too (2026-09-30).
+        self.assertEqual(
+            validate_params("motion", {"quality": "720p", "preset": "drv-12s"},
+                            ast_params=self.ast, curated=self.curated), [])
+
     def test_quality_khong_kem_preset_drv_thi_bi_chan(self):
         # ĐÂY là ca bug: batch/example.yaml từng dạy `{ quality: 540p, frames: 33 }`
         # không có preset. enforceMotionResolution (motion-resolution.js:20) return SỚM
