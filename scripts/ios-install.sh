@@ -13,6 +13,19 @@ IOS_DEVELOPMENT_TEAM=${IOS_DEVELOPMENT_TEAM:-$(grep -s '^IOS_DEVELOPMENT_TEAM=' 
 : "${IOS_DEVELOPMENT_TEAM:?set IOS_DEVELOPMENT_TEAM in .env (your personal team id)}"
 
 tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT
+# The device tunnel is opened on demand and closes when idle, so `list` alone reports a phone that is
+# reachable over wifi ("available (paired)") as tunnelState=disconnected. Any call addressed to it wakes
+# the tunnel (2026-09-30: `info details` flipped it to connected), which is what makes a phone with
+# "Connect via network" ticked installable without the cable. Best effort: a phone that is off or
+# asleep just stays disconnected and the filter below reports it.
+xcrun devicectl list devices --json-output "$tmp" >/dev/null
+for id in $(python3 -c "
+import json, sys
+for d in json.load(open(sys.argv[1]))['result']['devices']:
+    if d['hardwareProperties'].get('reality') == 'physical' and d['connectionProperties'].get('pairingState') == 'paired':
+        print(d['hardwareProperties']['udid'])" "$tmp"); do
+  timeout 30 xcrun devicectl device info details --device "$id" >/dev/null 2>&1 || true
+done
 xcrun devicectl list devices --json-output "$tmp" >/dev/null
 # Physical, connected devices only; IOS_DEVICE (name or UDID) picks one if several are plugged in.
 udid=$(python3 - "$tmp" "${IOS_DEVICE:-}" <<'PY'
