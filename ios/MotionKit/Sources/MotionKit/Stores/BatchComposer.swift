@@ -65,6 +65,11 @@ public final class BatchComposer {
     /// past `maxJobs` must never be silently ignored (spec §4). Any toggle that
     /// goes through clears it.
     public private(set) var capReason: String?
+    /// The output length for multi-selected drivers (2026-09-30). The draft has
+    /// no driver slot then, and the server refuses a length without one
+    /// (`no_driver`), so the choice waits here and rides with each step's
+    /// driver PATCH, where it is checked against that driver's own length.
+    public private(set) var duration: DurationChoice = .full
     public private(set) var isRunning = false
     public private(set) var progress: Progress?
     public private(set) var failure: String?
@@ -288,8 +293,14 @@ public final class BatchComposer {
     /// only here, so it is emptied beside it. Also called when a pipeline
     /// without a character + outfit pair is selected: its cards cannot show
     /// the selection, and hidden outfits would still count as jobs.
+    public func setDuration(_ choice: DurationChoice) {
+        guard !isRunning else { return }
+        duration = choice
+    }
+
     public func reset() {
         guard !isRunning else { return }
+        duration = .full
         outfits = []
         drivers = []
         failure = nil
@@ -394,7 +405,8 @@ public final class BatchComposer {
             let seed: DraftPatch.Seed = step.outfit.seedID.map { .set($0) } ?? .clear
             var slots: [String: String?] = [Self.outfitRole: step.outfit.outfitID]
             if let driver = step.driverID { slots[Self.driverRole] = driver }
-            guard await draft.apply(DraftPatch(slots: slots, seed: seed)) else {
+            let length: DurationChoice? = drivers.isEmpty ? nil : duration
+            guard await draft.apply(DraftPatch(slots: slots, seed: seed, duration: length)) else {
                 return stop(at: step)
             }
             if !(await draft.addToBatch()) {

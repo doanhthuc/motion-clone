@@ -392,6 +392,26 @@ def ingest(path: Path) -> tuple[Path, dict]:
                   "size_bytes": p.size_bytes, "warning": ingest_mod.quality_warning(p)}
 
 
+_DURATIONS: dict[tuple[str, int, int], float | None] = {}
+
+
+def video_duration(path: Path) -> float | None:
+    """A video material's length in seconds for the app's length picker, or None
+    for an image or an unprobeable file. Memoised on (path, mtime, size): the
+    app asks once per picked driver, and ffprobe on the 1 GB droplet is not
+    something to repeat for an unchanged file."""
+    if _kind(path) != "video":
+        return None
+    st = path.stat()
+    key = (str(path), st.st_mtime_ns, st.st_size)
+    if key not in _DURATIONS:
+        try:
+            _DURATIONS[key] = ingest_mod.probe(path).duration_s
+        except RuntimeError:
+            _DURATIONS[key] = None
+    return _DURATIONS[key]
+
+
 def prune_thumbs(thumbs_root: Path, staging_root: Path) -> list[Path]:
     """Thumbnails whose material is gone (pruned, deleted, /clear'd)."""
     removed = []

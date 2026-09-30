@@ -53,6 +53,23 @@ public final class MaterialsStore {
         }
     }
 
+    private struct DurationResponse: Decodable, Sendable { let durationS: Double? }
+    private var durations: [String: Double] = [:]
+
+    /// A video material's length, asked of the server once per id (it probes
+    /// with ffprobe) — the bound the New Job length picker needs for drivers
+    /// that are not on the draft. nil when unknown or the request failed.
+    public func duration(ofMaterialID id: String) async -> Double? {
+        if let cached = durations[id] { return cached }
+        let parts = id.split(separator: "/", maxSplits: 1).map(String.init)
+        guard parts.count == 2,
+              let response = try? await client.get(
+                  DurationResponse.self, "v1", "materials", parts[0], parts[1], "duration"),
+              let seconds = response.durationS else { return nil }
+        durations[id] = seconds
+        return seconds
+    }
+
     public func thumbnail(for material: Material) async -> Data? {
         if let cached = thumbnails[material.id] { return cached }
         do {

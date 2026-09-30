@@ -828,6 +828,20 @@ class TestMaterialRoutes(HttpWriteBase):
         self.assertEqual((resp.status, resp.getheader("Content-Type")), (200, "image/jpeg"))
         self.assertTrue(body.startswith(b"\xff\xd8"))
 
+    def test_duration_of_a_video_is_its_probed_length(self):
+        (self.batch / "tg-staging" / "app" / "d.mp4").write_bytes(b"x")
+        probed = Probe(kind="video", width=1, height=1, duration_s=12.5, bitrate_kbps=1, size_bytes=1)
+        with mock.patch.object(materials.ingest_mod, "probe", return_value=probed):
+            resp, body = self.send("GET", "/v1/materials/app/d.mp4/duration")
+        self.assertEqual((resp.status, json.loads(body)), (200, {"duration_s": 12.5}))
+
+    def test_duration_of_an_image_is_null_and_unknown_is_404(self):
+        (self.batch / "tg-staging" / "app" / "i.png").write_bytes(b"x")
+        resp, body = self.send("GET", "/v1/materials/app/i.png/duration")
+        self.assertEqual((resp.status, json.loads(body)), (200, {"duration_s": None}))
+        resp, _ = self.send("GET", "/v1/materials/app/nope.mp4/duration")
+        self.assertEqual(resp.status, 404)
+
 
 def _fake_probe(path: Path) -> Probe:
     """A stand-in for ingest.probe: kind from the extension, no ffprobe call —
