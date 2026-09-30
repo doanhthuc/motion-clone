@@ -11,15 +11,21 @@ import SwiftUI
 struct NewJobActionBar: View {
     let store: DraftStore
     let composer: BatchComposer
+    let materials: MaterialsStore
     let draft: Draft
     let state: NewJobState
+    let pipeline: Pipeline
     let onContinue: () -> Void
     @State private var continuing = false
+    /// The shortest of the multi-picked drivers: a length past it would be
+    /// refused for that driver. nil until measured.
+    @State private var shortestDriver: Double?
 
     private var locked: Bool { store.isBusy || composer.isRunning || continuing }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
+            lengthRow
             statusLines
             HStack(spacing: 10) {
                 if state.addCount > 0 || composer.failure != nil { addButton }
@@ -34,6 +40,46 @@ struct NewJobActionBar: View {
         .accessibilityIdentifier("newjob.actionBar")
         .padding(.horizontal, 12)
         .padding(.bottom, 8)
+    }
+
+    private var hasDriver: Bool {
+        pipeline.required.contains(BatchComposer.driverRole)
+            || pipeline.optional.contains(BatchComposer.driverRole)
+    }
+
+    /// The output length, out of the Settings sheet where it was hard to find
+    /// (2026-09-30). Only a pipeline with a driver video has a length to cut.
+    @ViewBuilder private var lengthRow: some View {
+        if hasDriver {
+            // Drivers picked on the Driver card live in the composer, not the
+            // draft, so their lengths are asked of the server and the picker is
+            // bounded by the shortest one.
+            let multi = !composer.drivers.isEmpty
+            HStack(alignment: .top, spacing: 10) {
+                Text("Length").font(.subheadline.weight(.semibold)).padding(.top, 6)
+                DurationControl(current: multi ? composer.duration.seconds : draft.durationSec,
+                                driverLengthSec: multi ? shortestDriver : draft.slots[BatchComposer.driverRole]?.probe.durationS,
+                                disabled: locked,
+                                onSelect: { choice in
+                                    if multi { composer.setDuration(choice) } else { await store.selectDuration(choice) }
+                                })
+            }
+            .accessibilityIdentifier("newjob.length")
+            .task(id: composer.drivers) { await measureDrivers() }
+        }
+    }
+
+    private func measureDrivers() async {
+        var shortest: Double?
+        for id in composer.drivers {
+            guard let seconds = await materials.duration(ofMaterialID: id) else { shortestDriver = nil; return }
+            shortest = min(shortest ?? seconds, seconds)
+        }
+        shortestDriver = shortest
+        // A length chosen for a longer driver set is no longer valid: fall back to Full.
+        if let shortest, let chosen = composer.duration.seconds, Double(chosen) > shortest {
+            composer.setDuration(.full)
+        }
     }
 
     private func count(_ n: Int, _ noun: String) -> String { "\(n) \(noun)\(n == 1 ? "" : "s")" }

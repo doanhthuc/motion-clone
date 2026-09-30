@@ -171,13 +171,17 @@ public struct DraftPatch: Encodable, Sendable, Equatable {
 
     public let slots: [String: String?]
     public let seed: Seed
+    /// `nil` omits the key and keeps the draft's length. Sent beside a driver
+    /// slot it is validated against that driver in the same request.
+    public let duration: DurationChoice?
 
-    public init(slots: [String: String?] = [:], seed: Seed = .keep) {
+    public init(slots: [String: String?] = [:], seed: Seed = .keep, duration: DurationChoice? = nil) {
         self.slots = slots
         self.seed = seed
+        self.duration = duration
     }
 
-    private enum CodingKeys: String, CodingKey { case slots, tryonSeed }
+    private enum CodingKeys: String, CodingKey { case slots, tryonSeed, durationSec }
 
     public func encode(to encoder: any Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
@@ -186,6 +190,11 @@ public struct DraftPatch: Encodable, Sendable, Equatable {
         case .keep: break
         case .clear: try container.encodeNil(forKey: .tryonSeed)
         case .set(let id): try container.encode(id, forKey: .tryonSeed)
+        }
+        switch duration {
+        case nil: break
+        case .full: try container.encodeNil(forKey: .durationSec)
+        case .seconds(let n): try container.encode(n, forKey: .durationSec)
         }
     }
 }
@@ -229,5 +238,12 @@ public struct BatchEntryPatch: Encodable, Sendable, Equatable {
         case .full: try container.encodeNil(forKey: .durationSec)
         case .seconds(let n): try container.encode(n, forKey: .durationSec)
         }
+    }
+}
+
+extension DurationChoice {
+    /// `nil` is Full, the shape the length control reads.
+    public var seconds: Int? {
+        if case .seconds(let n) = self { n } else { nil }
     }
 }

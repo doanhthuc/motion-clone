@@ -404,6 +404,11 @@ class _Handler(BaseHTTPRequestHandler):
                 return send_file(self, thumb)
             except FileNotFoundError:
                 raise NOT_FOUND
+        if method == "GET" and len(rest) == 4 and rest[0] == "materials" and rest[3] == "duration":
+            path = materials.resolve_material(s.staging_root, rest[1], rest[2])
+            if path is None:
+                raise NOT_FOUND
+            return self._send_json(200, {"duration_s": materials.video_duration(path)})
         if method == "GET" and len(rest) == 3 and rest[0] == "materials":
             # The file itself, with Range (send_file), so the app can play a
             # video material instead of only showing its poster frame.

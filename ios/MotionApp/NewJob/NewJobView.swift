@@ -162,7 +162,7 @@ struct NewJobView: View {
             ToolbarItem(placement: .topBarTrailing) { moreMenu }
         }
         .safeAreaInset(edge: .bottom) {
-            NewJobActionBar(store: store, composer: composer, draft: draft, state: state,
+            NewJobActionBar(store: store, composer: composer, materials: materials, draft: draft, state: state, pipeline: pipeline,
                             onContinue: { showRun = true })
         }
         .sheet(item: $pick) { target in
