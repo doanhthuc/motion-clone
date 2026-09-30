@@ -56,7 +56,10 @@ struct DurationControl: View {
                     withAnimation(.snappy) { expandCustom = true }
                 }
             }
-            if expandCustom || isCustomValue {
+            // A slider needs a real range: with no measured driver (or a 1s one)
+            // `1...maxSeconds` is empty/degenerate and a stored custom length like
+            // 12s crashed the view on every load (2026-09-30).
+            if (expandCustom || isCustomValue) && maxSeconds > 1 {
                 customSlider.transition(.opacity.combined(with: .move(edge: .top)))
             }
             if driverLengthSec == nil {
