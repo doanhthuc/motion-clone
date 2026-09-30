@@ -18,6 +18,7 @@ from pathlib import Path
 
 import control
 from batchlib.local_tryon import is_local_provider
+from batchlib.manifest import supported_driver_durations
 from batchlib.pipelines import PIPELINES, optional_roles, required_roles
 from control import materials
 from control.tryon_library import TryonLibrary
@@ -178,6 +179,7 @@ def pipeline_catalog() -> list[dict]:
             "required": sorted(required),
             "optional": sorted(optional),
             "roles": {role: role_kind(role) for role in sorted(required | optional)},
+            "durations": supported_driver_durations(name),
             "providers": ([{"id": pid, "label": label} for pid, label in PROVIDER_LABELS.items()]
                           if _tryon_stage(name) is not None else []),
         })
@@ -491,6 +493,15 @@ class DraftStore:
                 raise DraftError("duration_too_long",
                                  f"{duration_sec}s is longer than the driver video "
                                  f"({resolved_driver.duration_s:.1f}s)")
+        # The length the job will carry after this patch, against the pipeline
+        # it will run on: a pipeline switch can strand a length the new one
+        # refuses at run time.
+        resolved_duration = duration_sec if "duration_sec" in body else job.duration_sec
+        allowed = supported_driver_durations(target)
+        if resolved_duration is not None and allowed is not None and resolved_duration not in allowed:
+            raise DraftError("duration_unsupported",
+                             f"{target} only takes a length of "
+                             + ", ".join(f"{n}s" for n in allowed) + " (or Full)")
         # Every check passed: apply. Nothing above wrote anything.
         dropped = drop_unusable(job, target) if pipeline is not None else []
         if provider is not None:

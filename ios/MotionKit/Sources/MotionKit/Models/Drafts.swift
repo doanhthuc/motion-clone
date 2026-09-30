@@ -28,6 +28,9 @@ public struct Pipeline: Decodable, Sendable, Equatable, Identifiable {
     public let optional: [String]
     public let roles: [String: PipelineRoleKind]
     public let providers: [PipelineProvider]
+    /// The only whole-second lengths this pipeline accepts; `nil` means any. A server
+    /// predating the field also decodes as `nil`.
+    public let durations: [Int]?
 }
 
 public struct PipelineCatalogResponse: Decodable, Sendable, Equatable {

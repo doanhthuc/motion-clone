@@ -35,6 +35,14 @@ _DRV_PRESET = re.compile(r"^drv-(5|10|15|20|30)s$")
 _CAMERA_DURATIONS = frozenset({5, 10, 15, 20, 30})
 
 
+def supported_driver_durations(pipeline: str) -> list[int] | None:
+    """The whole-second lengths `pipeline` accepts as a driver override, or
+    None when any positive length is fine. The camera pipeline only takes the
+    drv-Ns presets, so a custom 12s reached the run and died there with
+    "camera-motion.driverDurSec must be one of ..." (2026-09-30)."""
+    return sorted(_CAMERA_DURATIONS) if pipeline == _CAMERA_PIPELINE else None
+
+
 def synchronize_camera_stage_segments(
     pipeline: str,
     stage_params: dict[str, dict],
