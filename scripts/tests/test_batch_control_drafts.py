@@ -659,24 +659,23 @@ class TestDurationSec(StoreCase):
             with self.subTest(bad=bad):
                 self.assertRefused("bad_request", self.store.patch, {"duration_sec": bad})
 
-    def test_camera_pipeline_refuses_a_length_outside_its_presets(self):
-        # The run failed with "camera-motion.driverDurSec must be one of 5, 10,
-        # 15, 20, 30" after Continue, when a custom 12s was added (2026-09-30).
+    def test_camera_pipeline_takes_any_length_up_to_its_largest_preset(self):
+        # 12s failed at Continue with "must be one of 5, 10, 15, 20, 30" (2026-09-30).
         self.fill()
         self.store.patch({"pipeline": "tryon-camera-motion-enhance"})
-        self.assertRefused("duration_unsupported", self.store.patch, {"duration_sec": 7})
-        self.assertEqual(self.store.patch({"duration_sec": 5})["duration_sec"], 5)
+        self.assertEqual(self.store.patch({"duration_sec": 7})["duration_sec"], 7)
 
-    def test_switching_to_camera_refuses_a_stranded_custom_length(self):
+    def test_camera_pipeline_refuses_a_length_past_its_ceiling(self):
         self.fill()
-        self.store.patch({"duration_sec": 7})
-        self.assertRefused("duration_unsupported", self.store.patch,
-                           {"pipeline": "tryon-camera-motion-enhance"})
+        self.store.patch({"pipeline": "tryon-camera-motion-enhance"})
+        self.store._probe = lambda path: Probe("video", 576, 1024, 45.0, 0, 1)
+        self.store.patch({"slots": {"driver": "app/dance.mp4"}})
+        self.assertRefused("duration_too_long", self.store.patch, {"duration_sec": 31})
 
-    def test_catalog_lists_the_lengths_only_where_they_are_restricted(self):
+    def test_catalog_reports_a_ceiling_only_where_there_is_one(self):
         by_id = {p["id"]: p for p in drafts.pipeline_catalog()}
-        self.assertEqual(by_id["tryon-camera-motion-enhance"]["durations"], [5, 10, 15, 20, 30])
-        self.assertIsNone(by_id["motion-enhance"]["durations"])
+        self.assertEqual(by_id["tryon-camera-motion-enhance"]["max_duration_sec"], 30)
+        self.assertIsNone(by_id["motion-enhance"]["max_duration_sec"])
 
     def test_null_resets_to_full(self):
         self.fill()

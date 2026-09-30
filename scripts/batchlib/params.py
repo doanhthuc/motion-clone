@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ast
 import difflib
+import re
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -161,6 +162,12 @@ def known_params(job_type: str, *, ast_params: dict, curated: dict) -> dict[str,
     return out
 
 
+def _matches(value: str, values: list[str], pattern: str | None) -> bool:
+    """`values` is a fixed list; `pattern` is a regex for an open-ended family
+    (preset drv-<N>s takes any N, so a list cannot name them all)."""
+    return value in values or bool(pattern and re.fullmatch(pattern, value))
+
+
 def validate_params(job_type: str, params: dict, *, ast_params: dict, curated: dict) -> list[str]:
     """Chặn param không có thật, giá trị ngoài danh sách, VÀ param sẽ bị bỏ qua âm thầm.
 
@@ -193,8 +200,8 @@ def validate_params(job_type: str, params: dict, *, ast_params: dict, curated: d
         rule = requires.get(key) or {}
         need_key = str(rule.get("param") or "")
         need_values = [str(v) for v in (rule.get("values") or [])]
-        if need_key and str((params or {}).get(need_key, "")) not in need_values:
-            shown = " | ".join(need_values)
+        if need_key and not _matches(str((params or {}).get(need_key, "")), need_values, rule.get("pattern")):
+            shown = " | ".join(need_values) + (f" | /{rule['pattern']}/" if rule.get("pattern") else "")
             errors.append(
                 f"{job_type}.{key}: {value!r} sẽ bị API BỎ QUA âm thầm — nó chỉ có tác dụng "
                 f"khi {need_key} là {shown} ({rule.get('where') or 'tầng API'}).\n"
@@ -215,8 +222,8 @@ def validate_params(job_type: str, params: dict, *, ast_params: dict, curated: d
             when_key = str(when.get("param") or "")
             when_values = [str(v) for v in (when.get("values") or [])]
             if when_key:
-                if str((params or {}).get(when_key, "")) in when_values:
-                    shown = " | ".join(when_values)
+                if _matches(str((params or {}).get(when_key, "")), when_values, when.get("pattern")):
+                    shown = " | ".join(when_values) + (f" | /{when['pattern']}/" if when.get("pattern") else "")
                     errors.append(
                         f"{job_type}.{key}: {value!r} sẽ bị GHI ĐÈ vì {when_key} đang là "
                         f"{str((params or {}).get(when_key))!r} — với {when_key} ∈ {shown} thì "

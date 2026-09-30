@@ -59,7 +59,7 @@ struct NewJobActionBar: View {
                 Text("Length").font(.subheadline.weight(.semibold)).padding(.top, 6)
                 DurationControl(current: multi ? composer.duration.seconds : draft.durationSec,
                                 driverLengthSec: multi ? shortestDriver : draft.slots[BatchComposer.driverRole]?.probe.durationS,
-                                allowedSeconds: pipeline.durations,
+                                pipelineMaxSec: pipeline.maxDurationSec,
                                 disabled: locked,
                                 onSelect: { choice in
                                     if multi { composer.setDuration(choice) } else { await store.selectDuration(choice) }
@@ -67,14 +67,14 @@ struct NewJobActionBar: View {
             }
             .accessibilityIdentifier("newjob.length")
             .task(id: composer.drivers) { await measureDrivers() }
-            .onChange(of: pipeline.id) { _, _ in dropUnsupportedLength() }
+            .onChange(of: pipeline.id) { _, _ in dropOverlongLength() }
         }
     }
 
-    /// A length picked under one pipeline may be refused by the next (camera takes
-    /// only 5/10/15/20/30): fall back to Full rather than fail at Continue.
-    private func dropUnsupportedLength() {
-        if let allowed = pipeline.durations, let chosen = composer.duration.seconds, !allowed.contains(chosen) {
+    /// A length picked under one pipeline may exceed the next one's ceiling
+    /// (camera: 30s): fall back to Full rather than fail at Continue.
+    private func dropOverlongLength() {
+        if let cap = pipeline.maxDurationSec, let chosen = composer.duration.seconds, chosen > cap {
             composer.setDuration(.full)
         }
     }
@@ -86,7 +86,7 @@ struct NewJobActionBar: View {
             shortest = min(shortest ?? seconds, seconds)
         }
         shortestDriver = shortest
-        dropUnsupportedLength()
+        dropOverlongLength()
         // A length chosen for a longer driver set is no longer valid: fall back to Full.
         if let shortest, let chosen = composer.duration.seconds, Double(chosen) > shortest {
             composer.setDuration(.full)
