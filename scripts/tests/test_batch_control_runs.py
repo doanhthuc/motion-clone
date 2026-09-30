@@ -180,6 +180,38 @@ class TestOutcome(unittest.TestCase):
         self.assertEqual(control.BOT_LOCK_TIMEOUT_SEC, 60)
 
 
+
+class TestSlowWarning(RunsTestBase):
+    WARN = {"at": 1790741000.0, "ceiling_min": 60, "gpu": "slow",
+            "detail": "median SM clock 7% of max, median power 58 W"}
+
+    def _stages(self, status, warn):
+        stage = {"status": status}
+        if warn:
+            stage["slow_warning"] = warn
+        write_run(self.batch, "r", {"batch": "b", "runs": {"a": {"status": "running",
+                  "stages": {"camera-motion": stage}}}})
+        return runs.run_detail(self.batch, self.out, "r")["jobs"][0]["stages"][0]
+
+    def test_running_stage_carries_the_warning(self):
+        got = self._stages("running", self.WARN)["slow_warning"]
+        self.assertEqual((got["gpu"], got["ceiling_min"]), ("slow", 60))
+        self.assertIn("7%", got["detail"])
+
+    def test_no_warning_is_null(self):
+        self.assertIsNone(self._stages("running", None)["slow_warning"])
+
+    def test_a_stage_that_is_no_longer_running_drops_it(self):
+        self.assertIsNone(self._stages("done", self.WARN)["slow_warning"])
+
+    def test_body_is_stable_between_polls(self):
+        # The ETag is a hash of the body: the warning must not change while the stage runs.
+        self._stages("running", self.WARN)
+        a = runs.run_detail(self.batch, self.out, "r")
+        b = runs.run_detail(self.batch, self.out, "r")
+        self.assertEqual(json.dumps(a, sort_keys=True), json.dumps(b, sort_keys=True))
+
+
 if __name__ == "__main__":
     unittest.main()
 

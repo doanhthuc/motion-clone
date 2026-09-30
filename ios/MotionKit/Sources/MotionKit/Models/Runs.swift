@@ -45,6 +45,9 @@ public struct RunSummary: Decodable, Sendable, Equatable, Identifiable {
     public let updatedAt: Double
     public let jobsTotal: Int
     public let jobsDone: Int
+    /// Running stages the runner flagged as far past their usual time. Absent
+    /// from an older server.
+    public var slowStages: Int? = nil
 }
 
 /// `DELETE /v1/runs/{id}`: the run is gone; `videosDeleted` counts the
@@ -54,10 +57,25 @@ public struct RunDeleted: Decodable, Sendable, Equatable {
     public let videosDeleted: Int
 }
 
+/// The runner's "this stage has run past half its time ceiling" note
+/// (`control/runs.py` `_slow_warning`), with what the pod's GPU was doing when
+/// it was raised. Written once, so it never changes while the stage runs.
+public struct SlowWarning: Decodable, Sendable, Equatable {
+    public let at: Double?
+    public let ceilingMin: Double?
+    /// "slow" (clock far below max: a throttled GPU), "ok" or "unknown".
+    public let gpu: String
+    public let detail: String
+
+    public var isThrottled: Bool { gpu == "slow" }
+}
+
 public struct StageProgress: Decodable, Sendable, Equatable {
     public let name: String
     public let status: StageStatus
     public let elapsedSec: Double?
+    /// Additive: an older server sends none.
+    public let slowWarning: SlowWarning?
 }
 
 /// What a job was made from (`control/runs.py` `_job_setups`): material ids
