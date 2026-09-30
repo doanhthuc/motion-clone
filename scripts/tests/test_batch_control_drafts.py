@@ -659,6 +659,25 @@ class TestDurationSec(StoreCase):
             with self.subTest(bad=bad):
                 self.assertRefused("bad_request", self.store.patch, {"duration_sec": bad})
 
+    def test_camera_pipeline_refuses_a_length_outside_its_presets(self):
+        # The run failed with "camera-motion.driverDurSec must be one of 5, 10,
+        # 15, 20, 30" after Continue, when a custom 12s was added (2026-09-30).
+        self.fill()
+        self.store.patch({"pipeline": "tryon-camera-motion-enhance"})
+        self.assertRefused("duration_unsupported", self.store.patch, {"duration_sec": 7})
+        self.assertEqual(self.store.patch({"duration_sec": 5})["duration_sec"], 5)
+
+    def test_switching_to_camera_refuses_a_stranded_custom_length(self):
+        self.fill()
+        self.store.patch({"duration_sec": 7})
+        self.assertRefused("duration_unsupported", self.store.patch,
+                           {"pipeline": "tryon-camera-motion-enhance"})
+
+    def test_catalog_lists_the_lengths_only_where_they_are_restricted(self):
+        by_id = {p["id"]: p for p in drafts.pipeline_catalog()}
+        self.assertEqual(by_id["tryon-camera-motion-enhance"]["durations"], [5, 10, 15, 20, 30])
+        self.assertIsNone(by_id["motion-enhance"]["durations"])
+
     def test_null_resets_to_full(self):
         self.fill()
         self.store.patch({"duration_sec": 10})

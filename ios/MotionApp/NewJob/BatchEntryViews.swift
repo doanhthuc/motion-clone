@@ -396,6 +396,7 @@ struct BatchEntryDetail: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Length").font(.caption).foregroundStyle(Theme.secondary)
             DurationControl(current: entry.durationSec, driverLengthSec: entry.driverDurationS,
+                            allowedSeconds: store.catalog.first { $0.id == entry.pipeline }?.durations,
                             disabled: disabled, onSelect: { choice in
                                 await store.editBatch(entry.digest, BatchEntryPatch(duration: choice))
                             })

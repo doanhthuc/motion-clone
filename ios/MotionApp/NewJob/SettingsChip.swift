@@ -107,6 +107,7 @@ private struct SettingsSheet: View {
                 if hasDriver {
                     Section {
                         DurationControl(current: selectedDuration, driverLengthSec: driverLengthSec,
+                                        allowedSeconds: pipeline.durations,
                                         disabled: false, onSelect: onDurationSelected)
                             .listRowInsets(EdgeInsets(top: 8, leading: 8, bottom: 8, trailing: 8))
                     } header: {
