@@ -12,6 +12,10 @@ public final class RunsStore {
     /// jobs from it, and opening the card shows that copy at once.
     @ObservationIgnored private var details: [String: RunDetailStore] = [:]
 
+    /// Told about a run whose slow-stage count just went up. Set by the app; nil in tests.
+    @ObservationIgnored public var onSlowRun: (@MainActor (SlowRunNotice) -> Void)?
+    @ObservationIgnored private var slowSeen: [String: Int] = [:]
+
     public init(client: APIClient) { self.client = client }
 
     /// The run shown as the hero card: the first one executing right now.
@@ -43,6 +47,8 @@ public final class RunsStore {
     public func refresh() async {
         do {
             runs = try await client.get(RunsResponse.self, "v1", "runs").runs
+            for notice in SlowRunNotice.newlySlow(before: slowSeen, after: runs) { onSlowRun?(notice) }
+            slowSeen = Dictionary(uniqueKeysWithValues: runs.map { ($0.id, $0.slowStages ?? 0) })
             loaded = true
             error = nil
             lastSuccess = .now

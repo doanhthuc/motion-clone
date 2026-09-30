@@ -25,6 +25,8 @@ from batchlib.vast_models import models_for_manifest, total_download_gb
 from batchlib_ext.gpu_stock import volume_datacenter
 from batchlib_ext.handoff import Handoff, claim_mailbox, handoff_path, write_handoff
 from batchlib_ext.lease import Lease, clear_lease, read_lease, write_lease
+from batchlib_ext.gpu_probe import run_probe
+from batchlib_ext.vast_scoreboard import load_board, save_board
 from batchlib_ext.provision_failure import (ProvisionFailure,
                                             clear_provision_failure,
                                             provision_failure_path,
@@ -195,6 +197,41 @@ def wait_and_bootstrap(manifest: Manifest) -> None:
         if ids:
             os.environ["VAST_MODEL_IDS"] = " ".join(sorted(ids))
     sh("bash", "scripts/pod-bootstrap.sh")
+
+
+class SlowGpu(RuntimeError):
+    """The rented GPU is throttled well below its rated clock; nothing has been run on it."""
+
+
+# One replacement, not a loop of them: each bad machine costs a rent + bootstrap (~5 min) before
+# the probe can run, and the scoreboard already keeps the bad one out of the next search.
+MAX_SLOW_GPU_RETRIES = 1
+
+
+def blacklist_machine(instance_id: str, why: str) -> None:
+    """Record the instance's machine as `slow_gpu` so the next rent skips it for 24 h."""
+    try:
+        import vast_rent
+        board = load_board(vast_rent.BOARD_PATH)
+        machine = (vast_rent.make_api().instance_status(instance_id) or {}).get("machine_id")
+        vast_rent._record(board, int(machine), None, "slow_gpu", time.time())
+        save_board(vast_rent.BOARD_PATH, board)
+        print(f"machine {machine} blacklisted as slow_gpu: {why}", file=sys.stderr)
+    except Exception as exc:   # bookkeeping must never stop the destroy that follows
+        print(f"could not blacklist the slow machine: {exc!r}", file=sys.stderr)
+
+
+def check_gpu_speed(pod_id: str) -> None:
+    """Raise SlowGpu if the vast GPU cannot hold its clock under load. Vast only: RunPod has
+    never shown the fault, and its pods sit on a volume that a replacement would have to re-attach."""
+    if effective_provider() != "vast":
+        return
+    env = ROOT / ".env"
+    verdict = run_probe(env_get(env, "GPU_SSH_HOST"), env_get(env, "GPU_SSH_PORT"))
+    print(f"gpu probe: {verdict.state} — {verdict.detail}", file=sys.stderr)
+    if verdict.state == "slow":
+        blacklist_machine(pod_id, verdict.detail)
+        raise SlowGpu(verdict.detail)
 
 
 def batch_run(*args: str) -> int:
@@ -414,32 +451,50 @@ def main() -> int:
         print(f"local phase failed (exit {rc}) — NOT renting a pod", file=sys.stderr)
         return rc
 
-    pod_id = provision(ceiling_min=ceiling, manifest_path=manifest_path, manifest=manifest)
-    # The lease is written HERE, between provisioning and waiting — not after
-    # bootstrap. The pod bills from the line above, and tier 3's grace window is
-    # 10 minutes while bootstrap is 284s prebuilt (docs/gpu-pod.md:81) and ~30 min
-    # on a first run (docs/gpu-pod.md:228). The manifest path is resolved: the
-    # watchdog reads it as ROOT / lease.manifest, so a relative path recorded from
-    # another cwd would resolve to a different (or missing) journal and tier 1
-    # would fire on a live batch at 105 minutes.
-    write_lease(LEASE_PATH, Lease(pod_id=pod_id, provisioned_at=time.time(),
-                                  manifest=str(manifest_path.resolve()),
-                                  abs_max_min=ceiling,
-                                  provider=effective_provider()))
-    try:
-        # Inside the try, so a wait/bootstrap failure still reaches teardown.
-        # Tiers 1 and 2 now cover this phase too, because the lease exists.
-        wait_and_bootstrap(manifest)
-        # --resume, always: phase A already journalled the try-on stages, and
-        # resume is what makes them skipped rather than paid for twice.
-        rc = batch_run("--file", str(manifest_path), "--resume")
-    finally:
-        # Best effort only. The watchdog is the guarantee, not this block:
-        # `finally` does not run when the process is SIGKILLed or the VPS dies.
-        # chain_or_teardown destroys immediately unless a job is already
-        # queued for this same manifest's mailbox — see its own docstring.
-        chain_or_teardown(manifest_path)
-    return rc
+    for attempt in range(1 + MAX_SLOW_GPU_RETRIES):
+        pod_id = provision(ceiling_min=ceiling, manifest_path=manifest_path, manifest=manifest)
+        # The lease is written HERE, between provisioning and waiting — not after
+        # bootstrap. The pod bills from the line above, and tier 3's grace window is
+        # 10 minutes while bootstrap is 284s prebuilt (docs/gpu-pod.md:81) and ~30 min
+        # on a first run (docs/gpu-pod.md:228). The manifest path is resolved: the
+        # watchdog reads it as ROOT / lease.manifest, so a relative path recorded from
+        # another cwd would resolve to a different (or missing) journal and tier 1
+        # would fire on a live batch at 105 minutes.
+        write_lease(LEASE_PATH, Lease(pod_id=pod_id, provisioned_at=time.time(),
+                                      manifest=str(manifest_path.resolve()),
+                                      abs_max_min=ceiling,
+                                      provider=effective_provider()))
+        slow = False
+        try:
+            # Inside the try, so a wait/bootstrap failure still reaches teardown.
+            # Tiers 1 and 2 now cover this phase too, because the lease exists.
+            wait_and_bootstrap(manifest)
+            try:
+                check_gpu_speed(pod_id)
+            except SlowGpu as exc:
+                slow = True
+                print(f"pod {pod_id} is throttled ({exc}) — destroying it"
+                      + (", renting another" if attempt < MAX_SLOW_GPU_RETRIES else ""),
+                      file=sys.stderr)
+            else:
+                # --resume, always: phase A already journalled the try-on stages, and
+                # resume is what makes them skipped rather than paid for twice.
+                rc = batch_run("--file", str(manifest_path), "--resume")
+        finally:
+            # Best effort only. The watchdog is the guarantee, not this block:
+            # `finally` does not run when the process is SIGKILLed or the VPS dies.
+            # chain_or_teardown destroys immediately unless a job is already
+            # queued for this same manifest's mailbox — see its own docstring.
+            # A throttled pod is destroyed outright instead: chaining would hand
+            # this slow GPU to the next queued manifest.
+            if slow:
+                teardown(manifest_path)
+            else:
+                chain_or_teardown(manifest_path)
+        if not slow:
+            return rc
+    print("every rented GPU was throttled — giving up", file=sys.stderr)
+    return 1
 
 
 if __name__ == "__main__":

@@ -130,7 +130,12 @@ final class AppModel {
         }
         let client = APIClient(credentials: credentials)
         self.client = client
-        runs = RunsStore(client: client)
+        let runs = RunsStore(client: client)
+        // Only when the user allowed notifications; the app asks on first launch.
+        runs.onSlowRun = { notice in
+            Task { if await ImportNotifier.canNotify() { SlowRunNotifier().post(notice) } }
+        }
+        self.runs = runs
         let pod = PodStore(client: client)
         self.pod = pod
         materials = MaterialsStore(client: client)

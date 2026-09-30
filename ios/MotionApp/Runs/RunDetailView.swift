@@ -320,8 +320,13 @@ private struct JobPage: View {
     @ViewBuilder private var jobStatus: some View {
             switch job.status {
             case .running:
-                WorkStatus(title: "\(Format.stageName(runningStage?.name ?? "working"))…", active: true) {
-                    Text(stagePosition)
+                if let warning = runningStage?.slowWarning {
+                    SlowStageStatus(stage: runningStage?.name ?? "working", position: stagePosition,
+                                    warning: warning)
+                } else {
+                    WorkStatus(title: "\(Format.stageName(runningStage?.name ?? "working"))…", active: true) {
+                        Text(stagePosition)
+                    }
                 }
             case .error:
                 WorkStatus(title: "Failed", active: false, symbol: "exclamationmark.triangle.fill",
@@ -356,6 +361,28 @@ private struct JobPage: View {
 /// A finished video's poster, fitted, over a blur of itself — the try-on
 /// carousel's framing, so a portrait frame fills the page instead of
 /// floating in a 9:16 tile narrower than it.
+/// A running stage the runner flagged as far past its usual time. A throttled
+/// GPU (clock far below max) says so; otherwise it is only "slower than usual",
+/// because the run may still be healthy, just long.
+private struct SlowStageStatus: View {
+    let stage: String
+    let position: String
+    let warning: SlowWarning
+
+    var body: some View {
+        WorkStatus(title: "\(Format.stageName(stage)) is slow", active: false,
+                   symbol: "exclamationmark.triangle.fill", tint: Theme.warning) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(position)
+                Text(warning.isThrottled ? "GPU looks throttled · \(warning.detail)"
+                                         : "Past half its time limit · \(warning.detail)")
+                    .font(.footnote).foregroundStyle(Theme.warning)
+            }
+        }
+        .accessibilityElement(children: .combine)
+    }
+}
+
 private struct FramedPoster: View {
     let client: APIClient
     let batch: String

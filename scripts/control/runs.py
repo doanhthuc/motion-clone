@@ -58,6 +58,11 @@ def _summary(manifest: Path, state_file: Path) -> dict:
         "status": _status(manifest, jobs),
         "updated_at": state_file.stat().st_mtime,
         "jobs_total": len(jobs),
+        # Lets the phone raise a notification from the list poll alone (any tab), without
+        # opening every run's detail. Set-once with the warning, so the ETag stays stable.
+        "slow_stages": sum(1 for job in jobs.values() if isinstance(job, dict)
+                           for st in (job.get("stages") or {}).values()
+                           if isinstance(st, dict) and _slow_warning(st) is not None),
         "jobs_done": sum(1 for j in jobs.values()
                          if isinstance(j, dict) and j.get("status") == "done"),
     }
@@ -77,6 +82,16 @@ def list_runs(batch_dir: Path, out_dir: Path) -> list[dict]:
                 # run should not 500 the whole list — skip it.
                 continue
     return sorted(found, key=lambda r: r["updated_at"], reverse=True)
+
+
+def _slow_warning(stage: dict) -> dict | None:
+    """The runner's "this stage is far past its usual time" note, whitelisted for the phone.
+    `at` is a fixed timestamp and the note is written once, so it never breaks the ETag rule."""
+    warn = stage.get("slow_warning")
+    if not isinstance(warn, dict) or str(stage.get("status")) != "running":
+        return None
+    return {"at": warn.get("at"), "ceiling_min": warn.get("ceiling_min"),
+            "gpu": str(warn.get("gpu") or "unknown"), "detail": str(warn.get("detail") or "")}
 
 
 def _job_setups(manifest: Path) -> dict[str, dict]:
@@ -114,7 +129,9 @@ def run_detail(batch_dir: Path, out_dir: Path, run_id: str) -> dict | None:
         {"id": job_id, "status": str(job.get("status")),
          "stages": [{"name": name,
                      "status": str(stage.get("status")),
-                     "elapsed_sec": stage.get("elapsed_sec")}
+                     "elapsed_sec": stage.get("elapsed_sec"),
+                     # Only while the stage is still running: the runner pops it on done.
+                     "slow_warning": _slow_warning(stage)}
                     for name, stage in (job.get("stages") or {}).items()
                     if isinstance(stage, dict)],
          "setup": setups.get(job_id)}

@@ -245,6 +245,40 @@ class TestCameraAlias(unittest.TestCase):
             self.assertEqual(pod.submitted[1][1].get("preset"), "drv-15s")
 
 
+    def test_slow_stage_is_journalled_once_and_cleared_on_done(self):
+        # 2026-09-30: a camera-motion job ran 44+ min on a throttled GPU and nothing said so.
+        pod = FakePod()
+        clock = {"t": 1000.0}
+        seen = []
+
+        def poll(_s, job_id, timeout_min, on_progress=None, **_kw):
+            # Two polls, both past 50% of the stage ceiling; only the first may warn.
+            for _ in range(2):
+                clock["t"] += timeout_min * 60 * 0.6
+                on_progress({"status": "running", "progress": 0.9, "current_step": "x"})
+                seen.append(dict(state["runs"]["runA"]["stages"].get("camera-motion") or {}))
+            return pod.poll(_s, job_id, timeout_min, on_progress=None)
+
+        state = {"runs": {}}
+        logs = []
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch("batchlib.runner.submit_job", pod.submit), \
+             mock.patch("batchlib.runner.poll_job", poll), \
+             mock.patch("batchlib.runner.download_output", pod.download), \
+             mock.patch("batchlib.runner._gpu_speed_hint", return_value=("slow", "7% of max")):
+            tmp = Path(d)
+            run = self.manifest(tmp).runs[0]
+            run_one(settings=SETTINGS, run=run, out_dir=tmp / "out", state=state,
+                    state_file=tmp / "state.json", resume=False, log=logs.append,
+                    now=lambda: clock["t"])
+        first = next(s for s in seen if "slow_warning" in s)["slow_warning"]
+        self.assertEqual((first["gpu"], first["detail"]), ("slow", "7% of max"))
+        # Once per stage despite two over-threshold polls each -- not once per poll.
+        self.assertEqual(sum("!!" in line for line in logs), len(pod.submitted))
+        for stage in state["runs"]["runA"]["stages"].values():
+            self.assertNotIn("slow_warning", stage)
+
+
 class FakePod:
     """Pod giả có HÀNG JOB thật, không phải một hàm "poll gì cũng done".
 

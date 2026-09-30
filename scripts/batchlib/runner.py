@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from batchlib_ext.gpu_probe import PASSIVE_SCRIPT, run_probe
+
 from .client import JobError, JobFailed, JobGone, download_output, poll_job, submit_job
 from .config import ConfigError, Settings
 from .local_tryon import is_local_provider, run_local_tryon
@@ -216,9 +218,26 @@ def run_one(*, settings: Settings, run: Run, out_dir: Path, state: dict,
             prev_output = dest
             continue
 
+        slow_warned = False
+
         def _progress(d: dict) -> None:
+            nonlocal slow_warned
             log(f"      {d.get('status')} {round((d.get('progress') or 0) * 100)}% "
                 f"{d.get('current_step') or ''}")
+            if not slow_warned and now() - started > SLOW_STAGE_SHARE * stage.timeout_min * 60:
+                slow_warned = True
+                gpu_state, gpu_text = _gpu_speed_hint(_REPO_ROOT)
+                log(f"      !! {stage_name} has run past {SLOW_STAGE_SHARE:.0%} of its "
+                    f"{stage.timeout_min} min ceiling — {gpu_text}")
+                # Journalled so the phone's GET /v1/runs/{id} can show it: it reads only
+                # this file, never the log. Set once, so the body (and its ETag) does not
+                # change again while the stage keeps running.
+                stage_entry = entry["stages"].get(stage_name)
+                if stage_entry is not None:
+                    stage_entry["slow_warning"] = {
+                        "at": now(), "ceiling_min": stage.timeout_min,
+                        "gpu": gpu_state, "detail": gpu_text}
+                    save_state(state_file, state)
 
         job_id = str(recorded.get("job_id") or "")
         started = now()
@@ -265,6 +284,7 @@ def run_one(*, settings: Settings, run: Run, out_dir: Path, state: dict,
         entry["stages"][stage_name].update(
             status="done", elapsed_sec=elapsed, file=str(dest), bytes=size,
             params_sent=stored if isinstance(stored, dict) else {})
+        entry["stages"][stage_name].pop("slow_warning", None)   # a finished stage is not slow now
         save_state(state_file, state)
         log(f"    {stage_name}: xong {elapsed}s · {size // 1024} KB → {dest.name}")
         prev_output = dest
@@ -357,6 +377,26 @@ def prepare_batch(*, manifest: Manifest, out_root: Path, batch_id: str,
     state = load_state(state_file) if resume else {"version": 1, "runs": {}}
     state["batch"] = batch_id
     return out_dir, state, state_file
+
+
+# A stage past this share of its timeout ceiling is a warning, never a kill: a render that is
+# nearly done is worth more than the minutes saved. 2026-09-30: a 10 s camera-motion job (measured
+# 460 s) was 44+ min in on a GPU pinned at 7% of its clock, and the log only ever said "90%".
+SLOW_STAGE_SHARE = 0.5
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _gpu_speed_hint(root: Path) -> tuple[str, str]:
+    """(state, text) of the pod's GPU right now, for the slow-stage warning. Never raises."""
+    try:
+        from batchlib.config import env_get
+        host, port = env_get(root / ".env", "GPU_SSH_HOST"), env_get(root / ".env", "GPU_SSH_PORT")
+        if not host or not port:
+            return "unknown", "no pod ssh in .env, cannot read the GPU"
+        v = run_probe(host, port, PASSIVE_SCRIPT)
+        return v.state, v.detail
+    except Exception as exc:
+        return "unknown", f"could not read the GPU ({exc!r})"
 
 
 def run_batch(*, settings: Settings, manifest: Manifest, out_root: Path,

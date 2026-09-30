@@ -30,7 +30,7 @@ class MachineRecord:
     model_mbps: float | None   # measured model download throughput; filled by the model probe
     gb: float | None           # GB that measurement covered
     measured_at: float         # unix seconds
-    outcome: str               # "ok" | "slow_pull" | "failed" | "ssh_refused"
+    outcome: str               # "ok" | "slow_pull" | "failed" | "ssh_refused" | "slow_gpu"
 
 
 class Scoreboard:
