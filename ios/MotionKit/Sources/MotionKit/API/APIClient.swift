@@ -16,7 +16,7 @@ public struct ByteRangeResponse: Sendable, Equatable {
 
 public actor APIClient {
     public nonisolated let credentials: Credentials
-    private let session: URLSession
+    private nonisolated let session: URLSession
 
     public init(credentials: Credentials, session: URLSession = .shared) {
         self.credentials = credentials
@@ -227,6 +227,41 @@ public actor APIClient {
             acceptsRanges: acceptsRanges)
     }
 
+    /// One GET for `length` bytes from `offset` (nil: to the end), yielded as
+    /// the network delivers them rather than once the whole range has arrived.
+    /// Cancelling the consuming task, or dropping the stream, cancels the GET.
+    public nonisolated func streamRange(from offset: Int64, length: Int64?,
+                                        path components: [String]) -> AsyncThrowingStream<ByteStreamEvent, any Error> {
+        AsyncThrowingStream { continuation in
+            guard offset >= 0 else {
+                continuation.finish(throwing: APIError.transport("invalid negative byte offset"))
+                return
+            }
+            var range = "bytes=\(offset)-"
+            if let length {
+                guard length > 0 else {
+                    continuation.finish(throwing: APIError.transport("invalid empty byte range"))
+                    return
+                }
+                let (end, overflow) = offset.addingReportingOverflow(length - 1)
+                guard !overflow else {
+                    continuation.finish(throwing: APIError.transport("byte range overflow"))
+                    return
+                }
+                range += "\(end)"
+            }
+            var request = URLRequest(url: url(components))
+            request.timeoutInterval = 30
+            for (k, v) in authHeaders.merging(["Range": range], uniquingKeysWith: { $1 }) {
+                request.setValue(v, forHTTPHeaderField: k)
+            }
+            let task = session.dataTask(with: request)
+            task.delegate = ByteStreamDelegate(continuation)
+            continuation.onTermination = { _ in task.cancel() }
+            task.resume()
+        }
+    }
+
     /// Downloads to a temp file that keeps the source extension — Photos
     /// decides video vs image from it.
     public func download(_ components: String...) async throws(APIError) -> URL {
@@ -277,7 +312,7 @@ public actor APIClient {
         return .server(status: status, code: "http_\(status)", message: text)
     }
 
-    private static func totalLength(_ contentRange: String) -> Int64? {
+    static func totalLength(_ contentRange: String) -> Int64? {
         guard contentRange.lowercased().hasPrefix("bytes "),
               let slash = contentRange.lastIndex(of: "/") else { return nil }
         return Int64(contentRange[contentRange.index(after: slash)...])
