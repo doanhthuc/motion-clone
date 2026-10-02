@@ -9,10 +9,6 @@ import UniformTypeIdentifiers
 /// request then uses APIClient's normal Access + bearer headers.
 final class AuthenticatedAssetResourceLoader: NSObject, AVAssetResourceLoaderDelegate, @unchecked Sendable {
     private static let scheme = "motion-auth"
-    /// One round trip through the tunnel: 1 MiB is ~0.3 s from the Mac, small
-    /// enough that the first frame never waits for more than one of them.
-    private static let chunk: Int64 = 1 << 20
-
     private let client: APIClient
     /// API path segments, e.g. `["v1", "outputs", batch, file]`.
     private let path: [String]
@@ -62,34 +58,26 @@ final class AuthenticatedAssetResourceLoader: NSObject, AVAssetResourceLoaderDel
         let task = Task { [weak self] in
             guard let self else { return }
             defer { _ = lock.withLock { tasks.removeValue(forKey: key) } }
-            // Answered in `Self.chunk`-sized pieces, each handed to AVPlayer as
-            // it lands. Before 2026-09-25 a to-the-end request was one GET for
-            // the whole remainder, and AVPlayer saw no byte until all of it had
-            // arrived: a 20.7 MB output took 2.0–2.3 s from the Mac against
-            // 0.28–0.32 s for its first MiB (measured through the tunnel), and
-            // far longer on a phone's link — playback waited for the download.
-            var offset = start
-            var remaining = wanted
-            var total: Int64?
+            // One GET for the whole request, each piece handed to AVPlayer as it
+            // lands. The first frame waits only for the first piece, and the
+            // rest flows at single-GET speed. The 1 MiB-chunk loop this replaced
+            // (2026-09-25 to 2026-10-02) paid one round trip per MiB: measured
+            // through the tunnel from the Mac on 2026-10-02, a 1 MiB range took
+            // 0.44–1.64 s while one GET for the whole 17.5 MB output ran at
+            // 4.1–4.8 MB/s, against the 1.75 MB/s its 14 Mbps bitrate needs.
             do {
-                while !Task.isCancelled {
-                    let size = remaining.map { min($0, Self.chunk) } ?? Self.chunk
-                    let response = try await client.byteRange(
-                        from: offset, length: Int(size), path: path)
+                for try await event in client.streamRange(from: start, length: wanted, path: path) {
                     guard !Task.isCancelled else { return }
-                    if total == nil {
-                        total = response.totalLength
+                    switch event {
+                    case let .head(contentType, totalLength, acceptsRanges):
                         if let info = box.value.contentInformationRequest {
-                            info.contentType = response.contentType.flatMap { UTType(mimeType: $0)?.identifier }
-                            if let totalLength = response.totalLength { info.contentLength = totalLength }
-                            info.isByteRangeAccessSupported = response.acceptsRanges
+                            info.contentType = contentType.flatMap { UTType(mimeType: $0)?.identifier }
+                            if let totalLength { info.contentLength = totalLength }
+                            info.isByteRangeAccessSupported = acceptsRanges
                         }
+                    case let .data(data):
+                        box.value.dataRequest?.respond(with: data)
                     }
-                    box.value.dataRequest?.respond(with: response.data)
-                    offset += Int64(response.data.count)
-                    remaining = remaining.map { $0 - Int64(response.data.count) }
-                    let atEnd = total.map { offset >= $0 } ?? true
-                    if response.data.isEmpty || atEnd || (remaining ?? 1) <= 0 { break }
                 }
                 guard !Task.isCancelled else { return }
                 box.value.finishLoading()
