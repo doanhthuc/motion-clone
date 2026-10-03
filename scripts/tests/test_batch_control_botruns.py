@@ -881,7 +881,7 @@ class TestRentPanel(_AppRunsFixture):
         self.assertEqual(status, 200)
         self.assertEqual(body["runpod"], {
             "gpu": "NVIDIA GeForce RTX 5090", "datacenter": "EU-RO-1",
-            "stock": "High", "usd_per_hr": 0.99, "sold_out": False})
+            "stock": "High", "usd_per_hr": 0.99, "sold_out": False, "cloud": "secure"})
         self.assertFalse(body["after_phase_a"])
         self.assertEqual(body["jobs"], 1)
         self.assertGreater(body["estimate_min"], 0)
@@ -918,7 +918,8 @@ class TestRentPanel(_AppRunsFixture):
                 status, body = self.runs.rent_panel(self.runs.run_id, force=False)
             self.assertEqual(status, 200)
             self.assertEqual(body["runpod"], {"gpu": "NVIDIA GeForce RTX 5090",
-                                              "datacenter": "Community", **want})
+                                              "datacenter": "Community", "cloud": "community",
+                                              **want})
             secure_stock.assert_not_called()
 
     def test_rent_panel_never_prices_the_telegram_draft(self):

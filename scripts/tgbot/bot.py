@@ -7216,7 +7216,7 @@ def _rent_panel_data(chat_id: int, *, force: bool, manifest: Manifest | None) ->
         runpod = {"gpu": configured, "datacenter": "Community",
                   "stock": cstock.status if cstock is not None else None,
                   "usd_per_hr": _community_price(cstock),
-                  "sold_out": cstock is None or cstock.sold_out}
+                  "sold_out": cstock is None or cstock.sold_out, "cloud": "community"}
     else:
         volume_id = env_get(ROOT / ".env", "POD_VOLUME_ID")
         home_dc = volume_datacenter(volume_id)
@@ -7235,7 +7235,7 @@ def _rent_panel_data(chat_id: int, *, force: bool, manifest: Manifest | None) ->
         sold_out = home is None or home.stock_status.lower() == "none"
         runpod = {"gpu": configured, "datacenter": home_dc,
                  "stock": home.stock_status if home is not None else None,
-                 "usd_per_hr": price, "sold_out": sold_out}
+                 "usd_per_hr": price, "sold_out": sold_out, "cloud": "secure"}
 
     enabled = _vast_enabled()
     if manifest is None:

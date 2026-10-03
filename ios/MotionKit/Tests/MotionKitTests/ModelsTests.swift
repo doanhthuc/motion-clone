@@ -373,6 +373,14 @@ import Testing
         #expect(p.vast.canSpend && p.vast.sessionUsd == 1.05)
     }
 
+    @Test func communityPanelDecodesItsCloud() throws {
+        let p = try MotionJSON.decoder.decode(RentPanel.self, from: Fixtures.data(Fixtures.rentPanelCommunity))
+        #expect(p.runpod.isCommunity && p.runpod.soldOut && p.runpod.usdPerHr == 0.69)
+        // A server older than the field rents Secure only.
+        let old = try MotionJSON.decoder.decode(RentPanel.self, from: Fixtures.data(Fixtures.rentPanel))
+        #expect(old.runpod.cloud == nil && !old.runpod.isCommunity)
+    }
+
     @Test func soldOutPanelDecodesNulls() throws {
         let p = try MotionJSON.decoder.decode(RentPanel.self, from: Fixtures.data(Fixtures.rentPanelSoldOut))
         #expect(p.runpod.soldOut && p.runpod.usdPerHr == nil && p.runpod.stock == nil)

@@ -234,6 +234,14 @@ enum Fixtures {
      "jobs":2,"estimate_min":84}
     """#
 
+    static let rentPanelCommunity = #"""
+    {"runpod":{"gpu":"NVIDIA GeForce RTX 5090","datacenter":"Community","stock":null,
+               "usd_per_hr":0.69,"sold_out":true,"cloud":"community"},
+     "vast":{"enabled":true,"usd_per_hr":0.62,"session_usd":1.05,"blockers":[],"can_spend":true},
+     "run_id":"tg-1000","panel_token":"1790000000123.4.9","after_phase_a":false,
+     "jobs":1,"estimate_min":42}
+    """#
+
     static let rentPanelSoldOut = #"""
     {"runpod":{"gpu":"NVIDIA GeForce RTX 5090","datacenter":"EU-RO-1","stock":null,
                "usd_per_hr":null,"sold_out":true},
