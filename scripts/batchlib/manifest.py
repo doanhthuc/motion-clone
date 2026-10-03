@@ -43,42 +43,85 @@ def max_driver_duration(pipeline: str) -> int | None:
     return _CAMERA_MAX_SEC if pipeline == _CAMERA_PIPELINE else None
 
 
+def _resolve_shared(copied: dict[str, dict], stages: tuple[str, ...], prefix: str,
+                    field: str, snake_field: str, *, positive: bool = False) -> float | None:
+    """The one value of `field` the `stages` agree on, or None when none sets it."""
+    supplied: list[tuple[str, float]] = []
+    for stage_name in stages:
+        params = copied.get(stage_name, {})
+        for key in (field, snake_field):
+            if key not in params:
+                continue
+            try:
+                value = float(params[key])
+            except (TypeError, ValueError) as exc:
+                raise ManifestError(
+                    f"{prefix}{stage_name}.{key} must be a finite number"
+                ) from exc
+            if not math.isfinite(value):
+                raise ManifestError(f"{prefix}{stage_name}.{key} must be a finite number")
+            if (positive and value <= 0) or (not positive and value < 0):
+                relation = "positive" if positive else "non-negative"
+                raise ManifestError(f"{prefix}{stage_name}.{key} must be {relation}")
+            supplied.append((f"{stage_name}.{key}", value))
+    if supplied and any(value != supplied[0][1] for _, value in supplied[1:]):
+        names = ", ".join(name for name, _ in supplied)
+        raise ManifestError(f"{prefix}{field} conflicts between {names}")
+    return supplied[0][1] if supplied else None
+
+
+_SWAP_PIPELINE = "tryon-character-swap-enhance"
+_SWAP_STAGES = ("camera-tryon", "character-swap")
+# run_character_swap's own params.setdefault("preset", "drv-5s"): what the swap renders when the
+# manifest names no length, so the guide frame must come from the middle of those 5 s too.
+_SWAP_DEFAULT_SEC = 5
+
+
+def _synchronize_swap_segment(copied: dict[str, dict], prefix: str) -> dict[str, dict]:
+    """Point camera-tryon's guide frame at the middle of the part of the driver the swap renders.
+
+    Looser than the camera pipeline: the swap keeps its own length rules (any preset, longer
+    drivers trimmed by the worker), so nothing here is required or capped — the guide only has to
+    land inside the rendered segment. The worker renders min(driverDurSec, the drv-Ns preset).
+    """
+    start = _resolve_shared(copied, _SWAP_STAGES, prefix, "driverStartSec", "driver_start_sec")
+    duration = _resolve_shared(copied, _SWAP_STAGES, prefix, "driverDurSec", "driver_dur_sec",
+                               positive=True)
+    swap = copied.setdefault("character-swap", {})
+    preset = swap.get("preset")
+    match = _DRV_PRESET.fullmatch(preset) if isinstance(preset, str) else None
+    preset_duration = int(match.group(1)) if match else (_SWAP_DEFAULT_SEC if preset is None else None)
+    rendered = [value for value in (duration, preset_duration) if value is not None]
+    for stage_name in _SWAP_STAGES:
+        params = copied.setdefault(stage_name, {})
+        params.pop("driver_start_sec", None)
+        params.pop("driver_dur_sec", None)
+        if start is not None:
+            params["driverStartSec"] = start
+    if duration is not None:
+        swap["driverDurSec"] = duration
+    if rendered:
+        copied["camera-tryon"]["driverDurSec"] = min(rendered)
+    return copied
+
+
 def synchronize_camera_stage_segments(
     pipeline: str,
     stage_params: dict[str, dict],
     *,
     where: str = "",
 ) -> dict[str, dict]:
-    """Share a selected driver segment between the two camera-stage aliases."""
+    """Share a selected driver segment between a camera try-on and the stage that renders it."""
     copied = {stage: dict(params) for stage, params in stage_params.items()}
+    prefix = f"{where}: " if where else ""
+    if pipeline == _SWAP_PIPELINE:
+        return _synchronize_swap_segment(copied, prefix)
     if pipeline != _CAMERA_PIPELINE:
         return copied
 
-    prefix = f"{where}: " if where else ""
-
     def resolve(field: str, snake_field: str, *, positive: bool = False) -> float | None:
-        supplied: list[tuple[str, float]] = []
-        for stage_name in _CAMERA_STAGES:
-            params = copied.get(stage_name, {})
-            for key in (field, snake_field):
-                if key not in params:
-                    continue
-                try:
-                    value = float(params[key])
-                except (TypeError, ValueError) as exc:
-                    raise ManifestError(
-                        f"{prefix}{stage_name}.{key} must be a finite number"
-                    ) from exc
-                if not math.isfinite(value):
-                    raise ManifestError(f"{prefix}{stage_name}.{key} must be a finite number")
-                if (positive and value <= 0) or (not positive and value < 0):
-                    relation = "positive" if positive else "non-negative"
-                    raise ManifestError(f"{prefix}{stage_name}.{key} must be {relation}")
-                supplied.append((f"{stage_name}.{key}", value))
-        if supplied and any(value != supplied[0][1] for _, value in supplied[1:]):
-            names = ", ".join(name for name, _ in supplied)
-            raise ManifestError(f"{prefix}{field} conflicts between {names}")
-        return supplied[0][1] if supplied else None
+        return _resolve_shared(copied, _CAMERA_STAGES, prefix, field, snake_field,
+                               positive=positive)
 
     start = resolve("driverStartSec", "driver_start_sec")
     duration = resolve("driverDurSec", "driver_dur_sec", positive=True)

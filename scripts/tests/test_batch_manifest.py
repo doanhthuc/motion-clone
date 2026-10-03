@@ -110,6 +110,34 @@ class TestLoad(unittest.TestCase):
                     load_manifest(_fixture(Path(d), text))
                 self.assertIn("camera-motion", str(cm.exception))
 
+    def test_swap_guide_frame_comes_from_the_segment_the_swap_renders(self):
+        swap = CAMERA.replace("tryon-camera-motion-enhance", "tryon-character-swap-enhance") \
+                     .replace("camera-motion: { preset: drv-15s, quality: 720p }",
+                              "character-swap: { preset: drv-15s }")
+        with tempfile.TemporaryDirectory() as d:
+            run = load_manifest(_fixture(Path(d), swap)).runs[0]
+            self.assertEqual(run.stage_params["character-swap"]["driverStartSec"], 5)
+            self.assertEqual(run.stage_params["camera-tryon"]["driverStartSec"], 5)
+            self.assertEqual(run.stage_params["camera-tryon"]["driverDurSec"], 15)
+            self.assertNotIn("driverDurSec", run.stage_params["character-swap"])
+        # The worker renders min(driverDurSec, preset); with no preset it falls back to drv-5s.
+        for params, dur in (("{ preset: drv-15s, driverDurSec: 8 }", 8),
+                            ("{ quality: 720p }", 5),
+                            ("{ preset: drv-30s }", 30)):
+            text = swap.replace("character-swap: { preset: drv-15s }", f"character-swap: {params}")
+            with self.subTest(params=params), tempfile.TemporaryDirectory() as d:
+                run = load_manifest(_fixture(Path(d), text)).runs[0]
+                self.assertEqual(run.stage_params["camera-tryon"]["driverDurSec"], dur)
+
+    def test_conflicting_swap_segments_are_rejected_before_gpu(self):
+        text = CAMERA.replace("tryon-camera-motion-enhance", "tryon-character-swap-enhance") \
+                     .replace("camera-motion: { preset: drv-15s, quality: 720p }",
+                              "character-swap: { driverStartSec: 6 }")
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(ManifestError) as cm:
+                load_manifest(_fixture(Path(d), text))
+            self.assertIn("driverStartSec", str(cm.exception))
+
     def test_conflicting_camera_segments_are_rejected_before_gpu(self):
         text = CAMERA.replace("preset: drv-15s, quality: 720p",
                               "preset: drv-15s, quality: 720p, driverStartSec: 6")

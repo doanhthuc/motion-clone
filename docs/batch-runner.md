@@ -141,7 +141,7 @@ runs:
 | `motion-enhance` | motion → enhance | `character`, `driver` | — |
 | `tryon-motion-enhance` | tryon → motion → enhance | `character`, `outfit`, `driver` | `background` |
 | `character-swap-enhance` | character-swap → enhance | `character`, `driver` | — |
-| `tryon-character-swap-enhance` | tryon → character-swap → enhance | `character`, `outfit`, `driver` | `background` |
+| `tryon-character-swap-enhance` | camera-tryon → character-swap → enhance | `character`, `outfit`, `driver` | `background` |
 | `tryon-camera-motion-enhance` | camera-tryon → camera-motion → enhance | `character`, `outfit`, `driver` | `background` |
 
 Hai pipeline `character-swap`: `driver` = video nguồn **chứa người sẽ bị thay**, `character` = ảnh
@@ -150,11 +150,18 @@ người mẫu sẽ thế vào (ở `tryon-character-swap-enhance`, `character` 
 Khối param tên **đúng bằng tên chặng**: `tryon:` · `motion:` · `enhance:` · `character-swap:`
 (nhận `engine: wananimate|scail2`).
 
+**Character swap since 03/10/2026.** `tryon-character-swap-enhance` runs `camera-tryon` instead of
+`tryon`: the try-on is reframed to the middle of the driver segment the swap renders (the runner copies
+`driverStartSec`/`driverDurSec`/the `drv-Ns` preset from `character-swap:` to `camera-tryon:`). The
+`character-swap` stage now has camera-motion's face defaults (`faceLock: 1`, `faceLockRef: character`,
+`faceLockDetailKeep: 2.0`, `faceLockMouthKeep: 1.3`) and the bare-wrists/natural-nails defaults, in every
+swap pipeline. All of them are defaults, so `character-swap: { faceLock: 0 }` brings back the old face.
+
 **Bare wrists and natural nails (all pipelines).** The `tryon` and `motion` stages default to
 `naturalNails: true` and `removeWristAccessories: true`: the garment-edit prompt and the Wan prompt both
 ask for short unpainted natural nails and no watch or bracelet, so the video does not bring back what
-the try-on image lost. This reaches `tryon-motion-enhance`, `tryon-character-swap-enhance` (tryon stage)
-and `motion-enhance` (motion stage). Set either to `false` in that stage's block to opt out. The
+the try-on image lost. This reaches `tryon-motion-enhance` (tryon stage), `motion-enhance` (motion stage)
+and every character-swap pipeline (character-swap stage). Set either to `false` in that stage's block to opt out. The
 camera pipeline keeps its own wording (the camera compose prompt asset). Not yet measured on a real
 run: the added sentence goes last in the try-on prompt to limit the risk of diluting the garment command.
 

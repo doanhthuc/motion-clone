@@ -37,8 +37,8 @@ class Stage:
 
 
 # Bare wrists and plain natural nails, for the try-on image and the Wan render alike, so the video does not
-# bring back a watch or painted nails the garment edit removed. Stage-wide: reaches tryon-motion-enhance,
-# tryon-character-swap-enhance (tryon stage) and motion-enhance (motion stage). A manifest opts out per
+# bring back a watch or painted nails the garment edit removed. Stage-wide: reaches tryon-motion-enhance
+# (tryon stage), motion-enhance (motion stage) and every character-swap pipeline. A manifest opts out per
 # stage with `naturalNails: false` / `removeWristAccessories: false`. camera-tryon / camera-motion keep their
 # own contract (the camera compose prompt asset, and camera-motion's defaults below).
 _HANDS_DEFAULTS = {"naturalNails": True, "removeWristAccessories": True}
@@ -64,9 +64,21 @@ STAGES: dict[str, Stage] = {
     ),
     "character-swap": Stage(
         name="character-swap", job_type="character-swap",
+        # faceRef: the original character photo, for faceLockRef: character — same as camera-motion.
         inputs={"ref": "prev|material:character",
-                "video": "material:driver"},
+                "video": "material:driver",
+                "faceRef": "material:character"},
         output_ext=".mp4", min_bytes=100_000, timeout_min=60, param_type="character-swap",
+        # The face fixes camera-motion got between 18/09 and 27/09/2026 (see its comment below for
+        # every measurement), ported 03/10/2026. The swap has the same two causes of face drift:
+        # run_character_swap sets face_strength 1.0, so Wan is fed the driver's face crop every
+        # frame, and in tryon-character-swap-enhance the ref is a qwen-max/Gemini try-on that keeps
+        # only 0.59-0.65 of the character's identity. faceLock runs inside run_motion, which the
+        # swap already goes through, so these are params only — no worker change. doanhthuc
+        # reported the swap's face as the main gap to camera-motion on 03/10/2026.
+        defaults={**_HANDS_DEFAULTS, "faceLock": 1, "faceLockRestore": 0,
+                  "faceLockBlend": 1.0, "faceLockDetailKeep": 2.0,
+                  "faceLockMouthKeep": 1.3, "faceLockRef": "character"},
     ),
     # enhance 1080p60 nội suy RIFE ×4 rồi encode lại — luôn lâu hơn motion sinh ra nó.
     "enhance": Stage(
@@ -164,7 +176,11 @@ PIPELINES: dict[str, list[str]] = {
     "motion-enhance": ["motion", "enhance"],
     "tryon-motion-enhance": ["tryon", "motion", "enhance"],
     "character-swap-enhance": ["character-swap", "enhance"],
-    "tryon-character-swap-enhance": ["tryon", "character-swap", "enhance"],
+    # camera-tryon since 03/10/2026: the try-on is reframed to the driver's middle frame (shot size,
+    # camera height, placement), so Wan's replacement mode gets a reference shaped like the person it
+    # is replacing instead of the character photo's own framing. The background it composes is
+    # thrown away — the swap keeps the video's.
+    "tryon-character-swap-enhance": ["camera-tryon", "character-swap", "enhance"],
     "tryon-camera-motion-enhance": ["camera-tryon", "camera-motion", "enhance"],
 }
 
