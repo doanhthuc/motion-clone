@@ -899,6 +899,28 @@ class TestRentPanel(_AppRunsFixture):
         self.assertTrue(body["runpod"]["sold_out"])
         self.assertIsNone(body["runpod"]["stock"])
 
+    def test_rent_panel_on_runpod_community(self):
+        # No volume, so no home datacenter: stock is one Community-wide answer under the rent's
+        # own filters, and a RunPod that cannot be asked reads as sold out at the list price.
+        import runpod_community
+        self._seed_draft(validated=True)
+        for stock_now, want in (
+                (mock.Mock(return_value=runpod_community.Stock("Low", 0.71)),
+                 {"stock": "Low", "usd_per_hr": 0.71, "sold_out": False}),
+                (mock.Mock(side_effect=RuntimeError("graphql down")),
+                 {"stock": None, "usd_per_hr": runpod_community.DEFAULT_USD_PER_HR,
+                  "sold_out": True})):
+            with mock.patch("tgbot.bot._runpod_community", return_value=True), \
+                 mock.patch("tgbot.bot.runpod_community.stock_now", stock_now), \
+                 mock.patch("tgbot.bot.stock_at_cached") as secure_stock, \
+                 mock.patch("tgbot.bot.vast_fetch_quote", side_effect=RuntimeError("no vastai")), \
+                 mock.patch("tgbot.bot.vast_credit", return_value=25.0):
+                status, body = self.runs.rent_panel(self.runs.run_id, force=False)
+            self.assertEqual(status, 200)
+            self.assertEqual(body["runpod"], {"gpu": "NVIDIA GeForce RTX 5090",
+                                              "datacenter": "Community", **want})
+            secure_stock.assert_not_called()
+
     def test_rent_panel_never_prices_the_telegram_draft(self):
         # _draft_manifest(chat_id) with no jobs falls back to _jobs_for(chat_id),
         # i.e. the TELEGRAM chat's own draft. With the app's draft empty (or

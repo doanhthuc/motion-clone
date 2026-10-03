@@ -903,6 +903,51 @@ theo: con số *"pod CPU $0,06/giờ, 9 phút, ~$0,08"* ở [§Tải model vào 
 **chưa kiểm chứng** — nó tự mâu thuẫn (0,15 giờ × $0,06 = $0,009, không phải $0,08) và **không có
 dòng pod CPU nào** trong cả 7 dòng hoá đơn từ 24/07 đến 02/08.
 
+<a id="runpod-community"></a>
+#### Stateless Community pods — `RUNPOD_CLOUD=COMMUNITY` (2026-10-03)
+
+The dead end above assumed a pod needs the volume. Since the stateless Vast session worked end to
+end ([#vast-e2e](#vast-e2e)) and the phone's outputs live on the VPS (`out/<batch>/_final/`), not
+in the pod's MinIO, a pod no longer needs one. `RUNPOD_CLOUD=COMMUNITY` in `.env` (default
+`SECURE`) rents RunPod the Vast way:
+
+- **Rent** — `pod-provision.sh` posts to REST `/v1/pods` with `cloudType=COMMUNITY`, no volume,
+  `supportPublicIp` (pod-bootstrap.sh rsyncs over plain ssh, which RunPod's ssh proxy does not
+  carry), and host filters runpodctl cannot express. Filters, defaults and the create body live in
+  `scripts/runpod_community.py`, shared with the bot's quote:
+
+  | `.env` | default | REST field |
+  |---|---|---|
+  | `RUNPOD_MIN_DOWNLOAD_MBPS` | 1000 | `minDownloadMbps` |
+  | `RUNPOD_MIN_DISK_MBPS` | `MIN_DISK_BW` (3000) | `minDiskBandwidthMBps` |
+  | `RUNPOD_MIN_VCPU` | 8 | `minVCPUPerGPU` |
+  | `RUNPOD_MIN_RAM_GB` | 32 | `minRAMPerGPU` |
+  | `RUNPOD_COUNTRIES` | any | `countryCodes` |
+  | `MIN_CUDA_VERSION` | 13.0 | `allowedCudaVersions` (an exact list built from the floor) |
+
+  The defaults are the Vast floors, **not yet calibrated against a Community host**. There is no
+  CPU-clock or reliability filter, no way to pick or exclude a machine, and no auto-stop field —
+  the drain lease and the watchdog are the only ceiling.
+- **Checks after the rent** (`drain.py`, before any job runs; an unfit pod is destroyed and
+  replaced once):
+  1. SSH within `RUNPOD_WAIT_TIMEOUT_MIN` (default 10) — catches a stuck image pull.
+  2. `batchlib_ext/net_probe.py`: 4 parallel range reads of the Wan checkpoint from
+     huggingface.co for 15 s; below `RUNPOD_MIN_HF_MBS` (default 100 MB/s) is slow. Fails open.
+  3. `batchlib_ext/gpu_probe.py`, the same throttle check Vast gets.
+- **Boot** — models download at boot from the manifest's needs (`VAST_MODEL_IDS`, same registry as
+  Vast), in parallel with the install. Postgres and MinIO live on container disk and die with the
+  pod, so a failed job's pod-side state is gone after `gpu-destroy`; `drain.py` still pulls the job
+  logs before destroying.
+- **Quote** — the bot and the phone's rent panel read Community stock under the same filters from
+  GraphQL `lowestPrice(secureCloud: false, …)` (it has no disk-bandwidth field, so a host can pass
+  the quote and still be refused by the rent). A Community stock-out is reported as a plain
+  failure: the stock-out screen's buttons are Secure-only remedies.
+
+**Not measured yet:** boot time, HF throughput and the real invoice of a Community session. On
+2026-10-03 the RTX 5090 showed no Community stock at all (`stockStatus: null`; the 4090 was `Low`
+at $0.34), so the first rental waits for stock. Switching back is `RUNPOD_CLOUD=SECURE`; the
+volume is untouched by this mode.
+
 Kiểm bất cứ lúc nào:
 
 ```bash
