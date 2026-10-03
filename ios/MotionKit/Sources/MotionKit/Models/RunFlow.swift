@@ -34,6 +34,12 @@ public struct RentPanelRunpod: Decodable, Sendable, Equatable {
     public let stock: String?
     public let usdPerHr: Double?
     public let soldOut: Bool
+    /// "community" when the server rents RunPod Community pods (RUNPOD_CLOUD=COMMUNITY): no
+    /// Network Volume, so no home datacenter and nothing to migrate. Absent from servers older
+    /// than 2026-10-03, which only rent Secure.
+    public let cloud: String?
+
+    public var isCommunity: Bool { cloud == "community" }
 }
 
 public struct RentPanelVast: Decodable, Sendable, Equatable {

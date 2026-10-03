@@ -26,7 +26,8 @@ struct RentPanelView: View {
                         // On the trigger row, not the Group: a modifier on a
                         // Group applies to every child, so it would present once per section.
                         .sheet(isPresented: $changingGpu) { gpuSheet }
-                    if panel.runpod.soldOut {
+                    // Migrating moves the Network Volume; a Community pod mounts none.
+                    if panel.runpod.soldOut && !panel.runpod.isCommunity {
                         Button("Migrate the volume…") {
                             model.selectedTab = .pod
                             model.migrateSheet = MigrateRequest(destination: nil)
@@ -62,10 +63,16 @@ struct RentPanelView: View {
     }
 
     private func runpodRow(_ row: RentPanelRunpod) -> some View {
-        providerRow(provider: .runpod, title: row.gpu,
-                    detail: [row.datacenter, row.stock.map { "stock \($0)" },
-                             row.usdPerHr.map { "\(Format.usd($0))/h" }].compactMap { $0 }.joined(separator: " · "),
-                    blockers: row.soldOut ? ["Sold out at \(row.datacenter ?? "the home datacenter")"] : [])
+        if row.isCommunity {
+            return providerRow(provider: .runpod, title: "RunPod Community · \(row.gpu)",
+                               detail: [row.stock.map { "stock \($0)" },
+                                        row.usdPerHr.map { "\(Format.usd($0))/h" }].compactMap { $0 }.joined(separator: " · "),
+                               blockers: row.soldOut ? ["No Community host passes the filters right now"] : [])
+        }
+        return providerRow(provider: .runpod, title: row.gpu,
+                           detail: [row.datacenter, row.stock.map { "stock \($0)" },
+                                    row.usdPerHr.map { "\(Format.usd($0))/h" }].compactMap { $0 }.joined(separator: " · "),
+                           blockers: row.soldOut ? ["Sold out at \(row.datacenter ?? "the home datacenter")"] : [])
     }
 
     private func vastRow(_ row: RentPanelVast) -> some View {
