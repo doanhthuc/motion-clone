@@ -130,7 +130,27 @@ class TestKhaiBao(unittest.TestCase):
         # linux.py run_character_swap: inputs.ref (ảnh) + inputs.video (video nguồn)
         stage = STAGES["character-swap"]
         self.assertEqual(stage.job_type, "character-swap")
-        self.assertEqual(set(stage.inputs), {"ref", "video"})
+        self.assertEqual(set(stage.inputs), {"ref", "video", "faceRef"})
+
+    def test_character_swap_gets_camera_motions_face_lock(self):
+        # Ported 03/10/2026: same face drift (face_strength 1.0 feeds Wan the driver's face crop,
+        # and the try-on keeps only part of the character's identity), same fix.
+        self.assertEqual(STAGES["character-swap"].inputs["faceRef"], "material:character")
+        got = effective_stage_params("character-swap", {})
+        camera = effective_stage_params("camera-motion", {})
+        for key in ("faceLock", "faceLockRestore", "faceLockBlend", "faceLockDetailKeep",
+                    "faceLockMouthKeep", "faceLockRef", "naturalNails", "removeWristAccessories"):
+            self.assertEqual(got[key], camera[key], key)
+        # Defaults, not locks: a manifest can still A/B against the old swap.
+        self.assertEqual(effective_stage_params("character-swap", {"faceLock": 0})["faceLock"], 0)
+        self.assertEqual(locked_stage_param_errors("character-swap", {"faceLock": 0}), [])
+
+    def test_tryon_character_swap_enhance_frames_the_try_on_to_the_driver(self):
+        self.assertEqual(PIPELINES["tryon-character-swap-enhance"],
+                         ["camera-tryon", "character-swap", "enhance"])
+        self.assertTrue(effective_stage_params("camera-tryon", {})["cameraAware"])
+        # The face swap needs no new material: the character is already required.
+        self.assertEqual(optional_roles("tryon-character-swap-enhance"), {"background"})
 
 
 class TestRoles(unittest.TestCase):
