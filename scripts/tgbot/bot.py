@@ -44,6 +44,7 @@ from batchlib.runner import (_local_tryon_stage, has_local_tryon,
 # it, do not reimplement" for failed_job_ids rather than re-deriving "did this
 # run fail" from state.json by hand a second time.
 from drain import failed_job_ids, vast_download_gb
+import runpod_community
 from batch_run import EXIT_NEEDS_POD
 import batch_clean
 # Absolute, NOT `from .tgclient import ...`. This file runs as
@@ -4887,6 +4888,27 @@ def _gpu_price(gpu_id: str, stock: dict) -> float:
     return entries[0].price_per_hr if entries and entries[0].price_per_hr else 0.99
 
 
+def _community_stock(*, force: bool = False) -> "runpod_community.Stock | None":
+    """RunPod Community stock for the configured GPU under the rent's own host filters, or None
+    when RunPod cannot be asked. Only meaningful when _runpod_community() is true."""
+    try:
+        return runpod_community.stock_now(force=force,
+                                          get=lambda k: env_get(ROOT / ".env", k))
+    except (RuntimeError, ValueError):
+        return None
+
+
+def _runpod_community() -> bool:
+    """RUNPOD_CLOUD=COMMUNITY: a RunPod rent is a stateless Community pod, which has no Network
+    Volume and so no home datacenter — stock is one answer across every Community host."""
+    return runpod_community.cloud(lambda k: env_get(ROOT / ".env", k)) == "COMMUNITY"
+
+
+def _community_price(stock: "runpod_community.Stock | None") -> float:
+    return (stock.usd_per_hr if stock is not None and stock.usd_per_hr
+            else runpod_community.DEFAULT_USD_PER_HR)
+
+
 def _panel_cost_str() -> str:
     """Price + live stock for whichever GPU is configured right now, for the
     panel's ready-line (_panel_next_line) and its Run button (_panel_buttons)
@@ -4903,6 +4925,14 @@ def _panel_cost_str() -> str:
     panel itself breaks.
     """
     configured = env_get(ROOT / ".env", "GPU") or _PRIMARY_GPU_ID
+    if _runpod_community():
+        cstock = _community_stock()
+        price = _community_price(cstock)
+        if cstock is None:
+            return f"💸 ${price:.2f}/hour (Community)"
+        icon = _stock_icon((cstock.status or "none").lower())
+        return (f"💸 ${price:.2f}/h · {icon} {_esc(_GPU_DISPLAY_SHORT.get(configured, configured))}"
+                f" @ Community")
     volume_id = env_get(ROOT / ".env", "POD_VOLUME_ID")
     home_dc = volume_datacenter(volume_id)
     if not home_dc:
@@ -4927,6 +4957,8 @@ def _panel_price() -> float:
     button's price must never drift from what the ready-line above it says.
     """
     configured = env_get(ROOT / ".env", "GPU") or _PRIMARY_GPU_ID
+    if _runpod_community():
+        return _community_price(_community_stock())
     volume_id = env_get(ROOT / ".env", "POD_VOLUME_ID")
     if not volume_datacenter(volume_id):
         return 0.99
@@ -5272,6 +5304,10 @@ def _offer_run_confirm(tg: Tg, chat_id: int, *, message_id: int | None = None,
         _offer_vast_panel(tg, chat_id, message_id=message_id, force=force,
                           spend_cb=spend_cb, heading=heading)
         return
+    if _runpod_community():
+        _offer_community_confirm(tg, chat_id, message_id=message_id, force=force,
+                                 spend_cb=spend_cb + _RUNPOD_SUFFIX, heading=heading)
+        return
     wanted = [_PRIMARY_GPU_ID, *_FALLBACK_GPU_IDS]
     try:
         stock = ((stock_at(wanted) if force else stock_at_cached(wanted))
@@ -5358,6 +5394,37 @@ def _offer_run_confirm(tg: Tg, chat_id: int, *, message_id: int | None = None,
                         ("Cancel", _CB_RUN_NO)])
     _edit_or_send(tg, chat_id, message_id, "\n".join(lines), buttons,
                  parse_mode=PARSE_HTML)
+
+
+def _offer_community_confirm(tg: Tg, chat_id: int, *, message_id: int | None, force: bool,
+                             spend_cb: str, heading: str | None) -> None:
+    """The RunPod screen when RUNPOD_CLOUD=COMMUNITY. No GPU switch or region migration: those
+    exist to move a Network Volume, and a Community pod has none. Same rule as the Secure screen
+    for the spend button — dropped when no host passes the filters, since it could only fail."""
+    configured = env_get(ROOT / ".env", "GPU") or _PRIMARY_GPU_ID
+    stock = _community_stock(force=force)
+    price = _community_price(stock)
+    name = _GPU_DISPLAY_SHORT.get(configured, configured)
+    lines = [heading or f"{ICON_NVIDIA_CE} <b>Choose GPU</b> — RunPod Community", ""]
+    if stock is None:
+        lines.append(f"Current: <b>{_esc(name)}</b> — stock unknown (RunPod did not answer) · "
+                     f"{ICON_MONEY_CE} ${price:.2f}/h")
+    elif stock.sold_out:
+        lines.append(f"Current: {_stock_icon('none')} <b>{_esc(name)}</b> — no Community host "
+                     f"passes the filters right now · {ICON_MONEY_CE} ${price:.2f}/h")
+    else:
+        lines.append(f"Current: {_stock_icon(stock.status.lower())} <b>{_esc(name)}</b> — "
+                     f"{_esc(stock.status)} · {ICON_MONEY_CE} ${price:.2f}/h")
+    lines += ["", "No Network Volume: models download at boot (~2-3 min), and a slow or "
+                  "throttled host is replaced before the job starts."]
+    buttons = [_provider_row("runpod"),
+               [("Refresh", _CB_RUN_REFRESH + "m", _ce_id(ICON_REFRESH_CE))]]
+    if stock is not None and stock.sold_out:
+        buttons.append([("Cancel", _CB_RUN_NO)])
+    else:
+        buttons.append([(f"Yes, spend ${price:.2f}/h", spend_cb, _ce_id(ICON_ROCKET_CE)),
+                        ("Cancel", _CB_RUN_NO)])
+    _edit_or_send(tg, chat_id, message_id, "\n".join(lines), buttons, parse_mode=PARSE_HTML)
 
 
 def _offer_run_for_chat(tg: Tg, chat_id: int, *, message_id: int | None = None,
@@ -7141,24 +7208,34 @@ def _rent_panel_data(chat_id: int, *, force: bool, manifest: Manifest | None) ->
     lock (the token, `after_phase_a`, the app's jobs) before calling this.
     """
     configured = env_get(ROOT / ".env", "GPU") or _PRIMARY_GPU_ID
-    volume_id = env_get(ROOT / ".env", "POD_VOLUME_ID")
-    home_dc = volume_datacenter(volume_id)
-    wanted = [_PRIMARY_GPU_ID, *_FALLBACK_GPU_IDS]
-    try:
-        stock = ((stock_at(wanted) if force else stock_at_cached(wanted))
-                 if home_dc else {})
-    except RuntimeError:
-        # Fails open exactly like _offer_run_confirm: a dead runpodctl must
-        # never turn this into a 500, only into the honest "no evidence of
-        # stock" answer below (home is None -> sold_out).
-        stock = {}
-    price = _gpu_price(configured, stock)
-    home = next((e for e in (stock.get(configured) or [])
-                if e.datacenter_id == home_dc), None)
-    sold_out = home is None or home.stock_status.lower() == "none"
-    runpod = {"gpu": configured, "datacenter": home_dc,
-             "stock": home.stock_status if home is not None else None,
-             "usd_per_hr": price, "sold_out": sold_out}
+    if _runpod_community():
+        # No home datacenter: a Community pod mounts no volume. "Community" fills the field the
+        # app shows as the region. Unknown stock is sold_out, the same fail-closed reading the
+        # Secure branch gives a dead runpodctl.
+        cstock = _community_stock(force=force)
+        runpod = {"gpu": configured, "datacenter": "Community",
+                  "stock": cstock.status if cstock is not None else None,
+                  "usd_per_hr": _community_price(cstock),
+                  "sold_out": cstock is None or cstock.sold_out}
+    else:
+        volume_id = env_get(ROOT / ".env", "POD_VOLUME_ID")
+        home_dc = volume_datacenter(volume_id)
+        wanted = [_PRIMARY_GPU_ID, *_FALLBACK_GPU_IDS]
+        try:
+            stock = ((stock_at(wanted) if force else stock_at_cached(wanted))
+                     if home_dc else {})
+        except RuntimeError:
+            # Fails open exactly like _offer_run_confirm: a dead runpodctl must
+            # never turn this into a 500, only into the honest "no evidence of
+            # stock" answer below (home is None -> sold_out).
+            stock = {}
+        price = _gpu_price(configured, stock)
+        home = next((e for e in (stock.get(configured) or [])
+                    if e.datacenter_id == home_dc), None)
+        sold_out = home is None or home.stock_status.lower() == "none"
+        runpod = {"gpu": configured, "datacenter": home_dc,
+                 "stock": home.stock_status if home is not None else None,
+                 "usd_per_hr": price, "sold_out": sold_out}
 
     enabled = _vast_enabled()
     if manifest is None:

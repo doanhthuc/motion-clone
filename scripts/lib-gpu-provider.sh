@@ -21,6 +21,16 @@ gpu_provider() {
 pod_volume() {
   # printf, not a bare env_get: keeps the output newline-free like gpu_provider (callers capture it
   # with $(...), which strips a newline anyway; a direct reader would not).
-  if [ "$(gpu_provider)" = "runpod" ]; then printf '%s' "$(env_get POD_VOLUME)"; fi
+  if [ "$(gpu_provider)" = "runpod" ] && [ "$(runpod_cloud)" != "COMMUNITY" ]; then
+    printf '%s' "$(env_get POD_VOLUME)"
+  fi
   return 0
+}
+
+# SECURE (default) or COMMUNITY. A Network Volume only attaches to Secure Cloud pods, so a
+# Community pod is stateless like a Vast box: models download at boot, the database dies with it.
+# Environment first, then .env, like gpu_provider.
+runpod_cloud() {
+  local c="${RUNPOD_CLOUD:-$(env_get RUNPOD_CLOUD)}"
+  printf '%s' "${c:-SECURE}" | tr 'a-z' 'A-Z'
 }

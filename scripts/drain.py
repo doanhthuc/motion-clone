@@ -26,6 +26,7 @@ from batchlib_ext.gpu_stock import volume_datacenter
 from batchlib_ext.handoff import Handoff, claim_mailbox, handoff_path, write_handoff
 from batchlib_ext.lease import Lease, clear_lease, read_lease, write_lease
 from batchlib_ext.gpu_probe import run_probe
+from batchlib_ext import net_probe
 from batchlib_ext.vast_scoreboard import load_board, save_board
 from batchlib_ext.provision_failure import (ProvisionFailure,
                                             clear_provision_failure,
@@ -55,6 +56,29 @@ def effective_provider() -> str:
     """The cloud THIS run rents from. Same order as pod-provision.sh:21: the process
     environment (set by --provider), then .env, then vast."""
     return os.environ.get("GPU_PROVIDER") or env_get(ROOT / ".env", "GPU_PROVIDER") or "vast"
+
+
+def runpod_community() -> bool:
+    """RunPod with RUNPOD_CLOUD=COMMUNITY: a third-party host with no Network Volume. Same
+    precedence as lib-gpu-provider.sh's runpod_cloud(): environment, then .env, then SECURE."""
+    if effective_provider() != "runpod":
+        return False
+    cloud = os.environ.get("RUNPOD_CLOUD") or env_get(ROOT / ".env", "RUNPOD_CLOUD") or "SECURE"
+    return cloud.strip().upper() == "COMMUNITY"
+
+
+def stateless_box() -> bool:
+    """No Network Volume: models are downloaded at boot, and the host is a marketplace machine
+    whose GPU and network have to be checked rather than trusted. Vast only when chosen
+    explicitly with --provider, as before; RunPod Community however it was configured."""
+    chosen = os.environ.get("GPU_PROVIDER", "")
+    return bool(chosen and chosen != "runpod") or runpod_community()
+
+
+# A Community pod that has not answered SSH by now is treated as a stuck image pull and replaced.
+# Vast's VAST_PULL_DEADLINE_S is 8 min for the pull alone; this also covers sshd coming up. RunPod
+# Secure pulled the same 16-17 GB image in ~3 min (2026-08-06), so 10 is ~3x a good host.
+COMMUNITY_WAIT_TIMEOUT_MIN = 10
 
 
 def pod_max_hours(ceiling_min: int, configured: str) -> str:
@@ -158,10 +182,15 @@ def provision(*, ceiling_min: int, manifest_path: Path, manifest: Manifest) -> s
         sys.stderr.write(result.stderr)
     failure_path = provision_failure_path(manifest_path)
     if result.returncode != 0:
+        # A Community stock-out is reported as a plain failure: the stock-out screen's buttons
+        # (switch GPU at the volume's datacenter, migrate the volume) are Secure-only remedies,
+        # and the detail pod-provision.sh prints already names the Community ones.
+        community = runpod_community()
         write_provision_failure(failure_path, ProvisionFailure(
             gpu=env_get(ROOT / ".env", "GPU"),
-            datacenter=volume_datacenter(env_get(ROOT / ".env", "POD_VOLUME_ID")),
-            stock_out=_STOCK_OUT_MARKER in result.stderr,
+            datacenter=("Community" if community
+                        else volume_datacenter(env_get(ROOT / ".env", "POD_VOLUME_ID"))),
+            stock_out=_STOCK_OUT_MARKER in result.stderr and not community,
             detail=result.stderr.strip(),
             provider=effective_provider()))
         raise subprocess.CalledProcessError(result.returncode, result.args,
@@ -190,21 +219,36 @@ def wait_and_bootstrap(manifest: Manifest) -> None:
     own install -- only for the same explicit non-runpod --provider case provision() gates
     VAST_GB on, so a RunPod bootstrap is unchanged.
     """
-    sh("bash", "scripts/pod-wait.sh")
-    chosen = os.environ.get("GPU_PROVIDER", "")
-    if chosen and chosen != "runpod":
+    if runpod_community():
+        timeout = env_get(ROOT / ".env", "RUNPOD_WAIT_TIMEOUT_MIN") or str(COMMUNITY_WAIT_TIMEOUT_MIN)
+        try:
+            subprocess.run(["bash", "scripts/pod-wait.sh"], check=True, cwd=ROOT,
+                           env={**os.environ, "TIMEOUT": timeout})
+        except subprocess.CalledProcessError as exc:
+            raise BadHost(f"no SSH within {timeout} min (exit {exc.returncode})") from exc
+        check_network_speed()
+    else:
+        sh("bash", "scripts/pod-wait.sh")
+    if stateless_box():
         ids = models_for_manifest(manifest)
         if ids:
             os.environ["VAST_MODEL_IDS"] = " ".join(sorted(ids))
     sh("bash", "scripts/pod-bootstrap.sh")
 
 
-class SlowGpu(RuntimeError):
+class BadHost(RuntimeError):
+    """The rented machine is unfit (stuck boot, slow network, throttled GPU); nothing has been
+    run on it, so main() destroys it and rents a replacement."""
+
+
+class SlowGpu(BadHost):
     """The rented GPU is throttled well below its rated clock; nothing has been run on it."""
 
 
 # One replacement, not a loop of them: each bad machine costs a rent + bootstrap (~5 min) before
-# the probe can run, and the scoreboard already keeps the bad one out of the next search.
+# the probe can run, and the scoreboard already keeps the bad one out of the next search. RunPod
+# Community has no scoreboard — it cannot exclude a machine — so a replacement may land on the
+# same host; a second bad one ends the drain rather than paying for a third.
 MAX_SLOW_GPU_RETRIES = 1
 
 
@@ -222,16 +266,31 @@ def blacklist_machine(instance_id: str, why: str) -> None:
 
 
 def check_gpu_speed(pod_id: str) -> None:
-    """Raise SlowGpu if the vast GPU cannot hold its clock under load. Vast only: RunPod has
-    never shown the fault, and its pods sit on a volume that a replacement would have to re-attach."""
-    if effective_provider() != "vast":
+    """Raise SlowGpu if a marketplace GPU (Vast, RunPod Community) cannot hold its clock under
+    load. RunPod Secure is skipped: it has never shown the fault, and its pods sit on a volume
+    that a replacement would have to re-attach."""
+    vast = effective_provider() == "vast"
+    if not (vast or runpod_community()):
         return
     env = ROOT / ".env"
     verdict = run_probe(env_get(env, "GPU_SSH_HOST"), env_get(env, "GPU_SSH_PORT"))
     print(f"gpu probe: {verdict.state} — {verdict.detail}", file=sys.stderr)
     if verdict.state == "slow":
-        blacklist_machine(pod_id, verdict.detail)
+        if vast:
+            blacklist_machine(pod_id, verdict.detail)
         raise SlowGpu(verdict.detail)
+
+
+def check_network_speed() -> None:
+    """Raise BadHost if the box downloads from huggingface.co below the floor. Called for RunPod
+    Community only, before bootstrap: Vast already ranks offers by measured pull time."""
+    env = ROOT / ".env"
+    floor = env_get(env, "RUNPOD_MIN_HF_MBS")
+    verdict = net_probe.run_probe(env_get(env, "GPU_SSH_HOST"), env_get(env, "GPU_SSH_PORT"),
+                                  floor=float(floor) if floor else net_probe.MIN_MBPS)
+    print(f"network probe: {verdict.state} — {verdict.detail}", file=sys.stderr)
+    if verdict.state == "slow":
+        raise BadHost(f"slow download: {verdict.detail}")
 
 
 def batch_run(*args: str) -> int:
@@ -468,12 +527,12 @@ def main() -> int:
         try:
             # Inside the try, so a wait/bootstrap failure still reaches teardown.
             # Tiers 1 and 2 now cover this phase too, because the lease exists.
-            wait_and_bootstrap(manifest)
             try:
+                wait_and_bootstrap(manifest)
                 check_gpu_speed(pod_id)
-            except SlowGpu as exc:
+            except BadHost as exc:
                 slow = True
-                print(f"pod {pod_id} is throttled ({exc}) — destroying it"
+                print(f"pod {pod_id} is unfit ({exc}) — destroying it"
                       + (", renting another" if attempt < MAX_SLOW_GPU_RETRIES else ""),
                       file=sys.stderr)
             else:
@@ -485,15 +544,15 @@ def main() -> int:
             # `finally` does not run when the process is SIGKILLed or the VPS dies.
             # chain_or_teardown destroys immediately unless a job is already
             # queued for this same manifest's mailbox — see its own docstring.
-            # A throttled pod is destroyed outright instead: chaining would hand
-            # this slow GPU to the next queued manifest.
+            # An unfit pod is destroyed outright instead: chaining would hand
+            # this bad host to the next queued manifest.
             if slow:
                 teardown(manifest_path)
             else:
                 chain_or_teardown(manifest_path)
         if not slow:
             return rc
-    print("every rented GPU was throttled — giving up", file=sys.stderr)
+    print("every rented pod was unfit — giving up", file=sys.stderr)
     return 1
 
 

@@ -6414,6 +6414,27 @@ class TestRunStartsPhaseAFirst(unittest.TestCase):
         labels = [label for row in self.tg.buttons[-1] for label, *_ in row]
         self.assertTrue(any("$0.99/h" in label for label in labels), labels)
 
+    def test_community_screen_quotes_community_and_offers_no_volume_moves(self):
+        # RUNPOD_CLOUD=COMMUNITY: no home datacenter, so no GPU switch or region migration (both
+        # exist to move the volume). The spend button still names RunPod explicitly.
+        import runpod_community
+        for stock, can_spend in ((runpod_community.Stock("Low", 0.69), True),
+                                 (runpod_community.Stock(None, 0.69), False)):
+            with mock.patch("tgbot.bot._runpod_community", return_value=True), \
+                 mock.patch("tgbot.bot.runpod_community.stock_now", return_value=stock), \
+                 mock.patch("tgbot.bot.stock_at_cached") as secure_stock, \
+                 mock.patch("tgbot.bot._run_token", return_value="1"):
+                bot._offer_run_confirm(self.tg, ME)
+            secure_stock.assert_not_called()
+            entries = [e for row in self.tg.buttons[-1] for e in row]
+            spend = [e for e in entries if e[1].startswith(bot._CB_RUN_GO)]
+            self.assertEqual(bool(spend), can_spend, entries)
+            if spend:
+                self.assertEqual(spend[0][0], "Yes, spend $0.69/h")
+                self.assertTrue(spend[0][1].endswith(bot._RUNPOD_SUFFIX))
+            self.assertFalse([e for e in entries if e[1] in (bot._CB_RUN_SWITCH_MENU,
+                                                             bot._CB_RUN_MIGRATE_MENU)])
+
     def test_a_plain_draft_is_offered_the_unchanged_single_tap(self):
         # _offer_run_for_chat asks the DRAFT, not a manifest on disk: at
         # _CB_RUN_ASK time the file may not have been written yet.

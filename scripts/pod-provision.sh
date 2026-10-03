@@ -14,6 +14,8 @@
 # the instance is created, so this shows you the command and lets you read it first.
 #
 #   GPU_PROVIDER=vast|runpod   from .env — picks which CLI/branch runs below.
+#   RUNPOD_CLOUD=SECURE|COMMUNITY   RunPod only. COMMUNITY rents a stateless pod through REST with
+#                    host filters (download speed, disk bandwidth, vCPU, RAM) and no Network Volume.
 #   GPU=RTX_4090     card filter. 24GB is the DEPLOY.md minimum for Wan 2.2 Animate + BlockSwap;
 #                    the recommended card is RTX_5090 (32GB) — set GPU=RTX_5090 for it.
 #   DISK=120         GB. DEPLOY.md minimum for the motion-transfer box (~33GB model group + OS).
@@ -157,6 +159,20 @@ env_set() {
   fi
 }
 
+RUNPOD_CLOUD="${RUNPOD_CLOUD:-$(env_get RUNPOD_CLOUD)}"
+RUNPOD_CLOUD="$(printf '%s' "${RUNPOD_CLOUD:-SECURE}" | tr 'a-z' 'A-Z')"
+case "$RUNPOD_CLOUD" in
+  SECURE|COMMUNITY) ;;
+  *) die "RUNPOD_CLOUD=$RUNPOD_CLOUD không hợp lệ — chỉ nhận: SECURE | COMMUNITY" ;;
+esac
+# A Network Volume attaches only to Secure Cloud pods. .env keeps POD_VOLUME for switching back to
+# SECURE, so a Community rent ignores it instead of dying — same as lib-gpu-provider.sh's
+# pod_volume(), which is what pod-bootstrap.sh reads.
+if [ "$GPU_PROVIDER" = "runpod" ] && [ "$RUNPOD_CLOUD" = "COMMUNITY" ] && [ "$COMPUTE_TYPE" = "gpu" ] && [ -n "$POD_VOLUME" ]; then
+  log "RUNPOD_CLOUD=COMMUNITY — Network Volume ${POD_VOLUME_ID:-$POD_VOLUME} is ignored (it only attaches to Secure Cloud)."
+  POD_VOLUME=""
+fi
+
 # --- Network Volume is RunPod-only ------------------------------------------------------------
 # vast.ai has no network volume that survives destroying the instance, so POD_VOLUME there is a
 # lie: the wiring would "work" and then vanish with the pod.
@@ -165,6 +181,62 @@ if [ -n "$POD_VOLUME" ] && [ "$GPU_PROVIDER" != "runpod" ]; then
     Network Volumes are a RunPod feature. vast.ai storage dies with the instance, so models would
     still be re-downloaded (~33GB) on every rent.
     Either set GPU_PROVIDER=runpod, or clear POD_VOLUME to accept re-downloading."
+fi
+
+if [ "$GPU_PROVIDER" = "runpod" ] && [ "$RUNPOD_CLOUD" = "COMMUNITY" ] && [ "$COMPUTE_TYPE" = "gpu" ]; then
+  # --- RunPod Community branch -----------------------------------------------------------------
+  # Through REST /v1/pods, not runpodctl: `runpodctl pod create` (2.14) has --cloud-type but none
+  # of the host filters. The filters, their defaults and why they exist live in
+  # scripts/runpod_community.py, shared with the bot's price/stock quote.
+  RP_KEY="$(env_get RUNPOD_API_KEY)"
+  [ -n "$RP_KEY" ] || die "RUNPOD_CLOUD=COMMUNITY needs RUNPOD_API_KEY in .env (this branch talks REST)."
+  RP_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/runpod_community.py"
+  # Display only, like GPU_HOURLY: the real rate is costPerHr in the create response.
+  RP_HOURLY="${RUNPOD_COMMUNITY_HOURLY:-$(env_get RUNPOD_COMMUNITY_HOURLY)}"; RP_HOURLY="${RP_HOURLY:-0.69}"
+
+  BODY="$(GPU="$GPU" IMAGE="$IMAGE" DISK="$DISK" MIN_CUDA_VERSION="$MIN_CUDA_VERSION" \
+          python3 "$RP_HELPER" body)" || die "could not build the Community request body (see above)."
+  RP_FILTERS="$(MIN_CUDA_VERSION="$MIN_CUDA_VERSION" python3 "$RP_HELPER" summary)"
+
+  echo
+  echo "  curl -X POST https://rest.runpod.io/v1/pods \\"
+  echo "    -H 'Authorization: Bearer \$RUNPOD_API_KEY' -H 'Content-Type: application/json' \\"
+  echo "    -d '$BODY'"
+  echo
+
+  if [ "${CONFIRM:-}" != "yes" ]; then
+    warn "Dry run — nothing rented."
+    cat <<COMMUNITY_EOF
+
+  RunPod Community: '$GPU' ~\$$RP_HOURLY/hour (list price; the real rate is costPerHr in the response).
+  Host filters: $RP_FILTERS
+  No Network Volume: models download on every rent, the database dies with the pod.
+  NO auto-stop (REST /v1/pods has no such field) — drain.py writes a lease, the watchdog reaps orphans.
+
+  Rent it:   CONFIRM=yes bash scripts/pod-provision.sh
+COMMUNITY_EOF
+    exit 0
+  fi
+
+  log "renting RunPod Community via REST…"
+  RAW="$(curl -sS -X POST "https://rest.runpod.io/v1/pods" \
+    -H "Authorization: Bearer $RP_KEY" -H 'Content-Type: application/json' \
+    -d "$BODY" 2>&1)" || die "REST /v1/pods failed: $RAW"
+  NEW_ID="$(printf '%s' "$RAW" | python3 "$RP_HELPER" pod-id)"
+  if [ -z "$NEW_ID" ]; then
+    # Same phrase as the Secure branch's stock-out die below: drain.py's _STOCK_OUT_MARKER keys on
+    # it to show the bot's switch/subscribe buttons instead of a generic failure.
+    if printf '%s' "$RAW" | grep -qiE "no instances available|no longer any instances|out of (stock|capacity)|insufficient capacity"; then
+      die "hết máy '$GPU' trên Community đạt bộ lọc — không tự xoay sang card khác.
+  Loosen RUNPOD_MIN_* in .env, switch to RUNPOD_CLOUD=SECURE, or wait. Response: $RAW"
+    fi
+    die "could not rent a Community pod. Response:
+$RAW"
+  fi
+  COST="$(printf '%s' "$RAW" | python3 "$RP_HELPER" cost)"
+  env_set GPU_INSTANCE_ID "$NEW_ID"
+  log "rented — Community pod $NEW_ID${COST:+ (\$$COST/hour)} (saved to .env as GPU_INSTANCE_ID). Next: make gpu-wait"
+  exit 0
 fi
 
 if [ "$GPU_PROVIDER" = "runpod" ]; then

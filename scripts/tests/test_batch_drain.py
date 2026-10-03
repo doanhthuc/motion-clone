@@ -146,7 +146,7 @@ class TestProvision(unittest.TestCase):
                                side_effect=lambda path, key: {
                                    "POD_MAX_HOURS": "8", "GPU": "NVIDIA GeForce RTX 5090",
                                    "POD_VOLUME_ID": "u469c9efga",
-                                   "GPU_PROVIDER": "runpod"}[key]), \
+                                   "GPU_PROVIDER": "runpod", "RUNPOD_CLOUD": ""}[key]), \
              mock.patch.object(drain, "volume_datacenter", return_value="EU-RO-1"):
             mock_run.return_value = mock.Mock(returncode=1, stderr=stderr)
             with self.assertRaises(drain.subprocess.CalledProcessError):
@@ -166,7 +166,7 @@ class TestProvision(unittest.TestCase):
                                side_effect=lambda path, key: {
                                    "POD_MAX_HOURS": "8", "GPU": "NVIDIA GeForce RTX 5090",
                                    "POD_VOLUME_ID": "u469c9efga",
-                                   "GPU_PROVIDER": "runpod"}[key]), \
+                                   "GPU_PROVIDER": "runpod", "RUNPOD_CLOUD": ""}[key]), \
              mock.patch.object(drain, "volume_datacenter", return_value="EU-RO-1"):
             mock_run.return_value = mock.Mock(returncode=1, stderr=stderr)
             with self.assertRaises(drain.subprocess.CalledProcessError):

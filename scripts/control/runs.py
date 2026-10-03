@@ -18,6 +18,7 @@ from batchlib.manifest import ManifestError, load_manifest, load_state, state_pa
 from control.outputs import final_names
 from control.paths import safe_child
 import tgbot.run as run_mod
+import runpod_community
 
 
 # The flat rate the bot's own /kill text and [Run] fallback quote for RunPod
@@ -32,8 +33,13 @@ RUNPOD_FLAT_USD_PER_HR = 0.99
 def quoted_usd_per_hr(provider: str) -> float | None:
     """The quote for a lease's provider. None for Vast: its lease does not
     carry the rented offer's price, and guessing one would be a made-up number
-    next to a real bill."""
-    return RUNPOD_FLAT_USD_PER_HR if provider == "runpod" else None
+    next to a real bill. RunPod Community (RUNPOD_CLOUD=COMMUNITY) quotes its
+    own list price, still a constant for the same ETag reason."""
+    if provider != "runpod":
+        return None
+    if runpod_community.cloud() == "COMMUNITY":
+        return runpod_community.DEFAULT_USD_PER_HR
+    return RUNPOD_FLAT_USD_PER_HR
 
 
 def _status(manifest: Path, jobs: dict) -> str:

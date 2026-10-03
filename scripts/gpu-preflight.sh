@@ -233,6 +233,11 @@ if [ -n "$vol" ] && [ "$provider" != "runpod" ]; then
   echo -e "${R}✗ POD_VOLUME=$vol but GPU_PROVIDER=$provider — Network Volumes are RunPod-only.${X}"
   echo -e "${D}   vast.ai storage dies with the instance, so models would still re-download every rent.${X}"
   echo -e "${D}   Set GPU_PROVIDER=runpod, or clear POD_VOLUME.${X}"
+elif [ "$provider" = "runpod" ] && [ "$(get RUNPOD_CLOUD | tr 'a-z' 'A-Z')" = "COMMUNITY" ]; then
+  echo -e "${D}  RUNPOD_CLOUD=COMMUNITY — stateless pod, POD_VOLUME is ignored (docs/gpu-pod.md#runpod-community)${X}"
+  [ -n "$(get RUNPOD_API_KEY)" ] || {
+    blocking=$((blocking + 1))
+    echo -e "${R}✗ RUNPOD_CLOUD=COMMUNITY rents through REST and needs RUNPOD_API_KEY${X}"; }
 elif [ -z "$vol" ] && [ "$provider" = "runpod" ]; then
   echo -e "${Y}! POD_VOLUME empty on RunPod — you are leaving the biggest win on the table${X}"
   echo -e "${D}   (~33GB model re-download + database loss on every pod). docs/gpu-pod.md#network-volume${X}"
