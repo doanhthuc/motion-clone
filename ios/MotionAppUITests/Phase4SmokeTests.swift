@@ -32,6 +32,11 @@ final class Phase4SmokeTests: XCTestCase {
             _ = confirm.waitForExistence(timeout: 2)
         }
         XCTAssertTrue(confirm.exists || soldOut.exists, "rent panel must render")
+        // Kept so a layout change to the rent panel can be eyeballed from the .xcresult.
+        let shot = XCTAttachment(screenshot: app.screenshot())
+        shot.name = "rent-panel"
+        shot.lifetime = .keepAlways
+        add(shot)
         if confirm.exists {
             XCTAssertTrue(confirm.label.contains("$"), "Confirm carries its quote")
         }
