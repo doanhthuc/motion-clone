@@ -135,17 +135,22 @@ struct RunDetailView: View {
 
     /// What the run needs from you, if anything. Usually nothing.
     @ViewBuilder private func actions(_ d: RunDetail) -> some View {
-        if d.id == flow.runID, flow.canRetryRental, let failure = flow.pod?.failedRental {
+        let failedRental = d.id == flow.runID && flow.canRetryRental ? flow.pod?.failedRental : nil
+        if let failure = failedRental {
             RetryRentalCard(flow: flow, failure: failure)
-        } else if canContinue(d) {
+        }
+        if canContinue(d) {
             // The same road as after a fresh Phase A: previews, then the rent
             // panel, where the quote is shown and nothing is rented until Confirm.
+            // Kept beside the failed-rental card too: a Vast Retry is refused with "no current
+            // Vast price quote" after a bot restart (the quote lives in the bot's memory), and
+            // this is the only way on this screen to the rent panel that fetches a new one.
             NavigationLink {
                 RunFlowView(flow: flow, entry: .existing)
             } label: {
                 Label("Continue batch · \(d.jobsTotal - d.jobsDone) left", systemImage: "play.fill")
             }
-            .buttonStyle(PrimaryButtonStyle())
+            .buttonStyle(ContinueBatchButtonStyle(secondary: failedRental != nil))
             .accessibilityIdentifier("run.continue")
         }
         if d.id == pod.pod?.runId, pod.showsKill(runStatus: d.status), let runID = pod.pod?.runId {
