@@ -36,10 +36,13 @@ POD_NAME = "motion-transfer"
 DEFAULT_USD_PER_HR = 0.69
 
 # REST /v1/pods takes an exact list (allowedCudaVersions), not a floor like runpodctl's
-# --min-cuda-version. These are the versions the catalog listed for the RTX 5090 on 2026-10-03
-# (12.8-13.3 across Secure and Community), plus two ahead. A newer version RunPod adds later is
-# excluded until it is appended here — the safe direction: an unknown host is never rented.
-KNOWN_CUDA_VERSIONS = ("12.8", "12.9", "13.0", "13.1", "13.2", "13.3", "13.4", "13.5")
+# --min-cuda-version. allowedCudaVersions is an enum on the API side: on 2026-10-04 a list that
+# went "two ahead" to 13.1-13.5 was rejected whole with a 400 ("must be one of '13.0', '12.9', ...
+# '11.8'"), so only versions the API accepts may be listed. 12.8 is the 5090's floor (Blackwell).
+# A newer version RunPod adds later is excluded until it is appended here — the safe direction: an
+# unknown host is never rented. The catalog showed 12.8-13.3 on 2026-10-03, but the API's enum
+# topped out at 13.0 on 2026-10-04, so hosts on 13.1+ cannot be selected through this list.
+KNOWN_CUDA_VERSIONS = ("12.8", "12.9", "13.0")
 
 GRAPHQL_URL = "https://api.runpod.io/graphql"
 _TIMEOUT_S = 15

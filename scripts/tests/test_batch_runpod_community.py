@@ -56,8 +56,16 @@ class TestBody(unittest.TestCase):
         self.assertEqual(self._body(MIN_DISK_BW="2500")["minDiskBandwidthMBps"], 2500.0)
 
     def test_cuda_floor_becomes_an_exact_list(self):
-        self.assertEqual(self._body(MIN_CUDA_VERSION="13.2")["allowedCudaVersions"][0], "13.2")
+        self.assertEqual(self._body(MIN_CUDA_VERSION="12.9")["allowedCudaVersions"][0], "12.9")
         self.assertNotIn("12.9", self._body(MIN_CUDA_VERSION="13.0")["allowedCudaVersions"])
+
+    def test_every_cuda_version_is_in_the_rest_api_enum(self):
+        # Copied from the 400 POST /v1/pods returned on 2026-10-04 when the list held 13.1-13.5:
+        # allowedCudaVersions is an enum, so one unknown value rejects the whole rent.
+        api_enum = {"13.0", "12.9", "12.8", "12.7", "12.6", "12.5", "12.4", "12.3", "12.2",
+                    "12.1", "12.0", "11.8"}
+        self.assertLessEqual(set(self._body()["allowedCudaVersions"]), api_enum)
+        self.assertLessEqual(set(rc.KNOWN_CUDA_VERSIONS), api_enum)
 
     def test_cuda_compares_numerically(self):
         self.assertEqual(rc.cuda_versions_from("12.10")[0], "13.0")
