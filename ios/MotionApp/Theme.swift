@@ -79,6 +79,15 @@ struct SecondaryButtonStyle: ButtonStyle {
     }
 }
 
+/// Primary on its own, secondary when another primary action sits above it (one green button per
+/// screen section).
+struct ContinueBatchButtonStyle: ButtonStyle {
+    let secondary: Bool
+    func makeBody(configuration: Configuration) -> some View {
+        StyledButton(configuration: configuration, kind: secondary ? .secondary : .primary)
+    }
+}
+
 /// Secondary weight with red text: the action is dangerous, not the default.
 struct DestructiveButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
