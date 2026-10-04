@@ -710,6 +710,26 @@ class TestRealVastApi(unittest.TestCase):
                             1, image="i", disk_gb=1, label="l")
                 self.assertNotIsInstance(cm.exception, vast_rent.AmbiguousCreate)
 
+    def test_an_error_json_on_stderr_is_a_definite_rejection_even_at_exit_0(self):
+        # Measured 2026-10-04 on motion-vps: for an offer someone else already took, `vastai
+        # create` exits 0, prints nothing on stdout and puts the verdict on stderr. Read as
+        # "unreadable reply" it aborted the whole rent after the first machine timed out (the
+        # next offer was ~8 minutes stale), instead of moving on to the next offer.
+        stderr = ('{"error": true, "status_code": 400, "msg": "error 404/3603: no_such_ask  '
+                  'Instance type by id 29797715 is not available."}')
+        with self._run("", stderr=stderr):
+            with self.assertRaises(vast_rent.RentError) as cm:
+                vast_rent.RealVastApi().create_instance(1, image="i", disk_gb=1, label="l")
+        self.assertNotIsInstance(cm.exception, vast_rent.AmbiguousCreate)
+        self.assertIn("no_such_ask", str(cm.exception))
+
+    def test_a_5xx_error_json_on_stderr_stays_ambiguous(self):
+        # A server-side failure does not say whether the request landed before it broke.
+        stderr = '{"error": true, "status_code": 502, "msg": "bad gateway"}'
+        with self._run("", stderr=stderr):
+            with self.assertRaises(vast_rent.AmbiguousCreate):
+                vast_rent.RealVastApi().create_instance(1, image="i", disk_gb=1, label="l")
+
     def test_a_missing_binary_on_create_is_definite_nothing_was_created(self):
         with mock.patch.object(vast_rent.subprocess, "run", side_effect=FileNotFoundError("vastai")):
             with self.assertRaises(vast_rent.RentError) as cm:
