@@ -130,6 +130,21 @@ class RealVastApi:
         if out.returncode != 0:
             raise RentError(f"vastai create failed for offer {offer_id}: "
                             f"{(out.stderr or out.stdout).strip()}")
+        # The CLI exits 0 even when the API refuses the offer, and writes the verdict to stderr as
+        # {"error": true, "status_code": 400, "msg": "...no_such_ask..."} with stdout empty
+        # (measured 2026-10-04 with a nonexistent offer id, with and without --cancel-unavail). A
+        # 4xx is a refusal: nothing was created, so the next offer is safe to try. A 5xx says
+        # nothing about whether the request landed, so it stays ambiguous below.
+        if not out.stdout.strip():
+            try:
+                err = json.loads(out.stderr)
+            except json.JSONDecodeError:
+                err = None
+            if (isinstance(err, dict) and err.get("error") is True
+                    and isinstance(err.get("status_code"), int)
+                    and 400 <= err["status_code"] < 500):
+                raise RentError(f"vastai create refused offer {offer_id}: "
+                                f"{str(err.get('msg', out.stderr)).strip()[:200]}")
         # From here the exit code says the request was accepted: anything we cannot read is
         # AMBIGUOUS, not "no instance" — creating another one could leave two billing.
         try:
