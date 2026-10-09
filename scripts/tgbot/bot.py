@@ -207,13 +207,10 @@ _CONFIRM_WARNED: set[int] = set()
 # a phone is readable.
 STAGING_DIR_NAME = "tg-staging"
 
-# tg-staging/ has no cleanup of any other kind (added 2026-09-04): /clear
-# only runs when a user explicitly asks (_clear_job), and `make batch-clean`
-# only ever touches out/runs/, never this directory (scripts/batch_clean.py).
-# Left alone, every upload AND every TikTok download below sits forever on
-# the VPS's fixed 40GB disk (scripts/vps/README.md "Box"). 7 days covers the
-# normal "send material, confirm, run" session with margin.
-STAGING_MAX_AGE_DAYS = 7
+# tg-staging/ is deliberately never aged out (2026-10-09): materials stay until
+# the user deletes them (app DELETE or /clear). The earlier 7-day sweep is gone.
+# Only `make batch-clean` (out/runs/) and the sweeps in _tick_staging_prune
+# (abandoned uploads, orphan thumbs/posters, idempotency) remove anything.
 
 # An abandoned upload holds up to 2 GiB on a 25 GB disk, and a phone resuming
 # within a day is the realistic case.
@@ -332,18 +329,6 @@ def _stage_file(chat_id: int, src: Path, file_name: str | None) -> Path:
             f"/var/lib/telegram-bot-api at the identical host path.") from exc
 
 
-def _prune_old_staged_files(now: float | None = None) -> list[Path]:
-    """Delete files under batch/tg-staging/*/ older than STAGING_MAX_AGE_DAYS.
-
-    Age-based and blind to which chat or job a file belongs to — the
-    directory carries no other record of that once a job is cleared or
-    confirmed (job.py's Job only tracks the CURRENT assembly). Returns what
-    it removed, so the caller can log it.
-    """
-    return materials.prune_staged(ROOT / "batch" / STAGING_DIR_NAME, STAGING_MAX_AGE_DAYS,
-                                  time.time() if now is None else now)
-
-
 # How often main()'s poll loop actually runs the sweep above. Once a day
 # rather than every ~50s poll round (2026-09-04): the sweep stats every file
 # under tg-staging/, and the whole point of piggybacking on the poll loop
@@ -354,7 +339,7 @@ _LAST_STAGING_PRUNE = 0.0
 
 
 def _tick_staging_prune() -> None:
-    """Runs `_prune_old_staged_files` at most once per _STAGING_PRUNE_INTERVAL_SEC.
+    """Runs the daily sweeps at most once per _STAGING_PRUNE_INTERVAL_SEC.
 
     Called from main()'s poll loop rather than a separate thread or a
     systemd timer: deploy-bot.sh only ever does `git reset --hard` + restart
@@ -372,12 +357,6 @@ def _tick_staging_prune() -> None:
     # Each sweep runs on its own: one raising (a file deleted from the app
     # mid-sweep, a permission oddity) used to skip the two after it for another
     # 24 h, and the uploads sweep is the one that frees GB.
-    def staged() -> None:
-        removed = _prune_old_staged_files(now)
-        if removed:
-            log(f"pruned {len(removed)} staged file(s) older than "
-                f"{STAGING_MAX_AGE_DAYS}d: {', '.join(p.name for p in removed)}")
-
     def abandoned_uploads() -> None:
         dropped = uploads.prune_uploads(ROOT / "batch" / "uploads", UPLOAD_MAX_AGE_SEC, now)
         if dropped:
@@ -399,7 +378,7 @@ def _tick_staging_prune() -> None:
         if removed:
             log(f"pruned {removed} idempotency record(s) older than 24h")
 
-    for sweep in (staged, abandoned_uploads, orphan_thumbs, orphan_posters,
+    for sweep in (abandoned_uploads, orphan_thumbs, orphan_posters,
                   stale_idempotency_records):
         try:
             sweep()

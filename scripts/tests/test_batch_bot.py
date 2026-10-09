@@ -650,11 +650,8 @@ class TestTikTokLinkDownload(unittest.TestCase):
 
 
 class TestStagingPrune(unittest.TestCase):
-    """batch/tg-staging/ has no cleanup otherwise (2026-09-04) — not /clear
-    (user-triggered only) and not `make batch-clean` (out/runs/ only, see
-    scripts/batch_clean.py) — so files accumulate forever on the VPS's fixed
-    40GB disk (scripts/vps/README.md "Box") unless something ages them out.
-    """
+    """batch/tg-staging/ is deliberately never aged out (2026-10-09): the daily
+    tick must leave materials alone until the user deletes them."""
 
     def setUp(self):
         self._orig_root = bot.ROOT
@@ -674,23 +671,10 @@ class TestStagingPrune(unittest.TestCase):
         os.utime(path, (old, old))
         return path
 
-    def test_a_file_older_than_the_threshold_is_removed(self):
-        old = self._touch_with_age("old.mp4", bot.STAGING_MAX_AGE_DAYS + 1)
-        removed = bot._prune_old_staged_files(now=time.time())
-        self.assertEqual(removed, [old])
-        self.assertFalse(old.exists())
-
-    def test_a_file_within_the_threshold_is_kept(self):
-        recent = self._touch_with_age("recent.mp4", bot.STAGING_MAX_AGE_DAYS - 1)
-        removed = bot._prune_old_staged_files(now=time.time())
-        self.assertEqual(removed, [])
-        self.assertTrue(recent.exists())
-
-    def test_tick_runs_at_most_once_per_interval(self):
-        with mock.patch("tgbot.bot._prune_old_staged_files") as prune:
-            bot._tick_staging_prune()
-            bot._tick_staging_prune()
-        prune.assert_called_once()
+    def test_old_staged_files_are_never_aged_out(self):
+        old = self._touch_with_age("old.mp4", 365)
+        bot._tick_staging_prune()
+        self.assertTrue(old.exists())
 
 
 class TestOutPrune(unittest.TestCase):

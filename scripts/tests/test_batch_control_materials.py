@@ -67,59 +67,6 @@ class TestStageFile(unittest.TestCase):
         self.assertEqual(len({p.name for p in results}), 8)
 
 
-class TestPrune(unittest.TestCase):
-    def setUp(self):
-        self.root = Path(tempfile.mkdtemp())
-        (self.root / "app").mkdir()
-
-    def old(self, name, now):
-        path = self.root / "app" / name
-        path.write_bytes(b"o")
-        os.utime(path, (now - 8 * 86400, now - 8 * 86400))
-        return path
-
-    def test_removes_only_old_files(self):
-        now = time.time()
-        old = self.old("old.mp4", now)
-        new = self.root / "app" / "new.mp4"; new.write_bytes(b"n")
-        self.assertEqual(materials.prune_staged(self.root, 7, now), [old])
-        self.assertTrue(new.exists())
-
-    def test_a_file_deleted_before_the_stat_does_not_abort_the_sweep(self):
-        # A DELETE (or /clear) between iterdir and stat used to raise
-        # FileNotFoundError out of the whole tick, skipping the upload and
-        # thumbnail sweeps for another 24 h.
-        now = time.time()
-        vanishing, other = self.old("a.mp4", now), self.old("b.mp4", now)
-        real_is_file = Path.is_file
-
-        def is_file(self):
-            result = real_is_file(self)
-            if self == vanishing:
-                os.unlink(self)                 # gone between the listing and the stat
-            return result
-
-        with mock.patch.object(Path, "is_file", is_file):
-            removed = materials.prune_staged(self.root, 7, now)
-        self.assertIn(other, removed)
-        self.assertFalse(other.exists())
-
-    def test_a_file_deleted_before_the_unlink_does_not_abort_the_sweep(self):
-        now = time.time()
-        vanishing, other = self.old("a.mp4", now), self.old("b.mp4", now)
-        real_unlink = Path.unlink
-
-        def unlink(self, missing_ok=False):
-            if self == vanishing:
-                os.unlink(self)                 # gone between the stat and the unlink
-            return real_unlink(self, missing_ok=missing_ok)
-
-        with mock.patch.object(Path, "unlink", unlink):
-            removed = materials.prune_staged(self.root, 7, now)
-        self.assertIn(other, removed)
-        self.assertFalse(other.exists())
-
-
 class TestTickPrunesIndependently(unittest.TestCase):
     """One failing sweep must not skip the other two for another 24 h."""
 
@@ -130,13 +77,11 @@ class TestTickPrunesIndependently(unittest.TestCase):
         self.addCleanup(setattr, bot, "_LAST_STAGING_PRUNE", 0.0)
 
     def test_a_failing_sweep_does_not_skip_the_others(self):
-        with mock.patch.object(self.bot, "_prune_old_staged_files",
+        with mock.patch.object(self.bot.uploads, "prune_uploads",
                                side_effect=OSError("disk hiccup")), \
-             mock.patch.object(self.bot.uploads, "prune_uploads", return_value=[]) as up, \
              mock.patch.object(self.bot.materials, "prune_thumbs", return_value=[]) as th, \
              mock.patch.object(self.bot, "log") as log:
             self.bot._tick_staging_prune()
-        up.assert_called_once()
         th.assert_called_once()
         self.assertTrue(any("disk hiccup" in str(c) for c in log.call_args_list),
                         log.call_args_list)
