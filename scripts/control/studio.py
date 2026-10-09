@@ -4,7 +4,7 @@ Shaped like control/tryon_library.py: one JSON index per owner, read and
 written fresh under control.LOCK on every call, rewritten atomically. Files
 live under studio_dir/<owner>/<project_id>/{refs,img}/ — outside out/, so
 batch-clean never touches them. References are COPIED in at submit time:
-materials are pruned after 7 days and library entries can be deleted, and
+materials and library entries can be deleted, and
 neither may break a project's history or its Retry.
 """
 from __future__ import annotations

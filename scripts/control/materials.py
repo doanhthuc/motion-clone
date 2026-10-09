@@ -167,36 +167,6 @@ def stage_file(dest_dir: Path, src: Path, file_name: str | None, *,
     return dest
 
 
-def prune_staged(staging_root: Path, max_age_days: int, now: float) -> list[Path]:
-    """Delete files under <staging_root>/*/ older than `max_age_days`.
-
-    Age-based and blind to which owner or job a file belongs to — the
-    directory carries no other record of that once a job is cleared or
-    confirmed. Returns what it removed, so the caller can log it.
-
-    Tolerant of files that disappear mid-sweep (a DELETE from the app, a
-    /clear from Telegram): a bare `stat()`/`unlink()` raised FileNotFoundError
-    out of the whole daily tick, which then skipped the upload and thumbnail
-    sweeps for another 24 h.
-    """
-    cutoff = now - max_age_days * 86400
-    removed: list[Path] = []
-    if not staging_root.is_dir():
-        return removed
-    for owner_dir in staging_root.iterdir():
-        if not owner_dir.is_dir():
-            continue
-        for path in owner_dir.iterdir():
-            try:
-                if not path.is_file() or path.stat().st_mtime >= cutoff:
-                    continue
-                path.unlink(missing_ok=True)
-            except FileNotFoundError:
-                continue
-            removed.append(path)
-    return removed
-
-
 APP_OWNER = "app"
 # How many thumbnail ffmpeg processes may run at once — see thumbnail().
 _FFMPEG_SLOTS = threading.BoundedSemaphore(2)

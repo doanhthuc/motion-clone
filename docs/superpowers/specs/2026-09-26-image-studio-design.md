@@ -45,7 +45,7 @@ Decisions made in chat (2026-09-26):
 - `scripts/httpapi/server.py` — hand-rolled router, `ApiError(status, code, message)`,
   `_idempotency_key()`, `_send_json`. Owner for app-created things is `materials.APP_OWNER`.
 - Uploads (`control/uploads.py`) always land as **materials**; materials under
-  `batch/tg-staging/` are pruned after `STAGING_MAX_AGE_DAYS = 7` (`scripts/tgbot/bot.py`).
+  `batch/tg-staging/` are no longer pruned by age (removed 2026-10-09).
 - Models the Gemini key can call, listed 2026-09-26 via `GET /v1beta/models`:
   `gemini-3-pro-image` (Nano Banana Pro), `gemini-3.1-flash-image` (Nano Banana 2),
   `gemini-3.1-flash-lite-image` (Nano Banana 2 Lite), `gemini-2.5-flash-image` (not offered).
