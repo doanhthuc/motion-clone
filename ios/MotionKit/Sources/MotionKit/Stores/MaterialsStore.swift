@@ -202,19 +202,40 @@ public final class MaterialsStore {
     }
 
     public func delete(_ material: Material) async {
-        do {
-            try await client.delete("v1", "materials", material.owner, material.name)
-            materials.removeAll { $0.id == material.id }
-            thumbnails[material.id] = nil
-            warnings[material.id] = nil
-            errorMessage = nil
-        } catch let error {
-            if case .server(status: 404, _, _) = error {
-                await refresh()
-            } else {
-                errorMessage = error.userMessage
+        await delete([material])
+    }
+
+    /// Deletes each in turn — one VPS request at a time, as the single delete
+    /// does — and keeps going past a failure, so one refusal doesn't strand the
+    /// rest. Returns the ids still on the server, for a selection to keep.
+    @discardableResult
+    public func delete(_ list: [Material]) async -> Set<String> {
+        var failed: [(Material, APIError)] = []
+        var vanished = false
+        for material in list {
+            do {
+                try await client.delete("v1", "materials", material.owner, material.name)
+                forget(material.id)
+            } catch let error {
+                // Already gone elsewhere: the wanted state, not a failure.
+                if case .server(status: 404, _, _) = error { vanished = true } else { failed.append((material, error)) }
             }
         }
+        if vanished { await refresh() }
+        errorMessage = Self.bulkMessage(failed: failed.map(\.1), of: list.count)
+        return Set(failed.map(\.0.id))
+    }
+
+    private func forget(_ id: String) {
+        materials.removeAll { $0.id == id }
+        thumbnails[id] = nil
+        warnings[id] = nil
+    }
+
+    /// "Couldn't delete 2 of 5: <reason>", or the bare reason for a single one.
+    static func bulkMessage(failed: [APIError], of total: Int) -> String? {
+        guard let first = failed.first else { return nil }
+        return total == 1 ? first.userMessage : "Couldn't delete \(failed.count) of \(total): \(first.userMessage)"
     }
 
     private func progressHandler() -> Uploader.ProgressHandler {

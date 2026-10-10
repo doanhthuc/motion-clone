@@ -3,7 +3,7 @@ import SwiftUI
 
 /// One material in the library, used by the category rows and the See all
 /// grid alike: tap previews, long-press peeks at it and moves it to another
-/// role or deletes it.
+/// role or deletes it. While the screen is selecting, tap picks it instead.
 @MainActor
 struct MaterialTile: View {
     let material: MotionKit.Material
@@ -11,15 +11,23 @@ struct MaterialTile: View {
     let onOpen: () -> Void
     /// Asks for confirmation; the screen that owns the dialog does the delete.
     let onDelete: () -> Void
+    /// nil outside selection mode; otherwise whether this one is picked.
+    var selected: Bool? = nil
+    var onToggle: () -> Void = {}
     @State private var thumbnail: Data?
 
     var body: some View {
-        Button(action: onOpen) {
+        Button(action: selected == nil ? onOpen : onToggle) {
             MaterialCard(material: material, warning: store.warning(for: material.id),
-                         thumbnail: thumbnail, compact: true)
+                         thumbnail: thumbnail, selected: selected == true, compact: true)
+                .overlay(alignment: .topTrailing) {
+                    if let selected { SelectionCheck(selected: selected) }
+                }
         }
         .buttonStyle(.plain)
-        .accessibilityHint(material.kind == .video ? "Plays the video" : "Shows the full image")
+        .accessibilityAddTraits(selected == true ? .isSelected : [])
+        .accessibilityHint(selected != nil ? "Selects it"
+                           : material.kind == .video ? "Plays the video" : "Shows the full image")
         .contextMenu {
             if material.kind == .image {
                 Menu("Move to", systemImage: "folder") {
@@ -61,6 +69,23 @@ struct MaterialDeleteDialog: ViewModifier {
             Button("Cancel", role: .cancel) { candidate = nil }
         } message: {
             Text(candidate?.name ?? "")
+        }
+    }
+}
+
+/// The confirm for deleting every selected material at once.
+struct MaterialBulkDeleteDialog: ViewModifier {
+    @Binding var isPresented: Bool
+    let count: Int
+    let onConfirm: () -> Void
+
+    func body(content: Content) -> some View {
+        content.confirmationDialog("Delete \(count) material\(count == 1 ? "" : "s")?",
+                                   isPresented: $isPresented, titleVisibility: .visible) {
+            Button("Delete \(count)", role: .destructive, action: onConfirm)
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("They are removed from the VPS.")
         }
     }
 }

@@ -100,6 +100,12 @@ def _live_runs(batch_dir: Path) -> list[dict]:
     return found
 
 
+def busy_batches(batch_dir: Path) -> set[str]:
+    """The `out/` batch names a draining or Phase A run is writing into."""
+    return {r["batch"] for r in _live_runs(batch_dir)
+            if r.get("batch") and run_mod.busy(batch_dir / f"{r['id']}.yaml")}
+
+
 def list_runs(batch_dir: Path, out_dir: Path) -> list[dict]:
     """Live journals and past batches together, newest first."""
     live = _live_runs(batch_dir)

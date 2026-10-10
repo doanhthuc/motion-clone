@@ -60,22 +60,39 @@ public final class TryonLibraryStore {
     }
 
     public func delete(_ entry: TryonLibraryEntry) async {
+        await delete([entry])
+    }
+
+    /// Deletes each in turn and keeps going past a failure. Returns the ids
+    /// still on the server, for a selection to keep.
+    @discardableResult
+    public func delete(_ list: [TryonLibraryEntry]) async -> Set<String> {
         message = nil
-        do {
-            // The decoding overload: the server answers 200, `delete(_:)` accepts 204 only.
-            _ = try await client.delete(OkResponse.self, "v1", "tryon-library", entry.id)
-            forget(entry.id)
-        } catch {
-            if case .server(status: 404, code: _, message: _) = error {
-                // Deleted elsewhere (the bot, another phone) — the wanted state is
-                // already true, so drop it locally instead of showing a failure.
+        var failed: [(String, APIError)] = []
+        var vanished = 0
+        for entry in list {
+            do {
+                // The decoding overload: the server answers 200, `delete(_:)` accepts 204 only.
+                _ = try await client.delete(OkResponse.self, "v1", "tryon-library", entry.id)
                 forget(entry.id)
-                message = "That saved try-on was already deleted."
-            } else {
-                self.error = error
-                message = error.userMessage
+            } catch {
+                if case .server(status: 404, code: _, message: _) = error {
+                    // Deleted elsewhere (the bot, another phone) — the wanted state is
+                    // already true, so drop it locally instead of showing a failure.
+                    forget(entry.id)
+                    vanished += 1
+                } else {
+                    failed.append((entry.id, error))
+                }
             }
         }
+        if let error = failed.first?.1 {
+            self.error = error
+            message = MaterialsStore.bulkMessage(failed: failed.map(\.1), of: list.count)
+        } else if vanished > 0, list.count == 1 {
+            message = "That saved try-on was already deleted."
+        }
+        return Set(failed.map(\.0))
     }
 
     /// Fills the entry's materials and seeds the job with its image. The

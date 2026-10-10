@@ -12,6 +12,7 @@ struct RunsView: View {
     @State private var details: RunDetail?
     @State private var continuing = false
     @State private var deleting: RunDeleteTarget?
+    @State private var selection = Selection()
 
     var body: some View {
         ScrollView {
@@ -25,7 +26,10 @@ struct RunsView: View {
                 }
                 if let live = runs.live {
                     SectionTitle(text: "Now")
-                    if live.status == .phaseA {
+                    if selection.active {
+                        // A running run is never deletable; it stays in view, inert.
+                        card(live).opacity(0.4).allowsHitTesting(false)
+                    } else if live.status == .phaseA {
                         NavigationLink { RunFlowView(flow: flow, entry: .existing) } label: { card(live) }
                             .buttonStyle(CardPressStyle())
                     } else {
@@ -34,7 +38,9 @@ struct RunsView: View {
                 }
                 if !runs.recent.isEmpty {
                     SectionTitle(text: "Recent")
-                    ForEach(runs.recent) { link($0) }
+                    ForEach(runs.recent) { run in
+                        if selection.active { selectableCard(run) } else { link(run) }
+                    }
                     Text("\(runs.runs.count) total").font(.footnote).foregroundStyle(Theme.secondary)
                         .padding(.leading, 4)
                 }
@@ -53,7 +59,14 @@ struct RunsView: View {
         }
         .navigationDestination(isPresented: $continuing) { RunFlowView(flow: flow, entry: .existing) }
         .sheet(item: $details) { BatchDetailsSheet(detail: $0, store: runs.detailStore(for: $0.id), focus: nil) }
-        .runDeletion($deleting)
+        .runDeletion($deleting) { failed in withAnimation(.snappy) { selection.keep(failed) } }
+        .selectionMode($selection, selectable: deletable.map(\.id), busy: false) {
+            let chosen = deletable.filter { selection.contains($0.id) }
+            deleting = RunDeleteTarget(
+                ids: chosen.map(\.id),
+                title: chosen.count == 1 ? RunName.title(chosen[0].batch ?? chosen[0].id) : "\(chosen.count) runs",
+                videos: chosen.reduce(0) { $0 + (runs.detailStore(for: $1.id).detail?.outputs.count ?? 0) })
+        }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 NavigationLink { SettingsView() } label: { Image(systemName: "gearshape") }
@@ -103,6 +116,31 @@ struct RunsView: View {
                     } label: { Label("Delete run", systemImage: "trash") }
                 }
             }
+    }
+
+    /// What the long-press Delete offers, as a list: not running, no pod attached.
+    private var deletable: [RunSummary] {
+        runs.recent.filter { !$0.status.isLive && runs.detailStore(for: $0.id).detail?.lease == nil }
+    }
+
+    /// In selection mode a tap picks the run; one that can't be deleted is dimmed and inert.
+    @ViewBuilder private func selectableCard(_ run: RunSummary) -> some View {
+        let canDelete = deletable.contains { $0.id == run.id }
+        let picked = selection.contains(run.id)
+        Button { selection.toggle(run.id) } label: {
+            card(run)
+                .overlay {
+                    if picked { RoundedRectangle(cornerRadius: 22).strokeBorder(Theme.accent, lineWidth: 3) }
+                }
+                // Leading: each cover already carries its job's status check on the right.
+                .overlay(alignment: .topLeading) {
+                    if canDelete { SelectionCheck(selected: picked).padding(12) }
+                }
+        }
+        .buttonStyle(CardPressStyle())
+        .disabled(!canDelete)
+        .opacity(canDelete ? 1 : 0.4)
+        .accessibilityAddTraits(picked ? .isSelected : [])
     }
 
     /// The same rule as the run detail's Continue button.

@@ -6,6 +6,9 @@ struct MaterialsView: View {
     let uploads: MaterialUploadQueue
     @State private var adding = false
     @State private var deleteCandidate: MotionKit.Material?
+    @State private var selection = Selection()
+    @State private var confirmBulkDelete = false
+    @State private var bulkDeleting = false
     @State private var previewing: MotionKit.Material?
     /// 0 with the grid at rest, 1 once it has scrolled `collapseDistance`:
     /// drives the Add button from its tall form to a one-line bar.
@@ -33,6 +36,18 @@ struct MaterialsView: View {
         // image it was about, one dialog per photo (2026-09-26).
         .modifier(MaterialAdder(isPresented: $adding, group: nil, store: store, queue: uploads))
         .modifier(MaterialDeleteDialog(candidate: $deleteCandidate, store: store))
+        .selectionMode($selection, selectable: store.materials.map(\.id), busy: bulkDeleting) {
+            confirmBulkDelete = true
+        }
+        .modifier(MaterialBulkDeleteDialog(isPresented: $confirmBulkDelete, count: selection.ids.count) {
+            let chosen = store.materials.filter { selection.contains($0.id) }
+            bulkDeleting = true
+            Task {
+                let kept = await store.delete(chosen)
+                withAnimation(.snappy) { selection.keep(kept) }
+                bulkDeleting = false
+            }
+        })
         .navigationDestination(for: MaterialGroup.self) { group in
             MaterialCategoryView(group: group, store: store, uploads: uploads)
         }
@@ -101,7 +116,9 @@ struct MaterialsView: View {
                     ForEach(items) { material in
                         MaterialTile(material: material, store: store,
                                      onOpen: { previewing = material },
-                                     onDelete: { deleteCandidate = material })
+                                     onDelete: { deleteCandidate = material },
+                                     selected: selection.active ? selection.contains(material.id) : nil,
+                                     onToggle: { selection.toggle(material.id) })
                             .frame(width: Self.rowTileWidth)
                     }
                 }
@@ -144,8 +161,8 @@ struct MaterialsView: View {
             .contentShape(.rect)
         }
         .buttonStyle(.plain)
-        .disabled(busy)
-        .opacity(busy ? 0.5 : 1)
+        .disabled(busy || selection.active)
+        .opacity(busy || selection.active ? 0.5 : 1)
         .accessibilityLabel("Add material")
         .accessibilityHint("Photos, a TikTok link or Files")
     }

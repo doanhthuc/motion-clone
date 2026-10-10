@@ -94,6 +94,15 @@ extension URLProtocolTests {
         #expect(store.message == "That saved try-on was already deleted.")
     }
 
+    @Test func bulkDeleteDropsGoneEntriesWithoutAnError() async {
+        let (store, _) = make()
+        await store.load()
+        let kept = await store.delete(store.entries)   // "new" 404s: gone counts as done
+        #expect(kept.isEmpty)
+        #expect(store.entries.isEmpty)
+        #expect(store.message == nil)
+    }
+
     /// The 404 branch's local removal, against an entry that is actually on
     /// screen. This is the case that runs when the bot or a second phone
     /// deleted it: without `forget`, the grid keeps a tile whose image and

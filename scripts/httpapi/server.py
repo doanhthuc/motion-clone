@@ -429,6 +429,9 @@ class _Handler(BaseHTTPRequestHandler):
             s.material_roles.set(material_id, body.get("role"))
             item = s.material_roles.annotate([materials.material_item(rest[1], path)])[0]
             return self._send_json(200, {"material": item})
+        if method == "DELETE" and len(rest) == 3 and rest[0] == "outputs":
+            outputs.delete_output(s.out_dir, rest[1], rest[2], busy_batches=runs.busy_batches(s.batch_dir))
+            return self._send_empty(204)
         if method == "DELETE" and len(rest) == 3 and rest[0] == "materials":
             materials.delete_material(s.staging_root, s.batch_dir, rest[1], rest[2])
             s.material_roles.forget(f"{rest[1]}/{rest[2]}")

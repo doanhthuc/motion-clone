@@ -203,6 +203,7 @@ A run's `id` is the manifest stem (`batch/<id>.yaml`).
 | `GET /v1/outputs` | Batches in `out/*/_final` with their files |
 | `GET /v1/outputs/{batch}/{file}` | Streams the file with HTTP `Range` support so `AVPlayer` plays without a full download |
 | `GET /v1/outputs/{batch}/{file}/poster` | A 480 px JPEG frame of the file, rendered once with ffmpeg (added 2026-09-25) |
+| `DELETE /v1/outputs/{batch}/{file}` | *Added 2026-10-10:* removes one file from `_final/` with its poster and duration sidecar; `204`, `404` if it is not a listed output, `409 busy` while a run writing that batch is draining or in Phase A (the runner's `_finalize` writes there). The phone's Outputs long-press Delete and Select both use it, one request per file |
 
 Every path parameter that names a file goes through `_safe_child`; `..`, absolute paths and symlinks
 out of the root are `404`.
