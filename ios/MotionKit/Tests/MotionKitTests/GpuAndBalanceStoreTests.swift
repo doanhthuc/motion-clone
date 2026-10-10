@@ -157,5 +157,29 @@ extension URLProtocolTests {
         #expect(store.vastLine == "Couldn't read the Vast credit")
         #expect(store.balance?.runpod?.lowRunway == true)
     }
+
+    @Test func failedVastReadNeverDimsRunpod() async {
+        StubURLProtocol.install { request in
+            request.url?.query == "vast=1" ? (500, [:], Data()) : TestSupport.json(Fixtures.balance)
+        }
+        let store = BalanceStore(client: TestSupport.client())
+        await store.load()
+        await store.loadVast()
+        #expect(store.error == nil)
+        #expect(store.vastError != nil)
+        #expect(store.runpodLine == "$12.34 · ≈ 12h 28m at $0.99/h")
+    }
+
+    @Test func prefetchVastReadsOnceThenStops() async throws {
+        install(Routes())
+        let store = BalanceStore(client: TestSupport.client())
+        store.prefetchVast()
+        store.prefetchVast()
+        for _ in 0..<200 where store.vastLine == nil { try await Task.sleep(for: .milliseconds(10)) }
+        #expect(store.vastLine == "$7.50")
+        store.prefetchVast()
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(StubURLProtocol.requests.filter { $0.url?.query == "vast=1" }.count == 1)
+    }
 }
 }

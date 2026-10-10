@@ -11,13 +11,18 @@ struct BalanceSheet: View {
                 .navigationTitle("Balance")
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
-                .refreshable { await store.load() }
+                .refreshable {
+                    async let a: Void = store.load()
+                    async let b: Void = store.loadVast()
+                    _ = await (a, b)
+                }
         }
+        .onAppear { store.prefetchVast() }
         .presentationDetents([.medium])
     }
 }
 
-/// Balance rows: the runway is the hero number, the Vast credit is on tap.
+/// Balance rows: the runway is the hero number, the Vast credit loads beside it.
 struct BalanceSection: View {
     let store: BalanceStore
 
@@ -46,21 +51,27 @@ struct BalanceSection: View {
             } else {
                 LoadingBlock()
             }
-            if let vast = store.vastLine {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Vast").font(.subheadline).foregroundStyle(Theme.secondary)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Vast").font(.subheadline).foregroundStyle(Theme.secondary)
+                if let vast = store.vastLine {
                     Text(vast).font(.title3.weight(.semibold).monospacedDigit())
+                } else if store.isLoadingVast {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                        Text("Reading the Vast credit (~30 s)…").font(.footnote).foregroundStyle(Theme.secondary)
+                    }
                 }
-                .padding(.vertical, 2)
+                if let error = store.vastError {
+                    Text("Couldn't read — \(error.userMessage)")
+                        .font(.footnote).foregroundStyle(Theme.warning)
+                }
             }
+            .padding(.vertical, 2)
             ForEach(store.balance?.errors ?? [], id: \.self) { text in
                 Text(text).font(.footnote).foregroundStyle(Theme.warning)
             }
-            Button { Task { await store.loadVast() } } label: {
-                HStack(spacing: 8) {
-                    Text(store.isLoadingVast ? "Reading the Vast credit (~30 s)…" : "Check Vast credit")
-                    if store.isLoadingVast { Spacer(); ProgressView() }
-                }
+            Button(store.vast == nil ? "Check Vast credit" : "Refresh Vast credit") {
+                Task { await store.loadVast() }
             }
             .disabled(store.isLoadingVast)
             .accessibilityIdentifier("pod.checkVast")

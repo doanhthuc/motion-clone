@@ -66,6 +66,7 @@ struct PodView: View {
             }
         }
         .task {
+            balance.prefetchVast()
             async let a: Void = pod.refresh()
             async let b: Void = balance.load()
             async let c: Void = runs.refresh()
