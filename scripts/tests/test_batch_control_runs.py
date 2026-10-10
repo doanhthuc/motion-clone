@@ -310,3 +310,123 @@ class TestDeleteRun(RunsTestBase):
         runs.delete_run(self.batch, self.out, "r", with_videos=True)
         self.assertTrue((self.out_batch / "_final" / "a.mp4").exists())
         self.assertTrue((self.out_batch / "runs").exists())
+
+
+class TestPastRuns(RunsTestBase):
+    """Past batches read back from out/<batch>/ (2026-10-10): the bot keeps one
+    manifest per chat, so a new run resets the journal and the phone used to
+    see only the latest run."""
+
+    MANIFEST = (
+        "runs:\n"
+        "  - id: a\n"
+        "    pipeline: motion-enhance\n"
+        "    inputs:\n"
+        "      character: /opt/motion-clone/batch/tg-staging/app/IMG_1.png\n"
+        "      driver: /opt/motion-clone/batch/tg-staging/app/tiktok-1.mp4\n"
+        "  - id: b\n"
+        "    pipeline: motion-enhance\n"
+        "    inputs:\n"
+        "      character: /opt/motion-clone/batch/tg-staging/app/IMG_2.png\n"
+        "      driver: /opt/motion-clone/batch/tg-staging/app/tiktok-2.mp4\n"
+        "  - id: c\n"
+        "    pipeline: motion-enhance\n"
+        "    inputs:\n"
+        "      character: /opt/motion-clone/batch/tg-staging/app/IMG_3.png\n"
+        "      driver: /opt/motion-clone/batch/tg-staging/app/tiktok-3.mp4\n"
+    )
+    INDEX = (
+        "run\tstatus\tstage\tjob_id\telapsed_sec\tbytes\tparams_sent\tparams_manifest\n"
+        "a\tdone\tmotion\tj1\t247\t100\t{}\t{}\n"
+        "a\tdone\tenhance\tj2\t90\t200\t{}\t{}\n"
+        "b\terror\tmotion\tj3\t30\t100\t{}\t{}\n"
+        "b\terror\tenhance\tj4\t560\t\t{}\t{}\n"
+    )
+
+    def past(self, name: str, *, index: str | None = None, journal: dict | None = None,
+             mtime: float = 500) -> Path:
+        d = self.out / name
+        (d / "_final").mkdir(parents=True)
+        (d / "manifest.yaml").write_text(self.MANIFEST, encoding="utf-8")
+        (d / "_final" / "a.mp4").write_bytes(b"v")
+        for fname, body in (("_index.tsv", index),
+                            ("state.json", json.dumps(journal) if journal else None)):
+            if body is not None:
+                (d / fname).write_text(body, encoding="utf-8")
+                os.utime(d / fname, (mtime, mtime))
+        return d
+
+    def test_listed_after_the_live_journal_newest_first(self):
+        write_run(self.batch, "tg-1", STATE, mtime=3000)
+        self.past("2026-09-01-0000", index=self.INDEX, mtime=1000)
+        self.past("2026-09-02-0000", index=self.INDEX, mtime=2000)
+        self.assertEqual([r["id"] for r in runs.list_runs(self.batch, self.out)],
+                         ["tg-1", "2026-09-02-0000", "2026-09-01-0000"])
+
+    def test_the_live_batch_and_latest_are_not_listed_twice(self):
+        write_run(self.batch, "tg-1", STATE)
+        self.past(STATE["batch"], index=self.INDEX)
+        (self.out / "latest").symlink_to(self.out / STATE["batch"])
+        self.assertEqual([r["id"] for r in runs.list_runs(self.batch, self.out)], ["tg-1"])
+
+    def test_a_batch_that_never_ran_is_left_out(self):
+        self.past("2026-09-01-0000")                      # manifest only
+        (self.out / "2026-09-03-0000" / "_final").mkdir(parents=True)   # no manifest
+        self.assertEqual(runs.list_runs(self.batch, self.out), [])
+
+    def test_summary_from_the_index(self):
+        self.past("2026-09-01-0000", index=self.INDEX)
+        [r] = runs.list_runs(self.batch, self.out)
+        self.assertEqual((r["status"], r["batch"], r["jobs_total"], r["jobs_done"]),
+                         ("error", "2026-09-01-0000", 3, 1))
+
+    def test_detail_from_the_index(self):
+        self.past("2026-09-01-0000", index=self.INDEX)
+        d = runs.run_detail(self.batch, self.out, "2026-09-01-0000")
+        jobs = {j["id"]: j for j in d["jobs"]}
+        self.assertEqual([(s["name"], s["status"], s["elapsed_sec"]) for s in jobs["b"]["stages"]],
+                         [("motion", "done", 30), ("enhance", "error", 560)])
+        self.assertEqual((jobs["c"]["status"], jobs["c"]["stages"]), ("pending", []))
+        self.assertEqual(jobs["a"]["setup"]["inputs"]["driver"], "app/tiktok-1.mp4")
+        self.assertEqual((d["lease"], d["outputs"]), (None, ["a.mp4"]))
+        self.assertNotIn("/opt", json.dumps(d))
+
+    def test_the_archived_journal_wins_and_nothing_in_it_is_live(self):
+        journal = {"version": 1, "batch": "2026-09-01-0000", "runs": {
+            "a": {"status": "done", "stages": {"motion": {"status": "done", "elapsed_sec": 1}}},
+            "b": {"status": "running", "stages": {"motion": {
+                "status": "running", "slow_warning": {"at": 1, "ceiling_min": 9}}}}}}
+        self.past("2026-09-01-0000", index=self.INDEX, journal=journal)
+        [r] = runs.list_runs(self.batch, self.out)
+        self.assertEqual((r["status"], r["slow_stages"]), ("stopped", 0))
+        jobs = {j["id"]: j for j in runs.run_detail(self.batch, self.out, "2026-09-01-0000")["jobs"]}
+        self.assertEqual(jobs["b"]["status"], "pending")
+        self.assertEqual(jobs["b"]["stages"][0]["slow_warning"], None)
+
+    def test_unknown_unsafe_live_or_symlinked_ids_have_no_detail(self):
+        write_run(self.batch, "tg-1", STATE)
+        self.past(STATE["batch"], index=self.INDEX)
+        (self.out / "latest").symlink_to(self.out / STATE["batch"])
+        for run_id in ("nope", "../x", "", "latest", STATE["batch"]):
+            self.assertIsNone(runs.run_detail(self.batch, self.out, run_id))
+
+    def test_delete_keeps_videos_and_drops_it_from_the_list(self):
+        d = self.past("2026-09-01-0000", index=self.INDEX, journal=STATE)
+        (d / "runs" / "a").mkdir(parents=True)
+        outcome, videos = runs.delete_run(self.batch, self.out, "2026-09-01-0000", with_videos=False)
+        self.assertEqual((bool(outcome), videos), (True, 0))
+        self.assertEqual(sorted(p.name for p in d.iterdir()), ["_final"])
+        self.assertEqual(runs.list_runs(self.batch, self.out), [])
+
+    def test_delete_with_videos_removes_the_directory(self):
+        self.past("2026-09-01-0000", index=self.INDEX)
+        outcome, videos = runs.delete_run(self.batch, self.out, "2026-09-01-0000", with_videos=True)
+        self.assertEqual((bool(outcome), videos), (True, 1))
+        self.assertEqual(list(self.out.iterdir()), [])
+
+    def test_delete_never_reaches_the_live_batch_through_its_name(self):
+        write_run(self.batch, "tg-1", STATE)
+        d = self.past(STATE["batch"], index=self.INDEX)
+        outcome, _ = runs.delete_run(self.batch, self.out, STATE["batch"], with_videos=True)
+        self.assertEqual(outcome.code, "not_found")
+        self.assertTrue((d / "_final" / "a.mp4").exists())
