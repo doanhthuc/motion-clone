@@ -361,6 +361,37 @@ def write_index(out_dir: Path, state: dict) -> None:
     (out_dir / "_index.tsv").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+# The journal's copy inside its own batch directory, written when a new batch
+# takes over the journal. The bot keeps one manifest per chat
+# (`batch/tg-<chat>.yaml`), so every new run overwrote the previous run's
+# journal and the phone's Runs list could only ever show the latest one
+# (2026-10-10: 34 batch directories in out/, one journal in batch/).
+# control.runs reads past runs back from here.
+ARCHIVED_JOURNAL = "state.json"
+
+
+def archive_journal(state_file: Path, out_root: Path, new_batch_id: str) -> None:
+    """Copy the journal about to be reset into `out/<its batch>/state.json`.
+
+    `_index.tsv` already records a finished batch, but only a drain that
+    reached the end writes it: a run killed mid-way, or a Phase A that was
+    never confirmed, would otherwise vanish. Best effort — losing a past run's
+    record must never stop the next run from starting.
+    """
+    if not state_file.is_file():
+        return
+    old_batch = str(load_state(state_file).get("batch") or "")
+    if not old_batch or old_batch == new_batch_id or "/" in old_batch or ".." in old_batch:
+        return
+    dest = out_root / old_batch
+    if dest.is_symlink() or not dest.is_dir():
+        return
+    try:
+        shutil.copyfile(state_file, dest / ARCHIVED_JOURNAL)
+    except OSError:
+        pass
+
+
 def prepare_batch(*, manifest: Manifest, out_root: Path, batch_id: str,
                   resume: bool) -> tuple[Path, dict, Path]:
     """Tạo out_dir + nạp/khởi tạo state — tách khỏi run_batch() để Pha A
@@ -374,6 +405,8 @@ def prepare_batch(*, manifest: Manifest, out_root: Path, batch_id: str,
     # Chép NGUYÊN VĂN, không qua PyYAML — comment của người dùng phải sống sót.
     shutil.copyfile(manifest.path, out_dir / "manifest.yaml")
     state_file = state_path_for(manifest.path)
+    if not resume:
+        archive_journal(state_file, out_root, batch_id)
     state = load_state(state_file) if resume else {"version": 1, "runs": {}}
     state["batch"] = batch_id
     return out_dir, state, state_file

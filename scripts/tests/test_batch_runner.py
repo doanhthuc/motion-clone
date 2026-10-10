@@ -7,7 +7,7 @@ from batchlib.client import JobError, JobFailed, JobGone
 from batchlib.config import ConfigError, Settings
 from batchlib.manifest import load_manifest, load_state, save_state, state_path_for
 from batchlib.pipelines import PIPELINES, effective_stage_params
-from batchlib.runner import (LocalPhaseResult, batch_id_now, has_local_tryon,
+from batchlib.runner import (ARCHIVED_JOURNAL, LocalPhaseResult, batch_id_now, has_local_tryon,
                               local_tryon_reusable, needs_pod,
                               preserved_local_tryon, prepare_batch, run_batch, run_local_phase,
                               run_one, stage_dest, tryon_share_groups, tryon_share_key,
@@ -837,6 +837,34 @@ class TestPrepareBatch(unittest.TestCase):
             out_dir, state, _ = prepare_batch(
                 manifest=manifest, out_root=tmp / "out", batch_id="2026-08-20-0000", resume=True)
             self.assertEqual(state["runs"]["runA"]["status"], "done")
+
+    def test_a_new_batch_archives_the_journal_it_replaces(self):
+        # One manifest per chat means the next run resets this journal; the
+        # phone's Runs list reads past runs back from the archived copy.
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            manifest = load_manifest(_fixture(tmp))
+            state_file = state_path_for(manifest.path)
+            old = {"version": 1, "batch": "2026-08-20-0000",
+                   "runs": {"runA": {"status": "error", "stages": {}}}}
+            save_state(state_file, old)
+            (tmp / "out" / "2026-08-20-0000").mkdir(parents=True)
+            prepare_batch(manifest=manifest, out_root=tmp / "out",
+                          batch_id="2026-08-21-0900", resume=False)
+            self.assertEqual(load_state(tmp / "out" / "2026-08-20-0000" / ARCHIVED_JOURNAL), old)
+
+    def test_resume_or_a_missing_batch_dir_archives_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            manifest = load_manifest(_fixture(tmp))
+            save_state(state_path_for(manifest.path),
+                       {"version": 1, "batch": "2026-08-20-0000", "runs": {}})
+            prepare_batch(manifest=manifest, out_root=tmp / "out",
+                          batch_id="2026-08-21-0900", resume=False)
+            self.assertFalse((tmp / "out" / "2026-08-20-0000").exists())
+            prepare_batch(manifest=manifest, out_root=tmp / "out",
+                          batch_id="2026-08-21-0900", resume=True)
+            self.assertFalse((tmp / "out" / "2026-08-21-0900" / ARCHIVED_JOURNAL).exists())
 
 
 class TestRunBatchNhanPrepared(unittest.TestCase):
