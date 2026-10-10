@@ -9,6 +9,9 @@ struct SavedTryonsView: View {
     @Environment(AppModel.self) private var model
     @State private var deleteCandidate: TryonLibraryEntry?
     @State private var editing: StudioRef?
+    @State private var selection = Selection()
+    @State private var confirmBulkDelete = false
+    @State private var bulkDeleting = false
 
     private let columns = [GridItem(.flexible(), spacing: 12, alignment: .top),
                            GridItem(.flexible(), spacing: 12, alignment: .top)]
@@ -30,7 +33,9 @@ struct SavedTryonsView: View {
                         ForEach(library.entries) { entry in
                             SavedTryonTile(entry: entry, library: library, materials: materials,
                                            disabled: draft.isBusy || composer.isRunning,
-                                           onUse: { use(entry) }, onDelete: { deleteCandidate = entry })
+                                           onUse: { use(entry) }, onDelete: { deleteCandidate = entry },
+                                           selected: selection.active ? selection.contains(entry.id) : nil,
+                                           onToggle: { selection.toggle(entry.id) })
                                 .contextMenu {
                                     Button("Edit in Studio", systemImage: "wand.and.stars") {
                                         editing = StudioRef(kind: .tryon, id: entry.id)
@@ -51,6 +56,29 @@ struct SavedTryonsView: View {
             if draft.draft == nil { await draft.load() }
         }
         .sheet(item: $editing) { EditInStudioSheet(ref: $0) }
+        .selectionMode($selection, selectable: library.entries.map(\.id),
+                       busy: bulkDeleting || draft.isBusy || composer.isRunning) {
+            confirmBulkDelete = true
+        }
+        .confirmationDialog(
+            "Delete \(selection.ids.count) saved try-on\(selection.ids.count == 1 ? "" : "s")?",
+            isPresented: $confirmBulkDelete, titleVisibility: .visible
+        ) {
+            Button("Delete \(selection.ids.count)", role: .destructive) {
+                let chosen = library.entries.filter { selection.contains($0.id) }
+                bulkDeleting = true
+                Task {
+                    let kept = await library.delete(chosen)
+                    withAnimation(.snappy) { selection.keep(kept) }
+                    bulkDeleting = false
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            let users = Set(selection.ids.flatMap { library.users(of: $0) }).sorted()
+            Text(users.isEmpty ? "The images are removed from the VPS."
+                 : "Used by \(users.joined(separator: ", ")) — those jobs lose their saved image.")
+        }
         .confirmationDialog(
             "Delete this saved try-on?",
             isPresented: Binding(get: { deleteCandidate != nil }, set: { if !$0 { deleteCandidate = nil } }),
@@ -96,6 +124,9 @@ private struct SavedTryonTile: View {
     let disabled: Bool
     let onUse: () -> Void
     let onDelete: () -> Void
+    /// nil outside selection mode; otherwise whether this one is picked.
+    var selected: Bool? = nil
+    var onToggle: () -> Void = {}
     @State private var image: UIImage?
 
     var body: some View {
@@ -114,6 +145,18 @@ private struct SavedTryonTile: View {
                     }
                 }
                 .clipShape(.rect(cornerRadius: Theme.Radius.small))
+                .overlay {
+                    if selected == true {
+                        RoundedRectangle(cornerRadius: Theme.Radius.small)
+                            .strokeBorder(Theme.accent, lineWidth: 3)
+                    }
+                }
+                .overlay(alignment: .topTrailing) {
+                    if let selected { SelectionCheck(selected: selected) }
+                }
+                .contentShape(.rect)
+                .onTapGesture { if selected != nil { onToggle() } }
+                .accessibilityAddTraits(selected == true ? .isSelected : [])
             VStack(alignment: .leading, spacing: 2) {
                 Text(name("character") + " · " + name("outfit"))
                     .font(.subheadline).lineLimit(1).truncationMode(.middle)
@@ -124,12 +167,12 @@ private struct SavedTryonTile: View {
                 Button("Use in job", action: onUse)
                     .font(.subheadline.weight(.semibold))
                     .accessibilityIdentifier("saved.use.\(entry.id)")
-                    .disabled(disabled)
+                    .disabled(disabled || selected != nil)
                 Spacer()
                 Button(role: .destructive, action: onDelete) { Image(systemName: "trash") }
                     .foregroundStyle(Theme.secondary)
                     .accessibilityLabel("Delete")
-                    .disabled(disabled)
+                    .disabled(disabled || selected != nil)
             }
             .frame(minHeight: 44)
         }

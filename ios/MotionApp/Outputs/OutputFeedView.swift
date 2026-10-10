@@ -4,7 +4,7 @@ import MotionKit
 
 /// Full-screen, vertically paged outputs of one batch, in the style of Shorts:
 /// swipe to the next file, videos loop, tap to pause, drag the bar to seek,
-/// long-press for Save, Share and speed.
+/// long-press for Save, Share, speed and Delete.
 struct OutputFeedView: View {
     let client: APIClient
     let batch: OutputBatch
@@ -12,6 +12,11 @@ struct OutputFeedView: View {
     @State private var playback: FeedPlayback
     @State private var exporter = MediaExporter()
     @State private var showingActions = false
+    /// What's still on the server: starts as the batch, loses what Delete takes.
+    @State private var files: [OutputFile]
+    @State private var confirmDelete = false
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
     /// The counter line under the scrub bar, scaled with Dynamic Type so the strip
     /// grows instead of clipping it at the accessibility sizes.
@@ -21,11 +26,12 @@ struct OutputFeedView: View {
         self.client = client
         self.batch = batch
         _current = State(initialValue: file.id)
+        _files = State(initialValue: batch.files)
         _playback = State(initialValue: FeedPlayback(client: client, batch: batch.batch))
     }
 
-    private var currentFile: OutputFile? { batch.files.first { $0.id == current } }
-    private var position: Int { (batch.files.firstIndex { $0.id == current } ?? 0) + 1 }
+    private var currentFile: OutputFile? { files.first { $0.id == current } }
+    private var position: Int { (files.firstIndex { $0.id == current } ?? 0) + 1 }
 
     /// TikTok's layout: the video owns the screen down to a black strip the height
     /// of a tab bar, and the scrub bar and counter live in that strip. Filling
@@ -40,12 +46,13 @@ struct OutputFeedView: View {
             ZStack(alignment: .bottom) {
                 ScrollView(.vertical) {
                     LazyVStack(spacing: 0) {
-                        ForEach(batch.files) { file in
+                        ForEach(files) { file in
                             FeedPage(client: client, batch: batch.batch, file: file, clip: playback.clips[file.id],
                                      strip: stripHeight + bottomInset,
                                      onMore: { showingActions = true },
                                      onSave: { Task { await save() } },
-                                     onShare: { Task { await exporter.share(downloadCurrent) } })
+                                     onShare: { Task { await exporter.share(downloadCurrent) } },
+                                     onDelete: { confirmDelete = true })
                                 .containerRelativeFrame([.horizontal, .vertical])
                                 .id(file.id)
                         }
@@ -80,14 +87,22 @@ struct OutputFeedView: View {
                       isVideo: currentFile?.isVideo ?? false,
                       rate: currentFile?.isVideo == true
                           ? Binding(get: { playback.rate }, set: { playback.rate = $0 }) : nil,
+                      onDelete: { confirmDelete = true },
                       download: downloadCurrent)
+        .confirmationDialog(currentFile?.isVideo == false ? "Delete this image?" : "Delete this video?",
+                            isPresented: $confirmDelete, titleVisibility: .visible) {
+            Button("Delete", role: .destructive) { Task { await deleteCurrent() } }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Removed from the VPS. Copies already saved to Photos stay.")
+        }
         .onAppear {
             try? PlaybackAudioSession.configure()
             // Coming back after onDisappear tore the players down.
-            if playback.current == nil { playback.focus(current, in: batch.files) }
+            if playback.current == nil { playback.focus(current, in: files) }
         }
         .onChange(of: current, initial: true) { _, id in
-            playback.focus(id, in: batch.files)
+            playback.focus(id, in: files)
             exporter.toast = nil
         }
         .onChange(of: scenePhase) { _, phase in
@@ -123,9 +138,9 @@ struct OutputFeedView: View {
                     Color.clear.frame(height: ScrubBar.height)
                 }
                 // The batch name is on the screen that opened this feed; the position is what's new here.
-                Text("\(position)/\(batch.files.count)")
+                Text("\(position)/\(files.count)")
                     .font(.footnote.monospacedDigit()).foregroundStyle(Theme.secondary).lineLimit(1)
-                    .accessibilityLabel("\(position) of \(batch.files.count)")
+                    .accessibilityLabel("\(position) of \(files.count)")
             }
             .padding(.horizontal, 16)
             .frame(height: stripHeight, alignment: .top)
@@ -136,6 +151,24 @@ struct OutputFeedView: View {
     private func downloadCurrent() async throws -> URL {
         guard let file = currentFile else { throw CancellationError() }
         return try await client.download("v1", "outputs", batch.batch, file.name)
+    }
+
+    /// Photos' order: the next file takes its place, the previous one at the
+    /// end of the batch, and the feed closes when nothing is left.
+    private func deleteCurrent() async {
+        guard let outputs = model.outputs, let file = currentFile,
+              let index = files.firstIndex(where: { $0.id == file.id }) else { return }
+        let kept = await outputs.delete([OutputsStore.key(batch.batch, file)])
+        guard kept.isEmpty else {
+            exporter.show(outputs.message ?? "Couldn't delete.")
+            outputs.dismissMessage()
+            return
+        }
+        playback.stopAll()
+        files.remove(at: index)
+        if files.isEmpty { dismiss(); return }
+        current = files[min(index, files.count - 1)].id
+        playback.focus(current, in: files)
     }
 
     private func save() async {
@@ -153,6 +186,7 @@ private struct FeedPage: View {
     let onMore: () -> Void
     let onSave: () -> Void
     let onShare: () -> Void
+    let onDelete: () -> Void
     @State private var image: UIImage?
     @State private var error: APIError?
 
@@ -178,6 +212,7 @@ private struct FeedPage: View {
         // The long press has no VoiceOver gesture; its two actions do, directly.
         .accessibilityAction(named: "Save to Photos", onSave)
         .accessibilityAction(named: "Share", onShare)
+        .accessibilityAction(named: "Delete", onDelete)
         .task(id: file.id) { await loadImage() }
     }
 

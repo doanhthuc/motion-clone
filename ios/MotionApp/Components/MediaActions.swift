@@ -94,6 +94,8 @@ struct MediaActionSheet: View {
     let rate: Binding<Float>?
     let onSave: () -> Void
     let onShare: () -> Void
+    /// nil where the media can't be deleted from here (materials, try-on images).
+    var onDelete: (() -> Void)? = nil
 
     static let rates: [Float] = [0.5, 1, 1.5, 2]
 
@@ -129,6 +131,16 @@ struct MediaActionSheet: View {
                     .listRowBackground(Theme.surfaceRaised)
                 }
             }
+            if let onDelete {
+                Section {
+                    Button(action: onDelete) {
+                        Label(isVideo ? "Delete video" : "Delete image", systemImage: "trash")
+                            .foregroundStyle(Theme.danger)
+                    }
+                    .accessibilityIdentifier("media.delete")
+                    .listRowBackground(Theme.surfaceRaised)
+                }
+            }
         }
         .foregroundStyle(Theme.label)
         .tint(Theme.label)
@@ -139,7 +151,7 @@ struct MediaActionSheet: View {
         // iOS 26 glass let the video show through and the rows went muddy.
         .scrollContentBackground(.hidden)
         .presentationBackground(Theme.surface)
-        .presentationDetents([.height(rate == nil ? 170 : 236)])
+        .presentationDetents([.height((rate == nil ? 170 : 236) + (onDelete == nil ? 0 : 66))])
         .presentationDragIndicator(.visible)
     }
 
@@ -154,9 +166,10 @@ extension View {
     /// toast. The chosen action runs once the sheet has gone, because the share
     /// sheet cannot present while another sheet is still on screen.
     func mediaActions(isPresented: Binding<Bool>, exporter: MediaExporter, isVideo: Bool,
-                      rate: Binding<Float>?, download: @escaping () async throws -> URL) -> some View {
+                      rate: Binding<Float>?, onDelete: (() -> Void)? = nil,
+                      download: @escaping () async throws -> URL) -> some View {
         modifier(MediaActionsModifier(isPresented: isPresented, exporter: exporter, isVideo: isVideo,
-                                      rate: rate, download: download))
+                                      rate: rate, onDelete: onDelete, download: download))
     }
 }
 
@@ -165,17 +178,19 @@ private struct MediaActionsModifier: ViewModifier {
     let exporter: MediaExporter
     let isVideo: Bool
     let rate: Binding<Float>?
+    let onDelete: (() -> Void)?
     let download: () async throws -> URL
     @State private var pending: Pending?
 
-    private enum Pending { case save, share }
+    private enum Pending { case save, share, delete }
 
     func body(content: Content) -> some View {
         content
             .sensoryFeedback(.impact(weight: .medium), trigger: isPresented) { _, shown in shown }
             .sheet(isPresented: $isPresented, onDismiss: runPending) {
                 MediaActionSheet(isVideo: isVideo, rate: rate,
-                                 onSave: { choose(.save) }, onShare: { choose(.share) })
+                                 onSave: { choose(.save) }, onShare: { choose(.share) },
+                                 onDelete: onDelete.map { _ in { choose(.delete) } })
             }
             .sheet(item: Binding(get: { exporter.sharing }, set: { exporter.sharing = $0 })) { shared in
                 ActivityView(items: [shared.url])
@@ -193,10 +208,13 @@ private struct MediaActionsModifier: ViewModifier {
     private func runPending() {
         guard let action = pending else { return }
         pending = nil
+        // The confirm is the caller's dialog, and it can only present once this sheet is gone.
+        if action == .delete { onDelete?(); return }
         Task {
             switch action {
             case .save: await exporter.saveToPhotos(isVideo: isVideo, download)
             case .share: await exporter.share(download)
+            case .delete: break
             }
         }
     }

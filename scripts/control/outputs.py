@@ -140,6 +140,25 @@ def poster(out_dir: Path, batch: str, name: str) -> Path:
     return dest
 
 
+def delete_output(out_dir: Path, batch: str, name: str, *, busy_batches: set[str]) -> None:
+    """Remove one finished file from Outputs, with its poster and duration
+    sidecar (2026-10-10, the phone's Outputs select/long-press Delete).
+
+    Refused while a run holding this batch is draining or in Phase A: the
+    runner's `_finalize` writes into `_final/` at the end of each job, and a
+    file deleted under it would come back or leave the run's count wrong.
+    """
+    path = resolve_output(out_dir, batch.strip(), name.strip())
+    if path is None:
+        raise MaterialError("not_found", "no such output")
+    if path.parent.parent.name in busy_batches:
+        raise MaterialError("busy", "a run is still writing this batch; wait for it or kill it first")
+    path.unlink(missing_ok=True)
+    posters = path.parent / POSTER_DIR
+    for side in (posters / f"{path.name}.jpg", posters / f"{path.name}.json"):
+        side.unlink(missing_ok=True)
+
+
 def prune_posters(out_dir: Path) -> list[Path]:
     """Posters and duration sidecars whose output file is gone."""
     removed = []

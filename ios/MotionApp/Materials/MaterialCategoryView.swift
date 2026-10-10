@@ -12,6 +12,9 @@ struct MaterialCategoryView: View {
     let uploads: MaterialUploadQueue
     @State private var previewing: MotionKit.Material?
     @State private var deleteCandidate: MotionKit.Material?
+    @State private var selection = Selection()
+    @State private var confirmBulkDelete = false
+    @State private var bulkDeleting = false
     @State private var adding = false
 
     private let columns = Array(repeating: GridItem(.flexible(), spacing: 10, alignment: .top), count: 3)
@@ -41,7 +44,9 @@ struct MaterialCategoryView: View {
                         ForEach(items) { material in
                             MaterialTile(material: material, store: store,
                                          onOpen: { previewing = material },
-                                         onDelete: { deleteCandidate = material })
+                                         onDelete: { deleteCandidate = material },
+                                         selected: selection.active ? selection.contains(material.id) : nil,
+                                         onToggle: { selection.toggle(material.id) })
                         }
                     }
                 }
@@ -56,7 +61,7 @@ struct MaterialCategoryView: View {
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button("Add to \(group.title)", systemImage: "plus") { adding = true }
-                    .disabled(busy)
+                    .disabled(busy || selection.active)
                     .accessibilityIdentifier("category.add")
             }
         }
@@ -65,6 +70,18 @@ struct MaterialCategoryView: View {
             MaterialPreview(material: material, materials: store)
         }
         .modifier(MaterialDeleteDialog(candidate: $deleteCandidate, store: store))
+        .selectionMode($selection, selectable: group.items(in: store.materials).map(\.id), busy: bulkDeleting) {
+            confirmBulkDelete = true
+        }
+        .modifier(MaterialBulkDeleteDialog(isPresented: $confirmBulkDelete, count: selection.ids.count) {
+            let chosen = store.materials.filter { selection.contains($0.id) }
+            bulkDeleting = true
+            Task {
+                let kept = await store.delete(chosen)
+                withAnimation(.snappy) { selection.keep(kept) }
+                bulkDeleting = false
+            }
+        })
         .modifier(MaterialAdder(isPresented: $adding, group: group, store: store, queue: uploads))
     }
 }

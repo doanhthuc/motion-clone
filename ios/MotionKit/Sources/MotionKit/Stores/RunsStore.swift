@@ -44,6 +44,26 @@ public final class RunsStore {
         return result
     }
 
+    /// `delete(_:withVideos:)` for each run in turn, past a failure. A run
+    /// already gone counts as deleted.
+    public func delete(_ runIDs: [String], withVideos: Bool) async -> BulkRunDeletion {
+        var result = BulkRunDeletion()
+        for id in runIDs {
+            do throws(APIError) {
+                result.videosDeleted += try await delete(id, withVideos: withVideos).videosDeleted
+                result.deleted += 1
+            } catch {
+                if case .server(status: 404, _, _) = error {
+                    runs.removeAll { $0.id == id }
+                    result.deleted += 1
+                } else {
+                    result.failed.append((id, error))
+                }
+            }
+        }
+        return result
+    }
+
     public func refresh() async {
         do {
             runs = try await client.get(RunsResponse.self, "v1", "runs").runs
@@ -56,4 +76,11 @@ public final class RunsStore {
             self.error = error
         }
     }
+}
+
+public struct BulkRunDeletion: Sendable {
+    public var deleted = 0
+    public var videosDeleted = 0
+    public var failed: [(id: String, error: APIError)] = []
+    public init() {}
 }

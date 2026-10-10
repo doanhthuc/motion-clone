@@ -200,6 +200,23 @@ extension URLProtocolTests {
         #expect(store.errorMessage == nil)
     }
 
+    @Test func bulkDeleteKeepsGoingPastARefusalAndReturnsWhatStayed() async throws {
+        StubURLProtocol.install { request in
+            if request.httpMethod == "DELETE" {
+                return request.url?.path.hasSuffix("/app/coat.png") == true
+                    ? TestSupport.json(#"{"error":{"code":"in_use","message":"used by a run"}}"#, status: 409)
+                    : (204, [:], Data())
+            }
+            return TestSupport.json(list)
+        }
+        let store = MaterialsStore(client: TestSupport.client())
+        await store.refresh()
+        let kept = await store.delete(store.materials)
+        #expect(kept == ["app/coat.png"])
+        #expect(store.materials.map(\.id) == ["app/coat.png"])
+        #expect(store.errorMessage?.hasPrefix("Couldn't delete 1 of 2: ") == true)
+    }
+
     @Test func aSecondUploadIsRejectedWhileTheFirstIsActive() async throws {
         let parent = FileManager.default.temporaryDirectory.appending(component: UUID().uuidString)
         try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)

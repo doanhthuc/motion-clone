@@ -57,7 +57,7 @@ struct RunDetailView: View {
                 }
             }
         }
-        .runDeletion($deleting) { dismiss() }
+        .runDeletion($deleting) { failed in if failed.isEmpty { dismiss() } }
         .sheet(item: $details) { target in
             if let d = store.detail { BatchDetailsSheet(detail: d, store: store, focus: target.focus) }
         }

@@ -736,6 +736,31 @@ class TestKeepAlive(HttpWriteBase):
         self.assertEqual(json.loads(body), {"ok": True})
 
 
+class TestOutputDelete(HttpWriteBase):
+    def test_delete_removes_the_file_and_its_poster(self):
+        posters = self.out / "b1" / "_final" / ".posters"
+        posters.mkdir()
+        (posters / "a.mp4.jpg").write_bytes(b"j")
+        (posters / "a.mp4.json").write_text("{}")
+        resp, body = self.send("DELETE", "/v1/outputs/b1/a.mp4")
+        self.assertEqual((resp.status, body), (204, b""))
+        self.assertEqual(list(posters.iterdir()), [])
+        self.assertFalse((self.out / "b1" / "_final" / "a.mp4").exists())
+
+    def test_missing_or_outside_final_is_404(self):
+        for path in ("/v1/outputs/b1/missing.mp4", "/v1/outputs/b1/..%2F..%2Fr1.yaml",
+                     "/v1/outputs/..%2Fb1/a.mp4"):
+            resp, _ = self.send("DELETE", path)
+            self.assertEqual(resp.status, 404, path)
+        self.assertTrue((self.batch / "r1.yaml").exists())
+
+    def test_refused_while_its_run_is_draining(self):
+        with mock.patch.object(run_mod, "drain_running", return_value=True):
+            resp, body = self.send("DELETE", "/v1/outputs/b1/a.mp4")
+        self.assertEqual((resp.status, json.loads(body)["error"]["code"]), (409, "busy"))
+        self.assertTrue((self.out / "b1" / "_final" / "a.mp4").exists())
+
+
 class TestMaterialRoutes(HttpWriteBase):
     def setUp(self):
         super().setUp()

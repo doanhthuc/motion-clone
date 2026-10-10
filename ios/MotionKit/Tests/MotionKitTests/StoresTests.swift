@@ -15,6 +15,52 @@ extension URLProtocolTests {
         #expect(store.error == nil && store.lastSuccess != nil && !store.isStale)
     }
 
+    @Test func bulkRunDeleteCountsGoneRunsAndKeepsRefusedOnes() async {
+        StubURLProtocol.install { req in
+            guard req.httpMethod == "DELETE" else { return TestSupport.json(Fixtures.runs) }
+            switch req.url?.path {
+            case "/v1/runs/old-run": return TestSupport.json(#"{"deleted":"old-run","videos_deleted":2}"#)
+            case "/v1/runs/weird": return TestSupport.json(#"{"error":{"code":"not_found","message":"no run"}}"#, status: 404)
+            default: return TestSupport.json(#"{"error":{"code":"run_live","message":"running"}}"#, status: 409)
+            }
+        }
+        let store = RunsStore(client: TestSupport.client())
+        await store.refresh()
+        let result = await store.delete(["old-run", "weird", "tg-1000"], withVideos: true)
+        #expect(result.deleted == 2)
+        #expect(result.videosDeleted == 2)
+        #expect(result.failed.map(\.id) == ["tg-1000"])
+        #expect(store.runs.map(\.id) == ["tg-1000"])
+    }
+
+    @Test func outputDeleteDropsFilesAndEmptyBatchesAndKeepsRefusals() async {
+        let list = #"{"outputs":[{"batch":"b2","updated_at":2,"files":[{"name":"a.mp4","bytes":1},{"name":"b.mp4","bytes":1}]},{"batch":"b1","updated_at":1,"files":[{"name":"a.mp4","bytes":1}]}]}"#
+        StubURLProtocol.install { req in
+            guard req.httpMethod == "DELETE" else { return TestSupport.json(list) }
+            switch req.url?.path {
+            case "/v1/outputs/b2/b.mp4": return TestSupport.json(#"{"error":{"code":"busy","message":"a run is still writing this batch"}}"#, status: 409)
+            case "/v1/outputs/b1/a.mp4": return TestSupport.json(#"{"error":{"code":"not_found","message":"no such output"}}"#, status: 404)
+            default: return (204, [:], Data())
+            }
+        }
+        let store = OutputsStore(client: TestSupport.client())
+        await store.refresh()
+        let kept = await store.delete(["b2/a.mp4", "b2/b.mp4", "b1/a.mp4"])
+        #expect(kept == ["b2/b.mp4"])
+        #expect(store.batches.map(\.batch) == ["b2"])
+        #expect(store.batches.first?.files.map(\.name) == ["b.mp4"])
+        #expect(store.message?.hasPrefix("Couldn't delete 1 of 3: ") == true)
+    }
+
+    @Test func outputDeleteWorksBeforeTheListLoads() async {
+        StubURLProtocol.install { _ in (204, [:], Data()) }
+        let store = OutputsStore(client: TestSupport.client())
+        let kept = await store.delete(["2026-10-08-0857/a-2.mp4"])
+        #expect(kept.isEmpty)
+        #expect(StubURLProtocol.requests.last?.httpMethod == "DELETE")
+        #expect(StubURLProtocol.requests.last?.url?.path == "/v1/outputs/2026-10-08-0857/a-2.mp4")
+    }
+
     @Test func failedRefreshKeepsDataAndMarksStale() async {
         StubURLProtocol.install { _ in TestSupport.json(Fixtures.runs) }
         let store = RunsStore(client: TestSupport.client())
