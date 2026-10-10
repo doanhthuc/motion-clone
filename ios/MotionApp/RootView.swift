@@ -18,7 +18,8 @@ struct RootView: View {
                 SpaceShell(studio: studio) {
                     TabView(selection: $model.selectedTab) {
                         Tab("Runs", systemImage: "waveform.path.ecg", value: AppTab.runs) {
-                            NavigationStack { RunsView(runs: runs, pod: pod, flow: flow).sidebarButton().motionTabRoot(.runs) }
+                            NavigationStack { RunsView(runs: runs, pod: pod, flow: flow).sidebarButton().motionTabRoot(.runs).rootBanners() }
+                                .pushedBanners(.runs)
                         }
                         Tab("Materials", systemImage: "photo.on.rectangle", value: AppTab.materials) {
                             NavigationStack {
@@ -26,7 +27,9 @@ struct RootView: View {
                                                 composer: composer)
                                     .sidebarButton()
                                     .motionTabRoot(.materials)
+                                    .rootBanners()
                             }
+                            .pushedBanners(.materials)
                         }
                         Tab("New Job", systemImage: "plus.circle", value: AppTab.newJob) {
                             NavigationStack {
@@ -34,17 +37,22 @@ struct RootView: View {
                                            composer: composer, library: library)
                                     .sidebarButton()
                                     .motionTabRoot(.newJob)
+                                    .rootBanners()
                             }
+                            .pushedBanners(.newJob)
                         }
                         Tab("Outputs", systemImage: "play.rectangle", value: AppTab.outputs) {
-                            NavigationStack { OutputsView(store: outputs).sidebarButton().motionTabRoot(.outputs) }
+                            NavigationStack { OutputsView(store: outputs).sidebarButton().motionTabRoot(.outputs).rootBanners() }
+                                .pushedBanners(.outputs)
                         }
                         Tab("Pod", systemImage: "cpu", value: AppTab.pod) {
                             NavigationStack {
                                 PodView(pod: pod, gpu: gpu, balance: balance, flow: flow, runs: runs, subs: gpuSubs)
                                     .sidebarButton()
                                     .motionTabRoot(.pod)
+                                    .rootBanners()
                             }
+                            .pushedBanners(.pod)
                         }
                     }
                 }
@@ -52,13 +60,6 @@ struct RootView: View {
                 // Sentence-case section headers everywhere: the uppercase
                 // tracked labels were the loudest "template" tell in the audit.
                 .textCase(nil)
-                .safeAreaInset(edge: .top) {
-                    VStack(spacing: 8) {
-                        KillBanner(pod: pod)
-                        SpendBanner(flow: flow, migrate: migrate)
-                        FiredBanner(subs: gpuSubs)
-                    }
-                }
                 .onChange(of: flow.podRequested) { _, requested in
                     guard requested else { return }
                     // The request can come from anywhere the spend banner or a

@@ -67,12 +67,8 @@ struct RunsView: View {
                 title: chosen.count == 1 ? RunName.title(chosen[0].batch ?? chosen[0].id) : "\(chosen.count) runs",
                 videos: chosen.reduce(0) { $0 + (runs.detailStore(for: $1.id).detail?.outputs.count ?? 0) })
         }
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                NavigationLink { SettingsView() } label: { Image(systemName: "gearshape") }
-                    .accessibilityLabel("Settings")
-            }
-        }
+        // No Settings gear here: the sidebar has it (2026-10-10), and two
+        // buttons on the right outweighed the one on the left.
         .refreshable { await refresh() }
         .task { await refresh() }
         // While something runs, keep the Now card moving. Stops when the run

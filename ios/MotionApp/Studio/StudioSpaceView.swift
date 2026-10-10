@@ -61,6 +61,7 @@ struct StudioSpaceView: View {
             }
             .navigationBarTitleDisplayMode(.inline)
             .sidebarButton()
+            .rootBanners()
             .background(Theme.bg)
             // `SpaceShell` keeps this view mounted while Motion is showing, so
             // the alert and the catalog load are gated on Studio being the

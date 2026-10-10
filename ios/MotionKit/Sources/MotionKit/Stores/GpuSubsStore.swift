@@ -20,15 +20,22 @@ public final class GpuSubsStore {
     /// stock" rather than offer buttons that can only fail (2026-09-27).
     public private(set) var unsupported = false
     private var lastSeen: Double
+    /// Newest firing whose banner already had its turn. Separate from
+    /// `lastSeen`: the drawer still counts a bannered firing as new until it
+    /// is dismissed, but the banner itself shows once (2026-10-10 — keyed on
+    /// `lastSeen` alone, an undismissed firing came back on every launch).
+    private var lastBannered: Double
 
     private let client: APIClient
     private let defaults: UserDefaults
     static let seenKey = "gpuSubs.lastSeenFiredAt"
+    static let banneredKey = "gpuSubs.lastBanneredFiredAt"
 
     public init(client: APIClient, defaults: UserDefaults = .standard) {
         self.client = client
         self.defaults = defaults
         lastSeen = defaults.object(forKey: Self.seenKey) as? Double ?? -1
+        lastBannered = defaults.object(forKey: Self.banneredKey) as? Double ?? -1
     }
 
     public func load() async {
@@ -58,12 +65,28 @@ public final class GpuSubsStore {
 
     public var unseen: [GpuSubFiring] { fired.filter { $0.firedAt > lastSeen } }
 
+    /// The firing the banner should show: unseen, and not bannered before.
+    public var bannerFiring: GpuSubFiring? {
+        unseen.first { $0.firedAt > lastBannered }
+    }
+
+    /// Its banner had its turn (auto-hid, or was tapped through to the drawer).
+    public func markBannered(_ firing: GpuSubFiring) {
+        guard firing.firedAt > lastBannered else { return }
+        lastBannered = firing.firedAt
+        defaults.set(lastBannered, forKey: Self.banneredKey)
+    }
+
     public func markSeen() {
         // 0, not the phone's clock, when nothing has fired (2026-09-27):
         // `fired_at` is the VPS's clock, and a phone running ahead of it
         // would silently swallow the next firing as already seen.
         lastSeen = fired.map(\.firedAt).max() ?? 0
         defaults.set(lastSeen, forKey: Self.seenKey)
+        if lastSeen > lastBannered {
+            lastBannered = lastSeen
+            defaults.set(lastBannered, forKey: Self.banneredKey)
+        }
     }
 
     private static func key(_ gpu: String, _ datacenter: String) -> String { "\(gpu)|\(datacenter)" }

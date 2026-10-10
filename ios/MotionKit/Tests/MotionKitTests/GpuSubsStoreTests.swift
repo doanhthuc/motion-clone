@@ -72,6 +72,24 @@ extension URLProtocolTests {
         #expect(again.unseen.isEmpty)
     }
 
+    /// The 2026-10-10 bug: a firing whose banner auto-hid came back on every
+    /// launch, because only Dismiss wrote anything down.
+    @Test func aBanneredFiringStaysNewInTheDrawerButNeverBannersAgain() async throws {
+        let routes = Routes()
+        let (store, defaults) = store(routes)
+        await store.load()
+        routes.listing = GpuSubsStoreTests.listing.replacingOccurrences(of: "\"fired_at\": 100.0", with: "\"fired_at\": 200.0")
+        await store.load()
+        let firing = try #require(store.bannerFiring)
+        store.markBannered(firing)
+        #expect(store.bannerFiring == nil)
+        #expect(store.unseen.count == 1)
+        let (relaunched, _) = self.store(routes, defaults: defaults)
+        await relaunched.load()
+        #expect(relaunched.bannerFiring == nil)
+        #expect(relaunched.unseen.count == 1)
+    }
+
     @Test func anEmptyFirstLoadStillShowsTheFirstFiring() async {
         // markSeen with nothing fired must store 0, not the phone's clock: a
         // phone ahead of the VPS would otherwise hide the next firing.
