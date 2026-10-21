@@ -15,6 +15,9 @@ struct RunDetailView: View {
     @State private var selection: String?
     @State private var details: DetailsTarget?
     @State private var deleting: RunDeleteTarget?
+    @State private var exporter = MediaExporter()
+    @State private var confirmingSaveAll = false
+    @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
 
     /// The details sheet, opened for the whole batch or scrolled to one job.
@@ -41,6 +44,14 @@ struct RunDetailView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             if store.detail != nil {
+                if !videos.isEmpty {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button { confirmingSaveAll = true } label: { Image(systemName: "arrow.down.to.line") }
+                            .disabled(exporter.busy != nil)
+                            .accessibilityLabel("Save all videos")
+                            .accessibilityIdentifier("run.saveAll")
+                    }
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button { details = DetailsTarget(focus: nil) } label: { Image(systemName: "info.circle") }
                         .accessibilityLabel("Batch details")
@@ -58,6 +69,11 @@ struct RunDetailView: View {
             }
         }
         .runDeletion($deleting) { failed in if failed.isEmpty { dismiss() } }
+        .confirmationDialog(videos.count == 1 ? "Save this video to Photos?" : "Save \(videos.count) videos to Photos?",
+                            isPresented: $confirmingSaveAll, titleVisibility: .visible) {
+            Button(videos.count == 1 ? "Save" : "Save \(videos.count)") { saveAll() }
+            Button("Cancel", role: .cancel) {}
+        }
         .sheet(item: $details) { target in
             if let d = store.detail { BatchDetailsSheet(detail: d, store: store, focus: target.focus) }
         }
@@ -72,6 +88,20 @@ struct RunDetailView: View {
             async let b: Void = pod.refresh()
             _ = await (a, b)
         }
+    }
+
+    /// The run's finished videos, by file name in its output batch.
+    private var videos: [String] {
+        guard let d = store.detail, d.batch != nil else { return [] }
+        return d.outputs.filter { OutputFile(name: $0, bytes: 0).isVideo }
+    }
+
+    private func saveAll() {
+        guard let client = model.client, let batch = store.detail?.batch else { return }
+        let downloads: [() async throws -> URL] = videos.map { name in
+            { try await client.download("v1", "outputs", batch, name) }
+        }
+        Task { await exporter.saveAllToPhotos(downloads) }
     }
 
     private func content(_ d: RunDetail) -> some View {
@@ -96,6 +126,9 @@ struct RunDetailView: View {
                 }
                 if let current { StageStepper(job: current).padding(.horizontal, 20) }
             }
+            // In the column, not over the screen's bottom edge: there it covered Continue batch.
+            // Empty while idle, so the pager above gives up the height only while saving.
+            MediaStatusView(exporter: exporter)
             actions(d).padding(.horizontal, 20)
         }
         .padding(.top, 8)

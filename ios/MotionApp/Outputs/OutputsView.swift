@@ -14,6 +14,8 @@ struct OutputsView: View {
     /// One file from a long press, or the whole selection.
     @State private var deleting: [String]?
     @State private var bulkDeleting = false
+    /// The batch whose Save all is waiting on its confirm.
+    @State private var savingAll: OutputBatch?
 
     private let columns = Array(repeating: GridItem(.flexible(), spacing: 2), count: 3)
 
@@ -33,7 +35,11 @@ struct OutputsView: View {
                 }
                 ForEach(store.batches) { batch in
                     VStack(alignment: .leading, spacing: 10) {
-                        BatchHeader(batch: batch).padding(.horizontal, 16)
+                        BatchHeader(batch: batch,
+                                    onSaveAll: selection.active || !batch.files.contains(where: \.isVideo)
+                                        ? nil : { savingAll = batch },
+                                    saveDisabled: exporter.busy != nil)
+                            .padding(.horizontal, 16)
                         LazyVGrid(columns: columns, spacing: 2) {
                             ForEach(batch.files) { file in
                                 if selection.active {
@@ -70,6 +76,14 @@ struct OutputsView: View {
         } message: { _ in
             Text("Removed from the VPS. Copies already saved to Photos stay.")
         }
+        .confirmationDialog(saveAllTitle, isPresented: Binding { savingAll != nil } set: { if !$0 { savingAll = nil } },
+                            titleVisibility: .visible, presenting: savingAll) { batch in
+            let videos = batch.files.filter(\.isVideo)
+            Button(videos.count == 1 ? "Save" : "Save \(videos.count)") {
+                Task { await exporter.saveAllToPhotos(videos.map { download(batch.batch, $0) }) }
+            }
+            Button("Cancel", role: .cancel) {}
+        }
         .sheet(item: $exporter.sharing) { shared in
             ActivityView(items: [shared.url])
                 .presentationDetents([.medium, .large])
@@ -80,6 +94,11 @@ struct OutputsView: View {
 
     private var allKeys: [String] {
         store.batches.flatMap { b in b.files.map { OutputsStore.key(b.batch, $0) } }
+    }
+
+    private var saveAllTitle: String {
+        let n = savingAll?.files.filter(\.isVideo).count ?? 0
+        return n == 1 ? "Save this video to Photos?" : "Save \(n) videos to Photos?"
     }
 
     private var deleteTitle: String {
@@ -172,10 +191,29 @@ private struct OutputPeek: View {
 /// `YYYY-MM-DD-HHMM`; any other name is shown as typed, dated by its last write.
 struct BatchHeader: View {
     let batch: OutputBatch
+    /// nil hides Save all: while selecting, or when the batch has no video.
+    var onSaveAll: (() -> Void)? = nil
+    var saveDisabled = false
 
     var body: some View {
+        HStack(alignment: .bottom) {
+            titles
+            Spacer(minLength: 8)
+            if let onSaveAll {
+                Button("Save all", systemImage: "arrow.down.to.line", action: onSaveAll)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(Theme.accent)
+                    .frame(minHeight: 44)
+                    .disabled(saveDisabled)
+                    .accessibilityLabel("Save all videos from \(batch.batch)")
+                    .accessibilityIdentifier("outputs.saveAll")
+            }
+        }
+    }
+
+    private var titles: some View {
         let stamp = BatchStamp(batch.batch)
-        VStack(alignment: .leading, spacing: 2) {
+        return VStack(alignment: .leading, spacing: 2) {
             Text(stamp.map { $0.date.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day()) } ?? batch.batch)
                 .font(.title3.weight(.semibold))
                 .foregroundStyle(Theme.label)
