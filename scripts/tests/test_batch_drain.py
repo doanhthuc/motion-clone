@@ -359,6 +359,99 @@ class TestTeardown(unittest.TestCase):
         mock_sh.assert_called_once_with("make", "gpu-destroy")
 
 
+LOST_STATE = {
+    "batch": "b1",
+    "runs": {
+        "r1": {"status": "done", "stages": {"motion": {"status": "done", "job_id": "j1"}}},
+        # The exact text poll_job wrote on 2026-10-21 after Cloudflare answered 1033.
+        "r2": {"status": "error",
+               "error": "mất liên lạc với API 31 lần liên tiếp (lý do cuối: GET /jobs/j2 → 530: "
+                        "error code: 1033\n); job j2 có thể vẫn đang chạy",
+               "stages": {"motion": {"status": "error", "job_id": "j2"}}},
+    },
+}
+
+
+class TestLostContactRuns(unittest.TestCase):
+    def test_picks_only_runs_that_lost_the_api(self):
+        self.assertEqual(drain.lost_contact_runs(LOST_STATE), ["r2"])
+
+    def test_a_job_that_failed_on_the_pod_is_not_lost_contact(self):
+        # A real job failure must not buy ten minutes of grace: the pod answered.
+        self.assertEqual(drain.lost_contact_runs(FAILED_STATE), [])
+
+    def test_the_marker_is_what_poll_job_actually_raises(self):
+        from batchlib.client import JobError, poll_job
+        from batchlib.config import Settings
+        import urllib.error
+        with mock.patch("batchlib.client._request",
+                        side_effect=urllib.error.URLError("down")):
+            with self.assertRaises(JobError) as ctx:
+                poll_job(mock.Mock(spec=Settings), "j9", 60, sleep=lambda s: None)
+        state = {"runs": {"r": {"status": "error", "error": str(ctx.exception)}}}
+        self.assertEqual(drain.lost_contact_runs(state), ["r"])
+
+
+class TestWaitForApi(unittest.TestCase):
+    def _clock(self):
+        t = [0.0]
+        return t, (lambda: t[0]), (lambda s: t.__setitem__(0, t[0] + s))
+
+    def test_returns_true_as_soon_as_health_answers(self):
+        t, now, sleep = self._clock()
+        with mock.patch.object(drain, "load_settings", return_value=object()), \
+             mock.patch.object(drain, "health_ok", side_effect=[False, False, True]):
+            self.assertTrue(drain.wait_for_api(600, poll_s=15, sleep=sleep, now=now))
+        self.assertEqual(t[0], 30)
+
+    def test_gives_up_after_the_grace_window(self):
+        t, now, sleep = self._clock()
+        with mock.patch.object(drain, "load_settings", return_value=object()), \
+             mock.patch.object(drain, "health_ok", return_value=False):
+            self.assertFalse(drain.wait_for_api(600, poll_s=15, sleep=sleep, now=now))
+        self.assertEqual(t[0], 600)
+
+    def test_unreadable_settings_count_as_unreachable_not_a_crash(self):
+        t, now, sleep = self._clock()
+        with mock.patch.object(drain, "load_settings", side_effect=RuntimeError("no key")):
+            self.assertFalse(drain.wait_for_api(30, poll_s=15, sleep=sleep, now=now))
+
+
+class TestRecoverLostContact(unittest.TestCase):
+    def test_nothing_lost_returns_rc_without_waiting(self):
+        manifest_path = _write_manifest_and_state(tempfile.mkdtemp(), FAILED_STATE)
+        with mock.patch.object(drain, "wait_for_api") as wait, \
+             mock.patch.object(drain, "batch_run") as run:
+            self.assertEqual(drain.recover_lost_contact(manifest_path, "p1", 1), 1)
+        wait.assert_not_called()
+        run.assert_not_called()
+
+    def test_pod_back_reattaches_with_resume(self):
+        manifest_path = _write_manifest_and_state(tempfile.mkdtemp(), LOST_STATE)
+        with mock.patch.object(drain, "wait_for_api", return_value=True), \
+             mock.patch.object(drain, "batch_run", return_value=0) as run:
+            self.assertEqual(drain.recover_lost_contact(manifest_path, "p1", 1), 0)
+        run.assert_called_once_with("--file", str(manifest_path), "--resume")
+
+    def test_pod_gone_on_vast_blacklists_the_machine_and_keeps_rc(self):
+        manifest_path = _write_manifest_and_state(tempfile.mkdtemp(), LOST_STATE)
+        with mock.patch.object(drain, "wait_for_api", return_value=False), \
+             mock.patch.object(drain, "effective_provider", return_value="vast"), \
+             mock.patch.object(drain, "blacklist_machine") as bl, \
+             mock.patch.object(drain, "batch_run") as run:
+            self.assertEqual(drain.recover_lost_contact(manifest_path, "57062910", 1), 1)
+        bl.assert_called_once_with("57062910", mock.ANY, outcome="died")
+        run.assert_not_called()
+
+    def test_pod_gone_on_runpod_does_not_touch_the_vast_board(self):
+        manifest_path = _write_manifest_and_state(tempfile.mkdtemp(), LOST_STATE)
+        with mock.patch.object(drain, "wait_for_api", return_value=False), \
+             mock.patch.object(drain, "effective_provider", return_value="runpod"), \
+             mock.patch.object(drain, "blacklist_machine") as bl:
+            self.assertEqual(drain.recover_lost_contact(manifest_path, "p1", 1), 1)
+        bl.assert_not_called()
+
+
 class TestCollectDiagnostics(unittest.TestCase):
     def test_collect_diagnostics_survives_one_failing_fetch(self):
         # One bad job must not abort collection for the others.
