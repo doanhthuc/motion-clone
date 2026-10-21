@@ -30,6 +30,9 @@ POLL_SECONDS = 10
 # Trần số lần poll không dùng được liên tiếp. 30 × POLL_SECONDS ≈ 5 phút rớt mạng vẫn
 # tha được — job trên pod không chết vì Wi-Fi của máy local.
 MAX_POLL_MISSES = 30
+# The start of the JobError poll_job raises once MAX_POLL_MISSES is exceeded. The journal keeps
+# only str(exc), so drain.py matches on this text to tell "lost the pod" from "the job failed".
+LOST_CONTACT = "mất liên lạc với API"
 
 # Sàn tốc độ tải: dưới mức này coi như connection hỏng, bỏ và mở lại — không đợi
 # thêm. `timeout=` của urllib/http.client là timeout PER-RECV, tự reset mỗi khi có
@@ -157,7 +160,7 @@ def poll_job(s: Settings, job_id: str, timeout_min: int,
         misses += 1
         if misses > MAX_POLL_MISSES:
             raise JobError(
-                f"mất liên lạc với API {misses} lần liên tiếp (lý do cuối: {reason}); "
+                f"{LOST_CONTACT} {misses} lần liên tiếp (lý do cuối: {reason}); "
                 f"job {job_id} có thể vẫn đang chạy — chạy lại với RESUME=1 để bắt tiếp, "
                 f"đừng submit job mới"
             )

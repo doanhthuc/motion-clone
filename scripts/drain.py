@@ -18,6 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from batch_run import EXIT_NEEDS_POD
+from batchlib.client import LOST_CONTACT, health_ok
 from batchlib.config import env_get, load_settings
 from batchlib.manifest import Manifest, load_manifest, load_state, state_path_for
 from batchlib.pipelines import PIPELINES, STAGES
@@ -252,17 +253,17 @@ class SlowGpu(BadHost):
 MAX_SLOW_GPU_RETRIES = 1
 
 
-def blacklist_machine(instance_id: str, why: str) -> None:
-    """Record the instance's machine as `slow_gpu` so the next rent skips it for 24 h."""
+def blacklist_machine(instance_id: str, why: str, outcome: str = "slow_gpu") -> None:
+    """Record the instance's machine as `outcome` so the next rent skips it for 24 h."""
     try:
         import vast_rent
         board = load_board(vast_rent.BOARD_PATH)
         machine = (vast_rent.make_api().instance_status(instance_id) or {}).get("machine_id")
-        vast_rent._record(board, int(machine), None, "slow_gpu", time.time())
+        vast_rent._record(board, int(machine), None, outcome, time.time())
         save_board(vast_rent.BOARD_PATH, board)
-        print(f"machine {machine} blacklisted as slow_gpu: {why}", file=sys.stderr)
+        print(f"machine {machine} blacklisted as {outcome}: {why}", file=sys.stderr)
     except Exception as exc:   # bookkeeping must never stop the destroy that follows
-        print(f"could not blacklist the slow machine: {exc!r}", file=sys.stderr)
+        print(f"could not blacklist the machine: {exc!r}", file=sys.stderr)
 
 
 def check_gpu_speed(pod_id: str) -> None:
@@ -307,6 +308,59 @@ def failed_job_ids(state: dict) -> list[tuple[str, str]]:
             if stage.get("status") == "error" and stage.get("job_id"):
                 out.append((run_id, str(stage["job_id"])))
     return out
+
+
+# How long a drain keeps paying for a pod it cannot reach before giving up on it. On 2026-10-21
+# a Vast box went dark at 90% of a Wan job (tunnel 1033 AND ssh refused); poll_job gave up after
+# its ~5 min of misses and the drain destroyed the instance at once, so a job that might have
+# finished was lost with no log of why. Ten more minutes on a $0.70-0.99/h card is $0.12-0.17,
+# against re-running a ~10 min job from scratch plus not knowing what happened.
+LOST_CONTACT_GRACE_S = 600
+LOST_CONTACT_POLL_S = 15
+
+
+def lost_contact_runs(state: dict) -> list[str]:
+    """Runs that failed because the API stopped answering, not because a job failed."""
+    return [run_id for run_id, entry in (state.get("runs") or {}).items()
+            if entry.get("status") == "error" and LOST_CONTACT in str(entry.get("error") or "")]
+
+
+def wait_for_api(grace_s: float = LOST_CONTACT_GRACE_S, *, poll_s: float = LOST_CONTACT_POLL_S,
+                 sleep=time.sleep, now=time.time) -> bool:
+    """True as soon as /health answers again, False once `grace_s` has passed without it."""
+    deadline = now() + grace_s
+    while True:
+        try:
+            if health_ok(load_settings()):
+                return True
+        except Exception:
+            pass   # unreadable settings count as unreachable; teardown still follows
+        if now() >= deadline:
+            return False
+        sleep(poll_s)
+
+
+def recover_lost_contact(manifest_path: Path, pod_id: str, rc: int) -> int:
+    """Re-attach to jobs the batch lost sight of, if the pod comes back within the grace window.
+
+    `batch_run --resume` polls the job_id already in the journal (runner._try_reattach), so a job
+    that kept running through the outage is collected without paying for it twice. A pod that
+    never answers is left to the teardown that follows; on Vast its machine is blacklisted first,
+    while it can still be looked up, so the next rent does not land on the same dying box.
+    """
+    lost = lost_contact_runs(load_state(state_path_for(manifest_path)))
+    if not lost:
+        return rc
+    print(f"lost the API during {', '.join(lost)} — waiting up to "
+          f"{LOST_CONTACT_GRACE_S // 60:.0f} min for pod {pod_id} to answer before destroying it",
+          file=sys.stderr)
+    if not wait_for_api():
+        print(f"pod {pod_id} never answered again — destroying it", file=sys.stderr)
+        if effective_provider() == "vast":
+            blacklist_machine(pod_id, "went unreachable mid-batch", outcome="died")
+        return rc
+    print(f"pod {pod_id} is answering again — re-attaching with --resume", file=sys.stderr)
+    return batch_run("--file", str(manifest_path), "--resume")
 
 
 def collect_diagnostics(settings, state: dict, out_dir: Path) -> None:
@@ -539,6 +593,8 @@ def main() -> int:
                 # --resume, always: phase A already journalled the try-on stages, and
                 # resume is what makes them skipped rather than paid for twice.
                 rc = batch_run("--file", str(manifest_path), "--resume")
+                if rc != 0:
+                    rc = recover_lost_contact(manifest_path, pod_id, rc)
         finally:
             # Best effort only. The watchdog is the guarantee, not this block:
             # `finally` does not run when the process is SIGKILLed or the VPS dies.
