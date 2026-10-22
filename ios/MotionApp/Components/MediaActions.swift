@@ -7,7 +7,11 @@ import SwiftUI
 /// each downloads, then hands the file to PhotoKit or the share sheet.
 @MainActor @Observable
 final class MediaExporter {
-    enum Busy { case saving, sharing }
+    enum Busy: Equatable {
+        case saving, sharing
+        /// Save all: `done` of `total` files are through, saved or failed.
+        case savingMany(done: Int, total: Int)
+    }
 
     struct Toast: Equatable {
         let message: String
@@ -52,6 +56,37 @@ final class MediaExporter {
             show(e.userMessage)
         } catch {
             show("Couldn't save: \(error.localizedDescription)")
+        }
+    }
+
+    /// Every video of a run or batch, one after another: each is downloaded,
+    /// added and its temp file removed before the next, so a 6-video run
+    /// never holds ~100 MB on disk at once. A file that fails is skipped and
+    /// counted rather than stopping the rest.
+    func saveAllToPhotos(_ downloads: [() async throws -> URL]) async {
+        guard busy == nil, !downloads.isEmpty else { return }
+        busy = .savingMany(done: 0, total: downloads.count)
+        defer { busy = nil }
+        guard await PHPhotoLibrary.requestAuthorization(for: .addOnly) == .authorized else {
+            show("Photos access is off for Motion.", opensSettings: true)
+            return
+        }
+        var failed = 0
+        for (index, download) in downloads.enumerated() {
+            do {
+                let local = try await download()
+                defer { try? FileManager.default.removeItem(at: local.deletingLastPathComponent()) }
+                try await Self.addToPhotos(local, isVideo: true)
+            } catch {
+                failed += 1
+            }
+            busy = .savingMany(done: index + 1, total: downloads.count)
+        }
+        let saved = downloads.count - failed
+        if failed == 0 {
+            show(saved == 1 ? "Saved 1 video to Photos." : "Saved \(saved) videos to Photos.")
+        } else {
+            show("Saved \(saved) of \(downloads.count). \(failed) couldn't be downloaded.")
         }
     }
 
@@ -232,7 +267,7 @@ struct MediaStatusView: View {
             if let busy = exporter.busy {
                 HStack(spacing: 10) {
                     ProgressView().tint(.white)
-                    Text(busy == .saving ? "Saving…" : "Preparing…")
+                    Text(Self.label(busy))
                         .font(.subheadline.weight(.medium)).foregroundStyle(Theme.label)
                 }
                 .padding(.horizontal, 14).padding(.vertical, 8)
@@ -245,6 +280,15 @@ struct MediaStatusView: View {
         .transition(reduceMotion ? .opacity : .opacity.combined(with: .move(edge: .bottom)))
         .animation(.easeOut(duration: 0.2), value: exporter.toast)
         .animation(.easeOut(duration: 0.2), value: exporter.busy)
+    }
+
+    private static func label(_ busy: MediaExporter.Busy) -> String {
+        switch busy {
+        case .saving: "Saving…"
+        case .sharing: "Preparing…"
+        // The one in flight, counting from 1: "Saving 1 of 6…" while the first downloads.
+        case let .savingMany(done, total): "Saving \(min(done + 1, total)) of \(total)…"
+        }
     }
 
     private func toastView(_ toast: MediaExporter.Toast) -> some View {
